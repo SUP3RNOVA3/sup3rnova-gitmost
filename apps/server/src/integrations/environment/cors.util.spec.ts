@@ -3,7 +3,6 @@ import { buildCorsAllowlist, isOriginAllowed } from './cors.util';
 const WEBVIEW_ORIGINS = [
   'capacitor://localhost',
   'ionic://localhost',
-  'http://localhost',
   'https://localhost',
 ];
 
@@ -32,6 +31,13 @@ describe('isOriginAllowed', () => {
   it('rejects a foreign credentialed origin', () => {
     // With credentials:true a foreign credentialed origin must be rejected.
     expect(isOriginAllowed('https://evil.example', allowlist)).toBe(false);
+  });
+
+  it('rejects the cleartext http://localhost origin', () => {
+    // The native shell uses the secure scheme (https://localhost) on Android and
+    // the capacitor:// custom scheme on iOS, so cleartext http://localhost must
+    // not be trusted.
+    expect(isOriginAllowed('http://localhost', allowlist)).toBe(false);
   });
 
   it('rejects a trailing-slash mismatch', () => {
@@ -70,11 +76,11 @@ describe('buildCorsAllowlist', () => {
       configuredOrigins: ['https://app.example'],
     });
 
-    // app URL + 4 WebView origins, the duplicate configured origin collapses.
+    // app URL + WebView origins, the duplicate configured origin collapses.
     expect(allowlist.size).toBe(1 + WEBVIEW_ORIGINS.length);
   });
 
-  it('always includes the four WebView origins even with no configured origins', () => {
+  it('always includes every WebView origin even with no configured origins', () => {
     const allowlist = buildCorsAllowlist({
       appUrl: 'https://app.example',
       configuredOrigins: [],

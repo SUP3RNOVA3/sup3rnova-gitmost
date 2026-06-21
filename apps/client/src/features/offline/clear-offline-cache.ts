@@ -13,8 +13,10 @@ import { OFFLINE_CACHE_KEY } from "./query-persister";
  *      `OFFLINE_CACHE_KEY`),
  *   2. the Yjs page documents (IndexedDB databases named `page.<id>` created by
  *      y-indexeddb in make-offline.ts), and
- *   3. the service worker `api-get-cache` Cache Storage entry (private GET /api
- *      responses cached by the Workbox runtime).
+ *   3. any legacy service worker `api-get-cache` Cache Storage entry. The
+ *      Workbox runtime no longer creates this cache (the GET /api NetworkFirst
+ *      rule was removed — offline reads come from the persisted RQ cache), so
+ *      this is now a defensive cleanup for caches left by older app versions.
  *
  * Fully best-effort: every step is isolated so a single failure neither blocks
  * the remaining steps nor throws to the caller (logout must never be blocked on
@@ -72,9 +74,9 @@ export async function clearOfflineCache(): Promise<void> {
     // best-effort: ignore enumeration/deletion failures
   }
 
-  // 3. Clear the service worker API cache (private GET /api responses). The
-  // Workbox runtime cache name contains "api-get-cache" (Workbox may prefix it),
-  // so match by substring rather than exact name.
+  // 3. Clear any legacy service worker API cache. Current builds no longer
+  // create it, but an older client may have left an "api-get-cache" entry
+  // (Workbox may prefix the name), so match by substring rather than exact name.
   try {
     if ("caches" in window) {
       const keys = await caches.keys();

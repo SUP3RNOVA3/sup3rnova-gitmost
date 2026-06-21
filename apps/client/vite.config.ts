@@ -67,7 +67,21 @@ export default defineConfig(({ mode }) => {
           // Segment-anchored (`^/<seg>(/|$)`) so navigation requests to these
           // segments are consistently excluded from the SPA fallback, mirroring
           // the runtimeCaching urlPattern regexes below.
-          navigateFallbackDenylist: [/^\/api(\/|$)/, /^\/collab(\/|$)/, /^\/socket\.io(\/|$)/],
+          //
+          // `/share`, `/mcp`, and `/robots.txt` mirror the server static-serve
+          // exclude list (apps/server/src/main.ts setGlobalPrefix `exclude`):
+          // robots.txt, the SEO/OG/analytics-injected public share HTML, and the
+          // embedded MCP endpoint are served by server controllers, so the SW must
+          // never shadow them with the precached index.html app shell (doing so
+          // would break SEO and MCP).
+          navigateFallbackDenylist: [
+            /^\/api(\/|$)/,
+            /^\/collab(\/|$)/,
+            /^\/socket\.io(\/|$)/,
+            /^\/share(\/|$)/,
+            /^\/mcp(\/|$)/,
+            /^\/robots\.txt$/,
+          ],
           cleanupOutdatedCaches: true,
           clientsClaim: true,
           // The urlPattern regexes below mirror apps/client/src/pwa/sw-strategy.ts
@@ -77,19 +91,8 @@ export default defineConfig(({ mode }) => {
           // self-contained inline regex literals anchored to a path segment boundary.
           runtimeCaching: [
             { urlPattern: ({ url }) => /^\/(collab|socket\.io)(\/|$)/.test(url.pathname), handler: "NetworkOnly" },
-            // M2 read-path: GET navigation API responses fall back to cache when offline.
-            // Only GET is cached; mutations always hit the network (Workbox caching handlers
-            // only match GET by default, but scope explicitly for clarity/safety).
-            {
-              urlPattern: ({ url, request }) => /^\/api(\/|$)/.test(url.pathname) && request.method === "GET",
-              handler: "NetworkFirst",
-              options: {
-                cacheName: "api-get-cache",
-                networkTimeoutSeconds: 5,
-                expiration: { maxEntries: 200, maxAgeSeconds: 60 * 60 * 24 },
-              },
-            },
-            // Any non-GET /api stays network-only (never served stale).
+            // All /api stays network-only; offline reads come from the persisted
+            // React Query cache (IndexedDB) + y-indexeddb, not the SW HTTP cache.
             { urlPattern: ({ url }) => /^\/api(\/|$)/.test(url.pathname), handler: "NetworkOnly" },
           ],
         },
