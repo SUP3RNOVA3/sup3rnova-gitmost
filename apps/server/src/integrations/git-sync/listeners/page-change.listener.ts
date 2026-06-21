@@ -35,7 +35,9 @@ interface DebounceEntry {
  *
  * Loop-guard (best-effort, plan §10/§8.2): an event whose page row already reads
  * `lastUpdatedSource === 'git-sync'` is the orchestrator's OWN write, so we skip
- * it to avoid a write -> event -> sync echo. This is the cheap first guard; the
+ * it to avoid a write -> event -> sync echo. The guard ALWAYS runs (the page row
+ * is fetched for every event, structural ones included). This is the cheap first
+ * guard; the
  * full bodyHash + updatedAt loop-guard (consuming the push side's
  * `PushedPageRecord`) is a later hardening step (plan §8.2) — noted, not built
  * here. The poll-safety interval still converges anything this guard drops.
@@ -53,8 +55,8 @@ export class PageChangeListener {
 
   /**
    * One handler bound to ALL git-sync page events (the array form of `@OnEvent`).
-   * Resolves the affected page's space + workspace, applies the cheap loop-guard,
-   * and schedules the debounced cycle.
+   * Fetches the page row once to apply the loop-guard (unconditionally) and to
+   * resolve the page's space + workspace, then schedules the debounced cycle.
    */
   @OnEvent(GIT_SYNC_PAGE_EVENTS as unknown as string[])
   async handlePageEvent(event: PageEventLike): Promise<void> {
@@ -64,21 +66,24 @@ export class PageChangeListener {
       const pageId = this.firstPageId(event);
       if (!pageId) return;
 
-      // Prefer a spaceId carried on the event; otherwise read the page row (also
-      // gives us the loop-guard source). A missing page (hard-deleted) is ignored.
-      let spaceId = this.eventSpaceId(event, pageId);
-      let workspaceId = event.workspaceId;
+      // The loop-guard MUST always run — even structural events that already
+      // carry spaceId+workspaceId could be the orchestrator's OWN write (it stamps
+      // lastUpdatedSource='git-sync' on create/update/move/rename + body writes).
+      // So ALWAYS fetch the page row: it gives us the loop-guard source AND fills
+      // in any missing space/workspace in a single read. A missing page
+      // (hard-deleted) is ignored.
+      const page = await this.pageRepo.findById(pageId, {
+        includeContent: false,
+      });
+      if (!page) return;
 
-      if (!spaceId || !workspaceId) {
-        const page = await this.pageRepo.findById(pageId, {
-          includeContent: false,
-        });
-        if (!page) return;
-        spaceId = spaceId ?? page.spaceId;
-        workspaceId = workspaceId ?? page.workspaceId;
-        // Loop-guard: skip our own writes (best-effort, plan §8.2).
-        if (page.lastUpdatedSource === 'git-sync') return;
-      }
+      // Loop-guard: skip our own writes to avoid a write -> event -> sync echo
+      // (best-effort, plan §8.2). Applies unconditionally now.
+      if (page.lastUpdatedSource === 'git-sync') return;
+
+      // Prefer ids carried on the event; fall back to the row we already fetched.
+      const spaceId = this.eventSpaceId(event, pageId) ?? page.spaceId;
+      const workspaceId = event.workspaceId ?? page.workspaceId;
 
       if (!spaceId || !workspaceId) return;
       this.schedule(spaceId, workspaceId);

@@ -13,14 +13,16 @@ import { EventName } from '../../common/events/event.contants';
  * The page lifecycle events the git-sync listener reacts to (plan §10). A change
  * to any of these in an enabled space schedules a debounced sync cycle.
  *   - PAGE_CREATED / PAGE_UPDATED / PAGE_MOVED — structural + content edits;
- *   - PAGE_CONTENT_UPDATED — the collab body-save job (real name in the enum);
  *   - PAGE_SOFT_DELETED / PAGE_RESTORED — Trash transitions (deletes are soft);
  *   - PAGE_MOVED_TO_SPACE — cross-space move (cross-repo, plan §5).
+ *
+ * NOTE: body edits arrive via PAGE_UPDATED (emitted from persistence.extension),
+ * NOT via EventName.PAGE_CONTENT_UPDATED — that name is a BullMQ queue-job name,
+ * not an EventEmitter2 event, so @OnEvent would never fire for it.
  */
 export const GIT_SYNC_PAGE_EVENTS = [
   EventName.PAGE_CREATED,
   EventName.PAGE_UPDATED,
-  EventName.PAGE_CONTENT_UPDATED,
   EventName.PAGE_MOVED,
   EventName.PAGE_MOVED_TO_SPACE,
   EventName.PAGE_SOFT_DELETED,

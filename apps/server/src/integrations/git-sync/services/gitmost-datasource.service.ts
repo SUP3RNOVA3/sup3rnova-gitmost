@@ -30,14 +30,12 @@ export interface GitSyncBindContext {
 }
 
 /**
- * The git-sync provenance carried into PageService writes. PageService stamps
- * `lastUpdatedSource = 'agent'` only when `provenance.actor === 'agent'`; for any
- * other actor it leaves the column at its default ('user'). So create/move/rename
- * through PageService DO NOT yet stamp 'git-sync' on the page row — see the note
- * in the report. Body writes (writeBody, §3.3) DO stamp 'git-sync' because the
- * collab context's `actor: 'git-sync'` flows into PersistenceExtension. We pass a
- * 'git-sync' provenance anyway so that when PageService is extended to honor it,
- * the marker propagates without touching the datasource.
+ * The git-sync provenance carried into PageService writes. PageService.create/
+ * update/movePage honor this provenance and stamp `lastUpdatedSource = 'git-sync'`
+ * on the page row when `provenance.actor === 'git-sync'`. Body writes (writeBody,
+ * §3.3) likewise stamp 'git-sync' because the collab context's `actor: 'git-sync'`
+ * flows into PersistenceExtension. So ALL git-sync structural + body writes mark
+ * the row's source, which the listener's loop-guard reads to skip our own writes.
  */
 const GIT_SYNC_PROVENANCE: AuthProvenanceData = {
   actor: 'git-sync',

@@ -360,18 +360,28 @@ export class EnvironmentService {
     return this.configService.get<string>('GIT_SYNC_REMOTE_TEMPLATE');
   }
 
-  /** Poll-safety interval in ms (default 15000). */
+  /**
+   * Poll-safety interval in ms (default 15000). A NaN / non-positive value falls
+   * back to the default so a bad override can never disable or zero the poll loop.
+   */
   getGitSyncPollIntervalMs(): number {
-    return parseInt(
+    const parsed = parseInt(
       this.configService.get<string>('GIT_SYNC_POLL_INTERVAL_MS', '15000'),
+      10,
     );
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 15000;
   }
 
-  /** Event debounce window in ms (default 2000). */
+  /**
+   * Event debounce window in ms (default 2000). A NaN / non-positive value falls
+   * back to the default so a bad override can never disable the debounce.
+   */
   getGitSyncDebounceMs(): number {
-    return parseInt(
+    const parsed = parseInt(
       this.configService.get<string>('GIT_SYNC_DEBOUNCE_MS', '2000'),
+      10,
     );
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 2000;
   }
 
   /**
@@ -384,6 +394,7 @@ export class EnvironmentService {
   getGitSyncMaxDeletesPerCycle(): number {
     const parsed = parseInt(
       this.configService.get<string>('GIT_SYNC_MAX_DELETES_PER_CYCLE', '5'),
+      10,
     );
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
   }

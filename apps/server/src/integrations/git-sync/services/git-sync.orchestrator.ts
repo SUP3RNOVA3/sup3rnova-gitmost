@@ -1,5 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { Interval } from '@nestjs/schedule';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import { SchedulerRegistry } from '@nestjs/schedule';
 import { RedisService } from '@nestjs-labs/nestjs-ioredis';
 import type { Redis } from 'ioredis';
 import { randomUUID } from 'node:crypto';
@@ -60,18 +65,21 @@ export interface GitSyncRunStatus {
  * first; per-space opt-in is now REQUIRED on top of it.
  */
 @Injectable()
-export class GitSyncOrchestrator {
+export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(GitSyncOrchestrator.name);
   private readonly redis: Redis;
   /** Unique per process instance — the leader-lock value (CAS on release). */
   private readonly instanceId = randomUUID();
   /** In-process per-space mutex: spaceIds with a cycle currently running. */
   private readonly running = new Set<string>();
+  /** The registered poll-interval name, or null when none is registered. */
+  private pollIntervalName: string | null = null;
 
   constructor(
     private readonly environmentService: EnvironmentService,
     private readonly dataSource: GitmostDataSourceService,
     private readonly vaultRegistry: VaultRegistryService,
+    private readonly schedulerRegistry: SchedulerRegistry,
     redisService: RedisService,
     @InjectKysely() private readonly db: KyselyDB,
   ) {
@@ -346,18 +354,60 @@ export class GitSyncOrchestrator {
 
   // --- poll-safety interval (plan §10) -------------------------------------
 
+  /** Registered interval name (shared by registration + teardown). */
+  private static readonly POLL_INTERVAL_NAME = 'git-sync-poll';
+
   /**
-   * Poll-safety loop: catches events missed by the listener and reconciles after
-   * downtime. Gated on GIT_SYNC_ENABLED. The interval is a fixed value because
-   * `@Interval` cannot read config at class-eval time — the body short-circuits
-   * when disabled. Each enabled space runs under its own lock (overlaps skipped).
+   * Register the poll-safety interval DYNAMICALLY so it honors the configured
+   * GIT_SYNC_POLL_INTERVAL_MS (a static `@Interval` decorator could only hardcode
+   * a value at class-eval time, before config is readable — diverging from what
+   * `/status` reports). When git-sync is disabled we register nothing.
    *
-   * ScheduleModule: registered ONCE globally by TelemetryModule
-   * (ScheduleModule.forRoot()); GitSyncModule imports the plain ScheduleModule so
-   * @Interval is discovered without a duplicate forRoot (plan §6 note).
+   * ScheduleModule: forRoot() is registered ONCE globally by TelemetryModule;
+   * GitSyncModule imports the plain ScheduleModule so SchedulerRegistry is
+   * injectable without a duplicate forRoot (plan §6 note).
    */
-  @Interval('git-sync-poll', 15000)
-  async poll(): Promise<void> {
+  onModuleInit(): void {
+    if (!this.environmentService.isGitSyncEnabled()) return;
+
+    const ms = this.environmentService.getGitSyncPollIntervalMs();
+    const handle = setInterval(() => {
+      void this.pollTick();
+    }, ms);
+    // Do not keep the event loop alive solely for the poll timer.
+    handle.unref?.();
+    this.schedulerRegistry.addInterval(
+      GitSyncOrchestrator.POLL_INTERVAL_NAME,
+      handle,
+    );
+    this.pollIntervalName = GitSyncOrchestrator.POLL_INTERVAL_NAME;
+    this.logger.log(`git-sync: poll interval registered (${ms}ms).`);
+  }
+
+  /** Tear down the dynamic interval on shutdown (guard against double-delete). */
+  onModuleDestroy(): void {
+    if (!this.pollIntervalName) return;
+    try {
+      // deleteInterval clears the timer and removes it from the registry.
+      this.schedulerRegistry.deleteInterval(this.pollIntervalName);
+    } catch (err) {
+      this.logger.warn(
+        `git-sync: failed to delete poll interval: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    } finally {
+      this.pollIntervalName = null;
+    }
+  }
+
+  /**
+   * One poll tick: catches events missed by the listener and reconciles after
+   * downtime. Gated on GIT_SYNC_ENABLED (defensive — the interval is only
+   * registered when enabled). Each enabled space runs under its own lock
+   * (overlaps skipped). Never throws (runOnce swallows per-space errors).
+   */
+  private async pollTick(): Promise<void> {
     if (!this.environmentService.isGitSyncEnabled()) return;
     let spaces: EnabledSpace[];
     try {

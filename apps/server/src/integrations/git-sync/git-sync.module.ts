@@ -21,9 +21,10 @@ import { GitSyncController } from './git-sync.controller';
  *   - EnvironmentModule (global) — EnvironmentService config;
  *   - CollaborationModule — exports CollaborationGateway for native body writes;
  *   - PageModule — exports PageService for structural mutations;
- *   - ScheduleModule (NOT forRoot) — so @Interval is discovered. forRoot() is
- *     already registered globally by TelemetryModule; importing the plain module
- *     here avoids a duplicate scheduler registration (plan §6 note).
+ *   - ScheduleModule (NOT forRoot) — so SchedulerRegistry is injectable (the
+ *     orchestrator registers a DYNAMIC poll interval in onModuleInit). forRoot()
+ *     is already registered globally by TelemetryModule; importing the plain
+ *     module here avoids a duplicate scheduler registration (plan §6 note).
  *
  * RedisService is provided by the global RedisModule (app.module) and CASL's
  * WorkspaceAbilityFactory by the global CaslModule — both resolve without an
