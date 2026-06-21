@@ -24,6 +24,7 @@ import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
 import { RESET } from "jotai/utils";
 import { useTranslation } from "react-i18next";
 import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
+import { clearOfflineCache } from "@/features/offline/clear-offline-cache";
 
 export default function useAuth() {
   const { t } = useTranslation();
@@ -129,6 +130,13 @@ export default function useAuth() {
     // remain.)
     clearPersistedTreeCaches();
     await logout();
+    // Purge the previous user's offline data while the page is still alive —
+    // window.location.replace below would otherwise interrupt async cleanup.
+    try {
+      await clearOfflineCache();
+    } catch {
+      // best-effort: never block logout on cache cleanup
+    }
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
   };
 

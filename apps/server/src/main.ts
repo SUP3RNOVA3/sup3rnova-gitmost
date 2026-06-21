@@ -19,6 +19,10 @@ import { resolveTrustProxy } from './integrations/environment/trust-proxy.util';
 import { isMetricsEnabled } from './integrations/metrics/metrics.registry';
 import { recordHttpResponse } from './integrations/metrics/http-metrics.hook';
 import { startMetricsServer } from './integrations/metrics/metrics.server';
+import {
+  buildCorsAllowlist,
+  isOriginAllowed,
+} from './integrations/environment/cors.util';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
 async function bootstrap() {
@@ -178,25 +182,19 @@ async function bootstrap() {
   // The web client is same-origin in production; an explicit allowlist lets
   // native/mobile WebView origins (Capacitor) and any configured cross-origin
   // clients call the API, while everything else is rejected.
-  const corsAllowedOrigins = new Set<string>([
-    environmentService.getAppUrl(),
-    ...environmentService.getCorsAllowedOrigins(),
-    // Capacitor / Ionic WebView origins used by the native shell.
-    'capacitor://localhost',
-    'ionic://localhost',
-    'http://localhost',
-    'https://localhost',
-  ]);
+  const corsAllowedOrigins = buildCorsAllowlist({
+    appUrl: environmentService.getAppUrl(),
+    configuredOrigins: environmentService.getCorsAllowedOrigins(),
+  });
 
   app.enableCors({
     // Allow requests with no Origin header (curl, server-to-server, some native
     // WebView requests) and any origin in the allowlist; reject the rest.
-    origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
-      if (!origin || corsAllowedOrigins.has(origin)) {
-        callback(null, true);
-        return;
-      }
-      callback(null, false);
+    origin: (
+      origin: string | undefined,
+      callback: (err: Error | null, allow?: boolean) => void,
+    ) => {
+      callback(null, isOriginAllowed(origin, corsAllowedOrigins));
     },
     credentials: true,
     methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],

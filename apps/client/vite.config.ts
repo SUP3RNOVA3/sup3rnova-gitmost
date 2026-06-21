@@ -64,17 +64,24 @@ export default defineConfig(({ mode }) => {
         workbox: {
           globPatterns: ["**/*.{js,css,html,svg,png,ico,woff2,json}"],
           navigateFallback: "index.html",
-          navigateFallbackDenylist: [/^\/api\//, /^\/collab\//, /^\/socket\.io\//],
+          // Segment-anchored (`^/<seg>(/|$)`) so navigation requests to these
+          // segments are consistently excluded from the SPA fallback, mirroring
+          // the runtimeCaching urlPattern regexes below.
+          navigateFallbackDenylist: [/^\/api(\/|$)/, /^\/collab(\/|$)/, /^\/socket\.io(\/|$)/],
           cleanupOutdatedCaches: true,
           clientsClaim: true,
+          // The urlPattern regexes below mirror apps/client/src/pwa/sw-strategy.ts
+          // and MUST be kept in sync with it. Workbox `generateSW` serializes these
+          // functions standalone into the generated service worker, so they cannot
+          // import the module — the matching logic is intentionally duplicated as
+          // self-contained inline regex literals anchored to a path segment boundary.
           runtimeCaching: [
-            { urlPattern: ({ url }) => url.pathname.startsWith("/collab"), handler: "NetworkOnly" },
-            { urlPattern: ({ url }) => url.pathname.startsWith("/socket.io"), handler: "NetworkOnly" },
+            { urlPattern: ({ url }) => /^\/(collab|socket\.io)(\/|$)/.test(url.pathname), handler: "NetworkOnly" },
             // M2 read-path: GET navigation API responses fall back to cache when offline.
             // Only GET is cached; mutations always hit the network (Workbox caching handlers
             // only match GET by default, but scope explicitly for clarity/safety).
             {
-              urlPattern: ({ url, request }) => url.pathname.startsWith("/api") && request.method === "GET",
+              urlPattern: ({ url, request }) => /^\/api(\/|$)/.test(url.pathname) && request.method === "GET",
               handler: "NetworkFirst",
               options: {
                 cacheName: "api-get-cache",
@@ -83,7 +90,7 @@ export default defineConfig(({ mode }) => {
               },
             },
             // Any non-GET /api stays network-only (never served stale).
-            { urlPattern: ({ url }) => url.pathname.startsWith("/api"), handler: "NetworkOnly" },
+            { urlPattern: ({ url }) => /^\/api(\/|$)/.test(url.pathname), handler: "NetworkOnly" },
           ],
         },
         devOptions: { enabled: false },

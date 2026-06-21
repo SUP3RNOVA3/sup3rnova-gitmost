@@ -11,6 +11,11 @@ type DehydratableQuery = {
   queryKey: readonly unknown[];
 };
 
+// idb-keyval key under which TanStack Query persists its dehydrated cache.
+// Exported so the logout cache-clear logic deletes the exact same key (no
+// magic-string drift between persist and purge).
+export const OFFLINE_CACHE_KEY = "gitmost-rq-cache";
+
 // IndexedDB-backed storage adapter for TanStack Query's async persister.
 const idbStorage = {
   getItem: (key: string) => get<string>(key).then((v) => v ?? null),
@@ -20,7 +25,7 @@ const idbStorage = {
 
 export const queryPersister = createAsyncStoragePersister({
   storage: idbStorage,
-  key: "gitmost-rq-cache",
+  key: OFFLINE_CACHE_KEY,
   throttleTime: 1000,
 });
 
