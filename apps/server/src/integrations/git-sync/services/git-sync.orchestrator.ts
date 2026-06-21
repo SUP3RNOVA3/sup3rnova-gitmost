@@ -34,6 +34,19 @@ interface EnabledSpace {
   workspaceId: string;
 }
 
+/**
+ * Thrown by `ingestExternalPush` when the per-space lock cannot be acquired (a
+ * poll cycle is mid-flight on this or another replica). The /git HTTP handler
+ * maps it to a 503 so the git client retries rather than racing a cycle's
+ * working-tree checkout/merge.
+ */
+export class GitSyncLockHeldError extends Error {
+  constructor(public readonly spaceId: string) {
+    super(`git-sync: space ${spaceId} is busy (lock held); retry the push`);
+    this.name = 'GitSyncLockHeldError';
+  }
+}
+
 /** Small status summary returned by `runOnce` (for the admin trigger + logs). */
 export interface GitSyncRunStatus {
   spaceId: string;
@@ -123,6 +136,35 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /**
+   * CAS-guarded TTL refresh: extend the lock's TTL ONLY while WE still own it
+   * (the stored value matches our instanceId) — never extend another replica's
+   * lock that took over after our TTL expired. Used by the heartbeat in
+   * `withSpaceLock` so a long-running push (client-controlled receive-pack + the
+   * Docmost cycle) cannot outlive the lock and let a concurrent cycle race the
+   * working tree. Logs (warn) but never throws — a failed refresh must not break
+   * the cycle it is protecting.
+   */
+  private async refreshLock(spaceId: string): Promise<void> {
+    const lua =
+      'if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("pexpire", KEYS[1], ARGV[2]) else return 0 end';
+    try {
+      await this.redis.eval(
+        lua,
+        1,
+        GIT_SYNC_LOCK_PREFIX + spaceId,
+        this.instanceId,
+        String(GIT_SYNC_LOCK_TTL_MS),
+      );
+    } catch (err) {
+      this.logger.warn(
+        `git-sync: failed to refresh lock for space ${spaceId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   // --- enabled-space enumeration (plan §10) --------------------------------
 
   /**
@@ -188,27 +230,133 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       return { spaceId, ran: false, skipped: 'no-service-user' };
     }
 
-    // In-process mutex: never run two overlapping cycles for the same space on
-    // this instance (the Redis lock guards cross-instance, this guards in-proc).
-    if (this.running.has(spaceId)) {
-      return { spaceId, ran: false, skipped: 'in-progress' };
-    }
-
-    // Redis leader lock: only the holder runs the cycle (plan §9).
-    if (!(await this.acquire(spaceId))) {
-      return { spaceId, ran: false, skipped: 'lock-held' };
-    }
-
-    this.running.add(spaceId);
+    // Run the full cycle under the per-space lock. withSpaceLock owns the
+    // in-process mutex (no overlapping cycles on this instance) AND the Redis
+    // leader lock (single writer across replicas), and returns a skip sentinel
+    // when it could not enter — surfaced here as the existing skipped:'in-progress'
+    // / 'lock-held' status so runOnce's observable behavior is unchanged.
     try {
-      return await this.driveCycle(spaceId, workspaceId, serviceUserId);
+      const result = await this.withSpaceLock(spaceId, () =>
+        this.driveCycle(spaceId, workspaceId, serviceUserId),
+      );
+      if ('skipped' in result && !('spaceId' in result)) {
+        return { spaceId, ran: false, skipped: result.skipped };
+      }
+      return result;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       this.logger.error(`git-sync: cycle failed for space ${spaceId}: ${message}`);
       return { spaceId, ran: false, error: message };
+    }
+  }
+
+  /**
+   * Run `fn` under the per-space lock: the in-process mutex (no overlapping
+   * cycles on this instance) AND the Redis leader lock (single writer across
+   * replicas). Returns `fn`'s result, or a skip sentinel when the lock could not
+   * be acquired — `{ skipped: 'in-progress' }` (this instance is mid-cycle) or
+   * `{ skipped: 'lock-held' }` (another replica holds the Redis lock). The mutex
+   * + Redis lock are always released in a `finally`, even when `fn` throws (the
+   * throw propagates to the caller). This is the single reusable wrapper shared
+   * by `runOnce` (the poll/admin cycle) and `ingestExternalPush` (a push from a
+   * git client over HTTP) so both serialize against each other identically.
+   */
+  async withSpaceLock<T>(
+    spaceId: string,
+    fn: () => Promise<T>,
+  ): Promise<T | { skipped: 'lock-held' | 'in-progress' }> {
+    if (this.running.has(spaceId)) {
+      return { skipped: 'in-progress' };
+    }
+    if (!(await this.acquire(spaceId))) {
+      return { skipped: 'lock-held' };
+    }
+    this.running.add(spaceId);
+    // Heartbeat: periodically (≈ TTL/3) extend the lock's TTL while `fn` runs so
+    // a long push (client-controlled receive-pack + the Docmost cycle) cannot
+    // outlive the fixed TTL and let a concurrent cycle race the working tree. The
+    // refresh is CAS-guarded (only extends while WE own it). `.unref()` keeps the
+    // timer from holding the event loop open; it is ALWAYS cleared in `finally`.
+    const heartbeat = setInterval(() => {
+      void this.refreshLock(spaceId);
+    }, Math.max(1, Math.floor(GIT_SYNC_LOCK_TTL_MS / 3)));
+    heartbeat.unref?.();
+    try {
+      return await fn();
     } finally {
+      clearInterval(heartbeat);
       this.running.delete(spaceId);
       await this.release(spaceId);
+    }
+  }
+
+  /**
+   * Ingest a push that arrived over smart-HTTP (the /git host). Under the SAME
+   * per-space lock the poll cycle uses, it:
+   *   1. runs `runReceivePack()` — the closure that spawns `git http-backend` for
+   *      the receive-pack request and finishes streaming the HTTP response to the
+   *      client. The client's push result is determined here.
+   *   2. THEN — still holding the lock — runs the full Docmost cycle (the same
+   *      `driveCycle` body `runOnce` uses) so the freshly received commits on
+   *      `main` flow back into Docmost pages.
+   *
+   * If the cycle body in step 2 throws, it is LOGGED but NOT rethrown: the push
+   * already succeeded and the commits are durable on `main`, so the poll-interval
+   * backstop will reconcile them on the next tick. The receive-pack itself is the
+   * load-bearing step.
+   *
+   * Lock contention: if the lock cannot be acquired (a poll cycle is mid-flight),
+   * this throws a `GitSyncLockHeldError`. The HTTP handler converts that to a 503
+   * so git surfaces a retryable error to the user (chosen over blocking the
+   * request behind a potentially long cycle). The receive-pack is NOT run when
+   * the lock is held — we never write to the working tree concurrently with a
+   * cycle.
+   */
+  async ingestExternalPush(
+    spaceId: string,
+    workspaceId: string,
+    runReceivePack: () => Promise<void>,
+  ): Promise<void> {
+    if (!this.environmentService.isGitSyncEnabled()) {
+      // The HTTP gate already checks this, but be defensive: never run a cycle
+      // when sync is globally off.
+      throw new GitSyncLockHeldError(spaceId);
+    }
+    const serviceUserId = this.environmentService.getGitSyncServiceUserId();
+
+    const result = await this.withSpaceLock(spaceId, async () => {
+      // 1) Stream the receive-pack to the client (durable commits land on main).
+      await runReceivePack();
+
+      // 2) Reconcile the new commits into Docmost. A service user is required to
+      // attribute the writes; without one we cannot run the cycle — the commits
+      // are still durable and the poll backstop will pick them up once configured.
+      if (!serviceUserId) {
+        this.logger.error(
+          'git-sync: GIT_SYNC_SERVICE_USER_ID is required to ingest an external ' +
+            'push — the push is durable on main; skipping the immediate cycle.',
+        );
+        return;
+      }
+      try {
+        await this.driveCycle(spaceId, workspaceId, serviceUserId);
+      } catch (err) {
+        // Do NOT rethrow: the push succeeded and the commits are durable on main;
+        // the poll-interval backstop retries the cycle. Log for visibility.
+        this.logger.error(
+          `git-sync: post-push cycle failed for space ${spaceId} (push is ` +
+            `durable; poll will retry): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+        );
+      }
+      return;
+    });
+
+    // The lock was held (in-progress or another replica) — surface to the caller
+    // so the HTTP handler can answer 503 and let git retry.
+    if (typeof result === 'object' && result !== null && 'skipped' in result) {
+      throw new GitSyncLockHeldError(spaceId);
     }
   }
 

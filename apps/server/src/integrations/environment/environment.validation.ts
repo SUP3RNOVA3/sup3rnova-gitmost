@@ -179,6 +179,13 @@ export class EnvironmentVariables {
   @IsString()
   GIT_SYNC_ENABLED: string;
 
+  // Whether to serve the per-space vaults over smart-HTTP (the /git host).
+  // When unset, defaults to GIT_SYNC_ENABLED (see isGitSyncHttpEnabled).
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  @IsString()
+  GIT_SYNC_HTTP_ENABLED: string;
+
   @IsOptional()
   @IsString()
   GIT_SYNC_DATA_DIR: string;

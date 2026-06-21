@@ -4,11 +4,14 @@ import { DatabaseModule } from '@docmost/db/database.module';
 import { EnvironmentModule } from '../environment/environment.module';
 import { CollaborationModule } from '../../collaboration/collaboration.module';
 import { PageModule } from '../../core/page/page.module';
+import { AuthModule } from '../../core/auth/auth.module';
 import { GitmostDataSourceService } from './services/gitmost-datasource.service';
 import { GitSyncOrchestrator } from './services/git-sync.orchestrator';
 import { VaultRegistryService } from './services/vault-registry.service';
 import { PageChangeListener } from './listeners/page-change.listener';
 import { GitSyncController } from './git-sync.controller';
+import { GitHttpBackendService } from './http/git-http-backend.service';
+import { GitHttpService } from './http/git-http.service';
 
 /**
  * The git-sync control plane (plan §6). Wires the native datasource, the
@@ -36,6 +39,8 @@ import { GitSyncController } from './git-sync.controller';
     EnvironmentModule,
     CollaborationModule,
     PageModule,
+    // AuthModule exports AuthService (verifyUserCredentials for /git HTTP Basic).
+    AuthModule,
     ScheduleModule,
   ],
   controllers: [GitSyncController],
@@ -44,6 +49,12 @@ import { GitSyncController } from './git-sync.controller';
     GitSyncOrchestrator,
     VaultRegistryService,
     PageChangeListener,
+    // /git smart-HTTP host (the raw Fastify route in main.ts resolves these).
+    GitHttpBackendService,
+    GitHttpService,
   ],
+  // Exported so the raw Fastify route registered in main.ts can resolve the
+  // handler from the Nest container (app.get(GitHttpService)).
+  exports: [GitHttpService],
 })
 export class GitSyncModule {}

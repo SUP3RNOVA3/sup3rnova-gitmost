@@ -344,6 +344,18 @@ export class EnvironmentService {
   }
 
   /**
+   * Whether gitmost serves the per-space vaults over smart-HTTP (the /git host).
+   * When GIT_SYNC_HTTP_ENABLED is UNSET it DEFAULTS to isGitSyncEnabled() — so
+   * enabling sync also enables the host unless explicitly disabled. When set, it
+   * is honored verbatim ('true' -> on, anything else -> off).
+   */
+  isGitSyncHttpEnabled(): boolean {
+    const raw = this.configService.get<string>('GIT_SYNC_HTTP_ENABLED');
+    if (raw === undefined) return this.isGitSyncEnabled();
+    return raw.toLowerCase() === 'true';
+  }
+
+  /**
    * Root directory holding the per-space vault repos. Defaults to
    * `<DATA_DIR or ./data>/git-sync`. `DATA_DIR` is read directly (no dedicated
    * getter exists in this codebase) so the vault root tracks the data volume.
