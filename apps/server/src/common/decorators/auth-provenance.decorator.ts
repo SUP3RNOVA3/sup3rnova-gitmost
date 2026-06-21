@@ -62,6 +62,14 @@ export function agentSourceFields<S extends string, C extends string>(
   sourceKey: S,
   chatKey: C,
 ): Partial<Record<S, ProvenanceSource> & Record<C, string | null>> {
+  // git-sync data-plane write (plan §8.1): stamp the source 'git-sync' with NO
+  // aiChatId (it has no internal ai_chats row). Mirrors the agent branch; each
+  // write has a single actor, so precedence is irrelevant here.
+  if (provenance?.actor === 'git-sync') {
+    return { [sourceKey]: 'git-sync' } as Partial<
+      Record<S, ProvenanceSource> & Record<C, string | null>
+    >;
+  }
   if (provenance?.actor !== 'agent') return {};
   return {
     [sourceKey]: 'agent',

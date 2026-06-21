@@ -332,4 +332,58 @@ export class EnvironmentService {
       .map((o) => o.trim())
       .filter(Boolean);
   }
+
+  // --- git-sync (plan §7.2) -------------------------------------------------
+
+  /** Global master switch for the git-sync control plane (default false). */
+  isGitSyncEnabled(): boolean {
+    return (
+      this.configService.get<string>('GIT_SYNC_ENABLED', 'false').toLowerCase() ===
+      'true'
+    );
+  }
+
+  /**
+   * Root directory holding the per-space vault repos. Defaults to
+   * `<DATA_DIR or ./data>/git-sync`. `DATA_DIR` is read directly (no dedicated
+   * getter exists in this codebase) so the vault root tracks the data volume.
+   */
+  getGitSyncDataDir(): string {
+    const explicit = this.configService.get<string>('GIT_SYNC_DATA_DIR');
+    if (explicit) return explicit;
+    const dataDir = this.configService.get<string>('DATA_DIR') || './data';
+    return `${dataDir.replace(/\/+$/, '')}/git-sync`;
+  }
+
+  /** Optional remote template, e.g. `git@host:vault-{spaceId}.git`. */
+  getGitSyncRemoteTemplate(): string | undefined {
+    return this.configService.get<string>('GIT_SYNC_REMOTE_TEMPLATE');
+  }
+
+  /** Poll-safety interval in ms (default 15000). */
+  getGitSyncPollIntervalMs(): number {
+    return parseInt(
+      this.configService.get<string>('GIT_SYNC_POLL_INTERVAL_MS', '15000'),
+    );
+  }
+
+  /** Event debounce window in ms (default 2000). */
+  getGitSyncDebounceMs(): number {
+    return parseInt(
+      this.configService.get<string>('GIT_SYNC_DEBOUNCE_MS', '2000'),
+    );
+  }
+
+  /**
+   * The service user id git-sync writes are attributed to. Required when sync is
+   * enabled (validated in environment.validation.ts); optional otherwise.
+   */
+  getGitSyncServiceUserId(): string | undefined {
+    return this.configService.get<string>('GIT_SYNC_SERVICE_USER_ID');
+  }
+
+  /** Optional path to the SSH key used for git remote access. */
+  getGitSyncSshKeyPath(): string | undefined {
+    return this.configService.get<string>('GIT_SYNC_SSH_KEY_PATH');
+  }
 }

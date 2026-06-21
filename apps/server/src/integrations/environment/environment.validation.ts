@@ -170,6 +170,41 @@ export class EnvironmentVariables {
     },
   )
   CLICKHOUSE_URL: string;
+
+  // --- git-sync (plan §7.2) — all OPTIONAL. The master switch defaults off; a
+  // required-if-enabled service user id is validated only when sync is on. ---
+
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  @IsString()
+  GIT_SYNC_ENABLED: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_DATA_DIR: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_REMOTE_TEMPLATE: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_POLL_INTERVAL_MS: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_DEBOUNCE_MS: string;
+
+  // Required when git-sync is enabled: the service user create/move/rename/delete
+  // are attributed to (plan §7.2). Optional otherwise.
+  @ValidateIf((obj) => obj.GIT_SYNC_ENABLED === 'true')
+  @IsNotEmpty()
+  @IsString()
+  GIT_SYNC_SERVICE_USER_ID: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_SSH_KEY_PATH: string;
 }
 
 export function validate(config: Record<string, any>) {
