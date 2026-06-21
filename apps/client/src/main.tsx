@@ -90,12 +90,8 @@ root.render(
   </BrowserRouter>,
 );
 
-// Register the service worker for PWA installability and an offline app shell.
-// Production only: in dev the Vite server and HMR must not be intercepted.
-if (import.meta.env.PROD && "serviceWorker" in navigator) {
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch((err) => {
-      console.error("Service worker registration failed:", err);
-    });
-  });
-}
+// Service worker registration is owned by <PwaUpdatePrompt /> above (via
+// vite-plugin-pwa's useRegisterSW: Workbox precache + prompt-based updates,
+// and skipped inside the Capacitor native WebView). The earlier hand-written
+// /sw.js registration from the mobile bootstrap was removed here to avoid a
+// double registration / competing service worker.
