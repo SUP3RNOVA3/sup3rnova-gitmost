@@ -1,30 +1,19 @@
 {
+  "id": "/",
   "name": "Gitmost",
   "short_name": "Gitmost",
+  "description": "Gitmost - open-source collaborative documentation and knowledge base.",
+  "lang": "en",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
+  "orientation": "any",
   "background_color": "#0E1117",
   "theme_color": "#0E1117",
   "icons": [
-    {
-      "src": "icons/favicon-16x16.png",
-      "type": "image/png",
-      "sizes": "16x16"
-    },
-    {
-      "src": "icons/favicon-32x32.png",
-      "type": "image/png",
-      "sizes": "32x32"
-    },
-    {
-      "src": "icons/app-icon-192x192.png",
-      "type": "image/png",
-      "sizes": "180x180 192x192"
-    },
-    {
-      "src": "icons/app-icon-512x512.png",
-      "type": "image/png",
-      "sizes": "512x512"
-    }
+    { "src": "icons/favicon-16x16.png", "type": "image/png", "sizes": "16x16" },
+    { "src": "icons/favicon-32x32.png", "type": "image/png", "sizes": "32x32" },
+    { "src": "icons/app-icon-192x192.png", "type": "image/png", "sizes": "192x192", "purpose": "any" },
+    { "src": "icons/app-icon-512x512.png", "type": "image/png", "sizes": "512x512", "purpose": "any" }
   ]
 }

@@ -64,3 +64,8 @@ lerna-debug.log*
 
 # Self-hosted VAD / onnxruntime-web assets (copied from node_modules at dev/build time)
 apps/client/public/vad/
+
+# Capacitor native platform projects (generated locally via 'npx cap add ios|android')
+/ios
+/android
+.capacitor

@@ -428,4 +428,19 @@ export class EnvironmentService {
   getSandboxMaxTotalBytes(): number {
     return this.getPositiveIntEnv('SANDBOX_MAX_TOTAL_BYTES', 134_217_728);
   }
+
+  getCorsAllowedOrigins(): string[] {
+    const raw = this.configService.get<string>('CORS_ALLOWED_ORIGINS', '');
+    return raw
+      .split(',')
+      .map((o) => o.trim())
+      .filter(Boolean);
+  }
+
+  isSwaggerEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('SWAGGER_ENABLED', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
 }

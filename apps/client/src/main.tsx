@@ -89,3 +89,13 @@ root.render(
     </MantineProvider>
   </BrowserRouter>,
 );
+
+// Register the service worker for PWA installability and an offline app shell.
+// Production only: in dev the Vite server and HMR must not be intercepted.
+if (import.meta.env.PROD && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch((err) => {
+      console.error("Service worker registration failed:", err);
+    });
+  });
+}

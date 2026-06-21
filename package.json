@@ -16,10 +16,18 @@
     "server:start": "nx run server:start:prod",
     "email:dev": "nx run server:email:dev",
     "dev": "pnpm concurrently -n \"frontend,backend\" -c \"cyan,green\" \"pnpm run client:dev\" \"pnpm run server:dev\"",
-    "clean": "rm -rf apps/*/dist packages/*/dist apps/client/node_modules/.vite"
+    "clean": "rm -rf apps/*/dist packages/*/dist apps/client/node_modules/.vite",
+    "cap:copy": "cap copy",
+    "cap:sync": "cap sync",
+    "cap:ios": "cap open ios",
+    "cap:android": "cap open android",
+    "mobile:build": "pnpm run client:build && cap sync"
   },
   "dependencies": {
     "@braintree/sanitize-url": "^7.1.2",
+    "@capacitor/android": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/ios": "^7.0.0",
     "@casl/ability": "6.8.0",
     "@docmost/editor-ext": "workspace:*",
     "@floating-ui/dom": "^1.7.3",
@@ -78,6 +86,7 @@
     "yjs": "^13.6.30"
   },
   "devDependencies": {
+    "@capacitor/cli": "^7.0.0",
     "@nx/js": "22.6.1",
     "@types/bytes": "^3.1.5",
     "@types/qrcode": "^1.5.6",

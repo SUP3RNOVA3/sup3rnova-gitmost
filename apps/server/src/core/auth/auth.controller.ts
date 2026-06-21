@@ -98,6 +98,12 @@ export class AuthController {
         } else if (mfaResult.authToken) {
           // User doesn't have MFA and workspace doesn't require it
           this.setAuthCookie(res, mfaResult.authToken);
+          // Opt-in body token for native clients (Bearer auth). The response is
+          // wrapped by TransformHttpResponseInterceptor, so clients read it at
+          // `data.authToken`. Web clients omit returnToken and keep the cookie.
+          if (loginInput.returnToken) {
+            return { authToken: mfaResult.authToken };
+          }
           return;
         }
       }
@@ -105,6 +111,12 @@ export class AuthController {
 
     const authToken = await this.authService.login(loginInput, workspace.id);
     this.setAuthCookie(res, authToken);
+    // Opt-in body token for native clients (Bearer auth). The response is wrapped
+    // by TransformHttpResponseInterceptor, so clients read it at `data.authToken`.
+    // Web clients omit returnToken and keep using the httpOnly cookie only.
+    if (loginInput.returnToken) {
+      return { authToken };
+    }
   }
 
   @UseGuards(SetupGuard)

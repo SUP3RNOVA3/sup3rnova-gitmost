@@ -1,0 +1,48 @@
+# Mobile app bootstrap
+
+Purpose: this document records what has been bootstrapped in the repo to enable a
+mobile app for Gitmost, per the first-step checklist in
+[docs/mobile-app-plan.md](./mobile-app-plan.md) section 12.
+
+## What is in the repo now
+
+- **PWA**: web app manifest, a hand-rolled service worker, and production-only
+  service worker registration in the client. This lets the existing responsive
+  web UI be installed and run as a Progressive Web App.
+- **Backend mobile auth**: opt-in token return from the login flow. The login
+  request accepts a `returnToken` flag (must be sent as a JSON boolean) that makes
+  the server include the auth token in the response body, and the server already
+  accepts a `Bearer` token in the `Authorization` header. Note the global response
+  interceptor wraps every payload, so the native client reads the token at
+  `response.data.authToken` (not at the top level). A native client can store this
+  token (Keychain / Keystore) and send it as `Authorization: Bearer` on each request.
+- **Explicit CORS allowlist**: the server reads a `CORS_ALLOWED_ORIGINS` env
+  variable for the allowed origins, and always allows the native WebView origins
+  (`capacitor://localhost`, `ionic://localhost`, `http://localhost`,
+  `https://localhost`) so the mobile shell can call the API.
+- **Optional OpenAPI / Swagger**: an opt-in OpenAPI/Swagger surface gated behind
+  the `SWAGGER_ENABLED` env flag, useful for developing the native client.
+- **Capacitor config**: [capacitor.config.ts](../capacitor.config.ts) at the
+  repo root. It targets the `apps/client` web build output (`apps/client/dist`)
+  for the Android bundled mode, and on iOS loads the client from a hosted server
+  via `CAP_SERVER_URL` (`server.url`) so the AGPL web client is not bundled into
+  the `.ipa` (see mobile-app-plan section 9).
+
+## Remaining MANUAL / local steps (require Xcode / external accounts, out of scope here)
+
+- Run `pnpm install` to fetch the Capacitor packages and `@nestjs/swagger`.
+- Run `pnpm run client:build` to produce the web build in `apps/client/dist`.
+- Run `npx cap add ios` and/or `npx cap add android` to generate the native
+  platform projects (these live outside version control; see `.gitignore`).
+- Set `CAP_SERVER_URL` for the iOS build so the shell loads the hosted client
+  (AGPL-clean), then run `pnpm run mobile:build` / `cap sync`.
+- Set up push notifications: APNs for iOS and FCM for Android.
+- Obtain an Apple Developer account and the App Store / Play Console listings.
+- Confirm the AGPL iOS distribution decision (mobile-app-plan section 9) before
+  shipping anything to the App Store.
+
+## See also
+
+For the full background, rationale, and the licensing analysis, see
+[docs/mobile-app-plan.md](./mobile-app-plan.md) (section 12 for the bootstrap
+checklist, section 9 for the AGPL / App Store licensing path).
