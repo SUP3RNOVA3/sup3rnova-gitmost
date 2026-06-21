@@ -7,6 +7,7 @@ import { notifications } from "@mantine/notifications";
 import {
   IconArrowRight,
   IconClockHour4,
+  IconCloudDownload,
   IconCopy,
   IconDotsVertical,
   IconFileExport,
@@ -35,6 +36,12 @@ import {
   useToggleTemplateMutation,
   useToggleTemporaryMutation,
 } from "@/features/page-embed/queries/page-embed-query";
+import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
+import { getCollaborationUrl } from "@/lib/config.ts";
+import {
+  makePageAvailableOffline,
+  warmPageYdoc,
+} from "@/features/offline/make-offline";
 import { treeDataAtom } from "@/features/page/tree/atoms/tree-data-atom.ts";
 import { treeModel } from "@/features/page/tree/model/tree-model";
 import { pageToTreeNode } from "@/features/page/tree/utils";
@@ -72,6 +79,29 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
   const isTemplate = !!node.isTemplate;
   const toggleTemporary = useToggleTemporaryMutation();
   const isTemporary = !!node.temporaryExpiresAt;
+  const { data: collabQuery } = useCollabToken();
+
+  const handleMakeAvailableOffline = async () => {
+    notifications.show({ message: t("Saving page for offline use...") });
+    try {
+      // Prefetch read queries so they get persisted to IndexedDB.
+      await makePageAvailableOffline({
+        pageId: node.id,
+        slugId: node.slugId,
+        spaceId: node.spaceId,
+        parentPageId: node.parentPageId,
+      });
+      // Best-effort: warm the page's Yjs document into IndexedDB.
+      await warmPageYdoc(node.id, getCollaborationUrl(), collabQuery?.token);
+      notifications.show({ message: t("Page is now available offline") });
+    } catch {
+      // makePageAvailableOffline / warmPageYdoc never throw, but stay safe.
+      notifications.show({
+        message: t("Failed to make page available offline"),
+        color: "red",
+      });
+    }
+  };
 
   const handleToggleTemplate = async () => {
     const next = !isTemplate;
@@ -226,6 +256,17 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
             }}
           >
             {t("Export")}
+          </Menu.Item>
+
+          <Menu.Item
+            leftSection={<IconCloudDownload size={16} />}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handleMakeAvailableOffline();
+            }}
+          >
+            {t("Make available offline")}
           </Menu.Item>
 
           {canEdit && (

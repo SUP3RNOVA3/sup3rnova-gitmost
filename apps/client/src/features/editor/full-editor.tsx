@@ -34,6 +34,8 @@ import {
 } from "@/features/editor/atoms/editor-atoms.ts";
 import { DictationGroup } from "@/features/editor/components/fixed-toolbar/groups/dictation-group";
 import { GenerateTitleGroup } from "@/features/editor/components/fixed-toolbar/groups/generate-title-group";
+import { usePageCollabProviders } from "@/features/editor/hooks/use-page-collab-providers";
+import { EditorProvidersContext } from "@/features/editor/contexts/editor-providers-context";
 
 const MemoizedTitleEditor = React.memo(TitleEditor);
 const MemoizedPageEditor = React.memo(PageEditor);
@@ -90,6 +92,10 @@ export function FullEditor({
     user.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
   const isEditMode = currentPageEditMode === PageEditMode.Edit;
 
+  // Single shared Y.Doc + HocuspocusProvider for both the title and body
+  // editors (title lives in the 'title' fragment of the same doc).
+  const { ydoc, remote, providersReady } = usePageCollabProviders(pageId);
+
   // Apply the user's saved preference only once on initial load, not on every
   // page navigation — so the mode sticks across navigations within a session.
   useEffect(() => {
@@ -110,28 +116,32 @@ export function FullEditor({
       )}
       <MemoizedDeletedPageBanner slugId={slugId} />
       <MemoizedTemporaryNoteBanner slugId={slugId} />
-      <MemoizedTitleEditor
-        pageId={pageId}
-        slugId={slugId}
-        title={title}
-        spaceSlug={spaceSlug}
-        editable={editable}
-      />
-      <PageByline
-        pageId={pageId}
-        creator={creator}
-        contributors={contributors}
-        editable={editable}
-        isEditMode={isEditMode}
-        isDictationEnabled={isDictationEnabled}
-        isTitleGenEnabled={isTitleGenEnabled}
-      />
-      <MemoizedPageEditor
-        pageId={pageId}
-        editable={editable}
-        content={content}
-        canComment={canComment}
-      />
+      <EditorProvidersContext.Provider
+        value={ydoc && remote ? { ydoc, remote, providersReady } : null}
+      >
+        <MemoizedTitleEditor
+          pageId={pageId}
+          slugId={slugId}
+          title={title}
+          spaceSlug={spaceSlug}
+          editable={editable}
+        />
+        <PageByline
+          pageId={pageId}
+          creator={creator}
+          contributors={contributors}
+          editable={editable}
+          isEditMode={isEditMode}
+          isDictationEnabled={isDictationEnabled}
+          isTitleGenEnabled={isTitleGenEnabled}
+        />
+        <MemoizedPageEditor
+          pageId={pageId}
+          editable={editable}
+          content={content}
+          canComment={canComment}
+        />
+      </EditorProvidersContext.Provider>
     </Container>
   );
 }

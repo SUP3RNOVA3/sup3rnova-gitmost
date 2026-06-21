@@ -12,6 +12,8 @@ import {
   IconList,
   IconMarkdown,
   IconPrinter,
+  IconCloud,
+  IconCloudCheck,
   IconStar,
   IconStarFilled,
   IconTrash,
@@ -39,6 +41,8 @@ import { Trans, useTranslation } from "react-i18next";
 import ExportModal from "@/components/common/export-modal";
 import { htmlToMarkdown } from "@docmost/editor-ext";
 import {
+  isLocalSyncedAtom,
+  isRemoteSyncedAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms.ts";
@@ -411,14 +415,16 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
 function ConnectionWarning() {
   const { t } = useTranslation();
   const yjsConnectionStatus = useAtomValue(yjsConnectionStatusAtom);
+  const isLocalSynced = useAtomValue(isLocalSyncedAtom);
+  const isRemoteSynced = useAtomValue(isRemoteSyncedAtom);
   const [showWarning, setShowWarning] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    const isDisconnected = ["disconnected", "connecting"].includes(
-      yjsConnectionStatus,
-    );
+  const isDisconnected = ["disconnected", "connecting"].includes(
+    yjsConnectionStatus,
+  );
 
+  useEffect(() => {
     if (isDisconnected) {
       if (!timeoutRef.current) {
         timeoutRef.current = setTimeout(() => setShowWarning(true), 5000);
@@ -430,7 +436,7 @@ function ConnectionWarning() {
       }
       setShowWarning(false);
     }
-  }, [yjsConnectionStatus]);
+  }, [isDisconnected]);
 
   // Cleanup only on unmount
   useEffect(() => {
@@ -441,22 +447,59 @@ function ConnectionWarning() {
     };
   }, []);
 
-  if (!showWarning) return null;
+  // State (1): offline/disconnected — changes are kept locally. Preserve the
+  // existing >5s debounce before surfacing this state.
+  if (isDisconnected) {
+    if (!showWarning) return null;
 
+    const offlineLabel = t(
+      "Offline — changes are saved locally and will sync when you reconnect",
+    );
+    return (
+      <Tooltip label={offlineLabel} openDelay={250} withArrow>
+        <ThemeIcon
+          variant="default"
+          c="red"
+          role="status"
+          aria-label={offlineLabel}
+          style={{ border: "none" }}
+        >
+          <IconWifiOff size={20} stroke={2} />
+        </ThemeIcon>
+      </Tooltip>
+    );
+  }
+
+  // State (2): connected but the remote replica is not fully caught up yet.
+  if (!isRemoteSynced || !isLocalSynced) {
+    const syncingLabel = t("Syncing changes…");
+    return (
+      <Tooltip label={syncingLabel} openDelay={250} withArrow>
+        <ThemeIcon
+          variant="default"
+          c="dimmed"
+          role="status"
+          aria-label={syncingLabel}
+          style={{ border: "none" }}
+        >
+          <IconCloud size={20} stroke={2} />
+        </ThemeIcon>
+      </Tooltip>
+    );
+  }
+
+  // State (3): fully synced — subtle confirmation indicator.
+  const syncedLabel = t("All changes synced");
   return (
-    <Tooltip
-      label={t("Real-time editor connection lost. Retrying...")}
-      openDelay={250}
-      withArrow
-    >
+    <Tooltip label={syncedLabel} openDelay={250} withArrow>
       <ThemeIcon
         variant="default"
-        c="red"
+        c="dimmed"
         role="status"
-        aria-label={t("Real-time editor connection lost. Retrying...")}
+        aria-label={syncedLabel}
         style={{ border: "none" }}
       >
-        <IconWifiOff size={20} stroke={2} />
+        <IconCloudCheck size={20} stroke={2} />
       </ThemeIcon>
     </Tooltip>
   );

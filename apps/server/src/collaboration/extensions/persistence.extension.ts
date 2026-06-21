@@ -10,6 +10,7 @@ import * as Y from 'yjs';
 import { Injectable, Logger } from '@nestjs/common';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import {
+  buildTitleSeedYdoc,
   getPageId,
   isEmptyParagraphDoc,
   jsonToText,
@@ -171,10 +172,30 @@ export class PersistenceExtension implements Extension {
       const dbState = new Uint8Array(page.ydoc);
 
       Y.applyUpdate(doc, dbState);
+
+      // Legacy pages persisted their title only in the `page.title` column; the
+      // ydoc has no 'title' fragment. Seed it once so the client's
+      // collaborative title editor can show/edit the title. This runs inside the
+      // ydoc branch (NOT gated by the top-level 'default' body guard) because a
+      // body that loaded from page.ydoc can still lack a title fragment. The
+      // seed persists back to the DB so it is one-shot per page.
+      const seeded = this.seedTitleFragment(doc, page.title);
+      if (seeded) {
+        await this.persistYdoc(doc, pageId);
+      }
+
       return doc;
     }
 
-    // if no ydoc state in db convert json in page.content to Ydoc.
+    // NOTE (offline-sync M1, Goal 2): this per-load self-heal converts +
+    // title-seeds + persists every legacy page (content set, ydoc null) on its
+    // first open, which neutralizes the duplication trap incrementally. A
+    // proactive one-shot BATCH migration over all such pages could be added
+    // later, but it requires the tiptap schema + TiptapTransformer (Node/Yjs),
+    // which a Kysely SQL migration cannot run; no runnable-task/CLI convention
+    // exists in this repo yet, so we deliberately avoid a fragile migration.
+    //
+    // If no ydoc state in db, convert the JSON in page.content to a Y.Doc.
     if (page.content) {
       this.logger.debug(`converting json to ydoc: ${pageId}`);
 
@@ -184,12 +205,75 @@ export class PersistenceExtension implements Extension {
         tiptapExtensions,
       );
 
-      Y.encodeStateAsUpdate(ydoc);
+      // Seed the title fragment for legacy pages here too, so the freshly built
+      // ydoc carries the title from the page.title column.
+      this.seedTitleFragment(ydoc, page.title);
+
+      // DUPLICATION TRAP (classic Yjs): this rebuild produces a ydoc with FRESH
+      // Yjs client-ids each time it runs. If we returned it WITHOUT persisting,
+      // a later load would rebuild again with different client-ids, and a
+      // long-offline client holding a ydoc derived from an EARLIER rebuild could
+      // merge its update and DUPLICATE all the content (the two states share no
+      // common ancestor). Persist the built ydoc to page.ydoc immediately so
+      // every subsequent load takes the page.ydoc branch above and this rebuild
+      // never runs again for this page (one-shot per page).
+      await this.persistYdoc(ydoc, pageId);
+
       return ydoc;
     }
 
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
     return new Y.Doc();
+  }
+
+  /**
+   * Seed the 'title' fragment of `doc` from the `page.title` column for legacy
+   * pages whose persisted ydoc has no title fragment yet.
+   *
+   * Guarded STRICTLY by emptiness: we only seed when the existing 'title'
+   * fragment is empty AND there is a non-empty column title. Seeding a non-empty
+   * fragment would re-introduce the Yjs duplication trap, so we never do it.
+   * Returns true when a seed was applied (so the caller can persist).
+   * Defensive: a malformed title must not break document loading.
+   */
+  private seedTitleFragment(doc: Y.Doc, title: string | null): boolean {
+    const trimmed = (title ?? '').trim();
+    if (!trimmed) return false;
+
+    try {
+      const titleFrag = doc.get('title', Y.XmlFragment);
+      if (titleFrag.length !== 0) return false;
+
+      const titleSeed = buildTitleSeedYdoc(title);
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(titleSeed));
+      this.logger.debug('seeded title fragment from page.title column');
+      return true;
+    } catch (err) {
+      this.logger.warn(`failed to seed title fragment: ${err?.['message']}`);
+      return false;
+    }
+  }
+
+  /**
+   * Persist the current state of `doc` into page.ydoc. Used by the one-shot
+   * rebuild/seed self-heal in onLoadDocument so the conversion is durable and
+   * never repeats. Defensive (try/catch + log): a persistence failure here must
+   * NOT break document loading — the in-memory doc is still returned and the
+   * next store will persist it anyway.
+   */
+  private async persistYdoc(doc: Y.Doc, pageId: string): Promise<void> {
+    try {
+      await this.pageRepo.updatePage(
+        { ydoc: Buffer.from(Y.encodeStateAsUpdate(doc)) },
+        pageId,
+      );
+      this.logger.debug(`persisted rebuilt/seeded ydoc: ${pageId}`);
+    } catch (err) {
+      this.logger.error(
+        `Failed to persist rebuilt/seeded ydoc for page ${pageId}`,
+        err,
+      );
+    }
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
@@ -220,7 +304,34 @@ export class PersistenceExtension implements Extension {
       this.logger.warn('jsonToText' + err?.['message']);
     }
 
+    // Title lives in the SAME Y.Doc as the body, in a dedicated 'title' fragment
+    // (the collaborative title-editor contract with the client). Extract it
+    // defensively: a malformed title fragment must NOT crash the document store.
+    // `hasTitleFragment` distinguishes "the doc actually carries a title
+    // fragment" from "legacy doc with no title fragment" — only the former may
+    // write page.title, so a legacy doc never clobbers the column with ''.
+    let titleText = '';
+    let hasTitleFragment = false;
+    try {
+      const titleFrag = document.get('title', Y.XmlFragment);
+      hasTitleFragment = !!titleFrag && titleFrag.length > 0;
+      if (hasTitleFragment) {
+        const titleJson = TiptapTransformer.fromYdoc(document, 'title');
+        titleText = titleJson ? jsonToText(titleJson).trim() : '';
+      }
+    } catch (err) {
+      this.logger.warn('title extraction: ' + err?.['message']);
+      hasTitleFragment = false;
+    }
+
     let page: Page = null;
+    // Tracks whether the BODY ('default') changed in this store. The heavy
+    // body-only side-effects (transclusion sync, mentions, RAG, history) stay
+    // gated on this so a title-only change does not trigger them.
+    let bodyChanged = false;
+    // Tracks a successful title-only persist so the post-tx contributor folding
+    // (collabHistory.addContributors) runs for the title-only case too.
+    let titleOnlyPersisted = false;
     const editingUserIds = this.consumeContributors(documentName);
     // Sticky agent marker: 'agent' if any agent edit landed in this window, OR
     // if the current writer is the agent (covers a store with no prior onChange
@@ -267,8 +378,59 @@ export class PersistenceExtension implements Extension {
             return;
           }
 
-          if (isDeepStrictEqual(tiptapJson, page.content)) {
+          bodyChanged = !isDeepStrictEqual(tiptapJson, page.content);
+          // Only a populated 'title' fragment may update page.title; compare
+          // against the current column value (treat null as '').
+          const titleChanged =
+            hasTitleFragment && titleText !== (page.title ?? '');
+
+          // No-op fast path: neither body nor title changed.
+          if (!bodyChanged && !titleChanged) {
             page = null;
+            return;
+          }
+
+          // Title-only change: the body is unchanged, so skip the heavy body
+          // history/contributor logic and persist just the new title and the
+          // ydoc (the title fragment edit lives in the same ydoc). The early-skip
+          // used to drop this case entirely, losing the title change.
+          if (!bodyChanged) {
+            // Fold the window's editing users into contributors the same way the
+            // body branch does, so a user who edited ONLY the title is not dropped
+            // from page.contributorIds.
+            const contributorIds = Array.from(
+              new Set([
+                ...(page.contributorIds || []),
+                ...editingUserIds,
+                page.creatorId,
+              ]),
+            );
+            await this.pageRepo.updatePage(
+              {
+                title: titleText,
+                ydoc: ydocState,
+                lastUpdatedById: context.user.id,
+                contributorIds,
+                // A title-only change is not a body-authorship transition; leave
+                // lastUpdatedSource/aiChatId untouched so the user->agent history
+                // boundary in the body branch is not bypassed.
+              },
+              pageId,
+              trx,
+              // Mirror PageService.update's tree snapshot so a collaborative rename
+              // propagates to other users' sidebar/breadcrumbs like the REST rename.
+              {
+                treeUpdate: {
+                  id: pageId,
+                  slugId: page.slugId,
+                  spaceId: page.spaceId,
+                  parentPageId: page.parentPageId ?? null,
+                  title: titleText,
+                },
+              },
+            );
+            this.logger.debug(`Page title updated: ${pageId} - SlugId: ${page.slugId}`);
+            titleOnlyPersisted = true;
             return;
           }
 
@@ -278,7 +440,8 @@ export class PersistenceExtension implements Extension {
           // path already guards emptiness (onLoadDocument only hydrates from db
           // when the live doc isEmpty); the STORE path did not, so an empty
           // serialization was written straight over the page, wiping it
-          // silently.
+          // silently. Reached only when the body actually changed (the title-only
+          // fast path above already returned).
           //
           // #251 — the ONE legitimate empty-over-non-empty write is a user who
           // deliberately clears the page. That intent arrives out-of-band as a
@@ -348,12 +511,8 @@ export class PersistenceExtension implements Extension {
               { includeContent: true, trx },
             );
             const humanBaselineMissing =
-              !lastHistory ||
-              !isDeepStrictEqual(lastHistory.content, page.content);
-            if (
-              !isEmptyParagraphDoc(page.content as any) &&
-              humanBaselineMissing
-            ) {
+              !lastHistory || !isDeepStrictEqual(lastHistory.content, page.content);
+            if (!isEmptyParagraphDoc(page.content as any) && humanBaselineMissing) {
               await this.pageHistoryRepo.saveHistory(page, {
                 contributorIds: page.contributorIds ?? undefined,
                 trx,
@@ -371,9 +530,27 @@ export class PersistenceExtension implements Extension {
               lastUpdatedSource,
               lastUpdatedAiChatId: context?.aiChatId ?? null,
               contributorIds: contributorIds,
+              // Persist the title in the SAME transaction when the title fragment
+              // changed alongside the body.
+              ...(titleChanged ? { title: titleText } : {}),
             },
             pageId,
             trx,
+            // Mirror PageService.update's tree snapshot so a collaborative rename
+            // propagates to other users' sidebar/breadcrumbs like the REST rename.
+            // Only attach when the title actually changed; a body-only save must
+            // not trigger a tree broadcast.
+            titleChanged
+              ? {
+                  treeUpdate: {
+                    id: pageId,
+                    slugId: page.slugId,
+                    spaceId: page.spaceId,
+                    parentPageId: page.parentPageId ?? null,
+                    title: titleText,
+                  },
+                }
+              : undefined,
           );
 
           this.logger.debug(`Page updated: ${pageId} - SlugId: ${page.slugId}`);
@@ -394,6 +571,8 @@ export class PersistenceExtension implements Extension {
       }
     }
 
+    // `page` is truthy whenever anything was persisted (body OR title-only), so
+    // the page.updated broadcast fires for a title-only change too.
     if (page) {
       document.broadcastStateless(
         JSON.stringify({
@@ -411,14 +590,26 @@ export class PersistenceExtension implements Extension {
             : undefined,
         }),
       );
+    }
 
+    // Record the window's editing users in collab history for a title-only
+    // change too (the body branch does this below, gated on bodyChanged). Key
+    // contributors by the canonical page UUID (page.id), not the doc-name id
+    // which may be a slugId, so they MATCH the PAGE_HISTORY job which is
+    // enqueued with page.id and pops contributors by page.id (#260).
+    if (page && titleOnlyPersisted) {
+      await this.collabHistory.addContributors(page.id, editingUserIds);
+    }
+
+    // Body-only side-effects: skip them for a title-only change (body unchanged).
+    if (page && bodyChanged) {
       // Use the canonical page UUID (page.id), not the doc-name id, which may be
       // a slugId for a `page.<slugId>` doc (#260). The transclusion/reference
       // syncs write uuid-typed columns, so a slugId here threw Postgres 22P02.
       await this.syncTransclusion(page.id, page.workspaceId, tiptapJson);
     }
 
-    if (page) {
+    if (page && bodyChanged) {
       // Key contributors by the page UUID so they MATCH the PAGE_HISTORY job,
       // which is enqueued with page.id and pops contributors by page.id (#260).
       await this.collabHistory.addContributors(page.id, editingUserIds);

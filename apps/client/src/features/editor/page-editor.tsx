@@ -6,16 +6,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { IndexeddbPersistence } from "y-indexeddb";
-import * as Y from "yjs";
-import {
-  HocuspocusProvider,
-  onStatusParameters,
-  WebSocketStatus,
-  HocuspocusProviderWebsocket,
-  onSyncedParameters,
-  onStatelessParameters,
-} from "@hocuspocus/provider";
+import { WebSocketStatus } from "@hocuspocus/provider";
 import {
   Editor,
   EditorContent,
@@ -28,14 +19,16 @@ import {
   mainExtensions,
 } from "@/features/editor/extensions/extensions";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
   currentPageEditModeAtom,
   dictationAvailabilityAtom,
+  isLocalSyncedAtom,
+  isRemoteSyncedAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
+import { useEditorProviders } from "@/features/editor/contexts/editor-providers-context";
 import { asideStateAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom";
 import {
   activeCommentIdAtom,
@@ -60,10 +53,8 @@ import {
 } from "@/features/editor/components/common/editor-paste-handler.tsx";
 import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu-lazy";
 import DrawioMenu from "./components/drawio/drawio-menu";
-import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
-import { useDebouncedCallback, useDocumentVisibility } from "@mantine/hooks";
-import { useIdle } from "@/hooks/use-idle.ts";
+import { useDebouncedCallback } from "@mantine/hooks";
 import { queryClient } from "@/main.tsx";
 import { IPage } from "@/features/page/types/page.types.ts";
 import { useParams } from "react-router-dom";
@@ -74,9 +65,7 @@ import {
   GitmostInsertRecordingResult,
   gitmostInsertRecordingIntoEditor,
 } from "@/features/editor/gitmost/gitmost-recording.ts";
-import { FIVE_MINUTES } from "@/lib/constants.ts";
 import { PageEditMode } from "@/features/user/types/user.types.ts";
-import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
@@ -113,7 +102,6 @@ export default function PageEditor({
   canComment,
 }: PageEditorProps) {
   const { t } = useTranslation();
-  const collaborationURL = useCollaborationUrl();
   const isComponentMounted = useRef(false);
   const editorRef = useRef<Editor | null>(null);
 
@@ -127,22 +115,10 @@ export default function PageEditor({
   const [, setActiveCommentId] = useAtom(activeCommentIdAtom);
   const [showCommentPopup, setShowCommentPopup] = useAtom(showCommentPopupAtom);
   const [showReadOnlyCommentPopup] = useAtom(showReadOnlyCommentPopupAtom);
-  const [isLocalSynced, setIsLocalSynced] = useState(false);
-  const [isRemoteSynced, setIsRemoteSynced] = useState(false);
   const [yjsConnectionStatus, setYjsConnectionStatus] = useAtom(
     yjsConnectionStatusAtom,
   );
   const menuContainerRef = useRef(null);
-  const { data: collabQuery, refetch: refetchCollabToken } = useCollabToken();
-  // Always holds the latest collab token. The provider effect below runs once
-  // per pageId, so a handler created inside it would otherwise close over a
-  // stale `collabQuery`. Reading the ref gives the current token instead.
-  const collabTokenRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    collabTokenRef.current = collabQuery?.token;
-  }, [collabQuery?.token]);
-  const { isIdle, resetIdle } = useIdle(FIVE_MINUTES, { initialState: false });
-  const documentState = useDocumentVisibility();
   const { pageSlug } = useParams();
   const slugId = extractPageSlugId(pageSlug);
   const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
@@ -152,141 +128,27 @@ export default function PageEditor({
     [isComponentMounted],
   );
   const { handleScrollTo } = useEditorScroll({ canScroll });
-  // Providers only created once per pageId
-  const providersRef = useRef<{
-    local: IndexeddbPersistence;
-    remote: HocuspocusProvider;
-    socket: HocuspocusProviderWebsocket;
-  } | null>(null);
-  const [providersReady, setProvidersReady] = useState(false);
 
-  useEffect(() => {
-    if (!providersRef.current) {
-      const documentName = `page.${pageId}`;
-      const ydoc = new Y.Doc();
-      const local = new IndexeddbPersistence(documentName, ydoc);
-      const socket = new HocuspocusProviderWebsocket({
-        url: collaborationURL,
-      });
-      const onLocalSyncedHandler = () => {
-        setIsLocalSynced(true);
-      };
-      const onStatusHandler = (event: onStatusParameters) => {
-        setYjsConnectionStatus(event.status);
-      };
-      const onSyncedHandler = (event: onSyncedParameters) => {
-        setIsRemoteSynced(event.state);
-      };
-      const onStatelessHandler = ({ payload }: onStatelessParameters) => {
-        try {
-          const message = JSON.parse(payload);
-          if (message?.type !== "page.updated" || !message.updatedAt) return;
-          const pageData = queryClient.getQueryData<IPage>(["pages", slugId]);
-          if (pageData) {
-            queryClient.setQueryData(["pages", slugId], {
-              ...pageData,
-              updatedAt: message.updatedAt,
-              ...(message.lastUpdatedBy && {
-                lastUpdatedBy: message.lastUpdatedBy,
-              }),
-            });
-          }
-        } catch {
-          // ignore unrelated stateless messages
-        }
-      };
-      const onAuthenticationFailedHandler = () => {
-        // Read the latest token via the ref (the closure-captured `collabQuery`
-        // may be stale). Guard the decode: a missing or unparseable token must
-        // not throw "Invalid token specified" and should trigger a refresh so
-        // the editor reconnects even when the initial token fetch failed.
-        const token = collabTokenRef.current;
-        let needsRefresh = true; // no/unparseable token -> fetch a fresh one and reconnect
-        if (token) {
-          try {
-            // A token that decodes but lacks a numeric `exp` must be treated as
-            // expired (`Date.now()/1000 >= undefined` is `false`, which would
-            // otherwise skip the reconnect), so refresh on any missing/non-number exp.
-            const exp = jwtDecode<{ exp?: number }>(token).exp;
-            needsRefresh = typeof exp !== "number" || Date.now() / 1000 >= exp;
-          } catch {
-            needsRefresh = true;
-          }
-        }
-        if (!needsRefresh) return;
-        refetchCollabToken().then((result) => {
-          if (result.data?.token) {
-            socket.disconnect();
-            setTimeout(() => {
-              remote.configuration.token = result.data.token;
-              socket.connect();
-            }, 100);
-          }
-        });
-      };
-      const remote = new HocuspocusProvider({
-        websocketProvider: socket,
-        name: documentName,
-        document: ydoc,
-        token: collabQuery?.token,
-        onAuthenticationFailed: onAuthenticationFailedHandler,
-        onStatus: onStatusHandler,
-        onSynced: onSyncedHandler,
-        onStateless: onStatelessHandler,
-      });
-
-      local.on("synced", onLocalSyncedHandler);
-      providersRef.current = { socket, local, remote };
-      setProvidersReady(true);
-    } else {
-      setProvidersReady(true);
-    }
-    // Only destroy on final unmount
-    return () => {
-      providersRef.current?.socket.destroy();
-      providersRef.current?.remote.destroy();
-      providersRef.current?.local.destroy();
-      providersRef.current = null;
-    };
-  }, [pageId]);
-
-  // Only connect/disconnect on tab/idle, not destroy
-  useEffect(() => {
-    if (!providersReady || !providersRef.current) return;
-    const socket = providersRef.current.socket;
-
-    if (
-      isIdle &&
-      documentState === "hidden" &&
-      yjsConnectionStatus === WebSocketStatus.Connected
-    ) {
-      socket.disconnect();
-      return;
-    }
-    if (
-      documentState === "visible" &&
-      yjsConnectionStatus === WebSocketStatus.Disconnected
-    ) {
-      resetIdle();
-      socket.connect();
-    }
-  }, [isIdle, documentState, providersReady, resetIdle]);
-
-  // Attach here, to make sure the connection gets properly established
-  providersRef.current?.remote.attach();
+  // Shared providers + Y.Doc lifted into full-editor via context. The provider
+  // lifecycle (creation, idle/visibility connect, attach, destroy, token
+  // refresh) lives in usePageCollabProviders. Null-safe when rendered without
+  // the context (defensive) — in practice full-editor always provides it.
+  const editorProviders = useEditorProviders();
+  const remote = editorProviders?.remote ?? null;
+  const providersReady = editorProviders?.providersReady ?? false;
+  const isLocalSynced = useAtomValue(isLocalSyncedAtom);
+  const isRemoteSynced = useAtomValue(isRemoteSyncedAtom);
 
   const extensions = useMemo(() => {
-    if (!providersReady || !providersRef.current || !currentUser?.user) {
+    if (!providersReady || !remote || !currentUser?.user) {
       return mainExtensions;
     }
 
-    const remoteProvider = providersRef.current.remote;
-
     return [
       ...mainExtensions,
-      ...collabExtensions(remoteProvider, currentUser?.user),
+      ...collabExtensions(remote, currentUser?.user),
     ];
-  }, [providersReady, currentUser?.user]);
+  }, [providersReady, remote, currentUser?.user]);
 
   const editor = useEditor(
     {
@@ -651,7 +513,7 @@ export default function PageEditor({
             {editor &&
               !editorIsEditable &&
               (editable || canComment) &&
-              providersRef.current && <ReadonlyBubbleMenu editor={editor} />}
+              remote && <ReadonlyBubbleMenu editor={editor} />}
             {showCommentPopup && (
               <CommentDialog editor={editor} pageId={pageId} />
             )}

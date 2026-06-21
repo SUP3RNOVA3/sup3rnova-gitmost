@@ -1,5 +1,5 @@
 import "@/features/editor/styles/index.css";
-import React, { useCallback, useEffect, useState } from "react";
+import { useEffect } from "react";
 import { EditorContent, useEditor } from "@tiptap/react";
 import { Document } from "@tiptap/extension-document";
 import { Heading } from "@tiptap/extension-heading";
@@ -11,14 +11,14 @@ import {
   pageEditorAtom,
   titleEditorAtom,
 } from "@/features/editor/atoms/editor-atoms";
-import {
-  updatePageData,
-  useUpdateTitlePageMutation,
-} from "@/features/page/queries/page-query";
+import { updatePageData } from "@/features/page/queries/page-query";
 import { useDebouncedCallback, getHotkeyHandler } from "@mantine/hooks";
 import { useAtom } from "jotai";
 import { useQueryEmit } from "@/features/websocket/use-query-emit.ts";
-import { History } from "@tiptap/extension-history";
+import {
+  Collaboration,
+  isChangeOrigin,
+} from "@tiptap/extension-collaboration";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
@@ -29,6 +29,9 @@ import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { platformModifierKey } from "@/lib";
 import { useTitleAutofocus } from "@/features/editor/hooks/use-title-autofocus";
+import { useEditorProviders } from "@/features/editor/contexts/editor-providers-context";
+import { queryClient } from "@/main.tsx";
+import { IPage } from "@/features/page/types/page.types.ts";
 
 export interface TitleEditorProps {
   pageId: string;
@@ -46,65 +49,83 @@ export function TitleEditor({
   editable,
 }: TitleEditorProps) {
   const { t } = useTranslation();
-  const { mutateAsync: updateTitlePageMutationAsync } =
-    useUpdateTitlePageMutation();
   const pageEditor = useAtomValue(pageEditorAtom);
   const [, setTitleEditor] = useAtom(titleEditorAtom);
   const emit = useQueryEmit();
   const navigate = useNavigate();
-  const [activePageId, setActivePageId] = useState(pageId);
   const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
 
-  const titleEditor = useEditor({
-    extensions: [
-      Document.extend({
-        content: "heading",
-      }),
-      Heading.configure({
-        levels: [1],
-      }),
-      Text,
-      Placeholder.configure({
-        placeholder: t("Untitled"),
-        showOnlyWhenEditable: false,
-      }),
-      History.configure({
-        depth: 20,
-      }),
-      EmojiCommand,
-    ],
-    onCreate({ editor }) {
-      if (editor) {
-        // @ts-ignore
-        setTitleEditor(editor);
-        setActivePageId(pageId);
-      }
-    },
-    onUpdate({ editor }) {
-      debounceUpdate();
-    },
-    editable: editable,
-    content: title,
-    immediatelyRender: true,
-    shouldRerenderOnTransaction: false,
-    editorProps: {
-      attributes: {
-        "aria-label": t("Page title"),
+  // Shared Y.Doc (title lives in its own 'title' fragment of the same doc as
+  // the body). Yjs is the source of truth for the title content.
+  const editorProviders = useEditorProviders();
+  const ydoc = editorProviders?.ydoc ?? null;
+  const providersReady = editorProviders?.providersReady ?? false;
+
+  // Until the shared doc is ready, the collaborative editor binds nothing and
+  // would render an empty heading until the Yjs 'title' fragment hydrates. Show
+  // a non-editable static <h1> with the `title` prop in the meantime. The prop
+  // is NEVER fed into the collaborative editor (Yjs stays the single source of
+  // truth — seeding it would duplicate the title).
+  const titleReady = providersReady && !!ydoc;
+
+  const titleEditor = useEditor(
+    {
+      extensions: [
+        Document.extend({
+          content: "heading",
+        }),
+        Heading.configure({
+          levels: [1],
+        }),
+        Text,
+        Placeholder.configure({
+          placeholder: t("Untitled"),
+          showOnlyWhenEditable: false,
+        }),
+        // Bind the title to the dedicated 'title' fragment of the shared doc.
+        // Collaboration also manages undo/redo, so the History extension is
+        // intentionally omitted (it would conflict with Yjs). When the doc is
+        // not ready yet the editor renders empty until the doc arrives.
+        ...(ydoc
+          ? [Collaboration.configure({ document: ydoc, field: "title" })]
+          : []),
+        EmojiCommand,
+      ],
+      onCreate({ editor }) {
+        if (editor) {
+          // @ts-ignore
+          setTitleEditor(editor);
+        }
       },
-      handleDOMEvents: {
-        keydown: (_view, event) => {
-          if (platformModifierKey(event) && event.code === "KeyS") {
-            event.preventDefault();
-            return true;
-          }
-          if (platformModifierKey(event) && event.code === "KeyK") {
-            searchSpotlight.open();
-            return true;
-          }
+      onUpdate({ editor, transaction }) {
+        // Drive URL + tree propagation only on genuine local edits; skip
+        // remote/collab-origin Yjs updates to avoid feedback loops.
+        if (transaction && isChangeOrigin(transaction)) return;
+        debouncedPropagateTitle(editor.getText());
+      },
+      editable: editable,
+      immediatelyRender: true,
+      shouldRerenderOnTransaction: false,
+      editorProps: {
+        attributes: {
+          "aria-label": t("Page title"),
+        },
+        handleDOMEvents: {
+          keydown: (_view, event) => {
+            if (platformModifierKey(event) && event.code === "KeyS") {
+              event.preventDefault();
+              return true;
+            }
+            if (platformModifierKey(event) && event.code === "KeyK") {
+              searchSpotlight.open();
+              return true;
+            }
+          },
         },
       },
     },
-  });
+    [pageId, ydoc],
+  );
 
   useEffect(() => {
     const anchorId = window.location.hash
@@ -114,68 +135,44 @@ export function TitleEditor({
     navigate(pageSlug, { replace: true });
   }, [title]);
 
-  const saveTitle = useCallback(() => {
-    if (!titleEditor || activePageId !== pageId) return;
-
-    if (
-      titleEditor.getText() === title ||
-      (titleEditor.getText() === "" && title === null)
-    ) {
-      return;
-    }
-
-    updateTitlePageMutationAsync({
-      pageId: pageId,
-      title: titleEditor.getText(),
-    }).then((page) => {
-      const event: UpdateEvent = {
-        operation: "updateOne",
-        spaceId: page.spaceId,
-        entity: ["pages"],
-        id: page.id,
-        payload: {
-          title: page.title,
-          slugId: page.slugId,
-          parentPageId: page.parentPageId,
-          icon: page.icon,
-        },
-      };
-
-      if (page.title !== titleEditor.getText()) return;
-
-      updatePageData(page);
-
-      localEmitter.emit("message", event);
-      emit(event);
+  // On a local title change: update the URL slug and propagate the change to
+  // the live tree/breadcrumbs for online users. No REST round-trip — the title
+  // itself is persisted through Yjs. Offline this simply no-ops the socket
+  // emit and the title syncs on reconnect.
+  const debouncedPropagateTitle = useDebouncedCallback((titleText: string) => {
+    const anchorId = window.location.hash
+      ? window.location.hash.substring(1)
+      : undefined;
+    navigate(buildPageUrl(spaceSlug, slugId, titleText, anchorId), {
+      replace: true,
     });
-  }, [pageId, title, titleEditor]);
 
-  const debounceUpdate = useDebouncedCallback(saveTitle, 500);
+    const page =
+      queryClient.getQueryData<IPage>(["pages", slugId]) ??
+      queryClient.getQueryData<IPage>(["pages", pageId]);
+    if (!page) return;
 
-  useEffect(() => {
-    // Do not overwrite the title while the user is actively editing it. The
-    // server rebroadcasts PAGE_UPDATED to the author too, and that echo can
-    // carry a title that lags behind what the user has just typed; resetting
-    // content from it here would drop in-progress characters and jump the
-    // cursor. Apply external title changes only when the field is not focused.
-    if (
-      titleEditor &&
-      !titleEditor.isDestroyed &&
-      !titleEditor.isFocused &&
-      title !== titleEditor.getText()
-    ) {
-      titleEditor.commands.setContent(title);
-    }
-  }, [pageId, title, titleEditor]);
+    const updatedPage: IPage = { ...page, title: titleText };
+
+    const event: UpdateEvent = {
+      operation: "updateOne",
+      spaceId: page.spaceId,
+      entity: ["pages"],
+      id: page.id,
+      payload: {
+        title: titleText,
+        slugId: page.slugId,
+        parentPageId: page.parentPageId,
+        icon: page.icon,
+      },
+    };
+
+    updatePageData(updatedPage);
+    localEmitter.emit("message", event);
+    emit(event);
+  }, 500);
 
   useTitleAutofocus(titleEditor, pageId);
-
-  useEffect(() => {
-    return () => {
-      // force-save title on navigation
-      saveTitle();
-    };
-  }, [pageId]);
 
   useEffect(() => {
     if (!titleEditor) return;
@@ -243,16 +240,22 @@ export function TitleEditor({
 
   return (
     <div className="page-title">
-      <EditorContent
-        editor={titleEditor}
-        onKeyDown={(event) => {
-          // First handle the search hotkey
-          getHotkeyHandler([["mod+F", openSearchDialog]])(event);
+      {titleReady ? (
+        <EditorContent
+          editor={titleEditor}
+          onKeyDown={(event) => {
+            // First handle the search hotkey
+            getHotkeyHandler([["mod+F", openSearchDialog]])(event);
 
-          // Then handle other key events
-          handleTitleKeyDown(event);
-        }}
-      />
+            // Then handle other key events
+            handleTitleKeyDown(event);
+          }}
+        />
+      ) : (
+        // Static, non-editable fallback so the title is visible before Yjs
+        // hydrates the 'title' fragment. Not wired into the collaborative editor.
+        <h1>{title}</h1>
+      )}
     </div>
   );
 }

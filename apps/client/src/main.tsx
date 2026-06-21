@@ -11,7 +11,8 @@ import { MantineProvider } from "@mantine/core";
 import { BrowserRouter } from "react-router-dom";
 import { ModalsProvider } from "@mantine/modals";
 import { Notifications } from "@mantine/notifications";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient } from "@tanstack/react-query";
+import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { HelmetProvider } from "react-helmet-async";
 import "./i18n";
 import { PostHogProvider } from "posthog-js/react";
@@ -21,6 +22,12 @@ import {
   isCloud,
   isPostHogEnabled,
 } from "@/lib/config.ts";
+import {
+  queryPersister,
+  shouldDehydrateOfflineQuery,
+} from "@/features/offline/query-persister";
+import { PwaUpdatePrompt } from "@/pwa/pwa-update-prompt";
+import { isCapacitorNativePlatform } from "@/pwa/is-capacitor";
 import posthog from "posthog-js";
 import { initVitals } from "@/lib/telemetry/vitals";
 
@@ -31,6 +38,8 @@ export const queryClient = new QueryClient({
       refetchOnWindowFocus: false,
       retry: false,
       staleTime: 5 * 60 * 1000,
+      // Keep cached read data around long enough to be persisted/restored for offline use.
+      gcTime: 1000 * 60 * 60 * 24,
     },
   },
 });
@@ -55,14 +64,27 @@ root.render(
   <BrowserRouter>
     <MantineProvider theme={theme} cssVariablesResolver={mantineCssResolver}>
       <ModalsProvider>
-        <QueryClientProvider client={queryClient}>
+        <PersistQueryClientProvider
+          client={queryClient}
+          persistOptions={{
+            persister: queryPersister,
+            maxAge: 1000 * 60 * 60 * 24,
+            buster: APP_VERSION,
+            dehydrateOptions: {
+              shouldDehydrateQuery: shouldDehydrateOfflineQuery,
+            },
+          }}
+        >
           <Notifications position="bottom-center" limit={3} zIndex={10000} />
+          {/* Skip SW registration inside the Capacitor native WebView — the
+              native shell serves assets itself; a browser SW would conflict. */}
+          {!isCapacitorNativePlatform() && <PwaUpdatePrompt />}
           <HelmetProvider>
             <PostHogProvider client={posthog}>
               <App />
             </PostHogProvider>
           </HelmetProvider>
-        </QueryClientProvider>
+        </PersistQueryClientProvider>
       </ModalsProvider>
     </MantineProvider>
   </BrowserRouter>,

@@ -60,6 +60,7 @@ import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
 import { Node, Schema } from '@tiptap/pm/model';
 import * as Y from 'yjs';
 import { Logger } from '@nestjs/common';
+import { TiptapTransformer } from '@hocuspocus/transformer';
 
 export const tiptapExtensions = [
   StarterKit.configure({
@@ -143,6 +144,34 @@ export function htmlToJson(html: string) {
 
 export function jsonToText(tiptapJson: JSONContent) {
   return generateText(tiptapJson, tiptapExtensions);
+}
+
+/**
+ * Build a standalone Y.Doc that holds ONLY the page title, in a dedicated Yjs
+ * fragment named exactly 'title' (the collaborative title-editor contract with
+ * the client). The ProseMirror shape is a doc with a single level-1 heading
+ * whose text is the title (empty title => heading with no text child).
+ *
+ * The encoded state of the returned doc can be merged into a body doc via
+ * `Y.applyUpdate(doc, Y.encodeStateAsUpdate(titleSeed))` to seed the title
+ * fragment for legacy pages. Seeding MUST be guarded by an emptiness check on
+ * the existing 'title' fragment to avoid the Yjs duplication trap.
+ */
+export function buildTitleSeedYdoc(title: string): Y.Doc {
+  return TiptapTransformer.toYdoc(
+    {
+      type: 'doc',
+      content: [
+        {
+          type: 'heading',
+          attrs: { level: 1 },
+          content: title ? [{ type: 'text', text: title }] : [],
+        },
+      ],
+    },
+    'title',
+    tiptapExtensions,
+  );
 }
 
 export function jsonToNode(tiptapJson: JSONContent) {
