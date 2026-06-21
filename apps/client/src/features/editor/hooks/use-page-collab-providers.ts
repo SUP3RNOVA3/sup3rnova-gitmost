@@ -31,8 +31,6 @@ export interface PageCollabProviders {
   remote: HocuspocusProvider | null;
   socket: HocuspocusProviderWebsocket | null;
   providersReady: boolean;
-  isLocalSynced: boolean;
-  isRemoteSynced: boolean;
 }
 
 /**
@@ -45,14 +43,19 @@ export interface PageCollabProviders {
  */
 export function usePageCollabProviders(pageId: string): PageCollabProviders {
   const collaborationURL = useCollaborationUrl();
-  const [isLocalSynced, setIsLocalSynced] = useState(false);
-  const [isRemoteSynced, setIsRemoteSynced] = useState(false);
   const [yjsConnectionStatus, setYjsConnectionStatus] = useAtom(
     yjsConnectionStatusAtom,
   );
   const setIsLocalSyncedAtom = useSetAtom(isLocalSyncedAtom);
   const setIsRemoteSyncedAtom = useSetAtom(isRemoteSyncedAtom);
   const { data: collabQuery, refetch: refetchCollabToken } = useCollabToken();
+  // The provider-creating effect runs only once per pageId, so any token read
+  // inside its handlers would be captured STALE (the old token at first render).
+  // Mirror the latest token into a ref the auth-failure handler can read live.
+  const collabTokenRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    collabTokenRef.current = collabQuery?.token;
+  }, [collabQuery?.token]);
   const { isIdle, resetIdle } = useIdle(FIVE_MINUTES, { initialState: false });
   const documentState = useDocumentVisibility();
   const { pageSlug } = useParams();
@@ -68,13 +71,12 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
   const [providersReady, setProvidersReady] = useState(false);
 
   // Mirror the local/remote sync flags into shared atoms so the header
-  // indicator can read them, and keep the local component state in sync too.
+  // indicator can read them. These atoms are the single source of truth; the
+  // wrappers keep the existing call sites valid while driving only the atoms.
   const setLocalSynced = (value: boolean) => {
-    setIsLocalSynced(value);
     setIsLocalSyncedAtom(value);
   };
   const setRemoteSynced = (value: boolean) => {
-    setIsRemoteSynced(value);
     setIsRemoteSyncedAtom(value);
   };
 
@@ -114,20 +116,31 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
         }
       };
       const onAuthenticationFailedHandler = () => {
-        const payload = jwtDecode(collabQuery?.token);
-        const now = Date.now().valueOf() / 1000;
-        const isTokenExpired = now >= payload.exp;
-        if (isTokenExpired) {
-          refetchCollabToken().then((result) => {
-            if (result.data?.token) {
-              socket.disconnect();
-              setTimeout(() => {
-                remote.configuration.token = result.data.token;
-                socket.connect();
-              }, 100);
-            }
-          });
+        // Read the token from the ref, not the closed-over `collabQuery`: this
+        // handler is created once and would otherwise decode a stale token after
+        // a refetch. A missing/malformed token must NOT crash the handler —
+        // jwtDecode(undefined) throws — so treat any decode failure as "needs
+        // refresh" and proceed to refetch + reconnect instead of getting stuck.
+        const token = collabTokenRef.current;
+        let needsRefresh = true; // no/unparseable token -> fetch a fresh one and reconnect
+        if (token) {
+          try {
+            const payload = jwtDecode<{ exp: number }>(token);
+            needsRefresh = Date.now() / 1000 >= payload.exp;
+          } catch {
+            needsRefresh = true; // malformed token -> refresh
+          }
         }
+        if (!needsRefresh) return;
+        refetchCollabToken().then((result) => {
+          if (result.data?.token) {
+            socket.disconnect();
+            setTimeout(() => {
+              remote.configuration.token = result.data.token;
+              socket.connect();
+            }, 100);
+          }
+        });
       };
       const remote = new HocuspocusProvider({
         websocketProvider: socket,
@@ -188,7 +201,5 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
     remote: providersRef.current?.remote ?? null,
     socket: providersRef.current?.socket ?? null,
     providersReady,
-    isLocalSynced,
-    isRemoteSynced,
   };
 }
