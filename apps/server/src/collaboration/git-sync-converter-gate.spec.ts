@@ -225,6 +225,83 @@ const CORPUS: Record<string, any> = {
     ],
   }),
 
+  // --- editor-ext nodes/marks beyond the original corpus (item #7) ----------
+  // Each of these was verified to round-trip CLEANLY through the real gate
+  // (export -> markdown -> import -> editor-ext Yjs write path). Fixtures are
+  // pre-authored at the engine's normalize-on-write fixpoint (SPEC §11), e.g.
+  // details carries the materialized `open:false`, and color marks use the
+  // `rgb(...)` form the HTML re-parser normalizes to.
+
+  'mention (user)': doc(
+    para(
+      text('hi '),
+      {
+        type: 'mention',
+        attrs: {
+          id: 'user-123',
+          label: 'Alice',
+          entityType: 'user',
+          entityId: 'user-123',
+          creatorId: 'creator-1',
+        },
+      },
+      text(' there'),
+    ),
+  ),
+
+  'inline math': doc(
+    para(
+      text('inline '),
+      { type: 'mathInline', attrs: { text: 'x^2' } },
+      text(' math'),
+    ),
+  ),
+
+  'block math': doc({ type: 'mathBlock', attrs: { text: 'x^2 + y^2 = z^2' } }),
+
+  'details (collapsible)': doc({
+    type: 'details',
+    // `open:false` is the value editor-ext materializes on import; pre-authoring
+    // it puts the fixture at its round-trip fixpoint.
+    attrs: { open: false },
+    content: [
+      { type: 'detailsSummary', content: [text('Summary line')] },
+      { type: 'detailsContent', content: [para(text('hidden body'))] },
+    ],
+  }),
+
+  'highlight (mark, no color)': doc(
+    para(
+      text('a '),
+      text('highlighted', [{ type: 'highlight' }]),
+      text(' word'),
+    ),
+  ),
+
+  'highlight (mark, with color)': doc(
+    para(
+      text('a '),
+      text('red', [{ type: 'highlight', attrs: { color: 'rgb(255, 0, 0)' } }]),
+      text(' word'),
+    ),
+  ),
+
+  'subscript': doc(
+    para(text('H'), text('2', [{ type: 'subscript' }]), text('O')),
+  ),
+
+  'superscript': doc(
+    para(text('E=mc'), text('2', [{ type: 'superscript' }])),
+  ),
+
+  'text color (textStyle)': doc(
+    // The HTML re-parser normalizes CSS colors to the `rgb(...)` form, so the
+    // fixture pre-authors that form; a `#hex` color would round-trip to the
+    // equivalent rgb() and is therefore a value-normalization divergence (see
+    // the KNOWN DIVERGENCE block below).
+    para(text('green', [{ type: 'textStyle', attrs: { color: 'rgb(0, 255, 0)' } }])),
+  ),
+
   'nested / mixed document': doc(
     { type: 'heading', attrs: { level: 1 }, content: [text('Mixed')] },
     para(
@@ -345,5 +422,94 @@ describe('git-sync converter §13.1 KNOWN DIVERGENCE (markdown image lossiness)'
 
     // And it is therefore NOT canonically equal to the original (lock the loss).
     expect(docsCanonicallyEqual(imageDoc, canonNormalized)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KNOWN DIVERGENCE — text alignment (item #7; isolated, not silently dropped).
+//
+// editor-ext registers TextAlign for heading+paragraph, and the SERVER schema
+// fully supports it — the loss is intrinsic to the MARKDOWN transport:
+//
+//   • A paragraph's `textAlign` is EXPORTED as `<div align="...">text</div>`
+//     (markdown-converter case "paragraph"), but on import the converter's
+//     docmost-schema declares `textAlign` WITHOUT a parseHTML mapping, so the
+//     `align` attribute is never recovered -> it imports as `textAlign:null`
+//     and canonicalizes away. A heading's alignment is not even exported.
+//   • Therefore any non-default alignment is dropped on a full round trip.
+//
+// If the converter is ever taught to parse `align`/`text-align` back onto the
+// block, this assertion flips and an aligned-paragraph fixture should be
+// promoted into the green CORPUS above.
+// ---------------------------------------------------------------------------
+describe('git-sync converter §13.1 KNOWN DIVERGENCE (text alignment dropped)', () => {
+  it('drops a paragraph textAlign on the markdown round trip', async () => {
+    const alignedDoc = doc({
+      type: 'paragraph',
+      attrs: { textAlign: 'center' },
+      content: [text('centered')],
+    });
+
+    const { canonNormalized } = await runGate(alignedDoc);
+
+    // The round-tripped paragraph carries no alignment.
+    expect(canonNormalized).toEqual({
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'centered' }] }],
+    });
+    expect(docsCanonicallyEqual(alignedDoc, canonNormalized)).toBe(false);
+  });
+
+  it('drops a heading textAlign (headings do not export alignment at all)', async () => {
+    const alignedHeading = doc({
+      type: 'heading',
+      attrs: { level: 2, textAlign: 'center' },
+      content: [text('centered heading')],
+    });
+
+    const { md, canonNormalized } = await runGate(alignedHeading);
+
+    // Export is a plain markdown heading — no alignment syntax.
+    expect(md.trim()).toBe('## centered heading');
+    expect(docsCanonicallyEqual(alignedHeading, canonNormalized)).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KNOWN DIVERGENCE — textStyle color is VALUE-NORMALIZED, not lost (item #7).
+//
+// The textStyle/color mark itself round-trips (the green CORPUS has the rgb()
+// form). But a `#hex` color is normalized to the equivalent `rgb(...)` string
+// by the HTML re-parser on import, and canonicalize.ts does NOT normalize color
+// formats — so a `#hex` original is not STRING-identical to its round trip even
+// though the color is semantically preserved. Locked here so the boundary is
+// explicit: author color fixtures in rgb() form to stay in the green corpus.
+// ---------------------------------------------------------------------------
+describe('git-sync converter §13.1 KNOWN DIVERGENCE (textStyle color #hex -> rgb)', () => {
+  it('normalizes a #hex text color to rgb() (semantically preserved, string-divergent)', async () => {
+    const hexDoc = doc(
+      para(text('green', [{ type: 'textStyle', attrs: { color: '#00ff00' } }])),
+    );
+
+    const { canonNormalized } = await runGate(hexDoc);
+
+    // Color survives, but as the normalized rgb() string.
+    expect(canonNormalized).toEqual({
+      type: 'doc',
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            {
+              type: 'text',
+              text: 'green',
+              marks: [{ type: 'textStyle', attrs: { color: 'rgb(0, 255, 0)' } }],
+            },
+          ],
+        },
+      ],
+    });
+    // Not string-identical to the #hex original.
+    expect(docsCanonicallyEqual(hexDoc, canonNormalized)).toBe(false);
   });
 });
