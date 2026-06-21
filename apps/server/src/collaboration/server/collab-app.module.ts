@@ -20,6 +20,7 @@ import { CaslModule } from '../../core/casl/casl.module';
 import { ThrottleModule } from '../../integrations/throttle/throttle.module';
 import { CacheModule } from '@nestjs/cache-manager';
 import KeyvRedis from '@keyv/redis';
+import { PageTreeBridgePublisher } from '../listeners/page-tree-bridge.publisher';
 
 @Module({
   imports: [
@@ -54,6 +55,6 @@ import KeyvRedis from '@keyv/redis';
       ? [CollaborationController]
       : []),
   ],
-  providers: [AppService],
+  providers: [AppService, PageTreeBridgePublisher],
 })
 export class CollabAppModule {}
