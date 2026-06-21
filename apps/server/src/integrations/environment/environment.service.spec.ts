@@ -169,8 +169,7 @@ describe('EnvironmentService', () => {
   describe('getCorsAllowedOrigins', () => {
     it('splits, trims, and drops empty entries', () => {
       const svc = makeService({
-        CORS_ALLOWED_ORIGINS:
-          'https://a.com, https://b.com ,, https://c.com',
+        CORS_ALLOWED_ORIGINS: 'https://a.com, https://b.com ,, https://c.com',
       });
       expect(svc.getCorsAllowedOrigins()).toEqual([
         'https://a.com',
@@ -182,6 +181,25 @@ describe('EnvironmentService', () => {
     it('returns an empty array when the var is absent', () => {
       const svc = makeService({});
       expect(svc.getCorsAllowedOrigins()).toEqual([]);
+    });
+
+    it('returns an empty array for an empty string', () => {
+      const svc = makeService({ CORS_ALLOWED_ORIGINS: '' });
+      expect(svc.getCorsAllowedOrigins()).toEqual([]);
+    });
+
+    it('returns a single origin unchanged', () => {
+      const svc = makeService({
+        CORS_ALLOWED_ORIGINS: 'https://app.example',
+      });
+      expect(svc.getCorsAllowedOrigins()).toEqual(['https://app.example']);
+    });
+
+    // Adversarial case: leading/trailing/duplicate commas with surrounding
+    // spaces must be dropped, exercising both .map(trim) and .filter(Boolean).
+    it('drops leading/trailing commas with surrounding spaces', () => {
+      const svc = makeService({ CORS_ALLOWED_ORIGINS: ' , a , , b ' });
+      expect(svc.getCorsAllowedOrigins()).toEqual(['a', 'b']);
     });
   });
 
@@ -198,6 +216,12 @@ describe('EnvironmentService', () => {
       );
     });
 
+    it('is true for mixed-case "True"', () => {
+      expect(makeService({ SWAGGER_ENABLED: 'True' }).isSwaggerEnabled()).toBe(
+        true,
+      );
+    });
+
     it('defaults to false when absent', () => {
       expect(makeService({}).isSwaggerEnabled()).toBe(false);
     });
@@ -207,6 +231,15 @@ describe('EnvironmentService', () => {
         false,
       );
       expect(makeService({ SWAGGER_ENABLED: 'yes' }).isSwaggerEnabled()).toBe(
+        false,
+      );
+      expect(makeService({ SWAGGER_ENABLED: 'false' }).isSwaggerEnabled()).toBe(
+        false,
+      );
+      expect(makeService({ SWAGGER_ENABLED: '' }).isSwaggerEnabled()).toBe(
+        false,
+      );
+      expect(makeService({ SWAGGER_ENABLED: '1' }).isSwaggerEnabled()).toBe(
         false,
       );
     });

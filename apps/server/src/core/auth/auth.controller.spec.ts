@@ -81,5 +81,25 @@ describe('AuthController', () => {
       expect(result).toBeUndefined();
       expect(res.setCookie).toHaveBeenCalledTimes(1);
     });
+
+    // Guards against an `!== undefined`-style bug: an explicit `false` must
+    // behave exactly like the omitted case (cookie set, no token in the body).
+    it('returns no body token but still sets the cookie when returnToken is false', async () => {
+      const { ctrl, res } = makeController();
+      const loginInput = {
+        email: 'a@b.com',
+        password: 'pw',
+        returnToken: false,
+      };
+
+      const result = await ctrl.login(
+        workspace as any,
+        res as any,
+        loginInput as any,
+      );
+
+      expect(result).toBeUndefined();
+      expect(res.setCookie).toHaveBeenCalledTimes(1);
+    });
   });
 });
