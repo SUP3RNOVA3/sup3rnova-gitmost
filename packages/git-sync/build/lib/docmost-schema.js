@@ -1,3 +1,9 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.docmostExtensions = exports.sanitizeCssColor = exports.clampCalloutType = void 0;
 /**
  * Full TipTap extension set matching the real Docmost document schema.
  *
@@ -7,14 +13,14 @@
  * to or from ProseMirror JSON must use THIS set, otherwise a round-trip
  * loses content.
  */
-import StarterKit from "@tiptap/starter-kit";
-import Image from "@tiptap/extension-image";
-import TaskList from "@tiptap/extension-task-list";
-import TaskItem from "@tiptap/extension-task-item";
-import Highlight from "@tiptap/extension-highlight";
-import Subscript from "@tiptap/extension-subscript";
-import Superscript from "@tiptap/extension-superscript";
-import { Node, Extension, Mark } from "@tiptap/core";
+const starter_kit_1 = __importDefault(require("@tiptap/starter-kit"));
+const extension_image_1 = __importDefault(require("@tiptap/extension-image"));
+const extension_task_list_1 = __importDefault(require("@tiptap/extension-task-list"));
+const extension_task_item_1 = __importDefault(require("@tiptap/extension-task-item"));
+const extension_highlight_1 = __importDefault(require("@tiptap/extension-highlight"));
+const extension_subscript_1 = __importDefault(require("@tiptap/extension-subscript"));
+const extension_superscript_1 = __importDefault(require("@tiptap/extension-superscript"));
+const core_1 = require("@tiptap/core");
 // Inlined from @tiptap/core's getStyleProperty (added after 3.20.x) so this
 // package can stay on the same @tiptap/core version as the editor and avoid a
 // duplicate-tiptap version split in the monorepo. Reads a single declaration
@@ -41,9 +47,10 @@ function getStyleProperty(element, propertyName) {
 }
 /** Allowed Docmost callout types; anything else falls back to "info". */
 const CALLOUT_TYPES = ["info", "warning", "danger", "success"];
-export const clampCalloutType = (value) => value && CALLOUT_TYPES.includes(value.toLowerCase())
+const clampCalloutType = (value) => value && CALLOUT_TYPES.includes(value.toLowerCase())
     ? value.toLowerCase()
     : "info";
+exports.clampCalloutType = clampCalloutType;
 /**
  * Allowlist guard for CSS color values imported from HTML.
  *
@@ -61,14 +68,15 @@ export const clampCalloutType = (value) => value && CALLOUT_TYPES.includes(value
  *                             digits, %, ., commas, spaces and slashes
  */
 const SAFE_COLOR_RE = /^(?:[a-zA-Z]+|#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})|(?:rgb|rgba|hsl|hsla)\([0-9.,%/\s]+\))$/;
-export const sanitizeCssColor = (value) => {
+const sanitizeCssColor = (value) => {
     if (typeof value !== "string")
         return null;
     const color = value.trim();
     return color && SAFE_COLOR_RE.test(color) ? color : null;
 };
+exports.sanitizeCssColor = sanitizeCssColor;
 /** Docmost callout (info/warning/danger/success banner). */
-const Callout = Node.create({
+const Callout = core_1.Node.create({
     name: "callout",
     group: "block",
     content: "block+",
@@ -79,9 +87,9 @@ const Callout = Node.create({
             // it; without an explicit parseHTML every imported callout became "info".
             type: {
                 default: "info",
-                parseHTML: (el) => clampCalloutType(el.getAttribute("data-callout-type")),
+                parseHTML: (el) => (0, exports.clampCalloutType)(el.getAttribute("data-callout-type")),
                 renderHTML: (attrs) => ({
-                    "data-callout-type": clampCalloutType(attrs.type),
+                    "data-callout-type": (0, exports.clampCalloutType)(attrs.type),
                 }),
             },
             icon: {
@@ -99,7 +107,7 @@ const Callout = Node.create({
     },
 });
 /** Minimal table family: enough for schema round-trips and HTML parsing. */
-const Table = Node.create({
+const Table = core_1.Node.create({
     name: "table",
     group: "block",
     content: "tableRow+",
@@ -111,7 +119,7 @@ const Table = Node.create({
         return ["table", ["tbody", 0]];
     },
 });
-const TableRow = Node.create({
+const TableRow = core_1.Node.create({
     name: "tableRow",
     content: "(tableCell | tableHeader)*",
     parseHTML() {
@@ -134,7 +142,7 @@ const cellAttributes = () => ({
         renderHTML: (attrs) => attrs.align ? { align: attrs.align } : {},
     },
 });
-const TableCell = Node.create({
+const TableCell = core_1.Node.create({
     name: "tableCell",
     content: "block+",
     isolating: true,
@@ -146,7 +154,7 @@ const TableCell = Node.create({
         return ["td", 0];
     },
 });
-const TableHeader = Node.create({
+const TableHeader = core_1.Node.create({
     name: "tableHeader",
     content: "block+",
     isolating: true,
@@ -163,7 +171,7 @@ const TableHeader = Node.create({
  * do not declare. Without these, Node.fromJSON silently drops them —
  * including the block ids that heading anchors rely on.
  */
-const DocmostAttributes = Extension.create({
+const DocmostAttributes = core_1.Extension.create({
     name: "docmostAttributes",
     addGlobalAttributes() {
         return [
@@ -205,7 +213,7 @@ const DocmostAttributes = Extension.create({
  * which breaks update_page_json and edit_page_text on every commented page.
  * Mirrors Docmost's @docmost/editor-ext comment mark (commentId / resolved).
  */
-const Comment = Mark.create({
+const Comment = core_1.Mark.create({
     name: "comment",
     exitable: true,
     inclusive: false,
@@ -238,15 +246,15 @@ const Comment = Mark.create({
  * attribute. The parsed color is passed through the allowlist guard so a crafted
  * style cannot break out of the attribute when Docmost re-renders it.
  */
-const TextStyle = Mark.create({
+const TextStyle = core_1.Mark.create({
     name: "textStyle",
     addAttributes() {
         return {
             color: {
                 default: null,
-                parseHTML: (el) => sanitizeCssColor(el.style.color || el.getAttribute("data-color")),
+                parseHTML: (el) => (0, exports.sanitizeCssColor)(el.style.color || el.getAttribute("data-color")),
                 renderHTML: (attrs) => {
-                    const color = sanitizeCssColor(attrs.color);
+                    const color = (0, exports.sanitizeCssColor)(attrs.color);
                     return color ? { style: `color: ${color}` } : {};
                 },
             },
@@ -289,7 +297,7 @@ const TextStyle = Mark.create({
  * pattern these follow.
  */
 /** Docmost @mention (user/page reference). Inline atom. */
-const Mention = Node.create({
+const Mention = core_1.Node.create({
     name: "mention",
     group: "inline",
     inline: true,
@@ -343,7 +351,7 @@ const Mention = Node.create({
     },
 });
 /** Inline KaTeX expression. Carries the LaTeX source in `text`. */
-const MathInline = Node.create({
+const MathInline = core_1.Node.create({
     name: "mathInline",
     group: "inline",
     inline: true,
@@ -365,7 +373,7 @@ const MathInline = Node.create({
     },
 });
 /** Block KaTeX expression. Carries the LaTeX source in `text`. */
-const MathBlock = Node.create({
+const MathBlock = core_1.Node.create({
     name: "mathBlock",
     group: "block",
     atom: true,
@@ -387,7 +395,7 @@ const MathBlock = Node.create({
     },
 });
 /** Collapsible <details> wrapper: summary + content children. */
-const Details = Node.create({
+const Details = core_1.Node.create({
     name: "details",
     group: "block",
     content: "detailsSummary detailsContent",
@@ -410,7 +418,7 @@ const Details = Node.create({
     },
 });
 /** Clickable summary line of a <details> block. */
-const DetailsSummary = Node.create({
+const DetailsSummary = core_1.Node.create({
     name: "detailsSummary",
     group: "block",
     content: "inline*",
@@ -425,7 +433,7 @@ const DetailsSummary = Node.create({
     },
 });
 /** Body of a <details> block. Permissive content so fromYdoc output validates. */
-const DetailsContent = Node.create({
+const DetailsContent = core_1.Node.create({
     name: "detailsContent",
     group: "block",
     // Docmost declares block* (an empty details body is valid); block+ would
@@ -441,7 +449,7 @@ const DetailsContent = Node.create({
     },
 });
 /** File attachment card (non-image upload). Block atom. */
-const Attachment = Node.create({
+const Attachment = core_1.Node.create({
     name: "attachment",
     group: "block",
     inline: false,
@@ -493,7 +501,7 @@ const Attachment = Node.create({
     },
 });
 /** Uploaded <video> player. Block atom. */
-const Video = Node.create({
+const Video = core_1.Node.create({
     name: "video",
     group: "block",
     isolating: true,
@@ -564,7 +572,7 @@ const Video = Node.create({
  * references this type, so accept it as a generic block atom that preserves
  * its src so legacy/external documents survive a round-trip.
  */
-const Youtube = Node.create({
+const Youtube = core_1.Node.create({
     name: "youtube",
     group: "block",
     inline: false,
@@ -606,7 +614,7 @@ const Youtube = Node.create({
     },
 });
 /** Generic embed (provider iframe). Block atom. */
-const Embed = Node.create({
+const Embed = core_1.Node.create({
     name: "embed",
     group: "block",
     inline: false,
@@ -713,7 +721,7 @@ const diagramAttributes = () => ({
     },
 });
 /** draw.io diagram. Block atom (image-backed). */
-const Drawio = Node.create({
+const Drawio = core_1.Node.create({
     name: "drawio",
     group: "block",
     inline: false,
@@ -730,7 +738,7 @@ const Drawio = Node.create({
     },
 });
 /** Excalidraw diagram. Block atom (image-backed). */
-const Excalidraw = Node.create({
+const Excalidraw = core_1.Node.create({
     name: "excalidraw",
     group: "block",
     inline: false,
@@ -747,7 +755,7 @@ const Excalidraw = Node.create({
     },
 });
 /** Multi-column layout container holding one or more `column` children. */
-const Columns = Node.create({
+const Columns = core_1.Node.create({
     name: "columns",
     group: "block",
     content: "column+",
@@ -777,7 +785,7 @@ const Columns = Node.create({
     },
 });
 /** Single column within a `columns` layout. */
-const Column = Node.create({
+const Column = core_1.Node.create({
     name: "column",
     group: "block",
     content: "block+",
@@ -808,7 +816,7 @@ const Column = Node.create({
  * declares no attributes; the markdown-converter has a `case "subpages"`, so
  * the read path can emit it and toYdoc must accept it. Block atom.
  */
-const Subpages = Node.create({
+const Subpages = core_1.Node.create({
     name: "subpages",
     group: "block",
     inline: false,
@@ -824,7 +832,7 @@ const Subpages = Node.create({
     },
 });
 /** Uploaded <audio> player. Block atom. Mirrors Docmost audio attrs. */
-const Audio = Node.create({
+const Audio = core_1.Node.create({
     name: "audio",
     group: "block",
     inline: false,
@@ -864,7 +872,7 @@ const Audio = Node.create({
     },
 });
 /** Embedded PDF viewer. Block atom. Mirrors Docmost pdf attrs. */
-const Pdf = Node.create({
+const Pdf = core_1.Node.create({
     name: "pdf",
     group: "block",
     inline: false,
@@ -919,7 +927,7 @@ const Pdf = Node.create({
     },
 });
 /** Page break (print/export divider). Block atom; Docmost declares no attrs. */
-const PageBreak = Node.create({
+const PageBreak = core_1.Node.create({
     name: "pageBreak",
     group: "block",
     inline: false,
@@ -939,35 +947,35 @@ const PageBreak = Node.create({
  * ProseMirror DOM parser hoists <img> found inside <p> automatically.
  * StarterKit v3 already bundles the link extension, configured here.
  */
-export const docmostExtensions = [
-    StarterKit.configure({
+exports.docmostExtensions = [
+    starter_kit_1.default.configure({
         codeBlock: {},
         heading: {},
         link: { openOnClick: false },
     }),
-    Image.configure({ inline: false }),
-    TaskList,
-    TaskItem.configure({ nested: true }),
+    extension_image_1.default.configure({ inline: false }),
+    extension_task_list_1.default,
+    extension_task_item_1.default.configure({ nested: true }),
     // Highlight stores its color unescaped and Docmost interpolates it into
     // style="background-color: ${color}". Wrap the color attribute's parseHTML
     // with the same allowlist guard used by textStyle so a crafted import color
     // cannot break out of the style attribute. Multicolor behavior is preserved.
-    Highlight.extend({
+    extension_highlight_1.default.extend({
         addAttributes() {
             const parent = this.parent?.() ?? {};
             return {
                 ...parent,
                 color: {
                     ...parent.color,
-                    parseHTML: (el) => sanitizeCssColor(el.getAttribute("data-color") ||
+                    parseHTML: (el) => (0, exports.sanitizeCssColor)(el.getAttribute("data-color") ||
                         getStyleProperty(el, "background-color") ||
                         el.style.backgroundColor),
                 },
             };
         },
     }).configure({ multicolor: true }),
-    Subscript,
-    Superscript,
+    extension_subscript_1.default,
+    extension_superscript_1.default,
     // StarterKit does not provide a textStyle mark, so register ours; without it
     // generateJSON drops <span style="color: ...">, defeating the color import.
     TextStyle,

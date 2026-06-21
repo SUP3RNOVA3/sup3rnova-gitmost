@@ -1,3 +1,4 @@
+"use strict";
 /**
  * Headless, Docmost-equivalent document diff.
  *
@@ -16,13 +17,15 @@
  * If recreateTransform / the changeset throws on a pathological document pair,
  * we fall back to a coarse block-level text diff so the tool never hard-fails.
  */
-import { getSchema } from "@tiptap/core";
-import { Node } from "@tiptap/pm/model";
-import { ChangeSet, simplifyChanges } from "@tiptap/pm/changeset";
-import { recreateTransform } from "@fellow/prosemirror-recreate-transform";
-import { docmostExtensions } from "./docmost-schema.js";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.diffDocs = diffDocs;
+const core_1 = require("@tiptap/core");
+const model_1 = require("@tiptap/pm/model");
+const changeset_1 = require("@tiptap/pm/changeset");
+const prosemirror_recreate_transform_1 = require("@fellow/prosemirror-recreate-transform");
+const docmost_schema_1 = require("./docmost-schema");
 /** Build the schema once; it is pure and reused across calls. */
-const schema = getSchema(docmostExtensions);
+const schema = (0, core_1.getSchema)(docmost_schema_1.docmostExtensions);
 /** Recursively concatenate the plain text of a JSON node. */
 function plainText(node) {
     if (!node || typeof node !== "object")
@@ -209,7 +212,7 @@ function renderMarkdown(result, fellBack) {
  * @param newDocJson the later document
  * @param notesHeading heading delimiting body from notes for footnote counting
  */
-export function diffDocs(oldDocJson, newDocJson, notesHeading = "Примечания переводчика") {
+function diffDocs(oldDocJson, newDocJson, notesHeading = "Примечания переводчика") {
     const integrity = computeIntegrity(oldDocJson, newDocJson, notesHeading);
     let changes = [];
     let inserted = 0;
@@ -217,15 +220,15 @@ export function diffDocs(oldDocJson, newDocJson, notesHeading = "Примеча�
     let fellBack = false;
     const changedBlocks = new Set();
     try {
-        const oldNode = Node.fromJSON(schema, oldDocJson);
-        const newNode = Node.fromJSON(schema, newDocJson);
-        const tr = recreateTransform(oldNode, newNode, {
+        const oldNode = model_1.Node.fromJSON(schema, oldDocJson);
+        const newNode = model_1.Node.fromJSON(schema, newDocJson);
+        const tr = (0, prosemirror_recreate_transform_1.recreateTransform)(oldNode, newNode, {
             complexSteps: false,
             wordDiffs: true,
             simplifyDiff: true,
         });
-        const changeSet = ChangeSet.create(oldNode).addSteps(tr.doc, tr.mapping.maps, []);
-        const simplified = simplifyChanges(changeSet.changes, newNode);
+        const changeSet = changeset_1.ChangeSet.create(oldNode).addSteps(tr.doc, tr.mapping.maps, []);
+        const simplified = (0, changeset_1.simplifyChanges)(changeSet.changes, newNode);
         for (const change of simplified) {
             // Deleted text lives in the OLD doc coordinate range [fromA, toA).
             if (change.toA > change.fromA) {

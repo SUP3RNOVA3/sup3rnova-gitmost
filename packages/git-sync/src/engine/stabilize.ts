@@ -17,7 +17,7 @@ import {
   markdownToProseMirror,
   serializeDocmostMarkdownBody,
   type DocmostMdMeta,
-} from "../lib/index.js";
+} from "../lib/index";
 
 /**
  * Meta object as `exportPageBody` builds it (SPEC §4). Kept byte-for-byte

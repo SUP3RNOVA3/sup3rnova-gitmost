@@ -15,8 +15,8 @@ export {
   markdownToProseMirror,
   canonicalizeContent,
   docsCanonicallyEqual,
-} from "./lib/index.js";
-export type { DocmostMdMeta } from "./lib/index.js";
+} from "./lib/index";
+export type { DocmostMdMeta } from "./lib/index";
 
 // Pure engine (no IO): reconcile planner, vault layout, sanitize, stabilize,
 // loop-guard body hash.
@@ -25,7 +25,7 @@ export {
   decideAbsenceDeletions,
   MASS_DELETE_MIN_EXISTING,
   MASS_DELETE_FRACTION,
-} from "./engine/reconcile.js";
+} from "./engine/reconcile";
 export type {
   LiveEntry,
   ExistingEntry,
@@ -33,14 +33,14 @@ export type {
   MovedEntry,
   ReconciliationPlan,
   DeletionDecision,
-} from "./engine/reconcile.js";
+} from "./engine/reconcile";
 
-export { buildVaultLayout } from "./engine/layout.js";
-export type { PageNode, VaultEntry } from "./engine/layout.js";
+export { buildVaultLayout } from "./engine/layout";
+export type { PageNode, VaultEntry } from "./engine/layout";
 
-export { sanitizeTitle, disambiguate } from "./engine/sanitize.js";
+export { sanitizeTitle, disambiguate } from "./engine/sanitize";
 
-export { stabilizePageFile } from "./engine/stabilize.js";
-export type { PageMeta } from "./engine/stabilize.js";
+export { stabilizePageFile } from "./engine/stabilize";
+export type { PageMeta } from "./engine/stabilize";
 
-export { bodyHash } from "./engine/loop-guard.js";
+export { bodyHash } from "./engine/loop-guard";

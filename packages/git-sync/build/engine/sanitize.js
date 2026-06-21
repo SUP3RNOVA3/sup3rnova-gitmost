@@ -1,3 +1,4 @@
+"use strict";
 /**
  * Deterministic filename strategy (SPEC §12).
  *
@@ -6,6 +7,9 @@
  * functions are intentionally dependency-free and pure, so they are trivially
  * unit-testable.
  */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.sanitizeTitle = sanitizeTitle;
+exports.disambiguate = disambiguate;
 // Printable characters forbidden in file names on common filesystems (mainly
 // Windows): / \ < > : " | ? *. Each match is replaced with a single "-".
 // Spaces are NOT in this set; whitespace is normalized separately below.
@@ -64,7 +68,7 @@ function stripControlChars(input) {
  * result, an all-dots result, or a reserved Windows device name by prefixing
  * with "_".
  */
-export function sanitizeTitle(title) {
+function sanitizeTitle(title) {
     let name = stripControlChars(title ?? "")
         .replace(FORBIDDEN_PRINTABLE_RE, "-")
         .replace(WHITESPACE_RUN_RE, " ")
@@ -92,6 +96,6 @@ export function sanitizeTitle(title) {
  * to the same name. Appends a stable suffix built from the page's `slugId`, so
  * the result stays deterministic across runs (SPEC §12: `Title ~slugId`).
  */
-export function disambiguate(name, slugId) {
+function disambiguate(name, slugId) {
     return `${name} ~${slugId}`;
 }

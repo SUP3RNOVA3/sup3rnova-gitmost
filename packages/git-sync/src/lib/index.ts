@@ -14,14 +14,14 @@ export {
   serializeDocmostMarkdown,
   parseDocmostMarkdown,
   serializeDocmostMarkdownBody,
-} from "./markdown-document.js";
-export type { DocmostMdMeta } from "./markdown-document.js";
+} from "./markdown-document";
+export type { DocmostMdMeta } from "./markdown-document";
 
-export { convertProseMirrorToMarkdown } from "./markdown-converter.js";
+export { convertProseMirrorToMarkdown } from "./markdown-converter";
 
-export { markdownToProseMirror } from "./markdown-to-prosemirror.js";
+export { markdownToProseMirror } from "./markdown-to-prosemirror";
 
 export {
   canonicalizeContent,
   docsCanonicallyEqual,
-} from "./canonicalize.js";
+} from "./canonicalize";

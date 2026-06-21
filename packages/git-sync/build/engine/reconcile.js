@@ -1,3 +1,4 @@
+"use strict";
 /**
  * Pure reconciliation planner (SPEC §5/§6/§8).
  *
@@ -11,6 +12,10 @@
  * This module is intentionally PURE (no IO, no git) so the whole plan is
  * unit-testable. The actual file writing / git operations happen in pull.ts.
  */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MASS_DELETE_FRACTION = exports.MASS_DELETE_MIN_EXISTING = void 0;
+exports.planReconciliation = planReconciliation;
+exports.decideAbsenceDeletions = decideAbsenceDeletions;
 /**
  * Compute the reconciliation plan.
  *
@@ -33,7 +38,7 @@
  *     path is removed (as an absence/move) so the vault converges to exactly the
  *     live set.
  */
-export function planReconciliation(live, existing) {
+function planReconciliation(live, existing) {
     // Desired path for each live pageId.
     const liveByPageId = new Map();
     // Set of all paths that WILL be written (never delete/remove one of these).
@@ -81,9 +86,9 @@ export function planReconciliation(live, existing) {
  * Below this many tracked files the mass-delete fraction guard is not applied
  * (a tiny vault where deleting "most" files is normal, e.g. 1-of-2).
  */
-export const MASS_DELETE_MIN_EXISTING = 4;
+exports.MASS_DELETE_MIN_EXISTING = 4;
 /** Fraction of tracked files above which a delete plan is a suspected wipe. */
-export const MASS_DELETE_FRACTION = 0.5;
+exports.MASS_DELETE_FRACTION = 0.5;
 /**
  * Pure decision: should the ABSENCE-based deletions (`plan.toDelete`) be applied
  * this cycle? Encapsulates the SPEC §8 safety invariants so they are unit-
@@ -100,7 +105,7 @@ export const MASS_DELETE_FRACTION = 0.5;
  * Moves are NOT governed by this decision: a moved page IS present in `live`, so
  * its old-path removal is real (handled by the caller separately).
  */
-export function decideAbsenceDeletions(args) {
+function decideAbsenceDeletions(args) {
     const { treeComplete, liveCount, existingCount, deleteCount } = args;
     // No tracked files, or nothing to delete -> trivially fine to "apply".
     if (existingCount === 0 || deleteCount === 0)
@@ -109,8 +114,8 @@ export function decideAbsenceDeletions(args) {
         return { apply: false, reason: "incomplete-fetch" };
     if (liveCount === 0)
         return { apply: false, reason: "empty-live" };
-    if (existingCount >= MASS_DELETE_MIN_EXISTING &&
-        deleteCount > existingCount * MASS_DELETE_FRACTION) {
+    if (existingCount >= exports.MASS_DELETE_MIN_EXISTING &&
+        deleteCount > existingCount * exports.MASS_DELETE_FRACTION) {
         return { apply: false, reason: "mass-delete" };
     }
     return { apply: true };

@@ -10,7 +10,7 @@
  * lives in each file's meta block (pageId / slugId).
  */
 
-import { sanitizeTitle, disambiguate } from "./sanitize.js";
+import { sanitizeTitle, disambiguate } from "./sanitize";
 
 /** Flat page node as returned by `listAllSpacePages` (no content). */
 export interface PageNode {

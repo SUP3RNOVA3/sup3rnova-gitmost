@@ -1,3 +1,4 @@
+"use strict";
 /**
  * Pure, network-free helpers for manipulating a ProseMirror/TipTap document
  * tree by node id.
@@ -13,6 +14,19 @@
  * never mutated. All functions are defensively null-safe: missing/!Array
  * `content`, non-object nodes, and absent `attrs` are tolerated.
  */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.blockPlainText = blockPlainText;
+exports.buildOutline = buildOutline;
+exports.getNodeByRef = getNodeByRef;
+exports.replaceNodeById = replaceNodeById;
+exports.deleteNodeById = deleteNodeById;
+exports.sanitizeForYjs = sanitizeForYjs;
+exports.findUnstorableAttr = findUnstorableAttr;
+exports.insertNodeRelative = insertNodeRelative;
+exports.readTable = readTable;
+exports.insertTableRow = insertTableRow;
+exports.deleteTableRow = deleteTableRow;
+exports.updateTableCell = updateTableCell;
 /** Deep-clone a JSON-serializable value without mutating the original. */
 function clone(value) {
     if (typeof structuredClone === "function") {
@@ -36,7 +50,7 @@ function matchesId(node, nodeId) {
  * joined `blockPlainText` of their `content` children. Returns "" for nullish
  * or non-object inputs.
  */
-export function blockPlainText(node) {
+function blockPlainText(node) {
     if (!isObject(node))
         return "";
     let out = "";
@@ -66,7 +80,7 @@ function truncate(text, n) {
  * `firstText` is the block's plain text truncated to 100 chars. Null-safe:
  * a missing or non-object doc/content yields `[]`.
  */
-export function buildOutline(doc) {
+function buildOutline(doc) {
     if (!isObject(doc) || !Array.isArray(doc.content))
         return [];
     const out = [];
@@ -109,7 +123,7 @@ export function buildOutline(doc) {
  * (so a top-level block is `[index]`). The returned `node` is a DEEP CLONE,
  * so callers can mutate it without touching the input doc. Null-safe.
  */
-export function getNodeByRef(doc, ref) {
+function getNodeByRef(doc, ref) {
     if (!isObject(doc))
         return null;
     // "#<n>": index into the top-level content array.
@@ -149,7 +163,7 @@ export function getNodeByRef(doc, ref) {
  * is the number of nodes substituted. A fresh clone of `newNode` is used for
  * each match so they do not share references.
  */
-export function replaceNodeById(doc, nodeId, newNode) {
+function replaceNodeById(doc, nodeId, newNode) {
     const out = clone(doc);
     let replaced = 0;
     // Walk a content array, replacing direct matches and recursing into the
@@ -180,7 +194,7 @@ export function replaceNodeById(doc, nodeId, newNode) {
  * Operates on a clone of `doc`; returns `{ doc, deleted }` where `deleted` is
  * the number of nodes removed.
  */
-export function deleteNodeById(doc, nodeId) {
+function deleteNodeById(doc, nodeId) {
     const out = clone(doc);
     let deleted = 0;
     // Filter a content array in place, dropping matches and recursing into the
@@ -214,7 +228,7 @@ export function deleteNodeById(doc, nodeId) {
  * returns it; the input is never mutated. Defensively null-safe like the rest
  * of the file.
  */
-export function sanitizeForYjs(doc) {
+function sanitizeForYjs(doc) {
     const out = clone(doc);
     // Drop every key whose value is strictly `undefined` from an attrs object.
     const stripUndefined = (attrs) => {
@@ -252,7 +266,7 @@ export function sanitizeForYjs(doc) {
  * (e.g. `content[3].content[0].attrs.indent (undefined)`). Returns `null` when
  * every attribute is storable. Null-safe.
  */
-export function findUnstorableAttr(doc) {
+function findUnstorableAttr(doc) {
     const isUnstorable = (value) => {
         if (value === undefined)
             return "undefined";
@@ -384,7 +398,7 @@ function findAnchorChain(doc, opts) {
  * false when the anchor could not be resolved (the doc is returned unchanged
  * apart from being cloned).
  */
-export function insertNodeRelative(doc, node, opts) {
+function insertNodeRelative(doc, node, opts) {
     const out = clone(doc);
     const fresh = clone(node);
     // Defensive: stay null-safe like the other exports — a missing opts means
@@ -605,7 +619,7 @@ function makeCellParagraph(id, text) {
  *   so callers can `patch_node` a cell for rich-formatted edits.
  * - `path`: index path of the table within the doc.
  */
-export function readTable(doc, tableRef) {
+function readTable(doc, tableRef) {
     const root = clone(doc);
     const located = locateTable(root, tableRef);
     if (located == null)
@@ -645,7 +659,7 @@ export function readTable(doc, tableRef) {
  * `colspan:1, rowspan:1` attrs. `index` (when an integer in `[0, rows]`) splices
  * the row there; otherwise the row is appended at the end.
  */
-export function insertTableRow(doc, tableRef, cells, index) {
+function insertTableRow(doc, tableRef, cells, index) {
     const out = clone(doc);
     const located = locateTable(out, tableRef);
     if (located == null)
@@ -706,7 +720,7 @@ export function insertTableRow(doc, tableRef, cells, index) {
  * `deleted` is false only when the table cannot be located. Throws on an
  * out-of-range index, and refuses to delete the table's only row.
  */
-export function deleteTableRow(doc, tableRef, index) {
+function deleteTableRow(doc, tableRef, index) {
     const out = clone(doc);
     const located = locateTable(out, tableRef);
     if (located == null)
@@ -732,7 +746,7 @@ export function deleteTableRow(doc, tableRef, index) {
  * that reuses the cell's existing first-paragraph id when present, else a fresh
  * one.
  */
-export function updateTableCell(doc, tableRef, row, col, text) {
+function updateTableCell(doc, tableRef, row, col, text) {
     const out = clone(doc);
     const located = locateTable(out, tableRef);
     if (located == null)

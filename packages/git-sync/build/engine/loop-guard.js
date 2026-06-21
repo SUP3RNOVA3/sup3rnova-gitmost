@@ -1,3 +1,6 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.bodyHash = bodyHash;
 /**
  * Loop-guard primitives (SPEC §10). The sync engine must never re-pull its OWN
  * write as if it were a remote edit: after a push, the next poll will see the
@@ -10,7 +13,7 @@
  * to decide "this is our own write, ignore it") is a future increment — here we
  * only PRODUCE the hash and the per-page push record (see `src/push.ts`).
  */
-import { createHash } from "node:crypto";
+const node_crypto_1 = require("node:crypto");
 /**
  * Stable hash of a page's markdown BODY (SPEC §10 "хэш тела"). Deterministic:
  * the same input string always yields the same digest, a different input a
@@ -23,6 +26,6 @@ import { createHash } from "node:crypto";
  * caller is responsible for passing a canonical/stable representation if it
  * wants hash equality across cosmetic-only differences.
  */
-export function bodyHash(markdownBody) {
-    return createHash("sha256").update(markdownBody, "utf8").digest("hex");
+function bodyHash(markdownBody) {
+    return (0, node_crypto_1.createHash)("sha256").update(markdownBody, "utf8").digest("hex");
 }
