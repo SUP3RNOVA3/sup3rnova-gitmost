@@ -52,7 +52,12 @@ export function resolveSource(
   stickyTouched: boolean,
   contextActor?: string,
 ): ProvenanceSource {
-  return stickyTouched || contextActor === 'agent' ? 'agent' : 'user';
+  // Precedence: agent > git-sync > user. The sticky agent marker wins so a
+  // window that mixed an agent edit stays tagged 'agent'; otherwise a native
+  // git-sync write (plan §8.1) tags 'git-sync'; a plain human edit stays 'user'.
+  if (stickyTouched || contextActor === 'agent') return 'agent';
+  if (contextActor === 'git-sync') return 'git-sync';
+  return 'user';
 }
 
 /**
@@ -176,6 +181,9 @@ export class PersistenceExtension implements Extension {
     // Sticky agent marker: 'agent' if any agent edit landed in this window, OR
     // if the current writer is the agent (covers a store with no prior onChange
     // agent event in the same window). §15 H2.
+    // Provenance precedence: agent > git-sync > user (see resolveSource). A
+    // 'git-sync' store is NOT given an immediate history snapshot — it is
+    // debounced like a human edit (git-sync writes are full-body replaces).
     const lastUpdatedSource = resolveSource(
       this.consumeAgentTouched(documentName),
       context?.actor,

@@ -9,6 +9,8 @@ import { ProvenanceSource } from '../../core/auth/dto/jwt-payload';
  * cannot fake an 'agent' marker.
  */
 export interface AuthProvenanceData {
+  // ProvenanceSource includes 'git-sync' — set by the in-process git-sync data
+  // plane (plan §8.1) when it drives PageService writes; never from a request token.
   actor: ProvenanceSource;
   aiChatId: string | null;
 }
