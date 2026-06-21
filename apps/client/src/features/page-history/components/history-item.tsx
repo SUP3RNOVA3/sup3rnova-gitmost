@@ -1,6 +1,7 @@
 import { Text, Group, UnstyledButton, Avatar, Tooltip } from "@mantine/core";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { AiAgentBadge } from "@/components/ui/ai-agent-badge.tsx";
+import { GitSyncBadge } from "@/components/ui/git-sync-badge.tsx";
 import { formattedDate } from "@/lib/time";
 import classes from "./css/history.module.css";
 import clsx from "clsx";
@@ -41,6 +42,7 @@ const HistoryItem = memo(function HistoryItem({
   const contributors = historyItem.contributors;
   const hasContributors = contributors && contributors.length > 0;
   const isAgentEdit = historyItem.lastUpdatedSource === "agent";
+  const isGitSyncEdit = historyItem.lastUpdatedSource === "git-sync";
 
   return (
     <UnstyledButton
@@ -107,6 +109,10 @@ const HistoryItem = memo(function HistoryItem({
             // into the chat (the badge no longer reaches into page-history).
             onActivate={() => setHistoryModalOpen(false)}
           />
+        )}
+
+        {isGitSyncEdit && (
+          <GitSyncBadge authorName={historyItem.lastUpdatedBy?.name} />
         )}
       </Group>
     </UnstyledButton>

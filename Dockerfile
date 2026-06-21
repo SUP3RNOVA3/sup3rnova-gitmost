@@ -17,8 +17,9 @@ RUN pnpm build
 
 FROM base AS installer
 
+# git: required by the git-sync VaultGit (shells out to git)
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl bash \
+  && apt-get install -y --no-install-recommends curl bash git \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
