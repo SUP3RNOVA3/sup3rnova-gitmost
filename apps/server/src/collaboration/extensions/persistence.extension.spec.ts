@@ -314,7 +314,7 @@ describe('PersistenceExtension', () => {
       expect(pageRepo.updatePage).not.toHaveBeenCalled();
     });
 
-    it('seeds + persists when the persisted ydoc lacks a title fragment', async () => {
+    it('seeds + persists under a lock when the persisted ydoc lacks a title fragment', async () => {
       const src = TiptapTransformer.toYdoc(bodyJson, 'default', tiptapExtensions);
       const page = {
         id: 'PAGE_ID',
@@ -322,6 +322,7 @@ describe('PersistenceExtension', () => {
         ydoc: Buffer.from(Y.encodeStateAsUpdate(src)),
         content: null,
       };
+      // Both the cheap pre-check and the locked re-read return the same row.
       pageRepo.findById.mockResolvedValue(page);
 
       const document = { isEmpty: () => true };
@@ -330,14 +331,23 @@ describe('PersistenceExtension', () => {
         document,
       } as any);
 
+      // The locked re-read must take the row lock inside the tx.
+      const lockedReadCall = pageRepo.findById.mock.calls.find(
+        (c: any[]) => c[1]?.withLock,
+      );
+      expect(lockedReadCall).toBeDefined();
+      expect(lockedReadCall[1].trx).toBe(trx);
+
       expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
       const call = pageRepo.updatePage.mock.calls[0];
       expect(Buffer.isBuffer(call[0].ydoc)).toBe(true);
       expect(call[1]).toBe('PAGE_ID');
+      // Persist must run inside the transaction.
+      expect(call[2]).toBe(trx);
       expect(result).toBeTruthy();
     });
 
-    it('does NOT persist when the ydoc already has a title fragment', async () => {
+    it('does NOT lock or persist when the ydoc already has a title fragment', async () => {
       const src = TiptapTransformer.toYdoc(bodyJson, 'default', tiptapExtensions);
       Y.applyUpdate(src, Y.encodeStateAsUpdate(buildTitleSeedYdoc('Has Title')));
       const page = {
@@ -354,11 +364,14 @@ describe('PersistenceExtension', () => {
         document,
       } as any);
 
+      // Hot path: only the cheap lock-free read, no locked re-read, no write.
+      expect(pageRepo.findById).toHaveBeenCalledTimes(1);
+      expect(pageRepo.findById.mock.calls[0][1]?.withLock).toBeFalsy();
       expect(pageRepo.updatePage).not.toHaveBeenCalled();
       expect(result).toBeTruthy();
     });
 
-    it('converts legacy content -> ydoc and persists the built doc', async () => {
+    it('converts legacy content -> ydoc inside a tx and persists a {ydoc} Buffer', async () => {
       const page = {
         id: 'PAGE_ID',
         title: 'T',
@@ -373,8 +386,98 @@ describe('PersistenceExtension', () => {
         document,
       } as any);
 
+      const lockedReadCall = pageRepo.findById.mock.calls.find(
+        (c: any[]) => c[1]?.withLock,
+      );
+      expect(lockedReadCall).toBeDefined();
+      expect(lockedReadCall[1].trx).toBe(trx);
+
       expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+      const call = pageRepo.updatePage.mock.calls[0];
+      expect(Buffer.isBuffer(call[0].ydoc)).toBe(true);
+      expect(call[2]).toBe(trx);
+      // The rebuilt doc carries the body.
+      expect(JSON.stringify(cloneOut(result))).toContain('hello');
+    });
+
+    it('SKIPS rebuild when the locked re-read shows the ydoc was already healed', async () => {
+      // Simulate a concurrent process: the cheap pre-check sees ydoc=null (legacy
+      // rebuild path), but by the time we hold the lock another process has
+      // already persisted a healthy ydoc. We must adopt it, not rebuild/clobber.
+      const healed = TiptapTransformer.toYdoc(
+        { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'healed' }] }] },
+        'default',
+        tiptapExtensions,
+      );
+      Y.applyUpdate(healed, Y.encodeStateAsUpdate(buildTitleSeedYdoc('Healed Title')));
+      const healedYdoc = Buffer.from(Y.encodeStateAsUpdate(healed));
+
+      const preCheck = { id: 'PAGE_ID', title: 'T', ydoc: null, content: bodyJson };
+      const lockedRow = {
+        id: 'PAGE_ID',
+        title: 'Healed Title',
+        ydoc: healedYdoc,
+        content: bodyJson,
+      };
+      pageRepo.findById
+        .mockResolvedValueOnce(preCheck) // cheap pre-check
+        .mockResolvedValueOnce(lockedRow); // locked re-read
+
+      const document = { isEmpty: () => true };
+      const result = await ext.onLoadDocument({
+        documentName: 'page.PAGE_ID',
+        document,
+      } as any);
+
+      // The healthy ydoc had a title fragment already, so nothing was rebuilt or
+      // seeded -> no clobbering write.
+      expect(pageRepo.updatePage).not.toHaveBeenCalled();
+      // The returned doc is the healed body, NOT a fresh rebuild of bodyJson.
+      expect(JSON.stringify(cloneOut(result))).toContain('healed');
+    });
+
+    it('REJECTS the load when the rebuild persist fails (does not return an unpersisted doc)', async () => {
+      const page = { id: 'PAGE_ID', title: 'T', ydoc: null, content: bodyJson };
+      pageRepo.findById.mockResolvedValue(page);
+      pageRepo.updatePage.mockRejectedValue(new Error('db down'));
+      const errSpy = jest
+        .spyOn((ext as any).logger, 'error')
+        .mockImplementation(() => undefined);
+
+      const document = { isEmpty: () => true };
+      await expect(
+        ext.onLoadDocument({
+          documentName: 'page.PAGE_ID',
+          document,
+        } as any),
+      ).rejects.toThrow('db down');
+      expect(errSpy).toHaveBeenCalled();
+    });
+
+    it('seed-only persist FAILURE returns the doc from the existing ydoc (no throw)', async () => {
+      const src = TiptapTransformer.toYdoc(bodyJson, 'default', tiptapExtensions);
+      const page = {
+        id: 'PAGE_ID',
+        title: 'Legacy Title',
+        ydoc: Buffer.from(Y.encodeStateAsUpdate(src)),
+        content: null,
+      };
+      pageRepo.findById.mockResolvedValue(page);
+      pageRepo.updatePage.mockRejectedValue(new Error('db down'));
+      const errSpy = jest
+        .spyOn((ext as any).logger, 'error')
+        .mockImplementation(() => undefined);
+
+      const document = { isEmpty: () => true };
+      const result = await ext.onLoadDocument({
+        documentName: 'page.PAGE_ID',
+        document,
+      } as any);
+
+      // Non-fatal: we fall back to the doc loaded from the existing page.ydoc.
       expect(result).toBeTruthy();
+      expect(JSON.stringify(cloneOut(result))).toContain('hello');
+      expect(errSpy).toHaveBeenCalled();
     });
   });
 });

@@ -155,6 +155,10 @@ export class PersistenceExtension implements Extension {
       return;
     }
 
+    // Cheap, lock-free pre-check (hot path stays lock-free). It tells us whether
+    // any heal (legacy rebuild and/or title seed) is needed; the heal itself
+    // re-reads the row FOR UPDATE and re-validates inside a transaction so it
+    // runs exactly once (see healUnderLock).
     const page = await this.pageRepo.findById(pageId, {
       includeContent: true,
       includeYdoc: true,
@@ -166,25 +170,44 @@ export class PersistenceExtension implements Extension {
     }
 
     if (page.ydoc) {
-      this.logger.debug(`ydoc loaded from db: ${pageId}`);
-
       const doc = new Y.Doc();
-      const dbState = new Uint8Array(page.ydoc);
-
-      Y.applyUpdate(doc, dbState);
+      Y.applyUpdate(doc, new Uint8Array(page.ydoc));
 
       // Legacy pages persisted their title only in the `page.title` column; the
-      // ydoc has no 'title' fragment. Seed it once so the client's
-      // collaborative title editor can show/edit the title. This runs inside the
-      // ydoc branch (NOT gated by the top-level 'default' body guard) because a
-      // body that loaded from page.ydoc can still lack a title fragment. The
-      // seed persists back to the DB so it is one-shot per page.
-      const seeded = this.seedTitleFragment(doc, page.title);
-      if (seeded) {
-        await this.persistYdoc(doc, pageId);
+      // ydoc has no 'title' fragment. Decide cheaply (no lock) whether a seed is
+      // needed by inspecting the loaded doc's 'title' fragment. A seed is needed
+      // only when that fragment is empty AND there is a non-empty column title.
+      let titleSeedNeeded = false;
+      try {
+        const titleFrag = doc.get('title', Y.XmlFragment);
+        titleSeedNeeded = titleFrag.length === 0 && !!page.title?.trim();
+      } catch (err) {
+        // A malformed title fragment must not break loading; skip the seed.
+        this.logger.warn(`failed to inspect title fragment: ${err?.['message']}`);
+        titleSeedNeeded = false;
       }
 
-      return doc;
+      if (!titleSeedNeeded) {
+        // Fully healthy: a ydoc with a title fragment (or nothing to seed).
+        this.logger.debug(`ydoc loaded from db: ${pageId}`);
+        return doc;
+      }
+
+      // SEED-ONLY heal: a valid page.ydoc already exists; we only need to add the
+      // title fragment. If the persist fails we must NOT hand out an unpersisted
+      // fresh-client-id seed (it could later duplicate the title), so we fall
+      // back to the healthy doc loaded from the EXISTING page.ydoc, without the
+      // seed. The title just won't render until a later successful heal —
+      // non-fatal, non-corrupting.
+      try {
+        return await this.healUnderLock(pageId);
+      } catch (err) {
+        this.logger.error(
+          `Failed to persist seeded ydoc for page ${pageId}; serving existing ydoc without title seed`,
+          err,
+        );
+        return doc;
+      }
     }
 
     // NOTE (offline-sync M1, Goal 2): this per-load self-heal converts +
@@ -195,35 +218,86 @@ export class PersistenceExtension implements Extension {
     // which a Kysely SQL migration cannot run; no runnable-task/CLI convention
     // exists in this repo yet, so we deliberately avoid a fragile migration.
     //
-    // If no ydoc state in db, convert the JSON in page.content to a Y.Doc.
+    // If no ydoc state in db, REBUILD a Y.Doc from the JSON in page.content under
+    // a row lock (see healUnderLock).
     if (page.content) {
-      this.logger.debug(`converting json to ydoc: ${pageId}`);
-
-      const ydoc = TiptapTransformer.toYdoc(
-        page.content,
-        'default',
-        tiptapExtensions,
-      );
-
-      // Seed the title fragment for legacy pages here too, so the freshly built
-      // ydoc carries the title from the page.title column.
-      this.seedTitleFragment(ydoc, page.title);
-
-      // DUPLICATION TRAP (classic Yjs): this rebuild produces a ydoc with FRESH
-      // Yjs client-ids each time it runs. If we returned it WITHOUT persisting,
-      // a later load would rebuild again with different client-ids, and a
-      // long-offline client holding a ydoc derived from an EARLIER rebuild could
-      // merge its update and DUPLICATE all the content (the two states share no
-      // common ancestor). Persist the built ydoc to page.ydoc immediately so
-      // every subsequent load takes the page.ydoc branch above and this rebuild
-      // never runs again for this page (one-shot per page).
-      await this.persistYdoc(ydoc, pageId);
-
-      return ydoc;
+      // REBUILD heal: surface failures. If the persist fails we REFUSE the load
+      // (re-throw) rather than hand out an unpersisted fresh-client-id rebuild —
+      // returning it would re-arm the duplication trap. A transient DB failure
+      // means the client reconnects and retries: correctness over availability.
+      try {
+        return await this.healUnderLock(pageId);
+      } catch (err) {
+        this.logger.error(
+          `Failed to persist rebuilt ydoc for page ${pageId}; refusing load`,
+          err,
+        );
+        throw err;
+      }
     }
 
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
     return new Y.Doc();
+  }
+
+  /**
+   * Serialize the legacy self-heal (rebuild from page.content and/or seed the
+   * title fragment, then persist) so it runs exactly ONCE per page, closing the
+   * Yjs duplication trap. Both TiptapTransformer.toYdoc and buildTitleSeedYdoc
+   * mint FRESH Yjs client-ids every call, so two concurrent rebuilds (the API
+   * process via openDirectConnection AND the standalone collab process both
+   * seeing `ydoc IS NULL`) could each persist a different-client-id state and let
+   * a long-offline client merge-and-duplicate. We prevent that by re-reading the
+   * row FOR UPDATE inside a transaction and re-validating state under the lock:
+   * whoever wins the lock heals; the loser observes the healthy `ydoc` and adopts
+   * it instead of rebuilding. The persist happens IN THE SAME TX, so a failed
+   * write rolls back and propagates out (the caller then decides refuse vs.
+   * fall-back).
+   */
+  private async healUnderLock(pageId: string): Promise<Y.Doc> {
+    return executeTx(this.db, async (trx) => {
+      const locked = await this.pageRepo.findById(pageId, {
+        withLock: true,
+        includeContent: true,
+        includeYdoc: true,
+        trx,
+      });
+
+      const doc = new Y.Doc();
+      let rebuilt = false;
+
+      if (locked?.ydoc) {
+        // Another process already healed (or the page always had a ydoc): adopt
+        // the healthy persisted state, do NOT rebuild.
+        Y.applyUpdate(doc, new Uint8Array(locked.ydoc));
+      } else if (locked?.content) {
+        this.logger.debug(`converting json to ydoc: ${pageId}`);
+        const built = TiptapTransformer.toYdoc(
+          locked.content,
+          'default',
+          tiptapExtensions,
+        );
+        Y.applyUpdate(doc, Y.encodeStateAsUpdate(built));
+        rebuilt = true;
+      }
+      // else: no ydoc and no content -> a fresh empty doc.
+
+      // Idempotent, emptiness-guarded title seed (safe to call always).
+      const seeded = this.seedTitleFragment(doc, locked?.title ?? null);
+
+      if (rebuilt || seeded) {
+        // Persist IN THE SAME TX. If this throws, the tx rolls back and the
+        // error propagates out of executeTx to the caller.
+        await this.pageRepo.updatePage(
+          { ydoc: Buffer.from(Y.encodeStateAsUpdate(doc)) },
+          pageId,
+          trx,
+        );
+        this.logger.debug(`persisted rebuilt/seeded ydoc: ${pageId}`);
+      }
+
+      return doc;
+    });
   }
 
   /**
@@ -251,28 +325,6 @@ export class PersistenceExtension implements Extension {
     } catch (err) {
       this.logger.warn(`failed to seed title fragment: ${err?.['message']}`);
       return false;
-    }
-  }
-
-  /**
-   * Persist the current state of `doc` into page.ydoc. Used by the one-shot
-   * rebuild/seed self-heal in onLoadDocument so the conversion is durable and
-   * never repeats. Defensive (try/catch + log): a persistence failure here must
-   * NOT break document loading — the in-memory doc is still returned and the
-   * next store will persist it anyway.
-   */
-  private async persistYdoc(doc: Y.Doc, pageId: string): Promise<void> {
-    try {
-      await this.pageRepo.updatePage(
-        { ydoc: Buffer.from(Y.encodeStateAsUpdate(doc)) },
-        pageId,
-      );
-      this.logger.debug(`persisted rebuilt/seeded ydoc: ${pageId}`);
-    } catch (err) {
-      this.logger.error(
-        `Failed to persist rebuilt/seeded ydoc for page ${pageId}`,
-        err,
-      );
     }
   }
 
