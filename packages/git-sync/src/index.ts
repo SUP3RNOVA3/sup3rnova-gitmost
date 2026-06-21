@@ -44,3 +44,71 @@ export { stabilizePageFile } from "./engine/stabilize";
 export type { PageMeta } from "./engine/stabilize";
 
 export { bodyHash } from "./engine/loop-guard";
+
+// IO engine (plan §2.1/§3.1): the client seam, the VaultGit git wrapper, the
+// pull (Docmost->FS) + push (FS->Docmost) planners/appliers, and the (pure)
+// settings parser. The engine consumes the native `GitSyncClient` seam (server
+// implements it) — the upstream REST `DocmostClient` is NOT vendored.
+export type { GitSyncClient, GitSyncPageNodeLite } from "./engine/client.types";
+
+export {
+  VaultGit,
+  vaultGitEnv,
+  buildCommitMessage,
+  BOT_AUTHOR_NAME,
+  BOT_AUTHOR_EMAIL,
+  DEFAULT_BRANCH,
+} from "./engine/git";
+export type { DiffEntry, MergeResult, CommitOptions } from "./engine/git";
+
+export {
+  readExisting,
+  computePullActions,
+  applyPullActions,
+} from "./engine/pull";
+export type {
+  ReadExistingDeps,
+  PullActionsInput,
+  PullActions,
+  ApplyPullActionsDeps,
+  ApplyResult,
+} from "./engine/pull";
+
+export {
+  classifyRenameMoves,
+  computePushActions,
+  applyPushActions,
+  runPush,
+  parentFolderFile,
+  parseArgs,
+  LAST_PUSHED_REF,
+  DOCMOST_BRANCH,
+  LOCAL_AUTHOR_NAME,
+  LOCAL_AUTHOR_EMAIL,
+  LOCAL_SOURCE_TRAILER,
+} from "./engine/push";
+export type {
+  CreateAction,
+  UpdateAction,
+  DeleteAction,
+  RenameMoveAction,
+  RenameMoveActionClassified,
+  ClassifyRenameMovesDeps,
+  PushActions,
+  PushActionsInput,
+  MetaSide,
+  ApplyPushDeps,
+  WrittenBackPage,
+  PushedPageRecord,
+  PushFailure,
+  PushNoop,
+  ApplyPushResult,
+  PushDeps,
+  PushRunResult,
+  PushParsedArgs,
+} from "./engine/push";
+
+export { parseSettings, envSchema } from "./engine/settings";
+export type { Settings } from "./engine/settings";
+
+export { loadSettingsOrExit } from "./engine/config-errors";
