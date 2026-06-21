@@ -18,6 +18,7 @@ import {
   WorkspaceCaslSubject,
 } from '../../core/casl/interfaces/workspace-ability.type';
 import { EnvironmentService } from '../environment/environment.service';
+import { IsUUID } from 'class-validator';
 import {
   GitSyncOrchestrator,
   GitSyncRunStatus,
@@ -25,6 +26,10 @@ import {
 
 /** Body for the manual one-shot trigger. */
 class TriggerGitSyncDto {
+  // The global ValidationPipe runs with whitelist:true, which STRIPS any field
+  // lacking a validation decorator — without this @IsUUID the spaceId would be
+  // dropped and arrive as undefined.
+  @IsUUID()
   spaceId: string;
 }
 

@@ -375,6 +375,20 @@ export class EnvironmentService {
   }
 
   /**
+   * Defense-in-depth absolute cap on how many pages a single push cycle may
+   * soft-delete (default 5). A non-convergent / phantom-absence cycle whose push
+   * plan would delete more than this is forced to skip deletions that cycle (the
+   * orchestrator logs a WARNING). A non-positive or unparseable value falls back
+   * to the default 5 so the cap can never be silently disabled.
+   */
+  getGitSyncMaxDeletesPerCycle(): number {
+    const parsed = parseInt(
+      this.configService.get<string>('GIT_SYNC_MAX_DELETES_PER_CYCLE', '5'),
+    );
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 5;
+  }
+
+  /**
    * The service user id git-sync writes are attributed to. Required when sync is
    * enabled (validated in environment.validation.ts); optional otherwise.
    */

@@ -34,7 +34,12 @@ export interface GitSyncRunStatus {
   spaceId: string;
   ran: boolean;
   /** Why the cycle did not run (lock held elsewhere, busy, disabled, error). */
-  skipped?: 'lock-held' | 'in-progress' | 'disabled' | 'no-service-user';
+  skipped?:
+    | 'lock-held'
+    | 'in-progress'
+    | 'disabled'
+    | 'no-service-user'
+    | 'merge-in-progress';
   pull?: { written: number; deleted: number; conflict: boolean };
   push?: { mode: string; failures: number };
   error?: string;
@@ -46,12 +51,13 @@ export interface GitSyncRunStatus {
  * in-process per-space mutex (no overlapping cycles on one instance), it runs a
  * PULL (Docmost -> vault) then a PUSH (vault -> Docmost) for a space.
  *
- * Enumeration of enabled spaces (plan §10 / Phase-C dependency): the per-space
- * UI flag `space.settings.gitSync.enabled` is Phase C and not built yet, so this
- * queries spaces whose jsonb flag is already set AND, when none are, treats
- * GIT_SYNC_ENABLED as a master switch that enables ALL spaces (so the feature is
- * exercisable before the UI lands). Once Phase C writes the flag, only flagged
- * spaces sync. The whole loop is gated on GIT_SYNC_ENABLED first.
+ * Enumeration of enabled spaces (plan §10): STRICT opt-in. Only spaces whose
+ * per-space flag `space.settings.gitSync.enabled === true` (written by the Phase-C
+ * UI) are reconciled. There is intentionally NO all-spaces fallback: when no space
+ * carries the flag, git-sync does NOTHING (an empty list) — flagging every space
+ * the moment GIT_SYNC_ENABLED flips on is a safety hazard (it could mass-sync large
+ * spaces). The whole loop is still gated on the GIT_SYNC_ENABLED master switch
+ * first; per-space opt-in is now REQUIRED on top of it.
  */
 @Injectable()
 export class GitSyncOrchestrator {
@@ -112,27 +118,19 @@ export class GitSyncOrchestrator {
   // --- enabled-space enumeration (plan §10) --------------------------------
 
   /**
-   * Enumerate the spaces the poll loop should reconcile. Prefers the Phase-C
-   * per-space flag (`settings->'gitSync'->>'enabled' = 'true'`); when NO space
-   * carries it yet (UI not built), falls back to enumerating ALL live spaces (the
-   * GIT_SYNC_ENABLED master switch already gates whether we get here at all).
+   * Enumerate the spaces the poll loop should reconcile. STRICT opt-in: ONLY
+   * spaces carrying the Phase-C per-space flag (`settings->'gitSync'->>'enabled'
+   * = 'true'`, written by the Phase-C UI) are returned. There is intentionally NO
+   * fallback to "all live spaces" — when no space is flagged this returns an empty
+   * list and git-sync does nothing (correct opt-in behavior). The GIT_SYNC_ENABLED
+   * master switch gates whether the loop runs at all; this flag gates which spaces.
    */
   private async enabledSpaces(): Promise<EnabledSpace[]> {
-    const flagged = await this.db
-      .selectFrom('spaces')
-      .select(['id as spaceId', 'workspaceId'])
-      .where('deletedAt', 'is', null)
-      .where(sql<boolean>`settings->'gitSync'->>'enabled' = 'true'`)
-      .execute();
-
-    if (flagged.length > 0) return flagged;
-
-    // No per-space flag set yet (Phase C UI pending): the master switch enables
-    // all spaces so the feature can be verified end-to-end before the UI lands.
     return this.db
       .selectFrom('spaces')
       .select(['id as spaceId', 'workspaceId'])
       .where('deletedAt', 'is', null)
+      .where(sql<boolean>`settings->'gitSync'->>'enabled' = 'true'`)
       .execute();
   }
 
@@ -226,7 +224,24 @@ export class GitSyncOrchestrator {
     // tracked-file listing or diff (the engine's pull/push assume an inited repo).
     await vault.assertGitAvailable();
     await vault.ensureRepo();
+
+    // Refuse to run on top of an unresolved merge (SPEC §9 / plan §11.2): a prior
+    // conflicting pull leaves the vault mid-merge; the next checkout would fail.
+    if (await vault.isMergeInProgress()) {
+      this.logger.warn(
+        `git-sync[${spaceId}]: vault has an unresolved merge — resolve it (or ` +
+          `'git merge --abort') and re-run (SPEC §9); skipping cycle.`,
+      );
+      return { spaceId, ran: false, skipped: 'merge-in-progress' };
+    }
+
     await vault.ensureBranch('docmost', 'main');
+    // CRITICAL: pull writes happen on the `docmost` branch — applyPullActions
+    // commits there, then checks out `main` and merges docmost -> main. We MUST be
+    // on `docmost` BEFORE applying (mirrors the engine's own pull main()), else the
+    // Docmost content is written straight onto `main`, clobbering local file edits
+    // before push can diff them.
+    await vault.checkout('docmost');
 
     // --- PULL (plan §11.1/§11.2) --------------------------------------------
     // readExisting deps (ReadExistingDeps): list tracked *.md + read by relPath.
@@ -261,16 +276,56 @@ export class GitSyncOrchestrator {
     // binding must be preserved — pass the object, not bound method refs), a
     // makeClient factory returning the push client subset, vault-relative fs
     // read/write, and a logger. dryRun:false performs the real Docmost writes.
+    const pushDeps = {
+      settings,
+      git: vault,
+      makeClient: () => client,
+      readFile: (relPath: string) => readFile(`${vaultRoot}/${relPath}`, 'utf8'),
+      writeFile: (relPath: string, text: string) =>
+        writeFile(`${vaultRoot}/${relPath}`, text, 'utf8'),
+      log: (line: string) => this.logger.log(`git-sync[${spaceId}] ${line}`),
+    };
+
+    // DEFENSE-IN-DEPTH delete cap (plan §11.3 step 6). A non-convergent vault
+    // (e.g. empty/duplicate titles -> colliding paths) can compute PHANTOM
+    // absence-deletions that slip under the engine's mass-delete FRACTION guard
+    // and soft-delete real pages. So plan the push as a DRY-RUN FIRST to read the
+    // delete count, and if it exceeds GIT_SYNC_MAX_DELETES_PER_CYCLE, run the real
+    // apply with a client whose deletePage is NEUTRALIZED — creates/updates/
+    // moves/renames still apply, deletions are skipped this cycle. Never throws.
+    const maxDeletes = this.environmentService.getGitSyncMaxDeletesPerCycle();
+    let suppressDeletes = false;
+    try {
+      const dry = await runPush(pushDeps, { dryRun: true });
+      const plannedDeletes = dry.planned?.deletes ?? 0;
+      if (plannedDeletes > maxDeletes) {
+        suppressDeletes = true;
+        this.logger.warn(
+          `git-sync[${spaceId}]: push delete count ${plannedDeletes} exceeds ` +
+            `GIT_SYNC_MAX_DELETES_PER_CYCLE=${maxDeletes}; skipping deletions this ` +
+            `cycle (possible non-convergence / collision). Investigate vault layout.`,
+        );
+      }
+    } catch (err) {
+      // A failed dry-run plan must not block the apply, but we cannot trust a
+      // delete count we never got — fail SAFE by suppressing deletes this cycle.
+      suppressDeletes = true;
+      this.logger.warn(
+        `git-sync[${spaceId}]: push dry-run planning failed (${
+          err instanceof Error ? err.message : String(err)
+        }); skipping deletions this cycle as a precaution.`,
+      );
+    }
+
+    // When over the cap, neutralize deletes by wrapping the client's deletePage
+    // into a no-op (every other op is forwarded). The dry-run already committed
+    // the working tree to `main`, so the apply re-diffs and converges normally.
+    const applyClient = suppressDeletes
+      ? { ...client, deletePage: async () => undefined }
+      : client;
+
     const pushResult = await runPush(
-      {
-        settings,
-        git: vault,
-        makeClient: () => client,
-        readFile: (relPath) => readFile(`${vaultRoot}/${relPath}`, 'utf8'),
-        writeFile: (relPath, text) =>
-          writeFile(`${vaultRoot}/${relPath}`, text, 'utf8'),
-        log: (line) => this.logger.log(`git-sync[${spaceId}] ${line}`),
-      },
+      { ...pushDeps, makeClient: () => applyClient },
       { dryRun: false },
     );
 
