@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Hocuspocus, Document } from '@hocuspocus/server';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import {
+  buildTitleSeedYdoc,
   prosemirrorNodeToYElement,
   tiptapExtensions,
 } from './collaboration.util';
@@ -18,6 +19,35 @@ import { User } from '@docmost/db/types/entity.types';
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
 >;
+
+/**
+ * Clear+reseed the 'title' XmlFragment of `doc` so it holds EXACTLY `title`.
+ *
+ * Used by the gateway's direct `writePageTitle` method to write a new page
+ * title INTO the page's Yjs 'title' fragment. The title lives in the same
+ * Y.Doc as the body; onStoreDocument extracts it on every save, so a REST/MCP
+ * rename that only updated the page.title DB column would be reverted on the
+ * next collaborative save unless the Yjs 'title' fragment is kept in sync.
+ * The whole fragment is replaced (no merge/append),
+ * mirroring the 'replace' body path: the new title fully supersedes the old.
+ *
+ * DELIBERATE TRADE-OFF: because this does a FULL clear+replace of the 'title'
+ * fragment, a REST/MCP rename arriving while a user is actively editing the
+ * title in an open editor WILL overwrite that in-progress edit. This is
+ * acceptable — the title is a short, rarely-concurrently-edited field — and is
+ * preferable to leaving a stale Yjs title that onStoreDocument would revert the
+ * DB column to on the next save.
+ */
+export function writeTitleFragment(doc: Y.Doc, title: string): void {
+  const titleFragment = doc.getXmlFragment('title');
+
+  if (titleFragment.length > 0) {
+    titleFragment.delete(0, titleFragment.length);
+  }
+
+  const newTitleDoc = buildTitleSeedYdoc(title);
+  Y.applyUpdate(doc, Y.encodeStateAsUpdate(newTitleDoc));
+}
 
 @Injectable()
 export class CollaborationHandler {

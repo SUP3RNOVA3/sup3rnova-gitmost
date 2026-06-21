@@ -182,6 +182,55 @@ describe('PersistenceExtension', () => {
       expect(historyQueue.add).not.toHaveBeenCalled();
     });
 
+    it('an EMPTY title fragment does NOT overwrite a non-empty page.title (anti-corruption guard, Bug 2)', async () => {
+      // The client can momentarily seed the 'title' fragment as an EMPTY heading
+      // (hasTitleFragment true, extracted text '') before the real title syncs.
+      // Body is unchanged here, so the only candidate write is the title -> the
+      // guard must turn this into a full no-op (no updatePage, no broadcast).
+      const document = buildDoc();
+      addTitleFragment(document, ''); // empty heading: length > 0 but text ''
+      const page = basePage({
+        content: cloneOut(document),
+        title: 'Real Title',
+      });
+      pageRepo.findById.mockResolvedValue(page);
+
+      await ext.onStoreDocument({
+        documentName: 'page.PAGE_ID',
+        document,
+        context,
+      } as any);
+
+      // No write at all: the empty title is not authoritative and the body is
+      // unchanged, so onStoreDocument must take the no-op fast path.
+      expect(pageRepo.updatePage).not.toHaveBeenCalled();
+      expect(document.broadcastStateless).not.toHaveBeenCalled();
+    });
+
+    it('an EMPTY title fragment alongside a body change persists the body but NOT an empty title (anti-corruption guard, Bug 2)', async () => {
+      const document = buildDoc();
+      addTitleFragment(document, ''); // empty title fragment
+      const page = basePage({
+        content: { type: 'doc', content: [] }, // different body -> bodyChanged
+        title: 'Real Title',
+      });
+      pageRepo.findById.mockResolvedValue(page);
+
+      await ext.onStoreDocument({
+        documentName: 'page.PAGE_ID',
+        document,
+        context,
+      } as any);
+
+      expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+      const call = pageRepo.updatePage.mock.calls[0];
+      // Body is persisted, but the title is NOT included (empty == not
+      // authoritative) and no tree update is broadcast for the title.
+      expect(call[0].content).toBeTruthy();
+      expect('title' in call[0]).toBe(false);
+      expect(call[3]).toBeUndefined();
+    });
+
     it('body + title change persists both with full body side-effects', async () => {
       const document = buildDoc();
       addTitleFragment(document, 'New Title');

@@ -381,8 +381,26 @@ export class PersistenceExtension implements Extension {
           bodyChanged = !isDeepStrictEqual(tiptapJson, page.content);
           // Only a populated 'title' fragment may update page.title; compare
           // against the current column value (treat null as '').
+          //
+          // ANTI-CORRUPTION GUARD (Bug 2): the client's collaborative title-editor
+          // can momentarily initialize the 'title' fragment as an EMPTY heading
+          // (so `hasTitleFragment` is true, but the extracted `titleText` is '')
+          // BEFORE the server's real-title seed has synced. Writing that '' would
+          // silently wipe a non-empty page.title to "untitled". A wiki page is
+          // never legitimately retitled to empty via this path, so we treat an
+          // empty extracted title as "not authoritative" and never persist it.
+          // The `titleText.length > 0` clause makes this guard apply to BOTH the
+          // title-only branch and the body+title branch below.
+          //
+          // DELIBERATE: this intentionally makes it impossible to retitle a page
+          // to EMPTY via the collab path — a wiki page is never legitimately
+          // empty-titled. If a non-empty-title rule ever needs relaxing or
+          // enforcing differently, the REST UpdatePageDto is the place to validate
+          // the title, not this collab guard.
           const titleChanged =
-            hasTitleFragment && titleText !== (page.title ?? '');
+            hasTitleFragment &&
+            titleText.length > 0 &&
+            titleText !== (page.title ?? '');
 
           // No-op fast path: neither body nor title changed.
           if (!bodyChanged && !titleChanged) {

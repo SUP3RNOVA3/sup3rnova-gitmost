@@ -1,7 +1,14 @@
 import * as Y from 'yjs';
-import { CollaborationHandler } from './collaboration.handler';
+import { CollaborationHandler, writeTitleFragment } from './collaboration.handler';
 import * as yjsUtil from './yjs.util';
 import { User } from '@docmost/db/types/entity.types';
+import { TiptapTransformer } from '@hocuspocus/transformer';
+import { CollaborationGateway } from './collaboration.gateway';
+import {
+  buildTitleSeedYdoc,
+  jsonToText,
+  tiptapExtensions,
+} from './collaboration.util';
 
 /**
  * Unit tests for the `applyCommentSuggestion` collab handler (phase 3 of #315).
@@ -184,5 +191,135 @@ describe('CollaborationHandler.deleteCommentMark', () => {
         attributes: { comment: { commentId: 'other', resolved: false } },
       },
     ]);
+  });
+});
+
+// Read the plain text held in the doc's 'title' XmlFragment, the same way
+// PersistenceExtension.onStoreDocument extracts it before writing page.title.
+const readTitleText = (doc: Y.Doc): string => {
+  const titleJson = TiptapTransformer.fromYdoc(doc, 'title');
+  return titleJson ? jsonToText(titleJson).trim() : '';
+};
+
+describe('writeTitleFragment — the clear+seed title write (Bug 1)', () => {
+  it('replaces an OLD title fragment with EXACTLY the new title (no duplication)', () => {
+    // Seed the doc's 'title' fragment with an OLD title, like a real page.
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(buildTitleSeedYdoc('Old Title')));
+    expect(readTitleText(doc)).toBe('Old Title');
+
+    writeTitleFragment(doc, 'New Title');
+
+    // The fragment must contain EXACTLY the new title — not "Old TitleNew Title"
+    // (append) or "New TitleNew Title" (duplication). A single heading node.
+    expect(readTitleText(doc)).toBe('New Title');
+
+    const titleJson = TiptapTransformer.fromYdoc(doc, 'title') as any;
+    expect(titleJson.content).toHaveLength(1);
+    expect(titleJson.content[0].type).toBe('heading');
+  });
+
+  it('seeds the title fragment when it started empty', () => {
+    const doc = new Y.Doc();
+    // Force the 'title' fragment to exist but be empty.
+    doc.getXmlFragment('title');
+    expect(readTitleText(doc)).toBe('');
+
+    writeTitleFragment(doc, 'First Title');
+
+    expect(readTitleText(doc)).toBe('First Title');
+  });
+
+  it('does not corrupt the body when rewriting the title', () => {
+    // A doc with both a body and an old title; the body must survive untouched.
+    const doc = new Y.Doc();
+    const bodyDoc = TiptapTransformer.toYdoc(
+      {
+        type: 'doc',
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: 'body text' }] },
+        ],
+      },
+      'default',
+      tiptapExtensions,
+    );
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(bodyDoc));
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(buildTitleSeedYdoc('Old')));
+
+    writeTitleFragment(doc, 'New');
+
+    expect(readTitleText(doc)).toBe('New');
+    const bodyJson = TiptapTransformer.fromYdoc(doc, 'default');
+    expect(jsonToText(bodyJson)).toContain('body text');
+  });
+});
+
+describe('CollaborationGateway.writePageTitle — Redis-independent path', () => {
+  // Build a gateway with only its hocuspocus.openDirectConnection stubbed; the
+  // method must drive the clear+seed through that direct connection (NOT through
+  // redisSync), so the title write survives COLLAB_DISABLE_REDIS.
+  const makeGateway = (doc: Y.Doc) => {
+    const disconnect = jest.fn().mockResolvedValue(undefined);
+    const transact = jest.fn(async (fn: (d: Y.Doc) => void) => {
+      fn(doc);
+    });
+    const openDirectConnection = jest
+      .fn()
+      .mockResolvedValue({ transact, disconnect });
+
+    const gateway = Object.create(CollaborationGateway.prototype);
+    // redisSync is intentionally null — this is the no-Redis scenario.
+    gateway.redisSync = null;
+    gateway.hocuspocus = { openDirectConnection } as any;
+
+    return { gateway, openDirectConnection, transact, disconnect };
+  };
+
+  it('writes the new title via openDirectConnection and disconnects', async () => {
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(buildTitleSeedYdoc('Old Title')));
+
+    const { gateway, openDirectConnection, disconnect } = makeGateway(doc);
+
+    await gateway.writePageTitle('page-1', 'New Title', { user: { id: 'u1' } });
+
+    expect(openDirectConnection).toHaveBeenCalledWith(
+      'page.page-1',
+      expect.objectContaining({ user: { id: 'u1' } }),
+    );
+    expect(readTitleText(doc)).toBe('New Title');
+    expect(disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('threads agent provenance into the connection context', async () => {
+    const doc = new Y.Doc();
+    const { gateway, openDirectConnection } = makeGateway(doc);
+
+    await gateway.writePageTitle('page-1', 'Agent Title', {
+      user: { id: 'u1' },
+      actor: 'agent',
+      aiChatId: 'chat-1',
+    });
+
+    expect(openDirectConnection).toHaveBeenCalledWith(
+      'page.page-1',
+      expect.objectContaining({ actor: 'agent', aiChatId: 'chat-1' }),
+    );
+  });
+
+  it('disconnects even when the transaction throws', async () => {
+    const disconnect = jest.fn().mockResolvedValue(undefined);
+    const openDirectConnection = jest.fn().mockResolvedValue({
+      transact: jest.fn().mockRejectedValue(new Error('boom')),
+      disconnect,
+    });
+    const gateway = Object.create(CollaborationGateway.prototype);
+    gateway.redisSync = null;
+    gateway.hocuspocus = { openDirectConnection } as any;
+
+    await expect(
+      gateway.writePageTitle('page-1', 'X', {}),
+    ).rejects.toThrow('boom');
+    expect(disconnect).toHaveBeenCalledTimes(1);
   });
 });

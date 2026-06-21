@@ -31,6 +31,102 @@ describe('PageService', () => {
     expect(service).toBeDefined();
   });
 
+  describe('update — title sync into collab doc (Bug 1)', () => {
+    const makeUpdateService = () => {
+      const pageRepo = {
+        updatePage: jest.fn().mockResolvedValue(undefined),
+        findById: jest.fn().mockResolvedValue({ id: 'page-1' }),
+      };
+      const generalQueue = { add: jest.fn().mockResolvedValue(undefined) };
+      const collaborationGateway = {
+        writePageTitle: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const svc = new PageService(
+        pageRepo as any, // pageRepo
+        {} as any, // pagePermissionRepo
+        {} as any, // attachmentRepo
+        {} as any, // db
+        {} as any, // storageService
+        {} as any, // attachmentQueue
+        {} as any, // aiQueue
+        generalQueue as any, // generalQueue
+        {} as any, // eventEmitter
+        collaborationGateway as any, // collaborationGateway
+        {} as any, // watcherService
+        {} as any, // transclusionService
+      );
+
+      return { svc, pageRepo, collaborationGateway };
+    };
+
+    const basePage = (): Page =>
+      ({
+        id: 'page-1',
+        slugId: 'slug-1',
+        spaceId: 'space-1',
+        workspaceId: 'ws-1',
+        parentPageId: null,
+        title: 'Old Title',
+        icon: null,
+        contributorIds: [],
+      }) as any;
+
+    const user = { id: 'u1' } as any;
+
+    it('writes the new title into the collab doc when the title actually changed', async () => {
+      const { svc, collaborationGateway } = makeUpdateService();
+
+      await svc.update(basePage(), { title: 'New Title' } as any, user);
+
+      // Must use the Redis-independent writePageTitle (direct
+      // openDirectConnection), NOT handleYjsEvent which no-ops without Redis.
+      expect(collaborationGateway.writePageTitle).toHaveBeenCalledTimes(1);
+      expect(collaborationGateway.writePageTitle).toHaveBeenCalledWith(
+        'page-1',
+        'New Title',
+        expect.objectContaining({ user }),
+      );
+    });
+
+    it('threads agent provenance into the collab title write', async () => {
+      const { svc, collaborationGateway } = makeUpdateService();
+
+      await svc.update(basePage(), { title: 'New Title' } as any, user, {
+        actor: 'agent',
+        aiChatId: 'chat-1',
+      } as any);
+
+      expect(collaborationGateway.writePageTitle).toHaveBeenCalledWith(
+        'page-1',
+        'New Title',
+        expect.objectContaining({ actor: 'agent', aiChatId: 'chat-1' }),
+      );
+    });
+
+    it('does NOT write into the collab doc when the title is unchanged', async () => {
+      const { svc, collaborationGateway } = makeUpdateService();
+
+      // Same title -> titleChanged is false; an icon-only change must not fire
+      // the title sync.
+      await svc.update(
+        basePage(),
+        { title: 'Old Title', icon: '📄' } as any,
+        user,
+      );
+
+      expect(collaborationGateway.writePageTitle).not.toHaveBeenCalled();
+    });
+
+    it('does NOT write into the collab doc when the DTO omits the title', async () => {
+      const { svc, collaborationGateway } = makeUpdateService();
+
+      await svc.update(basePage(), { icon: '📄' } as any, user);
+
+      expect(collaborationGateway.writePageTitle).not.toHaveBeenCalled();
+    });
+  });
+
   describe('movePage cycle guard (#67)', () => {
     // A valid fractional-indexing key — movePage validates `position` by feeding
     // it to generateJitteredKeyBetween(position, null) before anything else.

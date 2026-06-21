@@ -15,7 +15,6 @@ import {
   useCreatePageMutation,
   useRemovePageMutation,
   useMovePageMutation,
-  useUpdatePageMutation,
   updateCacheOnMovePage,
 } from "@/features/page/queries/page-query.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
@@ -28,7 +27,6 @@ export type UseTreeMutation = {
     parentId: string | null,
     opts?: { temporary?: boolean },
   ) => Promise<void>;
-  handleRename: (id: string, name: string) => Promise<void>;
   handleDelete: (id: string) => Promise<void>;
 };
 
@@ -40,7 +38,6 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
   // children) and then immediately invokes a handler.
   const store = useStore();
   const createPageMutation = useCreatePageMutation();
-  const updatePageMutation = useUpdatePageMutation();
   const removePageMutation = useRemovePageMutation();
   const movePageMutation = useMovePageMutation();
   const navigate = useNavigate();
@@ -222,20 +219,6 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
     ],
   );
 
-  const handleRename = useCallback(
-    async (id: string, name: string) => {
-      setData((prev) =>
-        treeModel.update(prev, id, { name } as Partial<SpaceTreeNode>),
-      );
-      try {
-        await updatePageMutation.mutateAsync({ pageId: id, title: name });
-      } catch (error) {
-        console.error("Error updating page title:", error);
-      }
-    },
-    [updatePageMutation, setData],
-  );
-
   const handleDelete = useCallback(
     async (id: string) => {
       const node = treeModel.find(
@@ -281,7 +264,7 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
     [removePageMutation, setData, store, pageSlug, navigate, spaceSlug],
   );
 
-  return { handleMove, handleCreate, handleRename, handleDelete };
+  return { handleMove, handleCreate, handleDelete };
 }
 
 function isPageInNode(node: SpaceTreeNode, pageSlug: string): boolean {

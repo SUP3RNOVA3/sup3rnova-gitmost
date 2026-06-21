@@ -267,6 +267,8 @@ export class PageService {
     contributors.add(user.id);
     const contributorIds = Array.from(contributors);
 
+    const isAgent = provenance?.actor === 'agent';
+
     // Detect a real title/icon change so the WS tree listener can broadcast an
     // `updateOne` to the space (rename / icon swap) WITHOUT re-broadcasting on a
     // content-only save. Only treat a field as changed when the DTO actually
@@ -308,6 +310,43 @@ export class PageService {
           }
         : undefined,
     );
+
+    // Bug 1: a REST/MCP rename wrote the new title ONLY to the page.title DB
+    // column above. The title's source of truth is the Yjs 'title' fragment in
+    // the page's collab doc, which onStoreDocument re-extracts on every save —
+    // so leaving the fragment stale would REVERT this rename on the page's next
+    // collaborative save (and re-broadcast the old title). Push the new title
+    // into the Yjs 'title' fragment so Yjs stays in sync and never reverts.
+    //
+    // Use the gateway's writePageTitle (direct openDirectConnection) rather than
+    // a Redis-routed handleYjsEvent path: handleYjsEvent routes through
+    // redisSync and SILENTLY no-ops when Redis is disabled
+    // (COLLAB_DISABLE_REDIS=true), which would let the rename revert in a
+    // single-process deployment. writePageTitle is Redis-independent and
+    // openDirectConnection loads the doc from persistence when no editor is
+    // connected, so this also works for an offline page. Thread agent provenance
+    // into the context so onStoreDocument tags the title store 'agent' too.
+    if (titleChanged) {
+      try {
+        await this.collaborationGateway.writePageTitle(
+          page.id,
+          updatePageDto.title,
+          {
+            user,
+            ...(isAgent
+              ? { actor: 'agent', aiChatId: provenance.aiChatId }
+              : {}),
+          },
+        );
+      } catch (err) {
+        // The DB column write already succeeded (fast-read source stays
+        // correct); a failure to sync Yjs here must not fail the rename. Log so
+        // a persistent desync is visible.
+        this.logger.warn(
+          `Failed to sync renamed title into collab doc for page ${page.id}: ${err?.['message']}`,
+        );
+      }
+    }
 
     this.generalQueue
       .add(QueueJob.ADD_PAGE_WATCHERS, {

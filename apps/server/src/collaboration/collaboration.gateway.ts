@@ -24,7 +24,9 @@ import { CollabWsAdapter } from './adapter/collab-ws.adapter';
 import {
   CollaborationHandler,
   CollabEventHandlers,
+  writeTitleFragment,
 } from './collaboration.handler';
+import { User } from '@docmost/db/types/entity.types';
 
 @Injectable()
 export class CollaborationGateway {
@@ -186,6 +188,45 @@ export class CollaborationGateway {
 
   openDirectConnection(documentName: string, context?: any) {
     return this.hocuspocus.openDirectConnection(documentName, context);
+  }
+
+  /**
+   * Write a new page title INTO the page's Yjs 'title' fragment, Redis-INDEPENDENT.
+   *
+   * Unlike the Redis-routed `handleYjsEvent` path — which routes through
+   * `redisSync?.handleEvent` and SILENTLY no-ops when Redis is disabled
+   * (COLLAB_DISABLE_REDIS=true → redisSync === null) — this goes straight
+   * through the local Hocuspocus `openDirectConnection`. The title sync
+   * therefore works in BOTH single-process (no Redis) and Redis-clustered
+   * deployments.
+   *
+   * openDirectConnection loads the doc from persistence when no editor is
+   * connected, so this works whether or not an editor is currently open: the
+   * clear+reseed lands on the loaded doc and is persisted by onStoreDocument.
+   *
+   * Provenance: when the caller is the agent, the actor/aiChatId are threaded
+   * into the connection `context` so onStoreDocument sees `context.actor ===
+   * 'agent'` for the resulting title store (mirrors the body/REST path). The
+   * resulting title store is usually a no-op anyway — PageService already wrote
+   * the same title to the page.title column, so onStoreDocument's
+   * `titleText !== page.title` guard skips the column write — but we wire the
+   * context for correctness regardless.
+   */
+  async writePageTitle(
+    pageId: string,
+    title: string,
+    context?: { user?: User; actor?: string; aiChatId?: string },
+  ): Promise<void> {
+    const documentName = `page.${pageId}`;
+    const connection = await this.hocuspocus.openDirectConnection(
+      documentName,
+      context ?? {},
+    );
+    try {
+      await connection.transact((doc) => writeTitleFragment(doc, title));
+    } finally {
+      await connection.disconnect();
+    }
   }
 
   /*
