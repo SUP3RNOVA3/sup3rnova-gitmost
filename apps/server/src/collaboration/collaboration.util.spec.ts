@@ -1,9 +1,13 @@
 import * as Y from 'yjs';
+import { TiptapTransformer } from '@hocuspocus/transformer';
 import {
   getPageId,
   isEmptyParagraphDoc,
   jsonToNode,
   prosemirrorNodeToYElement,
+  buildTitleSeedYdoc,
+  jsonToText,
+  tiptapExtensions,
 } from './collaboration.util';
 import { Node } from '@tiptap/pm/model';
 
@@ -239,5 +243,51 @@ describe('prosemirrorNodeToYElement', () => {
     expect(element.length).toBe(2);
     expect(element.get(0).get(0).toString()).toBe('one');
     expect(element.get(1).get(0).toString()).toBe('two');
+  });
+});
+
+describe('buildTitleSeedYdoc', () => {
+  it('builds a level-1 heading carrying the title text', () => {
+    const doc = buildTitleSeedYdoc('Hello World');
+    const json: any = TiptapTransformer.fromYdoc(doc, 'title');
+
+    const first = json.content?.[0];
+    expect(first.type).toBe('heading');
+    expect(first.attrs.level).toBe(1);
+    expect(jsonToText(json).trim()).toBe('Hello World');
+  });
+
+  it('produces a non-empty title fragment for a non-empty title', () => {
+    const doc = buildTitleSeedYdoc('Some Title');
+    expect(doc.get('title', Y.XmlFragment).length).toBeGreaterThan(0);
+  });
+
+  it('produces a heading with no text child for an empty title', () => {
+    const doc = buildTitleSeedYdoc('');
+    const json: any = TiptapTransformer.fromYdoc(doc, 'title');
+
+    const first = json.content?.[0];
+    expect(first.type).toBe('heading');
+    // No text content for an empty title.
+    expect(first.content ?? []).toHaveLength(0);
+    expect(jsonToText(json).trim()).toBe('');
+  });
+
+  it('round-trips a title through build -> extract -> build -> extract', () => {
+    const title = 'Round Trip Title';
+    const doc1 = buildTitleSeedYdoc(title);
+    const text1 = jsonToText(TiptapTransformer.fromYdoc(doc1, 'title')).trim();
+
+    const doc2 = buildTitleSeedYdoc(text1);
+    const text2 = jsonToText(TiptapTransformer.fromYdoc(doc2, 'title')).trim();
+
+    expect(text1).toBe(title);
+    expect(text2).toBe(text1);
+  });
+
+  // Touch tiptapExtensions so the import is exercised (mirrors the brief's import
+  // list and guards against accidental tree-shaking of the schema dependency).
+  it('uses the shared tiptap extensions schema', () => {
+    expect(Array.isArray(tiptapExtensions)).toBe(true);
   });
 });

@@ -24,8 +24,10 @@ import { IPagination } from "@/lib/types.ts";
  * cursor chain until it runs out (or hits maxPages) so the whole list is cached.
  *
  * Best-effort: any failure is swallowed so a partial/failed warm never throws.
+ *
+ * Exported for unit testing of the cursor-walk / cache-write behavior.
  */
-async function warmInfiniteAll<T>(
+export async function warmInfiniteAll<T>(
   queryKey: unknown[],
   fetchPage: (cursor: string | undefined) => Promise<IPagination<T>>,
   maxPages = 50,

@@ -5,6 +5,13 @@ import { EnvironmentService } from './environment.service';
 describe('EnvironmentService', () => {
   let service: EnvironmentService;
 
+  // Build a service over a stub ConfigService whose get(key, def) returns
+  // values from the supplied env map (falling back to the provided default).
+  const makeService = (env: Record<string, string>) =>
+    new EnvironmentService({
+      get: (k: string, d?: string) => (k in env ? env[k] : d),
+    } as any);
+
   beforeEach(() => {
     service = new EnvironmentService(
       {} as any, // configService
@@ -156,6 +163,52 @@ describe('EnvironmentService', () => {
       expect(
         build({ appUrl: 'https://app.example.com' }).getSandboxPublicUrl(),
       ).toBe('https://app.example.com');
+    });
+  });
+
+  describe('getCorsAllowedOrigins', () => {
+    it('splits, trims, and drops empty entries', () => {
+      const svc = makeService({
+        CORS_ALLOWED_ORIGINS:
+          'https://a.com, https://b.com ,, https://c.com',
+      });
+      expect(svc.getCorsAllowedOrigins()).toEqual([
+        'https://a.com',
+        'https://b.com',
+        'https://c.com',
+      ]);
+    });
+
+    it('returns an empty array when the var is absent', () => {
+      const svc = makeService({});
+      expect(svc.getCorsAllowedOrigins()).toEqual([]);
+    });
+  });
+
+  describe('isSwaggerEnabled', () => {
+    it('is true for "true"', () => {
+      expect(makeService({ SWAGGER_ENABLED: 'true' }).isSwaggerEnabled()).toBe(
+        true,
+      );
+    });
+
+    it('is true case-insensitively for "TRUE"', () => {
+      expect(makeService({ SWAGGER_ENABLED: 'TRUE' }).isSwaggerEnabled()).toBe(
+        true,
+      );
+    });
+
+    it('defaults to false when absent', () => {
+      expect(makeService({}).isSwaggerEnabled()).toBe(false);
+    });
+
+    it('is false for non-"true" values', () => {
+      expect(makeService({ SWAGGER_ENABLED: '0' }).isSwaggerEnabled()).toBe(
+        false,
+      );
+      expect(makeService({ SWAGGER_ENABLED: 'yes' }).isSwaggerEnabled()).toBe(
+        false,
+      );
     });
   });
 });
