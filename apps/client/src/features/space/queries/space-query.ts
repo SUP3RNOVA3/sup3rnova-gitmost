@@ -1,5 +1,6 @@
 import {
   keepPreviousData,
+  queryOptions,
   useInfiniteQuery,
   useMutation,
   useQuery,
@@ -31,11 +32,37 @@ import { getRecentChanges } from "@/features/page/services/page-service.ts";
 import { useEffect } from "react";
 import { validate as isValidUuid } from "uuid";
 
+/**
+ * Centralized React Query key factories for space queries. The hooks below and
+ * the offline warm path (features/offline/make-offline.ts) share these so the
+ * runtime keys can never silently drift apart.
+ */
+export const spaceKeys = {
+  detail: (idOrSlug: string) => ["space", idOrSlug] as const,
+  list: (params?: QueryParams) => ["spaces", params] as const,
+  members: (spaceId: string, query?: string) =>
+    ["spaceMembers", spaceId, query] as const,
+};
+
+/**
+ * Shared queryOptions for fetching a space by id/slug. Both
+ * useGetSpaceBySlugQuery and the offline warm path consume this so the key,
+ * queryFn and staleTime stay identical. (`enabled` is intentionally omitted —
+ * prefetchQuery ignores it anyway and the warm path always passes a real id;
+ * the hook reapplies `enabled` itself.)
+ */
+export const spaceByIdQueryOptions = (spaceId: string) =>
+  queryOptions({
+    queryKey: spaceKeys.detail(spaceId),
+    queryFn: () => getSpaceById(spaceId),
+    staleTime: 5 * 60 * 1000,
+  });
+
 export function useGetSpacesQuery(
   params?: QueryParams,
 ): UseQueryResult<IPagination<ISpace>, Error> {
   return useQuery({
-    queryKey: ["spaces", params],
+    queryKey: spaceKeys.list(params),
     queryFn: () => getSpaces(params),
     placeholderData: keepPreviousData,
     refetchOnMount: true,
@@ -44,16 +71,16 @@ export function useGetSpacesQuery(
 
 export function useSpaceQuery(spaceId: string): UseQueryResult<ISpace, Error> {
   const query = useQuery({
-    queryKey: ["space", spaceId],
+    queryKey: spaceKeys.detail(spaceId),
     queryFn: () => getSpaceById(spaceId),
     enabled: !!spaceId,
   });
   useEffect(() => {
     if (query.data) {
       if (isValidUuid(spaceId)) {
-        queryClient.setQueryData(["space", query.data.slug], query.data);
+        queryClient.setQueryData(spaceKeys.detail(query.data.slug), query.data);
       } else {
-        queryClient.setQueryData(["space", query.data.id], query.data);
+        queryClient.setQueryData(spaceKeys.detail(query.data.id), query.data);
       }
     }
   }, [query.data]);
@@ -62,8 +89,11 @@ export function useSpaceQuery(spaceId: string): UseQueryResult<ISpace, Error> {
 }
 
 export const prefetchSpace = (spaceSlug: string, spaceId?: string) => {
+  // Note: intentionally NOT using spaceByIdQueryOptions here — that factory sets
+  // a 5min staleTime which would let this prefetch skip fetching fresh data;
+  // prefetchSpace must always refetch (default staleTime: 0).
   queryClient.prefetchQuery({
-    queryKey: ["space", spaceSlug],
+    queryKey: spaceKeys.detail(spaceSlug),
     queryFn: () => getSpaceById(spaceSlug),
   });
 
@@ -100,10 +130,8 @@ export function useGetSpaceBySlugQuery(
   spaceId: string,
 ): UseQueryResult<ISpace, Error> {
   return useQuery({
-    queryKey: ["space", spaceId],
-    queryFn: () => getSpaceById(spaceId),
+    ...spaceByIdQueryOptions(spaceId),
     enabled: !!spaceId,
-    staleTime: 5 * 60 * 1000,
   });
 }
 
@@ -116,14 +144,16 @@ export function useUpdateSpaceMutation() {
     onSuccess: (data, variables) => {
       notifications.show({ message: t("Space updated successfully") });
 
-      const space = queryClient.getQueryData([
-        "space",
-        variables.spaceId,
-      ]) as ISpace;
+      const space = queryClient.getQueryData(
+        spaceKeys.detail(variables.spaceId),
+      ) as ISpace;
       if (space) {
         const updatedSpace = { ...space, ...data };
-        queryClient.setQueryData(["space", variables.spaceId], updatedSpace);
-        queryClient.setQueryData(["space", data.slug], updatedSpace);
+        queryClient.setQueryData(
+          spaceKeys.detail(variables.spaceId),
+          updatedSpace,
+        );
+        queryClient.setQueryData(spaceKeys.detail(data.slug), updatedSpace);
       }
 
       queryClient.invalidateQueries({
@@ -148,7 +178,7 @@ export function useDeleteSpaceMutation() {
 
       if (variables.slug) {
         queryClient.removeQueries({
-          queryKey: ["space", variables.slug],
+          queryKey: spaceKeys.detail(variables.slug),
           exact: true,
         });
       }
@@ -156,7 +186,7 @@ export function useDeleteSpaceMutation() {
       // Remove space-specific queries
       if (variables.id) {
         queryClient.removeQueries({
-          queryKey: ["space", variables.id],
+          queryKey: spaceKeys.detail(variables.id),
           exact: true,
         });
 
@@ -196,7 +226,7 @@ export function useSpaceMembersInfiniteQuery(
   query?: string,
 ) {
   return useInfiniteQuery({
-    queryKey: ["spaceMembers", spaceId, query],
+    queryKey: spaceKeys.members(spaceId, query),
     queryFn: ({ pageParam }) =>
       getSpaceMembers(spaceId, { cursor: pageParam, limit: 50, query }),
     enabled: !!spaceId,

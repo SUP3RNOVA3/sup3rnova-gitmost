@@ -46,10 +46,23 @@ vi.mock("@hocuspocus/provider", () => ({
   }),
 }));
 
-import { warmInfiniteAll, warmPageYdoc } from "./make-offline";
+import {
+  warmInfiniteAll,
+  warmPageYdoc,
+  makePageAvailableOffline,
+} from "./make-offline";
 import { queryClient } from "@/main.tsx";
+import {
+  getPageById,
+  getPageBreadcrumbs,
+  getSidebarPages,
+} from "@/features/page/services/page-service";
+import { getPageComments } from "@/features/comment/services/comment-service";
 
 const setQueryData = (queryClient as any).setQueryData as ReturnType<
+  typeof vi.fn
+>;
+const prefetchQuery = (queryClient as any).prefetchQuery as ReturnType<
   typeof vi.fn
 >;
 
@@ -58,6 +71,12 @@ beforeEach(() => {
   // factories installed (vi.clearAllMocks would drop the constructor return
   // objects and break the provider/idb/yjs spies).
   setQueryData.mockClear();
+  prefetchQuery.mockReset();
+  prefetchQuery.mockResolvedValue(undefined);
+  (getPageById as ReturnType<typeof vi.fn>).mockReset();
+  (getPageBreadcrumbs as ReturnType<typeof vi.fn>).mockReset();
+  (getSidebarPages as ReturnType<typeof vi.fn>).mockReset();
+  (getPageComments as ReturnType<typeof vi.fn>).mockReset();
   h.ydocDestroy.mockClear();
   h.idbDestroy.mockClear();
   h.providerOn.mockClear();
@@ -117,13 +136,80 @@ describe("warmInfiniteAll", () => {
     expect(payload.pages).toHaveLength(2);
   });
 
-  it("swallows errors and never writes the cache on failure", async () => {
-    const fetchPage = vi.fn().mockRejectedValue(new Error("network"));
+  it("returns true on success", async () => {
+    const fetchPage = vi
+      .fn()
+      .mockResolvedValue({ items: [], meta: { nextCursor: null } });
 
     await expect(
       warmInfiniteAll(["comments", "p1"], fetchPage),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true);
+  });
+
+  it("reports errors (returns false) and never writes the cache on failure", async () => {
+    const fetchPage = vi.fn().mockRejectedValue(new Error("network"));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await expect(
+      warmInfiniteAll(["comments", "p1"], fetchPage),
+    ).resolves.toBe(false);
     expect(setQueryData).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+  });
+});
+
+describe("makePageAvailableOffline", () => {
+  const okPage = {
+    id: "uuid-1",
+    slugId: "slug-1",
+    space: { slug: "space-slug" },
+  };
+
+  it("returns ok:true with no failures when every step succeeds", async () => {
+    (getPageById as ReturnType<typeof vi.fn>).mockResolvedValue(okPage);
+    (getPageBreadcrumbs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (getSidebarPages as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+    (getPageComments as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+
+    const result = await makePageAvailableOffline({
+      pageId: "uuid-1",
+      spaceId: "space-uuid",
+    });
+
+    expect(result).toEqual({ ok: true, failed: [] });
+  });
+
+  it("returns ok:false with the failed step label when a warm step fails", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    (getPageById as ReturnType<typeof vi.fn>).mockResolvedValue(okPage);
+    (getPageBreadcrumbs as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (getSidebarPages as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+    // Comments warm fails -> labeled "comments".
+    (getPageComments as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("network"),
+    );
+
+    const result = await makePageAvailableOffline({
+      pageId: "uuid-1",
+      spaceId: "space-uuid",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.failed).toContain("comments");
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 });
 

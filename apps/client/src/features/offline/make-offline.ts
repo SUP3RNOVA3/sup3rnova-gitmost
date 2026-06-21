@@ -7,9 +7,13 @@ import {
   getPageById,
   getPageBreadcrumbs,
   getSidebarPages,
-  getAllSidebarPages,
 } from "@/features/page/services/page-service";
-import { getSpaceById } from "@/features/space/services/space-service.ts";
+import {
+  pageKeys,
+  sidebarPagesQueryOptions,
+} from "@/features/page/queries/page-query";
+import { spaceByIdQueryOptions } from "@/features/space/queries/space-query";
+import { RQ_KEY } from "@/features/comment/queries/comment-query";
 import { getPageComments } from "@/features/comment/services/comment-service";
 import { IPage } from "@/features/page/types/page.types";
 import { IPagination } from "@/lib/types.ts";
@@ -23,15 +27,19 @@ import { IPagination } from "@/lib/types.ts";
  * spinning forever offline, and silently truncates large lists. This walks the
  * cursor chain until it runs out (or hits maxPages) so the whole list is cached.
  *
- * Best-effort: any failure is swallowed so a partial/failed warm never throws.
+ * Best-effort: a failure does not throw (a partial/failed warm is still useful),
+ * but it is reported — the error is logged with context and `false` is returned
+ * so the caller can record the failed step instead of silently succeeding.
+ *
+ * Returns true if the whole list was paginated and written, false on any error.
  *
  * Exported for unit testing of the cursor-walk / cache-write behavior.
  */
 export async function warmInfiniteAll<T>(
-  queryKey: unknown[],
+  queryKey: readonly unknown[],
   fetchPage: (cursor: string | undefined) => Promise<IPagination<T>>,
   maxPages = 50,
-): Promise<void> {
+): Promise<boolean> {
   try {
     const pages: IPagination<T>[] = [];
     const pageParams: (string | undefined)[] = [];
@@ -46,90 +54,112 @@ export async function warmInfiniteAll<T>(
     }
 
     queryClient.setQueryData(queryKey, { pages, pageParams });
-  } catch {
-    // best-effort
+    return true;
+  } catch (error) {
+    console.error("warmInfiniteAll failed", { queryKey, error });
+    return false;
   }
 }
 
 export interface MakePageAvailableOfflineParams {
   pageId: string;
-  slugId?: string;
   spaceId?: string;
-  parentPageId?: string;
+}
+
+/**
+ * Outcome of {@link makePageAvailableOffline}. `ok` is true only when every warm
+ * step succeeded; `failed` lists the labels of the steps that failed (a subset
+ * of: "page", "space", "tree", "breadcrumbs", "comments").
+ */
+export interface MakePageAvailableOfflineResult {
+  ok: boolean;
+  failed: string[];
 }
 
 /**
  * Best-effort prefetch of a page's read queries so they get persisted to
  * IndexedDB and become readable offline.
  *
- * Each prefetch is isolated in try/catch — this function NEVER throws to its
- * caller. Only meaningful while online (the underlying requests must succeed).
+ * Each step is isolated and this function does NOT throw — a partial warm is
+ * still useful. Instead of silently succeeding, every failed step is logged
+ * with a label and recorded in the returned result: `{ ok, failed }` where
+ * `ok` is true only if no step failed and `failed` lists the failed step
+ * labels. Only meaningful while online (the underlying requests must succeed).
  */
 export async function makePageAvailableOffline({
   pageId,
   spaceId,
-}: MakePageAvailableOfflineParams): Promise<void> {
+}: MakePageAvailableOfflineParams): Promise<MakePageAvailableOfflineResult> {
+  const failed: string[] = [];
+
   // Fetch the page document ONCE and write it under BOTH cache keys, exactly
-  // like usePageQuery's onData effect. Every page consumer reads ["pages",
-  // <slugId>] (usePageQuery keys on the slugId for routed reads), so warming
-  // only ["pages", <uuid>] would leave the offline page blank.
+  // like usePageQuery's onData effect. Every page consumer reads
+  // pageKeys.detail(slugId) (usePageQuery keys on the slugId for routed reads),
+  // so warming only the uuid key would leave the offline page blank.
   let page: IPage | undefined;
   try {
     page = await getPageById({ pageId });
-    queryClient.setQueryData(["pages", page.slugId], page);
-    queryClient.setQueryData(["pages", page.id], page);
-  } catch {
-    // best-effort
+    queryClient.setQueryData(pageKeys.detail(page.slugId), page);
+    queryClient.setQueryData(pageKeys.detail(page.id), page);
+  } catch (error) {
+    console.error("makePageAvailableOffline: page step failed", {
+      pageId,
+      error,
+    });
+    failed.push("page");
   }
 
   // Warm the space — page.tsx renders nothing until the space query resolves
-  // (useGetSpaceBySlugQuery → ["space", <spaceSlug>]). Awaited (not the
-  // fire-and-forget prefetchSpace) so the space is actually persisted before
-  // the caller fires its success toast. Matches the hook's key/fn exactly.
+  // (useGetSpaceBySlugQuery). Awaited (not the fire-and-forget prefetchSpace) so
+  // the space is actually persisted before the caller fires its toast. Shares
+  // spaceByIdQueryOptions so the key/fn cannot drift from the hook.
   try {
     const spaceSlug = page?.space?.slug;
     if (spaceSlug) {
-      await queryClient.prefetchQuery({
-        queryKey: ["space", spaceSlug],
-        queryFn: () => getSpaceById(spaceSlug),
-      });
+      await queryClient.prefetchQuery(spaceByIdQueryOptions(spaceSlug));
     }
-  } catch {
-    // best-effort
+  } catch (error) {
+    console.error("makePageAvailableOffline: space step failed", {
+      pageId,
+      error,
+    });
+    failed.push("space");
   }
 
   // Warm the sidebar tree root so the WHOLE root level renders offline (matches
-  // useGetRootSidebarPagesQuery's ["root-sidebar-pages", spaceId] infinite
-  // key/fn). Fully paginated so large root levels are not truncated at 100.
+  // useGetRootSidebarPagesQuery's pageKeys.rootSidebar(spaceId) infinite cache).
+  // Fully paginated so large root levels are not truncated at 100.
   if (spaceId) {
-    await warmInfiniteAll(["root-sidebar-pages", spaceId], (cursor) =>
+    const ok = await warmInfiniteAll(pageKeys.rootSidebar(spaceId), (cursor) =>
       getSidebarPages({ spaceId, cursor, limit: 100 }),
     );
+    if (!ok) failed.push("tree");
   }
 
   // Warm the children of the page and of every ancestor so the path to this
-  // page is expandable offline. We MIRROR fetchAllAncestorChildren exactly —
-  // same regular ["sidebar-pages", { pageId, spaceId }] key, same
-  // getAllSidebarPages fn (which aggregates ALL children pages, so nothing is
-  // truncated at 100), same 30min staleTime — otherwise the warmed cache would
-  // never be read by the offline tree.
-  const warmSidebarChildren = async (id: string) => {
+  // page is expandable offline. We MIRROR fetchAllAncestorChildren exactly via
+  // sidebarPagesQueryOptions — same pageKeys.sidebar({ pageId, spaceId }) key,
+  // same getAllSidebarPages fn (which aggregates ALL children pages, so nothing
+  // is truncated at 100), same 30min staleTime — otherwise the warmed cache
+  // would never be read by the offline tree.
+  const warmSidebarChildren = async (id: string): Promise<boolean> => {
     try {
       // Keep EXACTLY { pageId, spaceId } so the key hashes identically to
       // fetchAllAncestorChildren's (no parentPageId, no extra fields).
       const params = { pageId: id, spaceId };
-      await queryClient.prefetchQuery({
-        queryKey: ["sidebar-pages", params],
-        queryFn: () => getAllSidebarPages(params),
-        staleTime: 30 * 60 * 1000,
+      await queryClient.prefetchQuery(sidebarPagesQueryOptions(params));
+      return true;
+    } catch (error) {
+      console.error("makePageAvailableOffline: tree node step failed", {
+        pageId: id,
+        error,
       });
-    } catch {
-      // best-effort per node
+      return false;
     }
   };
 
   // The page's own children.
-  await warmSidebarChildren(pageId);
+  if (!(await warmSidebarChildren(pageId))) failed.push("tree");
 
   // Each ancestor's children. Use the breadcrumbs endpoint ONLY to discover the
   // ancestor ids — we intentionally do NOT cache the breadcrumbs themselves
@@ -141,20 +171,29 @@ export async function makePageAvailableOffline({
     for (const ancestor of ancestors ?? []) {
       const ancestorId = ancestor?.id;
       if (!ancestorId || ancestorId === pageId) continue;
-      await warmSidebarChildren(ancestorId);
+      if (!(await warmSidebarChildren(ancestorId))) failed.push("tree");
     }
-  } catch {
-    // best-effort
+  } catch (error) {
+    console.error("makePageAvailableOffline: breadcrumbs step failed", {
+      pageId,
+      error,
+    });
+    failed.push("breadcrumbs");
   }
 
-  // Comments (matches useCommentsQuery's ["comments", pageId] infinite cache).
+  // Comments (matches useCommentsQuery's RQ_KEY(pageId) infinite cache).
   // useCommentsQuery reports isLoading while hasNextPage is true, so warming
   // only the first page leaves the offline comments panel spinning forever on
   // pages with >100 comments. Fully paginate so the last cached page has no
   // nextCursor and the panel settles offline.
-  await warmInfiniteAll(["comments", pageId], (cursor) =>
+  const commentsOk = await warmInfiniteAll(RQ_KEY(pageId), (cursor) =>
     getPageComments({ pageId, cursor, limit: 100 }),
   );
+  if (!commentsOk) failed.push("comments");
+
+  // Dedupe — the tree label can be recorded once per failed node/ancestor.
+  const uniqueFailed = [...new Set(failed)];
+  return { ok: uniqueFailed.length === 0, failed: uniqueFailed };
 }
 
 /**

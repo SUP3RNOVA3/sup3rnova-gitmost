@@ -1,6 +1,7 @@
 import {
   InfiniteData,
   QueryKey,
+  queryOptions,
   useInfiniteQuery,
   UseInfiniteQueryResult,
   useMutation,
@@ -43,11 +44,36 @@ import { SpaceTreeNode } from "@/features/page/tree/types";
 import { useQueryEmit } from "@/features/websocket/use-query-emit";
 import { moveToTrashNotificationMessage } from "@/features/page/components/move-to-trash-notification";
 
+/**
+ * Centralized React Query key factories for page queries. The hooks below and
+ * the offline warm path (features/offline/make-offline.ts) share these so the
+ * runtime keys can never silently drift apart.
+ */
+export const pageKeys = {
+  detail: (idOrSlug: string) => ["pages", idOrSlug] as const,
+  sidebar: (data: unknown) => ["sidebar-pages", data] as const,
+  rootSidebar: (spaceId: string) => ["root-sidebar-pages", spaceId] as const,
+  breadcrumbs: (pageId: string) => ["breadcrumbs", pageId] as const,
+  recentChanges: (spaceId?: string) => ["recent-changes", spaceId] as const,
+};
+
+/**
+ * Shared queryOptions for the sidebar-pages (ancestor children) query. Both
+ * fetchAllAncestorChildren and the offline warm path consume this so the key,
+ * queryFn and staleTime stay identical.
+ */
+export const sidebarPagesQueryOptions = (params: SidebarPagesParams) =>
+  queryOptions({
+    queryKey: pageKeys.sidebar(params),
+    queryFn: () => getAllSidebarPages(params),
+    staleTime: 30 * 60 * 1000,
+  });
+
 export function usePageQuery(
   pageInput: Partial<IPageInput>,
 ): UseQueryResult<IPage, Error> {
   const query = useQuery({
-    queryKey: ["pages", pageInput.pageId],
+    queryKey: pageKeys.detail(pageInput.pageId),
     queryFn: () => getPageById(pageInput),
     enabled: !!pageInput.pageId,
     staleTime: 5 * 60 * 1000,
@@ -56,9 +82,9 @@ export function usePageQuery(
   useEffect(() => {
     if (query.data) {
       if (isValidUuid(pageInput.pageId)) {
-        queryClient.setQueryData(["pages", query.data.slugId], query.data);
+        queryClient.setQueryData(pageKeys.detail(query.data.slugId), query.data);
       } else {
-        queryClient.setQueryData(["pages", query.data.id], query.data);
+        queryClient.setQueryData(pageKeys.detail(query.data.id), query.data);
       }
     }
   }, [query.data]);
@@ -80,18 +106,20 @@ export function useCreatePageMutation() {
 }
 
 export function updatePageData(data: IPage) {
-  const pageBySlug = queryClient.getQueryData<IPage>(["pages", data.slugId]);
-  const pageById = queryClient.getQueryData<IPage>(["pages", data.id]);
+  const pageBySlug = queryClient.getQueryData<IPage>(
+    pageKeys.detail(data.slugId),
+  );
+  const pageById = queryClient.getQueryData<IPage>(pageKeys.detail(data.id));
 
   if (pageBySlug) {
-    queryClient.setQueryData(["pages", data.slugId], {
+    queryClient.setQueryData(pageKeys.detail(data.slugId), {
       ...pageBySlug,
       ...data,
     });
   }
 
   if (pageById) {
-    queryClient.setQueryData(["pages", data.id], { ...pageById, ...data });
+    queryClient.setQueryData(pageKeys.detail(data.id), { ...pageById, ...data });
   }
 
   invalidateOnUpdatePage(
@@ -145,11 +173,11 @@ export function useRemovePageMutation() {
       });
 
       // Stamp deletedAt so a re-visit shows the trash banner, not stale state.
-      const cached = queryClient.getQueryData<IPage>(["pages", pageId]);
+      const cached = queryClient.getQueryData<IPage>(pageKeys.detail(pageId));
       if (cached) {
         const stamped = { ...cached, deletedAt: new Date() };
-        queryClient.setQueryData(["pages", cached.id], stamped);
-        queryClient.setQueryData(["pages", cached.slugId], stamped);
+        queryClient.setQueryData(pageKeys.detail(cached.id), stamped);
+        queryClient.setQueryData(pageKeys.detail(cached.slugId), stamped);
       }
 
       invalidateOnDeletePage(pageId);
@@ -267,8 +295,11 @@ export function useRestorePageMutation() {
       // Replace would strip space/permissions/content and break the editor.
       const merge = (cached: IPage | undefined) =>
         cached ? { ...cached, ...restoredPage } : cached;
-      queryClient.setQueryData<IPage>(["pages", restoredPage.id], merge);
-      queryClient.setQueryData<IPage>(["pages", restoredPage.slugId], merge);
+      queryClient.setQueryData<IPage>(pageKeys.detail(restoredPage.id), merge);
+      queryClient.setQueryData<IPage>(
+        pageKeys.detail(restoredPage.slugId),
+        merge,
+      );
     },
     onError: (error) => {
       notifications.show({
@@ -283,7 +314,7 @@ export function useGetSidebarPagesQuery(
   data: SidebarPagesParams | null,
 ): UseInfiniteQueryResult<InfiniteData<IPagination<IPage>, unknown>> {
   return useInfiniteQuery({
-    queryKey: ["sidebar-pages", data],
+    queryKey: pageKeys.sidebar(data),
     enabled: !!data?.pageId || !!data?.spaceId,
     queryFn: ({ pageParam }) =>
       getSidebarPages({ ...data, cursor: pageParam, limit: 100 }),
@@ -294,7 +325,7 @@ export function useGetSidebarPagesQuery(
 
 export function useGetRootSidebarPagesQuery(data: SidebarPagesParams) {
   return useInfiniteQuery({
-    queryKey: ["root-sidebar-pages", data.spaceId],
+    queryKey: pageKeys.rootSidebar(data.spaceId),
     queryFn: async ({ pageParam }) => {
       return getSidebarPages({
         spaceId: data.spaceId,
@@ -320,7 +351,7 @@ export function usePageBreadcrumbsQuery(
   pageId: string,
 ): UseQueryResult<Partial<IPage[]>, Error> {
   return useQuery({
-    queryKey: ["breadcrumbs", pageId],
+    queryKey: pageKeys.breadcrumbs(pageId),
     queryFn: () => getPageBreadcrumbs(pageId),
     enabled: !!pageId,
   });
@@ -332,10 +363,12 @@ export async function fetchAllAncestorChildren(
   // refresh (#159 #8), which must NOT receive the 30-min-cached children.
   opts?: { fresh?: boolean },
 ) {
-  // not using a hook here, so we can call it inside a useEffect hook
+  // not using a hook here, so we can call it inside a useEffect hook. Reuse the
+  // shared sidebarPagesQueryOptions (key + queryFn) so the offline warm path and
+  // this fetch never drift, but override staleTime for the `fresh` reconnect
+  // refresh (#159 #8), which must force a server refetch (staleTime 0).
   const response = await queryClient.fetchQuery({
-    queryKey: ["sidebar-pages", params],
-    queryFn: () => getAllSidebarPages(params),
+    ...sidebarPagesQueryOptions(params),
     staleTime: opts?.fresh ? 0 : 30 * 60 * 1000,
   });
 
@@ -345,7 +378,7 @@ export async function fetchAllAncestorChildren(
 
 export function useRecentChangesQuery(spaceId?: string) {
   return useInfiniteQuery({
-    queryKey: ["recent-changes", spaceId],
+    queryKey: pageKeys.recentChanges(spaceId),
     queryFn: ({ pageParam }) =>
       getRecentChanges({ spaceId, cursor: pageParam, limit: 15 }),
     initialPageParam: undefined as string | undefined,
@@ -416,12 +449,12 @@ export function invalidateOnCreatePage(data: Partial<IPage>) {
 
   let queryKey: QueryKey = null;
   if (data.parentPageId === null) {
-    queryKey = ["root-sidebar-pages", data.spaceId];
+    queryKey = pageKeys.rootSidebar(data.spaceId);
   } else {
-    queryKey = [
-      "sidebar-pages",
-      { pageId: data.parentPageId, spaceId: data.spaceId },
-    ];
+    queryKey = pageKeys.sidebar({
+      pageId: data.parentPageId,
+      spaceId: data.spaceId,
+    });
   }
 
   //update all sidebar pages
@@ -481,7 +514,7 @@ export function invalidateOnCreatePage(data: Partial<IPage>) {
 
     //update root sidebar pages haschildern
     const rootSideBarMatches = queryClient.getQueriesData({
-      queryKey: ["root-sidebar-pages", data.spaceId],
+      queryKey: pageKeys.rootSidebar(data.spaceId),
       exact: false,
     });
 
@@ -505,7 +538,7 @@ export function invalidateOnCreatePage(data: Partial<IPage>) {
 
   //update recent changes
   queryClient.invalidateQueries({
-    queryKey: ["recent-changes", data.spaceId],
+    queryKey: pageKeys.recentChanges(data.spaceId),
   });
 }
 
@@ -519,9 +552,9 @@ export function invalidateOnUpdatePage(
   invalidatePageTree();
   let queryKey: QueryKey = null;
   if (parentPageId === null) {
-    queryKey = ["root-sidebar-pages", spaceId];
+    queryKey = pageKeys.rootSidebar(spaceId);
   } else {
-    queryKey = ["sidebar-pages", { pageId: parentPageId, spaceId: spaceId }];
+    queryKey = pageKeys.sidebar({ pageId: parentPageId, spaceId: spaceId });
   }
   //update all sidebar pages
   queryClient.setQueryData<InfiniteData<IPagination<IPage>>>(
@@ -544,7 +577,7 @@ export function invalidateOnUpdatePage(
 
   //update recent changes
   queryClient.invalidateQueries({
-    queryKey: ["recent-changes", spaceId],
+    queryKey: pageKeys.recentChanges(spaceId),
   });
 }
 
@@ -559,8 +592,8 @@ export function updateCacheOnMovePage(
   // Remove page from old parent's cache
   const oldQueryKey =
     oldParentId === null
-      ? ["root-sidebar-pages", spaceId]
-      : ["sidebar-pages", { pageId: oldParentId, spaceId }];
+      ? pageKeys.rootSidebar(spaceId)
+      : pageKeys.sidebar({ pageId: oldParentId, spaceId });
 
   queryClient.setQueryData<InfiniteData<IPagination<IPage>>>(
     oldQueryKey,
@@ -580,7 +613,7 @@ export function updateCacheOnMovePage(
   if (oldParentId !== null) {
     const oldParentCache = queryClient.getQueryData<
       InfiniteData<IPagination<IPage>>
-    >(["sidebar-pages", { pageId: oldParentId, spaceId }]);
+    >(pageKeys.sidebar({ pageId: oldParentId, spaceId }));
 
     const remainingChildren =
       oldParentCache?.pages.flatMap((p) => p.items).length ?? 0;
@@ -618,8 +651,8 @@ export function updateCacheOnMovePage(
   // Add page to new parent's cache
   const newQueryKey =
     newParentId === null
-      ? ["root-sidebar-pages", spaceId]
-      : ["sidebar-pages", { pageId: newParentId, spaceId }];
+      ? pageKeys.rootSidebar(spaceId)
+      : pageKeys.sidebar({ pageId: newParentId, spaceId });
 
   queryClient.setQueryData<InfiniteData<IPagination<Partial<IPage>>>>(
     newQueryKey,

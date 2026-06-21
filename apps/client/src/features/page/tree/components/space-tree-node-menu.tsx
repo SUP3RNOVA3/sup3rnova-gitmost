@@ -84,18 +84,29 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
   const handleMakeAvailableOffline = async () => {
     notifications.show({ message: t("Saving page for offline use...") });
     try {
-      // Prefetch read queries so they get persisted to IndexedDB.
-      await makePageAvailableOffline({
+      // Prefetch read queries so they get persisted to IndexedDB. The result
+      // reports whether every warm step succeeded.
+      const result = await makePageAvailableOffline({
         pageId: node.id,
-        slugId: node.slugId,
         spaceId: node.spaceId,
-        parentPageId: node.parentPageId,
       });
       // Best-effort: warm the page's Yjs document into IndexedDB.
       await warmPageYdoc(node.id, getCollaborationUrl(), collabQuery?.token);
-      notifications.show({ message: t("Page is now available offline") });
+
+      if (result.ok) {
+        notifications.show({ message: t("Page is now available offline") });
+      } else {
+        // Partial warm — the page may still be partly usable offline, but some
+        // queries failed to cache, so surface it as an error rather than a
+        // silent success.
+        notifications.show({
+          message: t("Failed to make page available offline"),
+          color: "red",
+        });
+      }
     } catch {
-      // makePageAvailableOffline / warmPageYdoc never throw, but stay safe.
+      // makePageAvailableOffline no longer throws, but warmPageYdoc and other
+      // unexpected failures stay guarded here.
       notifications.show({
         message: t("Failed to make page available offline"),
         color: "red",
