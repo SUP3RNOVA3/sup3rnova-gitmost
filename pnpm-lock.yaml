@@ -884,6 +884,64 @@ importers:
         specifier: 17.0.5
         version: 17.0.5
 
+  packages/git-sync:
+    dependencies:
+      '@fellow/prosemirror-recreate-transform':
+        specifier: ^1.2.3
+        version: 1.2.3
+      '@tiptap/core':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/pm@3.20.4)
+      '@tiptap/extension-highlight':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))
+      '@tiptap/extension-image':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))
+      '@tiptap/extension-subscript':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4)
+      '@tiptap/extension-superscript':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4)
+      '@tiptap/extension-task-item':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/extension-list@3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4))
+      '@tiptap/extension-task-list':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/extension-list@3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4))
+      '@tiptap/html':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4)(happy-dom@20.8.9)
+      '@tiptap/pm':
+        specifier: 3.20.4
+        version: 3.20.4
+      '@tiptap/starter-kit':
+        specifier: 3.20.4
+        version: 3.20.4
+      jsdom:
+        specifier: 25.0.0
+        version: 25.0.0
+      marked:
+        specifier: 17.0.5
+        version: 17.0.5
+    devDependencies:
+      '@types/jsdom':
+        specifier: ^21.1.7
+        version: 21.1.7
+      '@types/node':
+        specifier: ^20.0.0
+        version: 20.19.43
+      fast-check:
+        specifier: ^4.8.0
+        version: 4.8.0
+      typescript:
+        specifier: ^5.0.0
+        version: 5.9.3
+      vitest:
+        specifier: 4.1.6
+        version: 4.1.6(@opentelemetry/api@1.9.0)(@types/node@20.19.43)(happy-dom@20.8.9)(jsdom@25.0.0)(vite@8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))
+
   packages/mcp:
     dependencies:
       '@fellow/prosemirror-recreate-transform':
@@ -5032,6 +5090,9 @@ packages:
   '@types/js-cookie@3.0.6':
     resolution: {integrity: sha512-wkw9yd1kEXOPnvEeEV1Go1MmxtBJL0RR79aOTAApecWFVu7w0NNXNqhcWgvw2YgZDYadliXkl14pa3WXw5jlCQ==}
 
+  '@types/jsdom@21.1.7':
+    resolution: {integrity: sha512-yOriVnggzrnQ3a9OKOCxaVuSug3w3/SbOj5i7VwXWZEyUNl3bLF9V3MfxGbZKuwqJOQyRfqXyROBB1CoZLFWzA==}
+
   '@types/jsdom@27.0.0':
     resolution: {integrity: sha512-NZyFl/PViwKzdEkQg96gtnB8wm+1ljhdDay9ahn4hgb+SfVtPCbm3TlmDUFXTA+MGN3CijicnMhG18SI5H3rFw==}
 
@@ -6923,6 +6984,10 @@ packages:
     engines: {node: '>=14.0.0'}
     peerDependencies:
       typescript: ^5.6.3
+
+  fast-check@4.8.0:
+    resolution: {integrity: sha512-GOJ158CUMnN6cSahsv4+ExARvIDuzzinFjkp0E9WtiBa5zcVeLozVkWaE4IzFcc+Y48Wp1EDlUZsXRyAztQcSg==}
+    engines: {node: '>=12.17.0'}
 
   fast-copy@4.0.2:
     resolution: {integrity: sha512-ybA6PDXIXOXivLJK/z9e+Otk7ve13I4ckBvGO5I2RRmBU1gMHLVDJYEuJYhGwez7YNlYji2M2DvVU+a9mSFDlw==}
@@ -9169,6 +9234,9 @@ packages:
 
   pure-rand@7.0.1:
     resolution: {integrity: sha512-oTUZM/NAZS8p7ANR3SHh30kXB+zK2r2BPcEn/awJIbOvq82WoMN4p62AWWp3Hhw50G0xMsw1mhIBLqHw64EcNQ==}
+
+  pure-rand@8.4.0:
+    resolution: {integrity: sha512-IoM8YF/jY0hiugFo/wOWqfmarlE6J0wc6fDK1PhftMk7MGhVZl88sZimmqBBFomLOCSmcCCpsfj7wXASCpvK9A==}
 
   pwacompat@2.0.17:
     resolution: {integrity: sha512-6Du7IZdIy7cHiv7AhtDy4X2QRM8IAD5DII69mt5qWibC2d15ZU8DmBG1WdZKekG11cChSu4zkSUGPF9sweOl6w==}
@@ -15432,9 +15500,15 @@ snapshots:
 
   '@types/js-cookie@3.0.6': {}
 
+  '@types/jsdom@21.1.7':
+    dependencies:
+      '@types/node': 25.5.0
+      '@types/tough-cookie': 4.0.5
+      parse5: 7.3.0
+
   '@types/jsdom@27.0.0':
     dependencies:
-      '@types/node': 20.19.43
+      '@types/node': 25.5.0
       '@types/tough-cookie': 4.0.5
       parse5: 7.3.0
 
@@ -15859,6 +15933,14 @@ snapshots:
       '@vitest/utils': 4.1.6
       chai: 6.2.2
       tinyrainbow: 3.1.0
+
+  '@vitest/mocker@4.1.6(vite@8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))':
+    dependencies:
+      '@vitest/spy': 4.1.6
+      estree-walker: 3.0.3
+      magic-string: 0.30.21
+    optionalDependencies:
+      vite: 8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3)
 
   '@vitest/mocker@4.1.6(vite@8.0.5(@types/node@22.19.1)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))':
     dependencies:
@@ -17702,6 +17784,10 @@ snapshots:
     dependencies:
       porter2: 1.1.0
       typescript: 5.9.3
+
+  fast-check@4.8.0:
+    dependencies:
+      pure-rand: 8.4.0
 
   fast-copy@4.0.2: {}
 
@@ -20252,6 +20338,8 @@ snapshots:
 
   pure-rand@7.0.1: {}
 
+  pure-rand@8.4.0: {}
+
   pwacompat@2.0.17: {}
 
   qrcode@1.5.4:
@@ -21560,6 +21648,24 @@ snapshots:
 
   vary@1.1.2: {}
 
+  vite@8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3):
+    dependencies:
+      lightningcss: 1.32.0
+      picomatch: 4.0.4
+      postcss: 8.5.14
+      rolldown: 1.0.0-rc.12
+      tinyglobby: 0.2.15
+    optionalDependencies:
+      '@types/node': 20.19.43
+      esbuild: 0.28.0
+      fsevents: 2.3.3
+      jiti: 2.4.2
+      less: 4.2.0
+      sugarss: 5.0.1(postcss@8.5.14)
+      terser: 5.39.0
+      tsx: 4.21.0
+      yaml: 2.8.3
+
   vite@8.0.5(@types/node@22.19.1)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3):
     dependencies:
       lightningcss: 1.32.0
@@ -21577,6 +21683,36 @@ snapshots:
       terser: 5.39.0
       tsx: 4.21.0
       yaml: 2.8.3
+
+  vitest@4.1.6(@opentelemetry/api@1.9.0)(@types/node@20.19.43)(happy-dom@20.8.9)(jsdom@25.0.0)(vite@8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3)):
+    dependencies:
+      '@vitest/expect': 4.1.6
+      '@vitest/mocker': 4.1.6(vite@8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))
+      '@vitest/pretty-format': 4.1.6
+      '@vitest/runner': 4.1.6
+      '@vitest/snapshot': 4.1.6
+      '@vitest/spy': 4.1.6
+      '@vitest/utils': 4.1.6
+      es-module-lexer: 2.1.0
+      expect-type: 1.3.0
+      magic-string: 0.30.21
+      obug: 2.1.1
+      pathe: 2.0.3
+      picomatch: 4.0.4
+      std-env: 4.1.0
+      tinybench: 2.9.0
+      tinyexec: 1.1.2
+      tinyglobby: 0.2.15
+      tinyrainbow: 3.1.0
+      vite: 8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3)
+      why-is-node-running: 2.3.0
+    optionalDependencies:
+      '@opentelemetry/api': 1.9.0
+      '@types/node': 20.19.43
+      happy-dom: 20.8.9
+      jsdom: 25.0.0
+    transitivePeerDependencies:
+      - msw
 
   vitest@4.1.6(@opentelemetry/api@1.9.0)(@types/node@22.19.1)(happy-dom@20.8.9)(jsdom@25.0.0)(vite@8.0.5(@types/node@22.19.1)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3)):
     dependencies:
