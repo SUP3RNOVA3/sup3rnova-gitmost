@@ -213,6 +213,22 @@ export class SpaceService {
         );
       }
 
+      if (typeof updateSpaceDto.gitSyncEnabled !== 'undefined') {
+        const prev = settingsBefore?.gitSync?.enabled ?? false;
+        if (prev !== updateSpaceDto.gitSyncEnabled) {
+          before.gitSyncEnabled = prev;
+          after.gitSyncEnabled = updateSpaceDto.gitSyncEnabled;
+        }
+
+        await this.spaceRepo.updateGitSyncSettings(
+          updateSpaceDto.spaceId,
+          workspaceId,
+          'enabled',
+          updateSpaceDto.gitSyncEnabled,
+          trx,
+        );
+      }
+
       updatedSpace = await this.spaceRepo.updateSpace(
         {
           name: updateSpaceDto.name,

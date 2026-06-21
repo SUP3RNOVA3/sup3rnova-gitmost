@@ -1,5 +1,14 @@
-import { Group, Box, Button, TextInput, Stack, Textarea } from "@mantine/core";
-import React from "react";
+import {
+  Group,
+  Box,
+  Button,
+  TextInput,
+  Stack,
+  Textarea,
+  Divider,
+  Switch,
+} from "@mantine/core";
+import React, { useState } from "react";
 import { useForm } from "@mantine/form";
 import { zod4Resolver } from "mantine-form-zod-resolver";
 import { z } from "zod/v4";
@@ -28,6 +37,23 @@ interface EditSpaceFormProps {
 export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
   const { t } = useTranslation();
   const updateSpaceMutation = useUpdateSpaceMutation();
+
+  const [gitSyncEnabled, setGitSyncEnabled] = useState<boolean>(
+    space?.settings?.gitSync?.enabled ?? false,
+  );
+
+  const handleGitSyncToggle = async (value: boolean) => {
+    const previous = gitSyncEnabled;
+    setGitSyncEnabled(value); // optimistic update
+    try {
+      await updateSpaceMutation.mutateAsync({
+        spaceId: space.id,
+        gitSyncEnabled: value,
+      });
+    } catch (err) {
+      setGitSyncEnabled(previous); // revert on failure
+    }
+  };
 
   const form = useForm<FormValues>({
     validate: zod4Resolver(formSchema),
@@ -104,6 +130,18 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
             </Group>
           )}
         </form>
+
+        <Divider my="lg" />
+
+        <Switch
+          label={t("Enable Git sync")}
+          description={t("Sync this space's pages to a Git repository.")}
+          checked={gitSyncEnabled}
+          disabled={readOnly || updateSpaceMutation.isPending}
+          onChange={(event) =>
+            handleGitSyncToggle(event.currentTarget.checked)
+          }
+        />
       </Box>
     </>
   );

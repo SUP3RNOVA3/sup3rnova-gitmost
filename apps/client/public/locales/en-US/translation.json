@@ -1241,6 +1241,8 @@
   "MCP server": "MCP server",
   "expose the workspace": "expose the workspace",
   "Enable MCP server": "Enable MCP server",
+  "Enable Git sync": "Enable Git sync",
+  "Sync this space's pages to a Git repository.": "Sync this space's pages to a Git repository.",
   "Exposes the workspace as an MCP server at /mcp — this provides a capability, it doesn't consume a model.": "Exposes the workspace as an MCP server at /mcp — this provides a capability, it doesn't consume a model.",
   "Resolves to {{url}}": "Resolves to {{url}}",
   "Model": "Model",
