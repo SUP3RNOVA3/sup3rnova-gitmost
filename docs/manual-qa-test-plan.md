@@ -60,7 +60,7 @@ Conventions:
 
 - **TC-SPACE-01** Create space: name (2-100), slug (alphanumeric, auto-generated from name as you type, 2-100), description (≤500). Watch slug live-generation quirks (single-char words, spaces, unicode).
 - **TC-SPACE-02** Duplicate slug → "Space slug exists…" red toast.
-- **TC-SPACE-03** Edit space: change name/slug/desc; only dirty fields sent; save disabled when clean; slug uniqueness excludes self.
+- **TC-SPACE-03** Edit space: change name/slug/desc; only dirty fields sent; save disabled when clean. NOTE (corrected): server `slugExists` does NOT exclude self (`space.repo.ts:60-74`) — saving with the slug field present but unchanged can wrongly 400 "Space slug exists". The client only avoids it by sending dirty fields. Treat self-exclusion as a BUG to verify, not expected behavior. See TC-SPACE-11.
 - **TC-SPACE-04** Delete space: type-name-to-confirm (case-insensitive); destructive; redirect to /home. Try wrong name → confirm disabled.
 - **TC-SPACE-05** Space members & roles (ADMIN/WRITER/READER): change role, remove; infinite scroll; search.
 - **TC-SPACE-06** Space grid / switcher: favorite a space, default space; only member spaces shown; create-space entry.
@@ -82,7 +82,7 @@ Conventions:
 
 ## G. Trash, History, Favorites, Labels
 
-- **TC-TRASH-01** Soft-delete page ("Move to trash", 30-day note); children remain; current page deleted → redirect.
+- **TC-TRASH-01** Soft-delete page via "Move to trash". NOTE (corrected): there is NO confirm dialog anymore — delete fires immediately and shows an 8-second **Undo toast** "Page moved to trash" (`page-query.ts:132-144`; menus call `handleDelete(id)` directly). The 30-day retention is real but lives only in `TrashCleanupService` and is NEVER surfaced at delete time. Children remain; current page deleted → redirect. Undo-specific scenarios in TC-TRASH-14..17.
 - **TC-TRASH-02** Trash list: view content modal, deleted-by/at, restore, delete-forever (admin only), empty state, pagination (50).
 - **TC-TRASH-03** Restore page whose parent is still deleted → where does it land? (orphan behavior).
 - **TC-TRASH-04** Permanent delete cascades to children; non-admin blocked.
@@ -309,3 +309,127 @@ Conventions:
 
 - **TC-MED-07** Notion ZIP import + async task lifecycle: import modal → pick Notion source (distinct from generic ZIP), upload Notion export zip. Verify persistent "Importing pages / Please don't close this tab" toast → 3s-poll lifecycle: success → "Import complete" + tree refetch + ws refetchRootTreeNode; failed → "Page import failed: {reason}"; backend error → "Import failed". Generic-zip path uses same poller.
 - **TC-MED-08** Multi-file md/html import partial-failure + per-file size: select MULTIPLE .md/.html at once; 30MB per-single-file limit ("File exceeds the 30mb import limit", distinct from 200MB zip); failing files SILENTLY swallowed (console.log only, no per-file error toast), summary counts only successes ("Successfully imported N pages"); zero success → "Failed to import pages". Mixed valid+invalid → count + no per-file error (sloppy-feedback candidate).
+
+---
+
+## V. Forgotten cases — second code-grounded pass (added 2026-06-23)
+
+Additional cases from a code-grounded gap audit of this plan (8 read-only audits across product zones; full rationale in `docs/qa-plan-gaps-pr136.md`). Same convention: steps → expected, `file:line` cited for grounding. **[BUG?]** = the case also surfaces a candidate defect.
+
+### V.0 Corrections to existing cases (text now stale vs code)
+
+- **TC-DICT-02 (expand)** — transcription throttle is **20 req/60s** (`ai-chat.controller.ts:213`), a SEPARATE bucket from the 25/60s AI-chat throttle. Streaming sends one request per VAD pause, so this bucket is the real limit.
+- **TC-MED-08 / TC-MED-05** — single md/html import limit is **30MB** (`import.controller.ts:56`) but the 413 message wrongly says **"Exceeds the 10mb import limit"** (`:67`). [BUG?] wording.
+- **TC-NOTIF-03** — the ≤4-immediate-emails/24h budget is **global per user**, NOT per page (`page-update-email-rate-limiter.ts:18-23`). The 7h cooldown IS per-(user,page).
+- **TC-SRCH-02** — on the default Postgres FTS build there is **no "Attachments" content-type filter** (hidden; `contentType` never sent to server; attachment search is Typesense/EE only) — `search-spotlight-filters.tsx:50`, `use-unified-search.ts:23`. Don't file a bug; it's EE-only.
+
+### V.1 AI chat & MCP (mostly new code, no manual coverage)
+
+- **TC-AI-09** Queue a message while a turn streams: text becomes a pending row (clock icon), composer clears; on clean finish the FIRST queued msg auto-sends (FIFO), then the next (`chat-thread.tsx:189-259`, `chat-input.tsx:39-104`).
+- **TC-AI-10** [BUG?] Queue preserved on Stop AND on stream error (must NOT auto-flush); removing a queued item via its X works (`chat-thread.tsx:249-259, 364-372`).
+- **TC-AI-11** Queue lifecycle: cleared when switching to another chat (remount by key); survives new-chat→server-id adoption without remount (`ai-chat-window.tsx:299-316`).
+- **TC-AI-12** "Stopped" notice: manual Stop → gray "Response stopped."; dropped connection → gray "Connection lost — the answer was interrupted."; clears on next turn (`chat-thread.tsx:249-290`, `chat-stopped-notice.tsx`).
+- **TC-AI-13** Reopen a chat with an interrupted turn from history → partial answer present + combined-wording gray notice (`message-item.tsx:129-144`, `ai-chat.service.ts:456-471`).
+- **TC-AI-14** [BUG?] Provider drops mid-answer → partial answer + tool-call cards + classified error banner persist and survive reload (`ai-chat.service.ts:435-455`).
+- **TC-AI-15** [BUG?] "Copy chat" while streaming includes the in-progress turn ("still being generated…"); switching chat mid-stream must not leak the previous chat's tail (`ai-chat-window.tsx:268-295`, `chat-thread.tsx:297-303`).
+- **TC-AI-16** [BUG?] Chat-history row shows relative creation time + origin page title; restrict the origin page from the user → title must NOT leak ("No document") (`conversation-list.tsx:29-44`, `ai-chat.service.ts:201-243`).
+- **TC-AI-17** Tool-call card states (running spinner → green done → red error+errorText) and clickable `/p/{uuid}` citations; generic "Ran tool {{name}}" fallback (`tool-call-card.tsx:41-81`, `tool-parts.tsx:55-136`).
+- **TC-AI-18** Provider ECONNRESET: turn recovers without a user-visible error before first byte; after partial bytes → classified "Lost connection" banner + partial retained (`ai-http.ts:55-84`, `error-message.ts:104-114`).
+- **TC-AI-19** "Ask AI" toolbar button: present in edit mode with AI enabled, absent when AI/generative off, expected behavior in read-only (`ask-ai-group.tsx:8-23`).
+- **TC-MCP-01** [BUG?] MCP auth headers are write-only: list never returns `headersEnc` (only `hasHeaders`); update with header omitted = unchanged, `{}` = clear, non-empty = replace (`mcp-servers.service.ts:80-101, 160-171`).
+- **TC-MCP-02** MCP transport http vs sse both connect; editing the URL re-runs SSRF check (blocked → 400), editing other fields without URL change does not (`mcp-clients.service.ts:306-323`, `mcp-servers.service.ts:76-78`).
+
+### V.2 Dictation / STT (fork feature, heavily changed)
+
+- **TC-DICT-03** [BUG?] Dictate with frequent pauses so >20 VAD segments cut in 60s → graceful degradation after the 21st 429s (no toast flood); earlier text preserved (`ai-chat.controller.ts:213`, `use-streaming-dictation.ts:185-227`).
+- **TC-DICT-04** Streaming is hardcoded ON in both surfaces (editor toolbar + chat composer); no batch-mode toggle exists; VAD assets (~13–26MB) download for every dictation user (`dictation-group.tsx:73`, `chat-input.tsx:74`).
+- **TC-DICT-05** Block one of `/vad/*.onnx|*.wasm|*.worklet` (or it serves as text/html) then click mic → status returns to idle, mic re-clickable, single red toast, no silent hang (`use-streaming-dictation.ts:348-367`, `copy-vad-assets.mjs`).
+- **TC-DICT-06** Fresh load, uncached model, ONE mic click → "Preparing…" then recording starts on the first click (AudioContext-in-gesture fix) (`use-streaming-dictation.ts:256-274`).
+- **TC-DICT-07** [BUG?] Click Stop while still talking (no pause) → the un-ended segment is silently dropped (data loss); compare to Stop after a pause (`use-streaming-dictation.ts:421-425`).
+- **TC-DICT-08** Stop then immediately restart with old responses in flight → stale-session transcripts must NOT leak into the new session; in-session order preserved despite out-of-order HTTP (`use-streaming-dictation.ts:148-227`).
+- **TC-DICT-09** Multi-segment insertion: move the caret / delete content above mid-session → subsequent inserts stay contiguous and clamp into doc bounds, no crash on editor destroy (`dictation-group.tsx:13-68`).
+- **TC-DICT-11** Three gate states: dictation toggle off (mic hidden, 403 if forced) / STT model blank (503 "Voice dictation is not configured") / endpoint 401/404 (verbatim server message) (`ai-chat.controller.ts:220-269`).
+
+### V.3 Editor & collaboration
+
+- **TC-ED-07** [BUG class] Type a long title fast in two tabs while a PAGE_UPDATED echo arrives → no dropped chars (focused-field guard); blur then apply an external title change (`title-editor.tsx:143-183`).
+- **TC-RT-02** Collab JWT expires/revoked with editor open → reads latest token via ref, refetches, reconnects; cover the `exp === undefined` / unparseable-token / no-token branches (no reconnect thrash) (`page-editor.tsx:176-204`).
+- **TC-RT-03** Live security window: trash / demote-to-reader / deactivate a user who has the page open → next reconnect is read-only or rejected; verify the mid-session window before reconnect (`authentication.extension.ts:78-102`).
+- **TC-MED-09** Paste a block with an image/pdf/excalidraw/drawio copied from page A into page B → only foreign-owned attachments re-upload to B; 404 fetch keeps original; node moved mid-fetch re-validates; dedup of repeats (`editor-paste-handler.tsx:75-217`).
+- **TC-LINK-02** Paste internal page URL matrix: empty selection → mention (with `#anchor`); non-empty selection → plain link; cross-host → link; unresolved/deleted page → link mark fallback, no crash (`editor-paste-handler.tsx:33-58`, `internal-link-paste.ts:20-76`).
+- **TC-MENT-02** Mention whitespace ladder: query starting with space never opens; >4 whitespace with only the create-page fallback present destroys; >7 destroys unconditionally; detect aside / comment-dialog / chat-input contexts (`mention-suggestion.ts:11-152`).
+- **TC-BLK-19** Indent/outdent on paragraphs & headings: Tab increments and clamps at 8, Shift-Tab to 0; inside list/table/code-block Tab keeps native behavior; malformed `data-indent` clamps (`editor-ext/lib/indent.ts:36-83`).
+- **TC-BLK-20** Slash menu does NOT open inside a code block; a no-match space-bearing query (`/todo abc`) auto-deactivates so stray text isn't left in the doc (`extensions/slash-command.ts:24-46`).
+
+### V.4 Pages, tree, watchers, backlinks
+
+- **TC-PAGE-17** [BUG?] Reorder a node between adjacent siblings in a deep tree → `generateJitteredKeyBetween` can yield <5 or >12 chars, which `MovePageDto` (`@MinLength(5)@MaxLength(12)`) rejects with a generic 400 and the tree reverts (`move-page.dto.ts:14-16`).
+- **TC-PAGE-18** [BUG?] Watcher `page.updated` fires ONLY on collab body saves with a prior history version — NOT on REST rename/icon and NOT on the first edit (`history.processor.ts:105-118`).
+- **TC-PAGE-19** Force the breadcrumb lazy-ancestry fetch to fail (offline/500) → graceful fallback; today there is no try/catch so ancestor expansion aborts with an uncaught error (`space-tree.tsx:129-139`).
+- **TC-PAGE-20** `/pages/created-by-user` accepts a `userId` the dashboard never sends → verify access is scoped to the requester's spaces and a non-UUID returns a clean 400 (`page.controller.ts:453-473`).
+- **TC-PAGE-21** Move-to-space with an accessible grandchild under an INACCESSIBLE child → confirm where the grandchild lands (orphan to source root vs dangling) (`page.service.ts:437-573, 1251`).
+- **TC-PAGE-22** [BUG?] Duplicate a deep tree where one attachment copy fails → silent broken image (log only); duplicating 3× yields three "Copy of X" siblings (`page.service.ts:837-885`).
+- **TC-BLK-11 (expand)** [BUG?] Subpages block on a parent with more children than the sidebar page-size shows only the first page (no `fetchNextPage`); verify live-refresh on child add/rename/move/trash (`subpages-view.tsx:28-48`).
+- **TC-WATCH-01** Mute a page (Stop watching) while watching its space → no `page.updated` for that page but still for other pages in the space; re-watch clears mute; favoriting has no notification effect (`watcher.repo.ts:66-102`).
+- **TC-PAGE-24** Backlinks edges: self-link (count/double-count), deleted target (count drops), incoming link from a space the viewer can't read (excluded) (`backlink.repo.ts:83-111`, `backlink.service.ts:40-55`).
+- **TC-DASH-02 (expand)** "New note" picker excludes READER-only spaces and caps at 100 spaces; a failed create still shows the error and re-enables (`new-note-button.tsx:17-44`).
+
+### V.5 Trash (undo toast), history, favorites, labels
+
+- **TC-TRASH-14** Trash a child from the tree menu → its node unmounts → ~3s later click Undo → page restored at the correct parent with children intact (restore reads tree via store, not a render closure) (`page-query.ts:120-279`).
+- **TC-TRASH-15** Undo after the 8s window expires → toast gone, no other undo affordance; recovery only via Trash → Restore; current-page trash redirects to space root (`page-query.ts:134`).
+- **TC-TRASH-16** Trash 3–4 sibling pages rapidly → stacked per-page toasts, each Undo restores the CORRECT page (closure capture), no id collision (`page-query.ts:132-142`).
+- **TC-TRASH-17** Two-tab consistency: trash in A (B drops node) → Undo in A → no duplicate node in either tab (addTreeNode vs refetchRoot reconciliation) (`page.repo.ts:358-447`, `page-query.ts:241-258`).
+- **TC-TRASH-18** Restore a child whose parent is still trashed → child detaches to root, subtree stays attached; restore the parent later → child does NOT re-parent (`page.repo.ts:380-448`).
+- **TC-TRASH-19** WRITER opens Trash and clicks "Delete" (item NOT hidden, unlike the banner) → server 403 "Only space admins can permanently delete pages" renders cleanly (`trash.tsx:173`, `page.controller.ts:335`).
+- **TC-HIST-02** AI-agent version badge: violet sparkles + tooltip, human author still shown; click/Enter opens that chat, CLEARS the chat draft, closes history, does not select the row; agent version without `aiChatId` is non-clickable (`history-item.tsx:37-108`).
+- **TC-HIST-03** Diff highlight on a version with text edits + added image/table + deleted callout: toggle on/off, counts match, deleted special-node renders as a ghost widget; oldest version → no diff; malformed → plain fallback (`history-editor.tsx:23-203`).
+- **TC-HIST-04** Restore is Manage-gated (WRITER sees no Restore button) and client-optimistic — un-saved restore must not persist on reload (`use-history-restore.tsx:38-69`, `history-list.tsx:151`).
+- **TC-FAV-02** Rapid favorite/unfavorite from the page/tree MENU (no pending guard, unlike the list StarButton) → final state correct, no duplicate row, no toast mismatch (`space-tree-node-menu.tsx:181-189`).
+- **TC-FAV-03** Trashed favorite still renders (click → deleted banner); permanently-deleted favorite row is null-skipped → verify pagination pages don't visibly shrink and empty state only when truly empty (`favorites-pages.tsx:52-126`).
+- **TC-LABEL-03** Label name regex `/^[a-z0-9_-][a-z0-9_~-]*$/`: `~tag` (tilde first) rejected; `a~b` ok; uppercase/space/unicode handled (client lowercases first) (`label.dto.ts:31`).
+- **TC-LABEL-05** `/labels/:name` for a label mostly on inaccessible pages → results filtered AFTER pagination → under-filled pages but "load more" terminates; nonexistent label returns uniform `usageCount:0` (no leak) (`label.service.ts:87-138`).
+- **TC-LABEL-06** Apply a label to pages X+Y, remove from each → label auto-deletes workspace-wide only on removal from its LAST page; re-adding creates a fresh row (`label.service.ts:40-67`).
+
+### V.6 Auth, members, groups, spaces, workspace
+
+- **TC-MEM-07** [BUG?] Plain MEMBER calls `POST /workspace/invites` and `/members` directly → returns pending invite emails+roles and the full roster (UI-only gating; CASL grants member `Read Member`) (`workspace.controller.ts:122-210`, `workspace-ability.factory.ts:69`).
+- **TC-SPACE-10** [BUG?] Delete the workspace default space → no guard; verify it doesn't leave a dangling `defaultSpaceId` breaking home/new-note/onboarding (`space.service.ts:270-292`).
+- **TC-SPACE-11** [BUG?] Save a space sending an unchanged slug (or two admins racing) → server `slugExists` counts the space's own row → wrong "Space slug exists" 400 (`space.repo.ts:60-74`).
+- **TC-AUTH-21** [BUG?] >70-char password on change-password and invite-accept (no MaxLength, unlike register/reset 8-70) → accepted and bcrypt silently truncates at 72 bytes (`change-password.dto.ts:10`, `invitation.dto.ts:51`).
+- **TC-AUTH-22** Session table: >25 logins trim oldest-by-last-active (their cookies 401 next request); >7-day sessions purged; valid JWT + revoked DB session ⇒ 401; revoke-all keeps current, revoke-current → 400 (`session.service.ts:14-37`, `jwt.strategy.ts:64-72`, `session.controller.ts:41-79`).
+- **TC-GRP-04** Delete a group (or remove a user) that is a space's only access path → user loses space access AND their favorites/watchers for that space are purged; users with another access path keep theirs; live sessions NOT killed (`group.service.ts:173-214`, `group-user.service.ts:106-172`).
+- **TC-WS-12** aiSearch toggle OFF (schedules 24h embedding-purge job) then back ON within the window → the pending purge job is removed so it can't wipe rebuilt embeddings; one dedup reindex runs (`workspace.service.ts:578-609`).
+- **TC-USER-08** Notification preferences: per-type email opt-outs (page.updated, page/comment user-mention, comment.created/resolved) toggle + persist + suppress email (`update-user-settings` path).
+- **GAP** Space/group `description` has no server MaxLength (≤500 is client-only) → 10k-char description via API is stored (`create-space.dto.ts:17`, `create-group.dto.ts`).
+
+### V.7 Import / export / attachments / storage
+
+- **TC-ATT-DL-01** Non-member (or restricted-page reader) fetches `/api/files/<id>/<name>` directly → 403/404; download uses `validateCanView`, upload uses `validateCanEdit`; READER who can view CAN download (`attachment.controller.ts:166-211`).
+- **TC-ATT-PUB-01** [BUG?] Public attachment JWT survives un-share / page move (check is only `jwt.pageId === attachment.pageId`, no live share check) → token-outlives-revocation leak; also expiry and cross-attachment reuse → 404 (`attachment.controller.ts:213-259`).
+- **TC-ATT-CHAT-01** AI-chat attachment is creator-only: another user (even admin) gets 404; `files/info` rejects chat attachments (`attachment.controller.ts:185-191, 391-415`).
+- **TC-STOR-RANGE-01** Seek a large inline video/audio (Range header) → 206 with correct Content-Range; past-EOF → 416; malformed Range → full stream; test on both local and S3 (`attachment.controller.ts:490-533`).
+- **TC-IMP-ZIPBOMB-01** [BUG?] Upload a <200MB zip that decompresses to many GB / hundreds of thousands of files → no decompression-ratio or entry-count cap → disk-fill/OOM stalls the import queue (`file.utils.ts:146-228`).
+- **TC-IMP-XSS-01** [BUG?] Import md/html with `<script>`/`onerror` and unsupported Notion blocks → verify HTML is sanitized (no stored-XSS) and whether unsupported content is silently dropped while reporting "success" (`import.service.ts:125-142`).
+- **TC-IMP-NEST-ZIP-01** Nested zip unwrapped only one level AND only when the outer zip has exactly one entry; doubly-nested or zip+stray-file → inner ignored → "no pages imported", not a crash (`file.utils.ts:95-144`).
+- **TC-IMP-NOTION-01** Notion export with duplicate-title folders (partial-UUID disambiguation) + nested DBs → all pages land with correct parent/child, none dropped/mis-parented (`file-import-task.service.ts:222-305`).
+- **TC-IMP-POLLER-01** [BUG?] Import poller `setInterval` has no cleanup (leak/double-poller on second import); a single transient `getFileTaskById` failure aborts polling with a false "Import failed" though the backend task is alive (`page-import-modal.tsx:152-231`).
+- **TC-EXP-ATTACH-FAIL-01** [BUG?] Export include-attachments with one unreadable attachment → file silently omitted, export reports "successful" (incomplete backup, no manifest) (`export.service.ts:358-380`).
+- **TC-EXP-PERM-01** Export a subtree where a middle page is inaccessible → its accessible descendants are pruned (chain broken); root inaccessible → "Root page is not accessible" (`export.service.ts:563-609`).
+- **TC-ATT-ORPHAN-01** Trash a page with attachments → blobs remain (restore works); permanent-delete/auto-purge → attachment-delete jobs run; partial storage-delete failure leaves orphaned blobs (log only) (`attachment.service.ts:382-426`).
+
+### V.8 Search, notifications, comments, realtime
+
+- **TC-NOTIF-05** [BUG?] After restricting a page from a user, the unread BADGE still counts its notification (count query lacks `filterAccessiblePageIds`) but the LIST hides it → permanent non-zero badge that can't be cleared + activity-existence leak (`notification.repo.ts:80` vs `notification.service.ts:61`).
+- **TC-NOTIF-06** [BUG?] "Direct" tab uses `type != page.updated` (blacklist) instead of the `DIRECT_NOTIFICATION_TYPES` whitelist → verification/approval types leak into Direct (`notification.repo.ts:58`, `notification.constants.ts:37-53`).
+- **TC-NOTIF-07** [BUG?] "Unread" filter when page 1 is all-read → empty state shown and the scroll sentinel isn't rendered → next page never loads, so an unread item on page 2 stays invisible despite the badge (`notification-list.tsx:62-83`).
+- **TC-NOTIF-08** Per-type dedup matrix (no DB unique constraint, in-code only): mention+participant → one notification; two edits in 7h → one page.updated; re-edit re-adding same mention suppressed; self-mention/resolve/comment suppressed (`comment.notification.ts:77-189`, `page.notification.ts:198-262`).
+- **TC-RT-04** [BUG?] `useQuerySubscription` registers `socket.on("message")` with NO cleanup → duplicate handlers and non-idempotent double-apply of `moveTreeNode`/`updateOne` + listener leak on re-mount/reconnect (`use-query-subscription.ts:21-167`).
+- **TC-RT-05** Tab A offline while Tab B creates/moves/deletes pages and comments → A reconnects → no resync (events lost, no refetch on reconnect) so A stays stale until reload (`ws.gateway.ts:38-62`).
+- **TC-RT-06** [BUG?] Within the 3s restriction-cache window after adding a space's FIRST page restriction, create/rename/icon/delete a restricted page → payload (title/icon) fans out to the whole space room; `invalidateSpaceRestrictionCache` has zero callers (`ws.service.ts:89-110`, `ws.utils.ts:13`).
+- **TC-RT-07** [BUG?] Same window: create/edit/resolve/delete a comment on a restricted page → comment body + selection text broadcast to the whole space room (`ws.service.ts:58-64`, `comment.service.ts:153-283`).
+- **TC-CMT-08** [BUG?] Open the Add-comment dialog on a selection, move the cursor before Submit → stored selection text is captured at submit, not at open → empty/wrong anchor; "jump to selection" then shows wrong text (`comment-dialog.tsx:53-69`).
+- **TC-CMT-10** Tab A resolves a comment; Tab B has the page open → list updates via WS but the inline decoration updates via Yjs → if one channel is mid-reconnect the panel and inline mark disagree (`use-query-subscription.ts:57-75`, `comment.service.ts:246-260`).
+- **TC-SRCH-05** [BUG?] Search operator-only / stopword-only inputs (`&`, `!`, `*`, `<->`, `\`, "the a of") → `to_tsquery` syntax error → unhandled 500; the `length<1` guard doesn't catch whitespace/operators (`search.service.ts:37, 50-60`).
+- **TC-SRCH-07** Query whose top-N ranked hits include restricted pages → access-filtering AFTER limit/offset returns <N visible results and the removed ranks are unreachable (`search.service.ts:67-139`).
+- **TC-SRCH-04** `/search/suggest` has no controller-level CASL check (unlike `pageSearch`) — pass a non-member `spaceId` and confirm the service filter alone blocks any page leak (`search.controller.ts:76-84`).
