@@ -314,7 +314,7 @@ Conventions:
 
 ## V. Forgotten cases — second code-grounded pass (added 2026-06-23)
 
-Additional cases from a code-grounded gap audit of this plan (8 read-only audits across product zones; full rationale in `docs/qa-plan-gaps-pr136.md`). Same convention: steps → expected, `file:line` cited for grounding. **[BUG?]** = the case also surfaces a candidate defect.
+Additional cases from a code-grounded gap audit of this plan (8 read-only audits across product zones). Same convention: steps → expected, `file:line` cited for grounding. **[BUG?]** = the case also surfaces a candidate defect.
 
 ### V.0 Corrections to existing cases (text now stale vs code)
 
