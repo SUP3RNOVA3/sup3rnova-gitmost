@@ -1,8 +1,8 @@
 /**
- * The client seam (plan §3.1). Upstream `pull.ts`/`push.ts` reached into the
+ * The client seam. Upstream `pull.ts`/`push.ts` reached into the
  * REST `DocmostClient` from the `docmost-client` package via `Pick<DocmostClient,
  * ...>` subsets. That package is NOT vendored here (the gitmost server writes
- * NATIVELY — through repositories + collab `openDirectConnection`, plan §3.2/§3.3),
+ * NATIVELY — through repositories + collab `openDirectConnection`),
  * so the engine must depend on a narrow STRUCTURAL interface instead.
  *
  * `GitSyncClient` is that interface: the native datasource (server side, a later
@@ -106,7 +106,7 @@ export interface GitSyncClient {
   /**
    * Reparent a page (and optionally set its fractional-index `position`). The
    * engine passes `position` UNDEFINED for now; the native impl computes a
-   * default between siblings (plan §3.2). Result is not inspected.
+   * default between siblings. Result is not inspected.
    */
   movePage(
     pageId: string,

@@ -1,5 +1,5 @@
 /**
- * Git-sync control-plane constants (plan §6/§9/§10).
+ * Git-sync control-plane constants.
  *
  * Event/job names are REUSED from the shared event contract (event.contants.ts)
  * so the listener subscribes to the exact names the rest of the server emits —
@@ -10,11 +10,11 @@
 import { EventName } from '../../common/events/event.contants';
 
 /**
- * The page lifecycle events the git-sync listener reacts to (plan §10). A change
+ * The page lifecycle events the git-sync listener reacts to. A change
  * to any of these in an enabled space schedules a debounced sync cycle.
  *   - PAGE_CREATED / PAGE_UPDATED / PAGE_MOVED — structural + content edits;
  *   - PAGE_SOFT_DELETED / PAGE_RESTORED — Trash transitions (deletes are soft);
- *   - PAGE_MOVED_TO_SPACE — cross-space move (cross-repo, plan §5).
+ *   - PAGE_MOVED_TO_SPACE — cross-space move (cross-repo).
  *
  * NOTE: body edits arrive via PAGE_UPDATED (emitted from persistence.extension),
  * NOT via EventName.PAGE_CONTENT_UPDATED — that name is a BullMQ queue-job name,
@@ -29,12 +29,12 @@ export const GIT_SYNC_PAGE_EVENTS = [
   EventName.PAGE_RESTORED,
 ] as const;
 
-/** Redis key prefix for the per-space leader lock (plan §9). */
+/** Redis key prefix for the per-space leader lock. */
 export const GIT_SYNC_LOCK_PREFIX = 'git-sync:lock:';
 
 /**
  * Leader-lock TTL (ms). Must exceed the maximum expected cycle duration so the
- * lock is not lost mid-cycle; on a crash it expires on its own (plan §9). The
+ * lock is not lost mid-cycle; on a crash it expires on its own. The
  * in-process mutex (orchestrator) prevents overlapping cycles on one instance,
  * and the Redis lock prevents two instances racing the same space.
  */

@@ -20,9 +20,9 @@ import { AuthProvenanceData } from '../../../common/decorators/auth-provenance.d
 /**
  * The acting context the orchestrator binds the datasource to. The datasource is
  * NOT a fixed-identity singleton: it operates on behalf of a (workspaceId,
- * userId) pair the orchestrator supplies per space (plan §3.2). `userId` is the
+ * userId) pair the orchestrator supplies per space. `userId` is the
  * git-sync service user — it stays the responsible author (creatorId /
- * lastUpdatedById) while the `'git-sync'` actor marks provenance (plan §8.1).
+ * lastUpdatedById) while the `'git-sync'` actor marks provenance.
  */
 export interface GitSyncBindContext {
   workspaceId: string;
@@ -44,7 +44,7 @@ const GIT_SYNC_PROVENANCE: AuthProvenanceData = {
 
 /**
  * Native, in-process implementation of the engine's `GitSyncClient` seam
- * (plan §3). Reads go through repositories (PageRepo/SpaceRepo); body writes go
+ * Reads go through repositories (PageRepo/SpaceRepo); body writes go
  * through collab `openDirectConnection` (§3.3); structural mutations
  * (create/move/delete/rename) go through PageService.
  *
@@ -94,7 +94,7 @@ export class GitmostDataSourceService {
   /**
    * Full page tree of a space mapped to the engine's `PageNode` shape. We read
    * the DB directly, so `complete` is ALWAYS `true` — the incomplete-fetch
-   * suppression (SPEC §8) never fires natively (plan §3.2).
+   * suppression (SPEC §8) never fires natively.
    */
   private async listSpaceTree(
     ctx: GitSyncBindContext,
@@ -270,7 +270,7 @@ export class GitmostDataSourceService {
   /**
    * Compute a fractional-index position AFTER the last sibling under
    * `parentPageId` (root pages when null) in the space, ordered by `position`
-   * with the "C" collation Docmost uses (plan §14.4). Falls back to a fresh key
+   * with the "C" collation Docmost uses. Falls back to a fresh key
    * when there are no siblings.
    */
   private async computeMovePosition(
@@ -394,7 +394,7 @@ export class GitmostDataSourceService {
    * PersistenceExtension.onStoreDocument, which persists ydoc+content+textContent,
    * stamps `lastUpdatedSource = 'git-sync'`, and broadcasts `page.updated`. The
    * service user (`user.id`) stays the responsible `lastUpdatedById`; the actor
-   * marks provenance (plan §8.1).
+   * marks provenance.
    */
   private async writeBody(
     pageId: string,

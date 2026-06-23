@@ -14,7 +14,7 @@ import { GitHttpBackendService } from './http/git-http-backend.service';
 import { GitHttpService } from './http/git-http.service';
 
 /**
- * The git-sync control plane (plan §6). Wires the native datasource, the
+ * The git-sync control plane. Wires the native datasource, the
  * orchestrator (poll + leader-lock), the per-space vault registry, the
  * event-driven listener, and the admin trigger controller.
  *
@@ -27,7 +27,7 @@ import { GitHttpService } from './http/git-http.service';
  *   - ScheduleModule (NOT forRoot) — so SchedulerRegistry is injectable (the
  *     orchestrator registers a DYNAMIC poll interval in onModuleInit). forRoot()
  *     is already registered globally by TelemetryModule; importing the plain
- *     module here avoids a duplicate scheduler registration (plan §6 note).
+ *     module here avoids a duplicate scheduler registration.
  *
  * RedisService is provided by the global RedisModule (app.module) and CASL's
  * WorkspaceAbilityFactory by the global CaslModule — both resolve without an

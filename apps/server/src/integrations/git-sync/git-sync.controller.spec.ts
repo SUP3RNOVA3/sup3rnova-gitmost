@@ -1,4 +1,4 @@
-// Unit tests for the ops/testing controller (plan §6). The orchestrator, env,
+// Unit tests for the ops/testing controller. The orchestrator, env,
 // and the workspace-ability factory are hand-built mocks. We assert the admin
 // guard (non-admin -> ForbiddenException, no orchestrator call), that trigger
 // uses the workspace from request context (never the body), and that status

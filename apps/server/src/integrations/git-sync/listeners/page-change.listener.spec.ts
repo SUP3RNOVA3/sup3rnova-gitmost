@@ -1,4 +1,4 @@
-// Unit tests for the event-driven git-sync trigger (plan §10). The orchestrator
+// Unit tests for the event-driven git-sync trigger. The orchestrator
 // and page repo are hand-built mocks; the debounce coalescing is exercised with
 // jest fake timers. We assert the gate, the loop-guard (anti-echo), the
 // missing-page short-circuit, the heterogeneous event-shape id resolution, the

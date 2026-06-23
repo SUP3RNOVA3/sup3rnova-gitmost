@@ -22,18 +22,17 @@ interface PageEventLike {
 }
 
 /**
- * Event-driven trigger for the git-sync control plane (plan §10). Subscribes to
+ * Event-driven trigger for the git-sync control plane. Subscribes to
  * the page lifecycle events and, for an enabled space, schedules a DEBOUNCED
  * `orchestrator.runOnce(spaceId, workspaceId)` — coalescing a burst of edits into
  * a single cycle per space.
  *
- * Loop-guard (best-effort, plan §10/§8.2): an event whose page row already reads
+ * Loop-guard (best-effort): an event whose page row already reads
  * `lastUpdatedSource === 'git-sync'` is the orchestrator's OWN write, so we skip
  * it to avoid a write -> event -> sync echo. The guard ALWAYS runs (the page row
  * is fetched for every event, structural ones included). This is the cheap first
- * guard; the
- * full bodyHash + updatedAt loop-guard (consuming the push side's
- * `PushedPageRecord`) is a later hardening step (plan §8.2) — noted, not built
+ * guard; the full bodyHash + updatedAt loop-guard (consuming the push side's
+ * `PushedPageRecord`) is a later hardening step — noted, not built
  * here. The poll-safety interval still converges anything this guard drops.
  */
 @Injectable()
@@ -74,7 +73,7 @@ export class PageChangeListener {
       if (!page) return;
 
       // Loop-guard: skip our own writes to avoid a write -> event -> sync echo
-      // (best-effort, plan §8.2). Applies unconditionally now.
+      // (best-effort). Applies unconditionally now.
       if (page.lastUpdatedSource === 'git-sync') return;
 
       // Prefer ids carried on the event; fall back to the row we already fetched.

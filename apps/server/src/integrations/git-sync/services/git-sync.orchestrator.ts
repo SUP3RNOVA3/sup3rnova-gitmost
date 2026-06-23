@@ -64,12 +64,12 @@ export interface GitSyncRunStatus {
 }
 
 /**
- * The git-sync control plane (plan §9/§10/§11). Drives the vendored engine in
+ * The git-sync control plane. Drives the vendored engine in
  * process: under a Redis leader lock (single-writer across replicas) plus an
  * in-process per-space mutex (no overlapping cycles on one instance), it runs a
  * PULL (Docmost -> vault) then a PUSH (vault -> Docmost) for a space.
  *
- * Enumeration of enabled spaces (plan §10): STRICT opt-in. Only spaces whose
+ * Enumeration of enabled spaces: STRICT opt-in. Only spaces whose
  * per-space flag `space.settings.gitSync.enabled === true` (written by the Phase-C
  * UI) are reconciled. There is intentionally NO all-spaces fallback: when no space
  * carries the flag, git-sync does NOTHING (an empty list) — flagging every space
@@ -99,7 +99,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     this.redis = redisService.getOrThrow();
   }
 
-  // --- Redis leader lock (plan §9) -----------------------------------------
+  // --- Redis leader lock -----------------------------------------
 
   /**
    * Acquire per-space leadership: `SET <key> <instanceId> PX <ttl> NX` returns
@@ -165,7 +165,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // --- enabled-space enumeration (plan §10) --------------------------------
+  // --- enabled-space enumeration --------------------------------
 
   /**
    * Enumerate the spaces the poll loop should reconcile. STRICT opt-in: ONLY
@@ -184,7 +184,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       .execute();
   }
 
-  // --- one sync cycle for a space (plan §11) -------------------------------
+  // --- one sync cycle for a space -------------------------------
 
   /**
    * Build the engine `Settings` for a space. The engine's REST-era fields
@@ -361,7 +361,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * The actual engine wiring (plan §11). Mirrors the engine's own `main`:
+   * The actual engine wiring. Mirrors the engine's own `main`:
    *   PULL  — readExisting -> computePullActions -> applyPullActions,
    *   PUSH  — runPush (dry-run disabled: a real apply).
    * The dependency-object shapes match pull.ts/push.ts exactly (see comments).
@@ -381,7 +381,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     await vault.assertGitAvailable();
     await vault.ensureRepo();
 
-    // Refuse to run on top of an unresolved merge (SPEC §9 / plan §11.2): a prior
+    // Refuse to run on top of an unresolved merge (SPEC §9): a prior
     // conflicting pull leaves the vault mid-merge; the next checkout would fail.
     if (await vault.isMergeInProgress()) {
       this.logger.warn(
@@ -399,7 +399,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     // before push can diff them.
     await vault.checkout('docmost');
 
-    // --- PULL (plan §11.1/§11.2) --------------------------------------------
+    // --- PULL --------------------------------------------
     // readExisting deps (ReadExistingDeps): list tracked *.md + read by relPath.
     const existing = await readExisting({
       listTracked: () => vault.listTrackedFiles('*.md'),
@@ -427,7 +427,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       vaultRoot,
     );
 
-    // --- PUSH (plan §11.3) --------------------------------------------------
+    // --- PUSH --------------------------------------------------
     // runPush deps (PushDeps): settings, the full vault git object (method `this`
     // binding must be preserved — pass the object, not bound method refs), a
     // makeClient factory returning the push client subset, vault-relative fs
@@ -442,7 +442,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       log: (line: string) => this.logger.log(`git-sync[${spaceId}] ${line}`),
     };
 
-    // DEFENSE-IN-DEPTH delete cap (plan §11.3 step 6). A non-convergent vault
+    // DEFENSE-IN-DEPTH delete cap. A non-convergent vault
     // (e.g. empty/duplicate titles -> colliding paths) can compute PHANTOM
     // absence-deletions that slip under the engine's mass-delete FRACTION guard
     // and soft-delete real pages. So plan the push as a DRY-RUN FIRST to read the
@@ -515,7 +515,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  // --- poll-safety interval (plan §10) -------------------------------------
+  // --- poll-safety interval -------------------------------------
 
   /** Registered interval name (shared by registration + teardown). */
   private static readonly POLL_INTERVAL_NAME = 'git-sync-poll';
@@ -528,7 +528,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
    *
    * ScheduleModule: forRoot() is registered ONCE globally by TelemetryModule;
    * GitSyncModule imports the plain ScheduleModule so SchedulerRegistry is
-   * injectable without a duplicate forRoot (plan §6 note).
+   * injectable without a duplicate forRoot.
    */
   onModuleInit(): void {
     if (!this.environmentService.isGitSyncEnabled()) return;

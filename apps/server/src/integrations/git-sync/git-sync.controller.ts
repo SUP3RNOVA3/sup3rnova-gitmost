@@ -34,7 +34,7 @@ class TriggerGitSyncDto {
 }
 
 /**
- * Ops/testing endpoints for the git-sync control plane (plan §6). Admin-guarded
+ * Ops/testing endpoints for the git-sync control plane. Admin-guarded
  * (workspace Manage/Settings, mirroring WorkspaceController) so only workspace
  * admins can force a cycle. Mounted under the global `/api` prefix:
  *   - POST /api/git-sync/trigger { spaceId } — run one cycle now (await result),

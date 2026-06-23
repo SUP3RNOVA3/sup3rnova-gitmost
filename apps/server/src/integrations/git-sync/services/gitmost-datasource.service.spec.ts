@@ -34,7 +34,7 @@ jest.mock('@docmost/editor-ext', () => ({
 import * as Y from 'yjs';
 import { GitmostDataSourceService } from './gitmost-datasource.service';
 
-// Focused unit/contract test for the native GitSyncClient adapter (plan §3).
+// Focused unit/contract test for the native GitSyncClient adapter.
 // No DB, no real collab server: the repos/services/gateway are mocked and we
 // assert the mapping logic + the provenance/soft-delete/position contracts.
 

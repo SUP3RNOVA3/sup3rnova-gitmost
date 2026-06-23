@@ -9,9 +9,9 @@ const execFileAsync = promisify(execFile);
 
 /**
  * Resolves the on-disk vault location per space and owns the (lazily created,
- * cached) `VaultGit` instance for each one (plan §3/§5).
+ * cached) `VaultGit` instance for each one.
  *
- * Topology (plan §5): one git repo per enabled space, rooted at
+ * Topology: one git repo per enabled space, rooted at
  * `<GIT_SYNC_DATA_DIR>/<spaceId>`. A `VaultGit` is constructed at most once per
  * space and reused across cycles — it is a thin, stateless shell-out wrapper, so
  * caching it just avoids re-resolving the path and re-running `mkdir`.

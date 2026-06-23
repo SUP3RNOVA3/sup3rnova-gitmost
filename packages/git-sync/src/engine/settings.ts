@@ -1,10 +1,10 @@
 /**
- * Engine settings (plan §2.1 / §7.2 — ADAPTED for vendoring).
+ * Engine settings (ADAPTED for vendoring).
  *
  * Upstream this module also loaded `.env` (`dotenv`) and bound `parseSettings`
  * to `process.env` via a `loadSettings()` entry point. In gitmost the engine is
  * driven IN-PROCESS by the NestJS server, which builds the `Settings` object
- * from `EnvironmentService` (plan §7.2) — so the engine must NOT reach into
+ * from `EnvironmentService` — so the engine must NOT reach into
  * `process.env` here. We therefore vendor ONLY:
  *   - the `Settings` type the engine consumes, and
  *   - `parseSettings(env)` as a PURE function (validate a raw env object -> typed

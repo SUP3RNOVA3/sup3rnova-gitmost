@@ -1,7 +1,7 @@
 /**
  * Public surface of `@docmost/git-sync`.
  *
- * Phase A (plan §12.A) vendors only the PURE converter + pure engine modules
+ * Phase A vendors only the PURE converter + pure engine modules
  * from docmost-sync. Server integration (GitmostDataSource, orchestrator,
  * VaultGit, pull/push) is added in later steps.
  */
@@ -45,7 +45,7 @@ export type { PageMeta } from "./engine/stabilize";
 
 export { bodyHash } from "./engine/loop-guard";
 
-// IO engine (plan §2.1/§3.1): the client seam, the VaultGit git wrapper, the
+// IO engine: the client seam, the VaultGit git wrapper, the
 // pull (Docmost->FS) + push (FS->Docmost) planners/appliers, and the (pure)
 // settings parser. The engine consumes the native `GitSyncClient` seam (server
 // implements it) — the upstream REST `DocmostClient` is NOT vendored.

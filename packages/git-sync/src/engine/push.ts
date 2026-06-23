@@ -22,7 +22,7 @@
  * then calls `move_page` / `rename_page` (both for a reparent+retitle), or
  * records a NO-OP for a cosmetic local-only file-path rename.
  *
- * VENDORED into gitmost (plan §2.1/§3.1): the client seam is the native
+ * VENDORED into gitmost: the client seam is the native
  * `GitSyncClient` (`Pick<GitSyncClient, ...>`), not the upstream REST
  * `DocmostClient`; the upstream CLI `main()` entry point is dropped (the gitmost
  * server drives the engine in-process). Engine LOGIC is byte-identical.

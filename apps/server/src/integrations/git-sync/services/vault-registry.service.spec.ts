@@ -1,5 +1,5 @@
 // Unit tests for the per-space vault path resolver + lazy VaultGit cache
-// (plan §3/§5). `mkdir` and `VaultGit` are mocked so construction is cheap and
+// `mkdir` and `VaultGit` are mocked so construction is cheap and
 // no real filesystem / git work happens. We assert the path normalization
 // (trailing slash) and the one-VaultGit-per-space caching contract.
 import { mkdir } from 'node:fs/promises';

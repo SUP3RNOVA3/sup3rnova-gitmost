@@ -7,7 +7,7 @@
  * (`preprocessCallouts`, `bridgeTaskLists`). The collaboration/websocket
  * write-path (Hocuspocus, Yjs, `ws`, `withPageLock`, `sanitizeForYjs`) that
  * lives in the same upstream file is intentionally NOT vendored — the gitmost
- * server writes page bodies natively through the collab gateway (plan §3.3).
+ * server writes page bodies natively through the collab gateway.
  */
 import { generateJSON } from "@tiptap/html";
 import { JSDOM } from "jsdom";

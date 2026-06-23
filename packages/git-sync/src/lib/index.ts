@@ -8,7 +8,7 @@
  *
  * The REST client, websocket/collab write-path, auth-utils and page-lock from
  * the upstream package are deliberately NOT vendored (the gitmost server writes
- * natively — plan §2.2/§2.3).
+ * natively).
  */
 export {
   serializeDocmostMarkdown,

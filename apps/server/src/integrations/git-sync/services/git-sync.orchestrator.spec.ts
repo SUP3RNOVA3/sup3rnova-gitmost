@@ -1,4 +1,4 @@
-// Unit tests for the git-sync control plane (plan §9/§10/§11). The vendored
+// Unit tests for the git-sync control plane. The vendored
 // engine (@docmost/git-sync) is fully mocked so we exercise ONLY the
 // orchestrator's wiring: gating, the Redis leader lock + in-process mutex,
 // the pull/push call order, the delete-cap anti-data-loss guard, the remote

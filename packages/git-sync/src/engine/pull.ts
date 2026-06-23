@@ -25,7 +25,7 @@
  * (read-only: listSpaceTree + getPageJson). All git operations run against
  * the vault repo (`cwd = vaultPath`), never the source repo (see ./git.ts).
  *
- * VENDORED into gitmost (plan §2.1/§3.1): the client seam is the native
+ * VENDORED into gitmost: the client seam is the native
  * `GitSyncClient` (`Pick<GitSyncClient, ...>`), not the upstream REST
  * `DocmostClient`; the upstream CLI `main()` entry point is dropped (the gitmost
  * server drives the engine in-process). Engine LOGIC is byte-identical.
