@@ -32,10 +32,7 @@ jest.mock('@docmost/editor-ext', () => ({
 }));
 
 import * as Y from 'yjs';
-import {
-  GitmostDataSourceService,
-  ActiveEditSessionError,
-} from './gitmost-datasource.service';
+import { GitmostDataSourceService } from './gitmost-datasource.service';
 
 // Focused unit/contract test for the native GitSyncClient adapter (plan §3).
 // No DB, no real collab server: the repos/services/gateway are mocked and we
@@ -56,10 +53,7 @@ interface Mocks {
     movePage: AnyMock;
     removePage: AnyMock;
   };
-  collabGateway: {
-    openDirectConnection: AnyMock;
-    getActiveEditorCount: AnyMock;
-  };
+  collabGateway: { openDirectConnection: AnyMock };
   // Minimal Kysely-ish chainable mock for the direct-query paths.
   db: any;
   // Captured collab connection (the fake conn the gateway returns).
@@ -110,8 +104,6 @@ function build(rows: any[] = []): {
         conn.context = ctx;
         return conn;
       }),
-      // Default: no live editor sessions, so body writes proceed.
-      getActiveEditorCount: jest.fn(() => 0),
     },
     db: {
       selectFrom: jest.fn(() => makeQueryBuilder(rows)),
@@ -247,31 +239,11 @@ describe('GitmostDataSourceService', () => {
       expect(res.updatedAt).toBe('2026-06-20T11:00:00.000Z');
     });
 
-    it('defers (throws ActiveEditSessionError) when a human is editing the page — never clobbers', async () => {
-      const { service, mocks } = build();
-      // A live editor session on this page.
-      mocks.collabGateway.getActiveEditorCount.mockReturnValue(1);
-
-      await expect(
-        service.bind(CTX).importPageMarkdown('p1', '# Hello\n\nworld'),
-      ).rejects.toBeInstanceOf(ActiveEditSessionError);
-
-      // The destructive full-body write must NOT have happened: no connection
-      // opened, no transact run. The engine's push loop catches this and retries
-      // on the next poll once the editor disconnects.
-      expect(mocks.collabGateway.getActiveEditorCount).toHaveBeenCalledWith(
-        'page.p1',
-      );
-      expect(mocks.collabGateway.openDirectConnection).not.toHaveBeenCalled();
-      expect(mocks.conn.transact).not.toHaveBeenCalled();
-    });
-
-    it('crash-safe: the captured write applies real content (update built before clearing)', async () => {
-      // The replacement Yjs update is computed BEFORE the connection opens / the
-      // fragment is cleared, so a transform failure can never leave the body
-      // emptied. Here we run the captured transact callback against a REAL Y.Doc
-      // and confirm it ends up with content (the precomputed update is valid and
-      // applied), i.e. the write produces a non-empty body rather than wiping it.
+    it('crash-safe: the incoming doc is built before the connection opens, and the captured merge applies content', async () => {
+      // The incoming Yjs doc is built BEFORE the connection opens, so a transform
+      // failure can never mutate the live body. Here we run the captured transact
+      // callback (the block-level merge) against a REAL empty Y.Doc and confirm it
+      // ends up with content — the write produces a non-empty body, never wipes it.
       const { service, mocks } = build();
       mocks.pageRepo.findById.mockResolvedValue({
         id: 'p1',
@@ -281,7 +253,7 @@ describe('GitmostDataSourceService', () => {
 
       const realDoc = new Y.Doc();
       expect(() => mocks.conn.capturedFn?.(realDoc)).not.toThrow();
-      // The body fragment is non-empty: the markdown was converted and applied.
+      // The body fragment is non-empty: the incoming block was merged in.
       expect(realDoc.getXmlFragment('default').length).toBeGreaterThan(0);
     });
   });

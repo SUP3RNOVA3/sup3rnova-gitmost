@@ -1,5 +1,4 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import * as Y from 'yjs';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import {
@@ -15,6 +14,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { PageService } from '../../../core/page/services/page.service';
 import { CollaborationGateway } from '../../../collaboration/collaboration.gateway';
 import { tiptapExtensions } from '../../../collaboration/collaboration.util';
+import { mergeXmlFragments } from './yjs-body-merge';
 import { AuthProvenanceData } from '../../../common/decorators/auth-provenance.decorator';
 
 /**
@@ -41,23 +41,6 @@ const GIT_SYNC_PROVENANCE: AuthProvenanceData = {
   actor: 'git-sync',
   aiChatId: null,
 };
-
-/**
- * Thrown when a git -> page body write is skipped because a human is editing the
- * page RIGHT NOW (a live collab session). The engine's push loop catches this
- * per page, records it as a (non-fatal) failure, and does NOT advance the
- * loop-guard for that page — so the write is retried on the next poll once the
- * editor disconnects, instead of clobbering their in-flight edits with a
- * full-body replace (plan §15.6 / review #5).
- */
-export class ActiveEditSessionError extends Error {
-  constructor(pageId: string) {
-    super(
-      `git-sync: page ${pageId} has an active edit session; deferring body write`,
-    );
-    this.name = 'ActiveEditSessionError';
-  }
-}
 
 /**
  * Native, in-process implementation of the engine's `GitSyncClient` seam
@@ -398,28 +381,15 @@ export class GitmostDataSourceService {
   ): Promise<void> {
     const documentName = `page.${pageId}`;
 
-    // Do NOT clobber a page someone is editing right now. The write below is a
-    // full-body replace (delete-all + re-insert); applied over a live editing
-    // session it would discard the user's in-flight changes. If a human editor
-    // is connected, defer: throw so the engine retries on the next poll once
-    // they disconnect (review #5 — "не писать в страницу с активной сессией").
-    if (this.collabGateway.getActiveEditorCount(documentName) > 0) {
-      this.logger.debug(
-        `Skipping git-sync body write for ${documentName}: active edit session`,
-      );
-      throw new ActiveEditSessionError(pageId);
-    }
-
-    // Build the replacement Yjs state BEFORE touching the live doc. If the
-    // transform throws (a malformed/unsupported doc), we must NOT have already
-    // cleared the fragment — otherwise a conversion failure would leave the page
-    // with an empty body (review #5 — crash-safe conversion).
-    const next = TiptapTransformer.toYdoc(
+    // Build the incoming Yjs doc BEFORE opening the connection / touching the
+    // live doc. If the transform throws (a malformed/unsupported doc) we must NOT
+    // have mutated the live body — otherwise a conversion failure could leave the
+    // page empty (review #5 — crash-safe conversion).
+    const targetDoc = TiptapTransformer.toYdoc(
       prosemirrorJson,
       'default',
       tiptapExtensions,
     );
-    const update = Y.encodeStateAsUpdate(next);
 
     const conn = await this.collabGateway.openDirectConnection(documentName, {
       actor: 'git-sync',
@@ -430,9 +400,15 @@ export class GitmostDataSourceService {
     });
     try {
       await conn.transact((doc) => {
-        const fragment = doc.getXmlFragment('default');
-        if (fragment.length > 0) fragment.delete(0, fragment.length);
-        Y.applyUpdate(doc, update);
+        // Block-level MERGE rather than a full-body replace (review #5): diff the
+        // live body against the incoming git body and apply only the blocks that
+        // actually changed. Blocks a human is concurrently editing — anything git
+        // did not change — are left untouched, and an unchanged resync is a 0-op
+        // write. Yjs CRDT-merges the minimal ops with live edits.
+        mergeXmlFragments(
+          doc.getXmlFragment('default'),
+          targetDoc.getXmlFragment('default'),
+        );
       });
     } finally {
       await conn.disconnect();
