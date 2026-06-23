@@ -7,13 +7,35 @@ jest.mock('../../../collaboration/collaboration.util', () => ({
   tiptapExtensions: [],
   getPageId: (name: string) => name.replace(/^page\./, ''),
 }));
+// writeBody now builds the replacement Yjs state eagerly (before clearing the
+// live doc), so TiptapTransformer.toYdoc runs in these unit tests. Real Tiptap
+// extensions are stubbed to [] above (they drag in the React graph), which can't
+// build a schema — so stub the transformer to return a small non-empty Y.Doc.
+// The real conversion is exercised by the @docmost/git-sync converter tests and
+// the integration tests.
+jest.mock('@hocuspocus/transformer', () => {
+  const Yjs = require('yjs');
+  return {
+    TiptapTransformer: {
+      toYdoc: jest.fn(() => {
+        const d = new Yjs.Doc();
+        d.getXmlFragment('default').insert(0, [new Yjs.XmlElement('paragraph')]);
+        return d;
+      }),
+    },
+  };
+});
 // PageService is only ever a mocked dependency here; stub the editor-ext entry
 // it imports so loading its module does not pull in the React graph either.
 jest.mock('@docmost/editor-ext', () => ({
   markdownToHtml: jest.fn(),
 }));
 
-import { GitmostDataSourceService } from './gitmost-datasource.service';
+import * as Y from 'yjs';
+import {
+  GitmostDataSourceService,
+  ActiveEditSessionError,
+} from './gitmost-datasource.service';
 
 // Focused unit/contract test for the native GitSyncClient adapter (plan §3).
 // No DB, no real collab server: the repos/services/gateway are mocked and we
@@ -34,7 +56,10 @@ interface Mocks {
     movePage: AnyMock;
     removePage: AnyMock;
   };
-  collabGateway: { openDirectConnection: AnyMock };
+  collabGateway: {
+    openDirectConnection: AnyMock;
+    getActiveEditorCount: AnyMock;
+  };
   // Minimal Kysely-ish chainable mock for the direct-query paths.
   db: any;
   // Captured collab connection (the fake conn the gateway returns).
@@ -85,6 +110,8 @@ function build(rows: any[] = []): {
         conn.context = ctx;
         return conn;
       }),
+      // Default: no live editor sessions, so body writes proceed.
+      getActiveEditorCount: jest.fn(() => 0),
     },
     db: {
       selectFrom: jest.fn(() => makeQueryBuilder(rows)),
@@ -218,6 +245,44 @@ describe('GitmostDataSourceService', () => {
       expect(typeof mocks.conn.capturedFn).toBe('function');
 
       expect(res.updatedAt).toBe('2026-06-20T11:00:00.000Z');
+    });
+
+    it('defers (throws ActiveEditSessionError) when a human is editing the page — never clobbers', async () => {
+      const { service, mocks } = build();
+      // A live editor session on this page.
+      mocks.collabGateway.getActiveEditorCount.mockReturnValue(1);
+
+      await expect(
+        service.bind(CTX).importPageMarkdown('p1', '# Hello\n\nworld'),
+      ).rejects.toBeInstanceOf(ActiveEditSessionError);
+
+      // The destructive full-body write must NOT have happened: no connection
+      // opened, no transact run. The engine's push loop catches this and retries
+      // on the next poll once the editor disconnects.
+      expect(mocks.collabGateway.getActiveEditorCount).toHaveBeenCalledWith(
+        'page.p1',
+      );
+      expect(mocks.collabGateway.openDirectConnection).not.toHaveBeenCalled();
+      expect(mocks.conn.transact).not.toHaveBeenCalled();
+    });
+
+    it('crash-safe: the captured write applies real content (update built before clearing)', async () => {
+      // The replacement Yjs update is computed BEFORE the connection opens / the
+      // fragment is cleared, so a transform failure can never leave the body
+      // emptied. Here we run the captured transact callback against a REAL Y.Doc
+      // and confirm it ends up with content (the precomputed update is valid and
+      // applied), i.e. the write produces a non-empty body rather than wiping it.
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'p1',
+        updatedAt: new Date('2026-06-20T11:00:00.000Z'),
+      });
+      await service.bind(CTX).importPageMarkdown('p1', '# Hi\n\nthere');
+
+      const realDoc = new Y.Doc();
+      expect(() => mocks.conn.capturedFn?.(realDoc)).not.toThrow();
+      // The body fragment is non-empty: the markdown was converted and applied.
+      expect(realDoc.getXmlFragment('default').length).toBeGreaterThan(0);
     });
   });
 

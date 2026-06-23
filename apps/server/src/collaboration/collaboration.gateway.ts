@@ -137,6 +137,21 @@ export class CollaborationGateway {
     return this.hocuspocus.getDocumentsCount();
   }
 
+  /**
+   * Number of LIVE human editor sessions (websocket connections) currently open
+   * on a document, or 0 if the document is not loaded. Unlike
+   * `Document.getConnectionsCount()` this deliberately excludes server-side
+   * direct connections (`directConnectionsCount`, e.g. the git-sync writer
+   * itself), so callers can tell whether a real person is editing right now.
+   *
+   * NOTE: this reflects only THIS instance. In a Redis-clustered deployment an
+   * editor attached to another node is not counted; for the single-instance
+   * deployments this guards (git-sync) that is exactly the live set.
+   */
+  getActiveEditorCount(documentName: string): number {
+    return this.hocuspocus.documents.get(documentName)?.connections.size ?? 0;
+  }
+
   handleYjsEvent<TName extends keyof CollabEventHandlers>(
     eventName: TName,
     documentName: string,

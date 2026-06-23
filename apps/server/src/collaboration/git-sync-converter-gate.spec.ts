@@ -401,18 +401,19 @@ describe('git-sync converter §13.1 KNOWN DIVERGENCE (markdown image lossiness)'
     },
   });
 
-  it('drops width/height/align (markdown ![](src) cannot carry them) and hoists the block image past a leading empty paragraph', async () => {
+  it('drops width/height/align (markdown ![](src) cannot carry them); the block-image hoist no longer leaves an empty paragraph', async () => {
     const { md, canonNormalized } = await runGate(imageDoc);
 
     // Export is plain markdown image syntax — no dimensions/align survive.
     expect(md.trim()).toBe('![](https://example.com/pic.png)');
 
-    // The round-tripped doc is the documented lossy shape: a leading empty
-    // paragraph (block-image hoist) + an image carrying ONLY src (+ alt="").
+    // The round-tripped doc carries ONLY src (+ alt=""). The leading empty
+    // paragraph that the block-image hoist used to leave behind (a phantom
+    // blank-gap on every sync) is now stripped on import (git-sync fix), so the
+    // doc is just the image — no empty-paragraph artifact.
     expect(canonNormalized).toEqual({
       type: 'doc',
       content: [
-        { type: 'paragraph' },
         {
           type: 'image',
           attrs: { alt: '', src: 'https://example.com/pic.png' },
@@ -420,7 +421,8 @@ describe('git-sync converter §13.1 KNOWN DIVERGENCE (markdown image lossiness)'
       ],
     });
 
-    // And it is therefore NOT canonically equal to the original (lock the loss).
+    // Still NOT canonically equal to the original: width/height/align are an
+    // intrinsic markdown-transport loss (unrelated to the empty-paragraph fix).
     expect(docsCanonicallyEqual(imageDoc, canonNormalized)).toBe(false);
   });
 });
