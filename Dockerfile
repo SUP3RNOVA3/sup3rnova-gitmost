@@ -39,6 +39,11 @@ COPY --from=builder /app/packages/editor-ext/dist /app/packages/editor-ext/dist
 COPY --from=builder /app/packages/editor-ext/package.json /app/packages/editor-ext/package.json
 COPY --from=builder /app/packages/mcp/build /app/packages/mcp/build
 COPY --from=builder /app/packages/mcp/package.json /app/packages/mcp/package.json
+# git-sync: the server requires @docmost/git-sync at runtime; without these the
+# image starts and crashes on `require('@docmost/git-sync')`. Built fresh by the
+# builder's `pnpm build` (nx builds the package's tsc `build` target).
+COPY --from=builder /app/packages/git-sync/build /app/packages/git-sync/build
+COPY --from=builder /app/packages/git-sync/package.json /app/packages/git-sync/package.json
 
 # Copy root package files
 COPY --from=builder /app/package.json /app/package.json
