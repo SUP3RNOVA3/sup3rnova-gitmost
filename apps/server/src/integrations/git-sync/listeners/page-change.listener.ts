@@ -21,12 +21,6 @@ interface PageEventLike {
   node?: { id: string; spaceId: string };
 }
 
-/** Per-space debounce bookkeeping. */
-interface DebounceEntry {
-  timer: NodeJS.Timeout;
-  workspaceId: string;
-}
-
 /**
  * Event-driven trigger for the git-sync control plane (plan §10). Subscribes to
  * the page lifecycle events and, for an enabled space, schedules a DEBOUNCED
@@ -45,7 +39,9 @@ interface DebounceEntry {
 @Injectable()
 export class PageChangeListener {
   private readonly logger = new Logger(PageChangeListener.name);
-  private readonly debounce = new Map<string, DebounceEntry>();
+  // spaceId -> pending debounce timer. The cycle closes over its own
+  // workspaceId, so the timer handle is all the map needs to track.
+  private readonly debounce = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly environmentService: EnvironmentService,
@@ -126,7 +122,7 @@ export class PageChangeListener {
    */
   private schedule(spaceId: string, workspaceId: string): void {
     const existing = this.debounce.get(spaceId);
-    if (existing) clearTimeout(existing.timer);
+    if (existing) clearTimeout(existing);
 
     const timer = setTimeout(() => {
       this.debounce.delete(spaceId);
@@ -143,6 +139,6 @@ export class PageChangeListener {
 
     // Do not keep the event loop alive solely for a pending sync.
     timer.unref?.();
-    this.debounce.set(spaceId, { timer, workspaceId });
+    this.debounce.set(spaceId, timer);
   }
 }
