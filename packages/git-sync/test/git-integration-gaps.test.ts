@@ -234,3 +234,92 @@ describe('VaultGit integration gaps (temp repo)', () => {
     expect(globalName).not.toBe(LOCAL_NAME);
   });
 });
+
+// Parser/error-fallback gaps for `git.ts` exercised WITHOUT a real git binary by
+// monkey-patching the private `runRaw` primitive (every git invocation funnels
+// through it, per the module header). These pin defensive arms the accepted
+// integration specs above could not reach: the unknown-status consume in the
+// `-z` walk, and the `|| r.stdout` empty-stderr error-detail fallbacks.
+describe('VaultGit parser/error-fallback gaps (runRaw stubbed)', () => {
+  // --- 1. diffNameStatus: unknown status (T) sandwiched between A and M --------
+  //
+  // Protects the default arm of the status switch (git.ts ~lines 497-502): an
+  // unknown status like `T` (type-change) consumes ONE path token defensively
+  // but emits nothing. If the walk pulled the wrong count here it would desync
+  // and misclassify the trailing M row.
+  it('diffNameStatus swallows an unknown T status mid-stream and stays aligned', async () => {
+    const git = new VaultGit('/tmp/any');
+    (git as any).runRaw = async () => ({
+      code: 0,
+      // A\0a.md  T\0t.md  M\0m.md  — T is the unknown status mid-stream.
+      stdout: 'A\0a.md\0T\0t.md\0M\0m.md\0',
+      stderr: '',
+    });
+
+    const entries = await git.diffNameStatus('X', 'Y');
+
+    // The T row's path token 't.md' is consumed but NOT emitted; the walk stays
+    // aligned so the trailing M/m.md parses cleanly (no off-by-one).
+    expect(entries).toEqual([
+      { status: 'A', path: 'a.md' },
+      { status: 'M', path: 'm.md' },
+    ]);
+    expect(entries.length).toBe(2);
+    expect(entries.some((e) => e.status === ('T' as any))).toBe(false);
+    expect(entries.some((e) => e.path === 't.md')).toBe(false);
+  });
+
+  // --- 2. diffNameStatus: unknown status (T) FIRST in the stream --------------
+  //
+  // Leading-position variant: a `T` at the head must consume its own path token
+  // without swallowing the following real A entry.
+  it('diffNameStatus swallows a leading unknown T status and parses the next A', async () => {
+    const git = new VaultGit('/tmp/any');
+    (git as any).runRaw = async () => ({
+      code: 0,
+      stdout: 'T\0t.md\0A\0a.md\0',
+      stderr: '',
+    });
+
+    const entries = await git.diffNameStatus('X', 'Y');
+
+    expect(entries.length).toBe(1);
+    expect(entries[0]).toEqual({ status: 'A', path: 'a.md' });
+  });
+
+  // --- 3. listTrackedFiles: non-zero exit, EMPTY stderr, stdout carries detail -
+  //
+  // The thrown message is built from `(r.stderr || r.stdout || '')`. This pins
+  // the `|| r.stdout` arm (empty stderr, non-empty stdout) — distinct from the
+  // non-empty-stderr and spawn-ENOENT paths the accepted specs cover.
+  it('listTrackedFiles uses stdout in the error message when stderr is empty', async () => {
+    const git = new VaultGit('/tmp/any');
+    (git as any).runRaw = async () => ({
+      code: 1,
+      stderr: '',
+      stdout: 'some detail',
+    });
+
+    await expect(git.listTrackedFiles()).rejects.toThrow(
+      'git ls-files failed: some detail',
+    );
+  });
+
+  // --- 4. diffNameStatus: non-zero exit, EMPTY stderr, stdout carries detail ---
+  //
+  // diffNameStatus has its OWN independent `(r.stderr || r.stdout || '').trim()`
+  // fallback (git.ts ~line 469), separate from listTrackedFiles. Pin the
+  // empty-stderr/non-empty-stdout arm of THIS branch.
+  it('diffNameStatus uses stdout in the error message when stderr is empty', async () => {
+    const git = new VaultGit('/tmp/any');
+    (git as any).runRaw = async () => ({
+      code: 1,
+      stderr: '',
+      stdout: 'diff detail',
+    });
+
+    await expect(git.diffNameStatus('X', 'Y')).rejects.toThrow(
+      'git diff --name-status failed: diff detail',
+    );
+  });
+});

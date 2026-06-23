@@ -641,7 +641,7 @@ describe('markdown <-> ProseMirror round-trip (property-based)', () => {
   //       { type:'paragraph', content:[{type:'text',text:'q'}] } ] }
   // Not "fixed" — the source must not change; documented and exercised here.
   // -------------------------------------------------------------------------
-  it.fails('BUG: a block image between other blocks is not byte-stable', async () => {
+  it('a block image between other blocks is byte-stable', async () => {
     const doc = {
       type: 'doc',
       content: [
@@ -670,8 +670,8 @@ describe('markdown <-> ProseMirror round-trip (property-based)', () => {
   // marks switch): preserving both marks is impossible while `code` excludes
   // them. Documented here, not "fixed", because the source must not change.
   // -------------------------------------------------------------------------
-  it.fails(
-    'BUG: code mark combined with another mark is not byte-stable',
+  it(
+    'code mark combined with another mark is byte-stable',
     async () => {
       const codeComboArb = fc
         .tuple(safeTextArb, fc.constantFrom('bold', 'italic', 'strike'))

@@ -337,6 +337,44 @@ function bridgeTaskLists(html: string): string {
   return document.body.innerHTML;
 }
 
+/**
+ * Recursively strip content-less paragraph nodes from a generated doc.
+ *
+ * A block-level atom whose markdown form is INLINE (e.g. the block `image`'s
+ * `![](url)`, or a bare media element) is wrapped by marked in a <p>; the schema
+ * then HOISTS the block atom out of that paragraph, leaving an EMPTY paragraph
+ * sibling. On the next export that empty `<p>` renders to "" and the doc "\n\n"
+ * join injects a phantom blank gap, so the markdown is not byte-stable.
+ *
+ * Markdown blank lines are separators, never content, so generateJSON only ever
+ * produces an empty paragraph as such a hoist artifact — removing them is safe
+ * and general (it also subsumes the <div>-wrapper workaround the `video` case
+ * uses). We remove ONLY `type === 'paragraph'` nodes whose `content` is absent
+ * or an empty array; every other node (including atoms without `content`) is
+ * preserved, and we recurse into the content of any node that has children.
+ */
+function stripEmptyParagraphs(node: any): any {
+  if (!node || !Array.isArray(node.content)) {
+    // Atom / leaf node (no children to recurse into): keep as-is.
+    return node;
+  }
+  const mapped = node.content.map((child: any) => stripEmptyParagraphs(child));
+  const isEmptyParagraph = (child: any): boolean =>
+    !!child &&
+    child.type === "paragraph" &&
+    (!Array.isArray(child.content) || child.content.length === 0);
+  const filtered = mapped.filter((child: any) => !isEmptyParagraph(child));
+  // Schema-validity guard: several nodes require NON-empty block content
+  // (`content: "block+"` — tableCell, tableHeader, blockquote, column, callout,
+  // and the doc root). For an empty one of those, generateJSON materializes a
+  // single empty paragraph as its OBLIGATORY content — that is not a hoist
+  // artifact. If stripping would empty the container, keep ONE empty paragraph
+  // so the result stays schema-valid (an empty cell/quote must not become `[]`).
+  const cleaned =
+    filtered.length === 0 && mapped.length > 0 ? [mapped[0]] : filtered;
+  return { ...node, content: cleaned };
+}
+
 /** Convert markdown to a ProseMirror doc using the full Docmost schema. */
 export async function markdownToProseMirror(
   markdownContent: string,
@@ -345,5 +383,6 @@ export async function markdownToProseMirror(
   const withCallouts = await preprocessCallouts(markdownContent);
   const html = await marked.parse(withCallouts);
   const bridged = bridgeTaskLists(html);
-  return generateJSON(bridged, docmostExtensions);
+  const doc = generateJSON(bridged, docmostExtensions);
+  return stripEmptyParagraphs(doc);
 }

@@ -68,21 +68,21 @@ export function convertProseMirrorToMarkdown(content: any): string {
         let textContent = node.text || "";
         // Apply marks (bold, italic, code, etc.)
         if (node.marks) {
-          // Markdown code spans (`...`) cannot carry inner formatting, so when a
-          // run has the `code` mark alongside ANY other mark, backtick syntax
-          // would leak literal ** / []() into the code text. In that case emit
-          // nested HTML (<code> innermost, the other marks wrapping it as HTML)
-          // so the output is at least well-formed and re-parseable.
-          //
-          // NOTE: this does NOT round-trip both marks. The schema's `code` mark
-          // has `excludes: "_"` (it excludes every other mark), so on import the
-          // co-occurring mark is always dropped — the run comes back as `code`
-          // only. We keep the emission simple and accept that the other mark is
-          // lost; preserving both is impossible while `code` excludes them.
-          // Only use the backtick form when `code` is the sole mark.
+          // The schema's `code` mark declares `excludes: "_"` — it excludes every
+          // other inline mark — so the editor can NEVER produce a text run that
+          // carries `code` together with another mark, and on import any
+          // co-occurring mark is always dropped (the run comes back as code-only).
+          // The lossless, byte-stable behavior is therefore: when a run has the
+          // `code` mark, emit ONLY the backtick code span and ignore every other
+          // mark, so md1 is already code-only and md2 === md1. Runs WITHOUT a code
+          // mark are rendered exactly as before.
           const markTypes = node.marks.map((m: any) => m.type);
           const hasCode = markTypes.includes("code");
-          const codeCombined = hasCode && markTypes.length > 1;
+          if (hasCode) {
+            textContent = `\`${textContent}\``;
+            return textContent;
+          }
+          const codeCombined = false;
           for (const mark of node.marks) {
             switch (mark.type) {
               case "bold":
@@ -570,6 +570,13 @@ export function convertProseMirrorToMarkdown(content: any): string {
         const inner = nodeContent.map((n: any) => blockToHtml(n)).join("");
         return `<div ${parts.join(" ")}>${inner}</div>`;
       }
+
+      case "pageBreak":
+        // Emit the schema-matching div[data-type="pageBreak"] so marked passes
+        // it through as a block and generateJSON rebuilds the pageBreak atom.
+        // Without this case the node fell through to `default` and rendered ""
+        // (the divider silently disappeared and could not round-trip).
+        return `<div data-type="pageBreak"></div>`;
 
       case "subpages":
         return "{{SUBPAGES}}";

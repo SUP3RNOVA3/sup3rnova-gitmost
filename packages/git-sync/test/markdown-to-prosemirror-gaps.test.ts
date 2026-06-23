@@ -6,6 +6,10 @@ import { describe, expect, it } from 'vitest';
 // pipeline. Importing this module mutates the global DOM via jsdom (required for
 // @tiptap/html under Node) — expected, same as the property test.
 import { markdownToProseMirror } from '../src/lib/markdown-to-prosemirror.js';
+// The export side (ProseMirror -> markdown) is pulled in for the round-trip
+// specs below (underline/sub/sup marks, heading levels, link title). Imported
+// directly from src/lib (not the barrel) like the other converter unit tests.
+import { convertProseMirrorToMarkdown } from '../src/lib/markdown-converter.js';
 
 // Find every node of a given type anywhere in a ProseMirror doc tree.
 const findAll = (node: any, type: string, acc: any[] = []): any[] => {
@@ -149,5 +153,297 @@ describe('bridgeTaskLists: numbered checklist + mixed-list negative', () => {
     // Both items survive as ordinary list items (text preserved).
     expect(allText(bulletLists[0])).toContain('checked item');
     expect(allText(bulletLists[0])).toContain('plain item');
+  });
+});
+
+// Find the first mark of a given type on a text node anywhere in the tree.
+const firstMark = (node: any, markType: string): any => {
+  if (node?.type === 'text') {
+    for (const m of node.marks || []) if (m.type === markType) return m;
+  }
+  for (const child of node?.content || []) {
+    const found = firstMark(child, markType);
+    if (found) return found;
+  }
+  return null;
+};
+
+// ---------------------------------------------------------------------------
+// Spec 1. IMPORT-side color sanitization for the highlight + textStyle marks.
+//
+// The Highlight.extend / TextStyle parseHTML run attacker-controlled colors
+// through sanitizeCssColor when generateJSON re-parses stored HTML. This is the
+// real defense that strips a crafted color on IMPORT (the export-side emission
+// is tested elsewhere; the parse path was not).
+// ---------------------------------------------------------------------------
+describe('import: highlight/textStyle color sanitization (parseHTML)', () => {
+  it('strips the unsafe "--x:1" declaration but keeps the safe "red" background-color', async () => {
+    const doc = await markdownToProseMirror(
+      '<mark style="background-color: red; --x:1">x</mark>',
+    );
+    const mark = firstMark(doc, 'highlight');
+    // The highlight mark IS present on the text run.
+    expect(mark).not.toBeNull();
+    expect(allText(doc)).toContain('x');
+    // NOTE(review): Spec 1 expected attrs.color === null for this input. The
+    // ACTUAL behavior is attrs.color === 'red': the schema's Highlight.extend
+    // reads the color via getStyleProperty(el, 'background-color'), which
+    // isolates the `background-color: red` declaration and DROPS the separate
+    // unsafe `--x:1` declaration. sanitizeCssColor('red') then accepts the bare
+    // named color. So the injection ('--x:1') is stripped (the defense holds)
+    // but the legitimate 'red' survives — color is 'red', not null. The
+    // color-dropped-to-null path is exercised by the data-color variant below,
+    // where the whole "red; --x:1" string reaches sanitizeCssColor and fails.
+    expect(mark.attrs.color).toBe('red');
+  });
+
+  it('drops a crafted color carried whole in data-color (sanitizeCssColor -> null)', async () => {
+    // Here the entire unsafe string is the candidate color (no per-declaration
+    // splitting), so sanitizeCssColor rejects it and the highlight color is null
+    // while the highlight mark itself is still applied.
+    const doc = await markdownToProseMirror(
+      '<mark data-color="red; --x:1">x</mark>',
+    );
+    const mark = firstMark(doc, 'highlight');
+    expect(mark).not.toBeNull();
+    expect(mark.attrs.color).toBeNull();
+  });
+
+  it("imports '#ff0000' as the highlight mark color verbatim", async () => {
+    const doc = await markdownToProseMirror(
+      '<mark style="background-color: #ff0000">x</mark>',
+    );
+    const mark = firstMark(doc, 'highlight');
+    expect(mark).not.toBeNull();
+    expect(mark.attrs.color).toBe('#ff0000');
+  });
+
+  it("imports a colored span as a textStyle mark with the sanitized color", async () => {
+    const doc = await markdownToProseMirror(
+      '<span style="color: rebeccapurple">y</span>',
+    );
+    const mark = firstMark(doc, 'textStyle');
+    expect(mark).not.toBeNull();
+    expect(mark.attrs.color).toBe('rebeccapurple');
+    // It is carried on a real text node containing the span's text.
+    expect(allText(doc)).toContain('y');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 2. Importing an unsupported callout fence clamps the type to 'info'.
+//
+// preprocessCallouts emits div[data-type=callout][data-callout-type=tip]; the
+// schema's Callout.type parseHTML pipes 'tip' through clampCalloutType, which
+// maps the unknown type to the 'info' default. End-to-end import-side clamp.
+// ---------------------------------------------------------------------------
+describe('import: unsupported callout fence clamps type to info', () => {
+  it("imports ':::tip' as a callout whose attrs.type === 'info'", async () => {
+    const doc = await markdownToProseMirror(':::tip\nhello\n:::');
+    const callouts = findAll(doc, 'callout');
+    expect(callouts).toHaveLength(1);
+    expect(callouts[0].attrs.type).toBe('info');
+    // The body paragraph survived inside the callout.
+    expect(allText(callouts[0])).toContain('hello');
+    const paras = findAll(callouts[0], 'paragraph');
+    expect(paras.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 3. Importing a columns layout with a string data-width yields a numeric
+// column width, and the columns wrapper carries its default layout/widthMode.
+// ---------------------------------------------------------------------------
+describe('import: columns layout with string data-width -> numeric width', () => {
+  it('parses data-width="33.5" to the number 33.5 and populates columns defaults', async () => {
+    const doc = await markdownToProseMirror(
+      '<div data-type="columns"><div data-type="column" data-width="33.5"><p>a</p></div></div>',
+    );
+    const columns = findAll(doc, 'columns');
+    expect(columns).toHaveLength(1);
+    // Columns default attrs are populated (not undefined).
+    expect(columns[0].attrs.widthMode).toBe('normal');
+    expect(columns[0].attrs.layout).not.toBeNull();
+    expect(columns[0].attrs.layout).toBe('two_equal');
+
+    const cols = findAll(columns[0], 'column');
+    expect(cols).toHaveLength(1);
+    // parseFloat('33.5') -> 33.5 as a NUMBER, not the string '33.5'.
+    expect(cols[0].attrs.width).toBe(33.5);
+    expect(typeof cols[0].attrs.width).toBe('number');
+    expect(allText(cols[0])).toContain('a');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 4. Comment mark resolved-attribute boolean coercion on import.
+//
+// The comment mark's resolved attr parseHTML compares
+// el.getAttribute('data-resolved') === 'true', so a missing attribute yields
+// false (default) and the literal 'true' yields boolean true.
+// ---------------------------------------------------------------------------
+describe('import: comment mark commentId + resolved boolean coercion', () => {
+  it("data-resolved='true' -> resolved:true with the parsed commentId", async () => {
+    const doc = await markdownToProseMirror(
+      '<span data-comment-id="c1" data-resolved="true">x</span>',
+    );
+    const mark = firstMark(doc, 'comment');
+    expect(mark).not.toBeNull();
+    expect(mark.attrs.commentId).toBe('c1');
+    expect(mark.attrs.resolved).toBe(true);
+  });
+
+  it('a missing data-resolved -> resolved:false (default)', async () => {
+    const doc = await markdownToProseMirror(
+      '<span data-comment-id="c2">y</span>',
+    );
+    const mark = firstMark(doc, 'comment');
+    expect(mark).not.toBeNull();
+    expect(mark.attrs.commentId).toBe('c2');
+    expect(mark.attrs.resolved).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 5. A NON-numeric truthy data-width reaches parseFloat and yields NaN.
+//
+// Column.width parseHTML is `value ? parseFloat(value) : null`; 'abc' is truthy
+// so parseFloat('abc') -> NaN leaks through as the raw attribute value rather
+// than falling back to the null default. (JSON.stringify would serialize NaN to
+// null — see the assertion below — so the leak is invisible in serialized JSON.)
+// ---------------------------------------------------------------------------
+describe('import: malformed non-numeric data-width leaks NaN', () => {
+  it("data-width='abc' -> column width is NaN (typeof number), not null", async () => {
+    const doc = await markdownToProseMirror(
+      '<div data-type="columns"><div data-type="column" data-width="abc"><p>x</p></div></div>',
+    );
+    const width = doc.content[0].content[0].attrs.width;
+    expect(typeof width).toBe('number');
+    expect(Number.isNaN(width)).toBe(true);
+    // Document that the leak is masked by JSON serialization: NaN -> null.
+    expect(JSON.parse(JSON.stringify(doc)).content[0].content[0].attrs.width).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 6. A column with NO data-width attribute lands on the null default.
+//
+// The else branch of `value ? parseFloat(value) : null` (getAttribute -> null)
+// must yield exactly null (not NaN/undefined), and the columns wrapper carries
+// its layout/widthMode defaults.
+// ---------------------------------------------------------------------------
+describe('import: width-less column lands on null default', () => {
+  it('no data-width -> column width === null, columns defaults populated', async () => {
+    const doc = await markdownToProseMirror(
+      '<div data-type="columns"><div data-type="column"><p>y</p></div></div>',
+    );
+    expect(doc.content[0].content[0].attrs.width).toBe(null);
+    expect(doc.content[0].attrs.layout).toBe('two_equal');
+    expect(doc.content[0].attrs.widthMode).toBe('normal');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 7. A structural callout div with missing/empty data-callout-type clamps
+// to 'info' via clampCalloutType (the parseHTML getAttrs fallback), with no icon.
+// ---------------------------------------------------------------------------
+describe('import: callout div with missing/empty data-callout-type clamps to info', () => {
+  it('a callout div with NO data-callout-type -> type:info, icon:null', async () => {
+    const doc = await markdownToProseMirror(
+      '<div data-type="callout"><p>z</p></div>',
+    );
+    expect(doc.content[0].type).toBe('callout');
+    expect(doc.content[0].attrs.type).toBe('info');
+    expect(doc.content[0].attrs.icon).toBeNull();
+  });
+
+  it('a callout div with EMPTY data-callout-type -> type:info, icon:null', async () => {
+    const doc = await markdownToProseMirror(
+      '<div data-type="callout" data-callout-type=""><p>w</p></div>',
+    );
+    expect(doc.content[0].type).toBe('callout');
+    expect(doc.content[0].attrs.type).toBe('info');
+    expect(doc.content[0].attrs.icon).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 8. A plain <td> with no align/colspan/rowspan/colwidth lands on the
+// schema defaults (align null via the `||` fallback arm; spans default to 1).
+// ---------------------------------------------------------------------------
+describe('import: span/align-less table cell lands on defaults', () => {
+  it('a bare td -> align:null, colspan:1, rowspan:1, colwidth:null', async () => {
+    const doc = await markdownToProseMirror(
+      '<table><tbody><tr><td><p>c</p></td></tr></tbody></table>',
+    );
+    const cells = findAll(doc, 'tableCell');
+    expect(cells).toHaveLength(1);
+    const attrs = cells[0].attrs;
+    expect(attrs.align).toBeNull();
+    expect(attrs.colspan).toBe(1);
+    expect(attrs.rowspan).toBe(1);
+    expect(attrs.colwidth).toBeNull();
+    expect(allText(cells[0])).toContain('c');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 9. underline/subscript/superscript marks survive import and re-export.
+// (inlineToHtml src 611-619 renders them back to <u>/<sub>/<sup>.)
+// ---------------------------------------------------------------------------
+describe('import+export: underline/subscript/superscript marks round-trip', () => {
+  it('<u>/<sub>/<sup> import to the right marks and re-export unchanged', async () => {
+    const doc = await markdownToProseMirror('<p><u>a</u><sub>b</sub><sup>c</sup></p>');
+    const para = findAll(doc, 'paragraph')[0];
+    const texts = (para.content || []).filter((n: any) => n.type === 'text');
+    expect(texts).toHaveLength(3);
+    expect(texts[0].text).toBe('a');
+    expect((texts[0].marks || []).map((m: any) => m.type)).toEqual(['underline']);
+    expect(texts[1].text).toBe('b');
+    expect((texts[1].marks || []).map((m: any) => m.type)).toEqual(['subscript']);
+    expect(texts[2].text).toBe('c');
+    expect((texts[2].marks || []).map((m: any) => m.type)).toEqual(['superscript']);
+
+    const md = convertProseMirrorToMarkdown(doc);
+    expect(md).toContain('<u>a</u>');
+    expect(md).toContain('<sub>b</sub>');
+    expect(md).toContain('<sup>c</sup>');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 10. Heading level attribute fidelity (h1/h2/h6) on import and re-export.
+// ---------------------------------------------------------------------------
+describe('import+export: heading levels 1/2/6 round-trip', () => {
+  it('parses # / ## / ###### to level 1/2/6 and re-emits them', async () => {
+    const doc = await markdownToProseMirror('# H1\n\n## H2\n\n###### H6');
+    const headings = findAll(doc, 'heading');
+    expect(headings).toHaveLength(3);
+    expect(headings[0].attrs.level).toBe(1);
+    expect(headings[1].attrs.level).toBe(2);
+    expect(headings[2].attrs.level).toBe(6);
+
+    const md = convertProseMirrorToMarkdown(doc);
+    const blocks = md.split('\n\n');
+    expect(blocks).toContain('# H1');
+    expect(blocks).toContain('## H2');
+    expect(blocks).toContain('###### H6');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Spec 11. Link mark recovers BOTH href and title on import and round-trips.
+// ---------------------------------------------------------------------------
+describe('import+export: link mark href + title round-trip', () => {
+  it('parses [lbl](http://a "the title") with href+title and re-emits it', async () => {
+    const doc = await markdownToProseMirror('[lbl](http://a "the title")');
+    const mark = firstMark(doc, 'link');
+    expect(mark).not.toBeNull();
+    expect(mark.attrs.href).toBe('http://a');
+    expect(mark.attrs.title).toBe('the title');
+    expect(allText(doc)).toContain('lbl');
+
+    const md = convertProseMirrorToMarkdown(doc);
+    expect(md).toContain('[lbl](http://a "the title")');
   });
 });

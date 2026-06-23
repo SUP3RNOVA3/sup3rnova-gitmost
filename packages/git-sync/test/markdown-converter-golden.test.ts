@@ -225,3 +225,166 @@ describe('empty / single-column tables', () => {
     expect(out).toBe('| Only |\n| --- |\n| v |');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Media / attachment / container full-attribute coverage. The base golden file
+// only sets the minimal attrs for each media node (src, or src+name), so the
+// optional-attribute emission branches and their exact ORDERING are uncovered.
+// These cases pin the full ordered attribute string for video/youtube/embed/
+// audio/pdf/attachment plus the all-absent side of every optional guard, and
+// the distinct HTML-container (blockToHtml / inlineToHtml) paths for an
+// orderedList and a hardBreak inside a column.
+// ---------------------------------------------------------------------------
+describe('media / attachment / container full-attribute golden coverage', () => {
+  it('video: emits all optional attrs in source order (alt->aria-label, attachmentId/size/align/aspectRatio->data-*)', () => {
+    expect(
+      c({
+        type: 'video',
+        attrs: {
+          src: '/v.mp4',
+          alt: 'clip',
+          attachmentId: 'att-1',
+          width: 640,
+          height: 480,
+          size: 1234,
+          align: 'center',
+          aspectRatio: 1.777,
+        },
+      }),
+    ).toBe(
+      '<div><video src="/v.mp4" aria-label="clip" data-attachment-id="att-1" width="640" height="480" data-size="1234" data-align="center" data-aspect-ratio="1.777"></video></div>',
+    );
+  });
+
+  it('video: with only src, every optional guard takes its false branch (src-only <video>, no data-type on wrapper)', () => {
+    expect(c({ type: 'video', attrs: { src: '/v.mp4' } })).toBe(
+      '<div><video src="/v.mp4"></video></div>',
+    );
+  });
+
+  it('youtube + embed: each emits its full optional attr set in source order', () => {
+    // (a) youtube: width/height/align all present -> data-* in order.
+    expect(
+      c({
+        type: 'youtube',
+        attrs: { src: 'https://youtu.be/abc', width: 560, height: 315, align: 'right' },
+      }),
+    ).toBe(
+      '<div data-type="youtube" data-src="https://youtu.be/abc" data-width="560" data-height="315" data-align="right"></div>',
+    );
+    // (b) embed: align/width/height optional branches after src+provider.
+    expect(
+      c({
+        type: 'embed',
+        attrs: { src: 'https://x.com/e', provider: 'iframe', align: 'left', width: 600, height: 400 },
+      }),
+    ).toBe(
+      '<div data-type="embed" data-src="https://x.com/e" data-provider="iframe" data-align="left" data-width="600" data-height="400"></div>',
+    );
+  });
+
+  it('audio: emits data-attachment-id then data-size after src when both are set', () => {
+    expect(c({ type: 'audio', attrs: { src: '/a.mp3', attachmentId: 'att-7', size: 9001 } })).toBe(
+      '<div><audio src="/a.mp3" data-attachment-id="att-7" data-size="9001"></audio></div>',
+    );
+  });
+
+  it('audio: with attachmentId but no size, data-size is suppressed (size != null false branch)', () => {
+    expect(c({ type: 'audio', attrs: { src: '/a.mp3', attachmentId: 'att-7' } })).toBe(
+      '<div><audio src="/a.mp3" data-attachment-id="att-7"></audio></div>',
+    );
+  });
+
+  it('pdf: emits the full optional attr set in order (data-name, data-attachment-id, data-size, width, height)', () => {
+    expect(
+      c({
+        type: 'pdf',
+        attrs: {
+          src: '/d.pdf',
+          name: 'd.pdf',
+          attachmentId: 'att-9',
+          size: 2048,
+          width: 800,
+          height: 600,
+        },
+      }),
+    ).toBe(
+      '<div data-type="pdf" src="/d.pdf" data-name="d.pdf" data-attachment-id="att-9" data-size="2048" width="800" height="600"></div>',
+    );
+  });
+
+  it('attachment: emits data-attachment-name/mime/size/id in order after the always-present url', () => {
+    expect(
+      c({
+        type: 'attachment',
+        attrs: {
+          url: '/f.zip',
+          name: 'f.zip',
+          mime: 'application/zip',
+          size: 512,
+          attachmentId: 'att-3',
+        },
+      }),
+    ).toBe(
+      '<div data-type="attachment" data-attachment-url="/f.zip" data-attachment-name="f.zip" data-attachment-mime="application/zip" data-attachment-size="512" data-attachment-id="att-3"></div>',
+    );
+  });
+
+  it('attachment: with only a url, no spurious data-attachment-name/mime/size/id appear (all guards false)', () => {
+    expect(c({ type: 'attachment', attrs: { url: '/f.zip' } })).toBe(
+      '<div data-type="attachment" data-attachment-url="/f.zip"></div>',
+    );
+  });
+
+  it('orderedList inside a column renders via blockToHtml as <ol> (start attr DROPPED) with bold->strong, code->code', () => {
+    const out = c({
+      type: 'columns',
+      attrs: { layout: 'two' },
+      content: [
+        {
+          type: 'column',
+          content: [
+            {
+              type: 'orderedList',
+              attrs: { start: 3 },
+              content: [
+                {
+                  type: 'listItem',
+                  content: [para(text('a', [{ type: 'bold' }]))],
+                },
+                {
+                  type: 'listItem',
+                  content: [para(text('b', [{ type: 'code' }]))],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    // blockToHtml orderedList path emits a plain <ol> with no start attribute,
+    // and inlineToHtml maps bold->strong, code->code.
+    expect(out).toContain(
+      '<ol><li><p><strong>a</strong></p></li><li><p><code>b</code></p></li></ol>',
+    );
+    // The start:3 attr is NOT preserved in the HTML/column container path.
+    expect(out).not.toContain('start=');
+  });
+
+  it('hardBreak inside a column renders as <br> via inlineToHtml (not the markdown two-space form)', () => {
+    const out = c({
+      type: 'columns',
+      attrs: { layout: 'two' },
+      content: [
+        {
+          type: 'column',
+          content: [para(text('a'), { type: 'hardBreak' }, text('b'))],
+        },
+      ],
+    });
+    expect(out).toContain('<p>a<br>b</p>');
+    // The processNode markdown "  \n" hard-break form must NOT appear in the
+    // raw-HTML column container path.
+    expect(out).not.toContain('  \n');
+  });
+});

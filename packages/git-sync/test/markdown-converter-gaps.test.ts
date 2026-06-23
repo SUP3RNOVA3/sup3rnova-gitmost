@@ -36,41 +36,35 @@ async function roundTrip(node: any): Promise<{ md1: string; doc2: any; md2: stri
 // existing documented `it.fails` bugs in markdown-roundtrip.property.test.ts).
 // ---------------------------------------------------------------------------
 describe('pageBreak data loss (no converter case — SPEC §11 divergence)', () => {
-  it('exports a pageBreak node to the empty string (the node disappears)', () => {
-    // Direct, NON-failing assertion of the lossy emission so the data loss is
-    // unambiguous: a standalone pageBreak yields "" (the .trim() of nothing).
-    expect(convertProseMirrorToMarkdown(doc({ type: 'pageBreak' }))).toBe('');
+  it('exports a pageBreak node to the schema-matching block div', () => {
+    // FIXED: a standalone pageBreak now emits the block-level HTML div so the
+    // node survives instead of being erased to "".
+    expect(convertProseMirrorToMarkdown(doc({ type: 'pageBreak' }))).toBe(
+      '<div data-type="pageBreak"></div>',
+    );
   });
 
-  it('drops a pageBreak sitting BETWEEN two paragraphs on export', () => {
-    // With surrounding content the lost node leaves no trace at all: the output
-    // is just the two paragraphs joined as if the page break were never there.
+  it('keeps a pageBreak sitting BETWEEN two paragraphs on export', () => {
+    // FIXED: with surrounding content the divider is emitted as its own block
+    // between the two paragraphs (joined by the doc "\n\n"), no longer dropped.
     const out = convertProseMirrorToMarkdown(
       doc(para(text('before')), { type: 'pageBreak' }, para(text('after'))),
     );
-    // The pageBreak renders to "", so the only trace it leaves is a doubled
-    // blank gap from the doc "\n\n" join ("before" + "" + "after"): no marker,
-    // no placeholder — the divider itself is gone (data loss). The leftover
-    // blank line is itself a phantom-diff hazard, but the node is unrecoverable.
-    expect(out).toBe('before\n\n\n\nafter');
-    expect(out).not.toContain('pageBreak');
+    expect(out).toBe(
+      'before\n\n<div data-type="pageBreak"></div>\n\nafter',
+    );
+    expect(out).toContain('pageBreak');
   });
 
-  // KNOWN, DOCUMENTED non-roundtrip data loss (kept honest as it.fails): a
-  // pageBreak node cannot survive an export -> import -> export cycle because it
-  // is erased on the FIRST export. The assertion below is what we WISH held (the
-  // node round-trips); it fails today, which `it.fails` turns green while keeping
-  // the divergence visible. Source must NOT change — this only documents it.
-  it.fails(
-    'BUG: a pageBreak node is lost on export and cannot round-trip',
-    async () => {
-      const { md1, doc2 } = await roundTrip({ type: 'pageBreak' });
-      // What we want: the placeholder is non-empty and the node comes back.
-      expect(md1).not.toBe('');
-      const types = (doc2.content || []).map((n: any) => n.type);
-      expect(types).toContain('pageBreak');
-    },
-  );
+  // FIXED: a pageBreak node now survives an export -> import -> export cycle
+  // because the FIRST export emits the schema-matching block div, which marked
+  // passes through and generateJSON rebuilds into a pageBreak node again.
+  it('a pageBreak node round-trips (export -> import yields a pageBreak)', async () => {
+    const { md1, doc2 } = await roundTrip({ type: 'pageBreak' });
+    expect(md1).not.toBe('');
+    const types = (doc2.content || []).map((n: any) => n.type);
+    expect(types).toContain('pageBreak');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -192,5 +186,593 @@ describe('empty detailsContent (schema allows block*)', () => {
     expect(detailsContent.content == null || detailsContent.content.length === 0).toBe(
       true,
     );
+  });
+});
+
+// ===========================================================================
+// CONVERTER GAP COVERAGE (specs 1–29)
+//
+// These describe the converter's exact emission for under-tested branches and,
+// for the round-trip cases, pin export byte-stability and/or documented data
+// loss. docsCanonicallyEqual is imported here (not at the top) to keep the
+// existing block's imports untouched. heading/col are local helpers; doc/text/
+// para are reused from the top of the file.
+// ===========================================================================
+import { docsCanonicallyEqual } from '../src/lib/canonicalize.js';
+
+const heading = (level: number, ...inline: any[]) => ({
+  type: 'heading',
+  attrs: { level },
+  content: inline,
+});
+// A two-layout columns block carrying a single column with exactly one child —
+// the shared shape for the raw-HTML-container round-trip specs (15, 17–29).
+const oneColumn = (child: any) => ({
+  type: 'columns',
+  attrs: { layout: 'two' },
+  content: [{ type: 'column', content: [child] }],
+});
+// Extract the single column's single child node from a round-tripped doc.
+const colChildOf = (doc2: any) =>
+  doc2?.content?.[0]?.content?.[0]?.content?.[0];
+
+describe('converter gap coverage — emission branches (specs 1–11)', () => {
+  // 1. orderedList renders index+1 and DROPS the start attribute.
+  it('orderedList start:5 restarts numbering at 1 (start attr ignored)', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'orderedList',
+        attrs: { start: 5 },
+        content: [
+          { type: 'listItem', content: [para(text('a'))] },
+          { type: 'listItem', content: [para(text('b'))] },
+        ],
+      }),
+    );
+    expect(out).toBe('1. a\n2. b');
+  });
+
+  // 2. An empty paragraph contributes an empty segment between two "\n\n" joins.
+  it('an empty paragraph between two paragraphs yields doubled blank lines', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc(para(text('a')), { type: 'paragraph' }, para(text('b'))),
+    );
+    expect(out).toBe('a\n\n\n\nb');
+  });
+
+  // 3. A code block inside a blockquote: every physical line gets "> ".
+  it('a codeBlock inside a blockquote prefixes every fence/code line with "> "', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'blockquote',
+        content: [
+          {
+            type: 'codeBlock',
+            attrs: { language: 'js' },
+            content: [text('a\nb')],
+          },
+        ],
+      }),
+    );
+    expect(out).toBe('> ```js\n> a\n> b\n> ```');
+  });
+
+  // 4. A GFM body cell with TWO block children (paragraph + bulletList): joined
+  //    by a space, the list's newline collapsed so the row stays intact.
+  it('a GFM body cell with paragraph+list joins them by a space (no "p1- a")', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'table',
+        content: [
+          {
+            type: 'tableRow',
+            content: [{ type: 'tableHeader', content: [para(text('h'))] }],
+          },
+          {
+            type: 'tableRow',
+            content: [
+              {
+                type: 'tableCell',
+                content: [
+                  para(text('p1')),
+                  {
+                    type: 'bulletList',
+                    content: [{ type: 'listItem', content: [para(text('a'))] }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out).toBe('| h |\n| --- |\n| p1 - a |');
+  });
+
+  // 5. code + link co-occur: the schema's `code` mark excludes all other marks
+  //    (including link), so the link cannot survive import. The lossless,
+  //    byte-stable behavior is to emit ONLY the backtick code span (code wins).
+  it('a code+link run emits the backtick code form (code wins, link dropped)', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc(
+        para({
+          type: 'text',
+          text: 'x',
+          marks: [
+            { type: 'code' },
+            { type: 'link', attrs: { href: 'http://a?b&c"d' } },
+          ],
+        }),
+      ),
+    );
+    expect(out).toBe('`x`');
+  });
+
+  // 6. hardBreak inside a heading: prefix applied once, "  \n" between a and b.
+  it('a hardBreak inside an h2 heading produces "## a  \\nb"', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc(heading(2, text('a'), { type: 'hardBreak' }, text('b'))),
+    );
+    expect(out).toBe('## a  \nb');
+  });
+
+  // 7. encodeMdUrl's non-space whitespace sub-path: a newline -> %0A.
+  it('an image src containing a newline percent-encodes it to %0A', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({ type: 'image', attrs: { alt: 'cap', src: '/a\nb.png' } }),
+    );
+    expect(out).toBe('![cap](/a%0Ab.png)');
+  });
+
+  // 8. spanned-table HTML fallback: rowspan>1 AND align cell-attr branches, <td>.
+  it('a spanned cell with rowspan+align emits <td rowspan align> in that order', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'table',
+        content: [
+          {
+            type: 'tableRow',
+            content: [
+              {
+                type: 'tableCell',
+                attrs: { rowspan: 2, align: 'center' },
+                content: [para(text('m'))],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out).toBe(
+      '<table><tbody><tr><td rowspan="2" align="center"><p>m</p></td></tr></tbody></table>',
+    );
+  });
+
+  // 9. taskItem fixed indent width of 2 (NOT prefix.length+1) for a nested sublist.
+  it('a task item with a nested bullet sublist indents the sublist by 2 columns', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'taskList',
+        content: [
+          {
+            type: 'taskItem',
+            attrs: { checked: false },
+            content: [
+              para(text('top')),
+              {
+                type: 'bulletList',
+                content: [
+                  { type: 'listItem', content: [para(text('child'))] },
+                ],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out).toBe('- [ ] top\n  - child');
+  });
+
+  // 10. A bulletList inside a blockquote: each list line independently prefixed.
+  it('a bulletList inside a blockquote prefixes every list line with "> "', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'blockquote',
+        content: [
+          {
+            type: 'bulletList',
+            content: [
+              { type: 'listItem', content: [para(text('x'))] },
+              { type: 'listItem', content: [para(text('y'))] },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out).toBe('> - x\n> - y');
+  });
+
+  // 11. GFM (non-spanned) cell: multi-block space-join + pipe-escape + newline-collapse.
+  it('a GFM cell escapes a literal pipe and collapses newlines across two paragraphs', () => {
+    const out = convertProseMirrorToMarkdown(
+      doc({
+        type: 'table',
+        content: [
+          {
+            type: 'tableRow',
+            content: [{ type: 'tableHeader', content: [para(text('h'))] }],
+          },
+          {
+            type: 'tableRow',
+            content: [
+              {
+                type: 'tableCell',
+                content: [para(text('a|b')), para(text('c'))],
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    expect(out).toBe('| h |\n| --- |\n| a\\|b c |');
+  });
+});
+
+describe('converter gap coverage — documented round-trip data loss (specs 12–14)', () => {
+  // 12. A 3-backtick fence inside a codeBlock body is NOT lengthened: the inner
+  //     fence prematurely terminates the block, splitting it into three nodes.
+  it('a triple-backtick fence inside a codeBlock body is lossy (fence collision)', async () => {
+    const d = doc({
+      type: 'codeBlock',
+      attrs: { language: 'js' },
+      content: [{ type: 'text', text: '```\ninner\n```' }],
+    });
+    const md1 = convertProseMirrorToMarkdown(d);
+    expect(md1).toBe('```js\n```\ninner\n```\n```');
+
+    const doc2 = await markdownToProseMirror(md1);
+    // The inner fence split the block into THREE top-level nodes.
+    const top = doc2.content || [];
+    expect(top).toHaveLength(3);
+    expect(top[0].type).toBe('codeBlock');
+    expect(top[0].attrs?.language).toBe('js');
+    expect(top[0].content?.[0]).toMatchObject({ type: 'text', text: '\n' });
+    expect(top[1].type).toBe('paragraph');
+    expect(top[1].content?.[0]).toMatchObject({ type: 'text', text: 'inner' });
+    expect(top[2].type).toBe('codeBlock');
+    expect(top[2].attrs?.language).toBeNull();
+    expect(top[2].content?.[0]).toMatchObject({ type: 'text', text: '\n' });
+
+    const md2 = convertProseMirrorToMarkdown(doc2);
+    expect(md2).not.toBe(md1); // not byte-stable
+    expect(docsCanonicallyEqual(d, doc2)).toBe(false); // documented data loss
+  });
+
+  // 13. A leading ordered-list marker in paragraph text is NOT escaped, so a
+  //     plain paragraph silently becomes an orderedList on re-import.
+  it('a paragraph starting with "1. " is promoted to an orderedList on re-import', async () => {
+    const d = doc({
+      type: 'paragraph',
+      content: [{ type: 'text', text: '1. not a list' }],
+    });
+    const md1 = convertProseMirrorToMarkdown(d);
+    expect(md1).toBe('1. not a list'); // no backslash escape
+
+    const doc2 = await markdownToProseMirror(md1);
+    expect(doc2.content?.[0]?.type).toBe('orderedList');
+    const li = doc2.content[0].content?.[0];
+    expect(li?.type).toBe('listItem');
+    expect(li.content?.[0]?.content?.[0]).toMatchObject({
+      type: 'text',
+      text: 'not a list', // the "1. " was consumed as a list marker
+    });
+    expect(docsCanonicallyEqual(d, doc2)).toBe(false);
+  });
+
+  // 14. The image emitter drops the title attribute (silently lost on round-trip).
+  it('an image title attribute is dropped on export and lost on re-import', async () => {
+    const d = doc({
+      type: 'image',
+      attrs: { src: '/i.png', alt: 'a', title: 't"q' },
+    });
+    const md1 = convertProseMirrorToMarkdown(d);
+    expect(md1).toBe('![a](/i.png)'); // no title, no quotes
+
+    const doc2 = await markdownToProseMirror(md1);
+    const img = (doc2.content || []).find((n: any) => n.type === 'image');
+    expect(img).toBeTruthy();
+    expect(img.attrs?.title).toBeNull(); // the original 't"q' was dropped
+    expect(img.attrs?.src).toBe('/i.png');
+    expect(img.attrs?.alt).toBe('a');
+    expect(docsCanonicallyEqual(d, doc2)).toBe(false);
+  });
+});
+
+describe('converter gap coverage — raw-HTML container round-trips (specs 15–29)', () => {
+  // 15. image inside a column: imageToHtml width+align arms; byte-stable; no
+  //     literal-markdown text node leaks.
+  it('an image in a column emits <img> (width/align arms) and round-trips byte-stable', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({
+        type: 'image',
+        attrs: { src: '/i.png', alt: 'cap', width: 320, align: 'center' },
+      }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><img src="/i.png" alt="cap" width="320" align="center"></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('image');
+  });
+
+  // 16. image inside a SPANNED table cell (the other raw-HTML container).
+  it('an image in a spanned table cell emits <img> (width arm) and round-trips byte-stable', async () => {
+    const { md1, md2 } = await roundTrip({
+      type: 'table',
+      content: [
+        {
+          type: 'tableRow',
+          content: [
+            {
+              type: 'tableCell',
+              attrs: { colspan: 2 },
+              content: [
+                {
+                  type: 'image',
+                  attrs: { src: '/i.png', alt: 'x', width: 100 },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(md1).toBe(
+      '<table><tbody><tr><td colspan="2"><img src="/i.png" alt="x" width="100"></td></tr></tbody></table>',
+    );
+    expect(md2).toBe(md1);
+  });
+
+  // 17. callout inside a column: calloutToHtml lower-cases the type; byte-stable.
+  it('a callout in a column emits the HTML div (type lower-cased) and round-trips', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({
+        type: 'callout',
+        attrs: { type: 'WARNING' },
+        content: [para(text('a'))],
+      }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><div data-type="callout" data-callout-type="warning"><p>a</p></div></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('callout');
+  });
+
+  // 18. details tree inside a column: summary via inlineToHtml, content via blockToHtml.
+  it('a details tree in a column emits <details>/<summary>/<div detailsContent> and round-trips', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({
+        type: 'details',
+        content: [
+          { type: 'detailsSummary', content: [text('S')] },
+          { type: 'detailsContent', content: [para(text('body'))] },
+        ],
+      }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><details><summary data-type="detailsSummary">S</summary><div data-type="detailsContent"><p>body</p></div></details></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('details');
+  });
+
+  // 19. taskList inside a column: BOTH checked:true and checked:false arms.
+  it('a taskList in a column emits both data-checked arms and round-trips', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({
+        type: 'taskList',
+        content: [
+          {
+            type: 'taskItem',
+            attrs: { checked: true },
+            content: [para(text('done'))],
+          },
+          {
+            type: 'taskItem',
+            attrs: { checked: false },
+            content: [para(text('todo'))],
+          },
+        ],
+      }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><ul data-type="taskList"><li data-type="taskItem" data-checked="true"><p>done</p></li><li data-type="taskItem" data-checked="false"><p>todo</p></li></ul></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('taskList');
+  });
+
+  // 20. bare taskItem (no wrapping taskList) inside a column self-wraps.
+  it('a bare taskItem in a column self-wraps in a single-item taskList and round-trips', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({
+        type: 'taskItem',
+        attrs: { checked: false },
+        content: [para(text('lone'))],
+      }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><ul data-type="taskList"><li data-type="taskItem" data-checked="false"><p>lone</p></li></ul></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('taskList');
+  });
+
+  // 21. blockquote inside a column: real <blockquote>, not markdown "> q".
+  it('a blockquote in a column emits <blockquote> and round-trips', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({ type: 'blockquote', content: [para(text('q'))] }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><blockquote><p>q</p></blockquote></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('blockquote');
+  });
+
+  // 22. horizontalRule inside a column: literal <hr>, not markdown "---".
+  it('a horizontalRule in a column emits <hr> and round-trips', async () => {
+    const { md1, doc2, md2 } = await roundTrip(
+      oneColumn({ type: 'horizontalRule' }),
+    );
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><hr></div></div>',
+    );
+    expect(md2).toBe(md1);
+    expect(colChildOf(doc2)?.type).toBe('horizontalRule');
+  });
+
+  // 23. Unknown block type with NON-text block children -> <div>-wrap of children.
+  it('an unknown block with block children wraps them in <div> (no markdown leak)', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(
+        oneColumn({
+          type: 'someFutureBlock',
+          content: [para(text('a')), para(text('b'))],
+        }),
+      ),
+    );
+    expect(md1).toContain('<div><p>a</p><p>b</p></div>');
+    // No markdown paragraph separator survives inside the raw-HTML column.
+    expect(md1).toBe(
+      '<div data-type="columns" data-layout="two"><div data-type="column"><div><p>a</p><p>b</p></div></div></div>',
+    );
+  });
+
+  // 24. Unknown block with ONLY inline/text children -> <div>inlineToHtml</div>.
+  it('an unknown block with only inline children renders inline as HTML (marks not markdown)', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(
+        oneColumn({
+          type: 'someInlineOnlyBlock',
+          content: [text('hi'), { type: 'text', text: '!', marks: [{ type: 'bold' }] }],
+        }),
+      ),
+    );
+    expect(md1).toContain('<div>hi<strong>!</strong></div>');
+  });
+
+  // 25. mathBlock inside a column delegates through processNode (NOT $$ fence).
+  it('a mathBlock in a column delegates to processNode (HTML div, no $$ fence)', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(oneColumn({ type: 'mathBlock', attrs: { text: 'a^2+b^2' } })),
+    );
+    expect(md1).toContain(
+      '<div data-type="mathBlock" data-katex="true" text="a^2+b^2"></div>',
+    );
+    expect(md1).not.toContain('$$');
+  });
+
+  // 26. SPANNED table inside a column delegates to processNode -> raw <table>.
+  it('a spanned table in a column delegates to raw <table> HTML (no GFM pipes)', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(
+        oneColumn({
+          type: 'table',
+          content: [
+            {
+              type: 'tableRow',
+              content: [
+                {
+                  type: 'tableCell',
+                  attrs: { colspan: 2 },
+                  content: [para(text('x'))],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    expect(md1).toContain('<table');
+    expect(md1).toContain('colspan="2"');
+    // No GFM pipe-table separator leaked into the raw-HTML column.
+    expect(md1).not.toContain('| --- |');
+  });
+
+  // 27. list item with TWO block children (paragraph + codeBlock) -> blockChildrenToHtml.
+  it('a list item with paragraph+codeBlock in a column emits both blocks as HTML', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(
+        oneColumn({
+          type: 'bulletList',
+          content: [
+            {
+              type: 'listItem',
+              content: [
+                para(text('p')),
+                {
+                  type: 'codeBlock',
+                  attrs: { language: 'js' },
+                  content: [text('a\nb')],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    expect(md1).toContain('<p>p</p>');
+    expect(md1).toContain('<pre><code class="language-js">a\nb</code></pre>');
+    // The two blocks appear sequentially inside the same <li>.
+    expect(md1).toContain(
+      '<li><p>p</p><pre><code class="language-js">a\nb</code></pre></li>',
+    );
+  });
+
+  // 28. ordered list item whose 2nd block child is a NESTED bulletList.
+  it('an ordered list item with a nested bulletList in a column emits nested <ul> HTML', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(
+        oneColumn({
+          type: 'orderedList',
+          content: [
+            {
+              type: 'listItem',
+              content: [
+                para(text('p1')),
+                {
+                  type: 'bulletList',
+                  content: [
+                    { type: 'listItem', content: [para(text('nested'))] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+    // NOTE(review): the spec's expected literal said '<ul><li>nested</li></ul>',
+    // but blockChildrenToHtml renders the nested listItem's paragraph child as a
+    // real <p>, so the actual (correct) emission is '<ul><li><p>nested</p></li></ul>'.
+    expect(md1).toContain(
+      '<ol><li><p>p1</p><ul><li><p>nested</p></li></ul></li></ol>',
+    );
+    // No markdown list markers leaked into the raw-HTML column.
+    expect(md1).not.toContain('1. ');
+    expect(md1).not.toContain('- nested');
+  });
+
+  // 29. mathInline atom inside a column paragraph -> inlineToHtml delegates via processNode.
+  it('a mathInline atom in a column paragraph emits schema HTML (no $...$ fence)', () => {
+    const md1 = convertProseMirrorToMarkdown(
+      doc(oneColumn(para(text('eq: '), { type: 'mathInline', attrs: { text: 'x_i' } }))),
+    );
+    expect(md1).toContain(
+      '<p>eq: <span data-type="mathInline" data-katex="true" text="x_i"></span></p>',
+    );
+    expect(md1).not.toContain('$x_i$');
   });
 });

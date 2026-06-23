@@ -396,3 +396,139 @@ describe('runPush — base selection (last-pushed else docmost)', () => {
     expect(calls.diffNameStatus[0].from).toBe(DOCMOST_BRANCH);
   });
 });
+
+// Coverage for two narrow, otherwise-untested branches in `applyPushActions`
+// (driven end-to-end via `runPush --apply`, the only write path):
+//   1. `errMessage` (push.ts line 762-763) NON-Error branch — `String(err)`.
+//   2. `createPage` partial-meta fallbacks (push.ts line 583-584) — `?? ''`.
+describe('runPush --apply — applyPushActions edge branches', () => {
+  it('records a thrown NON-Error (a string) via String(err), not "undefined"', async () => {
+    // One UPDATE (file carries a pageId), whose collab write throws the raw
+    // STRING 'boom'. Every other failure test throws an Error, so the
+    // `String(err)` fallback in errMessage (push.ts:763) is otherwise uncovered.
+    const file =
+      '<!-- docmost:meta\n{"version":1,"pageId":"p-7"}\n-->\n\nbody\n';
+    const { git, calls } = makeGit({
+      lastPushed: 'base-sha',
+      changes: [{ status: 'M', path: 'Doc.md' }],
+    });
+    const fs = makeFs({ 'Doc.md': file });
+    const client = makeClientFake();
+    // Throw a bare string (NON-Error) from the update path.
+    (client.importPageMarkdown as any).mockImplementation(async () => {
+      throw 'boom';
+    });
+    const { deps } = makeDeps(git, fs, client);
+
+    // runPush must COMPLETE (the failure is isolated), not reject.
+    const res = await runPush(deps, { dryRun: false });
+
+    expect(res.mode).toBe('apply');
+    expect(res.applied?.updated).toBe(0);
+    expect(res.failures).toHaveLength(1);
+    const failure = res.failures![0];
+    expect(failure.kind).toBe('update');
+    expect(failure.pageId).toBe('p-7');
+    expect(failure.path).toBe('Doc.md');
+    // String(err) of the thrown string 'boom' — NOT 'undefined' and NOT
+    // '[object Object]'. This is the load-bearing assertion for line 763.
+    expect(failure.error).toBe('boom');
+    // A failure means the refs are NOT advanced (partial push, SPEC §12).
+    expect(calls.updateRef).toEqual([]);
+    expect(calls.fastForwardBranch).toEqual([]);
+  });
+
+  it('records a thrown NON-Error OBJECT via String(err) too (no implicit message)', async () => {
+    // A thrown object literal -> String({}) === '[object Object]'. Pins down that
+    // errMessage stringifies (not reads a .message) for non-Error throwables.
+    const file =
+      '<!-- docmost:meta\n{"version":1,"pageId":"p-8"}\n-->\n\nbody\n';
+    const { git } = makeGit({
+      lastPushed: 'base-sha',
+      changes: [{ status: 'M', path: 'Doc.md' }],
+    });
+    const fs = makeFs({ 'Doc.md': file });
+    const client = makeClientFake();
+    (client.importPageMarkdown as any).mockImplementation(async () => {
+      throw { code: 500 };
+    });
+    const { deps } = makeDeps(git, fs, client);
+
+    const res = await runPush(deps, { dryRun: false });
+
+    expect(res.failures).toHaveLength(1);
+    // String({ code: 500 }) — the object's default stringification.
+    expect(res.failures![0].error).toBe('[object Object]');
+  });
+
+  it('createPage gets title="" (and parentPageId=undefined) when meta has a spaceId but NO title', async () => {
+    // A brand-new local file whose meta has a (truthy) spaceId — REQUIRED for the
+    // planner to emit a CREATE (computePushActions case "A": `else if (meta?.spaceId)`,
+    // push.ts:249) — but NO title and NO parentPageId. This exercises the
+    // `meta?.title ?? ''` fallback (push.ts:583) and `parentPageId ?? undefined`
+    // (push.ts:585) on the real createPage call.
+    //
+    // NOTE(review): The spec for this case asked for meta = ONLY `{version:1}`
+    // (no title AND no spaceId) to exercise BOTH `?? ''` fallbacks at once. That
+    // input is UNREACHABLE through runPush: the PURE planner (computePushActions,
+    // push.ts:254-262) SKIPS an added file with no usable spaceId
+    // (reason 'create-without-spaceId'), so it never becomes a CREATE action and
+    // applyPushActions' create branch never runs. A separate test below pins that
+    // skip. Hence `meta?.spaceId ?? ''` can never actually fall back to '' via the
+    // planner — only `meta?.title ?? ''` is reachable, which this test covers.
+    const newFile = serializeDocmostMarkdownBody({ version: 1, spaceId: 'sp-1' }, 'fresh body');
+    const { git } = makeGit({
+      lastPushed: 'base-sha',
+      mainSha: 'main-1',
+      changes: [{ status: 'A', path: 'New.md' }],
+    });
+    const fs = makeFs({ 'New.md': newFile });
+    const client = makeClientFake({ createId: 'page-new' });
+    const { deps } = makeDeps(git, fs, client);
+
+    const res = await runPush(deps, { dryRun: false });
+
+    expect(res.mode).toBe('apply');
+    expect(res.applied?.created).toBe(1);
+    expect(client.createPage).toHaveBeenCalledTimes(1);
+    const [title, content, spaceId, parentPageId] = (client.createPage as any).mock
+      .calls[0];
+    // `meta?.title ?? ''` -> '' (no title in meta).
+    expect(title).toBe('');
+    // The body is passed as content...
+    expect(content).toBe('fresh body');
+    // ...and the present spaceId flows through (it is NOT replaced by '').
+    expect(spaceId).toBe('sp-1');
+    // `meta?.parentPageId ?? undefined` -> undefined (absent in meta).
+    expect(parentPageId).toBe(undefined);
+  });
+
+  it('an added file with meta {version:1} only (no spaceId, no title) is SKIPPED, never created', async () => {
+    // Documents WHY the spec's "only {version:1}" create input is unreachable:
+    // the planner skips it (create-without-spaceId), so createPage is never called
+    // and `meta?.spaceId ?? ''` cannot fall back to '' via runPush.
+    const file = serializeDocmostMarkdownBody({ version: 1 }, 'fresh body');
+    const { git, calls } = makeGit({
+      lastPushed: 'base-sha',
+      changes: [{ status: 'A', path: 'Orphan.md' }],
+    });
+    const fs = makeFs({ 'Orphan.md': file });
+    const client = makeClientFake();
+    const { deps } = makeDeps(git, fs, client);
+
+    const res = await runPush(deps, { dryRun: false });
+
+    expect(res.planned).toEqual({
+      creates: 0,
+      updates: 0,
+      deletes: 0,
+      renamesMoves: 0,
+      skipped: 1,
+    });
+    expect(client.createPage).not.toHaveBeenCalled();
+    expect(res.applied?.created).toBe(0);
+    expect(res.applied?.skipped).toEqual([
+      { path: 'Orphan.md', status: 'A', reason: 'create-without-spaceId' },
+    ]);
+  });
+});

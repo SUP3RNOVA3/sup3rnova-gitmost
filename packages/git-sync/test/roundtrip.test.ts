@@ -6,6 +6,11 @@ import {
   convertProseMirrorToMarkdown,
   markdownToProseMirror,
 } from 'docmost-client';
+// Import canonical-equality DIRECTLY from src so we exercise the real
+// implementation alongside the converter pair above (the barrel re-exports the
+// same symbol; importing from src keeps these round-trip assertions pinned to
+// the package source rather than the published surface).
+import { docsCanonicallyEqual } from '../src/lib/canonicalize.js';
 
 // Resolve the fixture relative to this test file so the test is CWD-independent.
 const here = dirname(fileURLToPath(import.meta.url));
@@ -25,5 +30,139 @@ describe('round-trip idempotency (SPEC §11)', () => {
     // converter reconstructs schema default attrs (e.g. indent:null), a known
     // SPEC §11 divergence that does not affect markdown stability.
     expect(md2).toBe(md1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Full export -> import -> export round-trips for the schema's HTML-carried
+// atoms/blocks (math, mention, details). The existing markdown-converter unit
+// tests only assert the one-way emit string; here we additionally pin that the
+// re-import (generateJSON via the docmost schema) rebuilds the correct node and
+// that a second export reproduces the first byte-for-byte. Helpers mirror the
+// converter unit tests (a single-node doc renders exactly that node, trimmed).
+// ---------------------------------------------------------------------------
+const doc = (...nodes: any[]) => ({ type: 'doc', content: nodes });
+const text = (t: string) => ({ type: 'text', text: t });
+const para = (...inline: any[]) => ({ type: 'paragraph', content: inline });
+
+// Run the canonical export -> import -> export cycle for a single block node.
+async function roundTrip(
+  node: any,
+): Promise<{ md1: string; doc2: any; md2: string }> {
+  const md1 = convertProseMirrorToMarkdown(doc(node));
+  const doc2 = await markdownToProseMirror(md1);
+  const md2 = convertProseMirrorToMarkdown(doc2);
+  return { md1, doc2, md2 };
+}
+
+describe('math round-trip (mathBlock + mathInline)', () => {
+  it('mathBlock survives export -> import -> export with LaTeX recovered', async () => {
+    const source = { type: 'mathBlock', attrs: { text: 'a^2+b^2' } };
+    const { md1, doc2, md2 } = await roundTrip(source);
+
+    // One-way emit: LaTeX rides in the `text` HTML attribute, data-katex flag set.
+    expect(md1).toBe(
+      '<div data-type="mathBlock" data-katex="true" text="a^2+b^2"></div>',
+    );
+    // Byte-stable: the second export reproduces the first exactly.
+    expect(md2).toBe(md1);
+
+    // The re-imported doc's only block is a mathBlock whose LaTeX was recovered
+    // from the text= attribute by the schema's default parser.
+    const block = doc2.content[0];
+    expect(block.type).toBe('mathBlock');
+    expect(block.attrs.text).toBe('a^2+b^2');
+
+    // Canonical equality: source and re-imported doc are the same node.
+    expect(docsCanonicallyEqual(doc(source), doc2)).toBe(true);
+  });
+
+  it('mathInline (inside a paragraph) survives export -> import -> export', async () => {
+    const source = para({ type: 'mathInline', attrs: { text: 'x_i' } });
+    const { md1, doc2, md2 } = await roundTrip(source);
+
+    expect(md1).toBe(
+      '<span data-type="mathInline" data-katex="true" text="x_i"></span>',
+    );
+    expect(md2).toBe(md1);
+
+    // The re-imported paragraph's child is a mathInline with the LaTeX recovered.
+    const paragraph = doc2.content[0];
+    expect(paragraph.type).toBe('paragraph');
+    const inline = paragraph.content[0];
+    expect(inline.type).toBe('mathInline');
+    expect(inline.attrs.text).toBe('x_i');
+
+    expect(docsCanonicallyEqual(doc(source), doc2)).toBe(true);
+  });
+});
+
+describe('mention round-trip', () => {
+  it('mention survives export -> import -> export with data-* re-parsed', async () => {
+    const source = para({
+      type: 'mention',
+      attrs: { id: 'u1', label: 'Alice', entityType: 'user' },
+    });
+    const { md1, doc2, md2 } = await roundTrip(source);
+
+    // One-way emit: schema span with data-* attrs and the visible '@Alice' text.
+    expect(md1).toBe(
+      '<span data-type="mention" data-id="u1" data-label="Alice" data-entity-type="user">@Alice</span>',
+    );
+    // Byte-stable.
+    expect(md2).toBe(md1);
+
+    // The visible '@Alice' is cosmetic; generateJSON rebuilds a mention node from
+    // the data-* attributes. The unset attrs fall back to their schema defaults.
+    const paragraph = doc2.content[0];
+    expect(paragraph.type).toBe('paragraph');
+    const mention = paragraph.content[0];
+    expect(mention.type).toBe('mention');
+    expect(mention.attrs.id).toBe('u1');
+    expect(mention.attrs.label).toBe('Alice');
+    expect(mention.attrs.entityType).toBe('user');
+    expect(mention.attrs.entityId).toBeNull();
+    expect(mention.attrs.slugId).toBeNull();
+    expect(mention.attrs.creatorId).toBeNull();
+    expect(mention.attrs.anchorId).toBeNull();
+
+    expect(docsCanonicallyEqual(doc(source), doc2)).toBe(true);
+  });
+});
+
+describe('details open-attribute round-trip', () => {
+  it('the markdown details fence never carries an open flag and stays byte-stable', async () => {
+    // Source details is OPEN (attrs.open: ''), but the top-level markdown path
+    // emits a plain '<details>' fence (no 'open' attribute) — see converter
+    // case "detailsSummary" which hardcodes '<details>\n<summary>...'.
+    const source = {
+      type: 'details',
+      attrs: { open: '' },
+      content: [
+        { type: 'detailsSummary', content: [text('S')] },
+        { type: 'detailsContent', content: [para(text('body'))] },
+      ],
+    };
+    const { md1, doc2, md2 } = await roundTrip(source);
+
+    // The emitted fence drops the open flag entirely.
+    expect(md1).toBe('<details>\n<summary>S</summary>\n\nbody\n</details>');
+    expect(md1).not.toContain('open');
+
+    // Byte-stable: re-export reproduces the same fence.
+    expect(md2).toBe(md1);
+
+    // NOTE(review): the spec text says doc2's details attrs.open should be
+    // `null` (the raw return of el.getAttribute('open') on a plain <details>,
+    // schema src ~L438). In practice generateJSON applies the schema attribute
+    // default when the parseHTML result is null, so the materialised node carries
+    // attrs.open === false (the declared default at src ~L437), NOT null. We
+    // assert the ACTUAL value. The load-bearing point of the spec still holds:
+    // a plain <details> import does NOT recover the open flag (no truthy value),
+    // so renderHTML's `attrs.open ? {open:''} : {}` keeps the round-trip clean.
+    const details = doc2.content[0];
+    expect(details.type).toBe('details');
+    expect(details.attrs.open).toBe(false);
+    expect(details.attrs.open).toBeFalsy();
   });
 });
