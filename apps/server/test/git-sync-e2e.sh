@@ -34,7 +34,17 @@ COOKIES="$WORK/cookies.txt"
 PASS=0
 FAIL=0
 
-cleanup() { rm -rf "$WORK"; }
+# Hard-delete every fixture page this suite created (it operates ONLY on its own
+# E2E-* pages, never a real one) so the stand stays clean across runs.
+cleanup() {
+  docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+    "delete from pages where space_id='$SPACE_ID' and title like 'E2E-%';" >/dev/null 2>&1
+  # Converge the vault so it drops the now-deleted fixture files (a handful of
+  # under-cap deletes — applies cleanly) instead of waiting for the next poll.
+  curl -s -b "$COOKIES" -X POST "$SERVER/api/git-sync/trigger" \
+    -H 'Content-Type: application/json' -d "{\"spaceId\":\"$SPACE_ID\"}" >/dev/null 2>&1
+  rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -86,24 +96,35 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-say "push: a git edit propagates into the Docmost page"
-cd "$WORK/clone" || exit 1
+# A DEDICATED test page so the push/merge edits never touch a real page. We seed
+# it with a body line so git's rename heuristics + the 3-way merge have content
+# to work on, and so the assertions are isolated to this page id.
+say "setup: create a dedicated test page (edits target only this one)"
+TEST_TITLE="E2E-SyncTarget-$RANDOM$RANDOM"
+TEST_ID=$(api -X POST "$SERVER/api/pages/create" -H 'Content-Type: application/json' \
+  -d "{\"spaceId\":\"$SPACE_ID\",\"title\":\"$TEST_TITLE\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$TEST_ID" ] && ok "created test page $TEST_TITLE" || { bad "could not create the test page"; }
+sync_now
+
+# ----------------------------------------------------------------------------
+say "push: a git edit propagates into the (dedicated) Docmost page"
+rm -rf "$WORK/cpush"; gitc clone -q "$GIT_URL" "$WORK/cpush" 2>/dev/null
+cd "$WORK/cpush" || exit 1
 git config user.email e2e@test >/dev/null; git config user.name e2e >/dev/null
-target=$(find . -maxdepth 1 -name '*.md' | head -1)
+target=$(grep -rl "$TEST_ID" --include='*.md' . | head -1)
 if [ -n "$target" ]; then
   MARK="E2E-PUSH-$RANDOM$RANDOM"
   printf '\n## %s\n' "$MARK" >> "$target"
   git commit -aqm "e2e push: $MARK"
   if gitc push -q origin main 2>/dev/null; then
     sleep 2
-    # The receive-pack triggers an immediate cycle; give it a beat then verify.
-    has=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and content::text like '%$MARK%';")
-    [ "${has:-0}" -ge 1 ] && ok "pushed edit reached a Docmost page" || bad "marker $MARK not found in any page content"
+    has=$(psqlq "select count(*) from pages where id='$TEST_ID' and content::text like '%$MARK%';")
+    [ "${has:-0}" -ge 1 ] && ok "pushed edit reached the test page" || bad "marker $MARK not in the test page content"
   else
     bad "git push failed"
   fi
 else
-  bad "no .md to edit"
+  bad "test page .md not found in the clone"
 fi
 cd "$WORK" || exit 1
 
@@ -146,28 +167,27 @@ fi
 cd "$WORK" || exit 1
 
 # ----------------------------------------------------------------------------
-say "3-way merge: a git edit to one part keeps the rest of the page"
-# Re-clone fresh, append a unique line, push, then confirm BOTH the new line AND
-# the original push marker (from earlier) coexist in the page — i.e. the body
-# merge did not clobber prior content.
-rm -rf "$WORK/clone3"
-gitc clone -q "$GIT_URL" "$WORK/clone3" 2>/dev/null
-cd "$WORK/clone3" || exit 1
+say "3-way merge: a git edit to one part keeps the rest of the (test) page"
+# Re-clone fresh, append a second unique line to the SAME dedicated page, push,
+# then confirm BOTH markers coexist — the body merge did not clobber the first.
+rm -rf "$WORK/cmerge"
+gitc clone -q "$GIT_URL" "$WORK/cmerge" 2>/dev/null
+cd "$WORK/cmerge" || exit 1
 git config user.email e2e@test >/dev/null; git config user.name e2e >/dev/null
-mfile=$(grep -rl "E2E-PUSH-" . --include='*.md' | head -1)
+mfile=$(grep -rl "$TEST_ID" --include='*.md' . | head -1)
 if [ -n "$mfile" ]; then
   MARK2="E2E-MERGE-$RANDOM$RANDOM"
   printf '\n## %s\n' "$MARK2" >> "$mfile"
   git commit -aqm "e2e merge: $MARK2"
   if gitc push -q origin main 2>/dev/null; then
     sleep 2
-    both=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and content::text like '%$MARK2%' and content::text like '%E2E-PUSH-%';")
-    [ "${both:-0}" -ge 1 ] && ok "new edit added without losing prior content (3-way merge)" || bad "3-way merge lost content (new marker and prior marker not both present)"
+    both=$(psqlq "select count(*) from pages where id='$TEST_ID' and content::text like '%$MARK2%' and content::text like '%E2E-PUSH-%';")
+    [ "${both:-0}" -ge 1 ] && ok "new edit added without losing prior content (3-way merge)" || bad "3-way merge lost content (both markers not present)"
   else
     bad "push (merge) failed"
   fi
 else
-  bad "could not find the earlier-edited page to extend"
+  bad "test page .md not found in the clone"
 fi
 cd "$WORK" || exit 1
 
