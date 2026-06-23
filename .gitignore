@@ -10,6 +10,7 @@ data
 # via `pnpm build`, never committed, so src/ and prod can never silently diverge).
 packages/*/node_modules/
 packages/git-sync/build/
+packages/mcp/build/
 
 # Logs
 logs
