@@ -21,7 +21,10 @@ import {
   applyPullActions,
   runPush,
 } from '@docmost/git-sync';
-import { GitSyncOrchestrator } from './git-sync.orchestrator';
+import {
+  GitSyncOrchestrator,
+  GitSyncLockHeldError,
+} from './git-sync.orchestrator';
 import { SpaceLockService } from './space-lock.service';
 
 type AnyMock = jest.Mock;
@@ -305,6 +308,83 @@ describe('GitSyncOrchestrator', () => {
         'checkout:docmost',
         'applyPullActions',
       ]);
+    });
+  });
+
+  describe('ingestExternalPush', () => {
+    it('streams the receive-pack FIRST, then runs the Docmost cycle', async () => {
+      const order: string[] = [];
+      const built = build();
+      applyPullActionsMock.mockImplementation(async () => {
+        order.push('cycle');
+        return { written: 0, deleted: 0, merge: { conflict: false } };
+      });
+      const runReceivePack = jest.fn(async () => {
+        order.push('receive-pack');
+      });
+
+      await built.orchestrator.ingestExternalPush('space-1', 'ws-1', runReceivePack);
+
+      expect(runReceivePack).toHaveBeenCalledTimes(1);
+      // The cycle only runs AFTER the push commits land on main.
+      expect(order).toEqual(['receive-pack', 'cycle']);
+    });
+
+    it('throws GitSyncLockHeldError and does NOT run the receive-pack when the lock is held', async () => {
+      const built = build();
+      built.redis.set.mockResolvedValue(null); // acquire fails → lock-held
+      const runReceivePack = jest.fn(async () => undefined);
+
+      await expect(
+        built.orchestrator.ingestExternalPush('space-1', 'ws-1', runReceivePack),
+      ).rejects.toBeInstanceOf(GitSyncLockHeldError);
+
+      // We must never write to the working tree concurrently with a cycle.
+      expect(runReceivePack).not.toHaveBeenCalled();
+      expect(applyPullActionsMock).not.toHaveBeenCalled();
+    });
+
+    it('swallows a post-push cycle error (the push is durable; poll retries)', async () => {
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const built = build();
+      // Dry-run resolves, the real apply rejects → driveCycle throws AFTER the
+      // receive-pack already succeeded.
+      runPushMock
+        .mockResolvedValueOnce({ mode: 'apply', failures: [], planned: { deletes: 0 } })
+        .mockRejectedValueOnce(new Error('cycle boom'));
+      const runReceivePack = jest.fn(async () => undefined);
+
+      // Does NOT throw — the durable push must not be reported as failed.
+      await expect(
+        built.orchestrator.ingestExternalPush('space-1', 'ws-1', runReceivePack),
+      ).resolves.toBeUndefined();
+      expect(runReceivePack).toHaveBeenCalledTimes(1);
+      // Lock was still released (CAS eval) despite the cycle error.
+      expect(built.redis.eval).toHaveBeenCalled();
+    });
+
+    it('runs the receive-pack but SKIPS the cycle when no service user is configured', async () => {
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const built = build({ serviceUserId: undefined });
+      const runReceivePack = jest.fn(async () => undefined);
+
+      await expect(
+        built.orchestrator.ingestExternalPush('space-1', 'ws-1', runReceivePack),
+      ).resolves.toBeUndefined();
+      // The push is durable on main; the immediate cycle is skipped, not failed.
+      expect(runReceivePack).toHaveBeenCalledTimes(1);
+      expect(applyPullActionsMock).not.toHaveBeenCalled();
+    });
+
+    it('refuses (LockHeldError) and runs nothing when git-sync is globally disabled', async () => {
+      const built = build({ enabled: false });
+      const runReceivePack = jest.fn(async () => undefined);
+
+      await expect(
+        built.orchestrator.ingestExternalPush('space-1', 'ws-1', runReceivePack),
+      ).rejects.toBeInstanceOf(GitSyncLockHeldError);
+      expect(runReceivePack).not.toHaveBeenCalled();
+      expect(built.redis.set).not.toHaveBeenCalled();
     });
   });
 
