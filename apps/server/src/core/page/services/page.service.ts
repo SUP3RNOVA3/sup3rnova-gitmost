@@ -1289,8 +1289,18 @@ export class PageService {
     pageId: string,
     userId: string,
     workspaceId: string,
+    // Optional provenance. A git-sync-driven soft-delete stamps
+    // `lastUpdatedSource = 'git-sync'` so the change-listener loop-guard skips
+    // its own write (mirrors the create/update/move provenance branches above).
+    provenance?: AuthProvenanceData,
   ): Promise<void> {
-    await this.pageRepo.removePage(pageId, userId, workspaceId);
+    const isGitSync = provenance?.actor === 'git-sync';
+    await this.pageRepo.removePage(
+      pageId,
+      userId,
+      workspaceId,
+      isGitSync ? 'git-sync' : undefined,
+    );
   }
 
   private async parseProsemirrorContent(

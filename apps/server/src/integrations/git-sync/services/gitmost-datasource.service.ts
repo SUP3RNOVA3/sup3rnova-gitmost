@@ -232,7 +232,12 @@ export class GitmostDataSourceService {
     ctx: GitSyncBindContext,
     pageId: string,
   ): Promise<unknown> {
-    await this.pageService.removePage(pageId, ctx.userId, ctx.workspaceId);
+    await this.pageService.removePage(
+      pageId,
+      ctx.userId,
+      ctx.workspaceId,
+      GIT_SYNC_PROVENANCE,
+    );
     return { id: pageId };
   }
 
@@ -368,7 +373,13 @@ export class GitmostDataSourceService {
     ctx: GitSyncBindContext,
     pageId: string,
   ): Promise<unknown> {
-    await this.pageRepo.restorePage(pageId, ctx.workspaceId);
+    // Stamp git-sync provenance so the change-listener loop-guard skips the
+    // PAGE_RESTORED echo (mirrors deletePage / create / update / move).
+    await this.pageRepo.restorePage(
+      pageId,
+      ctx.workspaceId,
+      GIT_SYNC_PROVENANCE.actor,
+    );
     return { id: pageId };
   }
 

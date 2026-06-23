@@ -303,7 +303,7 @@ describe('GitSyncOrchestrator', () => {
   });
 
   describe('delete cap (anti-data-loss)', () => {
-    it('neutralizes deletePage on the apply client when planned deletes exceed the cap', async () => {
+    it('suppresses deletePage on the apply client (by throwing) when planned deletes exceed the cap', async () => {
       jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
       const built = build({ maxDeletes: 5 });
       // Dry-run plans 9 deletes (over the cap of 5); apply still runs.
@@ -315,20 +315,22 @@ describe('GitSyncOrchestrator', () => {
       expect(res.ran).toBe(true);
       expect(runPushMock).toHaveBeenCalledTimes(2);
 
-      // The second runPush (real apply, dryRun:false) got a neutralized client.
+      // The second runPush (real apply, dryRun:false) got a suppressed client.
       const [applyDeps, applyOpts] = runPushMock.mock.calls[1];
       expect(applyOpts).toEqual({ dryRun: false });
       const applyClient = applyDeps.makeClient();
-      // deletePage is still a function (the engine may call it)...
+      // deletePage is still a function (the engine calls it)...
       expect(typeof applyClient.deletePage).toBe('function');
-      await applyClient.deletePage('p1');
-      // ...but it is a NO-OP: the underlying real deletePage was NOT invoked.
+      // ...but it THROWS, so the engine records a per-page failure and holds
+      // `last-pushed` (a resolving no-op would advance past the dropped deletes
+      // and never replay them — PR #119 review). The real deletePage is NOT hit.
+      await expect(applyClient.deletePage('p1')).rejects.toThrow(/suppress/i);
       expect(built.client.deletePage).not.toHaveBeenCalled();
       // Creates/updates pass through to the real client.
       expect(applyClient.createPage).toBe(built.client.createPage);
     });
 
-    it('fails safe: a throwing dry-run still suppresses deletes and does not throw', async () => {
+    it('fails safe: a throwing dry-run still suppresses deletes and does not throw the cycle', async () => {
       jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
       const built = build({ maxDeletes: 5 });
       runPushMock
@@ -340,7 +342,8 @@ describe('GitSyncOrchestrator', () => {
       expect(res.ran).toBe(true);
       const [applyDeps] = runPushMock.mock.calls[1];
       const applyClient = applyDeps.makeClient();
-      await applyClient.deletePage('p1');
+      // Suppressed via throw (same fail-safe path as the over-cap case).
+      await expect(applyClient.deletePage('p1')).rejects.toThrow(/suppress/i);
       expect(built.client.deletePage).not.toHaveBeenCalled();
     });
 

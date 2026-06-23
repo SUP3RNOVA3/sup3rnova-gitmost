@@ -473,11 +473,26 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    // When over the cap, neutralize deletes by wrapping the client's deletePage
-    // into a no-op (every other op is forwarded). The dry-run already committed
-    // the working tree to `main`, so the apply re-diffs and converges normally.
+    // When over the cap, suppress deletes by making deletePage THROW (every
+    // other op is forwarded). A throw is recorded by the engine as a per-page
+    // `failure`, which (a) keeps `refs/docmost/last-pushed` from advancing past
+    // the commit that dropped the files, and (b) makes the next cycle re-diff
+    // from the un-advanced ref and re-plan the same deletes — so a transient
+    // over-cap is retried rather than silently dropped forever. (A no-op that
+    // resolved would let the engine count `deleted++` with no failure, advance
+    // the ref, and never replay the deletions — a pull would then recreate the
+    // user's deleted files. See PR #119 review.)
     const applyClient = suppressDeletes
-      ? { ...client, deletePage: async () => undefined }
+      ? {
+          ...client,
+          deletePage: async () => {
+            throw new Error(
+              'git-sync: delete suppressed this cycle ' +
+                '(over GIT_SYNC_MAX_DELETES_PER_CYCLE) — refs intentionally held ' +
+                'so the deletion is retried, not dropped',
+            );
+          },
+        }
       : client;
 
     const pushResult = await runPush(

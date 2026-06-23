@@ -292,10 +292,13 @@ describe('GitmostDataSourceService', () => {
     it('uses the soft-delete path (removePage), not a force delete', async () => {
       const { service, mocks } = build();
       await service.bind(CTX).deletePage('p1');
+      // Passes git-sync provenance so the soft-delete stamps
+      // lastUpdatedSource='git-sync' (loop-guard, PR #119 review).
       expect(mocks.pageService.removePage).toHaveBeenCalledWith(
         'p1',
         'svc-user',
         'ws-1',
+        { actor: 'git-sync', aiChatId: null },
       );
       // No forceDelete on the service surface used here.
       expect((mocks.pageService as any).forceDelete).toBeUndefined();
@@ -358,7 +361,12 @@ describe('GitmostDataSourceService', () => {
     it('restores via the repo restore path scoped to the workspace', async () => {
       const { service, mocks } = build();
       await service.bind(CTX).restorePage('p1');
-      expect(mocks.pageRepo.restorePage).toHaveBeenCalledWith('p1', 'ws-1');
+      // Stamps lastUpdatedSource='git-sync' on restore (loop-guard, PR #119).
+      expect(mocks.pageRepo.restorePage).toHaveBeenCalledWith(
+        'p1',
+        'ws-1',
+        'git-sync',
+      );
     });
   });
 });
