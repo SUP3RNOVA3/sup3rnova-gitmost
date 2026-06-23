@@ -101,6 +101,39 @@ export interface GitHttpBackendRequest {
  * Node response. Errors before any output produce a 500. Credentials are never
  * logged.
  */
+/**
+ * Build the `git http-backend` CGI environment overlay for one request (the
+ * variables layered on top of `vaultGitEnv`'s cwd-isolated base). Pure so the
+ * PATH_INFO / REMOTE_USER / conditional GIT_PROTOCOL wiring is unit-testable
+ * without spawning git.
+ *
+ * PATH_INFO is the repo-relative CGI path. The vault is a NON-BARE working repo
+ * on disk at `<dataDir>/<spaceId>` (the engine needs a working tree), so the
+ * repo directory git http-backend must resolve is `<spaceId>` — NOT
+ * `<spaceId>.git`. The URL carries the conventional `.git` suffix (stripped by
+ * parseGitPath into `spaceId`); re-appending it here pointed the CGI at a
+ * non-existent `<dataDir>/<spaceId>.git` and every fetch/push 404'd.
+ */
+export function buildGitBackendCgiEnv(
+  parsed: GitHttpBackendRequest,
+  projectRoot: string,
+): Record<string, string> {
+  const cgiEnv: Record<string, string> = {
+    GIT_PROJECT_ROOT: projectRoot,
+    GIT_HTTP_EXPORT_ALL: '1', // authz is done by us; no git-daemon-export-ok file
+    PATH_INFO: `/${parsed.spaceId}/${parsed.subpath}`,
+    REQUEST_METHOD: parsed.method,
+    QUERY_STRING: parsed.queryString,
+    CONTENT_TYPE: parsed.contentType,
+    REMOTE_USER: parsed.remoteUser,
+  };
+  // GIT_PROTOCOL is only set when the client sent the Git-Protocol header.
+  if (parsed.gitProtocol) {
+    cgiEnv.GIT_PROTOCOL = parsed.gitProtocol;
+  }
+  return cgiEnv;
+}
+
 @Injectable()
 export class GitHttpBackendService {
   private readonly logger = new Logger(GitHttpBackendService.name);
@@ -120,26 +153,11 @@ export class GitHttpBackendService {
     rawRes: ServerResponse,
   ): Promise<void> {
     const projectRoot = this.environmentService.getGitSyncDataDir();
-    // PATH_INFO is the repo-relative CGI path: /<spaceId>.git/<subpath>.
-    const pathInfo = `/${parsed.spaceId}.git/${parsed.subpath}`;
-
     // Build the CGI env from the engine's cwd-isolated base (strips GIT_DIR /
-    // GIT_WORK_TREE), then layer the http-backend CGI variables. GIT_PROTOCOL is
-    // only set when the client sent the Git-Protocol header. PATH is preserved
-    // (vaultGitEnv already copies process.env, so PATH carries through).
-    const cgiEnv: Record<string, string> = {
-      GIT_PROJECT_ROOT: projectRoot,
-      GIT_HTTP_EXPORT_ALL: '1', // authz is done by us; no git-daemon-export-ok file
-      PATH_INFO: pathInfo,
-      REQUEST_METHOD: parsed.method,
-      QUERY_STRING: parsed.queryString,
-      CONTENT_TYPE: parsed.contentType,
-      REMOTE_USER: parsed.remoteUser,
-    };
-    if (parsed.gitProtocol) {
-      cgiEnv.GIT_PROTOCOL = parsed.gitProtocol;
-    }
-    const env = vaultGitEnv(cgiEnv);
+    // GIT_WORK_TREE), then layer the http-backend CGI variables. PATH is
+    // preserved (vaultGitEnv already copies process.env, so PATH carries
+    // through).
+    const env = vaultGitEnv(buildGitBackendCgiEnv(parsed, projectRoot));
 
     return new Promise<void>((resolve) => {
       let settled = false;

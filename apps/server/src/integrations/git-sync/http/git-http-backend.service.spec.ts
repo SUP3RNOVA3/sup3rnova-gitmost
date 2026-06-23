@@ -4,7 +4,49 @@
 import {
   parseCgiResponse,
   splitCgiBuffer,
+  buildGitBackendCgiEnv,
 } from './git-http-backend.service';
+
+describe('buildGitBackendCgiEnv', () => {
+  const base = {
+    spaceId: 'space-1',
+    subpath: 'info/refs',
+    method: 'GET',
+    queryString: 'service=git-upload-pack',
+    contentType: '',
+    remoteUser: 'alice@example.com',
+  };
+
+  it('points PATH_INFO at the NON-bare repo dir (no .git suffix)', () => {
+    // Regression guard: the vault lives at <root>/<spaceId> (a working repo), so
+    // PATH_INFO must be /<spaceId>/<subpath>. A `.git` suffix made git
+    // http-backend resolve <root>/<spaceId>.git and 404 every fetch/push.
+    const env = buildGitBackendCgiEnv(base, '/vaults');
+    expect(env.PATH_INFO).toBe('/space-1/info/refs');
+    expect(env.PATH_INFO).not.toContain('.git');
+    expect(env.GIT_PROJECT_ROOT).toBe('/vaults');
+  });
+
+  it('forwards method/query/content-type/remote-user and exports all repos', () => {
+    const env = buildGitBackendCgiEnv(
+      { ...base, method: 'POST', subpath: 'git-receive-pack', contentType: 'application/x-git-receive-pack-request', queryString: '' },
+      '/vaults',
+    );
+    expect(env.REQUEST_METHOD).toBe('POST');
+    expect(env.PATH_INFO).toBe('/space-1/git-receive-pack');
+    expect(env.CONTENT_TYPE).toBe('application/x-git-receive-pack-request');
+    expect(env.REMOTE_USER).toBe('alice@example.com');
+    expect(env.GIT_HTTP_EXPORT_ALL).toBe('1');
+  });
+
+  it('sets GIT_PROTOCOL only when the client sent the header', () => {
+    expect(buildGitBackendCgiEnv(base, '/vaults').GIT_PROTOCOL).toBeUndefined();
+    expect(
+      buildGitBackendCgiEnv({ ...base, gitProtocol: 'version=2' }, '/vaults')
+        .GIT_PROTOCOL,
+    ).toBe('version=2');
+  });
+});
 
 describe('parseCgiResponse', () => {
   it('defaults to status 200 with no Status header', () => {
