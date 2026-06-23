@@ -5,6 +5,11 @@ data
 # compiled output
 /dist
 /node_modules
+# workspace package node_modules (pnpm symlinks — never commit; they bake
+# machine-local store paths) and the git-sync compiled output (built in CI/Docker
+# via `pnpm build`, never committed, so src/ and prod can never silently diverge).
+packages/*/node_modules/
+packages/git-sync/build/
 
 # Logs
 logs

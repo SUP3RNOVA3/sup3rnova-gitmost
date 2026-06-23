@@ -68,6 +68,13 @@ jobs:
       - name: Build editor-ext
         run: pnpm --filter @docmost/editor-ext build
 
+      # git-sync is no longer committed in built form (build/ is gitignored), so
+      # CI must compile it: the server suite imports the package via its built
+      # build/index.js. The server pretest also builds it, but building here keeps
+      # it explicit and independent of pnpm lifecycle ordering.
+      - name: Build git-sync
+        run: pnpm --filter @docmost/git-sync build
+
       - name: Run unit tests
         run: pnpm -r test
 
