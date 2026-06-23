@@ -112,3 +112,10 @@ export { parseSettings, envSchema } from "./engine/settings";
 export type { Settings } from "./engine/settings";
 
 export { loadSettingsOrExit } from "./engine/config-errors";
+
+export { runCycle } from "./engine/cycle";
+export type {
+  RunCycleDeps,
+  RunCycleResult,
+  CycleFs,
+} from "./engine/cycle";

@@ -1,26 +1,19 @@
-// Unit tests for the git-sync control plane. The vendored
-// engine (@docmost/git-sync) is fully mocked so we exercise ONLY the
-// orchestrator's wiring: gating, the Redis leader lock + in-process mutex,
-// the pull/push call order, the delete-cap anti-data-loss guard, the remote
-// template substitution, and the idempotent interval lifecycle.
+// Unit tests for the git-sync control plane. The vendored engine's `runCycle`
+// (which owns the PULL->PUSH branch choreography) is mocked so we exercise ONLY
+// the orchestrator's wiring: gating, the Redis leader lock + in-process mutex
+// (via SpaceLockService), the delete-cap POLICY it injects as `resolveApplyClient`,
+// the remote-template substitution in the settings it hands the engine, the
+// external-push ingest, and the idempotent interval lifecycle. The cycle
+// mechanics themselves are covered by the engine's own cycle round-trip spec.
 //
 // The engine mock must be declared before importing the orchestrator so the
-// module-graph import binds to the mocked functions (same idiom as the
-// datasource spec's top-of-file jest.mock stubs that avoid the React graph).
+// module-graph import binds to the mocked function.
 jest.mock('@docmost/git-sync', () => ({
-  readExisting: jest.fn(),
-  computePullActions: jest.fn(),
-  applyPullActions: jest.fn(),
-  runPush: jest.fn(),
+  runCycle: jest.fn(),
 }));
 
 import { Logger } from '@nestjs/common';
-import {
-  readExisting,
-  computePullActions,
-  applyPullActions,
-  runPush,
-} from '@docmost/git-sync';
+import { runCycle } from '@docmost/git-sync';
 import {
   GitSyncOrchestrator,
   GitSyncLockHeldError,
@@ -29,10 +22,14 @@ import { SpaceLockService } from './space-lock.service';
 
 type AnyMock = jest.Mock;
 
-const readExistingMock = readExisting as unknown as AnyMock;
-const computePullActionsMock = computePullActions as unknown as AnyMock;
-const applyPullActionsMock = applyPullActions as unknown as AnyMock;
-const runPushMock = runPush as unknown as AnyMock;
+const runCycleMock = runCycle as unknown as AnyMock;
+
+/** The default happy-path cycle result the engine returns. */
+const OK_CYCLE = {
+  ran: true,
+  pull: { written: 0, deleted: 0, conflict: false },
+  push: { mode: 'apply', failures: 0 },
+};
 
 interface BuildOptions {
   /** Env tunables (only the load-bearing ones are surfaced as overrides). */
@@ -150,16 +147,18 @@ function build(opts: BuildOptions = {}): Built {
   };
 }
 
-/** Reasonable engine defaults so a happy-path driveCycle completes. */
+/** The engine runs a clean cycle by default. */
 function primeEngineHappyPath(): void {
-  readExistingMock.mockResolvedValue({});
-  computePullActionsMock.mockReturnValue({ creates: [], updates: [], deletes: [] });
-  applyPullActionsMock.mockResolvedValue({
-    written: 0,
-    deleted: 0,
-    merge: { conflict: false },
-  });
-  runPushMock.mockResolvedValue({ mode: 'apply', failures: [], planned: { deletes: 0 } });
+  runCycleMock.mockResolvedValue(OK_CYCLE);
+}
+
+/** Pull the `resolveApplyClient` hook out of the (single) runCycle call args. */
+function lastResolveApplyClient(): (
+  plannedDeletes: number,
+  client: unknown,
+) => unknown {
+  const calls = runCycleMock.mock.calls;
+  return calls[calls.length - 1][0].resolveApplyClient;
 }
 
 beforeEach(() => {
@@ -242,13 +241,10 @@ describe('GitSyncOrchestrator', () => {
   });
 
   describe('poisoned-space protection', () => {
-    it('releases the lock and clears the mutex when driveCycle throws, returning { error }', async () => {
+    it('releases the lock and clears the mutex when the cycle throws, returning { error }', async () => {
       const built = build();
       jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
-      // Make the real apply runPush reject; dry-run still resolves first.
-      runPushMock
-        .mockResolvedValueOnce({ mode: 'apply', failures: [], planned: { deletes: 0 } })
-        .mockRejectedValueOnce(new Error('boom'));
+      runCycleMock.mockRejectedValueOnce(new Error('boom'));
 
       const res = await built.orchestrator.runOnce('space-1', 'ws-1');
       expect(res.ran).toBe(false);
@@ -257,16 +253,34 @@ describe('GitSyncOrchestrator', () => {
       expect(built.redis.eval).toHaveBeenCalledTimes(1);
 
       // A subsequent call can re-acquire (mutex cleared after the throw).
-      runPushMock.mockResolvedValue({ mode: 'apply', failures: [], planned: { deletes: 0 } });
+      runCycleMock.mockResolvedValue(OK_CYCLE);
       const res2 = await built.orchestrator.runOnce('space-1', 'ws-1');
       expect(res2.ran).toBe(true);
     });
   });
 
-  describe('merge-in-progress guard', () => {
-    it("returns skipped:'merge-in-progress' and runs no pull/push", async () => {
-      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-      const built = build({ vaultOverrides: { isMergeInProgress: jest.fn(async () => true) } });
+  describe('cycle wiring', () => {
+    it('drives runCycle with the space vault, the bound client, and settings', async () => {
+      const built = build();
+      await built.orchestrator.runOnce('space-1', 'ws-1');
+
+      expect(runCycleMock).toHaveBeenCalledTimes(1);
+      const [deps] = runCycleMock.mock.calls[0];
+      expect(deps.spaceId).toBe('space-1');
+      expect(deps.vault).toBe(built.vault);
+      expect(deps.client).toBe(built.client);
+      expect(deps.settings.vaultPath).toBe('/vaults/space-1');
+      expect(typeof deps.resolveApplyClient).toBe('function');
+      // The bound datasource identity is the (workspace, service-user) pair.
+      expect(built.dataSource.bind).toHaveBeenCalledWith({
+        workspaceId: 'ws-1',
+        userId: 'svc-user',
+      });
+    });
+
+    it("surfaces the engine's skipped status (e.g. merge-in-progress) verbatim", async () => {
+      const built = build();
+      runCycleMock.mockResolvedValue({ ran: false, skipped: 'merge-in-progress' });
 
       const res = await built.orchestrator.runOnce('space-1', 'ws-1');
       expect(res).toEqual({
@@ -274,40 +288,6 @@ describe('GitSyncOrchestrator', () => {
         ran: false,
         skipped: 'merge-in-progress',
       });
-      expect(applyPullActionsMock).not.toHaveBeenCalled();
-      expect(runPushMock).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('cycle order', () => {
-    it('runs ensureRepo -> ensureBranch(docmost,main) -> checkout(docmost) -> applyPullActions in order', async () => {
-      const order: string[] = [];
-      const built = build({
-        vaultOverrides: {
-          ensureRepo: jest.fn(async () => {
-            order.push('ensureRepo');
-          }),
-          ensureBranch: jest.fn(async (branch: string, base: string) => {
-            order.push(`ensureBranch:${branch}:${base}`);
-          }),
-          checkout: jest.fn(async (branch: string) => {
-            order.push(`checkout:${branch}`);
-          }),
-        },
-      });
-      applyPullActionsMock.mockImplementation(async () => {
-        order.push('applyPullActions');
-        return { written: 0, deleted: 0, merge: { conflict: false } };
-      });
-
-      await built.orchestrator.runOnce('space-1', 'ws-1');
-
-      expect(order).toEqual([
-        'ensureRepo',
-        'ensureBranch:docmost:main',
-        'checkout:docmost',
-        'applyPullActions',
-      ]);
     });
   });
 
@@ -315,9 +295,9 @@ describe('GitSyncOrchestrator', () => {
     it('streams the receive-pack FIRST, then runs the Docmost cycle', async () => {
       const order: string[] = [];
       const built = build();
-      applyPullActionsMock.mockImplementation(async () => {
+      runCycleMock.mockImplementation(async () => {
         order.push('cycle');
-        return { written: 0, deleted: 0, merge: { conflict: false } };
+        return OK_CYCLE;
       });
       const runReceivePack = jest.fn(async () => {
         order.push('receive-pack');
@@ -341,17 +321,14 @@ describe('GitSyncOrchestrator', () => {
 
       // We must never write to the working tree concurrently with a cycle.
       expect(runReceivePack).not.toHaveBeenCalled();
-      expect(applyPullActionsMock).not.toHaveBeenCalled();
+      expect(runCycleMock).not.toHaveBeenCalled();
     });
 
     it('swallows a post-push cycle error (the push is durable; poll retries)', async () => {
       jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
       const built = build();
-      // Dry-run resolves, the real apply rejects → driveCycle throws AFTER the
-      // receive-pack already succeeded.
-      runPushMock
-        .mockResolvedValueOnce({ mode: 'apply', failures: [], planned: { deletes: 0 } })
-        .mockRejectedValueOnce(new Error('cycle boom'));
+      // The cycle throws AFTER the receive-pack already succeeded.
+      runCycleMock.mockRejectedValueOnce(new Error('cycle boom'));
       const runReceivePack = jest.fn(async () => undefined);
 
       // Does NOT throw — the durable push must not be reported as failed.
@@ -373,7 +350,7 @@ describe('GitSyncOrchestrator', () => {
       ).resolves.toBeUndefined();
       // The push is durable on main; the immediate cycle is skipped, not failed.
       expect(runReceivePack).toHaveBeenCalledTimes(1);
-      expect(applyPullActionsMock).not.toHaveBeenCalled();
+      expect(runCycleMock).not.toHaveBeenCalled();
     });
 
     it('refuses (LockHeldError) and runs nothing when git-sync is globally disabled', async () => {
@@ -389,22 +366,16 @@ describe('GitSyncOrchestrator', () => {
   });
 
   describe('delete cap (anti-data-loss)', () => {
-    it('suppresses deletePage on the apply client (by throwing) when planned deletes exceed the cap', async () => {
+    // The cap is now a POLICY the orchestrator injects as runCycle's
+    // `resolveApplyClient` hook; the engine calls it with the dry-run's planned
+    // delete count. We pull the hook out of the runCycle args and exercise it.
+    it('suppresses deletePage (by throwing) when planned deletes exceed the cap', async () => {
       jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
       const built = build({ maxDeletes: 5 });
-      // Dry-run plans 9 deletes (over the cap of 5); apply still runs.
-      runPushMock
-        .mockResolvedValueOnce({ mode: 'plan', failures: [], planned: { deletes: 9 } })
-        .mockResolvedValueOnce({ mode: 'apply', failures: [], planned: { deletes: 0 } });
+      await built.orchestrator.runOnce('space-1', 'ws-1');
 
-      const res = await built.orchestrator.runOnce('space-1', 'ws-1');
-      expect(res.ran).toBe(true);
-      expect(runPushMock).toHaveBeenCalledTimes(2);
-
-      // The second runPush (real apply, dryRun:false) got a suppressed client.
-      const [applyDeps, applyOpts] = runPushMock.mock.calls[1];
-      expect(applyOpts).toEqual({ dryRun: false });
-      const applyClient = applyDeps.makeClient();
+      const resolveApplyClient = lastResolveApplyClient();
+      const applyClient = resolveApplyClient(9, built.client) as any;
       // deletePage is still a function (the engine calls it)...
       expect(typeof applyClient.deletePage).toBe('function');
       // ...but it THROWS, so the engine records a per-page failure and holds
@@ -416,32 +387,28 @@ describe('GitSyncOrchestrator', () => {
       expect(applyClient.createPage).toBe(built.client.createPage);
     });
 
-    it('fails safe: a throwing dry-run still suppresses deletes and does not throw the cycle', async () => {
+    it('fails safe: an Infinity planned-delete count (dry-run failed) is suppressed', async () => {
       jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
       const built = build({ maxDeletes: 5 });
-      runPushMock
-        .mockRejectedValueOnce(new Error('plan failed'))
-        .mockResolvedValueOnce({ mode: 'apply', failures: [], planned: { deletes: 0 } });
+      await built.orchestrator.runOnce('space-1', 'ws-1');
 
-      const res = await built.orchestrator.runOnce('space-1', 'ws-1');
-      // The cycle still completes (ran:true), it does NOT throw.
-      expect(res.ran).toBe(true);
-      const [applyDeps] = runPushMock.mock.calls[1];
-      const applyClient = applyDeps.makeClient();
-      // Suppressed via throw (same fail-safe path as the over-cap case).
+      // runCycle passes Number.POSITIVE_INFINITY when its dry-run planning threw;
+      // Infinity > cap → suppress (same throwing path).
+      const resolveApplyClient = lastResolveApplyClient();
+      const applyClient = resolveApplyClient(
+        Number.POSITIVE_INFINITY,
+        built.client,
+      ) as any;
       await expect(applyClient.deletePage('p1')).rejects.toThrow(/suppress/i);
       expect(built.client.deletePage).not.toHaveBeenCalled();
     });
 
     it('passes through the original client when planned deletes are within the cap', async () => {
       const built = build({ maxDeletes: 5 });
-      runPushMock
-        .mockResolvedValueOnce({ mode: 'plan', failures: [], planned: { deletes: 3 } })
-        .mockResolvedValueOnce({ mode: 'apply', failures: [], planned: { deletes: 0 } });
-
       await built.orchestrator.runOnce('space-1', 'ws-1');
-      const [applyDeps] = runPushMock.mock.calls[1];
-      const applyClient = applyDeps.makeClient();
+
+      const resolveApplyClient = lastResolveApplyClient();
+      const applyClient = resolveApplyClient(3, built.client) as any;
       // The ORIGINAL client is used (deletePage forwards to the real one).
       expect(applyClient).toBe(built.client);
       await applyClient.deletePage('p1');
@@ -450,12 +417,11 @@ describe('GitSyncOrchestrator', () => {
   });
 
   describe('remote template substitution', () => {
-    it('substitutes {spaceId} into the gitRemote handed to runPush', async () => {
+    it('substitutes {spaceId} into the gitRemote settings handed to the engine', async () => {
       const built = build({ remoteTemplate: 'git@h:vault-{spaceId}.git' });
       await built.orchestrator.runOnce('space-42', 'ws-1');
-      // Inspect the settings on the dry-run call (first runPush).
-      const [dryDeps] = runPushMock.mock.calls[0];
-      expect(dryDeps.settings.gitRemote).toBe('git@h:vault-space-42.git');
+      const [deps] = runCycleMock.mock.calls[0];
+      expect(deps.settings.gitRemote).toBe('git@h:vault-space-42.git');
     });
   });
 

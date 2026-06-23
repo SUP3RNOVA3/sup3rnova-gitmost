@@ -10,13 +10,7 @@ import { dirname } from 'node:path';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { sql } from 'kysely';
-import {
-  type Settings,
-  readExisting,
-  computePullActions,
-  applyPullActions,
-  runPush,
-} from '@docmost/git-sync';
+import { type Settings, runCycle } from '@docmost/git-sync';
 import { EnvironmentService } from '../../environment/environment.service';
 import { GitmostDataSourceService } from './gitmost-datasource.service';
 import { VaultRegistryService } from './vault-registry.service';
@@ -242,10 +236,11 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * The actual engine wiring. Mirrors the engine's own `main`:
-   *   PULL  — readExisting -> computePullActions -> applyPullActions,
-   *   PUSH  — runPush (dry-run disabled: a real apply).
-   * The dependency-object shapes match pull.ts/push.ts exactly (see comments).
+   * Drive ONE reconcile cycle for a space. The PULL->PUSH branch choreography
+   * lives in the engine's `runCycle` (so it can never drift from the engine it
+   * ships with); the orchestrator owns only the lock (its caller) and the
+   * gitmost-specific delete-cap POLICY, injected here as the `resolveApplyClient`
+   * hook.
    */
   private async driveCycle(
     spaceId: string,
@@ -254,118 +249,41 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
   ): Promise<GitSyncRunStatus> {
     const settings = this.buildSettings(spaceId);
     const vault = await this.vaultRegistry.getVault(spaceId);
-    const vaultRoot = settings.vaultPath;
     const client = this.dataSource.bind({ workspaceId, userId: serviceUserId });
+    const maxDeletes = this.environmentService.getGitSyncMaxDeletesPerCycle();
 
-    // Engine state store is git: make sure the repo + branches exist before any
-    // tracked-file listing or diff (the engine's pull/push assume an inited repo).
-    await vault.assertGitAvailable();
-    await vault.ensureRepo();
-
-    // Refuse to run on top of an unresolved merge (SPEC §9): a prior
-    // conflicting pull leaves the vault mid-merge; the next checkout would fail.
-    if (await vault.isMergeInProgress()) {
-      this.logger.warn(
-        `git-sync[${spaceId}]: vault has an unresolved merge — resolve it (or ` +
-          `'git merge --abort') and re-run (SPEC §9); skipping cycle.`,
-      );
-      return { spaceId, ran: false, skipped: 'merge-in-progress' };
-    }
-
-    await vault.ensureBranch('docmost', 'main');
-    // CRITICAL: pull writes happen on the `docmost` branch — applyPullActions
-    // commits there, then checks out `main` and merges docmost -> main. We MUST be
-    // on `docmost` BEFORE applying (mirrors the engine's own pull main()), else the
-    // Docmost content is written straight onto `main`, clobbering local file edits
-    // before push can diff them.
-    await vault.checkout('docmost');
-
-    // --- PULL --------------------------------------------
-    // readExisting deps (ReadExistingDeps): list tracked *.md + read by relPath.
-    const existing = await readExisting({
-      listTracked: () => vault.listTrackedFiles('*.md'),
-      readFile: (relPath) => readFile(`${vaultRoot}/${relPath}`, 'utf8'),
-    });
-
-    const tree = await client.listSpaceTree(spaceId);
-    const pullActions = computePullActions({
-      pages: tree.pages,
-      treeComplete: true,
-      existing,
-    });
-
-    // applyPullActions deps (ApplyPullActionsDeps): the read-side client subset,
-    // the vault git subset, and ABSOLUTE-path fs ops (mkdir/writeFile/rm).
-    const pullResult = await applyPullActions(
-      {
-        client,
-        git: vault,
+    const result = await runCycle({
+      spaceId,
+      client,
+      vault,
+      settings,
+      // ABSOLUTE-path fs primitives the engine cycle injects (it stays IO-free).
+      fs: {
+        readFile: (absPath) => readFile(absPath, 'utf8'),
         writeFile: (absPath, text) => writeFile(absPath, text, 'utf8'),
         mkdir: (absDir) => mkdir(absDir, { recursive: true }).then(() => undefined),
         rm: (absPath) => rm(absPath, { force: true }),
       },
-      pullActions,
-      vaultRoot,
-    );
-
-    // --- PUSH --------------------------------------------------
-    // runPush deps (PushDeps): settings, the full vault git object (method `this`
-    // binding must be preserved — pass the object, not bound method refs), a
-    // makeClient factory returning the push client subset, vault-relative fs
-    // read/write, and a logger. dryRun:false performs the real Docmost writes.
-    const pushDeps = {
-      settings,
-      git: vault,
-      makeClient: () => client,
-      readFile: (relPath: string) => readFile(`${vaultRoot}/${relPath}`, 'utf8'),
-      writeFile: (relPath: string, text: string) =>
-        writeFile(`${vaultRoot}/${relPath}`, text, 'utf8'),
       log: (line: string) => this.logger.log(`git-sync[${spaceId}] ${line}`),
-    };
-
-    // DEFENSE-IN-DEPTH delete cap. A non-convergent vault
-    // (e.g. empty/duplicate titles -> colliding paths) can compute PHANTOM
-    // absence-deletions that slip under the engine's mass-delete FRACTION guard
-    // and soft-delete real pages. So plan the push as a DRY-RUN FIRST to read the
-    // delete count, and if it exceeds GIT_SYNC_MAX_DELETES_PER_CYCLE, run the real
-    // apply with a client whose deletePage is NEUTRALIZED — creates/updates/
-    // moves/renames still apply, deletions are skipped this cycle. Never throws.
-    const maxDeletes = this.environmentService.getGitSyncMaxDeletesPerCycle();
-    let suppressDeletes = false;
-    try {
-      const dry = await runPush(pushDeps, { dryRun: true });
-      const plannedDeletes = dry.planned?.deletes ?? 0;
-      if (plannedDeletes > maxDeletes) {
-        suppressDeletes = true;
+      // DEFENSE-IN-DEPTH delete cap (gitmost-specific policy). A non-convergent
+      // vault (e.g. empty/duplicate titles -> colliding paths) can compute
+      // PHANTOM absence-deletions. When the push's planned delete count exceeds
+      // GIT_SYNC_MAX_DELETES_PER_CYCLE (or planning failed -> Infinity), suppress
+      // deletes by making deletePage THROW: the engine records each as a per-page
+      // failure, which keeps `refs/docmost/last-pushed` from advancing past the
+      // dropped-file commit, so the deletion is RETRIED next cycle rather than
+      // silently dropped (a no-op that resolved would advance the ref and a pull
+      // would then recreate the user's deleted files). See PR #119 review.
+      resolveApplyClient: (plannedDeletes, c) => {
+        if (plannedDeletes <= maxDeletes) return c;
         this.logger.warn(
           `git-sync[${spaceId}]: push delete count ${plannedDeletes} exceeds ` +
-            `GIT_SYNC_MAX_DELETES_PER_CYCLE=${maxDeletes}; skipping deletions this ` +
-            `cycle (possible non-convergence / collision). Investigate vault layout.`,
+            `GIT_SYNC_MAX_DELETES_PER_CYCLE=${maxDeletes}; suppressing deletions ` +
+            `this cycle (possible non-convergence / collision). Investigate vault ` +
+            `layout.`,
         );
-      }
-    } catch (err) {
-      // A failed dry-run plan must not block the apply, but we cannot trust a
-      // delete count we never got — fail SAFE by suppressing deletes this cycle.
-      suppressDeletes = true;
-      this.logger.warn(
-        `git-sync[${spaceId}]: push dry-run planning failed (${
-          err instanceof Error ? err.message : String(err)
-        }); skipping deletions this cycle as a precaution.`,
-      );
-    }
-
-    // When over the cap, suppress deletes by making deletePage THROW (every
-    // other op is forwarded). A throw is recorded by the engine as a per-page
-    // `failure`, which (a) keeps `refs/docmost/last-pushed` from advancing past
-    // the commit that dropped the files, and (b) makes the next cycle re-diff
-    // from the un-advanced ref and re-plan the same deletes — so a transient
-    // over-cap is retried rather than silently dropped forever. (A no-op that
-    // resolved would let the engine count `deleted++` with no failure, advance
-    // the ref, and never replay the deletions — a pull would then recreate the
-    // user's deleted files. See PR #119 review.)
-    const applyClient = suppressDeletes
-      ? {
-          ...client,
+        return {
+          ...c,
           deletePage: async () => {
             throw new Error(
               'git-sync: delete suppressed this cycle ' +
@@ -373,27 +291,11 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
                 'so the deletion is retried, not dropped',
             );
           },
-        }
-      : client;
-
-    const pushResult = await runPush(
-      { ...pushDeps, makeClient: () => applyClient },
-      { dryRun: false },
-    );
-
-    return {
-      spaceId,
-      ran: true,
-      pull: {
-        written: pullResult.written,
-        deleted: pullResult.deleted,
-        conflict: pullResult.merge.conflict,
+        };
       },
-      push: {
-        mode: pushResult.mode,
-        failures: pushResult.failures?.length ?? 0,
-      },
-    };
+    });
+
+    return { spaceId, ...result };
   }
 
   // --- poll-safety interval -------------------------------------
