@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 
 import { diff3Plan } from './three-way-merge';
+import { buildLcsTable } from './lcs';
 
 /**
  * Block-level merge of an incoming (git) page body into a LIVE Yjs document,
@@ -90,17 +91,7 @@ type Op =
 export function diffBlocks(a: string[], b: string[]): Op[] {
   const n = a.length;
   const m = b.length;
-  const dp: number[][] = Array.from({ length: n + 1 }, () =>
-    new Array(m + 1).fill(0),
-  );
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[i][j] =
-        a[i] === b[j]
-          ? dp[i + 1][j + 1] + 1
-          : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
-  }
+  const dp = buildLcsTable(a, b);
   const ops: Op[] = [];
   let i = 0;
   let j = 0;
