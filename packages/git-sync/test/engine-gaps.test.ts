@@ -300,7 +300,11 @@ describe('applyPushActions (push.ts) — move prefetch isolation', () => {
     // The update and the delete in the SAME batch still applied.
     expect(res.updated).toBe(1);
     expect(res.deleted).toBe(1);
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('u1', store['Up.md']);
+    expect(client.importPageMarkdown).toHaveBeenCalledWith(
+      'u1',
+      store['Up.md'],
+      null,
+    );
     expect(client.deletePage).toHaveBeenCalledWith('d1');
 
     // The broken move was ISOLATED: no movePage/renamePage call, recorded as a

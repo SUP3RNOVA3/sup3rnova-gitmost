@@ -143,11 +143,35 @@ describe('applyPushActions — update (collab path, SPEC §2/§15.6)', () => {
     expect(res.updated).toBe(1);
     // The collab/Yjs write path is used — NOT a raw jsonb overwrite.
     expect(client.importPageMarkdown).toHaveBeenCalledTimes(1);
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-1', fileBody);
+    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-1', fileBody, null);
     // No raw-overwrite path exists on the injected client surface at all.
     expect((client as any).updatePageJson).toBeUndefined();
     expect(client.createPage).not.toHaveBeenCalled();
     expect(client.deletePage).not.toHaveBeenCalled();
+  });
+
+  it('forwards the last-pushed base body (3-way merge ancestor) when present', async () => {
+    const baseBody =
+      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nbase body\n';
+    const fileBody =
+      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nupdated body\n';
+    const client = makeClient();
+    // The pre-image (refs/docmost/last-pushed) carries the base version.
+    const { git } = makeGit({ prevTree: { 'Doc.md': baseBody } });
+    const fs = makeFs({ 'Doc.md': fileBody });
+
+    await applyPushActions(
+      deps(client, git, fs),
+      actions({ updates: [{ pageId: 'p-1', path: 'Doc.md' }] }),
+    );
+
+    // importPageMarkdown receives the base so the server can 3-way merge it.
+    expect(client.importPageMarkdown).toHaveBeenCalledWith(
+      'p-1',
+      fileBody,
+      baseBody,
+    );
+    expect(git.showFileAtRef).toHaveBeenCalledWith(LAST_PUSHED_REF, 'Doc.md');
   });
 });
 
@@ -542,8 +566,8 @@ describe('applyPushActions — per-page error isolation + refs gated on success 
     // The 1st and 3rd were applied; the 2nd threw.
     expect(res.updated).toBe(2);
     expect(client.importPageMarkdown).toHaveBeenCalledTimes(3);
-    expect(client.importPageMarkdown).toHaveBeenNthCalledWith(1, 'p-a', 'a body');
-    expect(client.importPageMarkdown).toHaveBeenNthCalledWith(3, 'p-c', 'c body');
+    expect(client.importPageMarkdown).toHaveBeenNthCalledWith(1, 'p-a', 'a body', null);
+    expect(client.importPageMarkdown).toHaveBeenNthCalledWith(3, 'p-c', 'c body', null);
 
     // The failure is recorded with kind/pageId/path/error.
     expect(res.failures).toEqual([
@@ -649,7 +673,7 @@ describe('applyPushActions — mixed batch + skipped passthrough', () => {
     expect(res.writtenBack).toEqual([{ path: 'N.md', pageId: 'created-1' }]);
     expect(res.skipped).toEqual(skipped);
     expect(updateRefCalls).toEqual([{ ref: LAST_PUSHED_REF, target: 'sha-9' }]);
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('u-1', updFile);
+    expect(client.importPageMarkdown).toHaveBeenCalledWith('u-1', updFile, null);
     expect(client.deletePage).toHaveBeenCalledWith('d-1');
   });
 });

@@ -1,5 +1,7 @@
 import * as Y from 'yjs';
 
+import { diff3Plan } from './three-way-merge';
+
 /**
  * Block-level merge of an incoming (git) page body into a LIVE Yjs document,
  * replacing the previous full-body "delete everything + re-insert" write that
@@ -157,4 +159,43 @@ export function mergeXmlFragments(
     }
   }
   return applied;
+}
+
+/**
+ * THREE-WAY block merge: reconcile `live` toward `target` using `base` (the
+ * last-synced common ancestor) so a block only the human changed is KEPT and a
+ * block only git changed is taken — instead of git's version always winning
+ * (review #5). Conflicts (both changed the same block) resolve to git.
+ *
+ * Implementation: diff3Plan computes the merged block ORDER (picks from live or
+ * target); we materialize that as a virtual target fragment and reuse the 2-way
+ * `mergeXmlFragments` to splice it into `live` minimally (so untouched live block
+ * instances — and their in-flight edits — stay put). MUST be called inside a Yjs
+ * transaction. Returns the number of block operations applied.
+ */
+export function mergeXmlFragments3Way(
+  live: Y.XmlFragment,
+  target: Y.XmlFragment,
+  base: Y.XmlFragment,
+): number {
+  const liveKids = live.toArray();
+  const targetKids = target.toArray();
+  const liveKeys = liveKids.map(key);
+  const targetKeys = targetKids.map(key);
+  const baseKeys = base.toArray().map(key);
+
+  const plan = diff3Plan(baseKeys, liveKeys, targetKeys);
+
+  // Build the merged block sequence in a throwaway doc, cloning from whichever
+  // side each pick came from, then 2-way merge it back into the live fragment.
+  const merged = new Y.Doc();
+  const mergedFrag = merged.getXmlFragment('default');
+  const nodes = plan.map((p) =>
+    cloneXmlNode(
+      (p.src === 'live' ? liveKids[p.index] : targetKids[p.index]) as XmlNode,
+    ),
+  );
+  if (nodes.length) mergedFrag.insert(0, nodes);
+
+  return mergeXmlFragments(live, mergedFrag);
 }

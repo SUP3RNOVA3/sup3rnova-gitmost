@@ -2,6 +2,7 @@ import * as Y from 'yjs';
 
 import {
   mergeXmlFragments,
+  mergeXmlFragments3Way,
   cloneXmlNode,
   diffBlocks,
 } from './yjs-body-merge';
@@ -139,6 +140,57 @@ describe('yjs-body-merge', () => {
       const targetFrag = buildFragment(target, ['p', 'q', 'r']);
       live.transact(() => mergeXmlFragments(liveFrag, targetFrag));
       expect(texts(liveFrag)).toEqual(['p', 'q', 'r']);
+    });
+  });
+
+  describe('mergeXmlFragments3Way', () => {
+    it('keeps a human edit to one block while applying a git change to another (3-way)', () => {
+      // base (last synced): [a, b, c]. Human edited block 0 in the live doc; git
+      // changed block 2 in the incoming file. 3-way must keep BOTH — the 2-way
+      // merge would instead revert the human's block 0 to git's stale version.
+      const base = new Y.Doc();
+      const live = new Y.Doc();
+      const target = new Y.Doc();
+      const baseFrag = buildFragment(base, ['a', 'b', 'c']);
+      const liveFrag = buildFragment(live, ['HUMAN', 'b', 'c']);
+      const targetFrag = buildFragment(target, ['a', 'b', 'GIT']);
+
+      const humanBlock = liveFrag.get(0); // the human's live instance
+      live.transact(() =>
+        mergeXmlFragments3Way(liveFrag, targetFrag, baseFrag),
+      );
+
+      // Human's block preserved as the SAME instance; git's change applied.
+      expect(liveFrag.get(0)).toBe(humanBlock);
+      expect(texts(liveFrag)).toEqual(['HUMAN', 'b', 'GIT']);
+    });
+
+    it('a block both sides changed resolves to git (conflict policy)', () => {
+      const base = new Y.Doc();
+      const live = new Y.Doc();
+      const target = new Y.Doc();
+      const baseFrag = buildFragment(base, ['a', 'b', 'c']);
+      const liveFrag = buildFragment(live, ['a', 'HUMAN', 'c']);
+      const targetFrag = buildFragment(target, ['a', 'GIT', 'c']);
+
+      live.transact(() =>
+        mergeXmlFragments3Way(liveFrag, targetFrag, baseFrag),
+      );
+      expect(texts(liveFrag)).toEqual(['a', 'GIT', 'c']);
+    });
+
+    it('git change with no concurrent human edit (live == base) applies cleanly', () => {
+      const base = new Y.Doc();
+      const live = new Y.Doc();
+      const target = new Y.Doc();
+      const baseFrag = buildFragment(base, ['a', 'b']);
+      const liveFrag = buildFragment(live, ['a', 'b']);
+      const targetFrag = buildFragment(target, ['a', 'B2']);
+
+      live.transact(() =>
+        mergeXmlFragments3Way(liveFrag, targetFrag, baseFrag),
+      );
+      expect(texts(liveFrag)).toEqual(['a', 'B2']);
     });
   });
 

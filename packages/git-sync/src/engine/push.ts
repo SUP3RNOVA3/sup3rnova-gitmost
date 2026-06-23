@@ -552,7 +552,18 @@ export async function applyPushActions(
   for (const u of actions.updates) {
     try {
       const fullMarkdown = await deps.readFile(u.path);
-      const result = await client.importPageMarkdown(u.pageId, fullMarkdown);
+      // The last-synced version of this file (pre-image) is the common ancestor
+      // for a 3-way merge against the live page, so concurrent human edits are
+      // not clobbered (review #5). Null when the file is new at last-pushed.
+      const baseMarkdown = await deps.git.showFileAtRef(
+        LAST_PUSHED_REF,
+        u.path,
+      );
+      const result = await client.importPageMarkdown(
+        u.pageId,
+        fullMarkdown,
+        baseMarkdown,
+      );
       updated++;
       // §10 loop-guard data: hash the body we pushed + capture `updatedAt`.
       pushed.push({

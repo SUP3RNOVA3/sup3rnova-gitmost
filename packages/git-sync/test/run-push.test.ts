@@ -312,7 +312,7 @@ describe('runPush — --apply is the ONLY write path', () => {
 
     const res = await runPush(deps, { dryRun: false });
 
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-9', file);
+    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-9', file, null);
     expect(res.applied?.updated).toBe(1);
   });
 });

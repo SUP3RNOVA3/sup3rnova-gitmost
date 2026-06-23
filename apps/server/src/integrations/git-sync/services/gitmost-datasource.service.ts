@@ -14,7 +14,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { PageService } from '../../../core/page/services/page.service';
 import { CollaborationGateway } from '../../../collaboration/collaboration.gateway';
 import { tiptapExtensions } from '../../../collaboration/collaboration.util';
-import { mergeXmlFragments } from './yjs-body-merge';
+import { mergeXmlFragments, mergeXmlFragments3Way } from './yjs-body-merge';
 import { AuthProvenanceData } from '../../../common/decorators/auth-provenance.decorator';
 
 /**
@@ -74,8 +74,8 @@ export class GitmostDataSourceService {
       listSpaceTree: (spaceId, rootPageId) =>
         this.listSpaceTree(ctx, spaceId, rootPageId),
       getPageJson: (pageId) => this.getPageJson(ctx, pageId),
-      importPageMarkdown: (pageId, fullMarkdown) =>
-        this.importPageMarkdown(ctx, pageId, fullMarkdown),
+      importPageMarkdown: (pageId, fullMarkdown, baseMarkdown) =>
+        this.importPageMarkdown(ctx, pageId, fullMarkdown, baseMarkdown),
       createPage: (title, content, spaceId, parentPageId) =>
         this.createPage(ctx, title, content, spaceId, parentPageId),
       deletePage: (pageId) => this.deletePage(ctx, pageId),
@@ -164,18 +164,29 @@ export class GitmostDataSourceService {
   // --- writes (push) --------------------------------------------------------
 
   /**
-   * Replace a page's body from a self-contained markdown file: parse the meta+
-   * body envelope, convert the body to ProseMirror, then write it through collab
-   * (§3.3). Returns the fresh page's `updatedAt` for the loop-guard.
+   * Merge a page's body from a self-contained markdown file: parse the meta+body
+   * envelope, convert the body to ProseMirror, then merge it through collab
+   * (§3.3). When `baseMarkdown` (the last-synced version of the file) is given,
+   * the body write is a THREE-WAY merge against the live doc so concurrent human
+   * edits survive (review #5); without it, a 2-way merge. Returns the fresh
+   * page's `updatedAt` for the loop-guard.
    */
   private async importPageMarkdown(
     ctx: GitSyncBindContext,
     pageId: string,
     fullMarkdown: string,
+    baseMarkdown?: string | null,
   ): Promise<{ updatedAt?: string }> {
     const { body } = parseDocmostMarkdown(fullMarkdown);
     const doc = await markdownToProseMirror(body);
-    await this.writeBody(pageId, doc, ctx.userId);
+
+    let baseDoc: unknown;
+    if (baseMarkdown != null) {
+      const { body: baseBody } = parseDocmostMarkdown(baseMarkdown);
+      baseDoc = await markdownToProseMirror(baseBody);
+    }
+
+    await this.writeBody(pageId, doc, ctx.userId, baseDoc);
 
     const page = await this.pageRepo.findById(pageId);
     return {
@@ -378,18 +389,23 @@ export class GitmostDataSourceService {
     pageId: string,
     prosemirrorJson: unknown,
     userId: string,
+    baseProsemirrorJson?: unknown,
   ): Promise<void> {
     const documentName = `page.${pageId}`;
 
-    // Build the incoming Yjs doc BEFORE opening the connection / touching the
-    // live doc. If the transform throws (a malformed/unsupported doc) we must NOT
-    // have mutated the live body — otherwise a conversion failure could leave the
-    // page empty (review #5 — crash-safe conversion).
+    // Build the incoming (and base) Yjs docs BEFORE opening the connection /
+    // touching the live doc. If a transform throws (a malformed/unsupported doc)
+    // we must NOT have mutated the live body — otherwise a conversion failure
+    // could leave the page empty (review #5 — crash-safe conversion).
     const targetDoc = TiptapTransformer.toYdoc(
       prosemirrorJson,
       'default',
       tiptapExtensions,
     );
+    const baseDoc =
+      baseProsemirrorJson != null
+        ? TiptapTransformer.toYdoc(baseProsemirrorJson, 'default', tiptapExtensions)
+        : null;
 
     const conn = await this.collabGateway.openDirectConnection(documentName, {
       actor: 'git-sync',
@@ -400,15 +416,24 @@ export class GitmostDataSourceService {
     });
     try {
       await conn.transact((doc) => {
+        const liveFrag = doc.getXmlFragment('default');
+        const targetFrag = targetDoc.getXmlFragment('default');
         // Block-level MERGE rather than a full-body replace (review #5): diff the
         // live body against the incoming git body and apply only the blocks that
-        // actually changed. Blocks a human is concurrently editing — anything git
-        // did not change — are left untouched, and an unchanged resync is a 0-op
-        // write. Yjs CRDT-merges the minimal ops with live edits.
-        mergeXmlFragments(
-          doc.getXmlFragment('default'),
-          targetDoc.getXmlFragment('default'),
-        );
+        // actually changed; concurrently-edited blocks are left untouched and an
+        // unchanged resync is a 0-op write. With a `base` (the last-synced
+        // version) do a THREE-WAY merge so a block ONLY the human changed is kept
+        // and a block ONLY git changed is taken (conflicts -> git). Without a base
+        // (e.g. createPage), fall back to the 2-way merge.
+        if (baseDoc) {
+          mergeXmlFragments3Way(
+            liveFrag,
+            targetFrag,
+            baseDoc.getXmlFragment('default'),
+          );
+        } else {
+          mergeXmlFragments(liveFrag, targetFrag);
+        }
       });
     } finally {
       await conn.disconnect();
