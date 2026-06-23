@@ -52,6 +52,9 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
       });
     } catch (err) {
       setGitSyncEnabled(previous); // revert on failure
+      // The mutation surfaces a toast via onError; still log the raw error so it
+      // is not silently swallowed (AGENTS.md).
+      console.error("Failed to toggle git-sync for space", err);
     }
   };
 

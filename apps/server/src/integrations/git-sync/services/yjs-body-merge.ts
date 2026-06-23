@@ -5,8 +5,8 @@ import { diff3Plan } from './three-way-merge';
 /**
  * Block-level merge of an incoming (git) page body into a LIVE Yjs document,
  * replacing the previous full-body "delete everything + re-insert" write that
- * clobbered concurrent human edits on every sync (review #5 — "запись делать
- * через мерж").
+ * clobbered concurrent human edits on every sync (review #5 — "do the write as a
+ * merge").
  *
  * Strategy: diff the two documents at TOP-LEVEL BLOCK granularity (an LCS over a
  * canonical structural serialization of each block) and apply only the minimal

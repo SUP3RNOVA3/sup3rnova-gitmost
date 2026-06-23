@@ -183,7 +183,9 @@ export class PersistenceExtension implements Extension {
     // agent event in the same window). §15 H2.
     // Provenance precedence: agent > git-sync > user (see resolveSource). A
     // 'git-sync' store is NOT given an immediate history snapshot — it is
-    // debounced like a human edit (git-sync writes are full-body replaces).
+    // debounced like a human edit (a git-sync write is a block-level merge into
+    // the live doc, so it reads like an incremental human edit, not a bulk
+    // import that would warrant its own immediate snapshot).
     const lastUpdatedSource = resolveSource(
       this.consumeAgentTouched(documentName),
       context?.actor,
