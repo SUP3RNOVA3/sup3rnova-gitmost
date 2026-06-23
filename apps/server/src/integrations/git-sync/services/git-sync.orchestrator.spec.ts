@@ -22,6 +22,7 @@ import {
   runPush,
 } from '@docmost/git-sync';
 import { GitSyncOrchestrator } from './git-sync.orchestrator';
+import { SpaceLockService } from './space-lock.service';
 
 type AnyMock = jest.Mock;
 
@@ -118,12 +119,17 @@ function build(opts: BuildOptions = {}): Built {
 
   const db = {};
 
+  // The REAL SpaceLockService, constructed against the mock redis above, so all
+  // existing lock assertions (lock-held, in-progress, leader lock, release CAS,
+  // heartbeat) still exercise the same `redis.set`/`redis.eval` mock unchanged.
+  const spaceLock = new SpaceLockService(redisService as any);
+
   const orchestrator = new GitSyncOrchestrator(
     env as any,
     dataSource as any,
     vaultRegistry as any,
     scheduler as any,
-    redisService as any,
+    spaceLock as any,
     db as any,
   );
 

@@ -7,6 +7,7 @@ import { PageModule } from '../../core/page/page.module';
 import { AuthModule } from '../../core/auth/auth.module';
 import { GitmostDataSourceService } from './services/gitmost-datasource.service';
 import { GitSyncOrchestrator } from './services/git-sync.orchestrator';
+import { SpaceLockService } from './services/space-lock.service';
 import { VaultRegistryService } from './services/vault-registry.service';
 import { PageChangeListener } from './listeners/page-change.listener';
 import { GitSyncController } from './git-sync.controller';
@@ -47,6 +48,7 @@ import { GitHttpService } from './http/git-http.service';
   providers: [
     GitmostDataSourceService,
     GitSyncOrchestrator,
+    SpaceLockService,
     VaultRegistryService,
     PageChangeListener,
     // /git smart-HTTP host (the raw Fastify route in main.ts resolves these).
