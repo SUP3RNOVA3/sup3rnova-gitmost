@@ -237,12 +237,54 @@ export function computePushActions(input: PushActionsInput): PushActions {
     skipped: [],
   };
 
+  // GHOST-MOVE coalescing (⭐ data-loss guard). git's rename detection (`-M`)
+  // can miss a move when the two files are too dissimilar — which is exactly the
+  // case for the tiny `docmost:meta`-only files a layout RESHUFFLE produces (e.g.
+  // several untitled pages sharing the `_` fallback name; retitling one frees the
+  // bare `_` and another page's file relocates `_ ~slug.md` -> `_.md`). git then
+  // reports the move as a DELETE of the old path + an ADD of the new one. Taken
+  // literally that soft-deletes a page that merely MOVED — a live page vanishing
+  // into Trash. Identity is the pageId, not git's heuristic: a pageId that is
+  // BOTH deleted (pre-image) and added (current) is one page that relocated, so
+  // we classify it as a rename/move and NEVER as a delete.
+  // A pageId can land at its new path two ways: as an ADD (the path was free) or
+  // as a MODIFY (the path was occupied by ANOTHER page that left — the reshuffle
+  // case, where `_.md`'s occupant changes pageId). Both are "the page survives at
+  // a new path", so the surviving side is the CURRENT-meta pageId of A *and* M.
+  const deletedPath = new Map<string, string>();
+  const survivingPath = new Map<string, string>();
+  for (const change of changes) {
+    if (change.status === "D") {
+      const pid = metaAt(change.path, "prev")?.pageId;
+      if (pid) deletedPath.set(pid, change.path);
+    } else if (change.status === "A" || change.status === "M") {
+      const pid = metaAt(change.path, "current")?.pageId;
+      if (pid) survivingPath.set(pid, change.path);
+    }
+  }
+  const ghostMove = new Map<string, { oldPath: string; newPath: string }>();
+  for (const [pid, oldPath] of deletedPath) {
+    const newPath = survivingPath.get(pid);
+    if (newPath && newPath !== oldPath) {
+      ghostMove.set(pid, { oldPath, newPath });
+    }
+  }
+
   for (const change of changes) {
     switch (change.status) {
       case "A": {
         const meta = metaAt(change.path, "current");
         const pageId = meta?.pageId;
-        if (pageId) {
+        if (pageId && ghostMove.has(pageId)) {
+          // Half of a git-undetected move (a matching DELETE exists): record it
+          // as a rename/move (like a real `R`), NOT an update — the `D` side is
+          // suppressed so the page is never soft-deleted.
+          actions.renamesMoves.push({
+            pageId,
+            oldPath: ghostMove.get(pageId)!.oldPath,
+            newPath: change.path,
+          });
+        } else if (pageId) {
           // Added but already carries a pageId (restored/copied file): the page
           // exists in Docmost, so push content as an UPDATE — never a duplicate.
           actions.updates.push({ pageId, path: change.path });
@@ -266,7 +308,16 @@ export function computePushActions(input: PushActionsInput): PushActions {
       case "M": {
         const meta = metaAt(change.path, "current");
         const pageId = meta?.pageId;
-        if (pageId) {
+        if (pageId && ghostMove.has(pageId)) {
+          // This path's occupant changed pageId: the previous page left and THIS
+          // page relocated here (a reshuffle). Its old file was DELETED elsewhere
+          // — coalesce into a rename/move so the page is never trashed.
+          actions.renamesMoves.push({
+            pageId,
+            oldPath: ghostMove.get(pageId)!.oldPath,
+            newPath: change.path,
+          });
+        } else if (pageId) {
           actions.updates.push({ pageId, path: change.path });
         } else {
           // A modified file with no pageId has no Docmost target to update.
@@ -283,7 +334,16 @@ export function computePushActions(input: PushActionsInput): PushActions {
         // (the version last pushed to Docmost) so we delete the RIGHT page.
         const prevMeta = metaAt(change.path, "prev");
         const pageId = prevMeta?.pageId;
-        if (pageId) {
+        if (pageId && ghostMove.has(pageId)) {
+          // The same pageId was re-ADDED at a new path: this is a git-undetected
+          // MOVE, handled by the `A` branch above. Suppress the delete so a moved
+          // page is never trashed (⭐ data-loss guard).
+          actions.skipped.push({
+            path: change.path,
+            status: "D",
+            reason: "ghost-move (re-added at a new path) — not a deletion",
+          });
+        } else if (pageId) {
           actions.deletes.push({ pageId });
         } else {
           // Untracked-file guard (SPEC §8): a file with no recoverable pageId was

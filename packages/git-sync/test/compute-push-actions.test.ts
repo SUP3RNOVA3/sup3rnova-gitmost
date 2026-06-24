@@ -223,3 +223,60 @@ describe('computePushActions — mixed batch', () => {
     expect(actions.skipped).toEqual([]);
   });
 });
+
+describe('computePushActions — ghost-move coalescing (data-loss guard)', () => {
+  // git's `-M` rename detection misses a move when the files are too dissimilar
+  // (tiny meta-only files after a layout reshuffle of `_`-fallback names). git
+  // then reports the move as a DELETE of the old path + an ADD of the new one.
+  // Taken literally this soft-deletes a page that merely MOVED. The classifier
+  // must recognize the shared pageId and emit a rename/move, never a delete.
+  it('D(old)+A(new) of the SAME pageId -> rename/move, NOT a delete', () => {
+    const changes: DiffEntry[] = [
+      { status: 'D', path: '_ ~slug.md' },
+      { status: 'A', path: '_.md' },
+    ];
+    const metaAt = metaTable({
+      '_ ~slug.md|prev': meta({ pageId: 'p1', title: '', spaceId: 'sp1' }),
+      '_.md|current': meta({ pageId: 'p1', title: '', spaceId: 'sp1' }),
+    });
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.deletes).toEqual([]); // the page is NEVER trashed
+    expect(actions.updates).toEqual([]); // not a spurious update either
+    expect(actions.renamesMoves).toEqual([
+      { pageId: 'p1', oldPath: '_ ~slug.md', newPath: '_.md' },
+    ]);
+    // The suppressed delete is recorded as a skip with a clear reason.
+    expect(actions.skipped).toEqual([
+      {
+        path: '_ ~slug.md',
+        status: 'D',
+        reason: 'ghost-move (re-added at a new path) — not a deletion',
+      },
+    ]);
+  });
+
+  it('a real delete (no matching add) is STILL a delete', () => {
+    const changes: DiffEntry[] = [{ status: 'D', path: 'Gone.md' }];
+    const metaAt = metaTable({
+      'Gone.md|prev': meta({ pageId: 'p9', title: 'Gone', spaceId: 'sp1' }),
+    });
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.deletes).toEqual([{ pageId: 'p9' }]);
+    expect(actions.renamesMoves).toEqual([]);
+  });
+
+  it('an unrelated D + A (different pageIds) are a real delete + a real update', () => {
+    const changes: DiffEntry[] = [
+      { status: 'D', path: 'A.md' },
+      { status: 'A', path: 'B.md' },
+    ];
+    const metaAt = metaTable({
+      'A.md|prev': meta({ pageId: 'pa', title: 'A', spaceId: 'sp1' }),
+      'B.md|current': meta({ pageId: 'pb', title: 'B', spaceId: 'sp1' }),
+    });
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.deletes).toEqual([{ pageId: 'pa' }]);
+    expect(actions.updates).toEqual([{ pageId: 'pb', path: 'B.md' }]);
+    expect(actions.renamesMoves).toEqual([]);
+  });
+});
