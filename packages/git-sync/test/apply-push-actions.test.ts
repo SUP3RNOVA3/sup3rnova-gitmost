@@ -2,10 +2,11 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { applyPushActions, LAST_PUSHED_REF } from '../src/engine/push';
 import { bodyHash } from '../src/engine/loop-guard';
 import type { ApplyPushDeps, PushActions } from '../src/engine/push';
-import {
-  parseDocmostMarkdown,
-  serializeDocmostMarkdownBody,
-} from '../src/lib/index';
+import { parsePageFile, serializePageFile } from '../src/lib/page-file';
+
+// The Docmost space this vault mirrors (native files carry no spaceId; the run
+// supplies it). A CREATE targets this space.
+const SPACE_ID = 'sp-test';
 
 // FS→Docmost push, FIRST increment (SPEC §6). `applyPushActions` is the THIN IO
 // half: create/update/delete via FAKES that record every call — no real network,
@@ -104,7 +105,17 @@ function deps(client: any, git: any, fs: ReturnType<typeof makeFs>): ApplyPushDe
     git,
     readFile: fs.fs.readFile,
     writeFile: fs.fs.writeFile,
+    spaceId: SPACE_ID,
   };
+}
+
+/**
+ * A native page file: `gitmost_id` frontmatter + a clean body. The TITLE is NOT
+ * stored — it is derived from the filename — so this helper takes only a pageId.
+ * Used to seed both the working tree (fs) and the prev tree (showFileAtRef).
+ */
+function fileFor(pageId: string, body = 'body'): string {
+  return serializePageFile(pageId, body);
 }
 
 function actions(partial: Partial<PushActions>): PushActions {
@@ -128,9 +139,8 @@ afterEach(() => {
 });
 
 describe('applyPushActions — update (collab path, SPEC §2/§15.6)', () => {
-  it('reads the file body and calls importPageMarkdown with it', async () => {
-    const fileBody =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nupdated body\n';
+  it('reads the file and calls importPageMarkdown with the STRIPPED body', async () => {
+    const fileBody = fileFor('p-1', 'updated body');
     const client = makeClient();
     const { git } = makeGit();
     const fs = makeFs({ 'Doc.md': fileBody });
@@ -141,9 +151,10 @@ describe('applyPushActions — update (collab path, SPEC §2/§15.6)', () => {
     );
 
     expect(res.updated).toBe(1);
-    // The collab/Yjs write path is used — NOT a raw jsonb overwrite.
+    // The collab/Yjs write path is used — NOT a raw jsonb overwrite. The pushed
+    // content is the CLEAN body (no gitmost_id frontmatter leaks to Docmost).
     expect(client.importPageMarkdown).toHaveBeenCalledTimes(1);
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-1', fileBody, null);
+    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-1', 'updated body', null);
     // No raw-overwrite path exists on the injected client surface at all.
     expect((client as any).updatePageJson).toBeUndefined();
     expect(client.createPage).not.toHaveBeenCalled();
@@ -151,68 +162,68 @@ describe('applyPushActions — update (collab path, SPEC §2/§15.6)', () => {
   });
 
   it('forwards the last-pushed base body (3-way merge ancestor) when present', async () => {
-    const baseBody =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nbase body\n';
-    const fileBody =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nupdated body\n';
     const client = makeClient();
-    // The pre-image (refs/docmost/last-pushed) carries the base version.
-    const { git } = makeGit({ prevTree: { 'Doc.md': baseBody } });
-    const fs = makeFs({ 'Doc.md': fileBody });
+    // The pre-image (refs/docmost/last-pushed) carries the base version; both
+    // sides are stripped to their clean body for a body-to-body 3-way merge.
+    const { git } = makeGit({ prevTree: { 'Doc.md': fileFor('p-1', 'base body') } });
+    const fs = makeFs({ 'Doc.md': fileFor('p-1', 'updated body') });
 
     await applyPushActions(
       deps(client, git, fs),
       actions({ updates: [{ pageId: 'p-1', path: 'Doc.md' }] }),
     );
 
-    // importPageMarkdown receives the base so the server can 3-way merge it.
+    // importPageMarkdown receives the stripped base so the server 3-way merges it.
     expect(client.importPageMarkdown).toHaveBeenCalledWith(
       'p-1',
-      fileBody,
-      baseBody,
+      'updated body',
+      'base body',
     );
     expect(git.showFileAtRef).toHaveBeenCalledWith(LAST_PUSHED_REF, 'Doc.md');
   });
 });
 
 describe('applyPushActions — create (assigned pageId written back to meta)', () => {
-  it('createPage is called and the new pageId is serialized back into the file', async () => {
-    // A brand-new local file: meta has title/spaceId but NO pageId yet.
-    const original = serializeDocmostMarkdownBody(
-      { version: 1, title: 'My New Page', spaceId: 'sp-7', parentPageId: 'parent-9' },
-      '# My New Page\n\nbody text',
-    );
+  it('createPage gets title/parent from the PATH and writes the pageId back', async () => {
+    // A brand-new local file with NO frontmatter (a hand-written Obsidian note)
+    // under a parent folder. title = filename, parent = the folder's folder-note,
+    // space = the run's space — all DERIVED, none stored in the file.
     const client = makeClient({ createId: 'page-new-42' });
     const { git } = makeGit();
-    const fs = makeFs({ 'New.md': original });
+    const fs = makeFs({
+      'Parent/My New Page.md': '# My New Page\n\nbody text\n',
+      // The enclosing folder's folder-note identifies the parent page.
+      'Parent/Parent.md': fileFor('parent-9'),
+    });
 
     const res = await applyPushActions(
       deps(client, git, fs),
-      actions({ creates: [{ path: 'New.md' }] }),
+      actions({ creates: [{ path: 'Parent/My New Page.md' }] }),
     );
 
     expect(res.created).toBe(1);
-    // createPage was called with title/body/spaceId/parentPageId from meta.
     expect(client.createPage).toHaveBeenCalledTimes(1);
     const [title, content, spaceId, parentPageId] =
       client.createPage.mock.calls[0];
-    expect(title).toBe('My New Page');
-    expect(spaceId).toBe('sp-7');
-    expect(parentPageId).toBe('parent-9');
+    expect(title).toBe('My New Page'); // from the filename
+    expect(spaceId).toBe(SPACE_ID); // from the run
+    expect(parentPageId).toBe('parent-9'); // from the folder's folder-note
     expect(content).toContain('body text');
 
-    // The file was rewritten with the assigned pageId in meta...
-    expect(fs.writes.map((w) => w.path)).toEqual(['New.md']);
-    const rewritten = fs.store['New.md'];
-    const parsed = parseDocmostMarkdown(rewritten);
-    expect(parsed.meta?.pageId).toBe('page-new-42');
-    // ...preserving the rest of the meta and the body.
-    expect(parsed.meta?.title).toBe('My New Page');
-    expect(parsed.meta?.spaceId).toBe('sp-7');
+    // The file was rewritten with the assigned pageId as gitmost_id frontmatter,
+    // body preserved, NO docmost:meta.
+    expect(fs.writes.map((w) => w.path)).toEqual(['Parent/My New Page.md']);
+    const rewritten = fs.store['Parent/My New Page.md'];
+    expect(rewritten.startsWith('---\ngitmost_id: page-new-42\n---')).toBe(true);
+    expect(rewritten).not.toContain('docmost:meta');
+    const parsed = parsePageFile(rewritten);
+    expect(parsed.id).toBe('page-new-42');
     expect(parsed.body).toContain('body text');
 
-    // The write-back is recorded so a follow-up commit can be made (NEXT inc).
-    expect(res.writtenBack).toEqual([{ path: 'New.md', pageId: 'page-new-42' }]);
+    // The write-back is recorded so a follow-up commit can be made.
+    expect(res.writtenBack).toEqual([
+      { path: 'Parent/My New Page.md', pageId: 'page-new-42' },
+    ]);
   });
 });
 
@@ -240,30 +251,20 @@ describe('applyPushActions — delete (soft-delete to Trash, SPEC §8)', () => {
 // stale `meta.parentPageId`, then `applyPushActions` calls move_page / rename_page
 // (both for a reparent+retitle) or records a path-only NO-OP with NO client call.
 
-/**
- * Helper: a self-contained file with the given pageId + title in its meta. Used
- * both to seed the working tree (fs) and the prev tree (git.showFileAtRef).
- */
-function fileWith(meta: { pageId: string; title?: string }): string {
-  return serializeDocmostMarkdownBody(
-    { version: 1, pageId: meta.pageId, ...(meta.title ? { title: meta.title } : {}) },
-    'body',
-  );
-}
-
 describe('applyPushActions — move (parent changed, title same; SPEC §5/§16)', () => {
   it('calls movePage(pageId, newParent) and NOT renamePage', async () => {
     // The page moved from the space root (Doc.md) under a folder (Parent/Doc.md).
-    // The new parent page's file is `Parent.md`; its meta carries the parent id.
+    // The new parent page owns folder `Parent/`, so its file is the FOLDER-NOTE
+    // `Parent/Parent.md`, whose gitmost_id is the parent id.
     const client = makeClient();
     const { git } = makeGit({
       // Prev pre-image: the file used to sit at the root (parent ROOT).
-      prevTree: { 'Doc.md': fileWith({ pageId: 'p-mv', title: 'Doc' }) },
+      prevTree: { 'Doc.md': fileFor('p-mv') },
     });
     const fs = makeFs({
-      // Current tree: the moved file + its new parent folder's `.md`.
-      'Parent/Doc.md': fileWith({ pageId: 'p-mv', title: 'Doc' }),
-      'Parent.md': fileWith({ pageId: 'parent-id', title: 'Parent' }),
+      // Current tree: the moved file + its new parent folder's folder-note.
+      'Parent/Doc.md': fileFor('p-mv'),
+      'Parent/Parent.md': fileFor('parent-id'),
     });
 
     const res = await applyPushActions(
@@ -290,14 +291,14 @@ describe('applyPushActions — move-to-root (newParent null; SPEC §16)', () => 
     const client = makeClient();
     const { git } = makeGit({
       // Prev: the file used to live under `Parent/`, so its old parent is the
-      // page whose file is `Parent.md` (parent-id).
+      // page whose folder-note is `Parent/Parent.md` (parent-id).
       prevTree: {
-        'Parent/Doc.md': fileWith({ pageId: 'p-mv', title: 'Doc' }),
-        'Parent.md': fileWith({ pageId: 'parent-id', title: 'Parent' }),
+        'Parent/Doc.md': fileFor('p-mv'),
+        'Parent/Parent.md': fileFor('parent-id'),
       },
     });
     // Current: the file is now at the root -> no enclosing folder -> parent ROOT.
-    const fs = makeFs({ 'Doc.md': fileWith({ pageId: 'p-mv', title: 'Doc' }) });
+    const fs = makeFs({ 'Doc.md': fileFor('p-mv') });
 
     const res = await applyPushActions(
       deps(client, git, fs),
@@ -315,19 +316,19 @@ describe('applyPushActions — move-to-root (newParent null; SPEC §16)', () => 
 });
 
 describe('applyPushActions — rename (same parent, title changed; SPEC §5/§6)', () => {
-  it('calls renamePage(pageId, title) and NOT movePage', async () => {
-    // Same enclosing folder on both sides (parent unchanged), only the title
-    // changed in meta -> a pure rename.
+  it('calls renamePage(pageId, title-from-filename) and NOT movePage', async () => {
+    // Same enclosing folder on both sides (parent unchanged), the FILENAME (=
+    // title) changed Old -> New -> a pure rename to the new filename's title.
     const client = makeClient();
     const { git } = makeGit({
       prevTree: {
-        'Folder/Old.md': fileWith({ pageId: 'p-rn', title: 'Old Title' }),
-        'Folder.md': fileWith({ pageId: 'folder-id', title: 'Folder' }),
+        'Folder/Old.md': fileFor('p-rn'),
+        'Folder/Folder.md': fileFor('folder-id'),
       },
     });
     const fs = makeFs({
-      'Folder/New.md': fileWith({ pageId: 'p-rn', title: 'New Title' }),
-      'Folder.md': fileWith({ pageId: 'folder-id', title: 'Folder' }),
+      'Folder/New.md': fileFor('p-rn'),
+      'Folder/Folder.md': fileFor('folder-id'),
     });
 
     const res = await applyPushActions(
@@ -342,7 +343,8 @@ describe('applyPushActions — rename (same parent, title changed; SPEC §5/§6)
     expect(res.renamed).toBe(1);
     expect(res.moved).toBe(0);
     expect(client.renamePage).toHaveBeenCalledTimes(1);
-    expect(client.renamePage).toHaveBeenCalledWith('p-rn', 'New Title');
+    // The title is the NEW filename (no extension), not a stored meta title.
+    expect(client.renamePage).toHaveBeenCalledWith('p-rn', 'New');
     expect(client.movePage).not.toHaveBeenCalled();
   });
 });
@@ -360,13 +362,13 @@ describe('applyPushActions — both (reparent + retitle; move THEN rename)', () 
       return { success: true, pageId, title };
     });
     const { git } = makeGit({
-      // Prev: at root (parent ROOT) with the old title.
-      prevTree: { 'Old.md': fileWith({ pageId: 'p-x', title: 'Old' }) },
+      // Prev: at root (parent ROOT), filename `Old`.
+      prevTree: { 'Old.md': fileFor('p-x') },
     });
     const fs = makeFs({
-      // Current: under a new folder AND retitled.
-      'NewParent/New.md': fileWith({ pageId: 'p-x', title: 'New' }),
-      'NewParent.md': fileWith({ pageId: 'np-id', title: 'NewParent' }),
+      // Current: under a new folder (folder-note np-id) AND renamed to `New`.
+      'NewParent/New.md': fileFor('p-x'),
+      'NewParent/NewParent.md': fileFor('np-id'),
     });
 
     const res = await applyPushActions(
@@ -387,41 +389,43 @@ describe('applyPushActions — both (reparent + retitle; move THEN rename)', () 
   });
 });
 
-describe('applyPushActions — noop (path-only rename; NO Docmost call; SPEC §5)', () => {
+describe('applyPushActions — noop (parent folder renamed; NO Docmost call; SPEC §5)', () => {
   it('calls NEITHER movePage NOR renamePage and records the noop', async () => {
-    // Same enclosing folder AND same title on both sides: a purely LOCAL file
-    // rename. The page is its pageId; the path is cosmetic -> Docmost untouched.
+    // The PARENT folder was renamed Old/ -> New/ (a retitle of the parent page,
+    // whose folder-note kept the SAME gitmost_id). For this CHILD, neither its
+    // own title (`Child`) nor its parent PAGE (same id `parent-P`) changed — only
+    // an ancestor's name did. The page is its pageId; Docmost is untouched.
     const client = makeClient();
     const { git } = makeGit({
       prevTree: {
-        'Folder/A.md': fileWith({ pageId: 'p-noop', title: 'Same' }),
-        'Folder.md': fileWith({ pageId: 'folder-id', title: 'Folder' }),
+        'Old/Child.md': fileFor('p-noop'),
+        'Old/Old.md': fileFor('parent-P'),
       },
     });
     const fs = makeFs({
-      'Folder/B.md': fileWith({ pageId: 'p-noop', title: 'Same' }),
-      'Folder.md': fileWith({ pageId: 'folder-id', title: 'Folder' }),
+      'New/Child.md': fileFor('p-noop'),
+      'New/New.md': fileFor('parent-P'),
     });
 
     const res = await applyPushActions(
       deps(client, git, fs),
       actions({
         renamesMoves: [
-          { pageId: 'p-noop', oldPath: 'Folder/A.md', newPath: 'Folder/B.md' },
+          { pageId: 'p-noop', oldPath: 'Old/Child.md', newPath: 'New/Child.md' },
         ],
       }),
     );
 
     expect(res.moved).toBe(0);
     expect(res.renamed).toBe(0);
-    // ZERO Docmost calls for a cosmetic rename.
+    // ZERO Docmost calls — only the ancestor folder name changed.
     expect(client.movePage).not.toHaveBeenCalled();
     expect(client.renamePage).not.toHaveBeenCalled();
     expect(res.noops).toEqual([
       {
         pageId: 'p-noop',
-        oldPath: 'Folder/A.md',
-        newPath: 'Folder/B.md',
+        oldPath: 'Old/Child.md',
+        newPath: 'New/Child.md',
         reason: 'path-only-rename',
       },
     ]);
@@ -435,11 +439,11 @@ describe('applyPushActions — move whose client call throws (SPEC §12 isolatio
       throw new Error('move boom');
     });
     const { git, updateRefCalls, ffCalls } = makeGit({
-      prevTree: { 'Doc.md': fileWith({ pageId: 'p-mv', title: 'Doc' }) },
+      prevTree: { 'Doc.md': fileFor('p-mv') },
     });
     const fs = makeFs({
-      'Parent/Doc.md': fileWith({ pageId: 'p-mv', title: 'Doc' }),
-      'Parent.md': fileWith({ pageId: 'parent-id', title: 'Parent' }),
+      'Parent/Doc.md': fileFor('p-mv'),
+      'Parent/Parent.md': fileFor('parent-id'),
     });
 
     const res = await applyPushActions(
@@ -589,8 +593,7 @@ describe('applyPushActions — per-page error isolation + refs gated on success 
 
 describe('applyPushActions — loop-guard push record (SPEC §10)', () => {
   it('records pageId + updatedAt + bodyHash per applied update', async () => {
-    const fileBody =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nupdated body\n';
+    const fileBody = fileFor('p-1', 'updated body');
     const client = {
       importPageMarkdown: vi.fn(async (_pageId: string, _md: string) => ({
         // The write returns an updatedAt the loop-guard records.
@@ -611,16 +614,14 @@ describe('applyPushActions — loop-guard push record (SPEC §10)', () => {
     expect(res.pushed).toHaveLength(1);
     expect(res.pushed[0].pageId).toBe('p-1');
     expect(res.pushed[0].updatedAt).toBe('2026-06-20T10:00:00.000Z');
-    // The bodyHash is a stable sha256 hex of the pushed markdown.
-    expect(res.pushed[0].bodyHash).toBe(bodyHash(fileBody));
+    // The bodyHash is a stable sha256 hex of the pushed BODY (frontmatter stripped).
+    expect(res.pushed[0].bodyHash).toBe(bodyHash('updated body'));
     expect(res.pushed[0].bodyHash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('omits updatedAt when the client result does not expose one', async () => {
-    const newFile = serializeDocmostMarkdownBody(
-      { version: 1, title: 'N', spaceId: 'sp' },
-      'fresh body',
-    );
+    // A hand-written file with no frontmatter; its body is the whole text.
+    const newFile = '# N\n\nfresh body\n';
     const client = makeClient({ createId: 'created-9' });
     const { git } = makeGit();
     const fs = makeFs({ 'N.md': newFile });
@@ -633,19 +634,16 @@ describe('applyPushActions — loop-guard push record (SPEC §10)', () => {
     expect(res.pushed).toHaveLength(1);
     expect(res.pushed[0].pageId).toBe('created-9');
     expect(res.pushed[0].updatedAt).toBeUndefined();
-    // bodyHash of the ORIGINAL pushed file text (what createPage received).
-    expect(res.pushed[0].bodyHash).toBe(bodyHash(newFile));
+    // bodyHash of the pushed BODY (parsePageFile strips nothing here — no
+    // frontmatter — so it is the trimmed file text).
+    expect(res.pushed[0].bodyHash).toBe(bodyHash(parsePageFile(newFile).body));
   });
 });
 
 describe('applyPushActions — mixed batch + skipped passthrough', () => {
   it('applies update + create + delete and carries skipped rows through', async () => {
-    const updFile =
-      '<!-- docmost:meta\n{"version":1,"pageId":"u-1"}\n-->\n\nupd\n';
-    const newFile = serializeDocmostMarkdownBody(
-      { version: 1, title: 'N', spaceId: 'sp' },
-      'fresh body',
-    );
+    const updFile = fileFor('u-1', 'upd');
+    const newFile = '# N\n\nfresh body\n';
     const client = makeClient({ createId: 'created-1' });
     const { git, updateRefCalls } = makeGit();
     const fs = makeFs({ 'U.md': updFile, 'N.md': newFile });
@@ -673,7 +671,8 @@ describe('applyPushActions — mixed batch + skipped passthrough', () => {
     expect(res.writtenBack).toEqual([{ path: 'N.md', pageId: 'created-1' }]);
     expect(res.skipped).toEqual(skipped);
     expect(updateRefCalls).toEqual([{ ref: LAST_PUSHED_REF, target: 'sha-9' }]);
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('u-1', updFile, null);
+    // The update pushes the STRIPPED body ('upd'), not the frontmatter file.
+    expect(client.importPageMarkdown).toHaveBeenCalledWith('u-1', 'upd', null);
     expect(client.deletePage).toHaveBeenCalledWith('d-1');
   });
 });

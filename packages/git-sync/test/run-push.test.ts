@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { runPush, LAST_PUSHED_REF, DOCMOST_BRANCH } from '../src/engine/push';
 import type { PushDeps } from '../src/engine/push';
 import type { Settings } from '../src/engine/settings';
-import { serializeDocmostMarkdownBody } from '../src/lib/index';
+import { serializePageFile } from '../src/lib/page-file';
+
+/** A native page file: `gitmost_id` frontmatter + clean body (title = filename). */
+function fileFor(pageId: string, body = 'body'): string {
+  return serializePageFile(pageId, body);
+}
 
 // runPush orchestration (SPEC §6 "ФС → Docmost"), DRY-RUN BY DEFAULT. Driven by
 // FAKES only — no live Docmost, git, fs, or network. Asserts the SAFE-BY-DEFAULT
@@ -162,8 +167,7 @@ function makeDeps(
 
 describe('runPush — dry-run is the DEFAULT (safe)', () => {
   it('logs a plan, builds NO client, makes ZERO Docmost calls, advances NO refs', async () => {
-    const file =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nedited body\n';
+    const file = fileFor('p-1', 'edited body');
     const { git, calls } = makeGit({
       lastPushed: 'base-sha',
       changes: [{ status: 'M', path: 'Doc.md' }],
@@ -212,10 +216,8 @@ describe('runPush — dry-run is the DEFAULT (safe)', () => {
 describe('runPush — --apply is the ONLY write path', () => {
   it('builds the client, calls applyPushActions, records created pageIds, advances last-pushed', async () => {
     // A brand-new local file: meta has title + spaceId but NO pageId yet.
-    const newFile = serializeDocmostMarkdownBody(
-      { version: 1, title: 'New', spaceId: 'sp-1' },
-      'fresh body',
-    );
+    // A brand-new hand-written file with NO frontmatter (title = filename `New`).
+    const newFile = 'fresh body\n';
     const { git, calls, setMainSha } = makeGit({
       lastPushed: 'base-sha',
       mainSha: 'main-1',
@@ -259,10 +261,8 @@ describe('runPush — --apply is the ONLY write path', () => {
     // MAIN push ff succeeds (ok) but the WRITE-BACK ff diverges — the write-back
     // branch must escalate identically to the main branch (set divergentDocmost,
     // log the same prominent WARNING), so main() exits 1.
-    const newFile = serializeDocmostMarkdownBody(
-      { version: 1, title: 'New', spaceId: 'sp-1' },
-      'fresh body',
-    );
+    // A brand-new hand-written file with NO frontmatter (title = filename `New`).
+    const newFile = 'fresh body\n';
     const { git, calls, setMainSha } = makeGit({
       lastPushed: 'base-sha',
       mainSha: 'main-1',
@@ -300,8 +300,7 @@ describe('runPush — --apply is the ONLY write path', () => {
   });
 
   it('an update goes through importPageMarkdown (collab path)', async () => {
-    const file =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-9"}\n-->\n\nbody\n';
+    const file = fileFor('p-9', 'body');
     const { git } = makeGit({
       lastPushed: 'base-sha',
       changes: [{ status: 'M', path: 'Doc.md' }],
@@ -312,7 +311,8 @@ describe('runPush — --apply is the ONLY write path', () => {
 
     const res = await runPush(deps, { dryRun: false });
 
-    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-9', file, null);
+    // The pushed content is the STRIPPED body (no gitmost_id frontmatter).
+    expect(client.importPageMarkdown).toHaveBeenCalledWith('p-9', 'body', null);
     expect(res.applied?.updated).toBe(1);
   });
 });
@@ -337,8 +337,7 @@ describe('runPush — merge-in-progress aborts (SPEC §9/§12)', () => {
 
 describe('runPush — divergent docmost escalation (SPEC §5)', () => {
   it('sets the escalation flag and logs a WARNING, but the apply still happened', async () => {
-    const file =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-1"}\n-->\n\nbody\n';
+    const file = fileFor('p-1', 'body');
     const { git } = makeGit({
       lastPushed: 'base-sha',
       changes: [{ status: 'M', path: 'Doc.md' }],
@@ -406,8 +405,7 @@ describe('runPush --apply — applyPushActions edge branches', () => {
     // One UPDATE (file carries a pageId), whose collab write throws the raw
     // STRING 'boom'. Every other failure test throws an Error, so the
     // `String(err)` fallback in errMessage (push.ts:763) is otherwise uncovered.
-    const file =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-7"}\n-->\n\nbody\n';
+    const file = fileFor('p-7', 'body');
     const { git, calls } = makeGit({
       lastPushed: 'base-sha',
       changes: [{ status: 'M', path: 'Doc.md' }],
@@ -441,8 +439,7 @@ describe('runPush --apply — applyPushActions edge branches', () => {
   it('records a thrown NON-Error OBJECT via String(err) too (no implicit message)', async () => {
     // A thrown object literal -> String({}) === '[object Object]'. Pins down that
     // errMessage stringifies (not reads a .message) for non-Error throwables.
-    const file =
-      '<!-- docmost:meta\n{"version":1,"pageId":"p-8"}\n-->\n\nbody\n';
+    const file = fileFor('p-8', 'body');
     const { git } = makeGit({
       lastPushed: 'base-sha',
       changes: [{ status: 'M', path: 'Doc.md' }],
@@ -461,22 +458,12 @@ describe('runPush --apply — applyPushActions edge branches', () => {
     expect(res.failures![0].error).toBe('[object Object]');
   });
 
-  it('createPage gets title="" (and parentPageId=undefined) when meta has a spaceId but NO title', async () => {
-    // A brand-new local file whose meta has a (truthy) spaceId — REQUIRED for the
-    // planner to emit a CREATE (computePushActions case "A": `else if (meta?.spaceId)`,
-    // push.ts:249) — but NO title and NO parentPageId. This exercises the
-    // `meta?.title ?? ''` fallback (push.ts:583) and `parentPageId ?? undefined`
-    // (push.ts:585) on the real createPage call.
-    //
-    // NOTE(review): The spec for this case asked for meta = ONLY `{version:1}`
-    // (no title AND no spaceId) to exercise BOTH `?? ''` fallbacks at once. That
-    // input is UNREACHABLE through runPush: the PURE planner (computePushActions,
-    // push.ts:254-262) SKIPS an added file with no usable spaceId
-    // (reason 'create-without-spaceId'), so it never becomes a CREATE action and
-    // applyPushActions' create branch never runs. A separate test below pins that
-    // skip. Hence `meta?.spaceId ?? ''` can never actually fall back to '' via the
-    // planner — only `meta?.title ?? ''` is reachable, which this test covers.
-    const newFile = serializeDocmostMarkdownBody({ version: 1, spaceId: 'sp-1' }, 'fresh body');
+  it('createPage derives title from the FILENAME, space from the run, parent from path', async () => {
+    // A brand-new hand-written file at the space ROOT (no enclosing folder). In
+    // the native-Obsidian format nothing is stored in the file: title comes from
+    // the FILENAME (`New`), spaceId from the RUN (the vault's space `space-1`),
+    // and parentPageId from the PATH (root -> undefined).
+    const newFile = 'fresh body\n';
     const { git } = makeGit({
       lastPushed: 'base-sha',
       mainSha: 'main-1',
@@ -493,42 +480,36 @@ describe('runPush --apply — applyPushActions edge branches', () => {
     expect(client.createPage).toHaveBeenCalledTimes(1);
     const [title, content, spaceId, parentPageId] = (client.createPage as any).mock
       .calls[0];
-    // `meta?.title ?? ''` -> '' (no title in meta).
-    expect(title).toBe('');
-    // The body is passed as content...
-    expect(content).toBe('fresh body');
-    // ...and the present spaceId flows through (it is NOT replaced by '').
-    expect(spaceId).toBe('sp-1');
-    // `meta?.parentPageId ?? undefined` -> undefined (absent in meta).
-    expect(parentPageId).toBe(undefined);
+    expect(title).toBe('New'); // from the filename
+    expect(content).toBe('fresh body'); // the stripped body
+    expect(spaceId).toBe('space-1'); // from the run (makeSettings)
+    expect(parentPageId).toBe(undefined); // root path -> no parent
   });
 
-  it('an added file with meta {version:1} only (no spaceId, no title) is SKIPPED, never created', async () => {
-    // Documents WHY the spec's "only {version:1}" create input is unreachable:
-    // the planner skips it (create-without-spaceId), so createPage is never called
-    // and `meta?.spaceId ?? ''` cannot fall back to '' via runPush.
-    const file = serializeDocmostMarkdownBody({ version: 1 }, 'fresh body');
-    const { git, calls } = makeGit({
+  it('an added file with NO frontmatter is CREATED (space from the run), never skipped', async () => {
+    // Native: every file in the vault belongs to the vault's space, supplied by
+    // the RUN — so a brand-new hand-written file (no gitmost_id) is always a
+    // CREATE, never skipped for a "missing spaceId" (that legacy skip is gone).
+    const file = 'just some text\n';
+    const { git } = makeGit({
       lastPushed: 'base-sha',
       changes: [{ status: 'A', path: 'Orphan.md' }],
     });
     const fs = makeFs({ 'Orphan.md': file });
-    const client = makeClientFake();
+    const client = makeClientFake({ createId: 'orphan-id' });
     const { deps } = makeDeps(git, fs, client);
 
     const res = await runPush(deps, { dryRun: false });
 
     expect(res.planned).toEqual({
-      creates: 0,
+      creates: 1,
       updates: 0,
       deletes: 0,
       renamesMoves: 0,
-      skipped: 1,
+      skipped: 0,
     });
-    expect(client.createPage).not.toHaveBeenCalled();
-    expect(res.applied?.created).toBe(0);
-    expect(res.applied?.skipped).toEqual([
-      { path: 'Orphan.md', status: 'A', reason: 'create-without-spaceId' },
-    ]);
+    expect(client.createPage).toHaveBeenCalledTimes(1);
+    expect((client.createPage as any).mock.calls[0][0]).toBe('Orphan'); // title=filename
+    expect(res.applied?.created).toBe(1);
   });
 });

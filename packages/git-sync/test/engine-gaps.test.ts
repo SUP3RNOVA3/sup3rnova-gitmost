@@ -8,7 +8,7 @@ import { firstDivergence } from '../src/engine/roundtrip-helpers';
 import { applyPullActions } from '../src/engine/pull';
 import type { PullActions, ApplyPullActionsDeps } from '../src/engine/pull';
 import type { DeletionDecision } from '../src/engine/reconcile';
-import { serializeDocmostMarkdownBody } from '../src/lib/index';
+import { serializePageFile, parsePageFile } from '../src/lib/page-file';
 
 // Engine-layer coverage gaps flagged by the PR #119 reviewers (test-strategy
 // report, Module 2 `src/engine`). Each block targets a specific under-covered
@@ -17,13 +17,15 @@ import { serializeDocmostMarkdownBody } from '../src/lib/index';
 
 // --- 1. push.ts:parentFolderFile — move<->rename classification lynchpin -----
 //
-// `parentFolderFile(path)` returns the parent FOLDER's `.md` file for a vault-
-// relative path (the enclosing folder one level up, SPEC §5 path-as-truth), or
-// `null` for a root-level path with no enclosing folder. It is the lynchpin of
-// the move-vs-rename classifier, so it is tested directly here (it was only
-// covered indirectly before): root-level, deep nesting, and — critically —
-// names CONTAINING DOTS (the lastIndexOf('/') split must not be confused by a
-// dot in a segment; only the LAST slash matters).
+// `parentFolderFile(path)` returns the parent PAGE's file for a vault-relative
+// path (SPEC §5 path-as-truth), or `null` for a root-level page. In the native-
+// Obsidian FOLDER-NOTE layout the parent page that owns a folder is its folder-
+// note `<dir>/<base>.md` (NOT `<dir>.md`). For a file that IS its folder's
+// folder-note, the parent is ONE LEVEL UP (the grandparent folder's note, or
+// ROOT at the top). It is the lynchpin of the move-vs-rename classifier, so it
+// is tested directly: root-level, a leaf in a folder, a folder-note itself,
+// deep nesting, and — critically — names CONTAINING DOTS (only the LAST slash
+// splits the path).
 describe('parentFolderFile (push.ts)', () => {
   it('returns null for a root-level path (no enclosing folder)', () => {
     expect(parentFolderFile('Child.md')).toBeNull();
@@ -31,24 +33,33 @@ describe('parentFolderFile (push.ts)', () => {
     expect(parentFolderFile('README.md')).toBeNull();
   });
 
-  it('returns the immediate enclosing folder file for a one-level path', () => {
-    expect(parentFolderFile('Space/Child.md')).toBe('Space.md');
+  it('returns the enclosing folder-note for a LEAF inside a folder', () => {
+    // The parent page owns folder `Space/`, so its file is the folder-note
+    // `Space/Space.md` — NOT `Space.md`.
+    expect(parentFolderFile('Space/Child.md')).toBe('Space/Space.md');
   });
 
-  it('returns the DEEPEST enclosing folder file for a deeply nested path', () => {
-    // Only the last slash matters: the parent is the immediate folder, turned
-    // into its `<folder>.md` page file (NOT the space root).
+  it('returns the grandparent folder-note for a FOLDER-NOTE itself', () => {
+    // `Space/Sub/Sub.md` IS the folder-note of `Space/Sub`; its parent is the
+    // folder-note one level up, `Space/Space.md`.
+    expect(parentFolderFile('Space/Sub/Sub.md')).toBe('Space/Space.md');
+    // A top-level folder-note `Space/Space.md` has the ROOT as its parent.
+    expect(parentFolderFile('Space/Space.md')).toBeNull();
+  });
+
+  it('returns the DEEPEST enclosing folder-note for a deeply nested leaf', () => {
+    // Only the last slash matters: the parent is the immediate folder's note.
     expect(parentFolderFile('Space/Parent/Sub/Child.md')).toBe(
-      'Space/Parent/Sub.md',
+      'Space/Parent/Sub/Sub.md',
     );
   });
 
   it('handles names CONTAINING DOTS without splitting on the dot', () => {
     // A dot in a folder/file segment must not be mistaken for the path split.
-    // The split is purely on the LAST '/', so the `.md` is appended to the whole
-    // parent dir verbatim (dots and all).
-    expect(parentFolderFile('Space/v1.2.3/Child.md')).toBe('Space/v1.2.3.md');
-    expect(parentFolderFile('a.b/c.d.md')).toBe('a.b.md');
+    // The split is purely on the LAST '/', so the folder-note is the dotted
+    // folder name repeated inside it (dots and all).
+    expect(parentFolderFile('Space/v1.2.3/Child.md')).toBe('Space/v1.2.3/v1.2.3.md');
+    expect(parentFolderFile('a.b/c.d.md')).toBe('a.b/a.b.md');
     // A dotted root-level name still has no enclosing folder.
     expect(parentFolderFile('v1.2.3.md')).toBeNull();
   });
@@ -271,10 +282,7 @@ describe('applyPushActions (push.ts) — move prefetch isolation', () => {
     // The update file exists and is readable; the move's NEW-path tree reads
     // throw (simulating an unreadable/missing parent folder file at `current`).
     const store: Record<string, string> = {
-      'Up.md': serializeDocmostMarkdownBody(
-        { version: 1, pageId: 'u1', title: 'U', spaceId: 'sp' } as any,
-        'body',
-      ),
+      'Up.md': serializePageFile('u1', 'body'),
     };
     const deps: ApplyPushDeps = {
       client,
@@ -284,6 +292,7 @@ describe('applyPushActions (push.ts) — move prefetch isolation', () => {
         throw new Error(`unreadable ${p}`);
       }),
       writeFile: vi.fn(async () => {}),
+      spaceId: 'sp',
     };
     const actions: PushActions = {
       creates: [],
@@ -302,7 +311,7 @@ describe('applyPushActions (push.ts) — move prefetch isolation', () => {
     expect(res.deleted).toBe(1);
     expect(client.importPageMarkdown).toHaveBeenCalledWith(
       'u1',
-      store['Up.md'],
+      parsePageFile(store['Up.md']).body,
       null,
     );
     expect(client.deletePage).toHaveBeenCalledWith('d1');

@@ -27,11 +27,8 @@
  * `DocmostClient`; the upstream CLI `main()` entry point is dropped (the gitmost
  * server drives the engine in-process). Engine LOGIC is byte-identical.
  */
-import {
-  parseDocmostMarkdown,
-  serializeDocmostMarkdownBody,
-  type DocmostMdMeta,
-} from "../lib/index";
+import { type DocmostMdMeta } from "../lib/index";
+import { parsePageFile, serializePageFile } from "../lib/page-file";
 import type { GitSyncClient } from "./client.types";
 import type { DiffEntry } from "./git";
 import { VaultGit, DEFAULT_BRANCH } from "./git";
@@ -450,6 +447,12 @@ export interface ApplyPushDeps {
   /** Write a file's full text by its vault-relative path. */
   writeFile: (path: string, text: string) => Promise<void>;
   /**
+   * The Docmost spaceId this vault mirrors. A CREATE targets this space (the
+   * native file carries no spaceId — every file in the vault belongs to it), and
+   * it backs the synthetic native meta the classifier reads.
+   */
+  spaceId: string;
+  /**
    * `updateRef` advances `refs/docmost/last-pushed`; `fastForwardBranch` advances
    * the `docmost` mirror after a clean push. `showFileAtRef` reads a file's text
    * at a ref (used by the move/rename classifier to resolve the PREVIOUS parent
@@ -630,25 +633,27 @@ export async function applyPushActions(
   //    Each update is isolated: a thrown page is recorded and the batch goes on.
   for (const u of actions.updates) {
     try {
-      const fullMarkdown = await deps.readFile(u.path);
+      // Push the CLEAN body only (no `gitmost_id` frontmatter): the frontmatter
+      // is engine metadata, never page content. The server converts the markdown
+      // it receives verbatim, so stripping here keeps the id out of Docmost.
+      const body = parsePageFile(await deps.readFile(u.path)).body;
       // The last-synced version of this file (pre-image) is the common ancestor
       // for a 3-way merge against the live page, so concurrent human edits are
-      // not clobbered (review #5). Null when the file is new at last-pushed.
-      const baseMarkdown = await deps.git.showFileAtRef(
-        LAST_PUSHED_REF,
-        u.path,
-      );
+      // not clobbered (review #5). Null when the file is new at last-pushed. Its
+      // body is stripped the SAME way so the merge compares body-to-body.
+      const baseFull = await deps.git.showFileAtRef(LAST_PUSHED_REF, u.path);
+      const baseMarkdown = baseFull === null ? null : parsePageFile(baseFull).body;
       const result = await client.importPageMarkdown(
         u.pageId,
-        fullMarkdown,
+        body,
         baseMarkdown,
       );
       updated++;
-      // §10 loop-guard data: hash the body we pushed + capture `updatedAt`.
+      // §10 loop-guard data: hash the BODY we pushed + capture `updatedAt`.
       pushed.push({
         pageId: u.pageId,
         ...extractUpdatedAt(result),
-        bodyHash: bodyHash(fullMarkdown),
+        bodyHash: bodyHash(body),
       });
     } catch (err: unknown) {
       failures.push({
@@ -666,32 +671,33 @@ export async function applyPushActions(
   for (const c of actions.creates) {
     try {
       const text = await deps.readFile(c.path);
-      const { meta, body } = parseDocmostMarkdown(text);
-      // Derive create args from the file's current meta. A new local file may
-      // have partial meta (e.g. title/spaceId only); spaceId is required by
-      // Docmost (the planner already guards a create against a missing spaceId).
-      const title = meta?.title ?? "";
-      const spaceId = meta?.spaceId ?? "";
-      const parentPageId = meta?.parentPageId ?? undefined;
-      const result = await client.createPage(title, body, spaceId, parentPageId);
+      const { body } = parsePageFile(text);
+      // Derive create args from the PATH (native-Obsidian, SPEC §5): title from
+      // the filename, parent from the enclosing folder's folder-note, space from
+      // the run (the vault's space). `parentPageId: null` -> created at ROOT.
+      const title = titleFromPath(c.path);
+      const parentPageId =
+        (await resolveParentPageIdViaTree(deps, c.path, "current")) ?? undefined;
+      const result = await client.createPage(
+        title,
+        body,
+        deps.spaceId,
+        parentPageId,
+      );
       // `createPage` returns `{ data: { id, ... }, success }`; the assigned
       // pageId is at `result.data.id`.
       const assignedPageId: string | undefined = result?.data?.id;
       if (assignedPageId) {
-        // Re-serialize the file with the pageId in meta, body preserved.
-        const newMeta: DocmostMdMeta = {
-          version: meta?.version ?? 1,
-          ...meta,
-          pageId: assignedPageId,
-        };
-        const rewritten = serializeDocmostMarkdownBody(newMeta, body);
+        // Write the assigned pageId back as the `gitmost_id` frontmatter, body
+        // preserved — the file becomes engine-tracked (SPEC §4).
+        const rewritten = serializePageFile(assignedPageId, body);
         await deps.writeFile(c.path, rewritten);
         writtenBack.push({ path: c.path, pageId: assignedPageId });
-        // §10 loop-guard data for the created page (hash the pushed body).
+        // §10 loop-guard data for the created page (hash the pushed BODY).
         pushed.push({
           pageId: assignedPageId,
           ...extractUpdatedAt(result),
-          bodyHash: bodyHash(text),
+          bodyHash: bodyHash(body),
         });
       }
       created++;
@@ -745,11 +751,11 @@ export async function applyPushActions(
         );
         metaTable.set(
           `${rm.newPath}|current`,
-          await metaAtViaTree(deps, rm.newPath, "current"),
+          await metaAtViaTree(deps, rm.newPath, "current", deps.spaceId),
         );
         metaTable.set(
           `${rm.oldPath}|prev`,
-          await metaAtViaTree(deps, rm.oldPath, "prev"),
+          await metaAtViaTree(deps, rm.oldPath, "prev", deps.spaceId),
         );
       } catch (err: unknown) {
         prefetchFailed.add(rm.pageId);
@@ -863,8 +869,58 @@ function errMessage(err: unknown): string {
  */
 export function parentFolderFile(path: string): string | null {
   const slash = path.lastIndexOf("/");
-  if (slash < 0) return null; // root-level file: no enclosing folder.
-  return `${path.slice(0, slash)}.md`;
+  if (slash < 0) return null; // root-level file: parent is ROOT.
+  const dir = path.slice(0, slash); // the enclosing folder
+  // The page that OWNS the enclosing folder is its folder-note `<dir>/<base>.md`.
+  const folderNote = `${dir}/${baseSegment(dir)}.md`;
+  if (path === folderNote) {
+    // This path IS its folder's folder-note, so its parent is ONE LEVEL UP: the
+    // folder-note of the grandparent folder (or ROOT at the top level).
+    const up = dir.lastIndexOf("/");
+    if (up < 0) return null; // top-level folder -> parent is ROOT.
+    const grandDir = dir.slice(0, up);
+    return `${grandDir}/${baseSegment(grandDir)}.md`;
+  }
+  // A leaf (or a nested folder-note) sitting inside `dir`: its parent is `dir`'s
+  // folder-note.
+  return folderNote;
+}
+
+/** The last path segment of a forward-slash path (the folder/file base name). */
+function baseSegment(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? path : path.slice(slash + 1);
+}
+
+/**
+ * The page TITLE derived from a vault path: the file's base name without the
+ * `.md` extension. In the native-Obsidian layout the filename IS the title — for
+ * a folder-note `<dir>/<base>.md` that base equals the folder name, so the same
+ * rule yields the folder's title. Self-consistent across pull/push: a pulled
+ * (possibly disambiguated) filename round-trips to the same title, so a stable
+ * file never pushes a spurious rename.
+ */
+function titleFromPath(path: string): string {
+  const base = baseSegment(path);
+  return base.endsWith(".md") ? base.slice(0, -3) : base;
+}
+
+/**
+ * Build the synthetic `DocmostMdMeta` the planner/classifier consume, from the
+ * NATIVE format: `pageId` from the `gitmost_id` frontmatter, `title` from the
+ * filename, `spaceId` from the run (the vault's space — every file belongs to
+ * it). `parentPageId` is intentionally absent: tree position is resolved from the
+ * PATH (`resolveParentPageId`), never from a stored field (SPEC §5).
+ */
+function nativeMeta(
+  text: string,
+  path: string,
+  spaceId: string,
+): DocmostMdMeta {
+  const { id } = parsePageFile(text);
+  const meta: DocmostMdMeta = { version: 1, title: titleFromPath(path), spaceId };
+  if (id) meta.pageId = id;
+  return meta;
 }
 
 /**
@@ -899,25 +955,23 @@ async function resolveParentPageIdViaTree(
     return null;
   }
   if (text === null) return null; // showFileAtRef returns null when absent.
-  try {
-    const { meta } = parseDocmostMarkdown(text);
-    return meta?.pageId ?? null;
-  } catch {
-    // Unparseable parent meta -> no resolvable parent pageId.
-    return null;
-  }
+  // The parent page's identity is its `gitmost_id` frontmatter; folder position
+  // is irrelevant here, only the pageId.
+  return parsePageFile(text).id;
 }
 
 /**
- * Resolve the file `docmost:meta` at a side for the rename/move classifier (the
- * title comes from here). Mirrors `resolveParentPageIdViaTree`'s IO sides:
- * `current` reads the working tree, `prev` reads `refs/docmost/last-pushed`.
- * Returns `null` on a missing/unreadable/unparseable file.
+ * Resolve the synthetic native meta at a side for the rename/move classifier (the
+ * title — derived from the path — comes from here). Mirrors
+ * `resolveParentPageIdViaTree`'s IO sides: `current` reads the working tree,
+ * `prev` reads `refs/docmost/last-pushed`. Returns `null` only when the file is
+ * missing/unreadable at that side (a real absence the classifier must see).
  */
 async function metaAtViaTree(
   deps: Pick<ApplyPushDeps, "readFile" | "git">,
   path: string,
   side: MetaSide,
+  spaceId: string,
 ): Promise<DocmostMdMeta | null> {
   let text: string | null;
   try {
@@ -929,11 +983,7 @@ async function metaAtViaTree(
     return null;
   }
   if (text === null) return null;
-  try {
-    return parseDocmostMarkdown(text).meta ?? null;
-  } catch {
-    return null;
-  }
+  return nativeMeta(text, path, spaceId);
 }
 
 /**
@@ -1156,13 +1206,13 @@ export async function runPush(
     if (!metaTable.has(`${currentPath}|current`)) {
       metaTable.set(
         `${currentPath}|current`,
-        await readMetaCurrent(deps, currentPath),
+        await readMetaCurrent(deps, currentPath, settings.docmostSpaceId),
       );
     }
     if (!metaTable.has(`${prevPath}|prev`)) {
       metaTable.set(
         `${prevPath}|prev`,
-        await readMetaPrev(deps, base.ref, prevPath),
+        await readMetaPrev(deps, base.ref, prevPath, settings.docmostSpaceId),
       );
     }
   }
@@ -1179,7 +1229,8 @@ export async function runPush(
   if (changes.some((c) => c.status === "D")) {
     currentPageIds = new Set<string>();
     for (const relPath of await git.listTrackedFiles("*.md")) {
-      const pid = (await readMetaCurrent(deps, relPath))?.pageId;
+      const pid = (await readMetaCurrent(deps, relPath, settings.docmostSpaceId))
+        ?.pageId;
       if (pid) currentPageIds.add(pid);
     }
   }
@@ -1214,6 +1265,7 @@ export async function runPush(
       git,
       readFile: deps.readFile,
       writeFile: deps.writeFile,
+      spaceId: settings.docmostSpaceId,
     },
     actions,
     pushedCommit,
@@ -1293,10 +1345,11 @@ export async function runPush(
   };
 }
 
-/** Parse a file's `docmost:meta` from the live working tree (`current` side). */
+/** Synthetic native meta from the live working tree (`current` side). */
 async function readMetaCurrent(
   deps: Pick<PushDeps, "readFile">,
   path: string,
+  spaceId: string,
 ): Promise<DocmostMdMeta | null> {
   let text: string;
   try {
@@ -1304,18 +1357,15 @@ async function readMetaCurrent(
   } catch {
     return null; // absent on disk (e.g. a D row's path) -> no current meta.
   }
-  try {
-    return parseDocmostMarkdown(text).meta ?? null;
-  } catch {
-    return null; // unparseable meta -> not engine-tracked.
-  }
+  return nativeMeta(text, path, spaceId);
 }
 
-/** Parse a file's `docmost:meta` from the base ref's pre-image (`prev` side). */
+/** Synthetic native meta from the base ref's pre-image (`prev` side). */
 async function readMetaPrev(
   deps: Pick<PushDeps, "git">,
   baseRef: string,
   path: string,
+  spaceId: string,
 ): Promise<DocmostMdMeta | null> {
   let text: string | null;
   try {
@@ -1324,11 +1374,7 @@ async function readMetaPrev(
     return null;
   }
   if (text === null) return null; // path absent at the base ref.
-  try {
-    return parseDocmostMarkdown(text).meta ?? null;
-  } catch {
-    return null;
-  }
+  return nativeMeta(text, path, spaceId);
 }
 
 /** Emit the full plan (counts + per-item) to the injected logger. */
