@@ -141,4 +141,82 @@ describe('buildVaultLayout', () => {
     const paths = [p1, p2, c1, c2].map(pathOf);
     expect(new Set(paths).size).toBe(paths.length);
   });
+
+  // --- native-Obsidian folder-note layout -------------------------------------
+
+  const pathOf = (e: { segments: string[]; stem: string }) =>
+    [...e.segments, e.stem].join('/');
+
+  it('puts a LEAF (no children) at <name> (segments=[])', () => {
+    const pages: PageNode[] = [{ id: 'p1', title: 'Заметка' }];
+    const layout = buildVaultLayout(pages);
+    expect(layout.get('p1')).toEqual({ segments: [], stem: 'Заметка' });
+  });
+
+  it('puts a PARENT (with children) at <name>/<name> (folder-note)', () => {
+    const pages: PageNode[] = [
+      { id: 'par', title: 'Проект', hasChildren: true },
+      { id: 'ch', title: 'Задача', parentPageId: 'par' },
+    ];
+    const layout = buildVaultLayout(pages);
+    // Folder-note: the parent's OWN file lives inside its own folder.
+    expect(layout.get('par')).toEqual({ segments: ['Проект'], stem: 'Проект' });
+    // The child sits ALONGSIDE the folder-note in the same folder.
+    expect(layout.get('ch')).toEqual({ segments: ['Проект'], stem: 'Задача' });
+    expect(pathOf(layout.get('par')!)).toBe('Проект/Проект');
+    expect(pathOf(layout.get('ch')!)).toBe('Проект/Задача');
+  });
+
+  it('nests a PARENT-of-parents as <a>/<b>/<b>', () => {
+    const pages: PageNode[] = [
+      { id: 'a', title: 'Проект', hasChildren: true },
+      { id: 'b', title: 'Подпроект', parentPageId: 'a', hasChildren: true },
+      { id: 'c', title: 'Лист', parentPageId: 'b' },
+    ];
+    const layout = buildVaultLayout(pages);
+    expect(pathOf(layout.get('a')!)).toBe('Проект/Проект');
+    expect(pathOf(layout.get('b')!)).toBe('Проект/Подпроект/Подпроект');
+    expect(pathOf(layout.get('c')!)).toBe('Проект/Подпроект/Лист');
+  });
+
+  it('disambiguates a CHILD named like its parent folder (folder-note wins)', () => {
+    // A child whose title equals the parent's title would collide with the
+    // parent's folder-note `Проект/Проект`. The folder-note must keep the
+    // canonical path; the CHILD (a leaf) is the one that gets a suffix.
+    const pages: PageNode[] = [
+      { id: 'par', title: 'Проект', slugId: 'parSlug', hasChildren: true },
+      { id: 'ch', title: 'Проект', slugId: 'chSlug', parentPageId: 'par' },
+    ];
+    const layout = buildVaultLayout(pages);
+    const par = layout.get('par')!;
+    const ch = layout.get('ch')!;
+    // Folder-note keeps `Проект/Проект`.
+    expect(pathOf(par)).toBe('Проект/Проект');
+    // Child is forced off that path (suffix applied), still in the folder.
+    expect(ch.segments).toEqual(['Проект']);
+    expect(pathOf(ch)).not.toBe('Проект/Проект');
+    expect(ch.stem.startsWith('Проект ')).toBe(true);
+    expect(pathOf(par)).not.toBe(pathOf(ch));
+  });
+
+  it('keeps two same-named PARENTS distinct (folder == file name each)', () => {
+    const pages: PageNode[] = [
+      { id: 'a', title: 'Dup', slugId: 'sa', hasChildren: true },
+      { id: 'b', title: 'Dup', slugId: 'sb', hasChildren: true },
+    ];
+    const layout = buildVaultLayout(pages);
+    const a = layout.get('a')!;
+    const b = layout.get('b')!;
+    // Each parent's folder segment EQUALS its file stem (folder-note invariant):
+    // a folder `X/` must always contain its own note `X`.
+    expect(a.segments).toEqual([a.stem]);
+    expect(b.segments).toEqual([b.stem]);
+    expect(pathOf(a)).not.toBe(pathOf(b));
+  });
+
+  it('does not move a childless page into a folder', () => {
+    const pages: PageNode[] = [{ id: 'p', title: 'Пусто', hasChildren: false }];
+    const layout = buildVaultLayout(pages);
+    expect(layout.get('p')).toEqual({ segments: [], stem: 'Пусто' });
+  });
 });

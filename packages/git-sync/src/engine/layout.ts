@@ -114,17 +114,42 @@ export function buildVaultLayout(pages: PageNode[]): Map<string, VaultEntry> {
     });
   }
 
+  // FOLDER-NOTE transform (native-Obsidian layout): a page WITH CHILDREN lives at
+  // `<…>/<stem>/<stem>.md` — its body is the folder-note INSIDE its own folder
+  // (LostPaul Folder Notes convention), and its children sit alongside it in that
+  // folder. A leaf stays `<…>/<stem>.md`. Children's segments already point into
+  // the parent's folder (folderSegmentsFor walks ancestor NAMES), so only the
+  // parent's own file relocates here; the sibling name pass above already made
+  // the parent name unique, so folder == file name stays consistent.
+  for (const p of pages) {
+    if (!p || !p.id) continue;
+    const entry = layout.get(p.id);
+    if (entry && p.hasChildren) {
+      entry.segments = [...entry.segments, entry.stem];
+    }
+  }
+
   // Final full-path uniqueness pass — a belt-and-suspenders safety net. Note
   // that cross-bucket (orphan/root) collisions are now resolved in the name pass
   // above (orphans share the "__root__" bucket), so ancestor names are final
   // before `segments` are built and this pass should rarely/never re-stem an
   // ancestor. It only re-stems the colliding LATER leaf via the sanitized
   // slugId/id, then (if still colliding) appends the id.
+  //
+  // Process FOLDER-NOTES (pages with children) FIRST so a parent claims its
+  // canonical `<name>/<name>.md` before a same-named CHILD — the child (a leaf)
+  // is the one that disambiguates, never the folder-note.
   const usedPaths = new Set<string>();
   const seenIds = new Set<string>();
   const pathKey = (e: VaultEntry): string => [...e.segments, e.stem].join("/");
-  for (const p of pages) {
-    if (!p || !p.id || seenIds.has(p.id)) continue;
+  const ordered = pages
+    .filter((p): p is PageNode => Boolean(p && p.id))
+    .sort(
+      (a, b) =>
+        Number(Boolean(b.hasChildren)) - Number(Boolean(a.hasChildren)),
+    );
+  for (const p of ordered) {
+    if (seenIds.has(p.id)) continue;
     seenIds.add(p.id);
     const entry = layout.get(p.id);
     if (!entry) continue;

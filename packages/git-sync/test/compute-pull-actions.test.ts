@@ -28,9 +28,11 @@ describe('computePullActions — normal complete fetch', () => {
       treeComplete: true,
       existing: [],
     });
-    // Each live page is (re)written at its deterministic layout path.
+    // Each live page is (re)written at its deterministic layout path. `root`
+    // has a child, so it lives at the folder-note `Root/Root.md` (native-Obsidian
+    // layout), with the child alongside it in that folder.
     expect(actions.toWrite).toEqual([
-      { pageId: 'root', relPath: 'Root.md' },
+      { pageId: 'root', relPath: 'Root/Root.md' },
       { pageId: 'child', relPath: 'Root/Child.md' },
     ]);
     expect(actions.moved).toEqual([]);
