@@ -20,7 +20,9 @@
 set -uo pipefail
 
 SERVER="${SERVER:-http://localhost:3000}"
-SPACE_ID="${SPACE_ID:-019ef1f7-437b-7ae9-9306-809a1729f085}"
+# By default the suite PROVISIONS its own throwaway space (so it never touches
+# real data). Set SPACE_ID explicitly to run against an existing space instead.
+SPACE_ID="${SPACE_ID:-}"
 EMAIL="${EMAIL:-admin@test.local}"
 PASSWORD="${PASSWORD:-Test12345!}"
 DB_CONTAINER="${DB_CONTAINER:-gitmost-db}"
@@ -28,21 +30,26 @@ DB_USER="${DB_USER:-docmost}"
 DB_NAME="${DB_NAME:-docmost}"
 
 BASIC=$(printf '%s:%s' "$EMAIL" "$PASSWORD" | base64 -w0)
-GIT_URL="$SERVER/git/$SPACE_ID.git"
+GIT_URL=""        # set once the space is known (after login/provisioning)
+PROVISIONED=""    # the space id we created (and must delete on exit), if any
 WORK=$(mktemp -d /tmp/git-sync-e2e.XXXXXX)
 COOKIES="$WORK/cookies.txt"
 PASS=0
 FAIL=0
 
-# Hard-delete every fixture page this suite created (it operates ONLY on its own
-# E2E-* pages, never a real one) so the stand stays clean across runs.
 cleanup() {
-  docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc \
-    "delete from pages where space_id='$SPACE_ID' and title like 'E2E-%';" >/dev/null 2>&1
-  # Converge the vault so it drops the now-deleted fixture files (a handful of
-  # under-cap deletes — applies cleanly) instead of waiting for the next poll.
-  curl -s -b "$COOKIES" -X POST "$SERVER/api/git-sync/trigger" \
-    -H 'Content-Type: application/json' -d "{\"spaceId\":\"$SPACE_ID\"}" >/dev/null 2>&1
+  # Delete the throwaway space we created (cascades its pages); never touch a
+  # caller-supplied space beyond our own E2E-* fixtures.
+  if [ -n "$PROVISIONED" ]; then
+    docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+      "delete from pages where space_id='$PROVISIONED'; delete from spaces where id='$PROVISIONED';" >/dev/null 2>&1
+    rm -rf "/tmp/gitmost-vaults/$PROVISIONED" 2>/dev/null
+  elif [ -n "$SPACE_ID" ]; then
+    docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc \
+      "delete from pages where space_id='$SPACE_ID' and title like 'E2E-%';" >/dev/null 2>&1
+    curl -s -b "$COOKIES" -X POST "$SERVER/api/git-sync/trigger" \
+      -H 'Content-Type: application/json' -d "{\"spaceId\":\"$SPACE_ID\"}" >/dev/null 2>&1
+  fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -52,6 +59,9 @@ ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
 
 gitc() { git -c http.extraHeader="Authorization: Basic $BASIC" "$@"; }
+# Push retrying on 503 — the host returns 503+Retry-After when a sync cycle holds
+# the per-space lock (a real client retries; so do we, to dodge poll races).
+gpush() { local out; for _ in 1 2 3 4 5 6; do out=$(gitc push -q origin main 2>&1); echo "$out" | grep -q '503\|busy' && { sleep 2; continue; }; return 0; done; return 1; }
 psqlq() { docker exec "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc "$1" 2>/dev/null; }
 api()  { curl -s -b "$COOKIES" "$@"; }
 
@@ -67,6 +77,22 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -c "$COOKIES" -X POST \
   "$SERVER/api/auth/login" -H 'Content-Type: application/json' \
   -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")
 [ "$code" = "200" ] && ok "login 200" || { bad "login returned $code"; exit 1; }
+
+# ----------------------------------------------------------------------------
+if [ -z "$SPACE_ID" ]; then
+  say "setup: provision a throwaway git-sync space (never touches real data)"
+  slug="e2e$(date +%s)$RANDOM"
+  SPACE_ID=$(api -X POST "$SERVER/api/spaces/create" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"E2E Throwaway $slug\",\"slug\":\"$slug\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  if [ -n "$SPACE_ID" ]; then
+    PROVISIONED="$SPACE_ID"
+    psqlq "update spaces set settings = coalesce(settings,'{}'::jsonb) || '{\"gitSync\":{\"enabled\":true}}'::jsonb where id='$SPACE_ID';" >/dev/null
+    ok "provisioned space $SPACE_ID"
+  else
+    bad "could not provision a test space"; exit 1
+  fi
+fi
+GIT_URL="$SERVER/git/$SPACE_ID.git"
 
 # ----------------------------------------------------------------------------
 say "gate: smart-HTTP auth/authz"
@@ -86,6 +112,16 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Basic $BASIC" \
 [ "$code" = "200" ] && ok "valid creds + sync space -> 200" || bad "valid clone gate expected 200, got $code"
 
 # ----------------------------------------------------------------------------
+# A DEDICATED test page so the push/merge edits never touch a real page, and so
+# a freshly-provisioned (empty) space has content for the fetch test below.
+say "setup: create a dedicated test page (edits target only this one)"
+TEST_TITLE="E2E-SyncTarget-$RANDOM$RANDOM"
+TEST_ID=$(api -X POST "$SERVER/api/pages/create" -H 'Content-Type: application/json' \
+  -d "{\"spaceId\":\"$SPACE_ID\",\"title\":\"$TEST_TITLE\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$TEST_ID" ] && ok "created test page $TEST_TITLE" || { bad "could not create the test page"; }
+sync_now
+
+# ----------------------------------------------------------------------------
 say "fetch: clone the space vault over HTTP"
 sync_now
 if gitc clone -q "$GIT_URL" "$WORK/clone" 2>/dev/null; then
@@ -94,17 +130,6 @@ if gitc clone -q "$GIT_URL" "$WORK/clone" 2>/dev/null; then
 else
   bad "clone failed"
 fi
-
-# ----------------------------------------------------------------------------
-# A DEDICATED test page so the push/merge edits never touch a real page. We seed
-# it with a body line so git's rename heuristics + the 3-way merge have content
-# to work on, and so the assertions are isolated to this page id.
-say "setup: create a dedicated test page (edits target only this one)"
-TEST_TITLE="E2E-SyncTarget-$RANDOM$RANDOM"
-TEST_ID=$(api -X POST "$SERVER/api/pages/create" -H 'Content-Type: application/json' \
-  -d "{\"spaceId\":\"$SPACE_ID\",\"title\":\"$TEST_TITLE\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-[ -n "$TEST_ID" ] && ok "created test page $TEST_TITLE" || { bad "could not create the test page"; }
-sync_now
 
 # ----------------------------------------------------------------------------
 say "push: a git edit propagates into the (dedicated) Docmost page"
@@ -116,7 +141,7 @@ if [ -n "$target" ]; then
   MARK="E2E-PUSH-$RANDOM$RANDOM"
   printf '\n## %s\n' "$MARK" >> "$target"
   git commit -aqm "e2e push: $MARK"
-  if gitc push -q origin main 2>/dev/null; then
+  if gpush; then
     sleep 2
     has=$(psqlq "select count(*) from pages where id='$TEST_ID' and content::text like '%$MARK%';")
     [ "${has:-0}" -ge 1 ] && ok "pushed edit reached the test page" || bad "marker $MARK not in the test page content"
@@ -154,7 +179,7 @@ delfile=$(find . -maxdepth 1 -name "*$NEW_TITLE*.md" | head -1)
 if [ -n "$delfile" ]; then
   git rm -q "$delfile"
   git commit -qm "e2e delete: $NEW_TITLE"
-  if gitc push -q origin main 2>/dev/null; then
+  if gpush; then
     sleep 2
     deleted=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and title='$NEW_TITLE' and deleted_at is not null;")
     [ "${deleted:-0}" -ge 1 ] && ok "page '$NEW_TITLE' was soft-deleted (in Trash)" || bad "page '$NEW_TITLE' not soft-deleted after git rm"
@@ -179,7 +204,7 @@ if [ -n "$mfile" ]; then
   MARK2="E2E-MERGE-$RANDOM$RANDOM"
   printf '\n## %s\n' "$MARK2" >> "$mfile"
   git commit -aqm "e2e merge: $MARK2"
-  if gitc push -q origin main 2>/dev/null; then
+  if gpush; then
     sleep 2
     both=$(psqlq "select count(*) from pages where id='$TEST_ID' and content::text like '%$MARK2%' and content::text like '%E2E-PUSH-%';")
     [ "${both:-0}" -ge 1 ] && ok "new edit added without losing prior content (3-way merge)" || bad "3-way merge lost content (both markers not present)"

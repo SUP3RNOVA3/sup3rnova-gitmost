@@ -16,7 +16,9 @@
 set -uo pipefail
 
 SERVER="${SERVER:-http://localhost:3000}"
-SPACE_ID="${SPACE_ID:-019ef1f7-437b-7ae9-9306-809a1729f085}"
+# By default the suite PROVISIONS its own throwaway space (never touches real
+# data). Set SPACE_ID explicitly to run against an existing space instead.
+SPACE_ID="${SPACE_ID:-}"
 EMAIL="${EMAIL:-admin@test.local}"
 PASSWORD="${PASSWORD:-Test12345!}"
 DB_CONTAINER="${DB_CONTAINER:-gitmost-db}"
@@ -27,8 +29,9 @@ VAULT_DIR="${VAULT_DIR:-/tmp/gitmost-vaults}"
 LOCK_PREFIX="git-sync:lock:"
 
 BASIC=$(printf '%s:%s' "$EMAIL" "$PASSWORD" | base64 -w0)
-GIT_URL="$SERVER/git/$SPACE_ID.git"
-VAULT="$VAULT_DIR/$SPACE_ID"
+GIT_URL=""        # set once the space is known (after login/provisioning)
+VAULT=""          # ditto
+PROVISIONED=""    # the space id we created (and must delete on exit), if any
 WORK=$(mktemp -d /tmp/git-sync-adv.XXXXXX)
 COOKIES="$WORK/cookies.txt"
 PASS=0; FAIL=0
@@ -56,12 +59,15 @@ teardown(){
          delete from spaces where name like 'E2E-ADV-%';
          delete from pages where space_id='$SPACE_ID' and title like 'E2E-ADV-%';" >/dev/null
   docker exec "$REDIS_CONTAINER" redis-cli del "${LOCK_PREFIX}${SPACE_ID}" >/dev/null 2>&1
-  # The delete-cap case intentionally leaves the vault non-convergent (over-cap
-  # deletes held, last-pushed pinned). The vault is a CACHE — reset it so the next
-  # cycle rebuilds cleanly from Docmost (now that the fixture pages are gone),
-  # otherwise every later cycle re-attempts the suppressed deletes forever.
-  rm -rf "$VAULT"
-  sync_now
+  # Delete the throwaway space we created (cascades pages); the delete-cap case
+  # leaves the vault non-convergent, so dropping the whole space + its vault is
+  # the clean teardown. (When run against a caller-supplied space, only reset the
+  # vault — the fixtures above were already removed by pattern.)
+  if [ -n "$PROVISIONED" ]; then
+    psqlq "delete from pages where space_id='$PROVISIONED'; delete from spaces where id='$PROVISIONED';" >/dev/null
+  fi
+  [ -n "$VAULT" ] && rm -rf "$VAULT"
+  [ -z "$PROVISIONED" ] && [ -n "$SPACE_ID" ] && sync_now
   rm -rf "$WORK"
 }
 trap teardown EXIT
@@ -88,6 +94,18 @@ make_user(){
 say "setup: login + fixtures"
 [ "$(code -c "$COOKIES" -X POST "$SERVER/api/auth/login" -H 'Content-Type: application/json' -d "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")" = "200" ] \
   && ok "admin login" || { bad "admin login failed"; exit 1; }
+if [ -z "$SPACE_ID" ]; then
+  slug="adv$(date +%s)$RANDOM"
+  SPACE_ID=$(api -X POST "$SERVER/api/spaces/create" -H 'Content-Type: application/json' \
+    -d "{\"name\":\"E2E-ADV Throwaway $slug\",\"slug\":\"$slug\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  [ -n "$SPACE_ID" ] || { bad "could not provision a test space"; exit 1; }
+  PROVISIONED="$SPACE_ID"
+  psqlq "update spaces set settings = coalesce(settings,'{}'::jsonb) || '{\"gitSync\":{\"enabled\":true}}'::jsonb where id='$SPACE_ID';" >/dev/null
+  ok "provisioned throwaway space $SPACE_ID"
+fi
+GIT_URL="$SERVER/git/$SPACE_ID.git"
+VAULT="$VAULT_DIR/$SPACE_ID"
+sync_now  # initialize the vault for the new space
 gitc clone -q "$GIT_URL" "$WORK/c" 2>/dev/null && ok "baseline clone" || { bad "baseline clone failed"; exit 1; }
 ( cd "$WORK/c" && git config user.email e2e@test && git config user.name e2e )
 
