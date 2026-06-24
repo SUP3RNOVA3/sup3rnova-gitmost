@@ -1,7 +1,9 @@
 import { BadRequestException } from '@nestjs/common';
 import { PageService } from './page.service';
 import { MovePageDto } from '../dto/move-page.dto';
-import { Page } from '@docmost/db/types/entity.types';
+import { CreatePageDto } from '../dto/create-page.dto';
+import { UpdatePageDto } from '../dto/update-page.dto';
+import { Page, User } from '@docmost/db/types/entity.types';
 import { DEFAULT_TEMPORARY_NOTE_HOURS } from '../constants/temporary-note.constants';
 import { AuthProvenanceData } from '../../../common/decorators/auth-provenance.decorator';
 
