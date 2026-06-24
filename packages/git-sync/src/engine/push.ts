@@ -200,6 +200,15 @@ export interface PushActionsInput {
    * pass a plain lookup.
    */
   metaAt: (path: string, side: MetaSide) => DocmostMdMeta | null;
+  /**
+   * The pageIds present at ANY path in the current `main` tree (optional). When
+   * given, a deleted file whose pageId still lives somewhere in the tree is NOT
+   * a deletion but a MOVE — guards against trashing a live page when a layout
+   * reshuffle relocated its file (possibly across two cycles, so the matching
+   * add isn't in THIS diff). When omitted, only the in-diff D+A/M coalescing
+   * applies.
+   */
+  currentPageIds?: Set<string>;
 }
 
 /**
@@ -228,7 +237,7 @@ export interface PushActionsInput {
  *       (`C` copy is treated the same as `R` for recording purposes.)
  */
 export function computePushActions(input: PushActionsInput): PushActions {
-  const { changes, metaAt } = input;
+  const { changes, metaAt, currentPageIds } = input;
   const actions: PushActions = {
     creates: [],
     updates: [],
@@ -342,6 +351,16 @@ export function computePushActions(input: PushActionsInput): PushActions {
             path: change.path,
             status: "D",
             reason: "ghost-move (re-added at a new path) — not a deletion",
+          });
+        } else if (pageId && currentPageIds?.has(pageId)) {
+          // The pageId still EXISTS elsewhere in the current tree: the file moved
+          // (a layout reshuffle whose matching add was in an earlier cycle, so it
+          // is not in this diff). A live page must never be trashed because its
+          // FILENAME changed — identity is the pageId (⭐ data-loss guard).
+          actions.skipped.push({
+            path: change.path,
+            status: "D",
+            reason: "pageId still present in the tree (moved) — not a deletion",
           });
         } else if (pageId) {
           actions.deletes.push({ pageId });
@@ -978,6 +997,7 @@ export interface PushDeps {
     | "showFileAtRef"
     | "updateRef"
     | "fastForwardBranch"
+    | "listTrackedFiles"
   >;
   /** Build a real client — called ONLY on `--apply`, never on dry-run. */
   makeClient: (settings: Settings) => ApplyPushDeps["client"];
@@ -1149,7 +1169,22 @@ export async function runPush(
   const metaAt = (path: string, side: MetaSide): DocmostMdMeta | null =>
     metaTable.get(`${path}|${side}`) ?? null;
 
-  const actions = computePushActions({ changes, metaAt });
+  // The set of pageIds that STILL EXIST somewhere in the current `main` tree.
+  // Identity is the pageId, NOT the filename: a file vanishing from one path
+  // while the SAME pageId lives at another path is a MOVE (often a layout
+  // reshuffle of `_`-fallback names, whose two halves can even land in separate
+  // cycles), never a deletion. Built only when the diff contains deletes — the
+  // guard's whole job is to stop a phantom delete from trashing a live page.
+  let currentPageIds: Set<string> | undefined;
+  if (changes.some((c) => c.status === "D")) {
+    currentPageIds = new Set<string>();
+    for (const relPath of await git.listTrackedFiles("*.md")) {
+      const pid = (await readMetaCurrent(deps, relPath))?.pageId;
+      if (pid) currentPageIds.add(pid);
+    }
+  }
+
+  const actions = computePushActions({ changes, metaAt, currentPageIds });
   const planned = {
     creates: actions.creates.length,
     updates: actions.updates.length,

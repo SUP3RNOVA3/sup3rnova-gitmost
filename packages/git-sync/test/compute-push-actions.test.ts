@@ -280,3 +280,41 @@ describe('computePushActions — ghost-move coalescing (data-loss guard)', () =>
     expect(actions.renamesMoves).toEqual([]);
   });
 });
+
+describe('computePushActions — currentPageIds guard (cross-cycle move)', () => {
+  it('a D whose pageId still exists in the tree (no matching A in THIS diff) is NOT deleted', () => {
+    // The move happened across cycles: the new file landed earlier, so this diff
+    // only has the old path D. The pageId still lives in the tree -> not a delete.
+    const changes: DiffEntry[] = [{ status: 'D', path: '_ ~old.md' }];
+    const metaAt = metaTable({
+      '_ ~old.md|prev': meta({ pageId: 'pX', title: '', spaceId: 'sp1' }),
+    });
+    const actions = computePushActions({
+      changes,
+      metaAt,
+      currentPageIds: new Set(['pX']), // pX is still tracked somewhere on main
+    });
+    expect(actions.deletes).toEqual([]);
+    expect(actions.skipped).toEqual([
+      {
+        path: '_ ~old.md',
+        status: 'D',
+        reason: 'pageId still present in the tree (moved) — not a deletion',
+      },
+    ]);
+  });
+
+  it('a D whose pageId is GONE from the tree is a real delete', () => {
+    const changes: DiffEntry[] = [{ status: 'D', path: 'Removed.md' }];
+    const metaAt = metaTable({
+      'Removed.md|prev': meta({ pageId: 'pY', title: 'Removed', spaceId: 'sp1' }),
+    });
+    const actions = computePushActions({
+      changes,
+      metaAt,
+      currentPageIds: new Set(['pOther']), // pY is NOT present -> genuinely deleted
+    });
+    expect(actions.deletes).toEqual([{ pageId: 'pY' }]);
+    expect(actions.skipped).toEqual([]);
+  });
+});
