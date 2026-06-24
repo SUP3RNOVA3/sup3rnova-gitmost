@@ -1,14 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { readExisting } from '../src/engine/pull';
+import { serializePageFile } from '../src/lib/page-file';
 
 // R-Pull-1 (test-strategy report §5): `readExisting` now takes injectable IO
 // (`listTracked` / `readFile`), so its parsing + skip rules are unit-testable
 // without a real git repo or filesystem. These tests pass fakes only — no git,
-// no fs, no network.
+// no fs, no network. Identity is recovered from the native `gitmost_id`
+// frontmatter (no more `docmost:meta`).
 
-/** Build a valid self-contained file with a `docmost:meta` block. */
-function withMeta(meta: Record<string, unknown>, body = '# Title\nbody\n'): string {
-  return `<!-- docmost:meta\n${JSON.stringify(meta)}\n-->\n\n${body}`;
+/** Build a valid native page file with a `gitmost_id` frontmatter. */
+function withId(id: string, body = '# Title\nbody\n'): string {
+  return serializePageFile(id, body);
 }
 
 /** A fake `readFile` backed by an in-memory map (rejects on a missing key). */
@@ -24,8 +26,8 @@ function fakeReadFile(files: Record<string, string>) {
 describe('readExisting (R-Pull-1, injected IO)', () => {
   it('recovers { pageId, relPath } for valid tracked files', async () => {
     const files = {
-      'Space/A.md': withMeta({ version: 1, pageId: 'p1', title: 'A' }),
-      'Space/Sub/B.md': withMeta({ version: 1, pageId: 'p2', title: 'B' }),
+      'Space/A.md': withId('p1'),
+      'Space/Sub/B.md': withId('p2'),
     };
     const result = await readExisting({
       listTracked: async () => Object.keys(files),
@@ -37,23 +39,24 @@ describe('readExisting (R-Pull-1, injected IO)', () => {
     ]);
   });
 
-  it('SKIPS a file with no docmost:meta block (plain hand-written markdown)', async () => {
+  it('SKIPS a file with no frontmatter (plain hand-written markdown)', async () => {
     const files = {
-      'tracked.md': withMeta({ version: 1, pageId: 'p1' }),
-      'stray.md': '# Just a hand-written note\n\nNo meta here.\n',
+      'tracked.md': withId('p1'),
+      'stray.md': '# Just a hand-written note\n\nNo frontmatter here.\n',
     };
     const result = await readExisting({
       listTracked: async () => Object.keys(files),
       readFile: fakeReadFile(files),
     });
-    // Only the engine-tracked file (with a pageId) survives.
+    // Only the engine-tracked file (with a gitmost_id) survives.
     expect(result).toEqual([{ pageId: 'p1', relPath: 'tracked.md' }]);
   });
 
-  it('SKIPS a file whose meta has no pageId', async () => {
+  it('SKIPS a file whose frontmatter has no gitmost_id key', async () => {
     const files = {
-      'has-id.md': withMeta({ version: 1, pageId: 'keep' }),
-      'no-id.md': withMeta({ version: 1, title: 'untitled', slugId: 's' }),
+      'has-id.md': withId('keep'),
+      // A user's own frontmatter, but no gitmost_id -> not engine-tracked.
+      'no-id.md': '---\ntags: [note]\ntitle: untitled\n---\n\nbody\n',
     };
     const result = await readExisting({
       listTracked: async () => Object.keys(files),
@@ -62,12 +65,10 @@ describe('readExisting (R-Pull-1, injected IO)', () => {
     expect(result).toEqual([{ pageId: 'keep', relPath: 'has-id.md' }]);
   });
 
-  it('SKIPS a file with an unparseable (invalid-JSON) meta block, does not throw', async () => {
-    // Invalid JSON inside the meta block makes parseDocmostMarkdown throw; the
-    // skip-rule must swallow it and treat the file as not-engine-tracked.
+  it('SKIPS a file with an EMPTY gitmost_id value, does not throw', async () => {
     const files = {
-      'good.md': withMeta({ version: 1, pageId: 'good' }),
-      'broken.md': '<!-- docmost:meta\n{ this is : not, json }\n-->\n\nbody\n',
+      'good.md': withId('good'),
+      'blank.md': '---\ngitmost_id:\n---\n\nbody\n',
     };
     const result = await readExisting({
       listTracked: async () => Object.keys(files),
@@ -78,7 +79,7 @@ describe('readExisting (R-Pull-1, injected IO)', () => {
 
   it('does NOT throw when readFile REJECTS (tracked but missing) — treats it as skipped', async () => {
     const files = {
-      'present.md': withMeta({ version: 1, pageId: 'present' }),
+      'present.md': withId('present'),
       // "ghost.md" is listed as tracked but absent from the file map -> reject.
     };
     const result = await readExisting({
@@ -101,11 +102,11 @@ describe('readExisting (R-Pull-1, injected IO)', () => {
 
   it('combines all skip rules in one listing (only the valid files survive)', async () => {
     const files = {
-      'ok1.md': withMeta({ version: 1, pageId: 'a' }),
+      'ok1.md': withId('a'),
       'no-meta.md': 'plain\n',
-      'no-id.md': withMeta({ version: 1, title: 'x' }),
-      'broken.md': '<!-- docmost:meta\n{bad\n-->\nbody\n',
-      'ok2.md': withMeta({ version: 1, pageId: 'b' }),
+      'no-id.md': '---\ntags: [x]\n---\n\nbody\n',
+      'blank.md': '---\ngitmost_id:\n---\n\nbody\n',
+      'ok2.md': withId('b'),
       // missing.md rejects on read.
     };
     const result = await readExisting({

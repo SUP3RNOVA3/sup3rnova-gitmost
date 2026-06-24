@@ -8,7 +8,7 @@
  *   2. checkout docmost
  *   3. fetch the live tree (listSpaceTree -> {pages, complete}) -> compute the
  *      desired `live` files (relPath via the pure sanitize/disambiguation layout)
- *   4. parse `existing` tracked .md files (pageId + relPath from docmost:meta)
+ *   4. parse `existing` tracked .md files (pageId + relPath from gitmost_id frontmatter)
  *   5. plan = planReconciliation(live, existing)   (pure, SPEC §5/§8); toDelete
  *      is absence-only, moves are separate
  *   6. decideAbsenceDeletions: SUPPRESS absence deletions on an incomplete tree
@@ -32,7 +32,7 @@
  */
 import { dirname } from "node:path";
 import { sep } from "node:path";
-import { parseDocmostMarkdown } from "../lib/index";
+import { parsePageFile, serializePageFile } from "../lib/page-file";
 import type { GitSyncClient } from "./client.types";
 import { buildVaultLayout, type PageNode } from "./layout";
 import {
@@ -48,7 +48,7 @@ import {
   type MovedEntry,
   type DeletionDecision,
 } from "./reconcile";
-import { stabilizePageFile, type PageMeta } from "./stabilize";
+import { stabilizePageBody } from "./stabilize";
 
 // Engine-only mirror branch (SPEC §5): the engine writes here, humans never do.
 const DOCMOST_BRANCH = "docmost";
@@ -85,15 +85,15 @@ export interface ReadExistingDeps {
 }
 
 /**
- * Read every tracked .md file in the vault and parse its `docmost:meta` to
- * recover `{ pageId, relPath }`. Files without a parseable pageId in meta are
- * skipped (they are not engine-tracked pages — e.g. a stray hand-written file).
+ * Read every tracked .md file in the vault and recover `{ pageId, relPath }` from
+ * its `gitmost_id` frontmatter (native-Obsidian format). Files without a
+ * `gitmost_id` are skipped (they are not engine-tracked pages yet — e.g. a stray
+ * hand-written Obsidian file; PUSH adopts those separately).
  *
  * The IO is injected (R-Pull-1) so this is testable with fakes. Skip rules:
  *   - a `readFile` rejection (tracked but missing on disk, a mid-operation race)
  *     -> skipped, NOT thrown; the next pull converges;
- *   - unparseable meta (`parseDocmostMarkdown` throws) -> skipped;
- *   - parseable but no `pageId` in meta -> skipped.
+ *   - no `gitmost_id` frontmatter (`parsePageFile` -> id null) -> skipped.
  */
 export async function readExisting(
   deps: ReadExistingDeps,
@@ -111,15 +111,8 @@ export async function readExisting(
       // converges.
       continue;
     }
-    let pageId: string | undefined;
-    try {
-      const { meta } = parseDocmostMarkdown(text);
-      pageId = meta?.pageId;
-    } catch {
-      // Unparseable meta — not engine-tracked; leave it alone.
-      pageId = undefined;
-    }
-    if (pageId) existing.push({ pageId, relPath: rel });
+    const { id } = parsePageFile(text);
+    if (id) existing.push({ pageId: id, relPath: rel });
   }
   return existing;
 }
@@ -305,15 +298,13 @@ export async function applyPullActions(
   }): Promise<void> => {
     try {
       const page = await client.getPageJson(w.pageId);
-      const meta: PageMeta = {
-        version: 1,
-        pageId: page.id,
-        slugId: page.slugId,
-        title: page.title,
-        spaceId: page.spaceId,
-        parentPageId: page.parentPageId ?? null,
-      };
-      const text = await stabilizePageFile(page.content, meta);
+      // Native-Obsidian format: a minimal `gitmost_id` frontmatter + the fixpoint
+      // markdown body. title/parent/space are DERIVED (filename / folder / repo),
+      // so nothing but the pageId is persisted as meta.
+      const text = serializePageFile(
+        page.id,
+        await stabilizePageBody(page.content),
+      );
       const abs = relToAbs(vaultRoot, w.relPath);
       await deps.mkdir(dirname(abs));
       await deps.writeFile(abs, text);

@@ -164,6 +164,14 @@ describe('applyPullActions — happy path (write + commit + merge)', () => {
     const writtenPaths = fs.writes.map((w) => w.abs).sort();
     expect(writtenPaths).toEqual(['/vault/A.md', '/vault/Sub/B.md']);
 
+    // Every written file is in the native-Obsidian format: a `gitmost_id`
+    // frontmatter at the very top and NO legacy `docmost:meta` envelope. Guards
+    // against a regression back to the heavy meta block.
+    for (const w of fs.writes) {
+      expect(w.text.startsWith('---\ngitmost_id: ')).toBe(true);
+      expect(w.text).not.toContain('docmost:meta');
+    }
+
     // The git op order is: stageAll -> commit -> checkout main -> merge.
     expect(g.order).toEqual([
       'stageAll',

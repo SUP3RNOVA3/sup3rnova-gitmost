@@ -49,10 +49,30 @@ export async function stabilizePageFile(
   content: unknown,
   meta: PageMeta,
 ): Promise<string> {
-  const md1 = convertProseMirrorToMarkdown(content);
-  const doc2 = await markdownToProseMirror(md1);
-  const stableBody = convertProseMirrorToMarkdown(doc2);
   // The meta shape is exactly what `exportPageBody` writes; cast to the lib's
   // DocmostMdMeta (a superset with optional fields) for the serializer.
-  return serializeDocmostMarkdownBody(meta as DocmostMdMeta, stableBody);
+  return serializeDocmostMarkdownBody(
+    meta as DocmostMdMeta,
+    await stabilizePageBody(content),
+  );
+}
+
+/**
+ * The fixpoint markdown BODY for a page's ProseMirror `content`, WITHOUT any meta
+ * envelope:
+ *
+ *   md1        = convertProseMirrorToMarkdown(content)   // export...
+ *   doc2       = markdownToProseMirror(md1)              // ...import...
+ *   stableBody = convertProseMirrorToMarkdown(doc2)      // ...re-export
+ *
+ * The single export->import->export pass is the verified fixpoint (SPEC §11):
+ * idempotent for already-stable content, and the convergence point for the known
+ * converter asymmetries. The native-Obsidian writer (`serializePageFile`) wraps
+ * this body with a minimal `gitmost_id` frontmatter; determinism here is what
+ * keeps re-pulls of an unchanged page byte-identical (no churn, loop-guard).
+ */
+export async function stabilizePageBody(content: unknown): Promise<string> {
+  const md1 = convertProseMirrorToMarkdown(content);
+  const doc2 = await markdownToProseMirror(md1);
+  return convertProseMirrorToMarkdown(doc2);
 }
