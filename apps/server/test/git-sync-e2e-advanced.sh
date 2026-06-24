@@ -203,5 +203,28 @@ lp_after=$(vault_sha refs/docmost/last-pushed)
 # cleanup these pages (hard-delete; they are E2E-ADV-* so teardown also catches them)
 
 # ===========================================================================
+say "data-loss guard #2: untitled pages + retitle must NOT trash other pages"
+# THE bug from the browser flow: Docmost creates pages UNTITLED (title=''), which
+# all serialize to the `_` fallback name. Retitling one reshuffles the `_`
+# collision and relocates another's file; git reports the move as delete+add and
+# the push used to TRASH the relocated live page. Identity is the pageId now.
+ut_before=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and deleted_at is not null;")
+ut_ids=""
+for i in 1 2 3 4; do
+  id=$(api -X POST "$SERVER/api/pages/create" -H 'Content-Type: application/json' -d "{\"spaceId\":\"$SPACE_ID\",\"title\":\"\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  ut_ids="$ut_ids $id"; sync_now
+done
+# retitle the first one (like typing a title in the editor), then sync twice
+first=$(echo $ut_ids | awk '{print $1}')
+api -X POST "$SERVER/api/pages/update" -H 'Content-Type: application/json' -d "{\"pageId\":\"$first\",\"title\":\"E2E-ADV-Titled-$RANDOM\"}" >/dev/null
+sync_now; sync_now
+ut_after=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and deleted_at is not null;")
+live_kept=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and deleted_at is null and ($(echo $ut_ids | sed "s/ \?\([0-9a-f-]\+\)/ or id='\1'/g; s/^ or //"));")
+[ "${ut_after:-9}" = "${ut_before:-0}" ] && ok "no page trashed by the untitled+retitle reshuffle (was the data-loss bug)" || bad "trashed count grew ${ut_before}->${ut_after} (page lost to the reshuffle!)"
+[ "${live_kept:-0}" = "4" ] && ok "all 4 untitled/retitled pages still LIVE" || bad "only $live_kept/4 of the untitled pages survived"
+# cleanup these via the E2E-ADV teardown (the retitled one) + hard-delete the rest
+psqlq "delete from pages where id in ($(echo $ut_ids | sed "s/ \?\([0-9a-f-]\+\)/,'\1'/g; s/^,//"));" >/dev/null
+
+# ===========================================================================
 say "RESULTS: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
