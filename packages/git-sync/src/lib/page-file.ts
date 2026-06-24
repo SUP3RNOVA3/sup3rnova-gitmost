@@ -43,9 +43,18 @@ function readIdFromYaml(yaml: string): string | null {
 
 /**
  * Parse a page file into its identity (`id`) and clean markdown `body`. Tolerant:
- * a file with neither frontmatter nor legacy meta (a hand-written third-party
- * file) returns `id: null` and the whole text as the body — the caller then
- * ADOPTS it (creates a page, writes the id back).
+ * a file with no frontmatter (a hand-written third-party file) returns `id: null`
+ * and the whole text as the body — the caller then ADOPTS it (creates a page,
+ * writes the id back).
+ *
+ * KNOWN LIMITATION (phase 4 — adoption, see docs/backlog/git-sync-thin-meta.md):
+ * a leading frontmatter block is stripped from `body` even when it carries NO
+ * `gitmost_id` but DOES carry the user's own Obsidian properties (`tags:` etc.).
+ * On adoption those fields are not yet round-tripped — `serializePageFile`
+ * write-back persists only `gitmost_id`. Preserving arbitrary user frontmatter
+ * across the Docmost round-trip (BOTH adoption write-back AND the next pull's
+ * re-serialize) is deferred to the adoption phase; until then, do NOT roll the
+ * native format onto a real Obsidian vault whose notes carry properties.
  */
 export function parsePageFile(full: string): {
   id: string | null;

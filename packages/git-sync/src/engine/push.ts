@@ -96,7 +96,8 @@ export interface RenameMoveActionClassified {
  * given a path + side; the real `main` (a follow-up) wires them to the file tree
  * (`readFile` for `current`, `git.showFileAtRef` for `prev`), tests pass plain
  * lookups. SPEC §5 path-as-truth:
- *   - `metaAt`: the file's `docmost:meta` at that side (for the title).
+ *   - `metaAt`: the file's synthetic native meta at that side (title from the
+ *     filename, pageId from the `gitmost_id` frontmatter).
  *   - `resolveParentPageId`: the pageId of the page whose FILE is the parent
  *     FOLDER's `.md` (one level up from the given path), or `null` for ROOT.
  */
@@ -177,7 +178,7 @@ export interface PushActions {
 }
 
 /**
- * Which tree a `metaAt` lookup reads the file's `docmost:meta` from:
+ * Which tree a `metaAt` lookup reads the file's native meta from:
  *   - `current`: the current `main` tree (the live file content) — used for
  *     A/M/R, where the file still exists.
  *   - `prev`: the last-pushed PRE-IMAGE (e.g. `refs/docmost/last-pushed:<path>`)
@@ -191,7 +192,7 @@ export interface PushActionsInput {
   /** Diff rows of `main` vs `refs/docmost/last-pushed` (SPEC §6 step 2). */
   changes: DiffEntry[];
   /**
-   * Resolve a file's `docmost:meta` at a given side, or `null` if the file is
+   * Resolve a file's synthetic native meta at a given side, or `null` if the file is
    * absent there / has no parseable meta. PURE injection: the real `main` reads
    * the working tree (current) or `git show <last-pushed>:<path>` (prev); tests
    * pass a plain lookup.
@@ -234,7 +235,16 @@ export interface PushActionsInput {
  *       (`C` copy is treated the same as `R` for recording purposes.)
  */
 export function computePushActions(input: PushActionsInput): PushActions {
-  const { changes, metaAt, currentPageIds } = input;
+  const { metaAt, currentPageIds } = input;
+  // PAGE-FILE FILTER (design §"Адопция"): only `.md` files OUTSIDE any dot-folder
+  // are Docmost pages. `.obsidian/*`, attachments, and other non-page files are
+  // committed to the vault (no `.gitignore`) and so appear in the diff, but they
+  // are NEVER pages — Obsidian owns them. Without this filter every ADDED such
+  // file would be mis-classified as a CREATE (nativeMeta always supplies a
+  // spaceId, so the old `create-without-spaceId` skip no longer screens them),
+  // creating junk pages in Docmost and corrupting the file with a `gitmost_id`
+  // frontmatter. Filter BEFORE any classification so non-page A/M/D/R are ignored.
+  const changes = input.changes.filter((c) => isPageFile(c.path));
   const actions: PushActions = {
     creates: [],
     updates: [],
@@ -245,7 +255,7 @@ export function computePushActions(input: PushActionsInput): PushActions {
 
   // GHOST-MOVE coalescing (⭐ data-loss guard). git's rename detection (`-M`)
   // can miss a move when the two files are too dissimilar — which is exactly the
-  // case for the tiny `docmost:meta`-only files a layout RESHUFFLE produces (e.g.
+  // case for the tiny meta-only files a layout RESHUFFLE produces (e.g.
   // several untitled pages sharing the `_` fallback name; retitling one frees the
   // bare `_` and another page's file relocates `_ ~slug.md` -> `_.md`). git then
   // reports the move as a DELETE of the old path + an ADD of the new one. Taken
@@ -523,7 +533,7 @@ export interface ApplyPushResult {
   /** Pages retitled in Docmost via `rename_page` (push #3, SPEC §5/§6). */
   renamed: number;
   /**
-   * Files whose `docmost:meta` was rewritten with the pageId Docmost assigned on
+   * Files whose `gitmost_id` frontmatter was written with the pageId Docmost assigned on
    * create — these now need a FOLLOW-UP commit (the meta on disk changed). The
    * commit itself is the caller's job (NEXT increment); recorded here so it is
    * not lost.
@@ -570,8 +580,8 @@ export interface ApplyPushResult {
  *     `importPageMarkdown` parses the meta/body itself.
  *   - CREATE: derive title/spaceId/parentPageId from the file's current meta,
  *     `client.createPage(...)`, take the assigned pageId from the result, and
- *     write it BACK into the file's `docmost:meta` (re-serialized via
- *     `serializeDocmostMarkdownBody`, body preserved) so the file becomes
+ *     write it BACK as the file's `gitmost_id` frontmatter (re-serialized via
+ *     `serializePageFile`, body preserved) so the file becomes
  *     tracked. The write-back is recorded in `writtenBack` (a follow-up commit
  *     is needed — NEXT increment).
  *   - DELETE: `client.deletePage(pageId)` — soft-delete to Trash (SPEC §8).
@@ -886,6 +896,19 @@ export function parentFolderFile(path: string): string | null {
   return folderNote;
 }
 
+/**
+ * Whether a vault path is a Docmost PAGE file (design §"Адопция"): a `.md` file
+ * with NO dot-segment anywhere in its path. This excludes `.obsidian/` config,
+ * `.trash/`, dotfiles (`.foo.md`), and every non-`.md` file (attachments, JSON,
+ * …) — Obsidian owns those; they live in the vault but are never pages. Used to
+ * screen the PUSH diff so non-page files are never created/updated/deleted in
+ * Docmost (and never get a `gitmost_id` frontmatter written into them).
+ */
+export function isPageFile(path: string): boolean {
+  if (!path.endsWith(".md")) return false;
+  return !path.split("/").some((seg) => seg.startsWith("."));
+}
+
 /** The last path segment of a forward-slash path (the folder/file base name). */
 function baseSegment(path: string): string {
   const slash = path.lastIndexOf("/");
@@ -929,7 +952,7 @@ function nativeMeta(
  *   - `current` -> `deps.readFile(<dir>.md)` (the live working tree),
  *   - `prev`    -> `git.showFileAtRef('refs/docmost/last-pushed', <dir>.md)` (the
  *     last-pushed pre-image),
- * then parse its `docmost:meta` and return that page's pageId. A root-level path
+ * then read its `gitmost_id` frontmatter and return that page's pageId. A root-level path
  * (no enclosing folder), a missing/unreadable parent file, or a parent file with
  * no parseable pageId all resolve to `null` (parent is ROOT / unknown ->
  * `parentPageId: null`, SPEC §16 "parentPageId: null -> в корень").

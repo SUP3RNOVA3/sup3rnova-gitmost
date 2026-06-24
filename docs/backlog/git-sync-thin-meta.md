@@ -122,6 +122,12 @@ Obsidian резолвит `[[Заметка]]` по **basename** (не по по
    пути (`parentFolderFile` folder-note-aware). CREATE пишет `gitmost_id` обратно;
    UPDATE шлёт чистое тело (без frontmatter) на обе стороны 3-way merge. (готово)
 4. Адопция голых файлов/папок (частично в фазе 3: файл без `gitmost_id` → create).
+   ВАЖНО: тут же сохранить пользовательский frontmatter (Obsidian properties) при
+   адопции — `parsePageFile` сейчас срезает ведущий frontmatter даже без
+   `gitmost_id`, а write-back пишет только `gitmost_id`; нужно врезать `gitmost_id`
+   в существующий frontmatter и сохранять остальные поля И при write-back, И при
+   следующем pull (иначе pull перезатрёт). До этого native-формат НЕ катить на
+   реальный Obsidian-волт с properties.
 5. Чистка: выпилить старый `docmost:meta` формат-код целиком.
 6. Ссылки: конвертер Docmost-mention ↔ `[[wikilink]]` + переписывание при retitle.
 

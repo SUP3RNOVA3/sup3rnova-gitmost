@@ -318,3 +318,47 @@ describe('computePushActions — currentPageIds guard (cross-cycle move)', () =>
     expect(actions.skipped).toEqual([]);
   });
 });
+
+describe('computePushActions — page-file filter (non-page files ignored)', () => {
+  it('IGNORES added/modified/deleted non-page files (.obsidian, dotfiles, non-.md)', () => {
+    // A vault commits `.obsidian/*`, attachments, dotfiles (no .gitignore), so
+    // they show up in the diff — but they are NEVER Docmost pages. Even though a
+    // synthetic metaAt would hand back a spaceId (the vault's), none of these may
+    // become a CREATE/UPDATE/DELETE. This pins the data-corruption guard: an
+    // added `.obsidian/workspace.json` must NOT create a page nor get a gitmost_id.
+    const changes: DiffEntry[] = [
+      { status: 'A', path: '.obsidian/workspace.json' },
+      { status: 'M', path: '.obsidian/app.json' },
+      { status: 'A', path: 'attachments/diagram.png' },
+      { status: 'A', path: '.hidden.md' }, // dotfile, even with .md
+      { status: 'A', path: 'Notes/.config/x.md' }, // dot-segment mid-path
+      { status: 'D', path: '.obsidian/old.json' },
+    ];
+    // Every path resolves to a spaceId-bearing meta (the vault's space) — proving
+    // the filter, not a missing spaceId, is what screens them out.
+    const metaAt = (path: string): DocmostMdMeta =>
+      ({ version: 1, title: 'x', spaceId: 'sp-vault' }) as DocmostMdMeta;
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.creates).toEqual([]);
+    expect(actions.updates).toEqual([]);
+    expect(actions.deletes).toEqual([]);
+    expect(actions.renamesMoves).toEqual([]);
+    expect(actions.skipped).toEqual([]); // not even recorded as skipped — ignored
+  });
+
+  it('still processes a normal .md page alongside ignored non-page files', () => {
+    const changes: DiffEntry[] = [
+      { status: 'A', path: '.obsidian/workspace.json' },
+      { status: 'A', path: 'Real Page.md' },
+      { status: 'A', path: 'Folder/Note.md' },
+    ];
+    const metaAt = (path: string): DocmostMdMeta =>
+      ({ version: 1, title: 'x', spaceId: 'sp-vault' }) as DocmostMdMeta;
+    const actions = computePushActions({ changes, metaAt });
+    // Only the two real .md pages become creates; the .obsidian file is ignored.
+    expect(actions.creates).toEqual([
+      { path: 'Real Page.md' },
+      { path: 'Folder/Note.md' },
+    ]);
+  });
+});
