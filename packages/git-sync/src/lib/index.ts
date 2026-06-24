@@ -25,3 +25,4 @@ export {
   canonicalizeContent,
   docsCanonicallyEqual,
 } from "./canonicalize";
+export { parsePageFile, serializePageFile } from "./page-file";
