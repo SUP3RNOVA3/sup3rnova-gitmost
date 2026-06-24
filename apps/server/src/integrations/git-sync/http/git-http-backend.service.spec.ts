@@ -1,11 +1,186 @@
 // Unit tests for the pure CGI-response helpers used by GitHttpBackendService.
 // The header/body split MUST treat the body as binary (Buffer) and never
 // stringify it; the Status: header sets the HTTP status (default 200).
+import { EventEmitter } from 'node:events';
+import { spawn } from 'node:child_process';
+
+// Mock the spawn boundary so run() never launches a real `git http-backend`; the
+// fake child lets us drive every stdout/stderr/error/close branch by hand.
+jest.mock('node:child_process', () => ({ spawn: jest.fn() }));
+// vaultGitEnv just builds the CGI env overlay; stub it to a passthrough so the
+// service constructs without the real engine.
+jest.mock('@docmost/git-sync', () => ({
+  vaultGitEnv: (overlay: Record<string, string>) => overlay,
+}));
+
 import {
   parseCgiResponse,
   splitCgiBuffer,
   buildGitBackendCgiEnv,
+  GitHttpBackendService,
 } from './git-http-backend.service';
+import { Logger } from '@nestjs/common';
+import type { GitHttpBackendRequest } from './git-http-backend.service';
+
+const spawnMock = spawn as unknown as jest.Mock;
+
+/** A fake `git http-backend` child: EventEmitter + stdout/stderr/stdin streams. */
+function fakeChild() {
+  const child = new EventEmitter() as any;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  // stdin is written/ended/piped to; capture the calls, swallow nothing.
+  child.stdin = Object.assign(new EventEmitter(), {
+    end: jest.fn(),
+    write: jest.fn(),
+  });
+  return child;
+}
+
+/** A fake raw Node ServerResponse capturing status/headers/body/end. */
+function fakeRes() {
+  const res: any = {
+    headersSent: false,
+    writableEnded: false,
+    statusCode: 200,
+    _headers: {} as Record<string, string>,
+    _written: [] as Buffer[],
+    setHeader: jest.fn((name: string, value: string) => {
+      res._headers[name] = value;
+    }),
+    write: jest.fn((chunk: Buffer) => {
+      res._written.push(chunk);
+      return true;
+    }),
+    end: jest.fn((chunk?: Buffer | string) => {
+      if (chunk !== undefined) res._written.push(chunk as Buffer);
+      res.writableEnded = true;
+    }),
+  };
+  return res;
+}
+
+/** A fake raw Node IncomingMessage (GET => no body piped). */
+function fakeReq() {
+  const req = new EventEmitter() as any;
+  req.pipe = jest.fn();
+  return req;
+}
+
+const baseRequest: GitHttpBackendRequest = {
+  spaceId: 'space-1',
+  subpath: 'info/refs',
+  method: 'GET',
+  queryString: 'service=git-upload-pack',
+  contentType: '',
+  remoteUser: 'alice@example.com',
+};
+
+function buildService() {
+  const env = { getGitSyncDataDir: jest.fn(() => '/vaults') };
+  return new GitHttpBackendService(env as any);
+}
+
+describe('GitHttpBackendService.run', () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('(a) responds 500 when the child errors before any headers were written', async () => {
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService();
+    const res = fakeRes();
+
+    const p = service.run(baseRequest, fakeReq(), res);
+    // Emit a child 'error' before any stdout -> 500, headers not already sent.
+    child.emit('error', new Error('ENOENT spawn git'));
+    await p;
+
+    expect(res.statusCode).toBe(500);
+    expect(res._headers['Content-Type']).toBe('text/plain');
+    expect(res.end).toHaveBeenCalledWith('Internal server error');
+  });
+
+  it('(a) responds 500 when the child closes before a complete CGI header block', async () => {
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService();
+    const res = fakeRes();
+
+    const p = service.run(baseRequest, fakeReq(), res);
+    // stderr diagnostics, then a close with no valid CGI output -> 500.
+    child.stderr.emit('data', Buffer.from('fatal: boom'));
+    child.emit('close', 128);
+    await p;
+
+    expect(res.statusCode).toBe(500);
+    expect(res.end).toHaveBeenCalledWith('Internal server error');
+  });
+
+  it('(b) parses the CGI header block, sets status/headers, writes the body', async () => {
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService();
+    const res = fakeRes();
+
+    const p = service.run(baseRequest, fakeReq(), res);
+    // A full CGI response: status line + header + blank line + body.
+    child.stdout.emit(
+      'data',
+      Buffer.from(
+        'Status: 200 OK\r\nContent-Type: application/x-git-upload-pack-advertisement\r\n\r\nPACKBODY',
+        'utf8',
+      ),
+    );
+    child.emit('close', 0);
+    await p;
+
+    expect(res.statusCode).toBe(200);
+    expect(res._headers['Content-Type']).toBe(
+      'application/x-git-upload-pack-advertisement',
+    );
+    expect(Buffer.concat(res._written.map((c) => Buffer.from(c))).toString()).toContain(
+      'PACKBODY',
+    );
+    expect(res.writableEnded).toBe(true);
+  });
+
+  it('(c) swallows a stdout stream error (EPIPE) without throwing or 500ing', async () => {
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService();
+    const res = fakeRes();
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn');
+
+    const p = service.run(baseRequest, fakeReq(), res);
+    // The stdout 'error' handler must absorb this — no unhandled throw, no 500.
+    expect(() => child.stdout.emit('error', new Error('EPIPE'))).not.toThrow();
+    expect(() => child.stderr.emit('error', new Error('EPIPE'))).not.toThrow();
+    expect(warnSpy).toHaveBeenCalled();
+    expect(res.statusCode).not.toBe(500);
+
+    // Let run() settle so the promise does not dangle.
+    child.emit('close', 0);
+    await p;
+  });
+
+  it('spawn throwing synchronously -> 500 (spawn-failed)', async () => {
+    spawnMock.mockImplementation(() => {
+      throw new Error('spawn EACCES');
+    });
+    const service = buildService();
+    const res = fakeRes();
+
+    await service.run(baseRequest, fakeReq(), res);
+
+    expect(res.statusCode).toBe(500);
+    expect(res.end).toHaveBeenCalledWith('Internal server error');
+  });
+});
 
 describe('buildGitBackendCgiEnv', () => {
   const base = {

@@ -201,12 +201,22 @@ export class GitHttpBackendService {
           flushHeadersAndBody(chunk);
         }
       });
+      // A stream 'error' (e.g. EPIPE when the client aborts mid-response) is an
+      // EventEmitter 'error' with no listener -> Node rethrows it as an uncaught
+      // exception and crashes the process. Swallow + log it (never echo to the
+      // client); child.on('close')/'error' below drives the actual cleanup.
+      child.stdout?.on('error', (err) => {
+        this.logger.warn(`git http-backend stdout stream error: ${err.message}`);
+      });
 
       let stderr = '';
       child.stderr?.on('data', (chunk: Buffer) => {
         // Capture for diagnostics; never echo to the client. http-backend writes
         // CGI errors here. We do NOT log the request body or any credentials.
         if (stderr.length < 8192) stderr += chunk.toString('utf8');
+      });
+      child.stderr?.on('error', (err) => {
+        this.logger.warn(`git http-backend stderr stream error: ${err.message}`);
       });
 
       child.on('error', (err) => {

@@ -196,6 +196,38 @@ describe('PageChangeListener', () => {
     });
   });
 
+  describe('onModuleDestroy', () => {
+    it('clears every pending debounce timer and empties the map', async () => {
+      jest.useFakeTimers();
+      const clearSpy = jest.spyOn(global, 'clearTimeout');
+      try {
+        const { listener, orchestrator, pageRepo } = build({ debounceMs: 500 });
+        pageRepo.findById.mockResolvedValue({
+          id: 'p1',
+          spaceId: 'space-1',
+          workspaceId: 'ws-1',
+          lastUpdatedSource: 'user',
+        });
+
+        // Schedule a pending cycle, then tear the module down before it fires.
+        await listener.handlePageEvent({ pageId: 'p1', workspaceId: 'ws-1' });
+        clearSpy.mockClear(); // ignore any clears done by schedule() itself
+
+        listener.onModuleDestroy();
+
+        // The pending timer was cleared and the map drained, so advancing past
+        // the debounce window fires NO cycle.
+        expect(clearSpy).toHaveBeenCalledTimes(1);
+        expect((listener as any).debounce.size).toBe(0);
+        jest.advanceTimersByTime(500);
+        expect(orchestrator.runOnce).not.toHaveBeenCalled();
+      } finally {
+        clearSpy.mockRestore();
+        jest.useRealTimers();
+      }
+    });
+  });
+
   describe('error swallowing', () => {
     it('does not throw and logs a warning when findById throws', async () => {
       const warnSpy = jest

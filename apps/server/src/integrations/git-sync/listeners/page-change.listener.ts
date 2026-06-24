@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { OnEvent } from '@nestjs/event-emitter';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { EnvironmentService } from '../../environment/environment.service';
@@ -36,7 +36,7 @@ interface PageEventLike {
  * here. The poll-safety interval still converges anything this guard drops.
  */
 @Injectable()
-export class PageChangeListener {
+export class PageChangeListener implements OnModuleDestroy {
   private readonly logger = new Logger(PageChangeListener.name);
   // spaceId -> pending debounce timer. The cycle closes over its own
   // workspaceId, so the timer handle is all the map needs to track.
@@ -111,6 +111,19 @@ export class PageChangeListener {
     if (fromPages) return fromPages;
     if (event.node?.id === pageId) return event.node.spaceId;
     return undefined;
+  }
+
+  /**
+   * On shutdown, clear every pending debounce timer so a not-yet-fired cycle does
+   * not run against a tearing-down module. The timers are already `.unref()`'d (so
+   * they never block process exit), but clearing them also drops the dangling
+   * references and prevents a late `runOnce` from firing post-destroy.
+   */
+  onModuleDestroy(): void {
+    for (const timer of this.debounce.values()) {
+      clearTimeout(timer);
+    }
+    this.debounce.clear();
   }
 
   /**

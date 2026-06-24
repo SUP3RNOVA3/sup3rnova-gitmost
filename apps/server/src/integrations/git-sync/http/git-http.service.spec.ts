@@ -14,6 +14,7 @@ import {
   SpaceCaslSubject,
 } from '../../../core/casl/interfaces/space-ability.type';
 import { GitHttpService } from './git-http.service';
+import { GitSyncLockHeldError } from '../services/git-sync.orchestrator';
 
 type AnyMock = jest.Mock;
 
@@ -351,6 +352,66 @@ describe('GitHttpService.handle', () => {
       built.orchestrator.ingestExternalPush.mock.calls[0];
     expect(spaceId).toBe('space-1');
     expect(workspaceId).toBe('ws-1');
+  });
+
+  it('a push that loses the lock -> 503 with Retry-After and a busy body (headers not written twice)', async () => {
+    const built = build({ abilityCan: true });
+    // The lock could not be acquired: the receive-pack closure never ran, so the
+    // response is still unwritten and the handler must answer 503 itself.
+    built.orchestrator.ingestExternalPush.mockRejectedValue(
+      new GitSyncLockHeldError('space-1'),
+    );
+    const { reply, state } = fakeReply();
+    const req = fakeRequest({
+      url: '/git/space-1.git/git-receive-pack',
+      method: 'POST',
+      authorization: basic('dev@example.com', 'pw'),
+    });
+
+    await built.service.handle(req, reply);
+
+    // It hijacked and went through the orchestrator (write path), but the lock
+    // was held so the backend never ran.
+    expect(state.hijacked).toBe(true);
+    expect(built.orchestrator.ingestExternalPush).toHaveBeenCalledTimes(1);
+    expect(built.backend.run).not.toHaveBeenCalled();
+
+    // 503 + Retry-After were written on the raw response (headersSent was false).
+    const raw = reply.raw as any;
+    expect(raw.statusCode).toBe(503);
+    expect(raw.setHeader).toHaveBeenCalledWith('Content-Type', 'text/plain');
+    expect(raw.setHeader).toHaveBeenCalledWith('Retry-After', '1');
+    // The body carries the busy/retry message and the response was ended once.
+    expect(raw.end).toHaveBeenCalledTimes(1);
+    expect(raw.end).toHaveBeenCalledWith('git-sync busy, retry');
+    // Exactly the two headers above were set — no double write of headers.
+    expect(raw.setHeader).toHaveBeenCalledTimes(2);
+  });
+
+  it('does NOT rewrite the 503 status/headers when the response is already sent', async () => {
+    const built = build({ abilityCan: true });
+    built.orchestrator.ingestExternalPush.mockRejectedValue(
+      new GitSyncLockHeldError('space-1'),
+    );
+    const { reply } = fakeReply();
+    // Simulate the (defensive) case where headers were already flushed: the
+    // handler must skip statusCode/setHeader and only end() the socket.
+    const raw = reply.raw as any;
+    raw.headersSent = true;
+    const req = fakeRequest({
+      url: '/git/space-1.git/git-receive-pack',
+      method: 'POST',
+      authorization: basic('dev@example.com', 'pw'),
+    });
+
+    await built.service.handle(req, reply);
+
+    // No header writes when headersSent is already true (no "headers already
+    // sent" double-write path), but the body/end still runs.
+    expect(raw.setHeader).not.toHaveBeenCalled();
+    expect(raw.statusCode).toBe(200); // untouched default from the fake
+    expect(raw.end).toHaveBeenCalledTimes(1);
+    expect(raw.end).toHaveBeenCalledWith('git-sync busy, retry');
   });
 
   it('an unresolvable workspace -> 401 (credentials cannot be validated without one)', async () => {
