@@ -115,9 +115,13 @@ Obsidian резолвит `[[Заметка]]` по **basename** (не по по
 
 1. ✅ Формат файла: `parsePageFile`/`serializePageFile` (frontmatter id + тело,
    `gitmost_id` frontmatter + тело). Юниты. Без смены поведения. (готово)
-2. PULL пишет native-формат (frontmatter + folder-note layout). Волты wipe+rebuild.
-3. PUSH берёт идентичность из frontmatter, родителя из пути.
-4. Адопция голых файлов/папок.
+2. ✅ PULL пишет native-формат (frontmatter + folder-note layout). Волты
+   wipe+rebuild. (2a — folder-note layout в `buildVaultLayout`; 2b — PULL пишет
+   `serializePageFile`, `readExisting` читает frontmatter.) (готово)
+3. ✅ PUSH берёт идентичность из frontmatter, title из имени файла, родителя из
+   пути (`parentFolderFile` folder-note-aware). CREATE пишет `gitmost_id` обратно;
+   UPDATE шлёт чистое тело (без frontmatter) на обе стороны 3-way merge. (готово)
+4. Адопция голых файлов/папок (частично в фазе 3: файл без `gitmost_id` → create).
 5. Чистка: выпилить старый `docmost:meta` формат-код целиком.
 6. Ссылки: конвертер Docmost-mention ↔ `[[wikilink]]` + переписывание при retitle.
 
