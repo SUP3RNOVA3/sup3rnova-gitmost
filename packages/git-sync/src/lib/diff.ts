@@ -21,7 +21,7 @@ import { getSchema } from "@tiptap/core";
 import { Node } from "@tiptap/pm/model";
 import { ChangeSet, simplifyChanges } from "@tiptap/pm/changeset";
 import { recreateTransform } from "@fellow/prosemirror-recreate-transform";
-import { docmostExtensions } from "./docmost-schema";
+import { docmostExtensions } from "./docmost-schema.js";
 
 /** A single inserted/deleted change with its containing-block context. */
 export interface DiffChange {

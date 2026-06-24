@@ -1,24 +1,21 @@
 /**
- * The client seam. Upstream `pull.ts`/`push.ts` reached into the
- * REST `DocmostClient` from the `docmost-client` package via `Pick<DocmostClient,
- * ...>` subsets. That package is NOT vendored here (the gitmost server writes
- * NATIVELY — through repositories + collab `openDirectConnection`),
- * so the engine must depend on a narrow STRUCTURAL interface instead.
+ * The client seam. `pull.ts`/`push.ts` depend on a narrow STRUCTURAL interface
+ * rather than any concrete client, because the gitmost server writes NATIVELY —
+ * through repositories + collab `openDirectConnection`.
  *
- * `GitSyncClient` is that interface: the native datasource (server side, a later
- * step) implements it, and the vendored engine only ever uses `Pick<GitSyncClient,
- * ...>` subsets of it. The signatures below MIRROR exactly the methods the
- * vendored `pull.ts`/`push.ts` actually call (arg shapes + the fields the engine
- * reads off each result) — verified against the upstream `DocmostClient`
- * (packages/docmost-client/src/client.ts) so a real REST client is still
- * structurally assignable, and so the native adapter has a precise contract.
+ * `GitSyncClient` is that interface: the native datasource (server side)
+ * implements it, and the engine only ever uses `Pick<GitSyncClient, ...>`
+ * subsets of it. The signatures below MIRROR exactly the methods the engine's
+ * `pull.ts`/`push.ts` actually call (arg shapes + the fields the engine reads
+ * off each result), so a REST-style client is still structurally assignable and
+ * the native adapter has a precise contract.
  */
 
 /**
  * A page node as returned by `listSpaceTree` (the sidebar/tree walk, no body).
  * The engine layout (`buildVaultLayout`) consumes `PageNode` from `./layout`,
  * which only requires `id` (+ optional `title`/`slugId`/`parentPageId`); this
- * lite shape documents the fields the tree walk surfaces. Upstream nodes also
+ * lite shape documents the fields the tree walk surfaces. Real tree nodes also
  * carry `position`, `icon`, `hasChildren` — kept open via the index signature.
  */
 export interface GitSyncPageNodeLite {
@@ -27,7 +24,7 @@ export interface GitSyncPageNodeLite {
   title?: string;
   parentPageId?: string | null;
   hasChildren?: boolean;
-  /** Upstream `listSpaceTree` nodes carry extra fields (position, icon, …). */
+  /** `listSpaceTree` nodes carry extra fields (position, icon, …). */
   [key: string]: unknown;
 }
 

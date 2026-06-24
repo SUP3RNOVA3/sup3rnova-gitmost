@@ -2,7 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { mkdir } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { VaultGit, vaultGitEnv } from '@docmost/git-sync';
+import type { VaultGit } from '@docmost/git-sync';
+import { loadGitSync } from '../git-sync.loader';
 import { EnvironmentService } from '../../environment/environment.service';
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +42,7 @@ export class VaultRegistryService {
 
     const path = this.vaultPath(spaceId);
     await mkdir(path, { recursive: true });
+    const { VaultGit } = await loadGitSync();
     const vault = new VaultGit(path);
     this.vaults.set(spaceId, vault);
     return vault;
@@ -66,6 +68,7 @@ export class VaultRegistryService {
    * every request.
    */
   async ensureServable(spaceId: string): Promise<string> {
+    const { vaultGitEnv } = await loadGitSync();
     const vault = await this.getVault(spaceId);
     const path = this.vaultPath(spaceId);
 

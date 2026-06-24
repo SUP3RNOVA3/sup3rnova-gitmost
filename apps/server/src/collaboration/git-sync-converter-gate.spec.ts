@@ -1,7 +1,17 @@
 /**
+ * JEST CONFIG NOTE (#119 ESM refactor): this is the one spec that needs the REAL
+ * `@docmost/git-sync` converter (not a mock). The package is now ESM, which jest
+ * cannot `require()` nor `import()` without --experimental-vm-modules, so the
+ * server jest config `moduleNameMapper`s `@docmost/git-sync` to its TS SOURCE and
+ * strips the ESM `.js` import suffixes. ts-jest then type-checks that source under
+ * the server's (looser) tsconfig and trips a benign narrowing; the global
+ * `isolatedModules: true` on the ts-jest transform (apps/server/package.json)
+ * makes it transpile-only so this spec loads. Full type-checking of the package
+ * is still enforced by its own `tsc`/vitest gates and the server `tsc --noEmit`.
+ *
  * §13.1 IDEMPOTENCY GATE — the blocking gate for git-sync Phase B.
  *
- * Proves the vendored `@docmost/git-sync` pure converter is schema-compatible
+ * Proves the `@docmost/git-sync` pure converter is schema-compatible
  * with the server's REAL editor-ext document schema: a representative corpus of
  * editor-ext ProseMirror documents must survive a full round trip through the
  * actual server write path without losing any node / mark / attribute.
@@ -19,7 +29,7 @@
  *      validation that runs on a git-sync write (plan §3.3).
  *   4. assert docsCanonicallyEqual(canon(original), canon(normalized)) === true
  *
- * Any node / mark / attr that editor-ext drops (because the vendored
+ * Any node / mark / attr that editor-ext drops (because the git-sync
  * docmost-schema named it differently, or declares a different default) makes
  * the gate FAIL for that document — exactly the schema-divergence plan §3.3 /
  * §13.1 warn about. Genuine, irreducible divergences are isolated into the
@@ -31,9 +41,11 @@
  */
 import { TiptapTransformer } from '@hocuspocus/transformer';
 // Import the server's real schema FIRST so `@docmost/editor-ext` resolves to its
-// built CJS `dist` (its `main`). Importing the ESM `@docmost/git-sync` package
-// first flips jest's resolver to editor-ext's `module` (src) field, which then
-// drags in React node views (navigator-less) and breaks the node test env.
+// built CJS `dist` (its `main`). The ESM-only `@docmost/git-sync` package is
+// mapped to its TS SOURCE by the jest `moduleNameMapper` (the built ESM cannot
+// be `require()`d nor dynamically `import()`ed under jest's node VM), so ts-jest
+// transpiles the real converter to CJS here — exercising the actual converter
+// the server ships, not a stub.
 import { tiptapExtensions } from './collaboration.util';
 import {
   convertProseMirrorToMarkdown,

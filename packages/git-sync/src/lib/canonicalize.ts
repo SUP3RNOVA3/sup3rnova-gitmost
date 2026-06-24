@@ -1,9 +1,7 @@
 /**
- * docmost-sync ADDITION (not present in docmost-mcp).
- *
- * Semantic canonicalization of ProseMirror/TipTap documents for the Phase-0
- * round-trip idempotency check (SPEC §11, "Задача №0", option (б): compare a
- * CANONICALIZED form rather than raw bytes).
+ * Semantic canonicalization of ProseMirror/TipTap documents for the round-trip
+ * idempotency check (SPEC §11, "Задача №0", option (б): compare a CANONICALIZED
+ * form rather than raw bytes).
  *
  * `markdownToProseMirror` reconstructs schema DEFAULT attributes (e.g.
  * `indent: null` where the source omitted it) and regenerates per-block ids on
@@ -12,8 +10,7 @@
  * normalizes a document so that two semantically-equal docs compare deep-equal
  * regardless of block ids and absent-vs-explicit-default-null attributes.
  *
- * This file is intentionally a NEW, self-contained module so it is trivial to
- * backport into docmost-mcp without touching existing code.
+ * It is a self-contained module with no external dependencies.
  */
 
 /**

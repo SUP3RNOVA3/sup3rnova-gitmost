@@ -1,16 +1,14 @@
 /**
- * Engine settings (ADAPTED for vendoring).
+ * Engine settings.
  *
- * Upstream this module also loaded `.env` (`dotenv`) and bound `parseSettings`
- * to `process.env` via a `loadSettings()` entry point. In gitmost the engine is
- * driven IN-PROCESS by the NestJS server, which builds the `Settings` object
- * from `EnvironmentService` — so the engine must NOT reach into
- * `process.env` here. We therefore vendor ONLY:
+ * The engine is driven IN-PROCESS by the NestJS server, which builds the
+ * `Settings` object from `EnvironmentService` — so this module must NOT reach
+ * into `process.env`. It exposes only:
  *   - the `Settings` type the engine consumes, and
  *   - `parseSettings(env)` as a PURE function (validate a raw env object -> typed
  *     `Settings`), kept for unit tests and for the server to reuse if it wants
  *     to validate an env-shaped object.
- * The `loadSettings()` / `loadDotenv()` side-effecting entry point is dropped.
+ * There is no `.env`-loading side-effecting entry point.
  */
 import { z } from 'zod';
 

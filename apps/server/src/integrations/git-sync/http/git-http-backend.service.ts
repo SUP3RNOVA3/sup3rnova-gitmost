@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { spawn } from 'node:child_process';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { vaultGitEnv } from '@docmost/git-sync';
+import { loadGitSync } from '../git-sync.loader';
 import { EnvironmentService } from '../../environment/environment.service';
 
 /** The parsed first part of a CGI response: the HTTP status + header pairs. */
@@ -152,6 +152,7 @@ export class GitHttpBackendService {
     rawReq: IncomingMessage,
     rawRes: ServerResponse,
   ): Promise<void> {
+    const { vaultGitEnv } = await loadGitSync();
     const projectRoot = this.environmentService.getGitSyncDataDir();
     // Build the CGI env from the engine's cwd-isolated base (strips GIT_DIR /
     // GIT_WORK_TREE), then layer the http-backend CGI variables. PATH is

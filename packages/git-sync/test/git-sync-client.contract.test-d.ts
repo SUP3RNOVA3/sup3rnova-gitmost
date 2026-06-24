@@ -2,7 +2,7 @@ import { describe, it, expect, expectTypeOf } from 'vitest';
 import type {
   GitSyncClient,
   GitSyncPageNodeLite,
-} from '../src/engine/client.types';
+} from '../src/engine/client.types.js';
 
 // Contract / type-level guard of the `GitSyncClient` seam (src/engine/client.types.ts).
 //

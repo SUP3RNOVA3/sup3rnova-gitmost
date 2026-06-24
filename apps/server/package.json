@@ -189,7 +189,12 @@
           ]
         }
       ],
-      "^.+\\.(t|j)sx?$": "ts-jest"
+      "^.+\\.(t|j)sx?$": [
+        "ts-jest",
+        {
+          "isolatedModules": true
+        }
+      ]
     },
     "transformIgnorePatterns": [
       "/node_modules/(?!(\\.pnpm/)?(nanoid|uuid|image-dimensions|marked|happy-dom|lib0)(@|/))"
@@ -206,7 +211,10 @@
       "^@docmost/db/(.*)$": "<rootDir>/database/$1",
       "^@docmost/transactional/(.*)$": "<rootDir>/integrations/transactional/$1",
       "^@docmost/ee/(.*)$": "<rootDir>/ee/$1",
-      "^src/(.*)$": "<rootDir>/$1"
+      "^src/(.*)$": "<rootDir>/$1",
+      "^@docmost/git-sync$": "<rootDir>/../../../packages/git-sync/src/index.ts",
+      "^@docmost/git-sync/(.*)$": "<rootDir>/../../../packages/git-sync/src/$1",
+      "^(\\.{1,2}/.*)\\.js$": "$1"
     }
   }
 }

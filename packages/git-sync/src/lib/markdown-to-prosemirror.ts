@@ -1,67 +1,16 @@
 /**
- * Pure markdown -> ProseMirror conversion (extracted from docmost-sync's
- * `packages/docmost-client/src/lib/collaboration.ts`).
+ * Pure markdown -> ProseMirror conversion.
  *
- * Only the PURE converter path is vendored here: `markdownToProseMirror`
- * (marked -> HTML -> generateJSON) plus the two pre/post processors it needs
- * (`preprocessCallouts`, `bridgeTaskLists`). The collaboration/websocket
- * write-path (Hocuspocus, Yjs, `ws`, `withPageLock`, `sanitizeForYjs`) that
- * lives in the same upstream file is intentionally NOT vendored — the gitmost
- * server writes page bodies natively through the collab gateway.
+ * The converter path is `markdownToProseMirror` (marked -> HTML ->
+ * generateJSON) plus the two pre/post processors it needs (`preprocessCallouts`,
+ * `bridgeTaskLists`). The gitmost server writes the resulting page bodies
+ * natively through the collab gateway, so no websocket/Yjs write-path lives
+ * here.
  */
 import { generateJSON } from "@tiptap/html";
 import { JSDOM } from "jsdom";
-import { docmostExtensions } from "./docmost-schema";
-
-/**
- * Structural type for the bits of the `marked` ESM module we use: just the
- * `marked` named export's `parse` method (markdown -> HTML string).
- */
-interface MarkedModule {
-  marked: { parse(markdown: string): string | Promise<string> };
-}
-
-// `marked` is ESM-only. Under this package's CommonJS build TS would otherwise
-// downlevel a literal `import()` to `require()`, which cannot load an ESM-only
-// module. Indirect through `Function` so the real dynamic `import()` survives
-// compilation and loads ESM from CommonJS at runtime in Node (same trick as
-// apps/server/src/core/ai-chat/tools/docmost-client.loader.ts).
-const esmImport = new Function(
-  "specifier",
-  "return import(specifier)",
-) as (specifier: string) => Promise<unknown>;
-
-// Memoize the in-flight/loaded module so the dynamic import runs at most once.
-let markedPromise: Promise<MarkedModule> | null = null;
-
-/**
- * Lazily load the ESM-only `marked` module (cached).
- *
- * In the built CommonJS package (Node, jest with ts-jest) the `esmImport`
- * Function trick performs a real dynamic `import()` of the ESM module. Under
- * vitest, however, the transformed module is evaluated without a dynamic-import
- * callback, so `new Function('return import(...)')` throws "A dynamic import
- * callback was not specified"; there `require('marked')` succeeds because the
- * test runner's loader interops ESM. We therefore try the Function import first
- * and fall back to `require` so BOTH runtimes resolve `marked` transparently.
- */
-async function loadMarked(): Promise<MarkedModule["marked"]> {
-  if (!markedPromise) {
-    markedPromise = (esmImport("marked") as Promise<MarkedModule>)
-      .catch(() => {
-        // Function-trick import is unavailable (e.g. under vitest's evaluator):
-        // fall back to require, which the test runner can interop for ESM.
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return require("marked") as MarkedModule;
-      })
-      .catch((err) => {
-        // Do not cache a rejected import — allow the next call to retry.
-        markedPromise = null;
-        throw err;
-      });
-  }
-  return (await markedPromise).marked;
-}
+import { marked } from "marked";
+import { docmostExtensions } from "./docmost-schema.js";
 
 // Setup DOM environment for Tiptap HTML parsing in Node.js
 const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>");
@@ -109,8 +58,6 @@ async function preprocessCallouts(markdown: string): Promise<string> {
   if (markdown.length > MAX_CALLOUT_PREPROCESS_BYTES) {
     return markdown;
   }
-
-  const marked = await loadMarked();
 
   // Recursively transform a slice of lines, converting top-level callouts in
   // that slice into <div> blocks and rendering their inner content (which may
@@ -379,7 +326,6 @@ function stripEmptyParagraphs(node: any): any {
 export async function markdownToProseMirror(
   markdownContent: string,
 ): Promise<any> {
-  const marked = await loadMarked();
   const withCallouts = await preprocessCallouts(markdownContent);
   const html = await marked.parse(withCallouts);
   const bridged = bridgeTaskLists(html);

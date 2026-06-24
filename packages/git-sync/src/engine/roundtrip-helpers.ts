@@ -1,9 +1,7 @@
 /**
- * Pure helpers extracted from the docmost-sync Phase-0 idempotency harness
- * (`src/roundtrip.ts`). Only the IO-free comparison utilities are vendored —
- * the CLI scaffold (`--fixture`/`--page`/`--corpus`, `loadSettings`, the
- * `DocmostClient` live path and `process.exit`) is NOT vendored (the roundtrip
- * harness moves into the package's tests, not the engine).
+ * Pure, IO-free comparison helpers for the idempotency round-trip checks. The
+ * round-trip harness that drives these lives in the package's tests, not in the
+ * engine.
  */
 
 /**

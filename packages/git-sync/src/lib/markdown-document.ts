@@ -135,11 +135,9 @@ export function parseDocmostMarkdown(full: string): {
   return { meta, body, comments };
 }
 
-// --- docmost-sync addition (backport target: docmost-mcp/src/lib/markdown-document.ts) ---
-
 /**
  * Serialize a self-contained markdown file with the meta block + body ONLY —
- * NO trailing `docmost:comments` block. The docmost-sync engine never touches
+ * NO trailing `docmost:comments` block. The sync engine never touches
  * `/comments` (SPEC §3): the synced file carries just page identity (meta) and
  * the body, where comment threads survive only as inline `<span
  * data-comment-id>` anchor marks inside the body.

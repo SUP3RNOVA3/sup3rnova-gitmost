@@ -3,11 +3,10 @@
  *
  * IMPORTANT — VAULT-SCOPED: every operation here runs with `cwd = vaultPath`,
  * which is the vault's OWN git repository (default `data/vault`), SEPARATE from
- * the docmost-sync source repo. This module MUST NEVER run git against the
- * source repo. `data/` is gitignored by the source repo, so a nested repo under
- * `data/vault` is safe. The pull cycle is READ-ONLY toward Docmost; this module
- * only touches the local vault git, never a git remote (push is deferred, see
- * SPEC §7).
+ * the gitmost application repo. This module MUST NEVER run git against the
+ * application repo. `data/` is gitignored, so a nested repo under `data/vault`
+ * is safe. The pull cycle is READ-ONLY toward Docmost; this module only touches
+ * the local vault git, never a git remote (push is deferred, see SPEC §7).
  *
  * Implementation notes:
  *   - We shell out via `node:child_process` `execFile` (promisified), passing

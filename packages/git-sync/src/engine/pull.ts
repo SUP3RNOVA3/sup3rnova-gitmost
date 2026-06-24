@@ -25,30 +25,29 @@
  * (read-only: listSpaceTree + getPageJson). All git operations run against
  * the vault repo (`cwd = vaultPath`), never the source repo (see ./git.ts).
  *
- * VENDORED into gitmost: the client seam is the native
- * `GitSyncClient` (`Pick<GitSyncClient, ...>`), not the upstream REST
- * `DocmostClient`; the upstream CLI `main()` entry point is dropped (the gitmost
- * server drives the engine in-process). Engine LOGIC is byte-identical.
+ * The client seam is the native `GitSyncClient` (`Pick<GitSyncClient, ...>`);
+ * the gitmost server drives the engine in-process (there is no standalone CLI
+ * entry point).
  */
 import { dirname } from "node:path";
 import { sep } from "node:path";
-import { parsePageFile, serializePageFile } from "../lib/page-file";
-import type { GitSyncClient } from "./client.types";
-import { buildVaultLayout, type PageNode } from "./layout";
+import { parsePageFile, serializePageFile } from "../lib/page-file.js";
+import type { GitSyncClient } from "./client.types.js";
+import { buildVaultLayout, type PageNode } from "./layout.js";
 import {
   VaultGit,
   BOT_AUTHOR_NAME,
   BOT_AUTHOR_EMAIL,
   DEFAULT_BRANCH,
-} from "./git";
+} from "./git.js";
 import {
   planReconciliation,
   decideAbsenceDeletions,
   type LiveEntry,
   type MovedEntry,
   type DeletionDecision,
-} from "./reconcile";
-import { stabilizePageBody } from "./stabilize";
+} from "./reconcile.js";
+import { stabilizePageBody } from "./stabilize.js";
 
 // Engine-only mirror branch (SPEC §5): the engine writes here, humans never do.
 const DOCMOST_BRANCH = "docmost";

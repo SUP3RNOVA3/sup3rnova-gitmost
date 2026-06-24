@@ -22,21 +22,20 @@
  * then calls `move_page` / `rename_page` (both for a reparent+retitle), or
  * records a NO-OP for a cosmetic local-only file-path rename.
  *
- * VENDORED into gitmost: the client seam is the native
- * `GitSyncClient` (`Pick<GitSyncClient, ...>`), not the upstream REST
- * `DocmostClient`; the upstream CLI `main()` entry point is dropped (the gitmost
- * server drives the engine in-process). Engine LOGIC is byte-identical.
+ * The client seam is the native `GitSyncClient` (`Pick<GitSyncClient, ...>`);
+ * the gitmost server drives the engine in-process (there is no standalone CLI
+ * entry point).
  */
-import { type DocmostMdMeta } from "../lib/index";
-import { parsePageFile, serializePageFile } from "../lib/page-file";
-import type { GitSyncClient } from "./client.types";
-import type { DiffEntry } from "./git";
-import { VaultGit, DEFAULT_BRANCH } from "./git";
-import { bodyHash } from "./loop-guard";
-import { type Settings } from "./settings";
+import { type DocmostMdMeta } from "../lib/index.js";
+import { parsePageFile, serializePageFile } from "../lib/page-file.js";
+import type { GitSyncClient } from "./client.types.js";
+import type { DiffEntry } from "./git.js";
+import { VaultGit, DEFAULT_BRANCH } from "./git.js";
+import { bodyHash } from "./loop-guard.js";
+import { type Settings } from "./settings.js";
 
 // Re-export so callers/tests can import the diff row shape from either module.
-export type { DiffEntry } from "./git";
+export type { DiffEntry } from "./git.js";
 
 /** A page to CREATE in Docmost (new local file, meta has no pageId yet). */
 export interface CreateAction {

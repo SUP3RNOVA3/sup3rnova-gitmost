@@ -1,12 +1,11 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
-import {
-  type GitSyncClient,
-  type GitSyncPageNodeLite,
-  parseDocmostMarkdown,
-  markdownToProseMirror,
+import type {
+  GitSyncClient,
+  GitSyncPageNodeLite,
 } from '@docmost/git-sync';
+import { loadGitSync } from '../git-sync.loader';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { InjectKysely } from 'nestjs-kysely';
@@ -177,6 +176,7 @@ export class GitmostDataSourceService {
     fullMarkdown: string,
     baseMarkdown?: string | null,
   ): Promise<{ updatedAt?: string }> {
+    const { parseDocmostMarkdown, markdownToProseMirror } = await loadGitSync();
     const { body } = parseDocmostMarkdown(fullMarkdown);
     const doc = await markdownToProseMirror(body);
 
@@ -213,6 +213,7 @@ export class GitmostDataSourceService {
     );
 
     // The shell is created without body; push the markdown body through collab.
+    const { parseDocmostMarkdown, markdownToProseMirror } = await loadGitSync();
     const { body } = parseDocmostMarkdown(content);
     const doc = await markdownToProseMirror(body);
     await this.writeBody(page.id, doc, ctx.userId);

@@ -8,9 +8,13 @@ import { spawn } from 'node:child_process';
 // fake child lets us drive every stdout/stderr/error/close branch by hand.
 jest.mock('node:child_process', () => ({ spawn: jest.fn() }));
 // vaultGitEnv just builds the CGI env overlay; stub it to a passthrough so the
-// service constructs without the real engine.
-jest.mock('@docmost/git-sync', () => ({
-  vaultGitEnv: (overlay: Record<string, string>) => overlay,
+// service runs without the real engine. The service loads it at runtime via the
+// `loadGitSync()` bridge (the ESM `@docmost/git-sync` package cannot be
+// `require()`d under jest), so we mock that loader rather than the package.
+jest.mock('../git-sync.loader', () => ({
+  loadGitSync: jest.fn(async () => ({
+    vaultGitEnv: (overlay: Record<string, string>) => overlay,
+  })),
 }));
 
 import {
@@ -81,6 +85,12 @@ function buildService() {
   return new GitHttpBackendService(env as any);
 }
 
+// `run()` now awaits the async `loadGitSync()` bridge before it spawns the
+// child, so the spawn (and its stream-handler wiring) happens one microtask
+// after `run()` is called. These tests drive the fake child synchronously, so
+// flush the microtask queue first to let `run()` reach the spawn.
+const flush = () => new Promise((resolve) => setImmediate(resolve));
+
 describe('GitHttpBackendService.run', () => {
   beforeEach(() => {
     spawnMock.mockReset();
@@ -96,6 +106,7 @@ describe('GitHttpBackendService.run', () => {
     const res = fakeRes();
 
     const p = service.run(baseRequest, fakeReq(), res);
+    await flush();
     // Emit a child 'error' before any stdout -> 500, headers not already sent.
     child.emit('error', new Error('ENOENT spawn git'));
     await p;
@@ -112,6 +123,7 @@ describe('GitHttpBackendService.run', () => {
     const res = fakeRes();
 
     const p = service.run(baseRequest, fakeReq(), res);
+    await flush();
     // stderr diagnostics, then a close with no valid CGI output -> 500.
     child.stderr.emit('data', Buffer.from('fatal: boom'));
     child.emit('close', 128);
@@ -128,6 +140,7 @@ describe('GitHttpBackendService.run', () => {
     const res = fakeRes();
 
     const p = service.run(baseRequest, fakeReq(), res);
+    await flush();
     // A full CGI response: status line + header + blank line + body.
     child.stdout.emit(
       'data',
@@ -157,6 +170,7 @@ describe('GitHttpBackendService.run', () => {
     const warnSpy = jest.spyOn(Logger.prototype, 'warn');
 
     const p = service.run(baseRequest, fakeReq(), res);
+    await flush();
     // The stdout 'error' handler must absorb this — no unhandled throw, no 500.
     expect(() => child.stdout.emit('error', new Error('EPIPE'))).not.toThrow();
     expect(() => child.stderr.emit('error', new Error('EPIPE'))).not.toThrow();

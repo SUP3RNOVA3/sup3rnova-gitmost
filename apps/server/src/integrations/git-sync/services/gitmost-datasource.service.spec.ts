@@ -30,6 +30,21 @@ jest.mock('@hocuspocus/transformer', () => {
 jest.mock('@docmost/editor-ext', () => ({
   markdownToHtml: jest.fn(),
 }));
+// The service loads `parseDocmostMarkdown` / `markdownToProseMirror` at runtime
+// via the `loadGitSync()` bridge (the ESM `@docmost/git-sync` package cannot be
+// `require()`d under jest). Stub the loader: the real conversion is exercised by
+// the @docmost/git-sync converter tests and the converter gate; here the mocked
+// TiptapTransformer.toYdoc ignores the converted doc anyway, so a passthrough
+// body + a minimal ProseMirror doc is sufficient.
+jest.mock('../git-sync.loader', () => ({
+  loadGitSync: jest.fn(async () => ({
+    parseDocmostMarkdown: (md: string) => ({ meta: {}, body: md }),
+    markdownToProseMirror: async () => ({
+      type: 'doc',
+      content: [{ type: 'paragraph' }],
+    }),
+  })),
+}));
 
 import * as Y from 'yjs';
 import { GitmostDataSourceService } from './gitmost-datasource.service';

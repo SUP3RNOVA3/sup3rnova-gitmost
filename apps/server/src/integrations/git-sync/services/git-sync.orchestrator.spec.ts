@@ -1,4 +1,4 @@
-// Unit tests for the git-sync control plane. The vendored engine's `runCycle`
+// Unit tests for the git-sync control plane. The engine's `runCycle`
 // (which owns the PULL->PUSH branch choreography) is mocked so we exercise ONLY
 // the orchestrator's wiring: gating, the Redis leader lock + in-process mutex
 // (via SpaceLockService), the delete-cap POLICY it injects as `resolveApplyClient`,
@@ -7,13 +7,18 @@
 // mechanics themselves are covered by the engine's own cycle round-trip spec.
 //
 // The engine mock must be declared before importing the orchestrator so the
-// module-graph import binds to the mocked function.
-jest.mock('@docmost/git-sync', () => ({
-  runCycle: jest.fn(),
+// runtime `loadGitSync()` bridge resolves to the mocked `runCycle` (the ESM
+// `@docmost/git-sync` package cannot be `require()`d under jest). The `mock`
+// prefix lets the hoisted factory reference it.
+const mockRunCycle = jest.fn();
+
+jest.mock('../git-sync.loader', () => ({
+  loadGitSync: jest.fn(async () => ({
+    runCycle: mockRunCycle,
+  })),
 }));
 
 import { Logger } from '@nestjs/common';
-import { runCycle } from '@docmost/git-sync';
 import {
   GitSyncOrchestrator,
   GitSyncLockHeldError,
@@ -22,7 +27,7 @@ import { SpaceLockService } from './space-lock.service';
 
 type AnyMock = jest.Mock;
 
-const runCycleMock = runCycle as unknown as AnyMock;
+const runCycleMock = mockRunCycle as unknown as AnyMock;
 
 /** The default happy-path cycle result the engine returns. */
 const OK_CYCLE = {

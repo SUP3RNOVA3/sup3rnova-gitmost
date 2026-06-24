@@ -1,17 +1,30 @@
 // Unit tests for the per-space vault path resolver + lazy VaultGit cache
-// `mkdir` and `VaultGit` are mocked so construction is cheap and
+// `mkdir` and the git-sync loader are mocked so construction is cheap and
 // no real filesystem / git work happens. We assert the path normalization
 // (trailing slash) and the one-VaultGit-per-space caching contract.
+//
+// The service loads `VaultGit` (and `vaultGitEnv`) at runtime via the
+// `loadGitSync()` bridge (the ESM `@docmost/git-sync` package cannot be
+// `require()`d under jest), so we mock that loader rather than the package.
 import { mkdir } from 'node:fs/promises';
-import { VaultGit } from '@docmost/git-sync';
+import { loadGitSync } from '../git-sync.loader';
 
 jest.mock('node:fs/promises', () => ({
   mkdir: jest.fn(async () => undefined),
 }));
 
 // Cheap VaultGit stub: records the path it was constructed with; no shell-out.
-jest.mock('@docmost/git-sync', () => ({
-  VaultGit: jest.fn().mockImplementation((path: string) => ({ path })),
+// Declared with a `mock`-prefixed name so jest allows referencing it inside the
+// hoisted `jest.mock` factory below.
+const mockVaultGit = jest
+  .fn()
+  .mockImplementation((path: string) => ({ path }));
+
+jest.mock('../git-sync.loader', () => ({
+  loadGitSync: jest.fn(async () => ({
+    VaultGit: mockVaultGit,
+    vaultGitEnv: jest.fn(() => ({})),
+  })),
 }));
 
 import { VaultRegistryService } from './vault-registry.service';
@@ -19,7 +32,8 @@ import { VaultRegistryService } from './vault-registry.service';
 type AnyMock = jest.Mock;
 
 const mkdirMock = mkdir as unknown as AnyMock;
-const VaultGitMock = VaultGit as unknown as AnyMock;
+const VaultGitMock = mockVaultGit;
+void loadGitSync;
 
 function build(dataDir: string): { service: VaultRegistryService } {
   const env = {

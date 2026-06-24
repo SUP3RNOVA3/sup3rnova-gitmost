@@ -1,9 +1,10 @@
 /**
  * Public surface of `@docmost/git-sync`.
  *
- * Phase A vendors only the PURE converter + pure engine modules
- * from docmost-sync. Server integration (GitmostDataSource, orchestrator,
- * VaultGit, pull/push) is added in later steps.
+ * Exposes the pure converter (markdown <-> ProseMirror, file envelope,
+ * canonicalization) and the sync engine (reconcile planner, vault layout,
+ * pull/push, the git wrapper, and the settings parser) that the gitmost server
+ * drives in-process.
  */
 
 // Pure converter (markdown <-> ProseMirror, file envelope, canonicalization).
@@ -15,8 +16,8 @@ export {
   markdownToProseMirror,
   canonicalizeContent,
   docsCanonicallyEqual,
-} from "./lib/index";
-export type { DocmostMdMeta } from "./lib/index";
+} from "./lib/index.js";
+export type { DocmostMdMeta } from "./lib/index.js";
 
 // Pure engine (no IO): reconcile planner, vault layout, sanitize, stabilize,
 // loop-guard body hash.
@@ -25,7 +26,7 @@ export {
   decideAbsenceDeletions,
   MASS_DELETE_MIN_EXISTING,
   MASS_DELETE_FRACTION,
-} from "./engine/reconcile";
+} from "./engine/reconcile.js";
 export type {
   LiveEntry,
   ExistingEntry,
@@ -33,23 +34,23 @@ export type {
   MovedEntry,
   ReconciliationPlan,
   DeletionDecision,
-} from "./engine/reconcile";
+} from "./engine/reconcile.js";
 
-export { buildVaultLayout } from "./engine/layout";
-export type { PageNode, VaultEntry } from "./engine/layout";
+export { buildVaultLayout } from "./engine/layout.js";
+export type { PageNode, VaultEntry } from "./engine/layout.js";
 
-export { sanitizeTitle, disambiguate } from "./engine/sanitize";
+export { sanitizeTitle, disambiguate } from "./engine/sanitize.js";
 
-export { stabilizePageFile } from "./engine/stabilize";
-export type { PageMeta } from "./engine/stabilize";
+export { stabilizePageFile } from "./engine/stabilize.js";
+export type { PageMeta } from "./engine/stabilize.js";
 
-export { bodyHash } from "./engine/loop-guard";
+export { bodyHash } from "./engine/loop-guard.js";
 
 // IO engine: the client seam, the VaultGit git wrapper, the
 // pull (Docmost->FS) + push (FS->Docmost) planners/appliers, and the (pure)
-// settings parser. The engine consumes the native `GitSyncClient` seam (server
-// implements it) — the upstream REST `DocmostClient` is NOT vendored.
-export type { GitSyncClient, GitSyncPageNodeLite } from "./engine/client.types";
+// settings parser. The engine consumes the native `GitSyncClient` seam (the
+// server implements it) rather than any REST client.
+export type { GitSyncClient, GitSyncPageNodeLite } from "./engine/client.types.js";
 
 export {
   VaultGit,
@@ -58,21 +59,21 @@ export {
   BOT_AUTHOR_NAME,
   BOT_AUTHOR_EMAIL,
   DEFAULT_BRANCH,
-} from "./engine/git";
-export type { DiffEntry, MergeResult, CommitOptions } from "./engine/git";
+} from "./engine/git.js";
+export type { DiffEntry, MergeResult, CommitOptions } from "./engine/git.js";
 
 export {
   readExisting,
   computePullActions,
   applyPullActions,
-} from "./engine/pull";
+} from "./engine/pull.js";
 export type {
   ReadExistingDeps,
   PullActionsInput,
   PullActions,
   ApplyPullActionsDeps,
   ApplyResult,
-} from "./engine/pull";
+} from "./engine/pull.js";
 
 export {
   classifyRenameMoves,
@@ -86,7 +87,7 @@ export {
   LOCAL_AUTHOR_NAME,
   LOCAL_AUTHOR_EMAIL,
   LOCAL_SOURCE_TRAILER,
-} from "./engine/push";
+} from "./engine/push.js";
 export type {
   CreateAction,
   UpdateAction,
@@ -106,18 +107,18 @@ export type {
   PushDeps,
   PushRunResult,
   PushParsedArgs,
-} from "./engine/push";
+} from "./engine/push.js";
 
-export { parseSettings, envSchema } from "./engine/settings";
-export type { Settings } from "./engine/settings";
+export { parseSettings, envSchema } from "./engine/settings.js";
+export type { Settings } from "./engine/settings.js";
 
-export { loadSettingsOrExit } from "./engine/config-errors";
+export { loadSettingsOrExit } from "./engine/config-errors.js";
 
-export { runCycle } from "./engine/cycle";
+export { runCycle } from "./engine/cycle.js";
 export type {
   RunCycleDeps,
   RunCycleResult,
   CycleFs,
-} from "./engine/cycle";
+} from "./engine/cycle.js";
 
-export { parsePageFile, serializePageFile } from "./lib/page-file";
+export { parsePageFile, serializePageFile } from "./lib/page-file.js";

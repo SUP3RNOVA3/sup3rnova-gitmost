@@ -9,7 +9,8 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { sql } from 'kysely';
-import { type Settings, runCycle } from '@docmost/git-sync';
+import type { Settings } from '@docmost/git-sync';
+import { loadGitSync } from '../git-sync.loader';
 import { EnvironmentService } from '../../environment/environment.service';
 import { GitmostDataSourceService } from './gitmost-datasource.service';
 import { VaultRegistryService } from './vault-registry.service';
@@ -246,6 +247,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     workspaceId: string,
     serviceUserId: string,
   ): Promise<GitSyncRunStatus> {
+    const { runCycle } = await loadGitSync();
     const settings = this.buildSettings(spaceId);
     const vault = await this.vaultRegistry.getVault(spaceId);
     const client = this.dataSource.bind({ workspaceId, userId: serviceUserId });

@@ -1,8 +1,8 @@
-import { VaultGit } from "./git";
-import { GitSyncClient } from "./client.types";
-import { Settings } from "./settings";
-import { readExisting, computePullActions, applyPullActions } from "./pull";
-import { runPush } from "./push";
+import { VaultGit } from "./git.js";
+import { GitSyncClient } from "./client.types.js";
+import { Settings } from "./settings.js";
+import { readExisting, computePullActions, applyPullActions } from "./pull.js";
+import { runPush } from "./push.js";
 
 /**
  * Absolute-path filesystem primitives the cycle needs. Injected (not imported)
