@@ -95,15 +95,12 @@ Obsidian резолвит `[[Заметка]]` по **basename** (не по по
 - `.obsidian/`, аттачменты, dot-файлы, любые не-`.md` → **игнор** (не страницы),
   лежат в гите как есть, Obsidian ими владеет. Без `.gitignore`.
 
-## Миграция со старого формата
+## Без обратной совместимости
 
-Существующие волты несут `docmost:meta` в файлах.
-
-- На первом цикле нового движка: если у файла нет frontmatter, но есть
-  `docmost:meta` → читаем pageId оттуда, переписываем файл в native-формат
-  (frontmatter id + чистое тело + folder-note layout), разовый «normalize» коммит.
-- **Фолбэк навсегда**: `docmost:meta` всё ещё парсится как источник id, если
-  frontmatter нет (файл со старой системы). (Реализовано в `parsePageFile`.)
+Старый `docmost:meta` формат НЕ поддерживаем (данные тестовые). Волт — кэш: на
+переходе `rm -rf` волты спейсов, они пересобираются из Docmost сразу в native-
+формате. `parsePageFile` не читает `docmost:meta`; файл без `gitmost_id` frontmatter
+— это голый/рукописный файл → адопция (не legacy-страница).
 
 ## Краевые случаи
 
@@ -117,11 +114,11 @@ Obsidian резолвит `[[Заметка]]` по **basename** (не по по
 ## План фаз (каждая — юниты движка + браузерный e2e + изолированные shell-e2e)
 
 1. ✅ Формат файла: `parsePageFile`/`serializePageFile` (frontmatter id + тело,
-   фолбэк на legacy `docmost:meta`). Юниты. Без смены поведения. (готово)
-2. PULL пишет native-формат (frontmatter + folder-note layout) + миграция.
+   `gitmost_id` frontmatter + тело). Юниты. Без смены поведения. (готово)
+2. PULL пишет native-формат (frontmatter + folder-note layout). Волты wipe+rebuild.
 3. PUSH берёт идентичность из frontmatter, родителя из пути.
 4. Адопция голых файлов/папок.
-5. Чистка: убрать `docmost:meta` из генерации (оставить фолбэк-парсер).
+5. Чистка: выпилить старый `docmost:meta` формат-код целиком.
 6. Ссылки: конвертер Docmost-mention ↔ `[[wikilink]]` + переписывание при retitle.
 
 ## Риски

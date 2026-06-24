@@ -1,25 +1,22 @@
-import { parseDocmostMarkdown } from "./markdown-document";
-
 /**
- * The THIN page-file format (design: docs/backlog/git-sync-thin-meta.md, option
- * C). A page file is CLEAN markdown with a minimal YAML frontmatter carrying ONLY
- * the page's durable identity:
+ * The native-Obsidian page-file format (design: docs/backlog/git-sync-thin-meta.md).
+ * A page file is CLEAN markdown with a minimal YAML frontmatter carrying ONLY the
+ * page's durable identity:
  *
  *   ---
- *   id: 019ef6fc-2638-7ce1-9ce3-2756ce038480
+ *   gitmost_id: 019ef6fc-2638-7ce1-9ce3-2756ce038480
  *   ---
  *   <clean markdown body>
  *
  * Everything else is derived (title = filename, parentPageId = enclosing folder,
- * spaceId = the vault, updatedAt = git). The `id` (a Docmost pageId) is the only
- * non-derivable bit and travels WITH the file so identity survives any move,
+ * spaceId = the vault, updatedAt = git). `gitmost_id` (a Docmost pageId) is the
+ * only non-derivable bit and travels WITH the file so identity survives any move,
  * even one git's rename detection misses. Third-party editors (Obsidian, …) see
  * clean markdown; the frontmatter is hidden in their preview.
  *
- * MIGRATION: a file may still carry the LEGACY `<!-- docmost:meta {…} -->` block
- * (the pre-thin format). `parsePageFile` reads the id from the frontmatter first,
- * then falls back to the legacy meta — so old vaults keep working and a re-sync
- * rewrites them into the thin format.
+ * No backward-compat with the old `docmost:meta` format: vaults are a cache, wiped
+ * and rebuilt native. A file WITHOUT a `gitmost_id` frontmatter is an un-tracked
+ * (e.g. hand-written) file -> the caller ADOPTS it (creates a page, writes the id).
  */
 
 /**
@@ -56,23 +53,12 @@ export function parsePageFile(full: string): {
 } {
   const text = (full ?? "").replace(/\r\n/g, "\n");
 
-  // 1. Thin format: YAML frontmatter.
+  // Native format: a `gitmost_id` YAML frontmatter. Anything else (no frontmatter,
+  // or frontmatter without the key) is an un-tracked file -> adopt.
   const fm = text.match(FRONTMATTER_RE);
   if (fm) {
     return { id: readIdFromYaml(fm[1]), body: text.slice(fm[0].length).trim() };
   }
-
-  // 2. Legacy format: `<!-- docmost:meta -->` block (migration fallback).
-  if (/^\s*<!--\s*docmost:meta/.test(text)) {
-    try {
-      const { meta, body } = parseDocmostMarkdown(text);
-      return { id: meta?.pageId ?? null, body };
-    } catch {
-      // a corrupt legacy block -> treat as an un-tracked plain file (adopt).
-    }
-  }
-
-  // 3. Plain markdown — un-tracked (no identity yet).
   return { id: null, body: text.trim() };
 }
 

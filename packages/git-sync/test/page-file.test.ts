@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { parsePageFile, serializePageFile } from "../src/lib/page-file";
-import { serializeDocmostMarkdownBody } from "../src/lib/index";
 
 describe("page-file thin format", () => {
   it("round-trips id frontmatter + clean body", () => {
@@ -20,15 +19,6 @@ describe("page-file thin format", () => {
     expect(parsePageFile("---\ngitmost_id: 'xyz'\n---\nbody").id).toBe("xyz");
   });
 
-  it("MIGRATION: falls back to a legacy docmost:meta block for the id", () => {
-    const legacy = serializeDocmostMarkdownBody(
-      { version: 1, pageId: "legacy-1", title: "T", spaceId: "sp" },
-      "old body",
-    );
-    const { id, body } = parsePageFile(legacy);
-    expect(id).toBe("legacy-1");
-    expect(body).toContain("old body");
-  });
 
   it("ADOPT: a plain hand-written file has no id and keeps its whole body", () => {
     const { id, body } = parsePageFile("# Just a note\n\nwritten in Obsidian");
