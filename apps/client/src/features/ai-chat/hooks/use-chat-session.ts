@@ -32,8 +32,20 @@ export interface UseChatSessionResult {
   /** Show the history loader instead of the live thread. */
   waitingForHistory: boolean;
   /** Call when a turn finishes; `serverChatId` is the authoritative streamed id
-   *  (undefined on a failed turn). Handles new-chat id adoption + invalidations. */
-  onTurnFinished: (serverChatId?: string) => void;
+   *  (undefined on a failed turn). `finishingThreadKey` is the mount key of the
+   *  thread that produced this callback — when it no longer matches the mounted
+   *  thread (the user pressed New chat / switched mid-stream), the call is from an
+   *  abandoned thread and must NOT adopt or re-arm the fallback. Omitting it (old
+   *  callers / tests) treats the call as belonging to the current thread. Handles
+   *  new-chat id adoption + invalidations. */
+  onTurnFinished: (serverChatId?: string, finishingThreadKey?: string) => void;
+  /** Force a brand-new, empty thread (new mount key, no chat id) UNCONDITIONALLY.
+   *  The render-phase reconciler only remounts when `activeChatId` actually
+   *  changes; pressing "New chat" while already in a not-yet-adopted new chat
+   *  leaves `activeChatId === null` (a no-op for the atom), so the reconciler
+   *  never fires and the stale streaming thread stays mounted (#161). The window
+   *  calls this from startNewChat to guarantee a fresh thread regardless. */
+  startFreshThread: () => void;
   /** Disarm any pending error-path new-chat fallback. The window calls this from
    *  startNewChat/selectChat so a late refetch can't yank the user back into a
    *  just-failed chat after they explicitly moved on. */
@@ -78,6 +90,14 @@ export function useChatSession(
   const activeChatIdRef = useRef(activeChatId);
   activeChatIdRef.current = activeChatId;
 
+  // Live mirror of the mounted thread's key, read by onTurnFinished to tell a
+  // current-thread finish from an ABANDONED one. ai@6's useChat does not abort
+  // its request on unmount, and its callbacks are proxied so onFinish/onError of
+  // a thread the user already left (via New chat / switch) still fire AFTER that
+  // thread unmounts. By then this ref holds the NEW thread's key, so comparing it
+  // to the key the finishing thread reports rejects the abandoned turn (#161).
+  const threadKeyRef = useRef<string>("");
+
   // The mounted thread's identity: ONE atomic value tying ChatThread's mount key
   // (`thread.key`) to the chat id that mounted thread holds (`thread.chatId`).
   // Consolidating these makes the "key vs chat id diverged" state unrepresentable
@@ -93,6 +113,10 @@ export function useChatSession(
         ? newThread(`new-${generateId()}`)
         : switchThread(activeChatId),
   );
+
+  // Keep the live mirror pointed at the currently-mounted thread's key so a late
+  // onTurnFinished can be matched against it (see threadKeyRef above).
+  threadKeyRef.current = thread.key;
 
   // Error-path fallback for new-chat id adoption. When a brand-new chat's first
   // turn errors BEFORE the server's `start` chunk, no authoritative chatId ever
@@ -111,7 +135,21 @@ export function useChatSession(
   // yet) we adopt the server's AUTHORITATIVE streamed id (never the newest in the
   // list, which races a second tab — #137; see adopt-chat-id.ts).
   const onTurnFinished = useCallback(
-    (serverChatId?: string) => {
+    (serverChatId?: string, finishingThreadKey?: string) => {
+      // Reject a finish from an ABANDONED thread. After the user pressed New chat
+      // (or switched chats) mid-stream, the left-behind thread's onFinish/onError
+      // still fire (ai@6 does not abort on unmount). Adopting/arming off that late
+      // callback would yank the user back into the chat they just left (#161).
+      // `undefined` (legacy callers/tests) is treated as the current thread.
+      const isCurrentThread =
+        finishingThreadKey === undefined ||
+        finishingThreadKey === threadKeyRef.current;
+      if (!isCurrentThread) {
+        // Still surface the abandoned chat in the history list, but do NOT adopt,
+        // arm the fallback, or invalidate per-chat messages (no thread shows it).
+        onInvalidateChatList();
+        return;
+      }
       // Read the live id from the ref, not the closure: on a failed turn this can
       // run twice in one turn (onFinish + onError) before any re-render, and the
       // primary branch below updates the ref so the second call sees the adopted id.
@@ -229,10 +267,28 @@ export function useChatSession(
     pendingNewChatRef.current = null;
   }, []);
 
+  // Force a fresh, empty thread regardless of the current `activeChatId`. The
+  // render-phase reconciler only remounts on an activeChatId CHANGE, so "New chat"
+  // pressed while already in a not-yet-adopted new chat (activeChatId stays null)
+  // would otherwise leave the in-flight streaming thread mounted (#161). Dispatch
+  // `reconcile` to chatId:null with a brand-new key so React remounts ChatThread
+  // (a fresh useChat store). Disarm any armed fallback too. After this dispatch
+  // thread.chatId is null; the window also sets activeChatId to null, so the
+  // render-phase reconciler then finds them equal and does not double-remount.
+  const startFreshThread = useCallback(() => {
+    pendingNewChatRef.current = null;
+    dispatch({
+      type: "reconcile",
+      chatId: null,
+      newKey: `new-${generateId()}`,
+    });
+  }, []);
+
   return {
     threadKey: thread.key,
     waitingForHistory,
     onTurnFinished,
+    startFreshThread,
     cancelPendingAdoption,
   };
 }

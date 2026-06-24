@@ -67,7 +67,12 @@ interface ChatThreadProps {
    *  new chat, adopts the freshly created chat id. `serverChatId` is the
    *  authoritative id the server streamed on the assistant message metadata, or
    *  undefined on a failed turn — see adopt-chat-id.ts for the full #137 design. */
-  onTurnFinished: (serverChatId?: string) => void;
+  onTurnFinished: (serverChatId?: string, finishingThreadKey?: string) => void;
+  /** This thread's mount key (the same value the parent uses as React `key`).
+   *  Forwarded back through onTurnFinished so the session hook can tell a finish
+   *  from THIS still-mounted thread from a late finish of an abandoned thread the
+   *  user already left via New chat / switch (#161). */
+  threadKey?: string;
   /** Parent-owned ref that this thread keeps updated with its live useChat
    *  snapshot (full message list + streaming flag), so the header's
    *  "Copy chat" export can include the in-progress, not-yet-persisted
@@ -123,6 +128,7 @@ export default function ChatThread({
   onRolePicked,
   assistantName,
   onTurnFinished,
+  threadKey,
   liveStateRef,
   onLiveTurnTokens,
 }: ChatThreadProps) {
@@ -265,7 +271,7 @@ export default function ChatThread({
       // Forward the authoritative server chatId (streamed on the assistant
       // message metadata) so the parent adopts the REAL created chat id for a new
       // chat — see adopt-chat-id.ts for the full #137 design.
-      onTurnFinished(extractServerChatId(message));
+      onTurnFinished(extractServerChatId(message), threadKey);
       // Show a neutral "stopped" marker for an aborted turn; the red error banner
       // (via `error`) already covers isError, and a clean finish clears any marker.
       if (isError) setStopNotice(null);
@@ -286,7 +292,7 @@ export default function ChatThread({
       // Surface the raw failure in the browser console (devtools) for debugging;
       // the UI separately shows a friendly classified banner (see errorView).
       console.error("AI chat stream error:", streamError);
-      onTurnFinished();
+      onTurnFinished(undefined, threadKey);
     },
   });
 

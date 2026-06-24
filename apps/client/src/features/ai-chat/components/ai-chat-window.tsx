@@ -185,8 +185,13 @@ export default function AiChatWindow() {
   // The invalidate closures are passed inline: `onTurnFinished` is read live by
   // useChat's onFinish (never in an effect dep array), so their identity does not
   // matter — no memoization ceremony needed.
-  const { threadKey, waitingForHistory, onTurnFinished, cancelPendingAdoption } =
-    useChatSession({
+  const {
+    threadKey,
+    waitingForHistory,
+    onTurnFinished,
+    startFreshThread,
+    cancelPendingAdoption,
+  } = useChatSession({
       activeChatId,
       setActiveChatId,
       chats,
@@ -205,12 +210,25 @@ export default function AiChatWindow() {
   // just-failed chat after they chose a fresh one.
   const startNewChat = useCallback((): void => {
     cancelPendingAdoption();
+    // Force a fresh thread UNCONDITIONALLY. If the user is still on a brand-new,
+    // not-yet-adopted chat (activeChatId === null) while its first turn streams,
+    // setActiveChatId(null) is a no-op and the render-phase reconciler would not
+    // remount — leaving the streaming thread in place (#161). startFreshThread
+    // guarantees a clean remount; the abandoned thread's late finish is rejected
+    // by the threadKey guard in the session hook.
+    startFreshThread();
     setActiveChatId(null);
     setHistoryOpen(false);
     setDraft("");
     // Default the picker back to "Universal assistant" for the fresh chat.
     setSelectedRoleId(null);
-  }, [cancelPendingAdoption, setActiveChatId, setDraft, setSelectedRoleId]);
+  }, [
+    cancelPendingAdoption,
+    startFreshThread,
+    setActiveChatId,
+    setDraft,
+    setSelectedRoleId,
+  ]);
 
   const selectChat = useCallback(
     (chatId: string): void => {
@@ -621,6 +639,7 @@ export default function AiChatWindow() {
               onRolePicked={(role) => setSelectedRoleId(role.id)}
               assistantName={currentRole?.name}
               onTurnFinished={onTurnFinished}
+              threadKey={threadKey}
               liveStateRef={liveThreadRef}
               onLiveTurnTokens={setLiveTurnTokens}
             />

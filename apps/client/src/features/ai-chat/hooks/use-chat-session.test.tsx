@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { renderHook } from "@testing-library/react";
+import { renderHook, act } from "@testing-library/react";
 import { useChatSession } from "./use-chat-session";
 import type { UseChatSessionOptions } from "./use-chat-session";
 
@@ -185,6 +185,48 @@ describe("useChatSession", () => {
     // key becomes the chat id.
     rerender({ activeChatId: "C", chats });
     expect(result.current.threadKey).toBe("C");
+  });
+
+  it("#161: startFreshThread remounts even when activeChatId stays null (New chat mid-stream)", () => {
+    // The bug: pressing New chat while still on a brand-new, not-yet-adopted chat
+    // leaves activeChatId === null, so the render-phase reconciler never fires.
+    // startFreshThread must remount UNCONDITIONALLY (a new mount key).
+    const { result } = setup({ activeChatId: null, chats: { items: [] } });
+    const keyBefore = result.current.threadKey;
+    act(() => result.current.startFreshThread());
+    expect(result.current.threadKey).not.toBe(keyBefore);
+  });
+
+  it("#161: a late finish from an ABANDONED thread does not adopt or invalidate messages", () => {
+    const {
+      result,
+      setActiveChatId,
+      onInvalidateChatList,
+      onInvalidateChatMessages,
+    } = setup({ activeChatId: null, chats: { items: [{ id: "x" }] } });
+    const abandonedKey = result.current.threadKey;
+    // User pressed New chat mid-stream → fresh thread (new mount key).
+    act(() => result.current.startFreshThread());
+    expect(result.current.threadKey).not.toBe(abandonedKey);
+    // The left-behind thread's onFinish fires late, carrying ITS (now stale) key
+    // and the server id of the chat the user just left. It must NOT be adopted.
+    act(() => result.current.onTurnFinished("A", abandonedKey));
+    expect(setActiveChatId).not.toHaveBeenCalled();
+    expect(onInvalidateChatMessages).not.toHaveBeenCalled();
+    // The abandoned chat should still surface in the history list.
+    expect(onInvalidateChatList).toHaveBeenCalled();
+  });
+
+  it("#161: a finish from the CURRENT thread (matching key) still adopts", () => {
+    const { result, setActiveChatId } = setup({
+      activeChatId: null,
+      chats: { items: [{ id: "x" }] },
+    });
+    // Same thread that is mounted reports its finish with the matching key.
+    act(() =>
+      result.current.onTurnFinished("A", result.current.threadKey),
+    );
+    expect(setActiveChatId).toHaveBeenCalledWith("A");
   });
 
   it("waitingForHistory gates the loader only while opening an unloaded existing chat", () => {
