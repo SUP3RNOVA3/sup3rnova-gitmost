@@ -119,3 +119,18 @@ export type {
   RunCycleResult,
   CycleFs,
 } from "./engine/cycle";
+
+export {
+  VAULT_INDEX_PATH,
+  emptyVaultIndex,
+  parseVaultIndex,
+  serializeVaultIndex,
+  pageIdAt,
+  slugIdAt,
+  pathForPageId,
+  trackedPageIds,
+  setEntry,
+  removeAt,
+  moveEntry,
+} from "./engine/vault-index";
+export type { VaultIndex, VaultIndexEntry } from "./engine/vault-index";
