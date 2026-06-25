@@ -142,17 +142,22 @@ describe('PersistenceExtension.onStoreDocument — provenance precedence (#2)', 
     expect(sourceOf(pageRepo)).toBe('git-sync');
   });
 
-  it("keeps 'agent' even when the storing writer is 'git-sync' (agent > git-sync)", async () => {
+  it("keeps 'git-sync' for an explicit git-sync store even with a sticky agent marker (#14 loop-guard)", async () => {
     const { ext, pageRepo } = build();
 
     // An agent edit landed earlier in the coalescing window (sticky marker),
-    // then a git-sync writer performs the store. Agent precedence must win.
+    // then a git-sync writer performs the store. Red-team finding #14: an
+    // EXPLICIT current-write actor is authoritative for THIS write, so the
+    // store must stay 'git-sync' — otherwise the PageChangeListener loop-guard
+    // (keyed on lastUpdatedSource === 'git-sync') fails to recognize git-sync's
+    // own write and re-exports it. Explicit 'agent' still wins (see below); the
+    // sticky marker only promotes a plain human writer to 'agent'.
     await ext.onChange(makeChangePayload('agent'));
     await ext.onStoreDocument(
       makeStorePayload({ user: { id: 'svc-user' }, actor: 'git-sync' }),
     );
 
-    expect(sourceOf(pageRepo)).toBe('agent');
+    expect(sourceOf(pageRepo)).toBe('git-sync');
   });
 
   it("tags 'agent' when the storing writer itself is the agent (no prior onChange)", async () => {

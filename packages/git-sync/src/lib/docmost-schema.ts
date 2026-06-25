@@ -204,11 +204,38 @@ const DocmostAttributes = Extension.create({
         types: ["image"],
         attributes: {
           align: { default: null },
-          attachmentId: { default: null },
-          aspectRatio: { default: null },
+          // imageToHtml emits these Docmost-specific image attrs as data-*; map
+          // them back explicitly so a top-level image (or one inside a column)
+          // round-trips them. Without a parseHTML the default reads the bare
+          // attribute name (e.g. getAttribute("attachmentId") -> null) and the
+          // value — including the attachmentId that links the image to its
+          // stored file — is silently dropped on every round-trip (data loss).
+          attachmentId: {
+            default: null,
+            parseHTML: (el: HTMLElement) =>
+              el.getAttribute("data-attachment-id"),
+            renderHTML: (attrs: Record<string, any>) =>
+              attrs.attachmentId
+                ? { "data-attachment-id": attrs.attachmentId }
+                : {},
+          },
+          aspectRatio: {
+            default: null,
+            parseHTML: (el: HTMLElement) =>
+              el.getAttribute("data-aspect-ratio"),
+            renderHTML: (attrs: Record<string, any>) =>
+              attrs.aspectRatio != null
+                ? { "data-aspect-ratio": attrs.aspectRatio }
+                : {},
+          },
           height: { default: null },
           placeholder: { default: null },
-          size: { default: null },
+          size: {
+            default: null,
+            parseHTML: (el: HTMLElement) => el.getAttribute("data-size"),
+            renderHTML: (attrs: Record<string, any>) =>
+              attrs.size != null ? { "data-size": attrs.size } : {},
+          },
           width: { default: null },
         },
       },
@@ -1031,6 +1058,300 @@ const PageBreak = Node.create({
 });
 
 /**
+ * Footnote feature (mirror of @docmost/editor-ext footnote, matching the MCP
+ * schema mirror). Three nodes connected by `id`:
+ *  - FootnoteReference: inline atom marker in the body (<sup data-footnote-ref>);
+ *  - FootnotesList:     a single bottom container (<section data-footnotes>);
+ *  - FootnoteDefinition: one editable note keyed by id (<div data-footnote-def>).
+ * The visible number is not stored; it is derived from reference order. The
+ * <sup> parse rule uses priority 100 so it beats the Superscript mark's <sup>
+ * rule (otherwise an empty reference parses as an empty superscript and drops).
+ */
+const FootnoteReference = Node.create({
+  name: "footnoteReference",
+  priority: 101,
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: true,
+  draggable: false,
+  addAttributes() {
+    return {
+      id: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-id"),
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.id ? { "data-id": attrs.id } : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: "sup[data-footnote-ref]", priority: 100 }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["sup", { "data-footnote-ref": "", ...HTMLAttributes }];
+  },
+});
+
+const FootnotesList = Node.create({
+  name: "footnotesList",
+  group: "block",
+  content: "footnoteDefinition+",
+  isolating: true,
+  selectable: false,
+  defining: true,
+  parseHTML() {
+    return [{ tag: "section[data-footnotes]" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["section", { "data-footnotes": "", ...HTMLAttributes }, 0];
+  },
+});
+
+const FootnoteDefinition = Node.create({
+  name: "footnoteDefinition",
+  content: "paragraph+",
+  defining: true,
+  isolating: true,
+  selectable: false,
+  addAttributes() {
+    return {
+      id: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-id"),
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.id ? { "data-id": attrs.id } : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: "div[data-footnote-def]" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["div", { "data-footnote-def": "", ...HTMLAttributes }, 0];
+  },
+});
+
+/**
+ * Encode/decode the htmlEmbed `source` (arbitrary HTML/CSS/JS) to/from base64
+ * for the `data-source` attribute. Ported from @docmost/editor-ext so the
+ * markdown-converter HTML path (generateJSON via parseHTML) round-trips the
+ * raw source losslessly and keeps it inert while it sits in the attribute.
+ * `encodeURIComponent`/`decodeURIComponent` wrap btoa/atob so UTF-8 survives.
+ */
+export function encodeHtmlEmbedSource(source: string): string {
+  if (!source) return "";
+  try {
+    if (typeof btoa === "function") {
+      return btoa(encodeURIComponent(source));
+    }
+    return Buffer.from(encodeURIComponent(source), "utf-8").toString("base64");
+  } catch {
+    return "";
+  }
+}
+
+export function decodeHtmlEmbedSource(encoded: string): string {
+  if (!encoded) return "";
+  try {
+    if (typeof atob === "function") {
+      return decodeURIComponent(atob(encoded));
+    }
+    return decodeURIComponent(Buffer.from(encoded, "base64").toString("utf-8"));
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Docmost raw HTML embed. Block atom; the client renders `source` inside a
+ * sandboxed iframe. Mirrors the @docmost/editor-ext node — `source` rides the
+ * `data-source` attribute base64-encoded (this is an HTML/generateJSON path, so
+ * it MUST use base64 to avoid double-encoding / injection).
+ */
+const HtmlEmbed = Node.create({
+  name: "htmlEmbed",
+  group: "block",
+  inline: false,
+  isolating: true,
+  atom: true,
+  defining: true,
+  draggable: true,
+  addAttributes() {
+    return {
+      source: {
+        default: "",
+        parseHTML: (el: HTMLElement) =>
+          decodeHtmlEmbedSource(el.getAttribute("data-source") || ""),
+        renderHTML: (attrs: Record<string, any>) => ({
+          "data-source": encodeHtmlEmbedSource(attrs.source || ""),
+        }),
+      },
+      height: {
+        default: null,
+        parseHTML: (el: HTMLElement) => {
+          const v = el.getAttribute("data-height");
+          if (!v) return null;
+          const n = parseInt(v, 10);
+          return Number.isFinite(n) ? n : null;
+        },
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.height != null ? { "data-height": String(attrs.height) } : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'div[data-type="htmlEmbed"]' }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["div", { "data-type": "htmlEmbed", ...HTMLAttributes }];
+  },
+});
+
+/**
+ * Inline status pill. Mirrors @docmost/editor-ext status: the label rides in
+ * the element's TEXT content (not an attribute) and the color in data-color.
+ */
+const Status = Node.create({
+  name: "status",
+  group: "inline",
+  inline: true,
+  atom: true,
+  selectable: true,
+  draggable: true,
+  addAttributes() {
+    return {
+      text: {
+        default: "",
+        parseHTML: (el: HTMLElement) => el.textContent || "",
+      },
+      color: {
+        default: "gray",
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-color") || "gray",
+        renderHTML: (attrs: Record<string, any>) => ({
+          "data-color": attrs.color ?? "gray",
+        }),
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'span[data-type="status"]' }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return [
+      "span",
+      { "data-type": "status", "data-color": HTMLAttributes["data-color"] },
+      `${HTMLAttributes.text ?? ""}`,
+    ];
+  },
+});
+
+/**
+ * Whole-page live embed. Holds only a `sourcePageId` reference. Mirrors
+ * @docmost/editor-ext pageEmbed. Block atom.
+ */
+const PageEmbed = Node.create({
+  name: "pageEmbed",
+  group: "block",
+  atom: true,
+  isolating: true,
+  selectable: true,
+  draggable: true,
+  addAttributes() {
+    return {
+      sourcePageId: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-source-page-id"),
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.sourcePageId
+            ? { "data-source-page-id": attrs.sourcePageId }
+            : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'div[data-type="pageEmbed"]' }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["div", { "data-type": "pageEmbed", ...HTMLAttributes }];
+  },
+});
+
+/**
+ * Block node types allowed inside a `transclusionSource` (mirrors
+ * @docmost/editor-ext transclusion constants). Excludes transclusion nodes
+ * (no nesting) and child-only nodes.
+ */
+const TRANSCLUSION_SOURCE_CONTENT_EXPRESSION =
+  "(paragraph | heading | blockquote | codeBlock | horizontalRule | bulletList" +
+  " | orderedList | taskList | image | video | audio | attachment | callout" +
+  " | details | embed | mathBlock | table | drawio | excalidraw | pdf" +
+  " | subpages | columns | youtube)+";
+
+/** Sync-source block: editable content shared into transclusion references. */
+const TransclusionSource = Node.create({
+  name: "transclusionSource",
+  group: "block",
+  content: TRANSCLUSION_SOURCE_CONTENT_EXPRESSION,
+  defining: true,
+  isolating: true,
+  addAttributes() {
+    return {
+      id: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-id"),
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.id ? { "data-id": attrs.id } : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'div[data-type="transclusionSource"]' }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["div", { "data-type": "transclusionSource", ...HTMLAttributes }, 0];
+  },
+});
+
+/** Live reference to a transcluded block/page. Block atom. */
+const TransclusionReference = Node.create({
+  name: "transclusionReference",
+  group: "block",
+  atom: true,
+  selectable: true,
+  draggable: false,
+  addAttributes() {
+    return {
+      sourcePageId: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-source-page-id"),
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.sourcePageId
+            ? { "data-source-page-id": attrs.sourcePageId }
+            : {},
+      },
+      transclusionId: {
+        default: null,
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-transclusion-id"),
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.transclusionId
+            ? { "data-transclusion-id": attrs.transclusionId }
+            : {},
+      },
+    };
+  },
+  parseHTML() {
+    return [{ tag: 'div[data-type="transclusionReference"]' }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return [
+      "div",
+      { "data-type": "transclusionReference", ...HTMLAttributes },
+    ];
+  },
+});
+
+/**
  * Full extension list. Image is block-level (matches Docmost); the
  * ProseMirror DOM parser hoists <img> found inside <p> automatically.
  * StarterKit v3 already bundles the link extension, configured here.
@@ -1041,7 +1362,29 @@ export const docmostExtensions = [
     heading: {},
     link: { openOnClick: false },
   }),
-  Image.configure({ inline: false }),
+  // Preserve image width/height as the AUTHORED string. Without an explicit
+  // parseHTML the stock Image node attribute falls back to tiptap core's
+  // `fromString`, which coerces a numeric width like "320" into the number 320
+  // — changing the stored type on every markdown round-trip (Docmost stores
+  // these as strings, e.g. "320" or "50%", matching how video/audio/pdf are
+  // handled in this mirror). The node attribute is applied AFTER the global
+  // DocmostAttributes one, so the fix must live on the Image node itself.
+  Image.extend({
+    addAttributes() {
+      const parent = (this.parent?.() ?? {}) as Record<string, any>;
+      return {
+        ...parent,
+        width: {
+          ...parent.width,
+          parseHTML: (el: HTMLElement) => el.getAttribute("width"),
+        },
+        height: {
+          ...parent.height,
+          parseHTML: (el: HTMLElement) => el.getAttribute("height"),
+        },
+      };
+    },
+  }).configure({ inline: false }),
   TaskList,
   TaskItem.configure({ nested: true }),
   // Highlight stores its color unescaped and Docmost interpolates it into
@@ -1094,5 +1437,13 @@ export const docmostExtensions = [
   Audio,
   Pdf,
   PageBreak,
+  FootnoteReference,
+  FootnotesList,
+  FootnoteDefinition,
+  HtmlEmbed,
+  Status,
+  PageEmbed,
+  TransclusionSource,
+  TransclusionReference,
   DocmostAttributes,
 ];

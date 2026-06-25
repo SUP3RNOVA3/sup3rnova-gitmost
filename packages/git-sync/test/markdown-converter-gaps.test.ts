@@ -419,33 +419,33 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
 });
 
 describe('converter gap coverage — documented round-trip data loss (specs 12–14)', () => {
-  // 12. A 3-backtick fence inside a codeBlock body is NOT lengthened: the inner
-  //     fence prematurely terminates the block, splitting it into three nodes.
-  it('a triple-backtick fence inside a codeBlock body is lossy (fence collision)', async () => {
+  // 12. A 3-backtick fence inside a codeBlock body is now lengthened: the outer
+  //     fence widens to (longest inner run + 1) backticks per CommonMark, so the
+  //     inner ``` is treated as content and the block survives as ONE node.
+  it('a triple-backtick fence inside a codeBlock body round-trips via a widened fence', async () => {
     const d = doc({
       type: 'codeBlock',
       attrs: { language: 'js' },
       content: [{ type: 'text', text: '```\ninner\n```' }],
     });
     const md1 = convertProseMirrorToMarkdown(d);
-    expect(md1).toBe('```js\n```\ninner\n```\n```');
+    // Outer fence widened to 4 backticks; the inner 3-backtick fence is content.
+    expect(md1).toBe('````js\n```\ninner\n```\n````');
 
     const doc2 = await markdownToProseMirror(md1);
-    // The inner fence split the block into THREE top-level nodes.
+    // The block survives as a SINGLE code block (no premature split).
     const top = doc2.content || [];
-    expect(top).toHaveLength(3);
+    expect(top).toHaveLength(1);
     expect(top[0].type).toBe('codeBlock');
     expect(top[0].attrs?.language).toBe('js');
-    expect(top[0].content?.[0]).toMatchObject({ type: 'text', text: '\n' });
-    expect(top[1].type).toBe('paragraph');
-    expect(top[1].content?.[0]).toMatchObject({ type: 'text', text: 'inner' });
-    expect(top[2].type).toBe('codeBlock');
-    expect(top[2].attrs?.language).toBeNull();
-    expect(top[2].content?.[0]).toMatchObject({ type: 'text', text: '\n' });
+    expect(top[0].content?.[0]?.text).toContain('```\ninner\n```');
 
     const md2 = convertProseMirrorToMarkdown(doc2);
-    expect(md2).not.toBe(md1); // not byte-stable
-    expect(docsCanonicallyEqual(d, doc2)).toBe(false); // documented data loss
+    expect(md2).toBe(md1); // byte-stable
+    // Canonically the re-imported code text gains a single trailing newline
+    // (marked re-adds it; the exporter strips it back, hence byte stability).
+    // The fence is no longer lossy: the inner fence and content fully survive.
+    expect(docsCanonicallyEqual(d, doc2)).toBe(false);
   });
 
   // 13. A leading ordered-list marker in paragraph text is NOT escaped, so a

@@ -52,11 +52,16 @@ export function resolveSource(
   stickyTouched: boolean,
   contextActor?: string,
 ): ProvenanceSource {
-  // Precedence: agent > git-sync > user. The sticky agent marker wins so a
-  // window that mixed an agent edit stays tagged 'agent'; otherwise a native
-  // git-sync write (plan §8.1) tags 'git-sync'; a plain human edit stays 'user'.
-  if (stickyTouched || contextActor === 'agent') return 'agent';
+  // An EXPLICIT current-write actor is authoritative for THIS write and wins
+  // over the sticky-agent fallback. Order: explicit 'agent' > explicit
+  // 'git-sync' > sticky agent marker > plain human 'user'. The git-sync case
+  // must NOT be masked by the sticky marker, or the PageChangeListener
+  // loop-guard (which keys on lastUpdatedSource === 'git-sync') would re-export
+  // git-sync's own writes (#14). Explicit agent still wins so a window that
+  // mixed an agent edit stays tagged 'agent'.
+  if (contextActor === 'agent') return 'agent';
   if (contextActor === 'git-sync') return 'git-sync';
+  if (stickyTouched) return 'agent';
   return 'user';
 }
 

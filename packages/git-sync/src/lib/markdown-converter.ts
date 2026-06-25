@@ -1,3 +1,18 @@
+import { encodeHtmlEmbedSource } from "./docmost-schema.js";
+
+/**
+ * Hard cap on processNode recursion depth (see the depth guard below).
+ *
+ * Chosen well above any realistic document (the deepest legitimate nesting the
+ * editor can produce is far shallower) yet far below the point where the
+ * converter's own call stack overflows. The heaviest shape (deeply nested
+ * lists) costs ~5 JS frames per level and the runtime stack holds ~10k frames,
+ * so the measured overflow is around level ~650 (deeply nested lists); 400
+ * leaves a comfortable margin while still rendering pathological-but-bounded
+ * docs in full (the 200-level stress fixture reaches depth ~204).
+ */
+const MAX_NODE_DEPTH = 400;
+
 /**
  * Convert ProseMirror/TipTap JSON content to Markdown
  * Supports all Docmost-specific node types and extensions
@@ -43,7 +58,34 @@ export function convertProseMirrorToMarkdown(content: any): string {
       .replace(/\(/g, "%28")
       .replace(/\)/g, "%29");
 
+  // Recursion depth guard. processNode is mutually recursive (directly and via
+  // processListItem/processTaskItem/blockToHtml), and a pathologically nested
+  // document (e.g. tens of thousands of nested blockquotes) would otherwise
+  // overflow the call stack and throw a RangeError, which would abort the sync
+  // and prevent the page from ever being written. We track the live nesting
+  // depth in a closure counter (the wrapper below) so we NEVER throw: past the
+  // limit we stop recursing and emit the node's own text (or nothing) instead.
+  // Normal documents never approach MAX_NODE_DEPTH, so their output is byte-
+  // identical. NOTE: the wrapper signature is (node) only — several callers use
+  // `.map(processNode)`, which would otherwise pass the array index as a second
+  // argument; the wrapper ignores extra arguments so that is harmless.
+  let nodeDepth = 0;
   const processNode = (node: any): string => {
+    if (nodeDepth >= MAX_NODE_DEPTH) {
+      // Bail out of deeper recursion without throwing. A text node still has
+      // its own content worth keeping; a container at the limit collapses to
+      // "" (its already-too-deep subtree is dropped) rather than overflowing.
+      return typeof node?.text === "string" ? node.text : "";
+    }
+    nodeDepth++;
+    try {
+      return processNodeInner(node);
+    } finally {
+      nodeDepth--;
+    }
+  };
+
+  const processNodeInner = (node: any): string => {
     const type = node.type;
     const nodeContent = node.content || [];
 
@@ -182,7 +224,16 @@ export function convertProseMirrorToMarkdown(content: any): string {
           .map(processNode)
           .join("")
           .replace(/\n+$/, "");
-        return "```" + language + "\n" + code + "\n```";
+        // CommonMark: an inner ``` run inside the code would prematurely close
+        // a 3-backtick fence (corrupting the block on re-import). Use an outer
+        // fence one backtick longer than the longest backtick run in the code
+        // (minimum 3) so the inner fence is always content.
+        const longestBacktickRun = (code.match(/`+/g) || []).reduce(
+          (max: number, run: string) => Math.max(max, run.length),
+          0,
+        );
+        const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+        return fence + language + "\n" + code + "\n" + fence;
 
       case "bulletList":
         return nodeContent
@@ -228,16 +279,35 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // a bare "\n" would be reimported as a soft break and lost.
         return "  \n";
 
-      case "image":
-        const imgAlt = node.attrs?.alt || "";
+      case "image": {
+        const imgAttrs = node.attrs || {};
+        // A top-level image with layout/identity attrs beyond src/alt cannot be
+        // expressed by markdown `![](src)` — width/height/align/size/
+        // attachmentId/aspectRatio would be silently dropped on export and lost
+        // on re-import. Emit the SAME schema-matching <img> used inside columns
+        // (imageToHtml) so those attrs survive the round-trip. A bare image
+        // (only src/alt, optionally a title — which has no schema attr) keeps
+        // the lighter markdown form so existing image round-trip tests hold.
+        const hasLayoutAttrs =
+          imgAttrs.width != null ||
+          imgAttrs.height != null ||
+          imgAttrs.align ||
+          imgAttrs.size != null ||
+          imgAttrs.attachmentId ||
+          imgAttrs.aspectRatio != null;
+        if (hasLayoutAttrs) {
+          return imageToHtml(node);
+        }
+        const imgAlt = imgAttrs.alt || "";
         // Neutralize characters that could break out of the markdown image
         // URL: spaces/newlines and parentheses would terminate the (...) target
         // and let a stored src inject following markdown/HTML. Percent-encode
         // them so the URL stays a single inert token.
-        const imgSrc = encodeMdUrl(node.attrs?.src);
+        const imgSrc = encodeMdUrl(imgAttrs.src);
         // No "caption" attribute exists in the Docmost image schema, so we do
         // not emit one (the previous caption branch was dead).
         return `![${imgAlt}](${imgSrc})`;
+      }
 
       case "video": {
         // Emit the schema-matching <video> element so generateJSON rebuilds the
@@ -581,6 +651,83 @@ export function convertProseMirrorToMarkdown(content: any): string {
       case "subpages":
         return "{{SUBPAGES}}";
 
+      case "status": {
+        // Inline status pill. The schema reads the label from the element's
+        // TEXT content and the color from data-color, so emit both; without a
+        // case this inline atom fell through to `default` and collapsed to "".
+        const attrs = node.attrs || {};
+        const statusColor = attrs.color || "gray";
+        return `<span data-type="status" data-color="${escapeAttr(statusColor)}">${escapeHtmlText(attrs.text ?? "")}</span>`;
+      }
+
+      case "htmlEmbed": {
+        // Block atom; the schema reads the raw source from a base64-encoded
+        // data-source attribute (and an optional fixed height from data-height).
+        // Encode with the shared helper so it decodes symmetrically on import.
+        const attrs = node.attrs || {};
+        const parts: string[] = [
+          `data-type="htmlEmbed"`,
+          `data-source="${escapeAttr(encodeHtmlEmbedSource(attrs.source ?? ""))}"`,
+        ];
+        if (attrs.height != null)
+          parts.push(`data-height="${escapeAttr(attrs.height)}"`);
+        return `<div ${parts.join(" ")}></div>`;
+      }
+
+      case "footnoteReference": {
+        // Inline atom marker. The schema reads its id from data-id on a
+        // sup[data-footnote-ref]; the visible number is derived, not stored.
+        const attrs = node.attrs || {};
+        const idAttr = attrs.id ? ` data-id="${escapeAttr(attrs.id)}"` : "";
+        return `<sup data-footnote-ref${idAttr}></sup>`;
+      }
+
+      case "footnotesList": {
+        // Bottom container of footnote definitions (section[data-footnotes]).
+        const inner = nodeContent.map((n: any) => blockToHtml(n)).join("");
+        return `<section data-footnotes>${inner}</section>`;
+      }
+
+      case "footnoteDefinition": {
+        // One footnote note keyed by id (div[data-footnote-def]).
+        const attrs = node.attrs || {};
+        const idAttr = attrs.id ? ` data-id="${escapeAttr(attrs.id)}"` : "";
+        const inner = nodeContent.map((n: any) => blockToHtml(n)).join("");
+        return `<div data-footnote-def${idAttr}>${inner}</div>`;
+      }
+
+      case "pageEmbed": {
+        // Whole-page live embed; the schema reads data-source-page-id.
+        const attrs = node.attrs || {};
+        const parts: string[] = [`data-type="pageEmbed"`];
+        if (attrs.sourcePageId)
+          parts.push(`data-source-page-id="${escapeAttr(attrs.sourcePageId)}"`);
+        return `<div ${parts.join(" ")}></div>`;
+      }
+
+      case "transclusionReference": {
+        // Live reference to a transcluded block/page. Block atom; the schema
+        // reads data-source-page-id and data-transclusion-id.
+        const attrs = node.attrs || {};
+        const parts: string[] = [`data-type="transclusionReference"`];
+        if (attrs.sourcePageId)
+          parts.push(`data-source-page-id="${escapeAttr(attrs.sourcePageId)}"`);
+        if (attrs.transclusionId)
+          parts.push(
+            `data-transclusion-id="${escapeAttr(attrs.transclusionId)}"`,
+          );
+        return `<div ${parts.join(" ")}></div>`;
+      }
+
+      case "transclusionSource": {
+        // Sync-source container; the schema reads data-id and re-parses its
+        // block children, so render them as schema-matching HTML.
+        const attrs = node.attrs || {};
+        const idAttr = attrs.id ? ` data-id="${escapeAttr(attrs.id)}"` : "";
+        const inner = nodeContent.map((n: any) => blockToHtml(n)).join("");
+        return `<div data-type="transclusionSource"${idAttr}>${inner}</div>`;
+      }
+
       default:
         // Fallback: process children
         return nodeContent.map(processNode).join("");
@@ -782,6 +929,12 @@ export function convertProseMirrorToMarkdown(content: any): string {
       case "attachment":
       case "drawio":
       case "excalidraw":
+      case "htmlEmbed":
+      case "footnotesList":
+      case "footnoteDefinition":
+      case "pageEmbed":
+      case "transclusionSource":
+      case "transclusionReference":
         return processNode(block);
       default:
         // Any still-unhandled block type: NEVER fall back to markdown inside a

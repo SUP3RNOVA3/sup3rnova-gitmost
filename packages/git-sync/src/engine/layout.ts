@@ -54,23 +54,54 @@ export function buildVaultLayout(pages: PageNode[]): Map<string, VaultEntry> {
     if (p && p.id && !byId.has(p.id)) byId.set(p.id, p);
   }
 
-  // Resolve each node's display name once, deterministically, tracking sibling
-  // collisions per parent. `usedBySibling` maps a parent key -> set of names
-  // already taken under that parent. The bucket key is the node's parent ONLY
-  // when that parent is actually present in `byId`; otherwise (null parent, or
-  // an orphan whose parent is outside the input set) the node buckets at
-  // `"__root__"`. This is critical: orphans land at the vault root (see
-  // `folderSegmentsFor`), so they MUST share the root bucket with real root
-  // pages to be disambiguated against each other here — making `nameById` final
-  // before any `segments` are computed, so no ancestor name can drift later.
-  const usedBySibling = new Map<string, Set<string>>();
-  const nameById = new Map<string, string>();
+  // Resolve each node's display name once, deterministically. The bucket key is
+  // the node's parent ONLY when that parent is actually present in `byId`;
+  // otherwise (null parent, or an orphan whose parent is outside the input set)
+  // the node buckets at `"__root__"`. This is critical: orphans land at the vault
+  // root (see `folderSegmentsFor`), so they MUST share the root bucket with real
+  // root pages to be disambiguated against each other here — making `nameById`
+  // final before any `segments` are computed, so no ancestor name can drift.
+  const parentKeyOf = (p: PageNode): string =>
+    p.parentPageId && byId.has(p.parentPageId) ? p.parentPageId : "__root__";
+  // Group nodes by (parentKey, sanitized base title) so sibling collisions are
+  // resolved by a STABLE rule that does NOT depend on input array order. Dedupe
+  // ids (first occurrence wins, matching `byId`).
+  const siblingGroups = new Map<string, PageNode[]>();
+  const namedIds = new Set<string>();
   for (const p of pages) {
-    if (p && p.id && !nameById.has(p.id)) {
-      const parentKey =
-        p.parentPageId && byId.has(p.parentPageId) ? p.parentPageId : "__root__";
-      nameById.set(p.id, nameForNode(p, parentKey, usedBySibling));
+    if (!p || !p.id || namedIds.has(p.id)) continue;
+    namedIds.add(p.id);
+    const key = `${parentKeyOf(p)}\u0000${sanitizeTitle(p.title ?? "")}`;
+    const bucket = siblingGroups.get(key);
+    if (bucket) bucket.push(p);
+    else siblingGroups.set(key, [p]);
+  }
+  // Assign each node its display name. Within a colliding group, sort the
+  // siblings by their stable disambiguation key (`slugId` else `id`) and let the
+  // FIRST keep the bare sanitized title; every OTHER gets the ` ~<slugId>`
+  // suffix. This makes `nameById` a pure function of the page SET — reordering
+  // the input never moves the suffix onto a different page (red-team #4a). The
+  // suffix is itself sanitized (the slugId/id is untrusted and must never inject
+  // a path separator).
+  const nameById = new Map<string, string>();
+  const disambKeyOf = (p: PageNode): string => p.slugId ?? p.id;
+  for (const bucket of siblingGroups.values()) {
+    const base = sanitizeTitle(bucket[0].title ?? "");
+    if (bucket.length === 1) {
+      nameById.set(bucket[0].id, base);
+      continue;
     }
+    const sorted = [...bucket].sort((a, b) => {
+      const ka = disambKeyOf(a);
+      const kb = disambKeyOf(b);
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    sorted.forEach((p, i) => {
+      nameById.set(
+        p.id,
+        i === 0 ? base : disambiguate(base, sanitizeTitle(disambKeyOf(p))),
+      );
+    });
   }
 
   // Every id we index above MUST get a resolved name; this helper returns it
@@ -169,34 +200,3 @@ export function buildVaultLayout(pages: PageNode[]): Map<string, VaultEntry> {
   return layout;
 }
 
-/**
- * Compute a deterministic, collision-free name for a node among its SIBLINGS.
- * `usedBySibling` maps a parent key -> set of names already taken, so two
- * siblings that sanitize to the same name get a stable ` ~slugId` suffix
- * (SPEC §12). The suffix is itself passed through `sanitizeTitle`, because the
- * slugId/id is a second untrusted-data channel that must never leak a path
- * separator into the name. `parentKey` is supplied by the caller (it resolves
- * to `"__root__"` for root pages AND for orphans whose parent is outside the
- * input set, so they share one bucket). The name is COSMETIC; identity lives in
- * the meta block.
- */
-function nameForNode(
-  node: PageNode,
-  parentKey: string,
-  usedBySibling: Map<string, Set<string>>,
-): string {
-  let used = usedBySibling.get(parentKey);
-  if (!used) {
-    used = new Set<string>();
-    usedBySibling.set(parentKey, used);
-  }
-
-  let name = sanitizeTitle(node.title ?? "");
-  if (used.has(name)) {
-    // Sibling collision: disambiguate with the stable, sanitized slugId (fall
-    // back to the sanitized pageId if no slugId is present).
-    name = disambiguate(name, sanitizeTitle(node.slugId ?? node.id));
-  }
-  used.add(name);
-  return name;
-}

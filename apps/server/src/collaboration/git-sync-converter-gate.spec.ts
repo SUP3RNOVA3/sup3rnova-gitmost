@@ -402,7 +402,7 @@ describe('git-sync converter §13.1 idempotency gate (editor-ext schema)', () =>
 // data-* attrs, as it already does for video/diagrams), these assertions flip
 // and the image fixture should be promoted into the green CORPUS above.
 // ---------------------------------------------------------------------------
-describe('git-sync converter §13.1 KNOWN DIVERGENCE (markdown image lossiness)', () => {
+describe('git-sync converter §13.1 image dimensions preserved (was KNOWN DIVERGENCE)', () => {
   const imageDoc = doc({
     type: 'image',
     attrs: {
@@ -413,29 +413,26 @@ describe('git-sync converter §13.1 KNOWN DIVERGENCE (markdown image lossiness)'
     },
   });
 
-  it('drops width/height/align (markdown ![](src) cannot carry them); the block-image hoist no longer leaves an empty paragraph', async () => {
+  it('preserves width/height/align by exporting an HTML <img> (PR #119 round-trip fix)', async () => {
     const { md, canonNormalized } = await runGate(imageDoc);
 
-    // Export is plain markdown image syntax — no dimensions/align survive.
-    expect(md.trim()).toBe('![](https://example.com/pic.png)');
+    // A top-level image carrying layout attrs is now exported as a schema-
+    // matching HTML <img> (the same path video/diagrams already use), so the
+    // dimensions and alignment survive the round trip instead of collapsing to
+    // bare `![](src)`.
+    expect(md.trim()).toBe(
+      '<img src="https://example.com/pic.png" width="640" height="480" align="center">',
+    );
 
-    // The round-tripped doc carries ONLY src (+ alt=""). The leading empty
-    // paragraph that the block-image hoist used to leave behind (a phantom
-    // blank-gap on every sync) is now stripped on import (git-sync fix), so the
-    // doc is just the image — no empty-paragraph artifact.
-    expect(canonNormalized).toEqual({
-      type: 'doc',
-      content: [
-        {
-          type: 'image',
-          attrs: { alt: '', src: 'https://example.com/pic.png' },
-        },
-      ],
-    });
-
-    // Still NOT canonically equal to the original: width/height/align are an
-    // intrinsic markdown-transport loss (unrelated to the empty-paragraph fix).
-    expect(docsCanonicallyEqual(imageDoc, canonNormalized)).toBe(false);
+    // The round-tripped image keeps src + the layout attrs. width/height are
+    // re-imported as strings (matching the video/audio/pdf string convention),
+    // so assert the values rather than the JS type.
+    const imgAttrs = (canonNormalized as any).content[0].attrs;
+    expect((canonNormalized as any).content[0].type).toBe('image');
+    expect(imgAttrs.src).toBe('https://example.com/pic.png');
+    expect(imgAttrs.align).toBe('center');
+    expect(String(imgAttrs.width)).toBe('640');
+    expect(String(imgAttrs.height)).toBe('480');
   });
 });
 

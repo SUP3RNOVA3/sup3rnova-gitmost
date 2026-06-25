@@ -27,6 +27,16 @@ export interface RunCycleDeps {
   fs: CycleFs;
   log: (line: string) => void;
   /**
+   * Optional cooperative-abort signal. The caller (orchestrator) wires this to
+   * the per-space lock: if a heartbeat refresh cannot CONFIRM the lock is still
+   * held (CAS-miss / Redis error), the signal is aborted and the cycle bails at
+   * its next checkpoint (before the pull-apply and before the push-apply — the
+   * two destructive write phases) instead of writing blind after a possible
+   * lock loss. This is a COARSE best-effort guard; a fully fenced cross-process
+   * single-writer still needs the fencing-token redesign (follow-up).
+   */
+  signal?: AbortSignal;
+  /**
    * Delete-cap hook (the ONLY caller-specific policy). Called with the push
    * dry-run's planned delete count (`Number.POSITIVE_INFINITY` when the dry-run
    * itself failed, so the hook can fail safe) and the live client; returns the
@@ -47,6 +57,13 @@ export interface RunCycleResult {
   skipped?: "merge-in-progress";
   pull?: { written: number; deleted: number; conflict: boolean };
   push?: { mode: string; failures: number };
+  /**
+   * Forwarded from the push result: `true` when the push REFUSED to fast-forward
+   * a divergent `docmost` mirror (the §5 invariant — `docmost` mirrors what
+   * Docmost contains — is broken). Surfaced here so a caller driving `runCycle`
+   * can detect the breach without scraping logs (red-team #15).
+   */
+  divergentDocmost?: boolean;
 }
 
 /**
@@ -70,7 +87,7 @@ export interface RunCycleResult {
  * Lock + cap POLICY live in the caller; this owns only the mechanics.
  */
 export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
-  const { spaceId, client, vault, settings, fs, log, resolveApplyClient } =
+  const { spaceId, client, vault, settings, fs, log, resolveApplyClient, signal } =
     deps;
   const vaultRoot = settings.vaultPath;
   const abs = (relPath: string) => `${vaultRoot}/${relPath}`;
@@ -106,6 +123,9 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
     treeComplete: tree.complete,
     existing,
   });
+
+  // Bail before the first destructive write phase if the lock was lost.
+  signal?.throwIfAborted();
 
   const pullResult = await applyPullActions(
     {
@@ -150,6 +170,9 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
     applyClient = resolveApplyClient(plannedDeletes, client);
   }
 
+  // Bail before pushing to Docmost if the lock was lost during pull.
+  signal?.throwIfAborted();
+
   const pushResult = await runPush(
     { ...pushDeps, makeClient: () => applyClient },
     { dryRun: false },
@@ -166,5 +189,8 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
       mode: pushResult.mode,
       failures: pushResult.failures?.length ?? 0,
     },
+    // Forward a divergent-`docmost` escalation so the caller can act on the §5
+    // invariant breach without scraping logs (red-team #15).
+    divergentDocmost: pushResult.divergentDocmost ?? false,
   };
 }

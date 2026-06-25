@@ -50,22 +50,125 @@ function matchMap(pairs: Array<[number, number]>): Map<number, number> {
   return m;
 }
 
-const keysEqual = (x: string[], y: string[]): boolean =>
-  x.length === y.length && x.every((v, k) => v === y[k]);
+/**
+ * One change `side` made to `base` within a region: base blocks `[oStart,oEnd)`
+ * were replaced by the side's blocks listed in `content` (region-local indices).
+ * A pure insert has `oStart === oEnd`; a pure delete has empty `content`.
+ */
+interface Hunk {
+  oStart: number;
+  oEnd: number;
+  content: number[];
+}
 
 /**
- * Resolve one region (the live slice, target slice, and base slice that occupy
- * the same span between two anchors). 'target' (git) wins ties and conflicts.
+ * Diff `o` against one side as a list of non-overlapping hunks (the base spans
+ * the side rewrote/inserted/deleted), derived from their LCS alignment.
  */
-function decideRegion(
-  aRegion: string[],
-  bRegion: string[],
-  oRegion: string[],
-): 'live' | 'target' {
-  if (keysEqual(aRegion, bRegion)) return 'target'; // same edit on both sides
-  if (keysEqual(aRegion, oRegion)) return 'target'; // live unchanged -> git's edit
-  if (keysEqual(bRegion, oRegion)) return 'live'; // git unchanged -> human's edit
-  return 'target'; // genuine conflict -> git wins
+function buildHunks(o: string[], side: string[]): Hunk[] {
+  const pairs = lcsPairs(o, side); // [oIdx, sideIdx] kept (unchanged) blocks
+  const hunks: Hunk[] = [];
+  let prevO = -1;
+  let prevS = -1;
+  const flush = (curO: number, curS: number): void => {
+    const oStart = prevO + 1;
+    const oEnd = curO;
+    const content: number[] = [];
+    for (let s = prevS + 1; s < curS; s++) content.push(s);
+    if (oEnd > oStart || content.length > 0) hunks.push({ oStart, oEnd, content });
+  };
+  for (const [oIdx, sIdx] of pairs) {
+    flush(oIdx, sIdx);
+    prevO = oIdx;
+    prevS = sIdx;
+  }
+  flush(o.length, side.length);
+  return hunks;
+}
+
+/**
+ * Do two hunks (one per side) touch the same base region? Pure inserts only
+ * collide when nested strictly inside the other hunk's base span (or, for two
+ * inserts, at the same gap); changes sitting at a shared boundary do not.
+ */
+function hunksOverlap(a: Hunk, b: Hunk): boolean {
+  const aIns = a.oStart === a.oEnd;
+  const bIns = b.oStart === b.oEnd;
+  if (aIns && bIns) return a.oStart === b.oStart;
+  if (aIns) return b.oStart < a.oStart && a.oStart < b.oEnd;
+  if (bIns) return a.oStart < b.oStart && b.oStart < a.oEnd;
+  return Math.max(a.oStart, b.oStart) < Math.min(a.oEnd, b.oEnd);
+}
+
+interface LocalPick {
+  src: 'live' | 'target';
+  local: number;
+}
+
+/**
+ * Fine-grained three-way merge of ONE inter-anchor region. Combines the human's
+ * and git's NON-overlapping hunks (e.g. a human edit to one block plus a git
+ * insert/delete of OTHER blocks in the same region) so neither change is lost.
+ * Returns the merged region as region-local picks, or `null` when the two sides
+ * changed the SAME base block — a genuine conflict the caller resolves by the
+ * original all-or-nothing rule (git wins the whole region).
+ */
+function tryMergeRegion(
+  o: string[],
+  a: string[],
+  b: string[],
+): LocalPick[] | null {
+  const aHunks = buildHunks(o, a);
+  const bHunks = buildHunks(o, b);
+
+  // Any overlap between a human hunk and a git hunk is a real conflict; bail so
+  // the caller falls back to git-wins (preserving the original behavior).
+  for (const ah of aHunks) {
+    for (const bh of bHunks) {
+      if (hunksOverlap(ah, bh)) return null;
+    }
+  }
+
+  // Disjoint: live index of each base block that BOTH sides kept (stable).
+  const aKept = matchMap(lcsPairs(o, a)); // base index -> live index
+
+  const out: LocalPick[] = [];
+  let pa = 0;
+  let pb = 0;
+  let oi = 0;
+  while (oi < o.length || pa < aHunks.length || pb < bHunks.length) {
+    const ah = pa < aHunks.length ? aHunks[pa] : null;
+    const bh = pb < bHunks.length ? bHunks[pb] : null;
+    const nextStart = Math.min(
+      ah ? ah.oStart : o.length,
+      bh ? bh.oStart : o.length,
+    );
+
+    // Emit stable base blocks (kept by both) until the next hunk, from LIVE.
+    while (oi < nextStart) {
+      out.push({ src: 'live', local: aKept.get(oi) as number });
+      oi++;
+    }
+    if (!ah && !bh) break;
+
+    // Apply the hunk at oi. When both sides act here they are disjoint, so the
+    // pure-insert (oEnd === oi) is emitted before the side that consumes base oi.
+    const aHere = ah !== null && ah.oStart === oi;
+    const bHere = bh !== null && bh.oStart === oi;
+    let useA: boolean;
+    if (aHere && bHere) {
+      useA = ah!.oEnd === oi; // insert side first; otherwise either order is fine
+    } else {
+      useA = aHere;
+    }
+    const h = (useA ? ah : bh) as Hunk;
+    const src: 'live' | 'target' = useA ? 'live' : 'target';
+    for (const idx of h.content) out.push({ src, local: idx });
+    oi = h.oEnd;
+    if (useA) pa++;
+    else pb++;
+  }
+  return out;
 }
 
 export interface Pick {
@@ -96,13 +199,22 @@ export function diff3Plan(o: string[], a: string[], b: string[]): Pick[] {
     const bEnd = anchor < o.length ? (oToB.get(anchor) as number) : b.length;
 
     // Resolve the region [oi,anchor) that one or both sides rewrote/inserted.
-    const take = decideRegion(
+    // Try a fine-grained three-way merge first so a human block-edit survives a
+    // git insert/delete of OTHER blocks in the same region; only a genuine
+    // same-block conflict (null) falls back to the original git-wins rule.
+    const merged = tryMergeRegion(
+      o.slice(oi, anchor),
       a.slice(ai, aEnd),
       b.slice(bi, bEnd),
-      o.slice(oi, anchor),
     );
-    if (take === 'live') {
-      for (let k = ai; k < aEnd; k++) res.push({ src: 'live', index: k });
+    if (merged) {
+      for (const p of merged) {
+        res.push(
+          p.src === 'live'
+            ? { src: 'live', index: ai + p.local }
+            : { src: 'target', index: bi + p.local },
+        );
+      }
     } else {
       for (let k = bi; k < bEnd; k++) res.push({ src: 'target', index: k });
     }

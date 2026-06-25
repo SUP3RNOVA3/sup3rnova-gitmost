@@ -133,8 +133,27 @@ export function classifyRenameMoves(
   return renamesMoves.map((rm) => {
     const newParent = deps.resolveParentPageId(rm.newPath, "current");
     const oldParent = deps.resolveParentPageId(rm.oldPath, "prev");
-    const newTitle = deps.metaAt(rm.newPath, "current")?.title;
-    const oldTitle = deps.metaAt(rm.oldPath, "prev")?.title;
+    // Strip the cosmetic ` ~<slugId>` disambiguation suffix before comparing
+    // titles: it is a LOCAL filesystem artifact (`buildVaultLayout` appends it to
+    // a colliding sibling's stem), NOT part of the page's real title. A pure
+    // disambiguation file-rename ('Report.md' -> 'Report ~a1.md') must therefore
+    // NOT be pushed to Docmost as a title change (red-team #4b), and any title we
+    // DO push must carry the real title ('Report'), never the suffixed form.
+    const rawNewTitle = deps.metaAt(rm.newPath, "current")?.title;
+    const rawOldTitle = deps.metaAt(rm.oldPath, "prev")?.title;
+    // A PURE disambiguation rename only APPENDS a cosmetic ` ~<suffix>` to the
+    // SAME title (layout.ts), so the real Docmost title is unchanged. Strip the
+    // suffix ONLY when the new name is exactly the old title plus that suffix —
+    // never blindly strip a genuine retitle whose new title legitimately ends in
+    // ` ~token` (e.g. "Budget ~draft" -> "Budget ~final"), which would corrupt
+    // the title in Docmost / drop a real rename (review finding).
+    const isCosmeticDisambiguation =
+      typeof rawNewTitle === "string" &&
+      typeof rawOldTitle === "string" &&
+      rawNewTitle !== rawOldTitle &&
+      stripDisambiguationSuffix(rawNewTitle) === rawOldTitle;
+    const newTitle = isCosmeticDisambiguation ? rawOldTitle : rawNewTitle;
+    const oldTitle = rawOldTitle;
 
     const out: RenameMoveActionClassified = {
       pageId: rm.pageId,
@@ -646,7 +665,11 @@ export async function applyPushActions(
       // Push the CLEAN body only (no `gitmost_id` frontmatter): the frontmatter
       // is engine metadata, never page content. The server converts the markdown
       // it receives verbatim, so stripping here keeps the id out of Docmost.
-      const body = parsePageFile(await deps.readFile(u.path)).body;
+      // Also strip any git conflict markers — they must NEVER reach Docmost
+      // (SPEC §9, red-team #13); content on both sides is preserved.
+      const body = stripConflictMarkers(
+        parsePageFile(await deps.readFile(u.path)).body,
+      );
       // The last-synced version of this file (pre-image) is the common ancestor
       // for a 3-way merge against the live page, so concurrent human edits are
       // not clobbered (review #5). Null when the file is new at last-pushed. Its
@@ -689,6 +712,10 @@ export async function applyPushActions(
   // folder, so (parentPageId, title) identifies the page; a match means a prior
   // cycle already created it, so we ADOPT instead of duplicating.
   let liveByParentTitle: Map<string, string> | null = null;
+  // A (parentPageId, title) that more than ONE live page shares is AMBIGUOUS:
+  // adopting one of them would silently overwrite an arbitrary, possibly-unrelated
+  // sibling (red-team #6). Such keys are recorded here and EXCLUDED from adoption.
+  const ambiguousAdoptKeys = new Set<string>();
   if (actions.creates.length > 0) {
     const live = await client.listSpaceTree(deps.spaceId);
     // Only trust a COMPLETE tree for retry-adopt: a truncated tree could miss an
@@ -699,32 +726,56 @@ export async function applyPushActions(
       liveByParentTitle = new Map();
       for (const n of live.pages) {
         const key = `${n.parentPageId ?? " root"} ${n.title ?? ""}`;
-        // Keep the FIRST node for a key (the layout makes this unique in practice).
-        if (!liveByParentTitle.has(key)) liveByParentTitle.set(key, n.id);
+        // First node claims the key; a SECOND match marks it ambiguous so neither
+        // is ever adopted-over (the create falls back to a fresh createPage).
+        if (liveByParentTitle.has(key)) ambiguousAdoptKeys.add(key);
+        else liveByParentTitle.set(key, n.id);
       }
     }
   }
-  for (const c of actions.creates) {
+  // Order creates PARENT-before-CHILD (red-team #12): a child whose parent is
+  // ALSO a fresh create must run AFTER its parent so the parent's just-assigned
+  // pageId is available to parent it (otherwise it is placed at the space ROOT).
+  const orderedCreates = orderCreatesParentFirst(actions.creates);
+  // Track pageIds assigned (or adopted) to each create's PATH in THIS batch, so a
+  // child can resolve its freshly-created parent's id without depending on the
+  // on-disk write-back being observable yet (red-team #12).
+  const createdIdByPath = new Map<string, string>();
+  for (const c of orderedCreates) {
     try {
       const text = await deps.readFile(c.path);
-      const { body } = parsePageFile(text);
+      // Conflict markers must never reach Docmost (SPEC §9, red-team #13); strip
+      // them from the create body too, preserving both sides' content.
+      const body = stripConflictMarkers(parsePageFile(text).body);
       // Derive create args from the PATH (native-Obsidian, SPEC §5): title from
       // the filename, parent from the enclosing folder's folder-note, space from
       // the run (the vault's space). `parentPageId: null` -> created at ROOT.
       const title = titleFromPath(c.path);
+      // Resolve the parent from the PATH (SPEC §5). Prefer an id assigned to the
+      // parent's folder-note EARLIER in this same batch — a freshly-created parent
+      // whose on-disk write-back may not be observable yet (red-team #12; creates
+      // are ordered parent-before-child so the parent already ran).
+      const parentFile = parentFolderFile(c.path);
       const parentPageId =
-        (await resolveParentPageIdViaTree(deps, c.path, "current")) ?? undefined;
+        (parentFile !== null ? createdIdByPath.get(parentFile) : undefined) ??
+        (await resolveParentPageIdViaTree(deps, c.path, "current")) ??
+        undefined;
       // Retry-adopt (#1 idempotency): a prior cycle already created this page in
       // Docmost but failed to persist the pageId back to the file, so it was
       // re-seen as a create. Adopt the existing page instead of duplicating it:
       // write the id back (file becomes tracked) and push the body as an UPDATE
-      // (idempotent — targets by pageId). Do NOT call createPage again.
+      // (idempotent — targets by pageId). Do NOT call createPage again. SKIP
+      // adoption when the (parent, title) is AMBIGUOUS — adopting an arbitrary
+      // duplicate-title sibling would silently overwrite it (red-team #6).
       const adoptKey = `${parentPageId ?? " root"} ${title}`;
-      const existingId = liveByParentTitle?.get(adoptKey);
+      const existingId = ambiguousAdoptKeys.has(adoptKey)
+        ? undefined
+        : liveByParentTitle?.get(adoptKey);
       if (existingId) {
         const rewritten = serializePageFile(existingId, body);
         await deps.writeFile(c.path, rewritten);
         writtenBack.push({ path: c.path, pageId: existingId });
+        createdIdByPath.set(c.path, existingId);
         const adopted = await client.importPageMarkdown(existingId, body, null);
         pushed.push({
           pageId: existingId,
@@ -749,6 +800,7 @@ export async function applyPushActions(
         const rewritten = serializePageFile(assignedPageId, body);
         await deps.writeFile(c.path, rewritten);
         writtenBack.push({ path: c.path, pageId: assignedPageId });
+        createdIdByPath.set(c.path, assignedPageId);
         // §10 loop-guard data for the created page (hash the pushed BODY).
         pushed.push({
           pageId: assignedPageId,
@@ -943,6 +995,35 @@ export function parentFolderFile(path: string): string | null {
 }
 
 /**
+ * Order CREATE actions so a create whose parent folder-note is ALSO being created
+ * appears AFTER its parent (red-team #12). A child created before its fresh parent
+ * cannot resolve the parent's pageId and would be placed at the space ROOT.
+ * Topological over the `parentFolderFile` relation, restricted to paths within the
+ * create set; an `inProgress` guard makes a malformed parent cycle safe.
+ */
+export function orderCreatesParentFirst(creates: CreateAction[]): CreateAction[] {
+  const byPath = new Map<string, CreateAction>();
+  for (const c of creates) byPath.set(c.path, c);
+  const ordered: CreateAction[] = [];
+  const visited = new Set<string>();
+  const inProgress = new Set<string>();
+  const visit = (c: CreateAction): void => {
+    if (visited.has(c.path) || inProgress.has(c.path)) return;
+    inProgress.add(c.path);
+    const parent = parentFolderFile(c.path);
+    if (parent !== null && parent !== c.path) {
+      const parentCreate = byPath.get(parent);
+      if (parentCreate) visit(parentCreate);
+    }
+    inProgress.delete(c.path);
+    visited.add(c.path);
+    ordered.push(c);
+  };
+  for (const c of creates) visit(c);
+  return ordered;
+}
+
+/**
  * Whether a vault path is a Docmost PAGE file (design §"Adoption"): a `.md` file
  * with NO dot-segment anywhere in its path. This excludes `.obsidian/` config,
  * `.trash/`, dotfiles (`.foo.md`), and every non-`.md` file (attachments, JSON,
@@ -953,6 +1034,51 @@ export function parentFolderFile(path: string): string | null {
 export function isPageFile(path: string): boolean {
   if (!path.endsWith(".md")) return false;
   return !path.split("/").some((seg) => seg.startsWith("."));
+}
+
+/**
+ * Git conflict-marker scan + strip (SPEC §9 — conflict markers must NEVER reach
+ * Docmost). A body is treated as conflicted only when it carries BOTH a begin
+ * (`<<<<<<<`) and an end (`>>>>>>>`) marker line, so a legitimate Markdown setext
+ * heading underline (`=======`) is not mistaken for a conflict. When conflicted,
+ * the three marker line types are removed while BOTH sides' content is preserved
+ * (no data loss): the marker SYNTAX never reaches Docmost, but the human's content
+ * does — where the conflict is visible and fixable rather than silently dropped.
+ */
+const CONFLICT_BEGIN_RE = /^<{7}/m;
+const CONFLICT_END_RE = /^>{7}/m;
+const CONFLICT_BEGIN_LINE_RE = /^<{7}/;
+const CONFLICT_SEP_LINE_RE = /^={7}/;
+const CONFLICT_END_LINE_RE = /^>{7}/;
+
+export function hasConflictMarkers(body: string): boolean {
+  return CONFLICT_BEGIN_RE.test(body) && CONFLICT_END_RE.test(body);
+}
+
+function stripConflictMarkers(body: string): string {
+  if (!hasConflictMarkers(body)) return body;
+  // Remove ONLY the three marker line types, and treat a `=======` line as a
+  // conflict separator ONLY when we are between a `<<<<<<<` begin and a `>>>>>>>`
+  // end — so a legitimate Markdown setext heading underline (`=======`) outside a
+  // conflict block is preserved (review finding). Both conflict sides' content is
+  // kept; only the marker SYNTAX is dropped.
+  let inBlock = false;
+  const out: string[] = [];
+  for (const line of body.split("\n")) {
+    if (CONFLICT_BEGIN_LINE_RE.test(line)) {
+      inBlock = true;
+      continue;
+    }
+    if (CONFLICT_END_LINE_RE.test(line)) {
+      inBlock = false;
+      continue;
+    }
+    if (inBlock && CONFLICT_SEP_LINE_RE.test(line)) {
+      continue;
+    }
+    out.push(line);
+  }
+  return out.join("\n");
 }
 
 /** The last path segment of a forward-slash path (the folder/file base name). */
@@ -972,6 +1098,20 @@ function baseSegment(path: string): string {
 function titleFromPath(path: string): string {
   const base = baseSegment(path);
   return base.endsWith(".md") ? base.slice(0, -3) : base;
+}
+
+/**
+ * The exact ` ~<slugId>` disambiguation suffix `buildVaultLayout`/`disambiguate`
+ * append to a colliding sibling's file stem (layout.ts): a single trailing
+ * ` ~<one path component>` (no slash, no further `~`). It is a COSMETIC, local
+ * filesystem artifact — never part of the page's real Docmost title — so it is
+ * stripped before a path-derived title is compared/pushed (red-team #4b).
+ */
+const DISAMBIGUATION_SUFFIX_RE = / ~[^/~]+$/;
+
+/** Remove a single trailing ` ~<slugId>` disambiguation suffix, if present. */
+function stripDisambiguationSuffix(title: string): string {
+  return title.replace(DISAMBIGUATION_SUFFIX_RE, "");
 }
 
 /**

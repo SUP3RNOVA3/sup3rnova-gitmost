@@ -151,8 +151,8 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     // when it could not enter — surfaced here as the existing skipped:'in-progress'
     // / 'lock-held' status so runOnce's observable behavior is unchanged.
     try {
-      const result = await this.spaceLock.withSpaceLock(spaceId, () =>
-        this.driveCycle(spaceId, workspaceId, serviceUserId),
+      const result = await this.spaceLock.withSpaceLock(spaceId, (signal) =>
+        this.driveCycle(spaceId, workspaceId, serviceUserId, signal),
       );
       if ('skipped' in result && !('spaceId' in result)) {
         return { spaceId, ran: false, skipped: result.skipped };
@@ -199,7 +199,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     }
     const serviceUserId = this.environmentService.getGitSyncServiceUserId();
 
-    const result = await this.spaceLock.withSpaceLock(spaceId, async () => {
+    const result = await this.spaceLock.withSpaceLock(spaceId, async (signal) => {
       // 1) Stream the receive-pack to the client (durable commits land on main).
       await runReceivePack();
 
@@ -214,7 +214,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
         return;
       }
       try {
-        await this.driveCycle(spaceId, workspaceId, serviceUserId);
+        await this.driveCycle(spaceId, workspaceId, serviceUserId, signal);
       } catch (err) {
         // Do NOT rethrow: the push succeeded and the commits are durable on main;
         // the poll-interval backstop retries the cycle. Log for visibility.
@@ -246,6 +246,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     spaceId: string,
     workspaceId: string,
     serviceUserId: string,
+    signal?: AbortSignal,
   ): Promise<GitSyncRunStatus> {
     const { runCycle } = await loadGitSync();
     const settings = this.buildSettings(spaceId);
@@ -254,6 +255,10 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     const maxDeletes = this.environmentService.getGitSyncMaxDeletesPerCycle();
 
     const result = await runCycle({
+      // Cooperative-abort signal from the per-space lock: if a heartbeat refresh
+      // cannot confirm the lock, the cycle bails before its next destructive
+      // write phase instead of writing blind after a possible lock loss.
+      signal,
       spaceId,
       client,
       vault,
