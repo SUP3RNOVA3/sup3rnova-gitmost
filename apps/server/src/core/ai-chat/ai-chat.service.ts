@@ -93,6 +93,10 @@ export interface AiChatStreamBody {
   // is attacker-controllable but harmless: the agent reads/writes via its
   // CASL-enforced page tools, which 403 on a page the user cannot access.
   openPage?: { id?: string; title?: string } | null;
+  // Set by the client's "Send now" (interrupt + resend) path. When true AND the
+  // preceding assistant turn really ended unfinished, the system prompt gets a
+  // note that the previous response was interrupted (see ai-chat.prompt.ts).
+  interrupted?: boolean;
   // useChat sends the full UIMessage list; the last one is the new user turn.
   messages?: UIMessage[];
 }
@@ -333,6 +337,16 @@ export class AiChatService implements OnModuleInit {
     // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
     const messages = await convertToModelMessages(uiMessages);
 
+    // Interrupt-resume note (#198): only when the client flagged this send as an
+    // interrupt AND the turn right before the just-inserted user message really
+    // ended unfinished. history is oldest→newest; the tail is the user row we just
+    // inserted, so history[len-2] is the previous turn. Accept 'aborted' and also
+    // 'streaming' (the abort persistence can still be in flight — abort/resend race).
+    const interrupted = shouldInjectInterruptNote(
+      body.interrupted,
+      history[history.length - 2],
+    );
+
     // The model is resolved by the controller before hijack (clean 503 path).
     // Here we only need the admin-configured system prompt.
     const resolved = await this.aiSettings.resolve(workspace.id);
@@ -404,6 +418,8 @@ export class AiChatService implements OnModuleInit {
         openedPage: openPageContext,
         // Guidance only for servers that connected and yielded ≥1 callable tool.
         mcpInstructions: external.instructions,
+        // #198: add the interrupt-resume note when the previous turn was cut short.
+        interrupted,
       });
 
       // Pass the resolved chatId so the write tools can mint provenance tokens
@@ -1143,6 +1159,26 @@ export interface AssistantFlush {
   toolCalls: unknown;
   metadata: Record<string, unknown>;
   status: 'streaming' | 'completed' | 'error' | 'aborted';
+}
+
+/**
+ * Pure decision (#198): does this turn need the interrupt-resume note in its
+ * system prompt? True only when the client flagged the send as a "Send now"
+ * interrupt AND the turn right before the just-inserted user message really
+ * ended unfinished (status 'aborted', or 'streaming' when the abort persistence
+ * is still in flight — the abort/resend race). A user/role mismatch, a settled
+ * status (completed/error/null), or a missing previous turn all gate it off.
+ * Extracted so the gating is unit-testable without seaming the streaming path.
+ */
+export function shouldInjectInterruptNote(
+  bodyInterrupted: boolean | undefined,
+  prevTurn: { role?: string; status?: string | null } | undefined,
+): boolean {
+  return (
+    bodyInterrupted === true &&
+    prevTurn?.role === 'assistant' &&
+    (prevTurn.status === 'aborted' || prevTurn.status === 'streaming')
+  );
 }
 
 /**

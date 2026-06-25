@@ -715,6 +715,8 @@
   "No chats yet.": "Чатов пока нет.",
   "Send": "Отправить",
   "Send when the agent finishes": "Отправить, когда агент закончит",
+  "Send now": "Отправить сейчас",
+  "Interrupt and send now": "Прервать и отправить сейчас",
   "Queue message": "Поставить в очередь",
   "Remove queued message": "Убрать из очереди",
   "Something went wrong": "Что-то пошло не так",

@@ -3,6 +3,7 @@ import {
   enqueueMessage,
   dequeue,
   removeQueuedById,
+  promoteToHead,
   type QueuedMessage,
 } from "./queue-helpers";
 
@@ -85,6 +86,47 @@ describe("removeQueuedById", () => {
     expect(queue).toEqual([
       { id: "a", text: "first" },
       { id: "b", text: "second" },
+    ]);
+  });
+});
+
+describe("promoteToHead", () => {
+  it("moves a middle item to the front and preserves the order of the rest", () => {
+    const queue: QueuedMessage[] = [
+      { id: "a", text: "first" },
+      { id: "b", text: "second" },
+      { id: "c", text: "third" },
+    ];
+    const next = promoteToHead(queue, "b");
+    expect(next).toEqual([
+      { id: "b", text: "second" },
+      { id: "a", text: "first" },
+      { id: "c", text: "third" },
+    ]);
+  });
+
+  it("returns an equivalent array when the id is absent", () => {
+    const queue: QueuedMessage[] = [
+      { id: "a", text: "first" },
+      { id: "b", text: "second" },
+    ];
+    expect(promoteToHead(queue, "missing")).toEqual([
+      { id: "a", text: "first" },
+      { id: "b", text: "second" },
+    ]);
+  });
+
+  it("does not mutate the input queue", () => {
+    const queue: QueuedMessage[] = [
+      { id: "a", text: "first" },
+      { id: "b", text: "second" },
+      { id: "c", text: "third" },
+    ];
+    promoteToHead(queue, "c");
+    expect(queue).toEqual([
+      { id: "a", text: "first" },
+      { id: "b", text: "second" },
+      { id: "c", text: "third" },
     ]);
   });
 });

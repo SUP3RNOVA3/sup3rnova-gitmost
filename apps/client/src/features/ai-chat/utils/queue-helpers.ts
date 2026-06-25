@@ -32,3 +32,14 @@ export function removeQueuedById(
 ): QueuedMessage[] {
   return queue.filter((m) => m.id !== id);
 }
+
+/** Move the queued message with the given id to the FRONT (returns a new array).
+ *  Returns the input array unchanged (by identity) when the id is absent. Pure. */
+export function promoteToHead(
+  queue: QueuedMessage[],
+  id: string,
+): QueuedMessage[] {
+  const target = queue.find((m) => m.id === id);
+  if (!target) return queue;
+  return [target, ...queue.filter((m) => m.id !== id)];
+}

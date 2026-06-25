@@ -9,6 +9,7 @@ import {
   flushAssistant,
   chatStreamMetadata,
   accumulateStepUsage,
+  shouldInjectInterruptNote,
   MAX_AGENT_STEPS,
   FINAL_STEP_INSTRUCTION,
 } from './ai-chat.service';
@@ -489,6 +490,70 @@ describe('accumulateStepUsage', () => {
       totalTokens: undefined,
       reasoningTokens: undefined,
     });
+  });
+});
+
+/**
+ * shouldInjectInterruptNote (#198): the pure gate behind the interrupt-resume
+ * note. It returns true ONLY when the client flagged the send as a "Send now"
+ * interrupt AND the previous turn (history[len-2]) really ended unfinished —
+ * an assistant row with status 'aborted' or (abort/resend race) 'streaming'.
+ * Every other shape gates it off.
+ */
+describe('shouldInjectInterruptNote (#198)', () => {
+  it('returns true for flag + assistant + aborted', () => {
+    expect(
+      shouldInjectInterruptNote(true, { role: 'assistant', status: 'aborted' }),
+    ).toBe(true);
+  });
+
+  it("returns true for flag + assistant + streaming (abort persistence in flight)", () => {
+    expect(
+      shouldInjectInterruptNote(true, {
+        role: 'assistant',
+        status: 'streaming',
+      }),
+    ).toBe(true);
+  });
+
+  it('returns false when the client did not flag an interrupt', () => {
+    expect(
+      shouldInjectInterruptNote(false, {
+        role: 'assistant',
+        status: 'aborted',
+      }),
+    ).toBe(false);
+    expect(
+      shouldInjectInterruptNote(undefined, {
+        role: 'assistant',
+        status: 'aborted',
+      }),
+    ).toBe(false);
+  });
+
+  it('returns false when the previous turn is not an assistant row', () => {
+    expect(
+      shouldInjectInterruptNote(true, { role: 'user', status: 'aborted' }),
+    ).toBe(false);
+  });
+
+  it('returns false for a settled assistant status (completed/error/null)', () => {
+    expect(
+      shouldInjectInterruptNote(true, {
+        role: 'assistant',
+        status: 'completed',
+      }),
+    ).toBe(false);
+    expect(
+      shouldInjectInterruptNote(true, { role: 'assistant', status: 'error' }),
+    ).toBe(false);
+    expect(
+      shouldInjectInterruptNote(true, { role: 'assistant', status: null }),
+    ).toBe(false);
+  });
+
+  it('returns false when there is no previous turn (undefined)', () => {
+    expect(shouldInjectInterruptNote(true, undefined)).toBe(false);
   });
 });
 

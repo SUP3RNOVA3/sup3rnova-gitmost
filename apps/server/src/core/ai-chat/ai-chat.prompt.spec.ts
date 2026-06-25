@@ -211,6 +211,32 @@ describe('buildSystemPrompt mcp tooling guidance', () => {
 });
 
 /**
+ * Unit tests for the interrupt-resume note (#198). When `interrupted` is true,
+ * buildSystemPrompt adds a context note telling the agent its previous response
+ * was cut short and is only partial; when false/omitted the note is absent.
+ */
+describe('buildSystemPrompt interrupt-resume note (#198)', () => {
+  const workspace = { name: 'Acme' } as unknown as Workspace;
+  // A distinctive fragment of INTERRUPT_NOTE.
+  const INTERRUPT_MARKER = 'interrupted by the user before it finished';
+
+  it('adds the interrupt note when interrupted is true', () => {
+    const prompt = buildSystemPrompt({ workspace, interrupted: true });
+    expect(prompt).toContain(INTERRUPT_MARKER);
+  });
+
+  it('omits the note when interrupted is false', () => {
+    const prompt = buildSystemPrompt({ workspace, interrupted: false });
+    expect(prompt).not.toContain(INTERRUPT_MARKER);
+  });
+
+  it('omits the note when interrupted is not provided', () => {
+    const prompt = buildSystemPrompt({ workspace });
+    expect(prompt).not.toContain(INTERRUPT_MARKER);
+  });
+});
+
+/**
  * Unit tests for the pure block builder. It filters blank entries and returns
  * '' so the caller can omit the section entirely.
  */

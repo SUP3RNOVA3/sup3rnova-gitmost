@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { generateId } from "ai";
-import { ActionIcon, Box, Group, Stack, Text } from "@mantine/core";
-import { IconClockHour4, IconX } from "@tabler/icons-react";
+import { ActionIcon, Box, Group, Stack, Text, Tooltip } from "@mantine/core";
+import {
+  IconClockHour4,
+  IconPlayerPlayFilled,
+  IconX,
+} from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { useChat, type UIMessage } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
@@ -24,6 +28,7 @@ import { liveTurnTokens } from "@/features/ai-chat/utils/count-stream-tokens.ts"
 import {
   dequeue,
   enqueueMessage,
+  promoteToHead,
   removeQueuedById,
   type QueuedMessage,
 } from "@/features/ai-chat/utils/queue-helpers.ts";
@@ -193,6 +198,14 @@ export default function ChatThread({
   // helper can call the current instance from the stable `onFinish` callback.
   const sendMessageRef = useRef<((m: { text: string }) => void) | null>(null);
 
+  // Set by "Send now" so the abort WE trigger flushes the promoted head (the
+  // normal abort path keeps the queue intact instead).
+  const flushOnAbortRef = useRef(false);
+  // Tags the very next send as an intentional user interrupt, so the server can
+  // note in the agent's context that the previous turn was cut short. One-shot:
+  // read-and-cleared by prepareSendMessagesRequest.
+  const interruptNextSendRef = useRef(false);
+
   // FIFO dequeue + send the next queued message (no-op when the queue is empty).
   const flushNext = useCallback(() => {
     const { head, rest } = dequeue(queuedRef.current);
@@ -224,17 +237,24 @@ export default function ChatThread({
         // when null) and tell the agent which page "this page" refers to. Both
         // are read live from refs so changing chats/pages does NOT recreate the
         // transport. `openPage` is null on a non-page route.
-        prepareSendMessagesRequest: ({ messages, body }) => ({
-          body: {
-            ...body,
-            chatId: chatIdRef.current,
-            openPage: openPageRef.current,
-            // Honoured by the server only when creating a new chat; null =>
-            // universal assistant.
-            roleId: roleIdRef.current,
-            messages,
-          },
-        }),
+        prepareSendMessagesRequest: ({ messages, body }) => {
+          // One-shot interrupt flag: consumed here so only the send triggered by
+          // "Send now" carries it; every normal send leaves it false.
+          const interrupted = interruptNextSendRef.current;
+          interruptNextSendRef.current = false;
+          return {
+            body: {
+              ...body,
+              chatId: chatIdRef.current,
+              openPage: openPageRef.current,
+              // Honoured by the server only when creating a new chat; null =>
+              // universal assistant.
+              roleId: roleIdRef.current,
+              interrupted,
+              messages,
+            },
+          };
+        },
       }),
     [],
   );
@@ -259,6 +279,16 @@ export default function ChatThread({
       // message metadata) so the parent adopts the REAL created chat id for a new
       // chat — see adopt-chat-id.ts for the full #137 design.
       onTurnFinished(extractServerChatId(message));
+      // Read-and-clear: only the immediately-following terminal outcome may consume it.
+      const intentionalInterrupt = flushOnAbortRef.current;
+      flushOnAbortRef.current = false;
+      if (intentionalInterrupt && isAbort) {
+        // "Send now": flush the promoted head even though the turn was aborted, and
+        // suppress the neutral "stopped" marker (this was a deliberate interrupt).
+        setStopNotice(null);
+        flushNext();
+        return;
+      }
       // Show a neutral "stopped" marker for an aborted turn; the red error banner
       // (via `error`) already covers isError, and a clean finish clears any marker.
       if (isError) setStopNotice(null);
@@ -317,9 +347,42 @@ export default function ChatThread({
 
   const isStreaming = status === "submitted" || status === "streaming";
 
-  // Clear the stopped marker as soon as a new turn begins streaming.
+  // "Send now" on a queued message: interrupt the current turn and immediately
+  // send THIS message. Any other queued messages stay queued and flush normally
+  // after the new turn finishes.
+  const sendNow = useCallback(
+    (id: string) => {
+      if (isStreaming) {
+        // Promote the chosen message to the head so the existing onFinish→flushNext
+        // sends exactly it, then interrupt: the abort triggers onFinish below.
+        setQueue(promoteToHead(queuedRef.current, id));
+        flushOnAbortRef.current = true;
+        interruptNextSendRef.current = true;
+        stop();
+      } else {
+        // Not streaming: nothing to interrupt — just send it now (no interrupt note).
+        const msg = queuedRef.current.find((m) => m.id === id);
+        if (!msg) return;
+        setQueue(removeQueuedById(queuedRef.current, id));
+        sendMessageRef.current?.({ text: msg.text });
+      }
+    },
+    [isStreaming, setQueue, stop],
+  );
+
+  // Clear the stopped marker as soon as a new turn begins streaming, and drop any
+  // stale "Send now" interrupt flags. In the legit interrupt path both refs are
+  // already consumed synchronously (onFinish + prepareSendMessagesRequest) before
+  // this effect runs, so clearing here is a no-op for it; its purpose is to defuse
+  // the race where a flag was armed but the expected abort never fired (the turn
+  // finished cleanly in the same tick as the click), so it cannot leak into an
+  // unrelated later turn.
   useEffect(() => {
-    if (isStreaming) setStopNotice(null);
+    if (isStreaming) {
+      setStopNotice(null);
+      flushOnAbortRef.current = false;
+      interruptNextSendRef.current = false;
+    }
   }, [isStreaming]);
 
   // Classify the turn error into a heading + detail so the banner names the cause
@@ -458,6 +521,17 @@ export default function ChatThread({
                 <Text size="xs" lineClamp={2} className={classes.queuedText}>
                   {m.text}
                 </Text>
+                <Tooltip label={t("Interrupt and send now")} withArrow>
+                  <ActionIcon
+                    size="xs"
+                    variant="subtle"
+                    color="blue"
+                    onClick={() => sendNow(m.id)}
+                    aria-label={t("Send now")}
+                  >
+                    <IconPlayerPlayFilled size={12} />
+                  </ActionIcon>
+                </Tooltip>
                 <ActionIcon
                   size="xs"
                   variant="subtle"
