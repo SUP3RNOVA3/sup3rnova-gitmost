@@ -4,11 +4,29 @@ import * as Y from "yjs";
 import WebSocket from "ws";
 import { marked } from "marked";
 import { generateJSON } from "@tiptap/html";
+import { Node as PMNode } from "@tiptap/pm/model";
+import { updateYFragment } from "y-prosemirror";
 import { JSDOM } from "jsdom";
-import { docmostExtensions } from "./docmost-schema.js";
+import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
 import { sanitizeForYjs, findUnstorableAttr } from "./node-ops.js";
+import { lexFootnoteLines } from "./footnote-lex.js";
 import { summarizeChange, VerifyReport } from "./diff.js";
+
+/**
+ * Build the descriptive error for an opaque Yjs encode failure ("Unexpected
+ * content type"), shared by both encode paths (`buildYDoc` -> `toYdoc` and
+ * `applyDocToFragment` -> `updateYFragment`) so the message wording stays in one
+ * place. `label` names the stage that failed (diagnostic). `sanitizeForYjs`
+ * already stripped `undefined` attrs, so a remaining failure is pinpointed via
+ * `findUnstorableAttr`.
+ */
+function unstorableYjsError(safe: any, label: string, e: unknown): Error {
+  const bad = findUnstorableAttr(safe);
+  return new Error(
+    `Failed to encode document to Yjs (${label}): ${e instanceof Error ? e.message : String(e)}.${bad ? ` Offending attribute: ${bad}.` : " A node/mark attribute likely holds a value Yjs cannot store (e.g. undefined)."}`,
+  );
+}
 
 /**
  * The resolved value of every content-mutating collab write: the document that
@@ -299,56 +317,12 @@ function bridgeTaskLists(html: string): string {
 // Mirror of packages/editor-ext footnote markdown handling. A `[^id]` inline
 // marker becomes <sup data-footnote-ref data-id="id">, and `[^id]: text`
 // definition lines are collected into a single <section data-footnotes>.
-const FOOTNOTE_DEF_RE = /^\[\^([^\]\s]+)\]:[ \t]*(.*)$/;
+// Definition detection + fence handling are shared with analyzeFootnotes via
+// lexFootnoteLines (footnote-lex.js). FOOTNOTE_REF_RE is the inline tokenizer's.
 const FOOTNOTE_REF_RE = /\[\^([^\]\s]+)\]/;
 
 function escapeFootnoteAttr(value: string): string {
   return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
-}
-
-function escapeFootnoteRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * Derive a DETERMINISTIC unique footnote id for the k-th (k >= 2) occurrence of
- * an original id `X` during definition dedup.
- *
- * EXACT MIRROR of editor-ext `deriveFootnoteId`
- * (packages/editor-ext/src/lib/footnote/footnote-util.ts). These two copies MUST
- * STAY IN SYNC: the same markdown imported through the editor and through this
- * MCP path has to produce identical ids, and the sync plugin (which re-ids on
- * every collaborating client) relies on the same scheme to converge. NEVER use
- * Math.random()/Date.now()/uuid here — a random id would diverge across clients.
- *
- * Scheme: base candidate `${originalId}__${occurrence}` (e.g. `X__2`), bumped
- * with a stable alphabetic suffix (`X__2b`, `X__2c`, ...) until it is not in
- * `taken` (the set of ids already present / already minted — pure doc state).
- */
-function deriveFootnoteId(
-  originalId: string,
-  occurrence: number,
-  taken: Set<string>,
-): string {
-  let candidate = `${originalId}__${occurrence}`;
-  let n = 0;
-  while (taken.has(candidate)) {
-    n += 1;
-    candidate = `${originalId}__${occurrence}${footnoteSuffix(n)}`;
-  }
-  return candidate;
-}
-
-/** Map 1 -> "b", 2 -> "c", ... (mirror of editor-ext `suffix`). */
-function footnoteSuffix(n: number): string {
-  let out = "";
-  let x = n;
-  while (x > 0) {
-    const rem = (x - 1) % 25;
-    out = String.fromCharCode(98 + rem) + out; // 98 = 'b'
-    x = Math.floor((x - 1) / 25);
-  }
-  return out;
 }
 
 const footnoteRefMarkedExtension = {
@@ -381,69 +355,39 @@ function extractFootnotes(markdown: string): {
   body: string;
   section: string;
 } {
-  const lines = markdown.split("\n");
   const bodyLines: string[] = [];
   const defs: Array<{ id: string; text: string }> = [];
-  // Track fenced-code state so a `[^id]: ...` line shown inside a ``` / ~~~ code
-  // block is preserved verbatim and not treated as a footnote definition.
-  let fence: string | null = null;
-  for (const line of lines) {
-    const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
-    if (fenceMatch) {
-      const marker = fenceMatch[2][0];
-      if (fence === null) fence = marker;
-      else if (marker === fence) fence = null;
-      bodyLines.push(line);
-      continue;
-    }
-    const m = fence === null ? FOOTNOTE_DEF_RE.exec(line) : null;
-    if (m) defs.push({ id: m[1], text: m[2] });
-    else bodyLines.push(line);
+  // Shared lexer (footnote-lex): a `[^id]: ...` line inside a ``` / ~~~ code
+  // block is inert and stays in the body verbatim; only real definition lines
+  // are pulled out. analyzeFootnotes() consumes the SAME lexer so its diagnostics
+  // match exactly what import keeps/strips (#166).
+  for (const tok of lexFootnoteLines(markdown)) {
+    if (!tok.inFence && tok.definition) defs.push(tok.definition);
+    else bodyLines.push(tok.line);
   }
   if (defs.length === 0) return { body: markdown, section: "" };
 
-  // De-duplicate colliding definition ids (mirror of editor-ext
-  // extractFootnoteDefinitions). Two definitions sharing an id would otherwise
-  // collapse into one footnote downstream; rename each colliding id to a
-  // DETERMINISTIC derived one (NOT random) and rewrite the corresponding `[^id]`
-  // marker so the (reference, definition) pairing stays 1:1. Determinism lets
-  // the same markdown imported here and via the editor produce identical ids.
-  let dedupedBody = bodyLines.join("\n");
-  const taken = new Set<string>(defs.map((d) => d.id));
-  const seenDefIds = new Map<string, number>();
+  // Duplicate definition ids: FIRST WINS, the rest are DROPPED (mirror of
+  // editor-ext extractFootnoteDefinitions). Reference markers are left untouched
+  // so repeated `[^a]` references reuse the single footnote (Pandoc semantics,
+  // #166). The dropped duplicate is surfaced to the caller via analyzeFootnotes
+  // (`duplicateDefinitions`), not silently lost. MUST stay in sync with the
+  // editor-ext mirror.
+  const firstById = new Map<string, string>(); // id -> first definition text
   for (const def of defs) {
-    const originalId = def.id;
-    const count = seenDefIds.get(originalId) ?? 0;
-    seenDefIds.set(originalId, count + 1);
-    if (count === 0) continue; // first definition keeps its id
-    const newId = deriveFootnoteId(originalId, count + 1, taken);
-    taken.add(newId);
-    def.id = newId;
-    // Remaining `[^originalId]` matches: index 0 = keeper's marker (left alone),
-    // index 1 = this duplicate's marker. Rewrite index 1.
-    let occurrence = 0;
-    let rewritten = false;
-    const re = new RegExp(`\\[\\^${escapeFootnoteRegExp(originalId)}\\]`, "g");
-    dedupedBody = dedupedBody.replace(re, (match) => {
-      const idx = occurrence++;
-      if (!rewritten && idx === 1) {
-        rewritten = true;
-        return `[^${newId}]`;
-      }
-      return match;
-    });
+    if (!firstById.has(def.id)) firstById.set(def.id, def.text);
   }
 
-  const inner = defs
+  const inner = [...firstById.entries()]
     .map(
-      (d) =>
+      ([id, text]) =>
         `<div data-footnote-def data-id="${escapeFootnoteAttr(
-          d.id,
-        )}"><p>${marked.parseInline(d.text || "")}</p></div>`,
+          id,
+        )}"><p>${marked.parseInline(text || "")}</p></div>`,
     )
     .join("");
   return {
-    body: dedupedBody,
+    body: bodyLines.join("\n"),
     section: `<section data-footnotes>${inner}</section>`,
   };
 }
@@ -499,20 +443,73 @@ export function buildYDoc(doc: any): Y.Doc {
   try {
     return TiptapTransformer.toYdoc(safe, "default", docmostExtensions);
   } catch (e) {
-    const bad = findUnstorableAttr(safe);
-    throw new Error(
-      `Failed to encode document to Yjs (toYdoc): ${e instanceof Error ? e.message : String(e)}.${bad ? ` Offending attribute: ${bad}.` : " A node/mark attribute likely holds a value Yjs cannot store (e.g. undefined)."}`,
-    );
+    throw unstorableYjsError(safe, "toYdoc", e);
   }
 }
 
 /**
- * Validate that a doc is Yjs-encodable by building (and discarding) a Y.Doc.
- * Throws the same descriptive error as the apply path when it is not. Used by
- * the dry-run preview so it fails identically to apply.
+ * Write a new ProseMirror doc into the live Yjs fragment by STRUCTURAL DIFF,
+ * preserving the Yjs identity of unchanged nodes (issue #152).
+ *
+ * The previous approach deleted the whole fragment and re-applied a fresh Y.Doc,
+ * which discarded every Yjs node id. y-prosemirror anchors the editor selection
+ * to those ids, so an open editor's cursor lost its anchor and snapped to the
+ * end of the document on every agent write (most visibly on comment anchoring,
+ * which changes no text at all). `updateYFragment` is exactly the routine the
+ * editor itself uses to sync ProseMirror edits into Yjs: it diffs the new node
+ * against the current fragment and touches only the changed children, so
+ * unchanged nodes keep their ids and the live cursor stays put.
+ *
+ * Must run inside a single `transact` so the diff applies atomically (no remote
+ * update interleaves). Keeps `buildYDoc`'s `findUnstorableAttr` diagnostic for
+ * the opaque "Unexpected content type" encode failure.
+ */
+export function applyDocToFragment(ydoc: Y.Doc, newDoc: any): void {
+  const safe = sanitizeForYjs(newDoc);
+  const fragment = ydoc.getXmlFragment("default");
+  // Hydrate the ProseMirror node in its OWN try so a failure here (e.g. an
+  // unknown node type) is labelled "fromJSON" — the stage that actually threw —
+  // instead of being misattributed to the Yjs write stage (#154 review).
+  let pmNode: PMNode;
+  try {
+    pmNode = PMNode.fromJSON(docmostSchema, safe);
+  } catch (e) {
+    throw unstorableYjsError(safe, "fromJSON", e);
+  }
+  try {
+    ydoc.transact(() => {
+      updateYFragment(ydoc, fragment, pmNode, {
+        mapping: new Map(),
+        isOMark: new Map(),
+      });
+    });
+  } catch (e) {
+    throw unstorableYjsError(safe, "updateYFragment", e);
+  }
+}
+
+/**
+ * Run an independent Yjs-encodability check (the same `sanitizeForYjs` + schema
+ * the apply path uses) and throw the same descriptive error when the doc cannot
+ * be stored. Used by the dry-run preview.
+ *
+ * Note: it does NOT run `updateYFragment` against the live fragment, so it is an
+ * encodability GATE, not a byte-for-byte rehearsal of apply — `buildYDoc`
+ * (`toYdoc`) and `applyDocToFragment` (`updateYFragment`) are two different
+ * encoders that nonetheless reject the same unstorable attributes. To narrow the
+ * preview/apply gap it ALSO rehearses the apply path's `PMNode.fromJSON`
+ * hydration, so a doc that would only fail there (e.g. an unknown node type) is
+ * rejected at preview time too (#154 review). Still cheap: no live fragment, no
+ * `updateYFragment`.
  */
 export function assertYjsEncodable(doc: any): void {
   buildYDoc(doc);
+  const safe = sanitizeForYjs(doc);
+  try {
+    PMNode.fromJSON(docmostSchema, safe);
+  } catch (e) {
+    throw unstorableYjsError(safe, "fromJSON", e);
+  }
 }
 
 /** Time we wait for the initial handshake/sync before giving up. */
@@ -727,16 +724,10 @@ export async function mutatePageContent(
               return;
             }
 
-            const tempDoc = buildYDoc(newDoc);
-            // Fetch the fragment immediately before the transact that mutates
-            // it, rather than reusing a handle grabbed across the transform.
-            const fragment = ydoc.getXmlFragment("default");
-            ydoc.transact(() => {
-              if (fragment.length > 0) {
-                fragment.delete(0, fragment.length);
-              }
-              Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(tempDoc));
-            });
+            // Structural diff into the live fragment (issue #152): preserves
+            // the Yjs ids of unchanged nodes, so an open editor's cursor is not
+            // yanked to the end of the document on every agent write.
+            applyDocToFragment(ydoc, newDoc);
           } catch (e) {
             // Includes errors thrown by transform (e.g. "afterText not found",
             // "text not found"): propagate them verbatim to the caller.

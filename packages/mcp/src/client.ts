@@ -20,9 +20,10 @@ import {
   mutatePageContent,
   buildCollabWsUrl,
   assertYjsEncodable,
+  applyDocToFragment,
   MutationResult,
 } from "./lib/collaboration.js";
-import { docmostExtensions } from "./lib/docmost-schema.js";
+import { footnoteWarningsField } from "./lib/footnote-analyze.js";
 import { buildPageTree } from "./lib/tree.js";
 import {
   serializeDocmostMarkdown,
@@ -31,6 +32,7 @@ import {
 import {
   replaceNodeById,
   deleteNodeById,
+  assertUnambiguousMatch,
   insertNodeRelative,
   buildOutline,
   getNodeByRef,
@@ -48,10 +50,7 @@ import {
 } from "./lib/json-edit.js";
 import { getCollabToken, performLogin } from "./lib/auth-utils.js";
 import { diffDocs, summarizeChange } from "./lib/diff.js";
-import {
-  applyAnchorInDoc,
-  canAnchorInDoc,
-} from "./lib/comment-anchor.js";
+import { applyAnchorInDoc, canAnchorInDoc } from "./lib/comment-anchor.js";
 import {
   blockText,
   walk,
@@ -304,7 +303,9 @@ export class DocmostClient {
       // getCollabToken wraps the AxiosError in a plain Error but attaches the
       // HTTP status as `.status`, so detect an auth failure via either the raw
       // AxiosError shape OR the attached status.
-      const axiosStatus = axios.isAxiosError(e) ? e.response?.status : undefined;
+      const axiosStatus = axios.isAxiosError(e)
+        ? e.response?.status
+        : undefined;
       const attachedStatus = (e as any)?.status;
       const isAuthError =
         axiosStatus === 401 ||
@@ -478,18 +479,14 @@ export class DocmostClient {
               return;
             }
 
-            const tempDoc = TiptapTransformer.toYdoc(
-              newDoc,
-              "default",
-              docmostExtensions,
-            );
-            const fragment = ydoc.getXmlFragment("default");
-            ydoc.transact(() => {
-              if (fragment.length > 0) {
-                fragment.delete(0, fragment.length);
-              }
-              Y.applyUpdate(ydoc, Y.encodeStateAsUpdate(tempDoc));
-            });
+            // Structural diff into the live fragment (issue #152), mirroring
+            // the main write path: preserves the Yjs ids of unchanged nodes so
+            // an open editor's cursor is not yanked to the end of the document.
+            // The previous destructive rewrite (delete-all + applyUpdate of a
+            // fresh Y.Doc) discarded every node id, so replaceImage — the only
+            // caller of this method — still reproduced the #152 cursor jump
+            // (#164). applyDocToFragment runs its own atomic `transact`.
+            applyDocToFragment(ydoc, newDoc);
           } catch (e) {
             finish(e instanceof Error ? e : new Error(String(e)));
             return;
@@ -600,11 +597,7 @@ export class DocmostClient {
    * sidebar requests and is bounded by that method's 10000-node cap (and skips
    * soft-deleted pages server-side).
    */
-  async listPages(
-    spaceId?: string,
-    limit: number = 50,
-    tree: boolean = false,
-  ) {
+  async listPages(spaceId?: string, limit: number = 50, tree: boolean = false) {
     await this.ensureAuthenticated();
 
     if (tree) {
@@ -883,7 +876,12 @@ export class DocmostClient {
         `table_insert_row: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
       );
     }
-    return { success: true, table: tableRef, inserted: true, verify: mutation.verify };
+    return {
+      success: true,
+      table: tableRef,
+      inserted: true,
+      verify: mutation.verify,
+    };
   }
 
   /**
@@ -902,7 +900,11 @@ export class DocmostClient {
       this.apiUrl,
       (liveDoc) => {
         deleted = false;
-        const { doc: nd, deleted: del } = deleteTableRow(liveDoc, tableRef, index);
+        const { doc: nd, deleted: del } = deleteTableRow(
+          liveDoc,
+          tableRef,
+          index,
+        );
         deleted = del;
         if (!deleted) return null; // table not found -> skip the write entirely
         return nd;
@@ -914,7 +916,12 @@ export class DocmostClient {
         `table_delete_row: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
       );
     }
-    return { success: true, table: tableRef, deleted: true, verify: mutation.verify };
+    return {
+      success: true,
+      table: tableRef,
+      deleted: true,
+      verify: mutation.verify,
+    };
   }
 
   /**
@@ -959,7 +966,13 @@ export class DocmostClient {
         `table_update_cell: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
       );
     }
-    return { success: true, table: tableRef, row, col, verify: mutation.verify };
+    return {
+      success: true,
+      table: tableRef,
+      row,
+      col,
+      verify: mutation.verify,
+    };
   }
 
   /**
@@ -1033,8 +1046,7 @@ export class DocmostClient {
         response = await axios.post(importUrl, form2, {
           headers: {
             ...form2.getHeaders(),
-            Authorization:
-              this.client.defaults.headers.common["Authorization"],
+            Authorization: this.client.defaults.headers.common["Authorization"],
           },
           timeout: 60000,
         });
@@ -1054,7 +1066,10 @@ export class DocmostClient {
       await this.client.post("/pages/update", { pageId: newPageId, title });
     }
 
-    return this.getPage(newPageId);
+    const page = await this.getPage(newPageId);
+    // Surface non-fatal footnote problems (dangling refs, empty/duplicate
+    // definitions, markers in tables) so the agent can fix its markup (#166).
+    return { ...page, ...footnoteWarningsField(content) };
   }
 
   /**
@@ -1065,10 +1080,11 @@ export class DocmostClient {
   async updatePage(pageId: string, content: string, title?: string) {
     await this.ensureAuthenticated();
 
-    if (title) {
-      await this.client.post("/pages/update", { pageId, title });
-    }
-
+    // Write the BODY first, then the title (#159 split-brain). If the collab
+    // body write fails (e.g. a persist timeout), the title must be left
+    // UNTOUCHED so the page never ends up with a new title over its old body.
+    // A title write failing AFTER a successful body is rarer (REST is fast) and
+    // leaves correct content under a stale title — the lesser inconsistency.
     let collabToken = "";
     let mutation;
     try {
@@ -1095,12 +1111,19 @@ export class DocmostClient {
       throw new Error(`Failed to update page content: ${error.message}`);
     }
 
+    // Body persisted successfully — now it is safe to set the title.
+    if (title) {
+      await this.client.post("/pages/update", { pageId, title });
+    }
+
     return {
       success: true,
       modified: true,
       message: "Page updated successfully.",
       pageId: pageId,
       verify: mutation.verify,
+      // Non-fatal footnote diagnostics (#166); omitted when there are none.
+      ...footnoteWarningsField(content),
     };
   }
 
@@ -1167,9 +1190,7 @@ export class DocmostClient {
       for (const mark of node.marks) {
         if (mark && mark.type === "link" && mark.attrs) {
           if (!this.isSafeUrl(mark.attrs.href, "link")) {
-            throw new Error(
-              `unsafe link href rejected: "${mark.attrs.href}"`,
-            );
+            throw new Error(`unsafe link href rejected: "${mark.attrs.href}"`);
           }
         }
       }
@@ -1228,7 +1249,11 @@ export class DocmostClient {
         "invalid ProseMirror document: every node must be an object with a string `type`",
       );
     }
-    if ("text" in node && node.type === "text" && typeof node.text !== "string") {
+    if (
+      "text" in node &&
+      node.type === "text" &&
+      typeof node.text !== "string"
+    ) {
       throw new Error(
         "invalid ProseMirror document: a text node must have a string `text`",
       );
@@ -1240,7 +1265,11 @@ export class DocmostClient {
         );
       }
       for (const mark of node.marks) {
-        if (!mark || typeof mark !== "object" || typeof mark.type !== "string") {
+        if (
+          !mark ||
+          typeof mark !== "object" ||
+          typeof mark.type !== "string"
+        ) {
           throw new Error(
             "invalid ProseMirror document: every mark must be an object with a string `type`",
           );
@@ -1315,10 +1344,8 @@ export class DocmostClient {
     // inject javascript:/data: link hrefs or media srcs straight into the doc.
     this.validateDocUrls(doc);
 
-    if (title) {
-      await this.client.post("/pages/update", { pageId, title });
-    }
-
+    // Write the BODY first, then the title (#159 split-brain): a failed body
+    // write (e.g. persist timeout) must not leave a new title over the old body.
     const collabToken = await this.getCollabTokenWithReauth();
     const mutation = await replacePageContent(
       pageId,
@@ -1326,6 +1353,11 @@ export class DocmostClient {
       collabToken,
       this.apiUrl,
     );
+
+    // Body persisted successfully — now it is safe to set the title.
+    if (title) {
+      await this.client.post("/pages/update", { pageId, title });
+    }
 
     return {
       success: true,
@@ -1344,9 +1376,7 @@ export class DocmostClient {
   async exportPageMarkdown(pageId: string): Promise<string> {
     await this.ensureAuthenticated();
     const page = await this.getPageRaw(pageId);
-    const body = page.content
-      ? convertProseMirrorToMarkdown(page.content)
-      : "";
+    const body = page.content ? convertProseMirrorToMarkdown(page.content) : "";
     let comments: any[] = [];
     try {
       comments = await this.listComments(pageId);
@@ -1416,6 +1446,11 @@ export class DocmostClient {
     if (meta?.pageId && meta.pageId !== pageId) {
       result.warning = `File was exported from page ${meta.pageId} but is being imported into ${pageId}.`;
     }
+    // Non-fatal footnote diagnostics (#166), analyzed on the BODY (the part after
+    // the docmost:meta / docmost:comments blocks) — so a `[^x]`-like token inside
+    // those JSON blocks never produces a false warning, while real markers in the
+    // body do. `body` comes from parseDocmostMarkdown(fullMarkdown) above.
+    Object.assign(result, footnoteWarningsField(body));
     return result;
   }
 
@@ -1555,9 +1590,10 @@ export class DocmostClient {
       pageId,
       applied: results,
       failed,
-      message: (failed?.length ?? 0)
-        ? `Applied ${results?.length ?? 0} edit(s); ${failed!.length} failed (see failed[]). Node ids and formatting preserved.`
-        : "Text edits applied (node ids and formatting preserved).",
+      message:
+        (failed?.length ?? 0)
+          ? `Applied ${results?.length ?? 0} edit(s); ${failed!.length} failed (see failed[]). Node ids and formatting preserved.`
+          : "Text edits applied (node ids and formatting preserved).",
       verify: mutation.verify,
     };
 
@@ -1616,18 +1652,26 @@ export class DocmostClient {
       this.apiUrl,
       (liveDoc) => {
         replaced = 0;
-        const { doc: nd, replaced: r } = replaceNodeById(liveDoc, nodeId, target);
+        const { doc: nd, replaced: r } = replaceNodeById(
+          liveDoc,
+          nodeId,
+          target,
+        );
         replaced = r;
-        if (replaced === 0) return null; // no match -> skip the write entirely
+        // 0 matches -> skip the write. >1 matches -> the id is AMBIGUOUS: Docmost
+        // duplicates block ids on copy/paste (and copyPageContent writes them
+        // verbatim), so replacing "the node with id X" would silently clobber
+        // EVERY duplicate (#159). Refuse: skip the write and throw below so the
+        // model re-targets with a more specific anchor instead of corrupting the
+        // page. Only an unambiguous single match is written.
+        if (replaced !== 1) return null;
         return nd;
       },
     );
 
-    if (replaced === 0) {
-      throw new Error(
-        `patch_node: no node with id "${nodeId}" found on page ${pageId}`,
-      );
-    }
+    // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
+    // the write for any count !== 1). Single shared guard (#159, #185 review).
+    assertUnambiguousMatch("patch_node", "replace", replaced, nodeId, pageId);
 
     return { success: true, replaced, nodeId, verify: mutation.verify };
   }
@@ -1696,7 +1740,11 @@ export class DocmostClient {
       this.apiUrl,
       (liveDoc) => {
         inserted = false;
-        const { doc: nd, inserted: ins } = insertNodeRelative(liveDoc, node, opts);
+        const { doc: nd, inserted: ins } = insertNodeRelative(
+          liveDoc,
+          node,
+          opts,
+        );
         inserted = ins;
         if (!inserted) return null; // anchor not found -> skip the write entirely
         return nd;
@@ -1711,7 +1759,7 @@ export class DocmostClient {
       // markdown/emoji are tolerated only as a strip-and-retry fallback, so a
       // miss usually means the text differs from what's on the page.
       const hint = opts.anchorText
-        ? ' anchorText must be the block\'s literal rendered plain text (no markdown wrappers or emoji); anchorNodeId from get_page_json is more reliable.'
+        ? " anchorText must be the block's literal rendered plain text (no markdown wrappers or emoji); anchorNodeId from get_page_json is more reliable."
         : "";
       throw new Error(
         `insert_node: anchor not found (${anchorDesc}) on page ${pageId}.${hint}`,
@@ -1748,16 +1796,19 @@ export class DocmostClient {
         deleted = 0;
         const { doc: nd, deleted: d } = deleteNodeById(liveDoc, nodeId);
         deleted = d;
-        if (deleted === 0) return null; // no match -> skip the write entirely
+        // 0 matches -> skip the write. >1 matches -> the id is AMBIGUOUS (block
+        // ids are duplicated on copy/paste, #159): deleting "the node with id X"
+        // would silently remove EVERY duplicate. Refuse: skip the write and throw
+        // below so the model re-targets. Only an unambiguous single match is
+        // deleted.
+        if (deleted !== 1) return null;
         return nd;
       },
     );
 
-    if (deleted === 0) {
-      throw new Error(
-        `delete_node: no node with id "${nodeId}" found on page ${pageId}`,
-      );
-    }
+    // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
+    // the write for any count !== 1). Single shared guard (#159, #185 review).
+    assertUnambiguousMatch("delete_node", "delete", deleted, nodeId, pageId);
 
     return { success: true, deleted, nodeId, verify: mutation.verify };
   }
@@ -2129,7 +2180,11 @@ export class DocmostClient {
    * subtree): pages updated after `since` are scanned and their comments
    * filtered by createdAt > since.
    */
-  async checkNewComments(spaceId: string, since: string, parentPageId?: string) {
+  async checkNewComments(
+    spaceId: string,
+    since: string,
+    parentPageId?: string,
+  ) {
     await this.ensureAuthenticated();
 
     const sinceDate = new Date(since);
@@ -2429,8 +2484,7 @@ export class DocmostClient {
         response = await axios.post(uploadUrl, form2, {
           headers: {
             ...form2.getHeaders(),
-            Authorization:
-              this.client.defaults.headers.common["Authorization"],
+            Authorization: this.client.defaults.headers.common["Authorization"],
           },
           timeout: 60000,
         });
@@ -2517,76 +2571,76 @@ export class DocmostClient {
       collabToken,
       this.apiUrl,
       (liveDoc) => {
-      const doc =
-        liveDoc && liveDoc.type === "doc"
-          ? liveDoc
-          : { type: "doc", content: [] };
-      if (!Array.isArray(doc.content)) doc.content = [];
+        const doc =
+          liveDoc && liveDoc.type === "doc"
+            ? liveDoc
+            : { type: "doc", content: [] };
+        if (!Array.isArray(doc.content)) doc.content = [];
 
-      if (opts.replaceText) {
-        // Ambiguity guard (mirrors editPageText): count matching top-level
-        // blocks first, so a non-unique fragment cannot silently replace the
-        // wrong block (e.g. text that also appears inside a callout/table).
-        const matches = doc.content.filter((b: any) =>
-          blockText(b).includes(opts.replaceText!),
-        );
-        if (matches.length === 0) {
-          throw new Error(`replaceText not found: "${opts.replaceText}"`);
-        }
-        if (matches.length > 1) {
-          throw new Error(
-            `replaceText "${opts.replaceText}" matches ${matches.length} blocks; use a longer unique fragment`,
+        if (opts.replaceText) {
+          // Ambiguity guard (mirrors editPageText): count matching top-level
+          // blocks first, so a non-unique fragment cannot silently replace the
+          // wrong block (e.g. text that also appears inside a callout/table).
+          const matches = doc.content.filter((b: any) =>
+            blockText(b).includes(opts.replaceText!),
           );
-        }
-        const idx = doc.content.findIndex((b: any) =>
-          blockText(b).includes(opts.replaceText!),
-        );
-        // Data-loss guard: replaceText swaps the WHOLE top-level block, so if
-        // the fragment only appears nested inside a container (table, callout,
-        // list, blockquote) the entire structure would be destroyed. Refuse
-        // when the matched block is a container rather than a leaf
-        // paragraph/heading and point the caller at a safer tool.
-        const CONTAINER_TYPES = new Set([
-          "table",
-          "callout",
-          "bulletList",
-          "orderedList",
-          "taskList",
-          "blockquote",
-        ]);
-        const matchedBlock = doc.content[idx];
-        if (matchedBlock && CONTAINER_TYPES.has(matchedBlock.type)) {
-          throw new Error(
-            `replaceText matched a ${matchedBlock.type} container block; replacing it would destroy the whole structure. ` +
-              `Use afterText to insert near it, or update_page_json for surgical edits.`,
+          if (matches.length === 0) {
+            throw new Error(`replaceText not found: "${opts.replaceText}"`);
+          }
+          if (matches.length > 1) {
+            throw new Error(
+              `replaceText "${opts.replaceText}" matches ${matches.length} blocks; use a longer unique fragment`,
+            );
+          }
+          const idx = doc.content.findIndex((b: any) =>
+            blockText(b).includes(opts.replaceText!),
           );
-        }
-        doc.content.splice(idx, 1, node);
-        placement = "replaced";
-      } else if (opts.afterText) {
-        // Ambiguity guard (mirrors editPageText): refuse a non-unique fragment.
-        const matches = doc.content.filter((b: any) =>
-          blockText(b).includes(opts.afterText!),
-        );
-        if (matches.length === 0) {
-          throw new Error(`afterText not found: "${opts.afterText}"`);
-        }
-        if (matches.length > 1) {
-          throw new Error(
-            `afterText "${opts.afterText}" matches ${matches.length} blocks; use a longer unique fragment`,
+          // Data-loss guard: replaceText swaps the WHOLE top-level block, so if
+          // the fragment only appears nested inside a container (table, callout,
+          // list, blockquote) the entire structure would be destroyed. Refuse
+          // when the matched block is a container rather than a leaf
+          // paragraph/heading and point the caller at a safer tool.
+          const CONTAINER_TYPES = new Set([
+            "table",
+            "callout",
+            "bulletList",
+            "orderedList",
+            "taskList",
+            "blockquote",
+          ]);
+          const matchedBlock = doc.content[idx];
+          if (matchedBlock && CONTAINER_TYPES.has(matchedBlock.type)) {
+            throw new Error(
+              `replaceText matched a ${matchedBlock.type} container block; replacing it would destroy the whole structure. ` +
+                `Use afterText to insert near it, or update_page_json for surgical edits.`,
+            );
+          }
+          doc.content.splice(idx, 1, node);
+          placement = "replaced";
+        } else if (opts.afterText) {
+          // Ambiguity guard (mirrors editPageText): refuse a non-unique fragment.
+          const matches = doc.content.filter((b: any) =>
+            blockText(b).includes(opts.afterText!),
           );
+          if (matches.length === 0) {
+            throw new Error(`afterText not found: "${opts.afterText}"`);
+          }
+          if (matches.length > 1) {
+            throw new Error(
+              `afterText "${opts.afterText}" matches ${matches.length} blocks; use a longer unique fragment`,
+            );
+          }
+          const idx = doc.content.findIndex((b: any) =>
+            blockText(b).includes(opts.afterText!),
+          );
+          doc.content.splice(idx + 1, 0, node);
+          placement = "after";
+        } else {
+          doc.content.push(node);
+          placement = "appended";
         }
-        const idx = doc.content.findIndex((b: any) =>
-          blockText(b).includes(opts.afterText!),
-        );
-        doc.content.splice(idx + 1, 0, node);
-        placement = "after";
-      } else {
-        doc.content.push(node);
-        placement = "appended";
-      }
 
-      return doc;
+        return doc;
       },
     );
 
@@ -2843,8 +2897,7 @@ export class DocmostClient {
   async diffPageVersions(pageId: string, from?: string, to?: string) {
     await this.ensureAuthenticated();
 
-    const isCurrent = (v?: string) =>
-      v == null || v === "" || v === "current";
+    const isCurrent = (v?: string) => v == null || v === "" || v === "current";
 
     const resolveSide = async (
       v?: string,
@@ -2965,7 +3018,9 @@ export class DocmostClient {
         throw new Error(`transform did not compile: ${e?.message ?? e}`);
       }
       if (typeof fn !== "function") {
-        throw new Error("transform must evaluate to a function (doc, ctx) => doc");
+        throw new Error(
+          "transform must evaluate to a function (doc, ctx) => doc",
+        );
       }
       const result = vm.runInNewContext(
         "f(d, c)",
@@ -2995,9 +3050,9 @@ export class DocmostClient {
       const raw = await this.getPageRaw(pageId);
       const current = raw.content || { type: "doc", content: [] };
       runTransform(current);
-      // Exercise the same Yjs encoder the apply path uses, so the preview
-      // fails with the SAME descriptive error when the doc is not encodable
-      // instead of returning a misleadingly-green diff.
+      // Run an independent Yjs-encodability check (same sanitize + schema as the
+      // apply path), so the preview fails with the same descriptive error when
+      // the doc is not encodable instead of returning a misleadingly-green diff.
       assertYjsEncodable(newDoc);
       return {
         pushed: false,

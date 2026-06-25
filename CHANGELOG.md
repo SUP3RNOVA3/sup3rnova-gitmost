@@ -12,16 +12,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Persistent AI-chat history as the source of truth + server-side export.**
+  An assistant turn is now persisted to the database step by step: the row is
+  inserted upfront as `streaming` and updated as each agent step finishes, then
+  finalized once to `completed`/`error`/`aborted`. A process that dies mid-turn
+  keeps every finished step, and a startup sweep flips any dangling `streaming`
+  row (untouched for 10 minutes) to `aborted`. Chat "Copy" now exports
+  server-side from these rows (`POST /ai-chat/export`) rather than from live
+  client state, so the export is identical whether a chat is freshly streaming,
+  just switched to, or reloaded — and is available from the first turn of a new
+  chat. (#183, #174)
+
 - **AI-agent attribution for MCP writes.** Comments (and pages) created through
   the MCP endpoint by a dedicated agent account are now badged as "AI", with
   unspoofable provenance derived from a per-user `is_agent` flag (not from the
-  request body). **Operator setup:** use a *dedicated* service account for the
+  request body). **Operator setup:** use a _dedicated_ service account for the
   MCP fallback and set the flag with SQL —
   `UPDATE users SET is_agent = true WHERE email = '<mcp-account>'`. Never flag a
   human or shared account, or its normal edits get mis-attributed as AI. See the
   AI-agent block in `.env.example`. (#143)
+- **Footnote import diagnostics.** The MCP page-write tools (`create_page`,
+  `update_page`, `import_page_markdown`) now return a `footnoteWarnings` array
+  flagging dangling references, empty or duplicate definitions, and `[^id]`
+  markers inside table rows, so an agent can fix its own markup. The page is
+  still created; the field is omitted when there are no problems. (#166)
+- **AI chat "Protocol" setting (`chatApiStyle`).** A new admin choice in AI
+  settings for the `openai` driver: `openai-compatible` (default) routes chat
+  through `@ai-sdk/openai-compatible`, which surfaces a provider's streamed
+  reasoning (`reasoning_content` → reasoning parts) for z.ai/GLM, DeepSeek,
+  OpenRouter, etc.; `openai` uses the official provider (real-OpenAI
+  reasoning-model request shaping). Chosen explicitly rather than inferred from
+  the base URL, since a custom URL can front real OpenAI too. (#175, #177)
+- **Per-MCP-server instructions in the agent prompt.** Each external MCP server
+  now has an admin-authored `instructions` field ("how/when to use this server's
+  tools") that is injected into the agent's system prompt next to that server's
+  tool descriptions. Trusted text, rendered inside the prompt safety sandwich;
+  shown only for a server that actually connected and contributed ≥1 callable
+  tool. (#180)
+- **Footnote multi-backlinks.** A footnote referenced more than once now shows a
+  back-link per reference (↩ a b c …), each scrolling to its own occurrence, like
+  Pandoc/Wikipedia; a single-reference footnote keeps the plain ↩. (#168)
 
 ### Changed
+
+- **AI chat default provider is now `openai-compatible` (reasoning surfaced).**
+  For the `openai` driver the chat provider defaults to the openai-compatible
+  implementation, so a workspace pointing at z.ai/GLM/DeepSeek now streams the
+  model's reasoning out of the box. An endpoint that is real OpenAI behind a
+  custom base URL should set the new `chatApiStyle` "Protocol" to `openai`. (#177)
+
+- **Footnotes now reuse (Pandoc semantics).** Multiple `[^a]` references to the
+  same id are ONE footnote — one number, one definition, several back-references
+  — instead of being renamed to `a__2`, `a__3`. Duplicate `[^a]:` definitions are
+  first-wins on import (the rest are dropped and reported via `footnoteWarnings`),
+  and a reference with no definition yields a single empty footnote rather than
+  one per occurrence. This supersedes the 0.93.0 "survive duplicate-id
+  definitions" behavior for the import path. (#166)
 
 - **Public share AI: default per-workspace hourly assistant cap lowered
   300 → 100.** The limiter falls back to this default whenever
@@ -41,6 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are nudged after a paste to refresh stale hit-testing geometry. The caret
   symptom is macOS-specific and was confirmed manually on macOS; the automated
   guard pins the DOM-order invariant, not the caret behavior itself. (#146, #147)
+- **AI chat: the live token counter now ticks between agent steps.** During a
+  multi-step turn the header token badge (and the "Thinking… · N tokens" line)
+  no longer froze on the previous step's authoritative usage; the current step's
+  estimate is combined per-component with `max`, so the count rises smoothly and
+  never jumps backwards. (#163)
 
 ## [0.93.0] - 2026-06-21
 
@@ -124,8 +175,7 @@ embeds — plus a large batch of security hardening and test coverage.
 - Page templates: import `ThrottleModule` so collab boots, never strand an
   in-flight page-embed id, and add defense-in-depth workspace checks.
 - Pages: `movePage` cycle guard with no phantom `PAGE_MOVED` event.
-- Import: surface the real error cause from `/pages/import` instead of a generic
-  400.
+- Import: surface the real error cause from `/pages/import` instead of a generic 400.
 
 ### Security
 

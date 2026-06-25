@@ -6,7 +6,6 @@ import MessageItem from "@/features/ai-chat/components/message-item.tsx";
 import TypingIndicator from "@/features/ai-chat/components/typing-indicator.tsx";
 import { isToolPart, toolRunState, ToolUiPart } from "@/features/ai-chat/utils/tool-parts.tsx";
 import { assistantMessageHasVisibleContent } from "@/features/ai-chat/utils/message-content.ts";
-import { liveTurnTokens } from "@/features/ai-chat/utils/count-stream-tokens.ts";
 import classes from "@/features/ai-chat/components/ai-chat.module.css";
 
 interface MessageListProps {
@@ -51,7 +50,9 @@ const BOTTOM_THRESHOLD = 40;
  * assistant message's LAST part is not live output:
  *  - the last message is still the user's (assistant hasn't started a row), or
  *  - the assistant row has no parts yet, or
- *  - its last part is an empty/whitespace text part, or
+ *  - its last part is an empty/whitespace text part, or a finished ("done")
+ *    text part while the turn continues (the model paused after some narration
+ *    and is thinking about its next step), or
  *  - its last part is a finished/errored tool (the model is thinking about the
  *    next step between tool calls).
  * It hides only while output is actively rendering: a non-empty streaming text
@@ -65,7 +66,19 @@ export function showTypingIndicator(messages: UIMessage[], isStreaming: boolean)
   const lastPart = last.parts[last.parts.length - 1];
   if (!lastPart) return true; // assistant row exists but has no parts yet.
   // The answer text is actively streaming in -> MessageItem renders it; no dots.
-  if (lastPart.type === "text" && lastPart.text.trim().length > 0) return false;
+  // Only while it is STILL streaming, though: once a non-empty text part is
+  // finalized ("done") but the turn is still in flight, the model has paused
+  // after some narration and is working on its next step (e.g. about to call a
+  // tool) — nothing is visibly progressing, so the dots must show. A text part
+  // without a `state` is treated as still-rendering (kept suppressed); this
+  // branch only runs while streaming, where live parts always carry a state.
+  if (
+    lastPart.type === "text" &&
+    lastPart.text.trim().length > 0 &&
+    (lastPart as { state?: "streaming" | "done" }).state !== "done"
+  ) {
+    return false;
+  }
   // A tool still in flight shows its own Loader in ToolCallCard -> no dots.
   if (
     isToolPart(lastPart.type) &&
@@ -93,19 +106,6 @@ export function typingIndicatorShowsName(messages: UIMessage[]): boolean {
   const last = messages[messages.length - 1];
   if (!last || last.role !== "assistant") return true;
   return !assistantMessageHasVisibleContent(last);
-}
-
-/**
- * The live thinking-token count to show on the standalone typing indicator. It
- * is the reasoning split of the tail assistant message (estimate while streaming,
- * authoritative once the server attaches usage at a step/turn boundary). Returns
- * 0 when the turn has produced no reasoning yet — the indicator then shows the
- * plain "Thinking…" line.
- */
-export function tailThinkingTokens(messages: UIMessage[]): number {
-  const last = messages[messages.length - 1];
-  if (!last || last.role !== "assistant") return 0;
-  return liveTurnTokens(last).reasoning;
 }
 
 /**
@@ -208,7 +208,6 @@ export default function MessageList({
           <TypingIndicator
             assistantName={assistantName}
             showName={typingIndicatorShowsName(messages)}
-            thinkingTokens={tailThinkingTokens(messages)}
           />
         )}
       </Stack>

@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { type UIMessage } from "@ai-sdk/react";
 import { Group, Loader, Tooltip } from "@mantine/core";
 import {
   IconArrowsDiagonal,
@@ -40,7 +39,7 @@ import {
 } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import ConversationList from "@/features/ai-chat/components/conversation-list.tsx";
 import ChatThread from "@/features/ai-chat/components/chat-thread.tsx";
-import { buildChatMarkdown } from "@/features/ai-chat/utils/chat-markdown.ts";
+import { exportAiChat } from "@/features/ai-chat/services/ai-chat-service.ts";
 import { useChatSession } from "@/features/ai-chat/hooks/use-chat-session.ts";
 import {
   shouldCollapseOnOutsidePointer,
@@ -80,17 +79,31 @@ function computeInitialGeom() {
     Math.min(DEFAULT_HEIGHT, window.innerHeight - 2 * EDGE_MARGIN),
   );
   const left = Math.max(EDGE_MARGIN, window.innerWidth - width - 24);
-  const maxTop = Math.max(EDGE_MARGIN, window.innerHeight - height - EDGE_MARGIN);
+  const maxTop = Math.max(
+    EDGE_MARGIN,
+    window.innerHeight - height - EDGE_MARGIN,
+  );
   const top = Math.min(60, maxTop);
   return { left, top, width, height };
 }
 
 // Clamp a geometry so the window stays within the current viewport.
-function clampGeom(g: { left: number; top: number; width: number; height: number }) {
+function clampGeom(g: {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}) {
   const effWidth = Math.max(g.width, MIN_WIDTH);
   const effHeight = Math.max(g.height, MIN_HEIGHT);
-  const maxLeft = Math.max(EDGE_MARGIN, window.innerWidth - effWidth - EDGE_MARGIN);
-  const maxTop = Math.max(EDGE_MARGIN, window.innerHeight - effHeight - EDGE_MARGIN);
+  const maxLeft = Math.max(
+    EDGE_MARGIN,
+    window.innerWidth - effWidth - EDGE_MARGIN,
+  );
+  const maxTop = Math.max(
+    EDGE_MARGIN,
+    window.innerHeight - effHeight - EDGE_MARGIN,
+  );
   return {
     ...g,
     left: Math.min(Math.max(EDGE_MARGIN, g.left), maxLeft),
@@ -107,7 +120,7 @@ function clampGeom(g: { left: number; top: number; width: number; height: number
  * ported from the GitmostAgent.jsx design.
  */
 export default function AiChatWindow() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const clipboard = useClipboard({ timeout: 500 });
   const queryClient = useQueryClient();
   const [windowOpen, setWindowOpen] = useAtom(aiChatWindowOpenAtom);
@@ -148,14 +161,6 @@ export default function AiChatWindow() {
   const { data: messageRows, isLoading: messagesLoading } =
     useAiChatMessagesQuery(activeChatId ?? undefined);
 
-  // Live snapshot of the active thread's useChat state, kept up to date by
-  // ChatThread. Lets the export include the in-progress (not-yet-persisted)
-  // streaming turn. A ref avoids re-rendering this window on every token.
-  const liveThreadRef = useRef<{ messages: UIMessage[]; isStreaming: boolean }>({
-    messages: [],
-    isStreaming: false,
-  });
-
   // Live turn-token total (reasoning + output) for the in-flight turn, pushed up
   // (THROTTLED to ~8 Hz inside ChatThread) so the header badge ticks mid-stream.
   // `null` means no turn is in flight -> the badge falls back to the persisted
@@ -189,46 +194,42 @@ export default function AiChatWindow() {
     threadKey,
     waitingForHistory,
     onTurnFinished,
+    onServerChatId,
     startFreshThread,
     cancelPendingAdoption,
   } = useChatSession({
-      activeChatId,
-      setActiveChatId,
-      chats,
-      messagesLoading,
-      onInvalidateChatList: () =>
-        queryClient.invalidateQueries({ queryKey: AI_CHATS_RQ_KEY }),
-      onInvalidateChatMessages: (id) =>
-        queryClient.invalidateQueries({ queryKey: AI_CHAT_MESSAGES_RQ_KEY(id) }),
-    });
+    activeChatId,
+    setActiveChatId,
+    chats,
+    messagesLoading,
+    onInvalidateChatList: () =>
+      queryClient.invalidateQueries({ queryKey: AI_CHATS_RQ_KEY }),
+    onInvalidateChatMessages: (id) =>
+      queryClient.invalidateQueries({ queryKey: AI_CHAT_MESSAGES_RQ_KEY(id) }),
+  });
 
   // startNewChat/selectChat set the public atom; the hook's render-phase
   // reconciler handles the remount when activeChatId actually CHANGES. But
-  // pressing "New chat" while already in a new chat leaves activeChatId === null
-  // (a no-op for the atom), so the reconciler never fires — explicitly disarm any
-  // armed error-path fallback here so a late refetch can't yank the user into a
-  // just-failed chat after they chose a fresh one.
+  // pressing "New chat" while already in a not-yet-adopted new chat leaves
+  // activeChatId === null (a no-op for the atom), so the reconciler never fires —
+  // startFreshThread forces the remount unconditionally (and disarms any armed
+  // error-path fallback) so a late refetch can't yank the user into a just-failed
+  // chat after they chose a fresh one (#161).
   const startNewChat = useCallback((): void => {
-    cancelPendingAdoption();
-    // Force a fresh thread UNCONDITIONALLY. If the user is still on a brand-new,
-    // not-yet-adopted chat (activeChatId === null) while its first turn streams,
-    // setActiveChatId(null) is a no-op and the render-phase reconciler would not
-    // remount — leaving the streaming thread in place (#161). startFreshThread
-    // guarantees a clean remount; the abandoned thread's late finish is rejected
-    // by the threadKey guard in the session hook.
+    // Force a fresh thread UNCONDITIONALLY. On a brand-new, not-yet-adopted chat
+    // (activeChatId === null) whose first turn is still streaming, setActiveChatId
+    // (null) is a no-op and the render-phase reconciler would not remount — leaving
+    // the streaming thread in place (#161). startFreshThread guarantees a clean
+    // remount and already disarms any armed error-path fallback (so a separate
+    // cancelPendingAdoption() call here is redundant); the abandoned thread's late
+    // finish is rejected by the threadKey guard in the session hook.
     startFreshThread();
     setActiveChatId(null);
     setHistoryOpen(false);
     setDraft("");
     // Default the picker back to "Universal assistant" for the fresh chat.
     setSelectedRoleId(null);
-  }, [
-    cancelPendingAdoption,
-    startFreshThread,
-    setActiveChatId,
-    setDraft,
-    setSelectedRoleId,
-  ]);
+  }, [startFreshThread, setActiveChatId, setDraft, setSelectedRoleId]);
 
   const selectChat = useCallback(
     (chatId: string): void => {
@@ -243,19 +244,28 @@ export default function AiChatWindow() {
     [cancelPendingAdoption, setActiveChatId, setDraft, setSelectedRoleId],
   );
 
-  // The active chat object (for its title) and an export gate: only enable the
-  // export button when an existing chat with loaded persisted rows is active.
+  // The active chat object (for its title) and an export gate. The export is now
+  // SERVER-sourced (the DB is the single source of truth — #183): the assistant
+  // row is persisted upfront + per step, so even a brand-new chat whose first
+  // turn is streaming/interrupted has a server row to render. Enable the button
+  // whenever a persisted chat is active (`activeChatId` is set). For a BRAND-NEW
+  // chat that id is adopted EARLY — at the stream's `start` chunk via
+  // onServerChatId (#174) — so the Copy button is available during the first
+  // turn's stream, not only after it terminates.
   const activeChat = useMemo(
     () => chats?.items?.find((c) => c.id === activeChatId) ?? null,
     [chats, activeChatId],
   );
-  const canExport = !!activeChatId && !!messageRows && messageRows.length > 0;
+  const canExport = !!activeChatId;
 
   // The role to display in the header and as the assistant's name. Prefer the
   // persisted role of an existing chat (chat-list JOIN); fall back to the role
   // picked via a card click for a brand-new or just-adopted chat. selectChat
   // resets selectedRoleId, so this fallback never leaks into an unrelated chat.
-  const currentRole = useMemo<{ name: string; emoji: string | null } | null>(() => {
+  const currentRole = useMemo<{
+    name: string;
+    emoji: string | null;
+  } | null>(() => {
     if (activeChat?.roleName) {
       return { name: activeChat.roleName, emoji: activeChat.roleEmoji ?? null };
     }
@@ -263,37 +273,21 @@ export default function AiChatWindow() {
     return picked ? { name: picked.name, emoji: picked.emoji } : null;
   }, [activeChat, enabledRoles, selectedRoleId]);
 
-  // Build a Markdown export from the already-loaded persisted rows (no network
-  // call) and copy it to the clipboard. The "Copied" notification is the
-  // feedback.
-  const handleCopy = useCallback(() => {
-    if (!activeChatId || !messageRows || messageRows.length === 0) return;
-    // While the active thread is streaming, the current user message and the
-    // in-progress assistant reply are NOT yet in messageRows (the persisted
-    // query is only refetched after the turn finishes). Pull the live tail —
-    // messages whose id is not among the persisted rows — and append them,
-    // flagging the streaming assistant message as still generating.
-    const live = liveThreadRef.current;
-    const rowIds = new Set(messageRows.map((r) => r.id));
-    const pending = live.isStreaming
-      ? live.messages
-          .filter((m) => !rowIds.has(m.id))
-          .map((m) => ({
-            role: m.role,
-            parts: (m.parts ?? []) as { type: string; text?: string }[],
-            generating: m.role === "assistant",
-          }))
-      : [];
-    const markdown = buildChatMarkdown({
-      title: activeChat?.title ?? null,
-      chatId: activeChatId,
-      rows: messageRows,
-      pending,
-      t,
-    });
-    clipboard.copy(markdown);
-    notifications.show({ message: t("Copied") });
-  }, [activeChatId, messageRows, activeChat, clipboard, t]);
+  // Fetch the server-rendered Markdown export and copy it to the clipboard. The
+  // server is the single source of truth (#183): it renders the transcript from
+  // the persisted rows — including an interrupted turn's in-progress row — so the
+  // export is identical whether the chat is freshly streaming, just switched to,
+  // or reloaded. The `lang` of the active i18n drives the few localized labels.
+  const handleCopy = useCallback(async () => {
+    if (!activeChatId) return;
+    try {
+      const markdown = await exportAiChat(activeChatId, i18n.language);
+      clipboard.copy(markdown);
+      notifications.show({ message: t("Copied") });
+    } catch {
+      notifications.show({ message: t("Failed to export chat"), color: "red" });
+    }
+  }, [activeChatId, clipboard, t, i18n.language]);
 
   // Current context size for the active chat: how much the conversation now
   // occupies in the model's context window — NOT the cumulative tokens spent.
@@ -369,7 +363,8 @@ export default function AiChatWindow() {
       const width = el.offsetWidth;
       const height = el.offsetHeight;
       setGeom((prev) => {
-        if (!prev || (prev.width === width && prev.height === height)) return prev;
+        if (!prev || (prev.width === width && prev.height === height))
+          return prev;
         return { ...prev, width, height };
       });
     });
@@ -515,11 +510,15 @@ export default function AiChatWindow() {
               flash a "0" badge before any token streams in (#151 review). */}
           {liveTurnTokens !== null && liveTurnTokens > 0 ? (
             <Tooltip label={t("Tokens generated this turn")} withArrow>
-              <span className={classes.badge}>{formatTokens(liveTurnTokens)}</span>
+              <span className={classes.badge}>
+                {formatTokens(liveTurnTokens)}
+              </span>
             </Tooltip>
           ) : contextTokens > 0 ? (
             <Tooltip label={t("Current context size")} withArrow>
-              <span className={classes.badge}>{formatTokens(contextTokens)}</span>
+              <span className={classes.badge}>
+                {formatTokens(contextTokens)}
+              </span>
             </Tooltip>
           ) : null}
         </div>
@@ -533,7 +532,11 @@ export default function AiChatWindow() {
               aria-label={t("Copy chat")}
               onClick={handleCopy}
             >
-              {clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
+              {clipboard.copied ? (
+                <IconCheck size={14} />
+              ) : (
+                <IconCopy size={14} />
+              )}
             </button>
           )}
           <button
@@ -640,7 +643,7 @@ export default function AiChatWindow() {
               assistantName={currentRole?.name}
               onTurnFinished={onTurnFinished}
               threadKey={threadKey}
-              liveStateRef={liveThreadRef}
+              onServerChatId={onServerChatId}
               onLiveTurnTokens={setLiveTurnTokens}
             />
           )}

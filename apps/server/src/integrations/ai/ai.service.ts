@@ -7,6 +7,7 @@ import {
   type LanguageModel,
 } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { createOllama } from 'ai-sdk-ollama';
 import { AiSettingsService } from './ai-settings.service';
@@ -14,6 +15,11 @@ import { AiNotConfiguredException } from './ai-not-configured.exception';
 import { AiEmbeddingNotConfiguredException } from './ai-embedding-not-configured.exception';
 import { AiSttNotConfiguredException } from './ai-stt-not-configured.exception';
 import { describeProviderError } from './ai-error.util';
+import { createInstrumentedFetch } from './ai-provider-http';
+import {
+  createStreamingFetch,
+  withPreResponseRetry,
+} from './ai-streaming-fetch';
 import { AiProviderCredentialsRepo } from '@docmost/db/repos/ai-chat/ai-provider-credentials.repo';
 import { SecretBoxService } from '../crypto/secret-box';
 import { AiDriver } from './ai.types';
@@ -42,6 +48,17 @@ export interface ChatModelOverride {
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
+
+  // Provider HTTP fetch for the chat path, layered so each transport concern is
+  // observed (#175). Inside-out: the streaming fetch (finite silence timeouts +
+  // keep-alive recycling) → provider-HTTP instrumentation (logs every attempt) →
+  // pre-response connection-reset retry as the OUTERMOST layer. Retry-outer means
+  // a reset the retry recovers from is still logged with its idle-gap, instead of
+  // collapsing into a clean "OK". Held for the service lifetime to reuse the
+  // streaming dispatcher's connection pool.
+  private readonly aiProviderFetch = withPreResponseRetry(
+    createInstrumentedFetch('AiService:provider-http', createStreamingFetch()),
+  );
 
   constructor(
     private readonly aiSettings: AiSettingsService,
@@ -83,6 +100,10 @@ export class AiService {
 
     let apiKey = cfg.apiKey;
     let baseUrl = cfg.baseUrl;
+    // Chat provider implementation, chosen EXPLICITLY by the admin (not inferred
+    // from baseUrl). Unset → 'openai-compatible' so reasoning is surfaced by
+    // default for this fork's openai+baseUrl setups.
+    const chatApiStyle = cfg.chatApiStyle ?? 'openai-compatible';
 
     // A driver override that differs from the workspace driver needs that
     // driver's own creds (the workspace driver's key would be wrong/absent).
@@ -133,14 +154,41 @@ export class AiService {
     }
 
     switch (driver) {
-      case 'openai':
-        // baseURL (when set) covers openai-compatible endpoints. Use Chat
-        // Completions (/chat/completions) — the portable OpenAI-compatible
-        // endpoint. The default callable createOpenAI(...)(model) targets the
-        // Responses API (/responses), which OpenAI-compatible gateways
-        // (OpenRouter, etc.) reject on multi-turn requests (history with
-        // assistant messages) → 400.
-        return createOpenAI({ apiKey, baseURL: baseUrl }).chat(chatModel);
+      case 'openai': {
+        // The provider implementation is chosen by the admin's `chatApiStyle`
+        // (NOT inferred from baseUrl — a custom URL can front real OpenAI too).
+        // Both branches hit Chat Completions (/chat/completions); the provider
+        // fetch is the instrumented streaming fetch (finite-but-generous stream
+        // timeouts, #175).
+        //
+        // 'openai-compatible' (default) maps the third-party provider's streamed
+        // `reasoning_content` to reasoning parts (z.ai/GLM, DeepSeek, ...) — the
+        // point of #175. It has no default endpoint, so it requires a baseURL;
+        // when there is none (real OpenAI, or a role's cross-driver override that
+        // cleared baseUrl) we fall back to the official provider.
+        if (chatApiStyle === 'openai-compatible' && baseUrl) {
+          return createOpenAICompatible({
+            name: 'openai-compatible',
+            apiKey,
+            baseURL: baseUrl,
+            // Keep streamed token usage (stream_options.include_usage): without
+            // it @ai-sdk/openai-compatible omits usage, zeroing the live token
+            // counter and reasoning-token metadata. The official provider always
+            // sent it, so this preserves parity.
+            includeUsage: true,
+            fetch: this.aiProviderFetch,
+          })(chatModel);
+        }
+        // Official @ai-sdk/openai: real-OpenAI reasoning-model request shaping;
+        // `.chat()` targets Chat Completions (the default callable targets the
+        // Responses API, which openai-compatible gateways 400 on multi-turn
+        // history). In this fork baseUrl is normally set; undefined = real OpenAI.
+        return createOpenAI({
+          apiKey,
+          baseURL: baseUrl,
+          fetch: this.aiProviderFetch,
+        }).chat(chatModel);
+      }
       case 'gemini':
         return createGoogleGenerativeAI({ apiKey })(chatModel);
       case 'ollama':
