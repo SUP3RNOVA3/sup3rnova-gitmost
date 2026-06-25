@@ -18,6 +18,12 @@ const SPACE_ID = 'sp-test';
 /** A recording client fake; createPage returns a configurable assigned id. */
 function makeClient(opts?: { createId?: string }) {
   const client = {
+    // Empty live tree by default -> creates take the normal createPage path; the
+    // retry-adopt lookup only fires when a (parentPageId, title) node matches.
+    listSpaceTree: vi.fn(async () => ({
+      pages: [] as { id: string; parentPageId?: string | null; title?: string }[],
+      complete: true,
+    })),
     importPageMarkdown: vi.fn(async (_pageId: string, _md: string) => ({
       success: true,
     })),
@@ -224,6 +230,143 @@ describe('applyPushActions — create (assigned pageId written back to meta)', (
     expect(res.writtenBack).toEqual([
       { path: 'Parent/My New Page.md', pageId: 'page-new-42' },
     ]);
+  });
+});
+
+describe('applyPushActions — create RETRY-ADOPT idempotency (#1)', () => {
+  // Create is NOT atomic with the pageId write-back: if a prior cycle created the
+  // page in Docmost but died before persisting the id back, the file is re-seen as
+  // a CREATE. The applier must ADOPT the existing page (write the id back + push the
+  // body as an idempotent UPDATE) instead of calling createPage again (which would
+  // duplicate the page). The live page is matched by (parentPageId, title).
+  it('ADOPTS an existing page (no createPage) when the live tree already has a match', async () => {
+    const client = makeClient({ createId: 'should-not-be-used' });
+    // The live Docmost tree already has the page this create targets:
+    //   title "My New Page" under the parent folder's page `parent-9`.
+    client.listSpaceTree.mockResolvedValue({
+      pages: [
+        { id: 'parent-9', parentPageId: null, title: 'Parent' },
+        { id: 'already-created-7', parentPageId: 'parent-9', title: 'My New Page' },
+      ],
+      complete: true,
+    });
+    const { git } = makeGit();
+    const fs = makeFs({
+      'Parent/My New Page.md': '# My New Page\n\nbody text\n',
+      'Parent/Parent.md': fileFor('parent-9'),
+    });
+
+    const res = await applyPushActions(
+      deps(client, git, fs),
+      actions({ creates: [{ path: 'Parent/My New Page.md' }] }),
+    );
+
+    expect(res.created).toBe(1);
+    // CRITICAL: createPage was NOT called — no duplicate page in Docmost.
+    expect(client.createPage).not.toHaveBeenCalled();
+    // The body was pushed as an UPDATE targeting the EXISTING id (idempotent).
+    expect(client.importPageMarkdown).toHaveBeenCalledTimes(1);
+    expect(client.importPageMarkdown).toHaveBeenCalledWith(
+      'already-created-7',
+      expect.stringContaining('body text'),
+      null,
+    );
+
+    // The file was rewritten with the EXISTING id as gitmost_id (now tracked).
+    expect(fs.writes.map((w) => w.path)).toEqual(['Parent/My New Page.md']);
+    const rewritten = fs.store['Parent/My New Page.md'];
+    expect(parsePageFile(rewritten).id).toBe('already-created-7');
+    expect(res.writtenBack).toEqual([
+      { path: 'Parent/My New Page.md', pageId: 'already-created-7' },
+    ]);
+  });
+
+  it('does NOT adopt from an INCOMPLETE tree even when a node matches (falls back to createPage)', async () => {
+    // Defensive guard: retry-adopt is only safe from a COMPLETE live tree. A
+    // TRUNCATED tree (complete:false) could miss an already-created page and let
+    // us duplicate it — the very thing adopt prevents. So on an incomplete tree
+    // the map is NOT built and we MUST fall back to the normal createPage path,
+    // even though this particular tree happens to carry a matching node.
+    const client = makeClient({ createId: 'page-new-55' });
+    // A node that WOULD match the create's (parentPageId 'parent-9', title
+    // 'My New Page') — but the tree is flagged incomplete, so it must be ignored.
+    client.listSpaceTree.mockResolvedValue({
+      pages: [
+        { id: 'parent-9', parentPageId: null, title: 'Parent' },
+        { id: 'already-created-7', parentPageId: 'parent-9', title: 'My New Page' },
+      ],
+      complete: false,
+    });
+    const { git } = makeGit();
+    const fs = makeFs({
+      'Parent/My New Page.md': '# My New Page\n\nbody text\n',
+      'Parent/Parent.md': fileFor('parent-9'),
+    });
+
+    const res = await applyPushActions(
+      deps(client, git, fs),
+      actions({ creates: [{ path: 'Parent/My New Page.md' }] }),
+    );
+
+    expect(res.created).toBe(1);
+    // CRITICAL: createPage ran (normal path) — adopt was suppressed by complete:false.
+    expect(client.createPage).toHaveBeenCalledTimes(1);
+    // No adopt-UPDATE happened: the matching node was NOT trusted.
+    expect(client.importPageMarkdown).not.toHaveBeenCalled();
+    // The file carries the NEWLY assigned id, not the would-be adopted one.
+    expect(parsePageFile(fs.store['Parent/My New Page.md']).id).toBe('page-new-55');
+    expect(res.writtenBack).toEqual([
+      { path: 'Parent/My New Page.md', pageId: 'page-new-55' },
+    ]);
+  });
+
+  it('a NORMAL create (empty live tree) STILL calls createPage', async () => {
+    // No matching live node -> the happy path: createPage runs, no adopt.
+    const client = makeClient({ createId: 'page-new-99' });
+    // makeClient's listSpaceTree returns an empty tree by default.
+    const { git } = makeGit();
+    const fs = makeFs({
+      'Parent/My New Page.md': '# My New Page\n\nbody text\n',
+      'Parent/Parent.md': fileFor('parent-9'),
+    });
+
+    const res = await applyPushActions(
+      deps(client, git, fs),
+      actions({ creates: [{ path: 'Parent/My New Page.md' }] }),
+    );
+
+    expect(res.created).toBe(1);
+    expect(client.createPage).toHaveBeenCalledTimes(1);
+    // No adopt-UPDATE happened (importPageMarkdown is the update path).
+    expect(client.importPageMarkdown).not.toHaveBeenCalled();
+    expect(parsePageFile(fs.store['Parent/My New Page.md']).id).toBe('page-new-99');
+  });
+
+  it('a thrown adopt is isolated as a `create` failure (per-page isolation, SPEC §12)', async () => {
+    const client = makeClient({ createId: 'unused' });
+    client.listSpaceTree.mockResolvedValue({
+      pages: [{ id: 'existing-1', parentPageId: null, title: 'Doc' }],
+      complete: true,
+    });
+    // The adopt pushes the body as an UPDATE; make that throw.
+    client.importPageMarkdown.mockRejectedValue(new Error('adopt boom'));
+    const { git, updateRefCalls } = makeGit();
+    const fs = makeFs({ 'Doc.md': '# Doc\n\nbody\n' });
+
+    const res = await applyPushActions(
+      deps(client, git, fs),
+      actions({ creates: [{ path: 'Doc.md' }] }),
+      'sha-adopt-fail',
+    );
+
+    expect(res.created).toBe(0);
+    expect(client.createPage).not.toHaveBeenCalled();
+    expect(res.failures).toEqual([
+      { kind: 'create', path: 'Doc.md', error: 'adopt boom' },
+    ]);
+    // A failure means the refs are NOT advanced (re-run retries cleanly, §12).
+    expect(res.lastPushedAdvanced).toBe(false);
+    expect(updateRefCalls).toEqual([]);
   });
 });
 

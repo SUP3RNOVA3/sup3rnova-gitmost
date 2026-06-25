@@ -1,5 +1,5 @@
 /**
- * Normalize-on-write helper (SPEC §11 "Резолюция").
+ * Normalize-on-write helper (SPEC §11 "Resolution").
  *
  * git diffs byte-for-byte, so writing a page in a NON-fixpoint markdown form
  * would make the next pull re-export it to a slightly different (but stable)

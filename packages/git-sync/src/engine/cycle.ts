@@ -114,6 +114,7 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
       writeFile: (absPath, text) => fs.writeFile(absPath, text),
       mkdir: (absDir) => fs.mkdir(absDir),
       rm: (absPath) => fs.rm(absPath),
+      log,
     },
     pullActions,
     vaultRoot,

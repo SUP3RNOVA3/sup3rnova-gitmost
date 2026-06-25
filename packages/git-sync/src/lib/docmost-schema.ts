@@ -6,6 +6,14 @@
  * (node ids, image sizing, link targets). Every code path that converts
  * to or from ProseMirror JSON must use THIS set, otherwise a round-trip
  * loses content.
+ *
+ * PROVENANCE / KEEP IN SYNC: this file is a VENDORED MIRROR of the canonical
+ * Docmost document schema in `@docmost/editor-ext`. The node/mark/attribute
+ * surface MUST be kept in sync with editor-ext — anything present there but
+ * missing here is silently dropped on a round-trip (data loss). The exported
+ * `docmostExtensions` surface is guarded by `test/schema-surface-snapshot.test.ts`,
+ * which fails loudly on any drift; when it does, re-verify parity against
+ * `@docmost/editor-ext` before updating the snapshot.
  */
 import StarterKit from "@tiptap/starter-kit";
 import Image from "@tiptap/extension-image";

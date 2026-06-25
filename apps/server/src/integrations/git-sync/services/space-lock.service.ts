@@ -111,25 +111,33 @@ export class SpaceLockService {
     if (this.running.has(spaceId)) {
       return { skipped: 'in-progress' };
     }
-    if (!(await this.acquire(spaceId))) {
-      return { skipped: 'lock-held' };
-    }
+    // Reserve the in-process slot synchronously (before any await) so two
+    // concurrent same-space calls on THIS instance cannot both pass the guard and
+    // race acquire(). Redis NX is already authoritative across replicas; this just
+    // closes the in-process TOCTOU window. Released in the outer finally on every
+    // path (acquire-failure, fn-throw, normal completion).
     this.running.add(spaceId);
-    // Heartbeat: periodically (≈ TTL/3) extend the lock's TTL while `fn` runs so
-    // a long push (client-controlled receive-pack + the Docmost cycle) cannot
-    // outlive the fixed TTL and let a concurrent cycle race the working tree. The
-    // refresh is CAS-guarded (only extends while WE own it). `.unref()` keeps the
-    // timer from holding the event loop open; it is ALWAYS cleared in `finally`.
-    const heartbeat = setInterval(() => {
-      void this.refreshLock(spaceId);
-    }, Math.max(1, Math.floor(GIT_SYNC_LOCK_TTL_MS / 3)));
-    heartbeat.unref?.();
     try {
-      return await fn();
+      if (!(await this.acquire(spaceId))) {
+        return { skipped: 'lock-held' };
+      }
+      // Heartbeat: periodically (≈ TTL/3) extend the lock's TTL while `fn` runs so
+      // a long push (client-controlled receive-pack + the Docmost cycle) cannot
+      // outlive the fixed TTL and let a concurrent cycle race the working tree. The
+      // refresh is CAS-guarded (only extends while WE own it). `.unref()` keeps the
+      // timer from holding the event loop open; it is ALWAYS cleared in `finally`.
+      const heartbeat = setInterval(() => {
+        void this.refreshLock(spaceId);
+      }, Math.max(1, Math.floor(GIT_SYNC_LOCK_TTL_MS / 3)));
+      heartbeat.unref?.();
+      try {
+        return await fn();
+      } finally {
+        clearInterval(heartbeat);
+        await this.release(spaceId);
+      }
     } finally {
-      clearInterval(heartbeat);
       this.running.delete(spaceId);
-      await this.release(spaceId);
     }
   }
 }

@@ -182,7 +182,7 @@ tea issues create --repo vvzvlad/gitmost --labels feature \
 
 ## Monorepo layout
 
-pnpm workspace (`pnpm@10.4.0`) orchestrated by **Nx**. Four workspace packages:
+pnpm workspace (`pnpm@10.4.0`) orchestrated by **Nx**. Five workspace packages:
 
 | Path | Name | Stack | Role |
 | --- | --- | --- | --- |
@@ -190,6 +190,7 @@ pnpm workspace (`pnpm@10.4.0`) orchestrated by **Nx**. Four workspace packages:
 | `apps/client` | `client` | React 18 + Vite + Mantine 8 + TanStack Query + Jotai | SPA frontend |
 | `packages/editor-ext` | `@docmost/editor-ext` | Tiptap/ProseMirror | Shared Tiptap node/mark extensions, imported by both the client and the server |
 | `packages/mcp` | `@docmost/mcp` | MCP SDK, Tiptap, Yjs | Standalone MCP server, also bundled into the server at `/mcp`. Does **not** import `editor-ext` — it keeps its own vendored mirror of the schema in `packages/mcp/src/lib/` |
+| `packages/git-sync` | `@docmost/git-sync` | Tiptap/ProseMirror, Yjs, git | Pure ProseMirror↔Markdown converter plus the two-way Docmost↔git Markdown sync engine. Bundled into the server (loaded over the ESM bridge), built in CI and the Dockerfile. Does **not** import `editor-ext` — it keeps its own vendored mirror of the document schema (kept in sync with `editor-ext`). |
 
 `build` targets are Nx-cached and dependency-ordered (`dependsOn: ["^build"]`), so `editor-ext` builds before the apps. `nx.json` sets `affected.defaultBase: main`.
 
@@ -263,7 +264,7 @@ The API server is a Fastify app with a global `/api` prefix (`main.ts` excludes 
 ### Client structure
 Vite SPA. Code is organized by feature under `apps/client/src/features/*` (mirrors the server domains: `page`, `space`, `comment`, `ai-chat`, `editor`, …). Conventions:
 - **TanStack Query** for server state (one `queries/` file per feature), **Jotai** atoms for local/shared UI state, **Mantine 8** + CSS modules (`*.module.css`) + `postcss-preset-mantine` for UI.
-- The editor is Tiptap; shared node/mark extensions live in `packages/editor-ext` and are imported by **both the client and the server** (collaboration, import/export) — editor schema changes often need to be made in `editor-ext`, not just the client. Note `packages/mcp` does *not* depend on `editor-ext`; it carries its own mirrored copy of the schema, so keep the two in sync manually when the document schema changes.
+- The editor is Tiptap; shared node/mark extensions live in `packages/editor-ext` and are imported by **both the client and the server** (collaboration, import/export) — editor schema changes often need to be made in `editor-ext`, not just the client. Note neither `packages/mcp` nor `packages/git-sync` depends on `editor-ext`; each carries its own mirrored copy of the schema. There are now **three** independent copies (`editor-ext` is canonical, plus `packages/mcp` and `packages/git-sync`), so keep all three in sync manually when the document schema changes.
 - API access goes through `apps/client/src/lib/api-client.ts` (axios). The `@` alias maps to `apps/client/src`.
 - Runtime config is injected at build time by `vite.config.ts` via `define` (`APP_URL`, `COLLAB_URL`, `APP_VERSION`, …) — these come from the root `.env`, not from `import.meta.env`.
 

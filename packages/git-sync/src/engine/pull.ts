@@ -1,5 +1,5 @@
 /**
- * Pull cycle — Docmost -> vault (SPEC §6 "Docmost -> ФС").
+ * Pull cycle — Docmost -> vault (SPEC §6 "Docmost -> FS").
  *
  * This increment turns the read-only mirror into the git-backed pull cycle:
  *
@@ -225,6 +225,11 @@ export interface ApplyPullActionsDeps {
   mkdir: (absDir: string) => Promise<void>;
   /** Remove a file by ABSOLUTE path (force: a missing file is a no-op). */
   rm: (absPath: string) => Promise<void>;
+  /**
+   * Injected logger for cycle diagnostics (mirrors the push side). Optional —
+   * falls back to `console.log` so existing callers stay green.
+   */
+  log?: (line: string) => void;
 }
 
 /** Outcome counters from `applyPullActions` (for the summary + tests). */
@@ -259,22 +264,25 @@ export async function applyPullActions(
   vaultRoot: string,
 ): Promise<ApplyResult> {
   const { client, git } = deps;
+  // One channel, mirroring the push side: route every cycle diagnostic through
+  // the injected logger; fall back to `console.log` when none is supplied.
+  const log = deps.log ?? ((line: string) => console.log(line));
 
   // Emit the SPEC §8 suppression warnings (preserved from the original `main`).
   const decision = actions.deletionDecision;
   if (!decision.apply) {
     if (decision.reason === "incomplete-fetch") {
-      console.warn(
+      log(
         "pull: tree fetch incomplete — deletions suppressed this cycle (SPEC §8)",
       );
     } else if (decision.reason === "empty-live") {
-      console.warn(
+      log(
         `pull: live fetch returned 0 pages but ${actions.existingCount} file(s) are ` +
           `tracked — deletions suppressed this cycle (SPEC §8). Re-run when ` +
           `Docmost is reachable.`,
       );
     } else {
-      console.warn(
+      log(
         `pull: plan would delete ${actions.plannedDeleteCount} of ${actions.existingCount} ` +
           `tracked file(s) (mass-delete guard) — deletions suppressed this ` +
           `cycle (SPEC §8). Verify the live Docmost tree, then re-run.`,
@@ -311,14 +319,14 @@ export async function applyPullActions(
     } catch (err) {
       failed++;
       failedPageIds.add(w.pageId);
-      console.error(
-        `pull: failed page ${w.pageId}:`,
-        err instanceof Error ? err.message : String(err),
+      log(
+        `pull: failed page ${w.pageId}: ` +
+          (err instanceof Error ? err.message : String(err)),
       );
     } finally {
       completed++;
       if (completed % PROGRESS_EVERY === 0) {
-        console.log(`pulled ${completed}/${actions.toWrite.length}`);
+        log(`pulled ${completed}/${actions.toWrite.length}`);
       }
     }
   };
@@ -346,9 +354,9 @@ export async function applyPullActions(
       await deps.rm(relToAbs(vaultRoot, rel));
       return true;
     } catch (err) {
-      console.error(
-        `pull: failed to ${what} ${rel}:`,
-        err instanceof Error ? err.message : String(err),
+      log(
+        `pull: failed to ${what} ${rel}: ` +
+          (err instanceof Error ? err.message : String(err)),
       );
       return false;
     }
@@ -364,7 +372,7 @@ export async function applyPullActions(
   for (const m of actions.moved) {
     if (!m.removeOldPath) continue;
     if (failedPageIds.has(m.pageId)) {
-      console.warn(
+      log(
         `pull: move write for ${m.pageId} failed — keeping old path ` +
           `${m.fromRelPath} (SPEC §8)`,
       );
@@ -401,15 +409,15 @@ export async function applyPullActions(
   await git.checkout(DEFAULT_BRANCH);
   const merge = await git.merge(DOCMOST_BRANCH);
   if (merge.conflict) {
-    console.error(
+    log(
       "pull: merge of docmost -> main CONFLICTED. Conflict markers were left " +
         "in the vault for manual resolution (SPEC §9). Nothing is pushed to " +
         "Docmost (read-only). Resolve locally, then re-run.",
     );
   } else if (!merge.ok) {
-    console.error(`pull: merge of docmost -> main failed: ${merge.output}`);
+    log(`pull: merge of docmost -> main failed: ${merge.output}`);
   }
-  console.log("pull: git push to remote is DEFERRED in this increment (SPEC §7).");
+  log("pull: git push to remote is DEFERRED in this increment (SPEC §7).");
 
   return { written, movedApplied, deleted, failed, committed, merge };
 }

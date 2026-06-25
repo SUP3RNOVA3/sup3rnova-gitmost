@@ -375,13 +375,109 @@ describe('GitmostDataSourceService', () => {
   describe('restorePage', () => {
     it('restores via the repo restore path scoped to the workspace', async () => {
       const { service, mocks } = build();
-      await service.bind(CTX).restorePage('p1');
+      const res = await service.bind(CTX).restorePage('p1');
       // Stamps lastUpdatedSource='git-sync' on restore (loop-guard, PR #119).
       expect(mocks.pageRepo.restorePage).toHaveBeenCalledWith(
         'p1',
         'ws-1',
         'git-sync',
       );
+      expect(res).toEqual({ id: 'p1' });
+    });
+  });
+
+  // Phase-B+ continuous-sync methods: not yet called by the engine but wired into
+  // the GitSyncClient seam (PR #119 review #5). Exercised via the bound client.
+  describe('listRecentSince', () => {
+    it('queries non-deleted pages newest-first and ISO-stringifies updatedAt', async () => {
+      const rows = [
+        {
+          id: 'p1',
+          slugId: 's1',
+          title: 'A',
+          parentPageId: null,
+          spaceId: 'space-1',
+          updatedAt: new Date('2026-06-20T10:00:00.000Z'),
+        },
+      ];
+      const { service, mocks } = build(rows);
+      const qb = mocks.db.selectFrom.mock.results; // populated after the call
+
+      const out = (await service
+        .bind(CTX)
+        .listRecentSince('space-1', '2026-06-19T00:00:00.000Z', 100)) as any[];
+
+      // Query builder shaped against the `pages` table with the expected chain.
+      expect(mocks.db.selectFrom).toHaveBeenCalledWith('pages');
+      const builder = qb[0].value;
+      expect(builder.select).toHaveBeenCalled();
+      expect(builder.orderBy).toHaveBeenCalledWith('updatedAt', 'desc');
+      // deletedAt is null + the conditional spaceId / since / cap clauses.
+      const whereArgs = builder.where.mock.calls.map((c: any[]) => c[0]);
+      expect(whereArgs).toContain('deletedAt');
+      expect(whereArgs).toContain('spaceId');
+      expect(whereArgs).toContain('updatedAt');
+      expect(builder.limit).toHaveBeenCalledWith(100);
+
+      expect(out).toEqual([
+        {
+          id: 'p1',
+          slugId: 's1',
+          title: 'A',
+          parentPageId: null,
+          spaceId: 'space-1',
+          updatedAt: '2026-06-20T10:00:00.000Z',
+        },
+      ]);
+    });
+
+    it('omits the spaceId / since / cap clauses when not supplied', async () => {
+      const { service, mocks } = build([]);
+
+      await service.bind(CTX).listRecentSince(undefined, null);
+
+      const builder = mocks.db.selectFrom.mock.results[0].value;
+      const whereArgs = builder.where.mock.calls.map((c: any[]) => c[0]);
+      // Only the deletedAt-is-null guard; no spaceId / updatedAt> clauses.
+      expect(whereArgs).toEqual(['deletedAt']);
+      expect(builder.limit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listTrash', () => {
+    it('queries soft-deleted pages and ISO-stringifies deletedAt (null stays null)', async () => {
+      const rows = [
+        {
+          id: 'p1',
+          slugId: 's1',
+          title: 'Trashed',
+          parentPageId: null,
+          spaceId: 'space-1',
+          deletedAt: new Date('2026-06-21T09:00:00.000Z'),
+        },
+        {
+          id: 'p2',
+          slugId: 's2',
+          title: 'NoDate',
+          parentPageId: null,
+          spaceId: 'space-1',
+          deletedAt: null,
+        },
+      ];
+      const { service, mocks } = build(rows);
+
+      const out = (await service.bind(CTX).listTrash('space-1')) as any[];
+
+      expect(mocks.db.selectFrom).toHaveBeenCalledWith('pages');
+      const builder = mocks.db.selectFrom.mock.results[0].value;
+      const whereCalls = builder.where.mock.calls;
+      // deletedAt is-not null (the trash predicate) + spaceId filter.
+      expect(whereCalls).toContainEqual(['deletedAt', 'is not', null]);
+      expect(whereCalls).toContainEqual(['spaceId', '=', 'space-1']);
+      expect(builder.orderBy).toHaveBeenCalledWith('deletedAt', 'desc');
+
+      expect(out[0].deletedAt).toBe('2026-06-21T09:00:00.000Z');
+      expect(out[1].deletedAt).toBeNull();
     });
   });
 });

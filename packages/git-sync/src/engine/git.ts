@@ -24,6 +24,12 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+// Safety net: kill a hung git subprocess. This engine performs only LOCAL git
+// operations (no network pushes), so a legitimate call never approaches this
+// bound; it only prevents an indefinitely-stuck subprocess from wedging a sync
+// cycle (the same risk the http-backend watchdog guards on the server side).
+const GIT_EXEC_TIMEOUT_MS = 120_000;
+
 /** Bot identity used for engine-authored vault commits (SPEC §7.3). */
 export const BOT_AUTHOR_NAME = "Docmost Sync";
 export const BOT_AUTHOR_EMAIL = "docmost-sync@local";
@@ -32,7 +38,7 @@ export const BOT_AUTHOR_EMAIL = "docmost-sync@local";
 export const DEFAULT_BRANCH = "main";
 
 /**
- * One row of `git diff --name-status` (SPEC §6 "ФС → Docmost"). `status` is the
+ * One row of `git diff --name-status` (SPEC §6 "FS -> Docmost"). `status` is the
  * single-letter change code (`-M` rename detection on), `path` is the (new) file
  * path; for a rename/copy (`R`/`C`) `oldPath` is the source and `path` is the
  * destination, with `score` carrying git's similarity index (0–100).
@@ -146,6 +152,7 @@ export class VaultGit {
           // can be sizable.
           ...(cwd !== undefined ? { cwd } : {}),
           maxBuffer: 64 * 1024 * 1024,
+          timeout: GIT_EXEC_TIMEOUT_MS,
           env: vaultGitEnv(opts?.env),
         },
       );
@@ -413,7 +420,7 @@ export class VaultGit {
    * the listing, e.g. `"*.md"`.
    *
    * The target wiki is RUSSIAN, so vault file names routinely contain Cyrillic
-   * (e.g. `Колонка.md`). With git's DEFAULT `core.quotepath=true`, `ls-files`
+   * (e.g. `Column.md` in Cyrillic). With git's DEFAULT `core.quotepath=true`, `ls-files`
    * returns non-ASCII paths octal-escaped and double-quoted (`"\320\232..."`),
    * which `src/pull.ts` `readExisting` would then parse as garbage paths,
    * breaking move/duplicate detection. We defeat that two ways at once:
@@ -519,7 +526,7 @@ export class VaultGit {
   /**
    * Read a ref to its SHA, or `null` if unset. Thin alias over `revParse`,
    * named for the push direction's marker `refs/docmost/last-pushed` (SPEC §5:
-   * "что из `main` уже отражено в Docmost").
+   * "what of `main` is already reflected in Docmost").
    */
   async readRef(ref: string): Promise<string | null> {
     return this.revParse(ref);

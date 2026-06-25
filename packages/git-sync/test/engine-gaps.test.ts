@@ -263,6 +263,7 @@ describe('applyPushActions (push.ts) — move prefetch isolation', () => {
 
   function makeClient() {
     return {
+      listSpaceTree: vi.fn(async () => ({ pages: [], complete: true })),
       importPageMarkdown: vi.fn(async () => ({ updatedAt: 'u' })),
       createPage: vi.fn(async () => ({ data: { id: 'new-id' } })),
       deletePage: vi.fn(async () => ({})),

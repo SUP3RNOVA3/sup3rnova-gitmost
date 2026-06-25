@@ -1,5 +1,5 @@
 /**
- * Push cycle — vault -> Docmost (SPEC §6 "ФС → Docmost"), FIRST increment.
+ * Push cycle — vault -> Docmost (SPEC §6 "FS -> Docmost"), FIRST increment.
  *
  * This module mirrors the structure of `./pull.ts`: a set of VaultGit diff/ref
  * primitives (in `./git.ts`), a PURE planner (`computePushActions`) that turns
@@ -65,7 +65,7 @@ export interface RenameMoveAction {
 /**
  * A CLASSIFIED rename/move (push #3): a `RenameMoveAction` resolved into the
  * Docmost op(s) it actually needs. The file PATH is the source of truth for tree
- * position (SPEC §5: "истина связи — pageId, не путь" — the path is COSMETIC and
+ * position (SPEC §5: "the identity is the pageId, not the path" — the path is COSMETIC and
  * LOCAL, the page identity is its pageId), so we compare the RESOLVED parent of
  * the new path against the resolved parent of the old path, and the title in the
  * current meta against the title in the previous meta. Each sub-op is emitted
@@ -235,7 +235,7 @@ export interface PushActionsInput {
  */
 export function computePushActions(input: PushActionsInput): PushActions {
   const { metaAt, currentPageIds } = input;
-  // PAGE-FILE FILTER (design §"Адопция"): only `.md` files OUTSIDE any dot-folder
+  // PAGE-FILE FILTER (design §"Adoption"): only `.md` files OUTSIDE any dot-folder
   // are Docmost pages. `.obsidian/*`, attachments, and other non-page files are
   // committed to the vault (no `.gitignore`) and so appear in the diff, but they
   // are NEVER pages — Obsidian owns them. Without this filter every ADDED such
@@ -445,6 +445,7 @@ export const DOCMOST_BRANCH = "docmost";
 export interface ApplyPushDeps {
   client: Pick<
     GitSyncClient,
+    | "listSpaceTree"
     | "importPageMarkdown"
     | "createPage"
     | "deletePage"
@@ -489,7 +490,7 @@ export interface PushedPageRecord {
    * exposed one. Absent when the (fake) client did not return it.
    */
   updatedAt?: string;
-  /** Stable hash of the markdown BODY that was pushed (SPEC §10 "хэш тела"). */
+  /** Stable hash of the markdown BODY that was pushed (SPEC §10 "body hash"). */
   bodyHash: string;
 }
 
@@ -675,8 +676,34 @@ export async function applyPushActions(
   }
 
   // 2. CREATES — create the page, then write the assigned pageId back to meta so
-  //    the file becomes tracked (SPEC §4 "записать присвоенный pageId обратно").
+  //    the file becomes tracked (SPEC §4 "write the assigned pageId back").
   //    Isolated per page like updates.
+  //
+  // RETRY-ADOPT (#1 idempotency): create is NOT atomic with the pageId write-back
+  // (createPage runs, then writeFile, then the write-back commit at runPush 7a). If
+  // the write-back dies in between, the file on disk still has no pageId and the
+  // next cycle re-classifies it as a CREATE -> a DUPLICATE page would be created.
+  // To guard against this, build a (parentPageId|root, title) -> existing pageId map
+  // ONCE from the LIVE Docmost tree (only when there is at least one create). The
+  // native-Obsidian layout makes filenames — and therefore titles — unique within a
+  // folder, so (parentPageId, title) identifies the page; a match means a prior
+  // cycle already created it, so we ADOPT instead of duplicating.
+  let liveByParentTitle: Map<string, string> | null = null;
+  if (actions.creates.length > 0) {
+    const live = await client.listSpaceTree(deps.spaceId);
+    // Only trust a COMPLETE tree for retry-adopt: a truncated tree could miss an
+    // already-created page and let us create a DUPLICATE (the very thing adopt
+    // prevents). The native client always returns complete:true (reads the DB);
+    // on an incomplete tree we leave the map null -> fall back to plain createPage.
+    if (live.complete) {
+      liveByParentTitle = new Map();
+      for (const n of live.pages) {
+        const key = `${n.parentPageId ?? " root"} ${n.title ?? ""}`;
+        // Keep the FIRST node for a key (the layout makes this unique in practice).
+        if (!liveByParentTitle.has(key)) liveByParentTitle.set(key, n.id);
+      }
+    }
+  }
   for (const c of actions.creates) {
     try {
       const text = await deps.readFile(c.path);
@@ -687,6 +714,26 @@ export async function applyPushActions(
       const title = titleFromPath(c.path);
       const parentPageId =
         (await resolveParentPageIdViaTree(deps, c.path, "current")) ?? undefined;
+      // Retry-adopt (#1 idempotency): a prior cycle already created this page in
+      // Docmost but failed to persist the pageId back to the file, so it was
+      // re-seen as a create. Adopt the existing page instead of duplicating it:
+      // write the id back (file becomes tracked) and push the body as an UPDATE
+      // (idempotent — targets by pageId). Do NOT call createPage again.
+      const adoptKey = `${parentPageId ?? " root"} ${title}`;
+      const existingId = liveByParentTitle?.get(adoptKey);
+      if (existingId) {
+        const rewritten = serializePageFile(existingId, body);
+        await deps.writeFile(c.path, rewritten);
+        writtenBack.push({ path: c.path, pageId: existingId });
+        const adopted = await client.importPageMarkdown(existingId, body, null);
+        pushed.push({
+          pageId: existingId,
+          ...extractUpdatedAt(adopted),
+          bodyHash: bodyHash(body),
+        });
+        created++;
+        continue;
+      }
       const result = await client.createPage(
         title,
         body,
@@ -896,7 +943,7 @@ export function parentFolderFile(path: string): string | null {
 }
 
 /**
- * Whether a vault path is a Docmost PAGE file (design §"Адопция"): a `.md` file
+ * Whether a vault path is a Docmost PAGE file (design §"Adoption"): a `.md` file
  * with NO dot-segment anywhere in its path. This excludes `.obsidian/` config,
  * `.trash/`, dotfiles (`.foo.md`), and every non-`.md` file (attachments, JSON,
  * …) — Obsidian owns those; they live in the vault but are never pages. Used to
@@ -954,7 +1001,7 @@ function nativeMeta(
  * then read its `gitmost_id` frontmatter and return that page's pageId. A root-level path
  * (no enclosing folder), a missing/unreadable parent file, or a parent file with
  * no parseable pageId all resolve to `null` (parent is ROOT / unknown ->
- * `parentPageId: null`, SPEC §16 "parentPageId: null -> в корень").
+ * `parentPageId: null`, SPEC §16 "parentPageId: null -> to root").
  *
  * The IO is async, so this returns an ASYNC resolver; the call sites prefetch the
  * parent pageIds (the classifier itself stays pure/sync over a plain table).
@@ -1112,7 +1159,7 @@ export interface PushRunResult {
 }
 
 /**
- * Run one FS->Docmost push cycle (SPEC §6 "ФС → Docmost"), DRY-RUN BY DEFAULT.
+ * Run one FS->Docmost push cycle (SPEC §6 "FS -> Docmost"), DRY-RUN BY DEFAULT.
  *
  * Steps (mirrors `pull.ts`):
  *   1. Preflight git: `assertGitAvailable` + `ensureRepo`; ABORT (clear message +
@@ -1425,18 +1472,4 @@ function logPlan(
     log(`  rename/move: ${rm.oldPath} -> ${rm.newPath} (${rm.pageId})`);
   for (const s of actions.skipped)
     log(`  skipped [${s.status}] ${s.path}: ${s.reason}`);
-}
-
-/** Parsed `push` CLI flags. DRY-RUN is the default; `--apply` opts into writes. */
-export interface PushParsedArgs {
-  /** True when `--apply` was passed (the ONLY path that writes to Docmost). */
-  apply: boolean;
-}
-
-/**
- * Parse the `push` CLI flags. SAFE BY DEFAULT: without `--apply` the run is a
- * DRY-RUN (plan only). Exported so the flag handling is unit-testable.
- */
-export function parseArgs(argv: string[]): PushParsedArgs {
-  return { apply: argv.includes("--apply") };
 }

@@ -81,7 +81,6 @@ export {
   applyPushActions,
   runPush,
   parentFolderFile,
-  parseArgs,
   LAST_PUSHED_REF,
   DOCMOST_BRANCH,
   LOCAL_AUTHOR_NAME,
@@ -106,13 +105,9 @@ export type {
   ApplyPushResult,
   PushDeps,
   PushRunResult,
-  PushParsedArgs,
 } from "./engine/push.js";
 
-export { parseSettings, envSchema } from "./engine/settings.js";
 export type { Settings } from "./engine/settings.js";
-
-export { loadSettingsOrExit } from "./engine/config-errors.js";
 
 export { runCycle } from "./engine/cycle.js";
 export type {

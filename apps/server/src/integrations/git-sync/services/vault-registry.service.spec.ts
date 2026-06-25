@@ -7,18 +7,33 @@
 // `loadGitSync()` bridge (the ESM `@docmost/git-sync` package cannot be
 // `require()`d under jest), so we mock that loader rather than the package.
 import { mkdir } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
 import { loadGitSync } from '../git-sync.loader';
 
 jest.mock('node:fs/promises', () => ({
   mkdir: jest.fn(async () => undefined),
 }));
 
+// ensureServable shells out via `promisify(execFile)`; mock execFile with a
+// callback-style fn so promisify resolves. Each `git config <key> <value>` call
+// is recorded so the four config writes (incl. the security-critical
+// receive.denyNonFastForwards=true) can be asserted.
+jest.mock('node:child_process', () => ({
+  execFile: jest.fn((_cmd: string, _args: string[], _opts: any, cb: any) =>
+    cb(null, { stdout: '', stderr: '' }),
+  ),
+}));
+
 // Cheap VaultGit stub: records the path it was constructed with; no shell-out.
-// Declared with a `mock`-prefixed name so jest allows referencing it inside the
-// hoisted `jest.mock` factory below.
+// `ensureRepo` is a resolved jest.fn so ensureServable can call it. Declared with
+// a `mock`-prefixed name so jest allows referencing it inside the hoisted
+// `jest.mock` factory below.
 const mockVaultGit = jest
   .fn()
-  .mockImplementation((path: string) => ({ path }));
+  .mockImplementation((path: string) => ({
+    path,
+    ensureRepo: jest.fn().mockResolvedValue(undefined),
+  }));
 
 jest.mock('../git-sync.loader', () => ({
   loadGitSync: jest.fn(async () => ({
@@ -32,6 +47,7 @@ import { VaultRegistryService } from './vault-registry.service';
 type AnyMock = jest.Mock;
 
 const mkdirMock = mkdir as unknown as AnyMock;
+const execFileMock = execFile as unknown as AnyMock;
 const VaultGitMock = mockVaultGit;
 void loadGitSync;
 
@@ -76,6 +92,54 @@ describe('VaultRegistryService', () => {
       expect(mkdirMock).toHaveBeenCalledWith('/vaults/space-1', {
         recursive: true,
       });
+    });
+  });
+
+  describe('ensureServable', () => {
+    it('ensures the repo then writes the four force-push-protection git configs', async () => {
+      const { service } = build('/vaults');
+
+      const path = await service.ensureServable('space-1');
+      expect(path).toBe('/vaults/space-1');
+
+      // ensureRepo ran first on the cached vault.
+      const vault = await service.getVault('space-1');
+      expect((vault as any).ensureRepo).toHaveBeenCalledTimes(1);
+
+      // Collect every `git config <key> <value>` write.
+      const configWrites = execFileMock.mock.calls
+        .filter(([cmd, args]) => cmd === 'git' && args[0] === 'config')
+        .map(([, args]) => [args[1], args[2]]);
+
+      expect(configWrites).toEqual([
+        ['receive.denyCurrentBranch', 'updateInstead'],
+        // Security-critical: blocks force-push / history rewrites on main.
+        ['receive.denyNonFastForwards', 'true'],
+        ['http.receivepack', 'true'],
+        ['http.uploadpack', 'true'],
+      ]);
+
+      // Every config write targets THIS vault's cwd.
+      for (const [cmd, args, opts] of execFileMock.mock.calls) {
+        if (cmd === 'git' && args[0] === 'config') {
+          expect(opts.cwd).toBe('/vaults/space-1');
+        }
+      }
+    });
+
+    it('rejects (and writes no git config) when ensureRepo rejects', async () => {
+      const { service } = build('/vaults');
+      const vault = await service.getVault('space-1');
+      (vault as any).ensureRepo.mockRejectedValueOnce(new Error('init failed'));
+
+      await expect(service.ensureServable('space-1')).rejects.toThrow(
+        'init failed',
+      );
+
+      const configWrites = execFileMock.mock.calls.filter(
+        ([cmd, args]) => cmd === 'git' && args[0] === 'config',
+      );
+      expect(configWrites).toHaveLength(0);
     });
   });
 });

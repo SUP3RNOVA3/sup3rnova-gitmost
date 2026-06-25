@@ -176,6 +176,45 @@ export class GitHttpBackendService {
         return done();
       }
 
+      // Watchdog: a client that opens git-receive-pack and stalls keeps the
+      // child alive forever, so run() never resolves and (because this runs
+      // inside withSpaceLock) the per-space lock is held + heartbeat-refreshed
+      // indefinitely. Bound the request: on expiry kill the child, send a clean
+      // 500 if nothing was sent yet, and settle the promise. The log carries no
+      // client echo / credentials / body. `.unref()` so the timer never keeps the
+      // event loop alive; ALWAYS cleared in the close/error handlers below.
+      const timer = setTimeout(() => {
+        this.logger.warn(
+          `git http-backend timed out after ` +
+            `${this.environmentService.getGitSyncBackendTimeoutMs()}ms; killing child`,
+        );
+        try {
+          child.kill('SIGTERM');
+          // Escalate to SIGKILL shortly after in case SIGTERM is ignored.
+          const sigkill = setTimeout(() => {
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              /* ignore */
+            }
+          }, 2000);
+          sigkill.unref?.();
+        } catch {
+          /* ignore */
+        }
+        if (!headerParsed && !rawRes.headersSent) {
+          this.send500(rawRes, 'timeout');
+        } else {
+          try {
+            rawRes.end();
+          } catch {
+            /* ignore */
+          }
+        }
+        done();
+      }, this.environmentService.getGitSyncBackendTimeoutMs());
+      timer.unref?.();
+
       // Accumulate stdout until we have the full CGI header block, then write the
       // parsed status/headers and start streaming the remaining body bytes.
       let headerParsed = false;
@@ -221,6 +260,7 @@ export class GitHttpBackendService {
       });
 
       child.on('error', (err) => {
+        clearTimeout(timer);
         if (!headerParsed && !rawRes.headersSent) {
           this.send500(rawRes, 'child-error', err);
         } else {
@@ -235,6 +275,7 @@ export class GitHttpBackendService {
       });
 
       child.on('close', (code) => {
+        clearTimeout(timer);
         if (!headerParsed && !rawRes.headersSent) {
           // The child exited before emitting a complete CGI header block.
           this.logger.error(

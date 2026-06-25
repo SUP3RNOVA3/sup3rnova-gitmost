@@ -528,6 +528,9 @@ importers:
       '@clickhouse/client':
         specifier: ^1.18.2
         version: 1.18.2
+      '@docmost/git-sync':
+        specifier: workspace:*
+        version: link:../../packages/git-sync
       '@docmost/mcp':
         specifier: workspace:*
         version: link:../../packages/mcp

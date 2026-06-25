@@ -1,7 +1,7 @@
 {
   "name": "@docmost/git-sync",
   "version": "0.1.0",
-  "description": "Pure converter + pure sync engine for the Docmost <-> git Markdown sync. See docs/git-sync-plan.md.",
+  "description": "Pure converter + pure sync engine for the Docmost <-> git Markdown sync. See docs/backlog/git-sync-thin-meta.md.",
   "private": true,
   "type": "module",
   "main": "./build/index.js",

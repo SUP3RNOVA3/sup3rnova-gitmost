@@ -99,17 +99,25 @@ function makeFs(opts?: { failWriteFor?: Set<string> }) {
   return { fs, writes, mkdirs, rms };
 }
 
+// A single injected `log` spy mirrors the push side: applyPullActions now routes
+// EVERY cycle diagnostic through `deps.log` (one channel), so tests inspect this
+// spy instead of console.warn/console.error. `deps()` creates a fresh spy per
+// call and stashes it on `lastLog` for the current test to assert against.
+let lastLog: ReturnType<typeof vi.fn>;
+
 function deps(
   client: any,
   git: any,
   fs: ReturnType<typeof makeFs>,
 ): ApplyPullActionsDeps {
+  lastLog = vi.fn();
   return {
     client,
     git,
     writeFile: fs.fs.writeFile,
     mkdir: fs.fs.mkdir,
     rm: fs.fs.rm,
+    log: lastLog,
   };
 }
 
@@ -341,7 +349,7 @@ describe('applyPullActions — deletion suppression (SPEC §8)', () => {
     // Subject reflects 0 deleted (no ", N deleted" suffix).
     expect(g.committedSubject).toBe('docmost: sync 1 page(s)');
     // The suppression warning was emitted.
-    expect(console.warn).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/tree fetch incomplete/),
     );
   });
@@ -472,10 +480,10 @@ describe('applyPullActions — suppression warning forks (empty-live / mass-dele
     expect(fs.rms).toEqual([]);
     // The empty-live message names the tracked-file count and "deletions
     // suppressed".
-    expect(console.warn).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/live fetch returned 0 pages but 4 file\(s\) are tracked/),
     );
-    expect(console.warn).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/deletions suppressed/),
     );
   });
@@ -502,10 +510,10 @@ describe('applyPullActions — suppression warning forks (empty-live / mass-dele
 
     expect(res.deleted).toBe(0);
     expect(fs.rms).toEqual([]);
-    expect(console.warn).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/plan would delete 5 of 6 tracked file\(s\) \(mass-delete guard\)/),
     );
-    expect(console.warn).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/deletions suppressed/),
     );
   });
@@ -513,8 +521,8 @@ describe('applyPullActions — suppression warning forks (empty-live / mass-dele
 
 describe('applyPullActions — removePath fault tolerance (rm REJECTS)', () => {
   it('does NOT reject, logs the failure, and does not count the failed removal', async () => {
-    // pull.ts 354-364: when `deps.rm` throws, removePath logs via console.error
-    // and returns false; the run continues. Existing delete tests use an rm
+    // pull.ts removePath catch: when `deps.rm` throws, it logs via the injected
+    // `log` and returns false; the run continues. Existing delete tests use an rm
     // that always succeeds, leaving this catch branch uncovered.
     const { client } = makeClient();
     const g = makeGit();
@@ -535,9 +543,8 @@ describe('applyPullActions — removePath fault tolerance (rm REJECTS)', () => {
     // Resolved (not rejected) — the pull is fault-tolerant.
     expect(res.deleted).toBe(0);
     // removePath's catch logs "pull: failed to delete Dead.md: ...".
-    expect(console.error).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/failed to .* Dead\.md/),
-      expect.anything(),
     );
     // The (would-be) removal never succeeded, so nothing was recorded.
     expect(fs.rms).toEqual([]);
@@ -567,12 +574,13 @@ describe('applyPullActions — removePath fault tolerance (rm REJECTS)', () => {
     expect(res.deleted).toBe(2);
     expect(fs.rms).toEqual(['/vault/Dead1.md', '/vault/Dead3.md']);
     expect(g.committedSubject).toBe('docmost: sync 0 page(s), 2 deleted');
-    // Exactly one rejection was logged (Dead2.md).
-    expect(console.error).toHaveBeenCalledTimes(1);
-    expect(console.error).toHaveBeenCalledWith(
-      expect.stringMatching(/failed to .* Dead2\.md/),
-      expect.anything(),
-    );
+    // Exactly one rejection was logged (Dead2.md). Other diagnostics share the
+    // `log` channel, so count ONLY the "failed to ..." failure lines.
+    const failLines = lastLog.mock.calls
+      .map((c: unknown[]) => String(c[0]))
+      .filter((m: string) => /failed to /.test(m));
+    expect(failLines.length).toBe(1);
+    expect(failLines[0]).toMatch(/failed to .* Dead2\.md/);
     // The run still reached commit + checkout + merge.
     expect(g.order).toEqual([
       'stageAll',
@@ -620,17 +628,16 @@ describe('applyPullActions — move old-path removal rejects vs move-write fails
     expect(fs.rms).toEqual(['/vault/Dead.md']); // Old/M.md rm threw, not recorded
     expect(g.committedSubject).toBe('docmost: sync 1 page(s), 1 deleted');
     // The failure log named the moved old path.
-    expect(console.error).toHaveBeenCalledWith(
+    expect(lastLog).toHaveBeenCalledWith(
       expect.stringMatching(/failed to .* Old\/M\.md/),
-      expect.anything(),
     );
   });
 
   it('a move-write FAILURE keeps the old path: rm is never attempted for it (data-loss guard, 374-383)', async () => {
     // Distinct branch from the move-old-path rm rejection above: here the
     // new-path WRITE itself fails, so `m` enters failedPageIds and the move
-    // loop short-circuits at line 376 BEFORE calling rm — emitting a
-    // console.warn and PRESERVING the old path (the only copy).
+    // loop short-circuits BEFORE calling rm — emitting a warning via the
+    // injected `log` and PRESERVING the old path (the only copy).
     const { client } = makeClient();
     const g = makeGit();
     const fs = makeFs({ failWriteFor: new Set(['/vault/New/M.md']) });
@@ -661,7 +668,7 @@ describe('applyPullActions — move old-path removal rejects vs move-write fails
     expect(fs.fs.rm).not.toHaveBeenCalledWith('/vault/Old/M.md');
     expect(fs.rms).toEqual([]);
     // The "keeping old path" warning fired exactly once for `m`.
-    const warnCalls = (console.warn as unknown as ReturnType<typeof vi.fn>).mock.calls
+    const warnCalls = lastLog.mock.calls
       .map((c: unknown[]) => String(c[0]))
       .filter((m: string) => m.includes('move write for m failed'));
     expect(warnCalls.length).toBe(1);

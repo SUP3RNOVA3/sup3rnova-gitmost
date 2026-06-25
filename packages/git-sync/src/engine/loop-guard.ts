@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 
 /**
- * Stable hash of a page's markdown BODY (SPEC §10 "хэш тела"). Deterministic:
+ * Stable hash of a page's markdown BODY (SPEC §10 "body hash"). Deterministic:
  * the same input string always yields the same digest, a different input a
  * different one. Used to recognize our own write later (loop suppression).
  *

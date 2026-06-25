@@ -38,6 +38,8 @@ function fakeChild() {
     end: jest.fn(),
     write: jest.fn(),
   });
+  // The watchdog kills the child on timeout; capture the signal.
+  child.kill = jest.fn();
   return child;
 }
 
@@ -80,8 +82,13 @@ const baseRequest: GitHttpBackendRequest = {
   remoteUser: 'alice@example.com',
 };
 
-function buildService() {
-  const env = { getGitSyncDataDir: jest.fn(() => '/vaults') };
+function buildService(backendTimeoutMs = 120000) {
+  const env = {
+    getGitSyncDataDir: jest.fn(() => '/vaults'),
+    // The watchdog timeout for the spawned git http-backend. Tests inject a tiny
+    // value (or use fake timers) to drive the timeout branch.
+    getGitSyncBackendTimeoutMs: jest.fn(() => backendTimeoutMs),
+  };
   return new GitHttpBackendService(env as any);
 }
 
@@ -180,6 +187,56 @@ describe('GitHttpBackendService.run', () => {
     // Let run() settle so the promise does not dangle.
     child.emit('close', 0);
     await p;
+  });
+
+  it('(d) timeout: a child that never closes is killed and a 500 is sent', async () => {
+    // The child never emits stdout/close (a stalled git-receive-pack). With a
+    // tiny injected watchdog timeout the run() promise must still resolve: the
+    // child is killed and a clean 500 is sent (no headers were sent yet).
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService(5); // 5ms watchdog
+    const res = fakeRes();
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn');
+
+    // run() resolves only via the watchdog firing (no close/error emitted).
+    await service.run(baseRequest, fakeReq(), res);
+
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(warnSpy).toHaveBeenCalled();
+    expect(res.statusCode).toBe(500);
+    expect(res.end).toHaveBeenCalledWith('Internal server error');
+  });
+
+  it('(d) timeout watchdog is cleared on a normal close (no kill, no 500)', async () => {
+    // A normal request that completes well within the watchdog window must NOT be
+    // killed and must NOT trip the timeout 500 — the timer is cleared on close.
+    jest.useFakeTimers();
+    try {
+      const child = fakeChild();
+      spawnMock.mockReturnValue(child);
+      const service = buildService(120000);
+      const res = fakeRes();
+
+      const p = service.run(baseRequest, fakeReq(), res);
+      // loadGitSync resolves on a real microtask; advance it under fake timers.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      child.stdout.emit(
+        'data',
+        Buffer.from('Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nOK', 'utf8'),
+      );
+      child.emit('close', 0);
+      await p;
+
+      // The watchdog never fired even if we advance past its window.
+      jest.advanceTimersByTime(200000);
+      expect(child.kill).not.toHaveBeenCalled();
+      expect(res.statusCode).toBe(200);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('spawn throwing synchronously -> 500 (spawn-failed)', async () => {

@@ -385,6 +385,21 @@ export class EnvironmentService {
   }
 
   /**
+   * Spawned `git http-backend` watchdog timeout in ms (default 120000). Bounds a
+   * single smart-HTTP request so a stalled `git-receive-pack` cannot hold the
+   * per-space lock forever (the child is killed and a 500 sent on expiry). A NaN /
+   * non-positive value falls back to the default so a bad override can never
+   * disable the watchdog.
+   */
+  getGitSyncBackendTimeoutMs(): number {
+    const v = parseInt(
+      this.configService.get<string>('GIT_SYNC_BACKEND_TIMEOUT_MS', '120000'),
+      10,
+    );
+    return Number.isFinite(v) && v > 0 ? v : 120000;
+  }
+
+  /**
    * Event debounce window in ms (default 2000). A NaN / non-positive value falls
    * back to the default so a bad override can never disable the debounce.
    */

@@ -103,8 +103,8 @@ function countUniqueLinks(doc: any): number {
 
 /**
  * Parse the ordered list of integers from `[N]` footnote markers found in the
- * BODY only (every top-level block before the first "Примечания..." notes
- * heading; if no such heading, the whole doc). Returned in reading order.
+ * BODY only (every top-level block before the first notes heading; if no such
+ * heading, the whole doc). Returned in reading order.
  */
 function footnoteMarkers(doc: any, notesHeading: string): number[] {
   const top: any[] = Array.isArray(doc?.content) ? doc.content : [];

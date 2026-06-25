@@ -47,6 +47,9 @@ function makeSettings(vaultPath: string): Settings {
 /** A recording client fake; createPage returns an assigned id + updatedAt. */
 function makeClientFake() {
   return {
+    // Empty live tree -> the create takes the normal createPage path (the
+    // retry-adopt lookup matches only on a live (parentPageId, title) node).
+    listSpaceTree: vi.fn(async () => ({ pages: [], complete: true })),
     importPageMarkdown: vi.fn(async () => ({
       data: { updatedAt: '2026-06-20T00:00:00.000Z' },
       success: true,

@@ -114,6 +114,9 @@ function makeGit(opts?: {
 /** A recording client fake; createPage returns a configurable assigned id. */
 function makeClientFake(opts?: { createId?: string }) {
   return {
+    // Empty live tree by default -> no retry-adopt match, so creates take the
+    // normal createPage path (the adopt lookup only fires on a (parent,title) hit).
+    listSpaceTree: vi.fn(async () => ({ pages: [], complete: true })),
     importPageMarkdown: vi.fn(async () => ({ success: true })),
     createPage: vi.fn(async (title: string) => ({
       data: { id: opts?.createId ?? 'assigned-id', title },

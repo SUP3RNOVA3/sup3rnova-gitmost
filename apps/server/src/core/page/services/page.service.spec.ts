@@ -713,5 +713,65 @@ describe('PageService', () => {
         expect(payload.lastUpdatedSource).toBeUndefined();
       });
     });
+
+    describe('removePage()', () => {
+      // removePage forwards a `source` 4th arg to pageRepo.removePage: 'git-sync'
+      // for a git-sync-driven soft-delete (so the change-listener loop-guard skips
+      // its own write), undefined otherwise.
+      const makeService = () => {
+        const pageRepo = {
+          removePage: jest.fn().mockResolvedValue(undefined),
+        };
+
+        const svc = new PageService(
+          pageRepo as any, // pageRepo
+          {} as any, // pagePermissionRepo
+          {} as any, // attachmentRepo
+          {} as any, // db
+          {} as any, // storageService
+          {} as any, // attachmentQueue
+          {} as any, // aiQueue
+          {} as any, // generalQueue
+          {} as any, // eventEmitter
+          {} as any, // collaborationGateway
+          {} as any, // watcherService
+          {} as any, // transclusionService
+        );
+
+        return { svc, pageRepo };
+      };
+
+      it("forwards 'git-sync' as the source for a git-sync soft-delete", async () => {
+        const { svc, pageRepo } = makeService();
+
+        await svc.removePage('page-1', 'user-1', 'ws-1', GIT_SYNC);
+
+        expect(pageRepo.removePage).toHaveBeenCalledTimes(1);
+        const [pageId, userId, workspaceId, source] =
+          pageRepo.removePage.mock.calls[0];
+        expect(pageId).toBe('page-1');
+        expect(userId).toBe('user-1');
+        expect(workspaceId).toBe('ws-1');
+        expect(source).toBe('git-sync');
+      });
+
+      it('forwards undefined as the source for a plain user delete', async () => {
+        const { svc, pageRepo } = makeService();
+
+        await svc.removePage('page-1', 'user-1', 'ws-1', USER_PROVENANCE);
+
+        const [, , , source] = pageRepo.removePage.mock.calls[0];
+        expect(source).toBeUndefined();
+      });
+
+      it('forwards undefined as the source when no provenance is given', async () => {
+        const { svc, pageRepo } = makeService();
+
+        await svc.removePage('page-1', 'user-1', 'ws-1');
+
+        const [, , , source] = pageRepo.removePage.mock.calls[0];
+        expect(source).toBeUndefined();
+      });
+    });
   });
 });
