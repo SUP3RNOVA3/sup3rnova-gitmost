@@ -4,7 +4,7 @@
  * Single source of truth so a typo like 'agnet' can't slip through as a bare
  * string (#143 review). Distinct from `ActorType` (auth principal kind).
  *
- * 'git-sync' marks writes made by the git-sync data plane (plan §8.1). It NEVER
+ * 'git-sync' marks writes made by the git-sync data plane (issue #194 §8.1). It NEVER
  * travels in a user-facing token; it is set in-process on the collab connection
  * context by the native datasource, so it cannot be spoofed from a request.
  */

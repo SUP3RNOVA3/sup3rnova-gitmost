@@ -39,9 +39,3 @@ export const GIT_SYNC_LOCK_PREFIX = 'git-sync:lock:';
  * and the Redis lock prevents two instances racing the same space.
  */
 export const GIT_SYNC_LOCK_TTL_MS = 5 * 60 * 1000;
-
-/** Default event-debounce window (ms), overridable via GIT_SYNC_DEBOUNCE_MS. */
-export const GIT_SYNC_DEBOUNCE_MS_DEFAULT = 2000;
-
-/** Default poll-safety interval (ms), overridable via GIT_SYNC_POLL_INTERVAL_MS. */
-export const GIT_SYNC_POLL_INTERVAL_MS_DEFAULT = 15000;

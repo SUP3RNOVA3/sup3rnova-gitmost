@@ -16,7 +16,7 @@
  * editor-ext ProseMirror documents must survive a full round trip through the
  * actual server write path without losing any node / mark / attribute.
  *
- * Pipeline per document (plan §13.1):
+ * Pipeline per document (issue #194 §13.1):
  *   1. md   = convertProseMirrorToMarkdown(content)          // git-sync export
  *   2. doc  = await markdownToProseMirror(md)                // git-sync import
  *   3. push `doc` through the REAL editor-ext Yjs write path the server uses:
@@ -26,12 +26,12 @@
  *      (apps/server/src/collaboration/extensions/persistence.extension.ts:96/115)
  *      with the same `tiptapExtensions` (collaboration.util.ts) and the same
  *      `@hocuspocus/transformer`, so the gate exercises the real schema
- *      validation that runs on a git-sync write (plan §3.3).
+ *      validation that runs on a git-sync write (issue #194 §3.3).
  *   4. assert docsCanonicallyEqual(canon(original), canon(normalized)) === true
  *
  * Any node / mark / attr that editor-ext drops (because the git-sync
  * docmost-schema named it differently, or declares a different default) makes
- * the gate FAIL for that document — exactly the schema-divergence plan §3.3 /
+ * the gate FAIL for that document — exactly the schema-divergence issue #194 §3.3 /
  * §13.1 warn about. Genuine, irreducible divergences are isolated into the
  * clearly-named `KNOWN DIVERGENCE` block at the bottom (never silently hidden).
  *

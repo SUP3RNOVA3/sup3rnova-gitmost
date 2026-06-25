@@ -171,7 +171,7 @@ export class EnvironmentVariables {
   )
   CLICKHOUSE_URL: string;
 
-  // --- git-sync (plan §7.2) — all OPTIONAL. The master switch defaults off; a
+  // --- git-sync (issue #194 §7.2) — all OPTIONAL. The master switch defaults off; a
   // required-if-enabled service user id is validated only when sync is on. ---
 
   @IsOptional()
@@ -202,6 +202,13 @@ export class EnvironmentVariables {
   @IsString()
   GIT_SYNC_DEBOUNCE_MS: string;
 
+  // Watchdog timeout (ms) for the spawned `git http-backend` process (default
+  // 120000): a stalled receive-pack is killed so it cannot hold the per-space
+  // lock forever. Optional int (validated as a string env).
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_BACKEND_TIMEOUT_MS: string;
+
   // Defense-in-depth absolute cap on soft-deletes per push cycle (default 5): a
   // non-convergent / phantom-absence cycle can never trash more than this many
   // pages without an explicit override. Optional int (validated as a string env).
@@ -210,7 +217,7 @@ export class EnvironmentVariables {
   GIT_SYNC_MAX_DELETES_PER_CYCLE: string;
 
   // Required when git-sync is enabled: the service user create/move/rename/delete
-  // are attributed to (plan §7.2). Optional otherwise.
+  // are attributed to (issue #194 §7.2). Optional otherwise.
   @ValidateIf((obj) => obj.GIT_SYNC_ENABLED === 'true')
   @IsNotEmpty()
   @IsString()

@@ -10,7 +10,7 @@ import { ProvenanceSource } from '../../core/auth/dto/jwt-payload';
  */
 export interface AuthProvenanceData {
   // ProvenanceSource includes 'git-sync' — set by the in-process git-sync data
-  // plane (plan §8.1) when it drives PageService writes; never from a request token.
+  // plane (issue #194 §8.1) when it drives PageService writes; never from a request token.
   actor: ProvenanceSource;
   aiChatId: string | null;
 }
@@ -62,7 +62,7 @@ export function agentSourceFields<S extends string, C extends string>(
   sourceKey: S,
   chatKey: C,
 ): Partial<Record<S, ProvenanceSource> & Record<C, string | null>> {
-  // git-sync data-plane write (plan §8.1): stamp the source 'git-sync' with NO
+  // git-sync data-plane write (issue #194 §8.1): stamp the source 'git-sync' with NO
   // aiChatId (it has no internal ai_chats row). Mirrors the agent branch; each
   // write has a single actor, so precedence is irrelevant here.
   if (provenance?.actor === 'git-sync') {

@@ -423,7 +423,7 @@ export class GitmostDataSourceService {
       actor: 'git-sync',
       // PersistenceExtension reads `context.user.id` for lastUpdatedById, so the
       // service user is required on the context (unlike the bare `{ actor }`
-      // sketch in the plan).
+      // sketch in issue #194).
       user: { id: userId },
     });
     try {

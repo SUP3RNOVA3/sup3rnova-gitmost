@@ -333,7 +333,7 @@ export class EnvironmentService {
       .filter(Boolean);
   }
 
-  // --- git-sync (plan §7.2) -------------------------------------------------
+  // --- git-sync (issue #194 §7.2) -------------------------------------------------
 
   /** Global master switch for the git-sync control plane (default false). */
   isGitSyncEnabled(): boolean {
