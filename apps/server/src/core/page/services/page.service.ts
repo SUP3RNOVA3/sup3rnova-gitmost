@@ -15,13 +15,13 @@ import {
   executeWithCursorPagination,
 } from '@docmost/db/pagination/cursor-pagination';
 import { InjectKysely } from 'nestjs-kysely';
-import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { MovePageDto } from '../dto/move-page.dto';
 import { shapeSidebarPagesTree } from './sidebar-pages-tree.util';
 import { generateSlugId } from '../../../common/helpers';
 import { getPageTitle } from '../../../common/helpers';
-import { executeTx } from '@docmost/db/utils';
+import { executeTx, dbOrTx } from '@docmost/db/utils';
 import { AttachmentRepo } from '@docmost/db/repos/attachment/attachment.repo';
 import { v7 as uuid7 } from 'uuid';
 import {
@@ -915,34 +915,49 @@ export class PageService {
       }
     }
 
-    // Server-side cycle guard: a page may not be moved into itself or into any
-    // page within its own subtree. Without this, an MCP/REST/agent caller (or a
-    // fast drag racing the client check) could persist a cycle and broadcast it.
-    // Only relevant when re-parenting under a concrete parent; moving to root
-    // (parentPageId null/undefined) can never create a cycle.
-    if (dto.parentPageId) {
-      if (dto.parentPageId === dto.pageId) {
-        throw new BadRequestException('Cannot move a page into its own subtree');
-      }
-      // Walk the destination parent's ancestor chain (reusing the breadcrumb
-      // ancestor CTE). If the page being moved appears among those ancestors,
-      // the destination lives inside the moved page's subtree -> cycle.
-      const destAncestors = await this.getPageBreadCrumbs(dto.parentPageId);
-      if (destAncestors.some((ancestor) => ancestor.id === dto.pageId)) {
-        throw new BadRequestException('Cannot move a page into its own subtree');
-      }
+    // Cheap self-move guard (no DB) — keep before the transaction.
+    if (dto.parentPageId && dto.parentPageId === dto.pageId) {
+      throw new BadRequestException('Cannot move a page into its own subtree');
     }
 
-    const updateResult = await this.pageRepo.updatePage(
-      {
-        position: dto.position,
-        parentPageId: parentPageId,
-        // Agent-edit provenance: annotate the source on an agent move. A normal
-        // user request leaves the existing source value unchanged.
-        ...agentSourceFields(provenance, 'lastUpdatedSource', 'lastUpdatedAiChatId'),
-      },
-      dto.pageId,
-    );
+    const updateValues = {
+      position: dto.position,
+      parentPageId: parentPageId,
+      // Agent-edit provenance: annotate the source on an agent move. A normal
+      // user request leaves the existing source value unchanged.
+      ...agentSourceFields(provenance, 'lastUpdatedSource', 'lastUpdatedAiChatId'),
+    };
+
+    let updateResult;
+    if (typeof parentPageId === 'string') {
+      // Genuine re-parent under a concrete parent: the ONLY path that can create
+      // a cycle. Two opposing moves (A: X under Y, B: Y under X) racing each
+      // other could each pass a cycle check built from a stale snapshot and
+      // persist a cycle (#159 finding #9). Serialize them: lock the moved page
+      // and the destination parent FOR UPDATE in a canonical (id-sorted) order
+      // so they cannot deadlock, then run the cycle check INSIDE the transaction
+      // against the now-committed state.
+      updateResult = await executeTx(this.db, async (trx) => {
+        // Both opposing moves touch the same two rows {pageId, parentPageId};
+        // a fixed lock order forces one to wait for the other to commit.
+        const lockIds = [dto.pageId, parentPageId].sort();
+        for (const id of lockIds) {
+          await this.pageRepo.findById(id, { withLock: true, trx });
+        }
+        // Re-read the destination's ancestor chain within the locked tx: it now
+        // reflects any concurrent re-parent that committed before we got the lock.
+        const destAncestors = await this.getPageBreadCrumbs(parentPageId, trx);
+        if (destAncestors.some((ancestor) => ancestor.id === dto.pageId)) {
+          throw new BadRequestException(
+            'Cannot move a page into its own subtree',
+          );
+        }
+        return this.pageRepo.updatePage(updateValues, dto.pageId, trx);
+      });
+    } else {
+      // Same-parent reorder or move-to-root: no cycle possible, no lock needed.
+      updateResult = await this.pageRepo.updatePage(updateValues, dto.pageId);
+    }
 
     // Guard against a phantom broadcast: if the row was concurrently deleted or
     // otherwise not updated, skip the PAGE_MOVED event so we don't replay a move
@@ -981,8 +996,8 @@ export class PageService {
     });
   }
 
-  async getPageBreadCrumbs(childPageId: string) {
-    const ancestors = await this.db
+  async getPageBreadCrumbs(childPageId: string, trx?: KyselyTransaction) {
+    const ancestors = await dbOrTx(this.db, trx)
       .withRecursive('page_ancestors', (db) =>
         db
           .selectFrom('pages')

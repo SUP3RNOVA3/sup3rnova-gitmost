@@ -40,11 +40,27 @@ describe('PageService', () => {
     // getPageBreadCrumbs are mockable, while every other collaborator stays a
     // bare stub. We only need to drive the three cycle-guard branches, so we
     // mock minimally rather than standing up the whole DI graph.
+    // A permissive chainable Proxy stands in for the Kysely trx so the
+    // FOR-UPDATE lock query chain inside the transaction resolves. Mirrors the
+    // pattern used by the movePageToSpace() spec below.
+    const makeChain = () => {
+      const c: any = new Proxy(function () {}, {
+        get: (_t, p) =>
+          p === 'then'
+            ? undefined
+            : p === 'execute' || p === 'executeTakeFirst'
+              ? () => Promise.resolve([])
+              : () => c,
+      });
+      return c;
+    };
+
     const makeService = (overrides?: {
       breadcrumbs?: Array<{ id: string }>;
     }) => {
       const pageRepo = {
-        // Destination parent lookup: a valid, non-deleted, same-space page.
+        // Destination parent lookup: a valid, non-deleted, same-space page. Also
+        // serves the FOR-UPDATE lock reads inside the transaction.
         findById: jest.fn().mockResolvedValue({
           id: 'dest-parent',
           deletedAt: null,
@@ -57,11 +73,19 @@ describe('PageService', () => {
 
       const eventEmitter = { emit: jest.fn() };
 
+      // Re-parenting under a concrete parent now runs through
+      // executeTx(this.db, ...), which calls db.transaction().execute(fn). The
+      // trxStub is the value handed to the callback (the locked transaction).
+      const trxStub = makeChain();
+      const db = {
+        transaction: () => ({ execute: (fn: any) => fn(trxStub) }),
+      };
+
       const svc = new PageService(
         pageRepo as any, // pageRepo
         {} as any, // pagePermissionRepo
         {} as any, // attachmentRepo
-        {} as any, // db
+        db as any, // db
         {} as any, // storageService
         {} as any, // attachmentQueue
         {} as any, // aiQueue
@@ -79,7 +103,7 @@ describe('PageService', () => {
         .spyOn(svc, 'getPageBreadCrumbs')
         .mockResolvedValue((overrides?.breadcrumbs ?? []) as any);
 
-      return { svc, pageRepo, eventEmitter };
+      return { svc, pageRepo, eventEmitter, trxStub };
     };
 
     // movePage takes `movedPage` as a param. Keep its parentPageId distinct from
@@ -145,6 +169,45 @@ describe('PageService', () => {
 
       await expect(svc.movePage(dto, makeMovedPage())).resolves.not.toThrow();
       expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+    });
+
+    it('serializes a legitimate re-parent under FOR UPDATE in canonical lock order (#159 #9)', async () => {
+      // Destination's ancestor chain does NOT contain the moved page -> no cycle.
+      const { svc, pageRepo, trxStub } = makeService({
+        breadcrumbs: [{ id: 'dest-parent' }, { id: 'root' }],
+      });
+      const getBreadcrumbsSpy = jest.spyOn(svc, 'getPageBreadCrumbs');
+      const dto: MovePageDto = {
+        pageId: 'page-1',
+        position: VALID_POSITION,
+        parentPageId: 'dest-parent',
+      };
+
+      await expect(svc.movePage(dto, makeMovedPage())).resolves.not.toThrow();
+
+      // Both rows are locked FOR UPDATE inside the transaction: findById is
+      // called with { withLock: true, trx: <the locked tx> } for the moved page
+      // and the destination parent.
+      const lockCalls = pageRepo.findById.mock.calls.filter(
+        (c: any[]) => c[1]?.withLock === true,
+      );
+      expect(lockCalls).toHaveLength(2);
+      for (const call of lockCalls) {
+        expect(call[1].withLock).toBe(true);
+        expect(call[1].trx).toBe(trxStub);
+      }
+
+      // Locks are acquired in a canonical (id-sorted) order so the two opposing
+      // moves serialize without deadlocking.
+      const lockedIds = lockCalls.map((c: any[]) => c[0]);
+      expect(lockedIds).toEqual(['page-1', 'dest-parent'].sort());
+
+      // The cycle re-check runs inside the locked transaction (trx passed).
+      expect(getBreadcrumbsSpy).toHaveBeenCalledWith('dest-parent', trxStub);
+
+      // The update is written inside the same transaction (trx is the 3rd arg).
+      expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+      expect(pageRepo.updatePage.mock.calls[0][2]).toBe(trxStub);
     });
   });
 
@@ -259,6 +322,19 @@ describe('PageService', () => {
 
     describe('movePage() → updatePage', () => {
       const VALID_POSITION = 'a0';
+      // Re-parenting under a concrete parent runs through executeTx(this.db, ...);
+      // a permissive chainable Proxy stands in for the locked Kysely trx.
+      const makeChain = () => {
+        const c: any = new Proxy(function () {}, {
+          get: (_t, p) =>
+            p === 'then'
+              ? undefined
+              : p === 'execute' || p === 'executeTakeFirst'
+                ? () => Promise.resolve([])
+                : () => c,
+        });
+        return c;
+      };
       const run = async (provenance: any) => {
         const pageRepo = {
           findById: jest.fn().mockResolvedValue({
@@ -268,9 +344,12 @@ describe('PageService', () => {
           }),
           updatePage: jest.fn().mockResolvedValue({ numUpdatedRows: 1n }),
         };
+        const trxStub = makeChain();
         const svc = makeSvc({
           pageRepo,
-          db: {} as any,
+          db: {
+            transaction: () => ({ execute: (fn: any) => fn(trxStub) }),
+          } as any,
         });
         // Legitimate move: destination ancestors do NOT include the moved page.
         jest
