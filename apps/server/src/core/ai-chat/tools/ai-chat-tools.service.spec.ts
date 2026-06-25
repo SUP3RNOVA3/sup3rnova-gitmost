@@ -120,21 +120,26 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
     const tools = await buildTools();
     const deletePage = tools.deletePage;
 
-    // The Zod input schema only allows `pageId`; parsing strips/ignores extra
-    // keys, so a permanent/force flag is never part of the validated input.
+    // inputSchema is now an AI SDK `Schema` (not a raw zod object). Its
+    // `validate` runs the same zod safeParse and forwards the STRIPPED data, so
+    // a permanent/force flag is never part of the validated input the SDK then
+    // hands to execute.
     const schema = (deletePage as unknown as { inputSchema: unknown })
       .inputSchema as {
-      parse: (v: unknown) => Record<string, unknown>;
+      validate: (
+        v: unknown,
+      ) => Promise<{ success: boolean; value?: Record<string, unknown> }>;
     };
-    const parsed = schema.parse({
+    const result = await schema.validate({
       pageId: 'page-789',
       permanentlyDelete: true,
       forceDelete: true,
     });
 
-    expect(parsed).toHaveProperty('pageId', 'page-789');
-    expect(parsed).not.toHaveProperty('permanentlyDelete');
-    expect(parsed).not.toHaveProperty('forceDelete');
+    expect(result.success).toBe(true);
+    expect(result.value).toHaveProperty('pageId', 'page-789');
+    expect(result.value).not.toHaveProperty('permanentlyDelete');
+    expect(result.value).not.toHaveProperty('forceDelete');
   });
 });
 
@@ -207,21 +212,25 @@ describe('AiChatToolsService expanded toolset guardrails', () => {
     const tools = await buildTools();
     const transformPage = tools.transformPage;
 
-    // The Zod input schema only allows pageId/transformJs/dryRun; parsing
-    // strips unknown keys, so deleteComments can never reach the client.
+    // inputSchema is now an AI SDK `Schema`; its `validate` runs the same zod
+    // safeParse, which only allows pageId/transformJs/dryRun and strips unknown
+    // keys — so deleteComments can never reach the client.
     const schema = (transformPage as unknown as { inputSchema: unknown })
       .inputSchema as {
-      parse: (v: unknown) => Record<string, unknown>;
+      validate: (
+        v: unknown,
+      ) => Promise<{ success: boolean; value?: Record<string, unknown> }>;
     };
-    const parsed = schema.parse({
+    const result = await schema.validate({
       pageId: 'p',
       transformJs: '(d)=>d',
       dryRun: true,
       deleteComments: true,
     });
 
-    expect(parsed).toHaveProperty('pageId', 'p');
-    expect(parsed).not.toHaveProperty('deleteComments');
+    expect(result.success).toBe(true);
+    expect(result.value).toHaveProperty('pageId', 'p');
+    expect(result.value).not.toHaveProperty('deleteComments');
   });
 });
 
