@@ -42,6 +42,10 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
     space?.settings?.gitSync?.enabled ?? false,
   );
 
+  const [autoMergeConflicts, setAutoMergeConflicts] = useState<boolean>(
+    space?.settings?.gitSync?.autoMergeConflicts ?? false,
+  );
+
   const handleGitSyncToggle = async (value: boolean) => {
     const previous = gitSyncEnabled;
     setGitSyncEnabled(value); // optimistic update
@@ -55,6 +59,20 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
       // The mutation surfaces a toast via onError; still log the raw error so it
       // is not silently swallowed (AGENTS.md).
       console.error("Failed to toggle git-sync for space", err);
+    }
+  };
+
+  const handleAutoMergeConflictsToggle = async (value: boolean) => {
+    const previous = autoMergeConflicts;
+    setAutoMergeConflicts(value); // optimistic update
+    try {
+      await updateSpaceMutation.mutateAsync({
+        spaceId: space.id,
+        autoMergeConflicts: value,
+      });
+    } catch (err) {
+      setAutoMergeConflicts(previous); // revert on failure
+      console.error("Failed to toggle git-sync auto-merge-conflicts", err);
     }
   };
 
@@ -143,6 +161,19 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
           disabled={readOnly || updateSpaceMutation.isPending}
           onChange={(event) =>
             handleGitSyncToggle(event.currentTarget.checked)
+          }
+        />
+
+        <Switch
+          mt="md"
+          label={t("Auto-merge conflicts on push")}
+          description={t(
+            "When off (recommended), a page whose content still has unresolved Git conflict markers is skipped on push until you resolve the conflict in Git. When on, the markers are stripped and both sides' content is pushed.",
+          )}
+          checked={autoMergeConflicts}
+          disabled={readOnly || updateSpaceMutation.isPending}
+          onChange={(event) =>
+            handleAutoMergeConflictsToggle(event.currentTarget.checked)
           }
         />
       </Box>

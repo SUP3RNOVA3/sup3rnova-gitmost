@@ -488,7 +488,26 @@ export interface ApplyPushDeps {
    * folder's `.md` at `refs/docmost/last-pushed`, SPEC §5 path-as-truth).
    */
   git: Pick<VaultGit, "updateRef" | "fastForwardBranch" | "showFileAtRef">;
+  /**
+   * Per-space PUSH policy for a page body that still carries unresolved git
+   * conflict markers (SPEC §9). When TRUE, the marker lines are stripped and both
+   * sides' content is pushed (the legacy `stripConflictMarkers` behavior). When
+   * FALSE/undefined (the SAFE DEFAULT), the conflicted page is NOT pushed: it is
+   * recorded as a per-page FAILURE (so the refs are not advanced and the page is
+   * retried) and the user resolves the git conflict first.
+   */
+  autoMergeConflicts?: boolean;
 }
+
+/**
+ * Reason recorded on a per-page push FAILURE when a page is skipped because its
+ * body still carries unresolved git conflict markers and `autoMergeConflicts` is
+ * off (the SAFE default). Recorded as a failure (not a soft skip) on purpose: it
+ * HOLDS the refs so the conflict commit is never marked as pushed and the page is
+ * retried until the human resolves the conflict in git (SPEC §9).
+ */
+export const CONFLICT_MARKERS_FAILURE_REASON =
+  "unresolved conflict markers — resolve in git first";
 
 /** A file whose meta was rewritten with a freshly-assigned pageId (post-create). */
 export interface WrittenBackPage {
@@ -665,11 +684,22 @@ export async function applyPushActions(
       // Push the CLEAN body only (no `gitmost_id` frontmatter): the frontmatter
       // is engine metadata, never page content. The server converts the markdown
       // it receives verbatim, so stripping here keeps the id out of Docmost.
-      // Also strip any git conflict markers — they must NEVER reach Docmost
-      // (SPEC §9, red-team #13); content on both sides is preserved.
-      const body = stripConflictMarkers(
-        parsePageFile(await deps.readFile(u.path)).body,
-      );
+      const rawBody = parsePageFile(await deps.readFile(u.path)).body;
+      // Git conflict markers must NEVER reach Docmost (SPEC §9, red-team #13).
+      // Per-space policy (`autoMergeConflicts`): when OFF (the SAFE default), a
+      // still-conflicted body is NOT pushed — record a failure so the refs are
+      // held and the page is retried once the human resolves the conflict in git.
+      // When ON, strip the marker lines and push both sides' content.
+      if (!deps.autoMergeConflicts && hasConflictMarkers(rawBody)) {
+        failures.push({
+          kind: "update",
+          pageId: u.pageId,
+          path: u.path,
+          error: CONFLICT_MARKERS_FAILURE_REASON,
+        });
+        continue;
+      }
+      const body = stripConflictMarkers(rawBody);
       // The last-synced version of this file (pre-image) is the common ancestor
       // for a 3-way merge against the live page, so concurrent human edits are
       // not clobbered (review #5). Null when the file is new at last-pushed. Its
@@ -744,9 +774,21 @@ export async function applyPushActions(
   for (const c of orderedCreates) {
     try {
       const text = await deps.readFile(c.path);
-      // Conflict markers must never reach Docmost (SPEC §9, red-team #13); strip
-      // them from the create body too, preserving both sides' content.
-      const body = stripConflictMarkers(parsePageFile(text).body);
+      const rawBody = parsePageFile(text).body;
+      // Conflict markers must never reach Docmost (SPEC §9, red-team #13). Honor
+      // the per-space `autoMergeConflicts` policy on the create path too: OFF (the
+      // SAFE default) records a failure (refs held, retried) rather than creating
+      // a page from conflicted content; ON strips the markers and pushes both
+      // sides' content.
+      if (!deps.autoMergeConflicts && hasConflictMarkers(rawBody)) {
+        failures.push({
+          kind: "create",
+          path: c.path,
+          error: CONFLICT_MARKERS_FAILURE_REASON,
+        });
+        continue;
+      }
+      const body = stripConflictMarkers(rawBody);
       // Derive create args from the PATH (native-Obsidian, SPEC §5): title from
       // the filename, parent from the enclosing folder's folder-note, space from
       // the run (the vault's space). `parentPageId: null` -> created at ROOT.
@@ -1475,6 +1517,9 @@ export async function runPush(
       readFile: deps.readFile,
       writeFile: deps.writeFile,
       spaceId: settings.docmostSpaceId,
+      // Per-space PUSH policy for still-conflicted bodies (SPEC §9). Default OFF:
+      // a conflicted page is skipped (recorded as a failure) instead of pushed.
+      autoMergeConflicts: settings.autoMergeConflicts ?? false,
     },
     actions,
     pushedCommit,

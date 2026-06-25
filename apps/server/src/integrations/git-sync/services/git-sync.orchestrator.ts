@@ -107,11 +107,24 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
    * datasource writes in-process — so they are placeholders; only `vaultPath`,
    * `gitRemote`, and the tunables are load-bearing.
    */
-  private buildSettings(spaceId: string): Settings {
+  private async buildSettings(spaceId: string): Promise<Settings> {
     const remoteTemplate = this.environmentService.getGitSyncRemoteTemplate();
     const gitRemote = remoteTemplate
       ? remoteTemplate.replace(/\{spaceId\}/g, spaceId)
       : undefined;
+    // Per-space PUSH policy for still-conflicted page bodies (SPEC §9): read the
+    // `gitSync.autoMergeConflicts` flag from the space's jsonb settings. STRICT
+    // opt-in like `enabled` — anything other than the literal 'true' (absent, null,
+    // 'false') resolves to the SAFE default (skip a conflicted page, do not push).
+    const row = await this.db
+      .selectFrom('spaces')
+      .select(
+        sql<boolean>`settings->'gitSync'->>'autoMergeConflicts' = 'true'`.as(
+          'autoMergeConflicts',
+        ),
+      )
+      .where('id', '=', spaceId)
+      .executeTakeFirst();
     return {
       docmostApiUrl: 'http://native.local',
       docmostEmail: 'native@local',
@@ -122,6 +135,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       pollIntervalMs: this.environmentService.getGitSyncPollIntervalMs(),
       debounceMs: this.environmentService.getGitSyncDebounceMs(),
       logLevel: 'info',
+      autoMergeConflicts: row?.autoMergeConflicts ?? false,
     };
   }
 
@@ -249,7 +263,7 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     signal?: AbortSignal,
   ): Promise<GitSyncRunStatus> {
     const { runCycle } = await loadGitSync();
-    const settings = this.buildSettings(spaceId);
+    const settings = await this.buildSettings(spaceId);
     const vault = await this.vaultRegistry.getVault(spaceId);
     const client = this.dataSource.bind({ workspaceId, userId: serviceUserId });
     const maxDeletes = this.environmentService.getGitSyncMaxDeletesPerCycle();

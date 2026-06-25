@@ -24,9 +24,11 @@ function makeSettings(): Settings {
 // ---------------------------------------------------------------------------
 // #13 — conflict markers must never reach Docmost (SPEC §9), even when there is
 // NO in-progress merge (markers committed on `main` by some other path). The
-// push apply reads the body and hands it to importPageMarkdown verbatim; the
-// DESIRED behavior is a content scan that prevents a `<<<<<<<` body from being
-// pushed. Assert the pushed body does NOT contain a conflict marker.
+// behavior is now gated by the per-space `autoMergeConflicts` setting:
+//   - DEFAULT (off): a still-conflicted page is NOT pushed — it is recorded as a
+//     per-page FAILURE and the refs are NOT advanced, so the user resolves the
+//     git conflict first.
+//   - ON: the marker lines are stripped and both sides' content is pushed.
 // ---------------------------------------------------------------------------
 function makePushGit(opts: {
   changes: { status: 'A' | 'M' | 'D' | 'R' | 'C'; path: string; oldPath?: string }[];
@@ -60,11 +62,14 @@ function makePushGit(opts: {
 }
 
 describe('#13 conflict markers reach Docmost', () => {
-  it('does NOT push a body containing a `<<<<<<< HEAD` conflict marker', async () => {
-    const conflictBody =
-      '<<<<<<< HEAD\nmy line\n=======\ntheir line\n>>>>>>> feature\n';
+  const conflictBody =
+    '<<<<<<< HEAD\nmy line\n=======\ntheir line\n>>>>>>> feature\n';
+
+  function makeConflictDeps(settings: Settings) {
     const file = serializePageFile('p-1', conflictBody);
-    const { git } = makePushGit({ changes: [{ status: 'M', path: 'Doc.md' }] });
+    const { git, calls } = makePushGit({
+      changes: [{ status: 'M', path: 'Doc.md' }],
+    });
 
     const importPageMarkdown = vi.fn(async () => ({ success: true }));
     const client = {
@@ -77,7 +82,7 @@ describe('#13 conflict markers reach Docmost', () => {
     };
 
     const deps: PushDeps = {
-      settings: makeSettings(),
+      settings,
       git,
       makeClient: () => client as any,
       readFile: vi.fn(async (path: string) => {
@@ -87,6 +92,38 @@ describe('#13 conflict markers reach Docmost', () => {
       writeFile: vi.fn(async () => {}),
       log: () => {},
     };
+    return { deps, importPageMarkdown, calls };
+  }
+
+  it('DEFAULT (autoMergeConflicts off): does NOT push a conflicted page; records a failure and holds the refs', async () => {
+    // makeSettings() leaves autoMergeConflicts undefined -> the SAFE default.
+    const { deps, importPageMarkdown, calls } = makeConflictDeps(makeSettings());
+
+    const res = await runPush(deps, { dryRun: false });
+    expect(res.mode).toBe('apply');
+
+    // The conflicted page is NOT pushed to Docmost at all.
+    expect(importPageMarkdown).not.toHaveBeenCalled();
+
+    // It is recorded as a per-page failure (so the user resolves the git conflict
+    // first), and because there is a failure the last-pushed ref is NOT advanced.
+    expect(res.applied?.failures).toEqual([
+      expect.objectContaining({
+        kind: 'update',
+        pageId: 'p-1',
+        path: 'Doc.md',
+      }),
+    ]);
+    expect(res.applied?.failures[0].error).toMatch(/conflict markers/i);
+    expect(res.applied?.lastPushedAdvanced).toBe(false);
+    expect(calls.updateRef).toHaveLength(0);
+  });
+
+  it('autoMergeConflicts on: strips the markers and pushes a clean body', async () => {
+    const { deps, importPageMarkdown } = makeConflictDeps({
+      ...makeSettings(),
+      autoMergeConflicts: true,
+    });
 
     const res = await runPush(deps, { dryRun: false });
     expect(res.mode).toBe('apply');
@@ -95,10 +132,12 @@ describe('#13 conflict markers reach Docmost', () => {
     expect(importPageMarkdown).toHaveBeenCalledTimes(1);
     const pushedBody: string = importPageMarkdown.mock.calls[0][1] as any;
 
-    // DESIRED: a content scan gates conflict markers; the body must be clean.
+    // The marker SYNTAX is stripped; both sides' content survives.
     expect(pushedBody).not.toContain('<<<<<<<');
     expect(pushedBody).not.toContain('=======');
     expect(pushedBody).not.toContain('>>>>>>>');
+    expect(pushedBody).toContain('my line');
+    expect(pushedBody).toContain('their line');
   });
 });
 

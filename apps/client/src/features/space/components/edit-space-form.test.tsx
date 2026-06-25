@@ -80,13 +80,19 @@ function renderForm(props: { space: ISpace; readOnly?: boolean }) {
   );
 }
 
-// The git-sync toggle is the only switch on the form. Mantine renders it as an
-// <input type="checkbox" role="switch">; its label text lives in a sibling
-// wrapper, so query by role and assert the visible label is present alongside.
+// The form now renders TWO switches (git-sync enable + auto-merge-conflicts) in
+// that DOM order. Mantine renders each as an <input type="checkbox"
+// role="switch"> but does NOT expose its label as the accessible name, so we
+// disambiguate by DOM order (index 0 = enable, 1 = auto-merge) and assert the
+// human-readable label text is present alongside.
 function getToggle(): HTMLInputElement {
-  // Sanity: the human-readable label is rendered.
   screen.getByText("Enable Git sync");
-  return screen.getByRole("switch") as HTMLInputElement;
+  return screen.getAllByRole("switch")[0] as HTMLInputElement;
+}
+
+function getAutoMergeToggle(): HTMLInputElement {
+  screen.getByText("Auto-merge conflicts on push");
+  return screen.getAllByRole("switch")[1] as HTMLInputElement;
 }
 
 afterEach(() => {
@@ -167,5 +173,68 @@ describe("EditSpaceForm git-sync toggle", () => {
     isPending = true;
     renderForm({ space: makeSpace() });
     expect(getToggle().disabled).toBe(true);
+  });
+});
+
+describe("EditSpaceForm auto-merge-conflicts toggle", () => {
+  it("derives initial checked state from space.settings.gitSync.autoMergeConflicts (true -> checked)", () => {
+    renderForm({
+      space: makeSpace({
+        settings: { gitSync: { autoMergeConflicts: true } },
+      }),
+    });
+    expect(getAutoMergeToggle().checked).toBe(true);
+  });
+
+  it("defaults to unchecked when autoMergeConflicts is missing (SAFE default)", () => {
+    renderForm({ space: makeSpace() });
+    expect(getAutoMergeToggle().checked).toBe(false);
+  });
+
+  it("fires the mutation with { spaceId, autoMergeConflicts } and optimistically flips on", async () => {
+    mutateAsync.mockResolvedValue(undefined);
+    renderForm({ space: makeSpace() });
+
+    const toggle = getAutoMergeToggle();
+    expect(toggle.checked).toBe(false);
+
+    fireEvent.click(toggle);
+
+    // Optimistic update.
+    expect(toggle.checked).toBe(true);
+    expect(mutateAsync).toHaveBeenCalledTimes(1);
+    expect(mutateAsync).toHaveBeenCalledWith({
+      spaceId: "space-1",
+      autoMergeConflicts: true,
+    });
+
+    await waitFor(() => expect(toggle.checked).toBe(true));
+  });
+
+  it("rolls back to its prior state when the mutation rejects", async () => {
+    mutateAsync.mockRejectedValue(new Error("network"));
+    renderForm({
+      space: makeSpace({
+        settings: { gitSync: { autoMergeConflicts: false } },
+      }),
+    });
+
+    const toggle = getAutoMergeToggle();
+    expect(toggle.checked).toBe(false);
+
+    fireEvent.click(toggle);
+
+    expect(toggle.checked).toBe(true);
+    expect(mutateAsync).toHaveBeenCalledWith({
+      spaceId: "space-1",
+      autoMergeConflicts: true,
+    });
+
+    await waitFor(() => expect(toggle.checked).toBe(false));
+  });
+
+  it("disables the toggle when readOnly", () => {
+    renderForm({ space: makeSpace(), readOnly: true });
+    expect(getAutoMergeToggle().disabled).toBe(true);
   });
 });

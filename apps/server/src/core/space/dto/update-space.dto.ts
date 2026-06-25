@@ -19,4 +19,8 @@ export class UpdateSpaceDto extends PartialType(CreateSpaceDto) {
   @IsOptional()
   @IsBoolean()
   gitSyncEnabled?: boolean;
+
+  @IsOptional()
+  @IsBoolean()
+  autoMergeConflicts?: boolean;
 }

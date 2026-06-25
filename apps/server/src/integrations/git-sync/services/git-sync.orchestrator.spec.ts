@@ -122,7 +122,19 @@ function build(opts: BuildOptions = {}): Built {
   };
   const redisService = { getOrThrow: jest.fn(() => redis) };
 
-  const db = {};
+  // Chainable Kysely stub. `buildSettings` reads the space's
+  // `gitSync.autoMergeConflicts` flag via
+  // `selectFrom('spaces').select(...).where('id','=',id).executeTakeFirst()`;
+  // default it to the SAFE off value. `enabledSpaces` uses `.execute()`.
+  const db = (() => {
+    const builder: any = {
+      select: () => builder,
+      where: () => builder,
+      executeTakeFirst: async () => ({ autoMergeConflicts: false }),
+      execute: async () => [],
+    };
+    return { selectFrom: () => builder };
+  })();
 
   // The REAL SpaceLockService, constructed against the mock redis above, so all
   // existing lock assertions (lock-held, in-progress, leader lock, release CAS,
