@@ -49,6 +49,12 @@ type XmlNode = Y.XmlElement | Y.XmlText | Y.XmlHook;
  * stable Yjs block (and any in-flight human edit on it) stays put. This mirrors
  * `canonicalize.ts`, which already strips the regenerated block `id` from the
  * round-trip idempotency comparison for exactly the same reason.
+ *
+ * Known limitation (accepted trade-off of content-based matching): two GENUINELY
+ * DISTINCT blocks whose content is byte-identical now collapse to the same content
+ * key, so when git deletes one of the duplicates the LCS may drop the OTHER live
+ * instance instead. The visible result is identical (one copy removed, one kept),
+ * but a concurrent in-flight human edit on the dropped instance could be lost.
  */
 const VOLATILE_KEY_ATTRS = new Set(['id']);
 
