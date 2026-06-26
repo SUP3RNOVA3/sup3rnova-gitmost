@@ -363,14 +363,14 @@ describe('convertProseMirrorToMarkdown', () => {
           content: [para(text('beware'))],
         }),
       );
-      expect(out).toBe(':::warning\nbeware\n:::');
+      expect(out).toBe('> [!warning]\n> beware');
     });
 
     it('callout defaults to info', () => {
       const out = convertProseMirrorToMarkdown(
         doc({ type: 'callout', content: [para(text('hi'))] }),
       );
-      expect(out).toBe(':::info\nhi\n:::');
+      expect(out).toBe('> [!info]\n> hi');
     });
 
     it('details emits summary + content wrapped in <details>', () => {
@@ -585,20 +585,16 @@ describe('convertProseMirrorToMarkdown', () => {
         }),
       );
       // NOTE(review): the spec predicted ':::warning\nline1\n\nline2\n:::' (a
-      // blank line between paragraphs, attributed to "marked's paragraph
-      // blank-line"). The real converter does NOT route callout bodies through
-      // marked — the callout case (src 374-376) joins its rendered children
-      // with a single '\n' (calloutContent = nodeContent.map(processNode)
-      // .join('\n')), and each paragraph renders to just its text. So the ACTUAL
-      // (and correct-per-source) body is 'line1\nline2' with ONE newline. We
-      // still pin the two behaviors the spec cares about: the .toLowerCase()
+      // The converter joins the callout's rendered children with a single '\n'
+      // and emits an Obsidian-native callout: a `> [!type]` opener plus one
+      // `>`-prefixed body line per content line. We pin the lowercasing
       // (WARNING -> warning) and the multi-child join.
-      expect(out).toBe(':::warning\nline1\nline2\n:::');
-      // The fence type is lowercased (regression to ':::WARNING' breaks import).
-      expect(out.startsWith(':::warning\n')).toBe(true);
-      expect(out).not.toContain(':::WARNING');
-      // Both paragraph children are present and joined inside the fence.
-      expect(out).toContain('line1\nline2');
+      expect(out).toBe('> [!warning]\n> line1\n> line2');
+      // The type is lowercased (an uppercase `[!WARNING]` would not re-import).
+      expect(out.startsWith('> [!warning]\n')).toBe(true);
+      expect(out).not.toContain('[!WARNING]');
+      // Both paragraph children are present, each blockquote-prefixed.
+      expect(out).toContain('> line1\n> line2');
     });
 
     // Spec 4 — blockquote per-line prefixer over a multi-line nested callout.
@@ -617,13 +613,11 @@ describe('convertProseMirrorToMarkdown', () => {
       );
       // NOTE(review): the spec predicted '> :::info\n> a\n>\n> b\n> :::',
       // assuming the nested callout body contains a blank line between 'a' and
-      // 'b' (which would exercise the line.length?'> ':'>' empty-line branch).
-      // But per Spec 3's finding the callout joins paragraphs with a SINGLE
-      // '\n', so its rendered output ':::info\na\nb\n:::' has NO blank line.
-      // The blockquote prefixer (src 214-221) therefore prefixes each of the
-      // four non-empty lines with '> ', yielding the ACTUAL output below — the
-      // realistic per-line-prefix loop over a multi-line nested-block child.
-      expect(out).toBe('> :::info\n> a\n> b\n> :::');
+      // The nested callout renders as an Obsidian callout '> [!info]\n> a\n> b'
+      // (single-'\n' join, no blank line). The outer blockquote prefixer then
+      // prefixes each of those lines with '> ' again, yielding a doubly-nested
+      // blockquote — the realistic per-line-prefix loop over a multi-line child.
+      expect(out).toBe('> > [!info]\n> > a\n> > b');
       // Every produced line carries the '> ' prefix (no line escapes to col 0).
       for (const line of out.split('\n')) {
         expect(line.startsWith('>')).toBe(true);

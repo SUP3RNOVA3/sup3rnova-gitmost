@@ -24,6 +24,63 @@ const allText = (node: any): string => {
 };
 
 // ---------------------------------------------------------------------------
+// Obsidian-native callouts: the export emits `> [!type]` (a blockquote callout,
+// which renders as a callout in Obsidian) and the importer parses it back —
+// alongside the legacy `:::type` fence so existing vaults keep working.
+// ---------------------------------------------------------------------------
+describe('preprocessCallouts: Obsidian `> [!type]` callouts', () => {
+  it('imports `> [!type]` as a callout node (not a plain blockquote)', async () => {
+    const md = ['> [!warning]', '> be careful', '> second line'].join('\n');
+    const docNode = await markdownToProseMirror(md);
+    const callouts = findAll(docNode, 'callout');
+    expect(callouts).toHaveLength(1);
+    expect(callouts[0].attrs?.type).toBe('warning');
+    expect(findAll(docNode, 'blockquote')).toHaveLength(0);
+    expect(allText(callouts[0])).toContain('be careful');
+  });
+
+  it('imports a nested `> > [!type]` callout inside another', async () => {
+    const md = ['> [!info]', '> outer', '> > [!danger]', '> > inner'].join('\n');
+    const docNode = await markdownToProseMirror(md);
+    const outer = docNode.content?.[0];
+    expect(outer?.type).toBe('callout');
+    expect(outer?.attrs?.type).toBe('info');
+    const inner = (outer?.content || []).filter(
+      (n: any) => n.type === 'callout',
+    );
+    expect(inner).toHaveLength(1);
+    expect(inner[0].attrs?.type).toBe('danger');
+    expect(allText(inner[0])).toContain('inner');
+  });
+
+  it('round-trips a callout: export -> `> [!type]` -> import keeps type + body', async () => {
+    const original = {
+      type: 'doc',
+      content: [
+        {
+          type: 'callout',
+          attrs: { type: 'success' },
+          content: [{ type: 'paragraph', content: [{ type: 'text', text: 'done' }] }],
+        },
+      ],
+    };
+    const md = convertProseMirrorToMarkdown(original);
+    expect(md).toBe('> [!success]\n> done');
+    const back = await markdownToProseMirror(md);
+    const callouts = findAll(back, 'callout');
+    expect(callouts).toHaveLength(1);
+    expect(callouts[0].attrs?.type).toBe('success');
+    expect(allText(callouts[0])).toContain('done');
+  });
+
+  it('a plain blockquote (no `[!type]`) stays a blockquote', async () => {
+    const back = await markdownToProseMirror('> just a quote\n> more');
+    expect(findAll(back, 'callout')).toHaveLength(0);
+    expect(findAll(back, 'blockquote')).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 3. preprocessCallouts — two uncovered branches.
 //
 // (a) NESTED callouts: an inner `:::type ... :::` inside an outer callout body

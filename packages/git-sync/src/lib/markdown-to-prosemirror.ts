@@ -32,6 +32,14 @@ const MAX_CALLOUT_PREPROCESS_BYTES = 4 * 1024 * 1024; // 4 MB
 const CALLOUT_OPEN_RE = /^:::\s*(\w+)\s*$/;
 /** Matches a bare closing callout fence: `:::`. */
 const CALLOUT_CLOSE_RE = /^:::\s*$/;
+/**
+ * Matches an Obsidian-native callout opener: `> [!type]` (type captured). An
+ * optional title after the type is allowed but ignored (the Docmost callout
+ * schema has no title). The body is the following contiguous blockquote lines.
+ */
+const CALLOUT_BQ_OPEN_RE = /^>\s*\[!(\w+)\]/;
+/** Matches any blockquote continuation line (`>` … ). */
+const BLOCKQUOTE_LINE_RE = /^>/;
 /** Matches the start/end of a code fence (``` or ~~~), capturing the marker. */
 const CODE_FENCE_RE = /^(\s*)(`{3,}|~{3,})/;
 
@@ -153,6 +161,29 @@ async function preprocessCallouts(markdown: string): Promise<string> {
         // literal line and continue, preserving the original text.
         out.push(line);
         i++;
+        continue;
+      }
+
+      // An Obsidian-native callout: `> [!type]` opener; the body is the following
+      // CONTIGUOUS blockquote (`>`-prefixed) lines. Strip ONE blockquote level and
+      // recurse so nested callouts (`> > [!type]`) are handled, then emit the same
+      // callout div the `:::` path produces. A normal blockquote (no `[!type]` on
+      // its first line) does not match and stays a blockquote.
+      const bqOpen = line.match(CALLOUT_BQ_OPEN_RE);
+      if (bqOpen) {
+        const type = bqOpen[1].toLowerCase();
+        const bodyLines: string[] = [];
+        let j = i + 1;
+        for (; j < lines.length; j++) {
+          if (!BLOCKQUOTE_LINE_RE.test(lines[j])) break;
+          bodyLines.push(lines[j].replace(/^>\s?/, ""));
+        }
+        const inner = await transform(bodyLines);
+        const renderedInner = await marked.parse(inner);
+        out.push(
+          `\n<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>\n`,
+        );
+        i = j;
         continue;
       }
 

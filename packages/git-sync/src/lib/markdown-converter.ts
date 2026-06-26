@@ -440,10 +440,21 @@ export function convertProseMirrorToMarkdown(content: any): string {
           .replace(/\|/g, "\\|");
       }
 
-      case "callout":
-        const calloutType = node.attrs?.type || "info";
-        const calloutContent = nodeContent.map(processNode).join("\n");
-        return `:::${calloutType.toLowerCase()}\n${calloutContent}\n:::`;
+      case "callout": {
+        // Obsidian-native callout: `> [!type]` opener + a blockquote (`>`-prefixed)
+        // body, so it renders as a callout in Obsidian. The importer parses both
+        // this and the legacy `:::type` fence (existing vaults). Each body line is
+        // blockquote-prefixed; a blank line becomes a bare `>` so the callout is
+        // not split.
+        const calloutType = (node.attrs?.type || "info").toLowerCase();
+        const calloutBody = nodeContent
+          .map(processNode)
+          .join("\n")
+          .split("\n")
+          .map((l: string) => (l.length ? `> ${l}` : ">"))
+          .join("\n");
+        return `> [!${calloutType}]\n${calloutBody}`;
+      }
 
       case "details": {
         // The `open` (collapsed/expanded) state lives on the details node, NOT on
