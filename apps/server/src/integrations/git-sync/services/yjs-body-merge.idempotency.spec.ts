@@ -1,9 +1,6 @@
 import * as Y from 'yjs';
 
-import {
-  mergeXmlFragments,
-  mergeXmlFragments3Way,
-} from './yjs-body-merge';
+import { mergeXmlFragments, mergeXmlFragments3Way } from './yjs-body-merge';
 
 /**
  * Regression for the HIGH-severity runaway whole-body duplication: a page body
@@ -22,8 +19,11 @@ import {
  * more unit — a self-sustaining loop.
  *
  * The fix normalizes the materialized default (`indent: 0`) out of the block key
- * (see `DEFAULT_KEY_ATTRS` in yjs-body-merge.ts), so a live block compares equal
- * to its git-round-tripped twin and the resync is a true no-op.
+ * (the schema-derived `serializeXmlNode` normalization in yjs-body-merge.ts drops
+ * every attr equal to its ProseMirror-schema default; `indent: 0` is one such),
+ * so a live block compares equal to its git-round-tripped twin and the resync is
+ * a true no-op. The sibling `yjs-body-merge.schema-defaults.spec.ts` covers the
+ * rest of the bug class (image.align, link mark internal, …).
  *
  * These tests model that EXACTLY at the Yjs level: a LIVE fragment whose blocks
  * carry `indent: 0` + block ids, versus a git-derived fragment of the SAME
@@ -35,7 +35,11 @@ import {
 
 type Attrs = Record<string, string | number>;
 
-function el(name: string, attrs: Attrs, children: (Y.XmlElement | Y.XmlText)[]) {
+function el(
+  name: string,
+  attrs: Attrs,
+  children: (Y.XmlElement | Y.XmlText)[],
+) {
   const e = new Y.XmlElement(name);
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v as string);
   if (children.length) e.insert(0, children);
@@ -55,7 +59,11 @@ function text(s: string): Y.XmlText {
  * per-block `id`. `n` makes each unit's ids unique (as the editor would stamp)
  * while keeping the visible CONTENT byte-identical across units.
  */
-function unit(live: boolean, n: number, headingText = 'Big Heading'): Y.XmlElement[] {
+function unit(
+  live: boolean,
+  n: number,
+  headingText = 'Big Heading',
+): Y.XmlElement[] {
   const ind: Attrs = live ? { indent: 0 } : {};
   const id = (base: string): Attrs => (live ? { id: `${base}${n}` } : {});
   const para = (attrs: Attrs, s: string) =>

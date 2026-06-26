@@ -1,5 +1,8 @@
 import * as Y from 'yjs';
+import { getSchema } from '@tiptap/core';
+import type { Schema } from '@tiptap/pm/model';
 
+import { tiptapExtensions } from '../../../collaboration/collaboration.util';
 import { diff3Plan } from './three-way-merge';
 import { buildLcsTable } from './lcs';
 
@@ -59,59 +62,127 @@ type XmlNode = Y.XmlElement | Y.XmlText | Y.XmlHook;
 const VOLATILE_KEY_ATTRS = new Set(['id']);
 
 /**
- * Editor-schema attribute DEFAULTS that the live Yjs document MATERIALIZES on
- * every block but a git round-trip does NOT carry — so they must be normalized
- * out of the block key, otherwise an unchanged block fails to compare equal
- * across `DB doc -> markdown (export) -> ProseMirror (re-import)`.
+ * The editor (ProseMirror) schema, built ONCE from the same `tiptapExtensions`
+ * the collaboration server uses to materialize Yjs docs. Memoized: building the
+ * schema is non-trivial and the block key is computed per block per cycle.
  *
- * `indent: 0` is the one that bites in practice (HIGH-severity runaway whole-body
- * duplication, see below). The editor's indent extension declares
- * `indent.default = 0` (`packages/editor-ext/src/lib/indent.ts`), and
- * `TiptapTransformer.toYdoc` STAMPS that default onto every `paragraph`/`heading`
- * Yjs node — so a body that originated in the UI carries `indent: 0` on every
- * block (and on the paragraph inside every list item, callout, and table cell).
- * `markdownToProseMirror`, parsing clean markdown, produces NO indent attribute
- * (the extension's `renderHTML` even omits it when `<= min`), so a re-imported
- * body has `a: {}` where the live body has `a: { indent: 0 }`.
+ * Why the schema (not a hardcoded denylist): the LIVE Yjs document is produced by
+ * `TiptapTransformer.toYdoc(pm, 'default', tiptapExtensions)`, which STAMPS every
+ * schema-default attribute onto every node and mark — `indent: 0` on every
+ * paragraph/heading, `image.align: "center"`, the link mark's `internal: false`,
+ * `highlight.colorName: null`, and so on for youtube/pdf/any future node. A body
+ * re-imported from git comes through the engine's `markdownToProseMirror`, whose
+ * schema declares those attrs with DIFFERENT (usually null) defaults; the
+ * resulting null/absent element attrs are then DROPPED by `y-prosemirror`'s
+ * toYdoc. So the SAME block carries materialized defaults on the live side and
+ * nothing on the git side, its key diverges, the three-way merge anchors on
+ * NOTHING, and the whole body is RE-APPENDED every reconcile cycle — an unbounded
+ * duplication loop with no client connected.
  *
- * Without this normalization EVERY live block's key differs from the same block
- * re-imported from git, so the three-way merge can anchor on NOTHING: the whole
- * body becomes one unanchored region, and any trailing unit that git's export
- * already contains (but the merge can't match against the identical live tail)
- * is RE-APPENDED on every reconcile cycle — an unbounded, self-sustaining
- * whole-body duplication loop with no client connected (each grown export
- * diverges from the last-pushed base by one more block). Dropping the default
- * makes a live `indent: 0` block compare equal to its git-round-tripped twin, so
- * the body anchors and the resync is a true no-op.
- *
- * Only the DEFAULT value is dropped: a genuine `indent: 2` is content and stays
- * in the key (so a real indentation edit still diffs and lands).
+ * Deriving the defaults from the actual schema normalizes ALL such attributes
+ * generally (it is not another per-attribute denylist): any attribute whose value
+ * equals the schema default — or is null/undefined — is dropped from the key, on
+ * BOTH element attributes and the mark attributes inside each XmlText delta, so a
+ * live block compares equal to its git-round-tripped twin and an unchanged resync
+ * applies zero ops. Genuinely non-default values (a real `indent: 2`, an
+ * `align: "left"`, a real `link.href`, a real highlight color) are content and
+ * stay in the key, so real edits still diff and land.
  */
-const DEFAULT_KEY_ATTRS: ReadonlyArray<readonly [string, unknown]> = [
-  ['indent', 0],
-];
+let memoSchema: Schema | null = null;
+let memoSchemaTried = false;
+function getMergeSchema(): Schema | null {
+  if (!memoSchemaTried) {
+    memoSchemaTried = true;
+    try {
+      memoSchema = getSchema(tiptapExtensions as any);
+    } catch {
+      // Defensive: if the schema can't be built (e.g. a degenerate extension
+      // set in a unit test that stubs `tiptapExtensions`), fall back to dropping
+      // only null/undefined attrs. The real server always builds it fine.
+      memoSchema = null;
+    }
+  }
+  return memoSchema;
+}
+
+/** True if `value` is the schema default for `attrName` of `attrSpecs`, or is
+ * null/undefined (which a git round-trip drops). Such attributes are excluded
+ * from the comparison key. `attrSpecs` is a ProseMirror node/mark spec attr map
+ * (`{ [name]: { default } }`); a missing map (unknown node/mark) only drops
+ * null/undefined. (A non-null value matching an attr declared without a default
+ * cannot occur — `spec.default === value` is then `undefined === value`, false.) */
+function isDefaultAttr(
+  attrSpecs: Record<string, any> | undefined | null,
+  attrName: string,
+  value: unknown,
+): boolean {
+  if (value === null || value === undefined) return true;
+  const spec = attrSpecs?.[attrName];
+  return !!spec && spec.default === value;
+}
+
+/**
+ * Normalize one XmlText delta op's mark attributes: drop every mark-attr whose
+ * value equals the mark's schema default (or is null/undefined), so the link
+ * mark's materialized `internal: false`/`target: "_blank"` and a highlight's
+ * `colorName: null` no longer diverge from a git round-trip that carries neither.
+ * The text (op.insert) and genuinely-set mark attrs (a real `href`, a real
+ * highlight color) are preserved verbatim. `attributes` maps markName -> mark
+ * attrs object (or `true`/boolean for attr-less marks); each is handled safely.
+ */
+function normalizeDelta(delta: any[]): any[] {
+  const schema = getMergeSchema();
+  return delta.map((op) => {
+    if (!op || op.attributes == null || typeof op.attributes !== 'object') {
+      return op;
+    }
+    const marks: Record<string, unknown> = {};
+    for (const markName of Object.keys(op.attributes).sort()) {
+      const markVal = op.attributes[markName];
+      if (markVal === null || markVal === undefined) continue;
+      if (typeof markVal !== 'object') {
+        // attr-less mark stored as a primitive (e.g. `true`) — keep as-is.
+        marks[markName] = markVal;
+        continue;
+      }
+      const markSpec = schema?.marks[markName]?.spec.attrs as
+        | Record<string, any>
+        | undefined;
+      const cleaned: Record<string, unknown> = {};
+      for (const ak of Object.keys(markVal as object).sort()) {
+        const av = (markVal as Record<string, unknown>)[ak];
+        if (isDefaultAttr(markSpec, ak, av)) continue;
+        cleaned[ak] = av;
+      }
+      marks[markName] = cleaned;
+    }
+    return { ...op, attributes: marks };
+  });
+}
 
 /**
  * Canonical, comparable serialization of a Yjs XML node (structure + text +
  * marks + attributes), with attribute keys sorted so equal blocks always produce
  * an identical string regardless of attribute insertion order. The volatile
- * block `id` (see `VOLATILE_KEY_ATTRS`) and editor-materialized schema defaults
- * (see `DEFAULT_KEY_ATTRS`) are excluded at every level so a block compares equal
- * by CONTENT across the git round-trip (which carries neither) — keeping the
+ * block `id` (see `VOLATILE_KEY_ATTRS`) and every schema-default attribute (see
+ * `getMergeSchema`) are excluded at every level — on element attributes AND on
+ * the mark attributes inside each XmlText delta — so a block compares equal by
+ * CONTENT across the git round-trip (which materializes neither), keeping the
  * merge anchor-able and idempotent.
  */
 export function serializeXmlNode(node: unknown): unknown {
   if (node instanceof Y.XmlText) {
-    return { t: node.toDelta() };
+    return { t: normalizeDelta(node.toDelta()) };
   }
   if (node instanceof Y.XmlElement) {
     const attrs = node.getAttributes() as Record<string, unknown>;
+    const attrSpecs = getMergeSchema()?.nodes[node.nodeName]?.spec.attrs as
+      | Record<string, any>
+      | undefined;
     const sorted: Record<string, unknown> = {};
     for (const k of Object.keys(attrs).sort()) {
       if (VOLATILE_KEY_ATTRS.has(k)) continue;
-      if (DEFAULT_KEY_ATTRS.some(([dk, dv]) => dk === k && attrs[k] === dv)) {
-        continue;
-      }
+      if (isDefaultAttr(attrSpecs, k, attrs[k])) continue;
       sorted[k] = attrs[k];
     }
     return {
@@ -153,10 +224,7 @@ export function cloneXmlNode(node: XmlNode): Y.XmlElement | Y.XmlText {
   return new Y.XmlElement('paragraph');
 }
 
-type Op =
-  | { op: 'keep' }
-  | { op: 'del' }
-  | { op: 'ins'; bi: number };
+type Op = { op: 'keep' } | { op: 'del' } | { op: 'ins'; bi: number };
 
 /**
  * LCS-based edit script turning sequence `a` (live block keys) into `b` (incoming
