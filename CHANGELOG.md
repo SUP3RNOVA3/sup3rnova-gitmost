@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   OpenRouter, etc.; `openai` uses the official provider (real-OpenAI
   reasoning-model request shaping). Chosen explicitly rather than inferred from
   the base URL, since a custom URL can front real OpenAI too. (#175, #177)
+- **AI chat "Context window (tokens)" setting (`chatContextWindow`).** A new
+  admin field in AI settings that records the chat model's context-window size.
+  When set (> 0) it becomes the denominator of the header context-badge, which
+  now reads "used / max"; `0`/empty clears the limit and the badge shows only
+  the current context as before. There is no provider-independent way to read a
+  model's window automatically, so it is an explicit workspace-level value.
+  (#189)
 - **Per-MCP-server instructions in the agent prompt.** Each external MCP server
   now has an admin-authored `instructions` field ("how/when to use this server's
   tools") that is injected into the agent's system prompt next to that server's
@@ -60,6 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   implementation, so a workspace pointing at z.ai/GLM/DeepSeek now streams the
   model's reasoning out of the box. An endpoint that is real OpenAI behind a
   custom base URL should set the new `chatApiStyle` "Protocol" to `openai`. (#177)
+
+- **AI chat header context-badge now shows "used / max".** When an admin sets
+  the new `chatContextWindow`, the badge displays the current context size over
+  the configured window (e.g. `120k / 200k`) instead of switching to a live
+  per-turn token counter during streaming. With no window configured the badge
+  keeps showing just the current context. (#189)
 
 - **Footnotes now reuse (Pandoc semantics).** Multiple `[^a]` references to the
   same id are ONE footnote — one number, one definition, several back-references

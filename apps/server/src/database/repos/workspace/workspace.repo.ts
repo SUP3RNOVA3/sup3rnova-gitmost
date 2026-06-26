@@ -256,11 +256,17 @@ export class WorkspaceRepo {
   ): Promise<Workspace> {
     const db = dbOrTx(this.db, trx);
     // Assemble the provider object IN SQL. Keys are fixed provider field names
-    // (sql.lit -> inlined literals, no injection); values are bound params cast
-    // to ::text — postgres.js sends bound params untyped, and jsonb_build_object's
-    // value args are polymorphic ("any"), so without the explicit ::text cast
-    // Postgres throws "could not determine data type of parameter $1". The result
-    // is a real jsonb object, never a double-encoded string. The CASE self-heals
+    // (sql.lit -> inlined literals, no injection); values are bound params with
+    // an explicit cast — postgres.js sends bound params untyped, and
+    // jsonb_build_object's value args are polymorphic ("any"), so without the
+    // cast Postgres throws "could not determine data type of parameter $1". The
+    // cast is branched by the JS runtime type so the value lands in jsonb with
+    // the matching JSON type: a number stays a JSON number (e.g.
+    // chatContextWindow → `{"chatContextWindow":200000}`, jsonb_typeof 'number'),
+    // a boolean a JSON boolean, everything else a JSON string. A plain `::text`
+    // for all would store a numeric field as the JSON STRING `"200000"`, which
+    // the client's `typeof === "number"` guards reject. The result is a real
+    // jsonb object, never a double-encoded string. The CASE self-heals
     // workspaces whose settings.ai.provider was previously corrupted into an
     // array/string.
     const entries = Object.entries(provider).filter(
@@ -268,7 +274,14 @@ export class WorkspaceRepo {
     );
     const patch = entries.length
       ? sql`jsonb_build_object(${sql.join(
-          entries.flatMap(([k, v]) => [sql.lit(k), sql`${v}::text`]),
+          entries.flatMap(([k, v]) => [
+            sql.lit(k),
+            typeof v === 'number'
+              ? sql`${v}::numeric`
+              : typeof v === 'boolean'
+                ? sql`${v}::boolean`
+                : sql`${v}::text`,
+          ]),
         )})`
       : sql`'{}'::jsonb`;
     return db
