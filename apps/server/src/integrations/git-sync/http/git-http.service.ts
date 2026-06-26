@@ -251,8 +251,17 @@ export class GitHttpService {
     // response directly to the socket (mirrors the MCP transport pattern).
     reply.hijack();
 
-    if (serviceKind === 'read') {
-      // Fetch/clone: stream http-backend directly, no lock (read-only).
+    // Only the ACTUAL pack-receiving write (POST git-receive-pack) runs under the
+    // space lock + a Docmost cycle. Everything else streams the http-backend
+    // directly with NO lock and NO cycle: a fetch/clone (read), AND the
+    // write-AUTHORIZED but READ-ONLY ref advertisement
+    // (GET info/refs?service=git-receive-pack). Running a cycle on info/refs is
+    // both wasteful and HARMFUL — it holds the per-space lock, so the push's
+    // immediately-following POST git-receive-pack collides with it and 503s
+    // (a deterministic push failure). Authz already happened above via the gate.
+    const isReceivePack =
+      req.method === 'POST' && parsedPath.subpath === 'git-receive-pack';
+    if (serviceKind === 'read' || !isReceivePack) {
       await this.backend.run(backendRequest, rawReq, rawRes);
       return;
     }

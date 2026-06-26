@@ -354,6 +354,32 @@ describe('GitHttpService.handle', () => {
     expect(workspaceId).toBe('ws-1');
   });
 
+  it('GET info/refs?service=git-receive-pack streams the backend WITHOUT a cycle/lock (so the follow-up POST never 503-collides)', async () => {
+    // A push is a TWO-request exchange: GET info/refs?service=git-receive-pack
+    // (ref advertisement) then POST git-receive-pack (the pack). The info/refs
+    // request is write-AUTHORIZED (push perms needed to see those refs) but is
+    // READ-ONLY — it must NOT run ingestExternalPush (a Docmost cycle under the
+    // per-space lock), or the immediately-following POST collides with the still-
+    // running cycle and deterministically 503s. It must just stream the backend.
+    const built = build({ abilityCan: true });
+    const { reply } = fakeReply();
+    const req = fakeRequest({
+      url: '/git/space-1.git/info/refs?service=git-receive-pack',
+      method: 'GET',
+      authorization: basic('dev@example.com', 'pw'),
+    });
+
+    await built.service.handle(req, reply);
+
+    // Authorized as a write (Manage), but executed as a plain stream.
+    expect(built.abilityCan).toHaveBeenCalledWith(
+      SpaceCaslAction.Manage,
+      SpaceCaslSubject.Page,
+    );
+    expect(built.orchestrator.ingestExternalPush).not.toHaveBeenCalled();
+    expect(built.backend.run).toHaveBeenCalledTimes(1);
+  });
+
   it('a push that loses the lock -> 503 with Retry-After and a busy body (headers not written twice)', async () => {
     const built = build({ abilityCan: true });
     // The lock could not be acquired: the receive-pack closure never ran, so the
