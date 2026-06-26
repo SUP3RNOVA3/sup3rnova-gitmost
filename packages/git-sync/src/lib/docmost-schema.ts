@@ -470,7 +470,7 @@ const Details = Node.create({
     return {
       open: {
         default: false,
-        parseHTML: (el: HTMLElement) => el.getAttribute("open"),
+        parseHTML: (el: HTMLElement) => el.hasAttribute("open"),
         renderHTML: (attrs: Record<string, any>) =>
           attrs.open ? { open: "" } : {},
       },

@@ -200,11 +200,30 @@ describe('git-sync converter: lose-prone atoms keep their VALUES across a round 
     const back = await markdownToProseMirror(md);
     const details = findNode(back, 'details');
     expect(details).toBeDefined();
-    // The schema parses the present `open` boolean attribute to "" (its raw
-    // value); a DROPPED open parses to the default `false`. Asserting it is no
-    // longer the default proves the nested path now preserves open — parity with
-    // the top-level <details> case. RED before the fix (open === false).
-    expect(details.attrs?.open).not.toBe(false);
+    // `open` must round-trip as a STRICT boolean `true` — not "" (the old raw
+    // getAttribute value) and not the default `false` (a dropped attribute).
+    // Before the schema parseHTML fix (hasAttribute), `<details open>` parsed to
+    // "" — falsy, so it rendered as a bare <details> and collapsed. RED before
+    // the fix (open was "" or false, never === true).
+    expect(details.attrs?.open).toBe(true);
+  });
+
+  it('B: a TOP-LEVEL details keeps open as strict boolean true', async () => {
+    const original = doc({
+      type: 'details',
+      attrs: { open: true },
+      content: [
+        { type: 'detailsSummary', content: [T('S')] },
+        { type: 'detailsContent', content: [P(T('b'))] },
+      ],
+    });
+    const md = convertProseMirrorToMarkdown(original);
+    const back = await markdownToProseMirror(md);
+    const details = findNode(back, 'details');
+    expect(details).toBeDefined();
+    // Strict boolean, proving the value survives as `true` (not ""/false).
+    // RED before the fix: parseHTML returned getAttribute("open") === "".
+    expect(details.attrs?.open).toBe(true);
   });
 
   it('D: htmlEmbed source VALUE and height survive', async () => {
