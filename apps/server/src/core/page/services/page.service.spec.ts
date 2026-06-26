@@ -653,11 +653,27 @@ describe('PageService', () => {
         };
         const eventEmitter = { emit: jest.fn() };
 
+        // movePage now runs the cycle-check + UPDATE inside executeTx(this.db),
+        // i.e. this.db.transaction().execute(fn => fn(trx)). A permissive
+        // chainable Proxy stands in for the Kysely trx so the per-space
+        // advisory-lock `sql``.execute(trx)` resolves and updatePage runs.
+        const trxStub: any = new Proxy(function () {}, {
+          get: (_t, p) =>
+            p === 'then'
+              ? undefined
+              : p === 'execute' || p === 'executeTakeFirst'
+                ? () => Promise.resolve([])
+                : () => trxStub,
+        });
+        const db = {
+          transaction: () => ({ execute: (fn: any) => fn(trxStub) }),
+        };
+
         const svc = new PageService(
           pageRepo as any, // pageRepo
           {} as any, // pagePermissionRepo
           {} as any, // attachmentRepo
-          {} as any, // db
+          db as any, // db
           {} as any, // storageService
           {} as any, // attachmentQueue
           {} as any, // aiQueue
