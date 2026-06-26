@@ -68,28 +68,27 @@ describe('pageBreak data loss (no converter case — SPEC §11 divergence)', () 
 });
 
 // ---------------------------------------------------------------------------
-// 2. subpages LOSSY round-trip (`case "subpages"` emits `{{SUBPAGES}}`).
+// 2. subpages round-trip (`case "subpages"` emits the schema-matching div).
 //
-// The golden test only pins the EMISSION string. The token has no markdown or
-// HTML meaning, so on re-import marked treats `{{SUBPAGES}}` as ordinary text:
-// the subpages BLOCK comes back as a plain PARAGRAPH carrying that literal
-// string, NOT a `subpages` node. The export is "lossy but legible" by design;
-// this test pins the actual lossy round-trip behavior.
+// It used to emit the literal `{{SUBPAGES}}`, which has no markdown/HTML meaning,
+// so on re-import the subpages BLOCK came back as a plain PARAGRAPH carrying the
+// literal string (the embed rendered as visible "{{SUBPAGES}}" text on the page
+// after a sync — data loss). It now emits `<div data-type="subpages">` like the
+// other embed nodes, so the schema's parseHTML rebuilds the subpages node.
 // ---------------------------------------------------------------------------
-describe('subpages lossy round-trip ({{SUBPAGES}} placeholder)', () => {
-  it('emits {{SUBPAGES}} which re-imports as a paragraph, not a subpages node', async () => {
+describe('subpages round-trip (schema-matching div)', () => {
+  it('emits the subpages div and re-imports as a subpages node (no literal leak)', async () => {
     const { md1, doc2 } = await roundTrip({ type: 'subpages' });
-    expect(md1).toBe('{{SUBPAGES}}');
+    expect(md1).toBe('<div data-type="subpages"></div>');
 
-    // The re-imported doc has a single paragraph holding the literal token.
-    const top = doc2.content || [];
-    expect(top).toHaveLength(1);
-    expect(top[0].type).toBe('paragraph');
-    expect(top[0].content?.[0]).toMatchObject({ type: 'text', text: '{{SUBPAGES}}' });
-
-    // The subpages node itself is gone: nothing in the doc is a subpages node.
-    const allTypes = top.map((n: any) => n.type);
-    expect(allTypes).not.toContain('subpages');
+    const collect = (n: any): string[] => [
+      n.type,
+      ...((n.content || []) as any[]).flatMap(collect),
+    ];
+    const allTypes = (doc2.content || []).flatMap(collect);
+    // The subpages node survives, and no literal {{SUBPAGES}} text leaked back.
+    expect(allTypes).toContain('subpages');
+    expect(JSON.stringify(doc2)).not.toContain('{{SUBPAGES}}');
   });
 });
 

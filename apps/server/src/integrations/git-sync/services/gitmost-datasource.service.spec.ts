@@ -48,6 +48,11 @@ jest.mock('../git-sync.loader', () => ({
 
 import * as Y from 'yjs';
 import { GitmostDataSourceService } from './gitmost-datasource.service';
+// The body-write seam picks 2-way vs 3-way merge based on whether a base doc was
+// built. We spy on the real module exports (ts-jest CJS output references them
+// through the namespace object, so the spies intercept the SUT's calls) and let
+// them call through, so we assert WHICH merge ran without mocking the behaviour.
+import * as bodyMerge from './yjs-body-merge';
 
 // Focused unit/contract test for the native GitSyncClient adapter.
 // No DB, no real collab server: the repos/services/gateway are mocked and we
@@ -270,6 +275,46 @@ describe('GitmostDataSourceService', () => {
       expect(() => mocks.conn.capturedFn?.(realDoc)).not.toThrow();
       // The body fragment is non-empty: the incoming block was merged in.
       expect(realDoc.getXmlFragment('default').length).toBeGreaterThan(0);
+    });
+
+    // The 2-way path (no base) is covered above; this exercises the THREE-WAY
+    // branch that only fires when a `baseMarkdown` is supplied (review #5).
+    describe('with a baseMarkdown (three-way merge)', () => {
+      afterEach(() => jest.restoreAllMocks());
+
+      it('builds a base doc and dispatches to mergeXmlFragments3Way (not the 2-way merge)', async () => {
+        const { service, mocks } = build();
+        mocks.pageRepo.findById.mockResolvedValue({
+          id: 'p1',
+          updatedAt: new Date('2026-06-20T11:00:00.000Z'),
+        });
+        // Spy through to the real implementations so we observe the dispatch.
+        const merge3 = jest.spyOn(bodyMerge, 'mergeXmlFragments3Way');
+        const merge2 = jest.spyOn(bodyMerge, 'mergeXmlFragments');
+
+        await service
+          .bind(CTX)
+          .importPageMarkdown('p1', '# Full\n\ngit', '# Base\n\nbase');
+
+        // The body write was staged through collab as before.
+        expect(mocks.conn.transact).toHaveBeenCalledTimes(1);
+        expect(typeof mocks.conn.capturedFn).toBe('function');
+
+        // Running the captured merge against a real live doc takes the 3-way path:
+        // the base was parsed/built and the 3-way helper is invoked with three
+        // fragments; the 2-way fallback is NOT used.
+        const liveDoc = new Y.Doc();
+        expect(() => mocks.conn.capturedFn?.(liveDoc)).not.toThrow();
+
+        expect(merge3).toHaveBeenCalledTimes(1);
+        expect(merge2).not.toHaveBeenCalled();
+        const [liveFrag, gitFrag, baseFrag] = merge3.mock.calls[0];
+        expect(liveFrag).toBeInstanceOf(Y.XmlFragment);
+        expect(gitFrag).toBeInstanceOf(Y.XmlFragment);
+        // The third arg is the BASE fragment — proof the base markdown was parsed
+        // and converted into its own doc for the common-ancestor comparison.
+        expect(baseFrag).toBeInstanceOf(Y.XmlFragment);
+      });
     });
   });
 

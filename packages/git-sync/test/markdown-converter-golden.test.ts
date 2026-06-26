@@ -142,8 +142,8 @@ describe('paragraph.textAlign -> <div align>', () => {
 });
 
 describe('subpages token + unknown-in-container fallback', () => {
-  it('subpages emits the {{SUBPAGES}} placeholder token', () => {
-    expect(c({ type: 'subpages' })).toBe('{{SUBPAGES}}');
+  it('subpages emits the schema-matching div (round-trips, unlike the old {{SUBPAGES}} literal)', () => {
+    expect(c({ type: 'subpages' })).toBe('<div data-type="subpages"></div>');
   });
 
   it('an unknown block inside a raw-HTML container is wrapped in <div> (never markdown)', () => {

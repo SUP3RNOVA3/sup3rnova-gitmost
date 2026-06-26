@@ -932,7 +932,7 @@ const Subpages = Node.create({
     return [{ tag: 'div[data-type="subpages"]' }];
   },
   renderHTML({ HTMLAttributes }) {
-    return ["div", { "data-type": "subpages", ...HTMLAttributes }, 0];
+    return ["div", { "data-type": "subpages", ...HTMLAttributes }];
   },
 });
 

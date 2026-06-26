@@ -20,6 +20,14 @@ jest.mock('../git-sync.loader', () => ({
 
 import { Logger } from '@nestjs/common';
 import {
+  Kysely,
+  DummyDriver,
+  PostgresAdapter,
+  PostgresIntrospector,
+  PostgresQueryCompiler,
+  CompiledQuery,
+} from 'kysely';
+import {
   GitSyncOrchestrator,
   GitSyncLockHeldError,
 } from './git-sync.orchestrator';
@@ -464,6 +472,93 @@ describe('GitSyncOrchestrator', () => {
       const built = build({ enabled: false });
       built.orchestrator.onModuleInit();
       expect(built.scheduler.addInterval).not.toHaveBeenCalled();
+    });
+  });
+
+  // The poll-safety backstop: each tick enumerates the STRICT opt-in spaces and
+  // reconciles each one under its own lock. We drive the private `pollTick()`
+  // directly and (separately) compile `enabledSpaces()` to assert its opt-in SQL.
+  describe('pollTick + enabledSpaces (strict opt-in backstop)', () => {
+    it('runs runOnce exactly once per enabled space, with the right (spaceId, workspaceId)', async () => {
+      const built = build();
+      // Isolate the tick wiring from the cycle machinery: stub the enumeration
+      // and count runOnce (it never throws; here we don't exercise its body).
+      const runOnce = jest
+        .spyOn(built.orchestrator, 'runOnce')
+        .mockResolvedValue({ spaceId: 'x', ran: true });
+      jest
+        .spyOn(built.orchestrator as any, 'enabledSpaces')
+        .mockResolvedValue([
+          { spaceId: 'space-1', workspaceId: 'ws-1' },
+          { spaceId: 'space-2', workspaceId: 'ws-2' },
+        ]);
+
+      await (built.orchestrator as any).pollTick();
+
+      expect(runOnce).toHaveBeenCalledTimes(2);
+      // Per-space isolation: each space is reconciled with its OWN workspace id.
+      expect(runOnce).toHaveBeenNthCalledWith(1, 'space-1', 'ws-1');
+      expect(runOnce).toHaveBeenNthCalledWith(2, 'space-2', 'ws-2');
+    });
+
+    it('does NOT throw and runs nothing when the enabled-spaces query throws (try/catch backstop)', async () => {
+      jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+      const built = build();
+      const runOnce = jest.spyOn(built.orchestrator, 'runOnce');
+      jest
+        .spyOn(built.orchestrator as any, 'enabledSpaces')
+        .mockRejectedValue(new Error('db down'));
+
+      // A failed enumeration must never break the interval — pollTick swallows it.
+      await expect(
+        (built.orchestrator as any).pollTick(),
+      ).resolves.toBeUndefined();
+      expect(runOnce).not.toHaveBeenCalled();
+    });
+
+    it('early-returns (no enumeration, no runOnce) when git-sync is disabled', async () => {
+      const built = build({ enabled: false });
+      const enabled = jest.spyOn(built.orchestrator as any, 'enabledSpaces');
+      const runOnce = jest.spyOn(built.orchestrator, 'runOnce');
+
+      await (built.orchestrator as any).pollTick();
+
+      // Gated on the master switch before any DB work.
+      expect(enabled).not.toHaveBeenCalled();
+      expect(runOnce).not.toHaveBeenCalled();
+    });
+
+    it('compiles the STRICT opt-in enumeration SQL (spaces, deletedAt is null, enabled flag)', async () => {
+      // Inject a compile-only Kysely (DummyDriver) whose `log` hook captures the
+      // exact SQL `enabledSpaces()` runs — no fake builder, the real query is
+      // compiled. DummyDriver yields no rows; we only assert the SQL shape.
+      const built = build();
+      let captured: CompiledQuery | undefined;
+      const compileDb = new Kysely<any>({
+        dialect: {
+          createAdapter: () => new PostgresAdapter(),
+          createDriver: () => new DummyDriver(),
+          createIntrospector: (d) => new PostgresIntrospector(d),
+          createQueryCompiler: () => new PostgresQueryCompiler(),
+        },
+        log: (event) => {
+          if (event.level === 'query') captured = event.query as CompiledQuery;
+        },
+      });
+      // Swap the orchestrator's injected db for the compile-only instance.
+      (built.orchestrator as any).db = compileDb;
+
+      const rows = await (built.orchestrator as any).enabledSpaces();
+      // DummyDriver returns no rows -> empty opt-in list (the no-space default).
+      expect(rows).toEqual([]);
+
+      expect(captured).toBeDefined();
+      const sql = captured!.sql.replace(/\s+/g, ' ');
+      expect(sql).toContain('from "spaces"');
+      // deletedAt-is-null guard (live spaces only).
+      expect(sql).toContain('"deletedAt" is null');
+      // STRICT per-space opt-in: the raw jsonb flag predicate, verbatim.
+      expect(sql).toContain(`settings->'gitSync'->>'enabled' = 'true'`);
     });
   });
 });

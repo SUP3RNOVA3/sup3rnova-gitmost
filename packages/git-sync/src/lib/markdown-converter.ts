@@ -649,7 +649,12 @@ export function convertProseMirrorToMarkdown(content: any): string {
         return `<div data-type="pageBreak"></div>`;
 
       case "subpages":
-        return "{{SUBPAGES}}";
+        // Emit the schema-matching div[data-type="subpages"] so marked passes it
+        // through as a block and generateJSON rebuilds the subpages atom. The old
+        // `{{SUBPAGES}}` literal had no parseHTML inverse, so on import it stayed
+        // as plain text — the embed rendered as the literal "{{SUBPAGES}}" on the
+        // page after a round-trip (red-team: subpages round-trip data loss).
+        return `<div data-type="subpages"></div>`;
 
       case "status": {
         // Inline status pill. The schema reads the label from the element's

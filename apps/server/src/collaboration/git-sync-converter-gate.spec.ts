@@ -360,6 +360,15 @@ const CORPUS: Record<string, any> = {
       content: [para(text('quote at the end'))],
     },
   ),
+
+  // Atom embeds that carry no inline text: they must round-trip via their
+  // schema-matching HTML (data-type div), NOT a literal that re-imports as plain
+  // text. `subpages` used to export as the literal "{{SUBPAGES}}" and came back
+  // as visible text on the page (red-team round-trip data loss) — this locks it.
+  // editor-ext materializes the `recursive: false` default on import, so the
+  // fixture pre-authors it to sit at the round-trip fixpoint (matches the other
+  // default-materializing fixtures above).
+  'subpages embed': doc({ type: 'subpages', attrs: { recursive: false } }),
 };
 
 describe('git-sync converter §13.1 idempotency gate (editor-ext schema)', () => {
