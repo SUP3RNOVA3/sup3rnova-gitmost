@@ -54,6 +54,12 @@ interface BuildOptions {
   debounceMs?: number;
   /** A hook applied to the fake vault so a test can override its behaviour. */
   vaultOverrides?: Record<string, unknown>;
+  /**
+   * The row `buildSettings` reads for the per-space `autoMergeConflicts` flag
+   * (`executeTakeFirst`). Default: the SAFE off value. Pass `undefined` to model
+   * a missing row (no space / no settings).
+   */
+  settingsRow?: { autoMergeConflicts: boolean } | undefined;
 }
 
 interface Built {
@@ -78,6 +84,10 @@ function build(opts: BuildOptions = {}): Built {
     debounceMs = 2000,
     vaultOverrides = {},
   } = opts;
+  // Distinguish "key omitted" (default off row) from "key present but undefined"
+  // (a deliberately MISSING settings row).
+  const settingsRow =
+    'settingsRow' in opts ? opts.settingsRow : { autoMergeConflicts: false };
   // Distinguish "key omitted" (default to a valid id) from "key present but
   // undefined" (the no-service-user test deliberately sets it undefined).
   const serviceUserId = 'serviceUserId' in opts ? opts.serviceUserId : 'svc-user';
@@ -135,7 +145,7 @@ function build(opts: BuildOptions = {}): Built {
     const builder: any = {
       select: () => builder,
       where: () => builder,
-      executeTakeFirst: async () => ({ autoMergeConflicts: false }),
+      executeTakeFirst: async () => settingsRow,
       execute: async () => [],
     };
     return { selectFrom: () => builder };
@@ -288,6 +298,20 @@ describe('GitSyncOrchestrator', () => {
         workspaceId: 'ws-1',
         userId: 'svc-user',
       });
+    });
+
+    it('threads autoMergeConflicts:true from the space settings row into the engine settings', async () => {
+      const built = build({ settingsRow: { autoMergeConflicts: true } });
+      await built.orchestrator.runOnce('space-1', 'ws-1');
+      const [deps] = runCycleMock.mock.calls[0];
+      expect(deps.settings.autoMergeConflicts).toBe(true);
+    });
+
+    it('defaults autoMergeConflicts to false when the settings row is missing', async () => {
+      const built = build({ settingsRow: undefined });
+      await built.orchestrator.runOnce('space-1', 'ws-1');
+      const [deps] = runCycleMock.mock.calls[0];
+      expect(deps.settings.autoMergeConflicts).toBe(false);
     });
 
     it("surfaces the engine's skipped status (e.g. merge-in-progress) verbatim", async () => {

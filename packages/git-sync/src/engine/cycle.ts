@@ -36,19 +36,6 @@ export interface RunCycleDeps {
    * single-writer still needs the fencing-token redesign (follow-up).
    */
   signal?: AbortSignal;
-  /**
-   * Delete-cap hook (the ONLY caller-specific policy). Called with the push
-   * dry-run's planned delete count (`Number.POSITIVE_INFINITY` when the dry-run
-   * itself failed, so the hook can fail safe) and the live client; returns the
-   * client to use for the REAL apply. The default (omitted) applies every op
-   * unmodified. gitmost uses it to neutralize deletes when over its cap.
-   *
-   * When omitted, NO dry-run is performed (one fewer push planning pass).
-   */
-  resolveApplyClient?: (
-    plannedDeletes: number,
-    client: GitSyncClient,
-  ) => GitSyncClient;
 }
 
 export interface RunCycleResult {
@@ -82,13 +69,14 @@ export interface RunCycleResult {
  *      content straight onto `main` would clobber local file edits before push
  *      can diff them.
  *   4. PULL: readExisting -> listSpaceTree -> computePullActions -> apply.
- *   5. PUSH: optional dry-run to feed the delete-cap hook, then the real apply.
+ *   5. PUSH: vault -> Docmost apply.
  *
- * Lock + cap POLICY live in the caller; this owns only the mechanics.
+ * Lock POLICY lives in the caller; this owns only the mechanics. Deletes are
+ * soft (Trash, reversible) and always logged, so there is no per-cycle
+ * delete-cap — engine convergence is the guard against phantom deletions.
  */
 export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
-  const { spaceId, client, vault, settings, fs, log, resolveApplyClient, signal } =
-    deps;
+  const { spaceId, client, vault, settings, fs, log, signal } = deps;
   const vaultRoot = settings.vaultPath;
   const abs = (relPath: string) => `${vaultRoot}/${relPath}`;
 
@@ -150,33 +138,10 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
     log,
   };
 
-  let applyClient = client;
-  if (resolveApplyClient) {
-    // Plan the push as a DRY-RUN first to read the delete count, then let the
-    // caller decide the apply client (e.g. neutralize deletes over a cap). A
-    // failed dry-run yields Infinity so the hook can fail safe.
-    let plannedDeletes: number;
-    try {
-      const dry = await runPush(pushDeps, { dryRun: true });
-      plannedDeletes = dry.planned?.deletes ?? 0;
-    } catch (err) {
-      log(
-        `push dry-run planning failed (${
-          err instanceof Error ? err.message : String(err)
-        }); deferring deletion policy to the cap hook (fail-safe).`,
-      );
-      plannedDeletes = Number.POSITIVE_INFINITY;
-    }
-    applyClient = resolveApplyClient(plannedDeletes, client);
-  }
-
   // Bail before pushing to Docmost if the lock was lost during pull.
   signal?.throwIfAborted();
 
-  const pushResult = await runPush(
-    { ...pushDeps, makeClient: () => applyClient },
-    { dryRun: false },
-  );
+  const pushResult = await runPush(pushDeps, { dryRun: false });
 
   return {
     ran: true,

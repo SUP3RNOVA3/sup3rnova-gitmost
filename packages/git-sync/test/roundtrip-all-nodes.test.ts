@@ -66,7 +66,10 @@ const FIXTURES: Record<string, { doc: any; primary: string }> = {
   pageBreak: { doc: doc({ type: 'pageBreak' }), primary: 'pageBreak' },
   htmlEmbed: { doc: doc({ type: 'htmlEmbed', attrs: { source: '<b>hi</b>' } }), primary: 'htmlEmbed' },
   pageEmbed: { doc: doc({ type: 'pageEmbed', attrs: { pageId: 'p1' } }), primary: 'pageEmbed' },
-  transclusion: { doc: doc({ type: 'transclusionSource', attrs: { pageId: 'p1' } }), primary: 'transclusionSource' },
+  // transclusionSource: the schema reads `id` (NOT `pageId`) and its content is
+  // `+` (at least one block child), so give it both or it never re-parses.
+  transclusion: { doc: doc({ type: 'transclusionSource', attrs: { id: 't1' }, content: [P(T('shared'))] }), primary: 'transclusionSource' },
+  transclusionReference: { doc: doc({ type: 'transclusionReference', attrs: { sourcePageId: 'p1', transclusionId: 't1' } }), primary: 'transclusionReference' },
   footnote: {
     doc: doc(
       P(T('x'), { type: 'footnoteReference', attrs: { id: 'fn1' } }),
@@ -138,4 +141,138 @@ describe('git-sync converter: node ATTRIBUTES survive a Markdown round trip', ()
       }
     });
   }
+});
+
+// Find the FIRST node of a given type anywhere in a ProseMirror tree (depth
+// first). Used by the structural round-trip assertions below that need the
+// re-imported node's concrete attrs/content, not just "the type is present".
+function findNode(n: any, type: string): any {
+  if (!n || typeof n !== 'object') return undefined;
+  if (n.type === type) return n;
+  if (Array.isArray(n.content)) {
+    for (const c of n.content) {
+      const hit = findNode(c, type);
+      if (hit) return hit;
+    }
+  }
+  return undefined;
+}
+
+// Collect every text run reachable under a node (concatenated). Lets a test
+// assert a footnote definition's note BODY survived, not just the wrapper.
+function allText(n: any): string {
+  if (!n || typeof n !== 'object') return '';
+  if (n.type === 'text') return n.text || '';
+  if (Array.isArray(n.content)) return n.content.map(allText).join('');
+  return '';
+}
+
+// Attributes survive as the TYPE-correct value, not just as a substring of the
+// serialized blob. These re-import and assert on the concrete re-parsed node.
+describe('git-sync converter: lose-prone atoms keep their VALUES across a round trip', () => {
+  it('A: a NESTED details (inside columns) keeps open:true', async () => {
+    // The raw-HTML path (detailsToHtml) is used for a details nested in a
+    // column/spanned cell — distinct from the top-level details case. Before the
+    // fix it emitted a bare <details>, dropping open every round trip.
+    const original = doc({
+      type: 'columns',
+      content: [
+        {
+          type: 'column',
+          attrs: { width: '100%' },
+          content: [
+            {
+              type: 'details',
+              attrs: { open: true },
+              content: [
+                { type: 'detailsSummary', content: [T('S')] },
+                { type: 'detailsContent', content: [P(T('b'))] },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    const md = convertProseMirrorToMarkdown(original);
+    // detailsToHtml must emit the `open` attribute (RED before the fix: it
+    // emitted a bare <details> inside the column).
+    expect(md).toContain('<details open>');
+    const back = await markdownToProseMirror(md);
+    const details = findNode(back, 'details');
+    expect(details).toBeDefined();
+    // The schema parses the present `open` boolean attribute to "" (its raw
+    // value); a DROPPED open parses to the default `false`. Asserting it is no
+    // longer the default proves the nested path now preserves open — parity with
+    // the top-level <details> case. RED before the fix (open === false).
+    expect(details.attrs?.open).not.toBe(false);
+  });
+
+  it('D: htmlEmbed source VALUE and height survive', async () => {
+    const original = doc({
+      type: 'htmlEmbed',
+      attrs: { source: '<b>hi</b>', height: 300 },
+    });
+    const md = convertProseMirrorToMarkdown(original);
+    const back = await markdownToProseMirror(md);
+    const embed = findNode(back, 'htmlEmbed');
+    expect(embed).toBeDefined();
+    // The exact raw source must decode back identically (base64 round trip).
+    expect(embed.attrs?.source).toBe('<b>hi</b>');
+    expect(embed.attrs?.height).toBe(300);
+  });
+
+  it('E: footnote definition BODY survives and its id matches the reference', async () => {
+    const original = doc(
+      P(T('x'), { type: 'footnoteReference', attrs: { id: 'fn1' } }),
+      {
+        type: 'footnotesList',
+        content: [
+          {
+            type: 'footnoteDefinition',
+            attrs: { id: 'fn1' },
+            content: [P(T('note'))],
+          },
+        ],
+      },
+    );
+    const md = convertProseMirrorToMarkdown(original);
+    const back = await markdownToProseMirror(md);
+    const list = findNode(back, 'footnotesList');
+    const def = findNode(back, 'footnoteDefinition');
+    const ref = findNode(back, 'footnoteReference');
+    expect(list).toBeDefined();
+    expect(def).toBeDefined();
+    expect(ref).toBeDefined();
+    // The note text rode along, not just the empty wrapper.
+    expect(allText(def)).toContain('note');
+    // The reference still points at the matching definition.
+    expect(ref.attrs?.id).toBe(def.attrs?.id);
+  });
+
+  it('F: transclusionReference keeps BOTH sourcePageId and transclusionId', async () => {
+    const original = doc({
+      type: 'transclusionReference',
+      attrs: { sourcePageId: 'PAGE_X', transclusionId: 'TR_Y' },
+    });
+    const md = convertProseMirrorToMarkdown(original);
+    const back = await markdownToProseMirror(md);
+    const ref = findNode(back, 'transclusionReference');
+    expect(ref).toBeDefined();
+    expect(ref.attrs?.sourcePageId).toBe('PAGE_X');
+    expect(ref.attrs?.transclusionId).toBe('TR_Y');
+  });
+
+  it('F: transclusionSource keeps its id and re-parses its child body', async () => {
+    const original = doc({
+      type: 'transclusionSource',
+      attrs: { id: 'SRC_Z' },
+      content: [P(T('shared body'))],
+    });
+    const md = convertProseMirrorToMarkdown(original);
+    const back = await markdownToProseMirror(md);
+    const src = findNode(back, 'transclusionSource');
+    expect(src).toBeDefined();
+    expect(src.attrs?.id).toBe('SRC_Z');
+    expect(allText(src)).toContain('shared body');
+  });
 });

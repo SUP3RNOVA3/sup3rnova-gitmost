@@ -854,9 +854,14 @@ export function convertProseMirrorToMarkdown(content: any): string {
 
   // Emit a schema-matching <details> tree. The schema parses <details>,
   // summary[data-type="detailsSummary"], and div[data-type="detailsContent"].
+  // The `open` (collapsed/expanded) state lives on the details node and the
+  // schema parses it back from the attribute, so emit it here too — mirroring
+  // the top-level `details` case — or a NESTED details (inside columns/cells)
+  // would silently drop `open:true` every round trip.
   const detailsToHtml = (node: any): string => {
+    const open = node.attrs?.open ? " open" : "";
     const inner = (node.content || []).map(blockToHtml).join("");
-    return `<details>${inner}</details>`;
+    return `<details${open}>${inner}</details>`;
   };
   const detailsSummaryToHtml = (node: any): string =>
     `<summary data-type="detailsSummary">${inlineToHtml(node.content || [])}</summary>`;

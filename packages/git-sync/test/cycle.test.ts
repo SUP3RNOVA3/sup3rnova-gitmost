@@ -92,27 +92,53 @@ describe("runCycle (composition)", () => {
     expect(deps.client.listSpaceTree).toHaveBeenCalledTimes(1);
   });
 
-  it("consults the resolveApplyClient hook with the planned delete count", async () => {
+  it("runs a SINGLE push planning pass (no dry-run; the delete-cap hook is gone)", async () => {
     const vault = fakeVault();
-    const hook = vi.fn((_planned: number, c: any) => c);
-    const deps = baseDeps(vault, { resolveApplyClient: hook });
-
-    await runCycle(deps);
-
-    // An empty vault plans zero deletes; the hook is still consulted so the
-    // caller's policy always sees the count (and a dry-run preceded it).
-    expect(hook).toHaveBeenCalledTimes(1);
-    expect(hook.mock.calls[0][0]).toBe(0);
-  });
-
-  it("skips the dry-run entirely when no resolveApplyClient hook is given", async () => {
-    const vault = fakeVault();
-    const deps = baseDeps(vault); // no resolveApplyClient
+    const deps = baseDeps(vault);
 
     const res = await runCycle(deps);
     expect(res.ran).toBe(true);
-    // With no cap hook there is a single runPush (the apply) — no dry-run pass.
+    // There is exactly one runPush (the apply) — no separate dry-run pass.
     // diffNameStatus is read once per runPush; assert a single planning pass.
     expect(vault.diffNameStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("throws on a PRE-aborted signal BEFORE applying the pull (first destructive phase)", async () => {
+    const vault = fakeVault();
+    const controller = new AbortController();
+    controller.abort();
+    const deps = baseDeps(vault, { signal: controller.signal });
+
+    await expect(runCycle(deps)).rejects.toThrow();
+
+    // The signal is checked AFTER planning but BEFORE the first write phase:
+    // the tree was listed (planning) but neither destructive phase advanced —
+    // no pull merge and no push diff.
+    expect(deps.client.listSpaceTree).toHaveBeenCalledTimes(1);
+    expect(vault.order).not.toContain("merge:main");
+    expect(vault.diffNameStatus).not.toHaveBeenCalled();
+  });
+
+  it("throws BEFORE the push apply when the signal aborts during the pull phase", async () => {
+    // Abort mid-cycle: the signal fires while listSpaceTree (the pull read)
+    // runs, so the SECOND checkpoint (before runPush) trips and the push apply
+    // never starts.
+    const controller = new AbortController();
+    const vault = fakeVault();
+    const deps = baseDeps(vault, {
+      signal: controller.signal,
+      client: {
+        ...baseDeps(vault).client,
+        listSpaceTree: vi.fn(async () => {
+          controller.abort();
+          return { pages: [], complete: true };
+        }),
+      } as any,
+    });
+
+    await expect(runCycle(deps)).rejects.toThrow();
+    // Pull planning ran but the push never did (aborted at a checkpoint).
+    expect(deps.client.listSpaceTree).toHaveBeenCalledTimes(1);
+    expect(vault.diffNameStatus).not.toHaveBeenCalled();
   });
 });

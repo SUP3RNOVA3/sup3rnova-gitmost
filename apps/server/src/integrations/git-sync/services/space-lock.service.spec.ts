@@ -187,6 +187,82 @@ describe('SpaceLockService', () => {
       }
     });
   });
+
+  // The lost-lock guard: a heartbeat refresh that cannot CONFIRM we still own the
+  // lock (CAS miss, res !== 1) OR that throws (Redis error) aborts the supplied
+  // controller so the in-flight protected fn stops instead of writing blind after
+  // a possible lock takeover. `withSpaceLock` threads that signal into `fn`.
+  describe('abort-on-lost-lock', () => {
+    it('aborts the in-flight fn when the heartbeat refresh CAS-MISSES (eval -> 0)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { service, redis } = build();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let captured: AbortSignal | undefined;
+
+        const run = service.withSpaceLock('space-1', async (signal) => {
+          captured = signal;
+          await gate;
+          return 'done';
+        });
+        // Let acquire resolve and the setInterval register.
+        await flushMicrotasks();
+        expect(captured).toBeDefined();
+        expect(captured!.aborted).toBe(false);
+
+        // The refresh CAS-misses: the key no longer holds our instanceId.
+        redis.eval.mockResolvedValue(0);
+        jest.advanceTimersByTime(Math.floor(GIT_SYNC_LOCK_TTL_MS / 3));
+        await flushMicrotasks();
+
+        // The lost lock aborted the protected fn's signal.
+        expect(captured!.aborted).toBe(true);
+
+        release();
+        await flushMicrotasks();
+        await expect(run).resolves.toBe('done');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('aborts the in-flight fn when the heartbeat refresh THROWS (Redis error)', async () => {
+      jest.useFakeTimers();
+      try {
+        const { service, redis } = build();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let captured: AbortSignal | undefined;
+
+        const run = service.withSpaceLock('space-1', async (signal) => {
+          captured = signal;
+          await gate;
+          return 'done';
+        });
+        await flushMicrotasks();
+        expect(captured!.aborted).toBe(false);
+
+        // The refresh eval rejects (Redis down). release() in finally must still
+        // resolve, so only reject the NEXT (heartbeat) call, then go back to OK.
+        redis.eval.mockRejectedValueOnce(new Error('redis down'));
+        jest.advanceTimersByTime(Math.floor(GIT_SYNC_LOCK_TTL_MS / 3));
+        await flushMicrotasks();
+
+        expect(captured!.aborted).toBe(true);
+
+        release();
+        await flushMicrotasks();
+        await expect(run).resolves.toBe('done');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
 });
 
 // Silence the warn logger if a refresh/release path ever logs (defensive).

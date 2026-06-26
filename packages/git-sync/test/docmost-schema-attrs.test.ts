@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   sanitizeCssColor,
   clampCalloutType,
+  encodeHtmlEmbedSource,
+  decodeHtmlEmbedSource,
 } from '../src/lib/docmost-schema.js';
 
 // These tests pin the two security/normalization helpers that Docmost
@@ -71,5 +73,28 @@ describe('clampCalloutType', () => {
   it('falls back to "info" for empty string and null', () => {
     expect(clampCalloutType('')).toBe('info');
     expect(clampCalloutType(null)).toBe('info');
+  });
+});
+
+// The htmlEmbed `source` rides the data-source attribute base64-encoded so the
+// raw HTML/CSS/JS stays inert and double-encoding-free across a round trip.
+// Encode/decode MUST be exact inverses (incl. UTF-8) or the embed body corrupts.
+describe('encode/decodeHtmlEmbedSource', () => {
+  it('round-trips ASCII HTML losslessly', () => {
+    const src = '<b>hi</b>';
+    expect(decodeHtmlEmbedSource(encodeHtmlEmbedSource(src))).toBe(src);
+  });
+
+  it('round-trips multi-byte UTF-8 (Cyrillic + emoji) losslessly', () => {
+    const src = '<p>Привет, мир 🌍 — café</p>';
+    const encoded = encodeHtmlEmbedSource(src);
+    // It is actually encoded (not passed through verbatim).
+    expect(encoded).not.toBe(src);
+    expect(decodeHtmlEmbedSource(encoded)).toBe(src);
+  });
+
+  it('maps empty string to empty string both ways', () => {
+    expect(encodeHtmlEmbedSource('')).toBe('');
+    expect(decodeHtmlEmbedSource('')).toBe('');
   });
 });
