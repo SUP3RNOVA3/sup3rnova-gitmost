@@ -1,6 +1,5 @@
 import { useState } from "react";
 import {
-  ActionIcon,
   Badge,
   Box,
   Button,
@@ -8,12 +7,11 @@ import {
   Modal,
   Paper,
   Stack,
-  Switch,
   Text,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { modals } from "@mantine/modals";
-import { IconPencil, IconPlus, IconTrash } from "@tabler/icons-react";
+import { IconPlus } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import useUserRole from "@/hooks/use-user-role.tsx";
 import {
@@ -23,6 +21,7 @@ import {
 } from "@/features/workspace/queries/ai-mcp-server-query.ts";
 import { IAiMcpServer } from "@/features/workspace/services/ai-mcp-server-service.ts";
 import AiMcpServerForm from "./ai-mcp-server-form.tsx";
+import AiMcpServerRow from "./ai-mcp-server-row.tsx";
 
 /**
  * Admin section: list / add / edit / delete external MCP servers the agent may
@@ -112,55 +111,16 @@ export default function AiMcpServers() {
 
       <Stack gap="xs" mt="sm">
         {servers?.map((server) => (
-          <Group key={server.id} justify="space-between" wrap="nowrap">
-            <Stack gap={2} style={{ minWidth: 0 }}>
-              <Group gap="xs">
-                <Text fw={500} truncate>
-                  {server.name}
-                </Text>
-                <Badge size="xs" variant="light">
-                  {server.transport.toUpperCase()}
-                </Badge>
-              </Group>
-              <Text
-                size="xs"
-                c="dimmed"
-                truncate
-                style={{ fontFamily: "ui-monospace, Menlo, monospace" }}
-              >
-                {server.url}
-              </Text>
-            </Stack>
-
-            <Group gap="xs" wrap="nowrap">
-              <Switch
-                size="sm"
-                checked={server.enabled}
-                aria-label={t("Enabled")}
-                onChange={(event) =>
-                  updateMutation.mutate({
-                    id: server.id,
-                    enabled: event.currentTarget.checked,
-                  })
-                }
-              />
-              <ActionIcon
-                variant="subtle"
-                aria-label={t("Edit")}
-                onClick={() => openEdit(server)}
-              >
-                <IconPencil size={16} />
-              </ActionIcon>
-              <ActionIcon
-                variant="subtle"
-                color="red"
-                aria-label={t("Delete")}
-                onClick={() => confirmDelete(server)}
-              >
-                <IconTrash size={16} />
-              </ActionIcon>
-            </Group>
-          </Group>
+          // Keyed by id (never remounts) so each row keeps its own test state.
+          <AiMcpServerRow
+            key={server.id}
+            server={server}
+            onEdit={openEdit}
+            onDelete={confirmDelete}
+            onToggleEnabled={(s, enabled) =>
+              updateMutation.mutate({ id: s.id, enabled })
+            }
+          />
         ))}
       </Stack>
 

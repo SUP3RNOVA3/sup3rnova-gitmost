@@ -713,6 +713,8 @@
   "Optional. Leave empty to allow all tools the server exposes.": "Optional. Leave empty to allow all tools the server exposes.",
   "Optional guidance for the agent on how and when to use this server's tools. Injected into the system prompt. The server's tools are namespaced as \"<server name>_*\".": "Optional guidance for the agent on how and when to use this server's tools. Injected into the system prompt. The server's tools are namespaced as \"<server name>_*\".",
   "Test": "Test",
+  "Failed": "Failed",
+  "OK · {{count}}": "OK · {{count}}",
   "Available tools": "Available tools",
   "No tools available": "No tools available",
   "Created successfully": "Created successfully",
