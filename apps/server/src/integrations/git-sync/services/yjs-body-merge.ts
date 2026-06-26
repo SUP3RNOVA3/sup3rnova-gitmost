@@ -59,12 +59,46 @@ type XmlNode = Y.XmlElement | Y.XmlText | Y.XmlHook;
 const VOLATILE_KEY_ATTRS = new Set(['id']);
 
 /**
+ * Editor-schema attribute DEFAULTS that the live Yjs document MATERIALIZES on
+ * every block but a git round-trip does NOT carry — so they must be normalized
+ * out of the block key, otherwise an unchanged block fails to compare equal
+ * across `DB doc -> markdown (export) -> ProseMirror (re-import)`.
+ *
+ * `indent: 0` is the one that bites in practice (HIGH-severity runaway whole-body
+ * duplication, see below). The editor's indent extension declares
+ * `indent.default = 0` (`packages/editor-ext/src/lib/indent.ts`), and
+ * `TiptapTransformer.toYdoc` STAMPS that default onto every `paragraph`/`heading`
+ * Yjs node — so a body that originated in the UI carries `indent: 0` on every
+ * block (and on the paragraph inside every list item, callout, and table cell).
+ * `markdownToProseMirror`, parsing clean markdown, produces NO indent attribute
+ * (the extension's `renderHTML` even omits it when `<= min`), so a re-imported
+ * body has `a: {}` where the live body has `a: { indent: 0 }`.
+ *
+ * Without this normalization EVERY live block's key differs from the same block
+ * re-imported from git, so the three-way merge can anchor on NOTHING: the whole
+ * body becomes one unanchored region, and any trailing unit that git's export
+ * already contains (but the merge can't match against the identical live tail)
+ * is RE-APPENDED on every reconcile cycle — an unbounded, self-sustaining
+ * whole-body duplication loop with no client connected (each grown export
+ * diverges from the last-pushed base by one more block). Dropping the default
+ * makes a live `indent: 0` block compare equal to its git-round-tripped twin, so
+ * the body anchors and the resync is a true no-op.
+ *
+ * Only the DEFAULT value is dropped: a genuine `indent: 2` is content and stays
+ * in the key (so a real indentation edit still diffs and lands).
+ */
+const DEFAULT_KEY_ATTRS: ReadonlyArray<readonly [string, unknown]> = [
+  ['indent', 0],
+];
+
+/**
  * Canonical, comparable serialization of a Yjs XML node (structure + text +
  * marks + attributes), with attribute keys sorted so equal blocks always produce
  * an identical string regardless of attribute insertion order. The volatile
- * block `id` (see `VOLATILE_KEY_ATTRS`) is excluded at every level so a block
- * compares equal by CONTENT across the git round-trip (which carries no ids) —
- * keeping the merge anchor-able and idempotent.
+ * block `id` (see `VOLATILE_KEY_ATTRS`) and editor-materialized schema defaults
+ * (see `DEFAULT_KEY_ATTRS`) are excluded at every level so a block compares equal
+ * by CONTENT across the git round-trip (which carries neither) — keeping the
+ * merge anchor-able and idempotent.
  */
 export function serializeXmlNode(node: unknown): unknown {
   if (node instanceof Y.XmlText) {
@@ -75,6 +109,9 @@ export function serializeXmlNode(node: unknown): unknown {
     const sorted: Record<string, unknown> = {};
     for (const k of Object.keys(attrs).sort()) {
       if (VOLATILE_KEY_ATTRS.has(k)) continue;
+      if (DEFAULT_KEY_ATTRS.some(([dk, dv]) => dk === k && attrs[k] === dv)) {
+        continue;
+      }
       sorted[k] = attrs[k];
     }
     return {
