@@ -445,16 +445,20 @@ export function convertProseMirrorToMarkdown(content: any): string {
         const calloutContent = nodeContent.map(processNode).join("\n");
         return `:::${calloutType.toLowerCase()}\n${calloutContent}\n:::`;
 
-      case "details":
-        return nodeContent.map(processNode).join("\n");
+      case "details": {
+        // The `open` (collapsed/expanded) state lives on the details node, NOT on
+        // the summary, so emit the <details> wrapper HERE carrying it — otherwise
+        // the open state is dropped on a round trip. The schema's details node
+        // parses `open` back from the attribute.
+        const open = node.attrs?.open ? " open" : "";
+        return `<details${open}>\n${nodeContent.map(processNode).join("")}</details>`;
+      }
 
       case "detailsSummary":
-        const summaryText = nodeContent.map(processNode).join("");
-        return `<details>\n<summary>${summaryText}</summary>\n`;
+        return `<summary>${nodeContent.map(processNode).join("")}</summary>\n\n`;
 
       case "detailsContent":
-        const detailsText = nodeContent.map(processNode).join("\n");
-        return `${detailsText}\n</details>`;
+        return `${nodeContent.map(processNode).join("\n")}\n`;
 
       case "mathInline": {
         // The schema's `text` attribute has no parseHTML, so TipTap's default
@@ -648,13 +652,16 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // (the divider silently disappeared and could not round-trip).
         return `<div data-type="pageBreak"></div>`;
 
-      case "subpages":
+      case "subpages": {
         // Emit the schema-matching div[data-type="subpages"] so marked passes it
         // through as a block and generateJSON rebuilds the subpages atom. The old
         // `{{SUBPAGES}}` literal had no parseHTML inverse, so on import it stayed
         // as plain text — the embed rendered as the literal "{{SUBPAGES}}" on the
         // page after a round-trip (red-team: subpages round-trip data loss).
-        return `<div data-type="subpages"></div>`;
+        // `data-recursive` carries the recursive toggle so it round-trips too.
+        const recursive = node.attrs?.recursive ? ` data-recursive="true"` : "";
+        return `<div data-type="subpages"${recursive}></div>`;
+      }
 
       case "status": {
         // Inline status pill. The schema reads the label from the element's

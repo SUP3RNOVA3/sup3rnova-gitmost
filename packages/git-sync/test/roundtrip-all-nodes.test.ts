@@ -107,3 +107,35 @@ describe('git-sync converter: every node/mark type survives a Markdown round tri
     });
   }
 });
+
+// A node surviving as the right TYPE is necessary but not sufficient — its
+// attributes must survive too. Each case carries a DISTINCTIVE attribute value
+// (real attr names, verified against the schema) that must reappear after a
+// round trip. This caught `subpages.recursive` and `details.open` being dropped.
+describe('git-sync converter: node ATTRIBUTES survive a Markdown round trip', () => {
+  const ATTR_CASES: Array<{ name: string; doc: any; needles: string[] }> = [
+    { name: 'callout type', doc: doc({ type: 'callout', attrs: { type: 'warning' }, content: [P(T('x'))] }), needles: ['warning'] },
+    { name: 'image dimensions/align/attachmentId', doc: doc({ type: 'image', attrs: { src: '/f/x.png', width: '777', height: '555', align: 'right', attachmentId: 'ATT777' } }), needles: ['777', '555', 'right', 'ATT777'] },
+    { name: 'subpages recursive', doc: doc({ type: 'subpages', attrs: { recursive: true } }), needles: ['"recursive":true'] },
+    { name: 'details open', doc: doc({ type: 'details', attrs: { open: true }, content: [{ type: 'detailsSummary', content: [T('S')] }, { type: 'detailsContent', content: [P(T('b'))] }] }), needles: ['"open":'] },
+    { name: 'mathInline formula', doc: doc(P({ type: 'mathInline', attrs: { text: 'E=mc^7' } })), needles: ['E=mc^7'] },
+    { name: 'mathBlock formula', doc: doc({ type: 'mathBlock', attrs: { text: '\\sum_7' } }), needles: ['sum_7'] },
+    { name: 'pageEmbed sourcePageId', doc: doc({ type: 'pageEmbed', attrs: { sourcePageId: 'PAGE777' } }), needles: ['PAGE777'] },
+    { name: 'video dimensions/attachmentId', doc: doc({ type: 'video', attrs: { src: '/f/v.mp4', width: '888', attachmentId: 'VID888' } }), needles: ['888', 'VID888'] },
+    { name: 'status text/color', doc: doc(P({ type: 'status', attrs: { text: 'InProgress777', color: 'orange' } })), needles: ['InProgress777', 'orange'] },
+    { name: 'mention entityId/label', doc: doc(P({ type: 'mention', attrs: { id: 'M1', label: 'Alice', entityType: 'user', entityId: 'ENT777' } })), needles: ['Alice', 'ENT777'] },
+    { name: 'columns widths', doc: doc({ type: 'columns', content: [{ type: 'column', attrs: { width: '37%' }, content: [P(T('L'))] }, { type: 'column', attrs: { width: '63%' }, content: [P(T('R'))] }] }), needles: ['37%', '63%'] },
+    { name: 'highlight color', doc: doc(P(T('x', [{ type: 'highlight', attrs: { color: '#abcdef' } }]))), needles: ['#abcdef'] },
+  ];
+  for (const { name, doc: original, needles } of ATTR_CASES) {
+    it(`preserves ${name}`, async () => {
+      const md = convertProseMirrorToMarkdown(original);
+      const back = JSON.stringify(await markdownToProseMirror(md));
+      for (const needle of needles) {
+        // The value must survive in the re-imported doc (or in the markdown the
+        // schema parses it back from).
+        expect(`${back} ${md}`).toContain(needle);
+      }
+    });
+  }
+});

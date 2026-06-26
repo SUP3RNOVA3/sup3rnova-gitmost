@@ -99,7 +99,7 @@ const expectedSurface: SurfaceEntry[] = [
   { name: "pdf", kind: "node", attrs: ["attachmentId", "height", "name", "placeholder", "size", "src", "width"] },
   { name: "status", kind: "node", attrs: ["color", "text"] },
   { name: "strike", kind: "mark", attrs: [] },
-  { name: "subpages", kind: "node", attrs: [] },
+  { name: "subpages", kind: "node", attrs: ["recursive"] },
   { name: "subscript", kind: "mark", attrs: [] },
   { name: "superscript", kind: "mark", attrs: [] },
   { name: "table", kind: "node", attrs: [] },

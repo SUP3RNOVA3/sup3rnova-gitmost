@@ -928,6 +928,17 @@ const Subpages = Node.create({
   atom: true,
   defining: true,
   draggable: true,
+  addAttributes() {
+    return {
+      recursive: {
+        default: false,
+        parseHTML: (el: HTMLElement) =>
+          el.getAttribute("data-recursive") === "true",
+        renderHTML: (attrs: Record<string, any>) =>
+          attrs.recursive ? { "data-recursive": "true" } : {},
+      },
+    };
+  },
   parseHTML() {
     return [{ tag: 'div[data-type="subpages"]' }];
   },
