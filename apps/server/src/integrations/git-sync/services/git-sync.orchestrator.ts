@@ -253,8 +253,8 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
    * Drive ONE reconcile cycle for a space. The PULL->PUSH branch choreography
    * lives in the engine's `runCycle` (so it can never drift from the engine it
    * ships with); the orchestrator owns only the lock (its caller) and the
-   * gitmost-specific delete-cap POLICY, injected here as the `resolveApplyClient`
-   * hook.
+   * service binding. There is no delete cap — deletes apply unconditionally (they
+   * are soft/reversible) and every cycle logs what it deleted via `log`.
    */
   private async driveCycle(
     spaceId: string,
@@ -266,7 +266,6 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     const settings = await this.buildSettings(spaceId);
     const vault = await this.vaultRegistry.getVault(spaceId);
     const client = this.dataSource.bind({ workspaceId, userId: serviceUserId });
-    const maxDeletes = this.environmentService.getGitSyncMaxDeletesPerCycle();
 
     const result = await runCycle({
       // Cooperative-abort signal from the per-space lock: if a heartbeat refresh
@@ -284,35 +283,13 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
         mkdir: (absDir) => mkdir(absDir, { recursive: true }).then(() => undefined),
         rm: (absPath) => rm(absPath, { force: true }),
       },
+      // Every cycle logs its full push plan + per-action lines + completion
+      // counts (created/updated/deleted/skipped/failures) through this `log`, so
+      // what was deleted (and what was not) is always recorded. There is no
+      // delete cap: deletes are soft (Trash, reversible), so a blocking limit
+      // only got in the way of legitimate deletes; engine correctness (covered by
+      // the reconcile/layout tests) is what prevents phantom deletions.
       log: (line: string) => this.logger.log(`git-sync[${spaceId}] ${line}`),
-      // DEFENSE-IN-DEPTH delete cap (gitmost-specific policy). A non-convergent
-      // vault (e.g. empty/duplicate titles -> colliding paths) can compute
-      // PHANTOM absence-deletions. When the push's planned delete count exceeds
-      // GIT_SYNC_MAX_DELETES_PER_CYCLE (or planning failed -> Infinity), suppress
-      // deletes by making deletePage THROW: the engine records each as a per-page
-      // failure, which keeps `refs/docmost/last-pushed` from advancing past the
-      // dropped-file commit, so the deletion is RETRIED next cycle rather than
-      // silently dropped (a no-op that resolved would advance the ref and a pull
-      // would then recreate the user's deleted files). See PR #119 review.
-      resolveApplyClient: (plannedDeletes, c) => {
-        if (plannedDeletes <= maxDeletes) return c;
-        this.logger.warn(
-          `git-sync[${spaceId}]: push delete count ${plannedDeletes} exceeds ` +
-            `GIT_SYNC_MAX_DELETES_PER_CYCLE=${maxDeletes}; suppressing deletions ` +
-            `this cycle (possible non-convergence / collision). Investigate vault ` +
-            `layout.`,
-        );
-        return {
-          ...c,
-          deletePage: async () => {
-            throw new Error(
-              'git-sync: delete suppressed this cycle ' +
-                '(over GIT_SYNC_MAX_DELETES_PER_CYCLE) — refs intentionally held ' +
-                'so the deletion is retried, not dropped',
-            );
-          },
-        };
-      },
     });
 
     return { spaceId, ...result };

@@ -1,7 +1,7 @@
 // Unit tests for the git-sync control plane. The engine's `runCycle`
 // (which owns the PULL->PUSH branch choreography) is mocked so we exercise ONLY
 // the orchestrator's wiring: gating, the Redis leader lock + in-process mutex
-// (via SpaceLockService), the delete-cap POLICY it injects as `resolveApplyClient`,
+// (via SpaceLockService),
 // the remote-template substitution in the settings it hands the engine, the
 // external-push ingest, and the idempotent interval lifecycle. The cycle
 // mechanics themselves are covered by the engine's own cycle round-trip spec.
@@ -48,7 +48,6 @@ interface BuildOptions {
   /** Env tunables (only the load-bearing ones are surfaced as overrides). */
   enabled?: boolean;
   serviceUserId?: string | undefined;
-  maxDeletes?: number;
   remoteTemplate?: string | undefined;
   dataDir?: string;
   pollIntervalMs?: number;
@@ -73,7 +72,6 @@ interface Built {
 function build(opts: BuildOptions = {}): Built {
   const {
     enabled = true,
-    maxDeletes = 100,
     remoteTemplate = undefined,
     dataDir = '/vaults',
     pollIntervalMs = 15000,
@@ -87,7 +85,6 @@ function build(opts: BuildOptions = {}): Built {
   const env: Record<string, AnyMock> = {
     isGitSyncEnabled: jest.fn(() => enabled),
     getGitSyncServiceUserId: jest.fn(() => serviceUserId),
-    getGitSyncMaxDeletesPerCycle: jest.fn(() => maxDeletes),
     getGitSyncRemoteTemplate: jest.fn(() => remoteTemplate),
     getGitSyncDataDir: jest.fn(() => dataDir),
     getGitSyncPollIntervalMs: jest.fn(() => pollIntervalMs),
@@ -175,15 +172,6 @@ function build(opts: BuildOptions = {}): Built {
 /** The engine runs a clean cycle by default. */
 function primeEngineHappyPath(): void {
   runCycleMock.mockResolvedValue(OK_CYCLE);
-}
-
-/** Pull the `resolveApplyClient` hook out of the (single) runCycle call args. */
-function lastResolveApplyClient(): (
-  plannedDeletes: number,
-  client: unknown,
-) => unknown {
-  const calls = runCycleMock.mock.calls;
-  return calls[calls.length - 1][0].resolveApplyClient;
 }
 
 beforeEach(() => {
@@ -295,7 +283,6 @@ describe('GitSyncOrchestrator', () => {
       expect(deps.vault).toBe(built.vault);
       expect(deps.client).toBe(built.client);
       expect(deps.settings.vaultPath).toBe('/vaults/space-1');
-      expect(typeof deps.resolveApplyClient).toBe('function');
       // The bound datasource identity is the (workspace, service-user) pair.
       expect(built.dataSource.bind).toHaveBeenCalledWith({
         workspaceId: 'ws-1',
@@ -387,57 +374,6 @@ describe('GitSyncOrchestrator', () => {
       ).rejects.toBeInstanceOf(GitSyncLockHeldError);
       expect(runReceivePack).not.toHaveBeenCalled();
       expect(built.redis.set).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('delete cap (anti-data-loss)', () => {
-    // The cap is now a POLICY the orchestrator injects as runCycle's
-    // `resolveApplyClient` hook; the engine calls it with the dry-run's planned
-    // delete count. We pull the hook out of the runCycle args and exercise it.
-    it('suppresses deletePage (by throwing) when planned deletes exceed the cap', async () => {
-      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-      const built = build({ maxDeletes: 5 });
-      await built.orchestrator.runOnce('space-1', 'ws-1');
-
-      const resolveApplyClient = lastResolveApplyClient();
-      const applyClient = resolveApplyClient(9, built.client) as any;
-      // deletePage is still a function (the engine calls it)...
-      expect(typeof applyClient.deletePage).toBe('function');
-      // ...but it THROWS, so the engine records a per-page failure and holds
-      // `last-pushed` (a resolving no-op would advance past the dropped deletes
-      // and never replay them — PR #119 review). The real deletePage is NOT hit.
-      await expect(applyClient.deletePage('p1')).rejects.toThrow(/suppress/i);
-      expect(built.client.deletePage).not.toHaveBeenCalled();
-      // Creates/updates pass through to the real client.
-      expect(applyClient.createPage).toBe(built.client.createPage);
-    });
-
-    it('fails safe: an Infinity planned-delete count (dry-run failed) is suppressed', async () => {
-      jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
-      const built = build({ maxDeletes: 5 });
-      await built.orchestrator.runOnce('space-1', 'ws-1');
-
-      // runCycle passes Number.POSITIVE_INFINITY when its dry-run planning threw;
-      // Infinity > cap → suppress (same throwing path).
-      const resolveApplyClient = lastResolveApplyClient();
-      const applyClient = resolveApplyClient(
-        Number.POSITIVE_INFINITY,
-        built.client,
-      ) as any;
-      await expect(applyClient.deletePage('p1')).rejects.toThrow(/suppress/i);
-      expect(built.client.deletePage).not.toHaveBeenCalled();
-    });
-
-    it('passes through the original client when planned deletes are within the cap', async () => {
-      const built = build({ maxDeletes: 5 });
-      await built.orchestrator.runOnce('space-1', 'ws-1');
-
-      const resolveApplyClient = lastResolveApplyClient();
-      const applyClient = resolveApplyClient(3, built.client) as any;
-      // The ORIGINAL client is used (deletePage forwards to the real one).
-      expect(applyClient).toBe(built.client);
-      await applyClient.deletePage('p1');
-      expect(built.client.deletePage).toHaveBeenCalledWith('p1');
     });
   });
 

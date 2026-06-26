@@ -209,12 +209,6 @@ export class EnvironmentVariables {
   @IsString()
   GIT_SYNC_BACKEND_TIMEOUT_MS: string;
 
-  // Defense-in-depth absolute cap on soft-deletes per push cycle (default 5): a
-  // non-convergent / phantom-absence cycle can never trash more than this many
-  // pages without an explicit override. Optional int (validated as a string env).
-  @IsOptional()
-  @IsString()
-  GIT_SYNC_MAX_DELETES_PER_CYCLE: string;
 
   // Required when git-sync is enabled: the service user create/move/rename/delete
   // are attributed to (issue #194 §7.2). Optional otherwise.
