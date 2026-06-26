@@ -92,6 +92,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer froze on the previous step's authoritative usage; the current step's
   estimate is combined per-component with `max`, so the count rises smoothly and
   never jumps backwards. (#163)
+- **AI chat: "New chat" pressed during the first turn's stream now resets the
+  thread instead of leaving the old turn streaming.** While a brand-new,
+  not-yet-adopted chat streamed its first turn, hitting "New chat" left
+  `activeChatId === null` (a no-op for the atom), so the reconciler never
+  remounted and the in-flight thread kept streaming behind the fresh one — and a
+  late refetch / late `onFinish` from that abandoned thread could yank the user
+  back into the chat they just left. "New chat" now forces a fresh empty thread
+  unconditionally and the finished thread's mount key is checked so a late
+  callback from an abandoned thread no longer adopts or re-arms the fallback.
+  (#161)
 
 ## [0.93.0] - 2026-06-21
 

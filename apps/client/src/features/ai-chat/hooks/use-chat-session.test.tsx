@@ -120,16 +120,40 @@ describe("useChatSession", () => {
     expect(setActiveChatId).not.toHaveBeenCalledWith("new");
   });
 
-  it("startNewChat while already in a new chat: cancelPendingAdoption stops a late refetch adopting the failed chat", () => {
-    // The Warning path the render-phase reconciler can't catch: pressing "New
-    // chat" while already in a new chat keeps activeChatId === null (a no-op for
-    // the atom), so only the explicit cancelPendingAdoption() disarms.
+  it("cancelPendingAdoption (selectChat) disarms a late refetch from adopting the just-failed chat", () => {
+    // cancelPendingAdoption is the explicit disarm the window calls from
+    // selectChat: switching to a chat whose id == null is a no-op for the atom, so
+    // the render-phase reconciler never fires and only this call disarms an armed
+    // error-path fallback. (startNewChat no longer routes through here — it calls
+    // startFreshThread, covered by the next test — but cancelPendingAdoption still
+    // backs selectChat, so this guard must hold.)
     const { result, rerender, setActiveChatId } = setup({
       activeChatId: null,
       chats: { items: [{ id: "x" }] },
     });
     result.current.onTurnFinished(undefined); // first turn failed → arm (before=["x"])
-    result.current.cancelPendingAdoption(); // window calls this from startNewChat
+    result.current.cancelPendingAdoption(); // window calls this from selectChat
+    // The just-failed row lands in a late refetch; it must NOT be adopted.
+    rerender({
+      activeChatId: null,
+      chats: { items: [{ id: "x" }, { id: "failed" }] },
+    });
+    expect(setActiveChatId).not.toHaveBeenCalledWith("failed");
+  });
+
+  it("#161: startFreshThread disarms the armed error-path fallback (New chat during the first turn)", () => {
+    // Pressing "New chat" while already in a not-yet-adopted new chat keeps
+    // activeChatId === null, so the render-phase reconciler never fires. The
+    // window now calls startFreshThread() (NOT cancelPendingAdoption) to force a
+    // fresh thread; this test pins the load-bearing fact that startFreshThread
+    // ALSO nulls pendingNewChatRef, so a late refetch of the just-failed row can't
+    // yank the user back into the abandoned chat.
+    const { result, rerender, setActiveChatId } = setup({
+      activeChatId: null,
+      chats: { items: [{ id: "x" }] },
+    });
+    result.current.onTurnFinished(undefined); // first turn failed → arm (before=["x"])
+    act(() => result.current.startFreshThread()); // "New chat" → fresh thread + disarm
     // The just-failed row lands in a late refetch; it must NOT be adopted.
     rerender({
       activeChatId: null,
