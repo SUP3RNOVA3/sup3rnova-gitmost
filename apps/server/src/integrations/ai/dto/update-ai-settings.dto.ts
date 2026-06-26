@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString } from 'class-validator';
+import { IsIn, IsInt, IsOptional, IsString, Min } from 'class-validator';
 import {
   AI_DRIVERS,
   AiDriver,
@@ -28,6 +28,13 @@ export class UpdateAiSettingsDto {
   @IsOptional()
   @IsIn(CHAT_API_STYLES)
   chatApiStyle?: ChatApiStyle;
+
+  // Chat model context-window size in tokens (header context-badge denominator).
+  // 0 (or empty) clears the limit so the badge shows only the current context.
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  chatContextWindow?: number;
 
   @IsOptional()
   @IsString()

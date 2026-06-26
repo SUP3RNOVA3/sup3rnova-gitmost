@@ -23,6 +23,9 @@ export interface IAiSettings {
   driver?: AiDriver;
   chatModel?: string;
   chatApiStyle?: ChatApiStyle;
+  // Chat model context-window size (tokens); shown as the "max" in the chat
+  // header context badge. 0/unset = no limit (badge shows the current size only).
+  chatContextWindow?: number;
   // Cheap model id for the anonymous public-share assistant; empty = chatModel.
   publicShareChatModel?: string;
   // Agent-role id whose persona the public-share assistant adopts; empty =
@@ -57,6 +60,8 @@ export interface IAiSettingsUpdate {
   driver?: AiDriver;
   chatModel?: string;
   chatApiStyle?: ChatApiStyle;
+  // Chat model context-window size (tokens); 0 clears the limit.
+  chatContextWindow?: number;
   publicShareChatModel?: string;
   // Agent-role id whose persona the public-share assistant adopts; empty =
   // built-in locked persona.

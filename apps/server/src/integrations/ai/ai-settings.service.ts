@@ -27,6 +27,8 @@ export interface UpdateAiSettingsInput {
   driver?: AiDriver;
   chatModel?: string;
   chatApiStyle?: ChatApiStyle;
+  // Chat context-window size (tokens); 0/empty clears the limit.
+  chatContextWindow?: number;
   embeddingModel?: string;
   baseUrl?: string;
   embeddingBaseUrl?: string;
@@ -162,6 +164,8 @@ export class AiSettingsService {
       chatModel: provider.chatModel,
       // Plain passthrough; getChatModel defaults unset to 'openai-compatible'.
       chatApiStyle: provider.chatApiStyle,
+      // Admin-configured context-window size; 0/unset = no limit (badge denominator).
+      chatContextWindow: provider.chatContextWindow,
       // Cheap model id for the anonymous public-share assistant; reuses the chat
       // driver/baseUrl/apiKey. Empty/unset → callers fall back to chatModel.
       publicShareChatModel: provider.publicShareChatModel,
@@ -244,6 +248,7 @@ export class AiSettingsService {
       driver: provider.driver,
       chatModel: provider.chatModel,
       chatApiStyle: provider.chatApiStyle,
+      chatContextWindow: provider.chatContextWindow,
       embeddingModel: provider.embeddingModel,
       baseUrl: provider.baseUrl,
       embeddingBaseUrl: provider.embeddingBaseUrl,

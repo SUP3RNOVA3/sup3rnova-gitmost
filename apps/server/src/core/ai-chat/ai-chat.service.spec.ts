@@ -292,6 +292,26 @@ describe('flushAssistant', () => {
     expect(f.metadata.contextTokens).toBe(15);
   });
 
+  it('completed: writes maxContextTokens when the model limit is > 0', () => {
+    const f = flushAssistant([toolStep], '', 'completed', {
+      contextTokens: 15,
+      maxContextTokens: 200_000,
+    });
+    expect(f.metadata.maxContextTokens).toBe(200_000);
+  });
+
+  it('omits maxContextTokens when the limit is unset or 0', () => {
+    const unset = flushAssistant([toolStep], '', 'completed', {
+      contextTokens: 15,
+    });
+    expect('maxContextTokens' in unset.metadata).toBe(false);
+    const zero = flushAssistant([toolStep], '', 'completed', {
+      contextTokens: 15,
+      maxContextTokens: 0,
+    });
+    expect('maxContextTokens' in zero.metadata).toBe(false);
+  });
+
   it('error: records the error and a derived finishReason', () => {
     const f = flushAssistant([], 'partial answer', 'error', { error: 'boom' });
     expect(f.status).toBe('error');

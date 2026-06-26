@@ -35,6 +35,13 @@ export interface AiProviderSettings {
   // Chat provider implementation for the `openai` driver. Unset → defaults to
   // 'openai-compatible' (so reasoning is surfaced by default). See ChatApiStyle.
   chatApiStyle?: ChatApiStyle;
+  // Admin-configured chat model context-window size, in tokens. There is no
+  // provider-independent way to discover this (OpenAI's /v1/models usually omits
+  // it, Gemini/Ollama/OpenRouter each expose it differently), so it is entered
+  // manually. Surfaced to the chat client (via assistant message metadata) as the
+  // denominator of the header "current / max" context badge. Empty/0 = no limit
+  // known → the badge shows only the current context size.
+  chatContextWindow?: number;
   embeddingModel?: string;
   baseUrl?: string;
   // Embedding-specific base URL. Falls back to `baseUrl` when empty/unset.
@@ -73,6 +80,7 @@ export const PROVIDER_SETTINGS_KEYS = [
   'driver',
   'chatModel',
   'chatApiStyle',
+  'chatContextWindow',
   'embeddingModel',
   'baseUrl',
   'embeddingBaseUrl',
@@ -98,6 +106,10 @@ export const PROVIDER_SETTINGS_KEYS = [
 export interface ResolvedAiConfig extends Partial<AiProviderSettings> {
   driver?: AiDriver;
   chatModel?: string;
+  // Admin-configured chat context-window size (tokens); 0/unset = no limit. Used
+  // as the header context-badge denominator. Re-declared for parity with the
+  // explicit fields above.
+  chatContextWindow?: number;
   // Cheap model id for the public-share assistant; reuses the chat creds.
   publicShareChatModel?: string;
   // Agent-role id whose persona the public-share assistant adopts (empty/unset
@@ -117,6 +129,8 @@ export interface MaskedAiSettings {
   driver?: AiDriver;
   chatModel?: string;
   chatApiStyle?: ChatApiStyle;
+  // Admin-configured chat context-window size (tokens); 0/unset = no limit.
+  chatContextWindow?: number;
   embeddingModel?: string;
   baseUrl?: string;
   embeddingBaseUrl?: string;

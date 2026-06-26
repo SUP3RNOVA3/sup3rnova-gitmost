@@ -21,6 +21,7 @@ export const AI_PROVIDER_SETTINGS_ALLOWED: readonly string[] = [
   'driver',
   'chatModel',
   'chatApiStyle',
+  'chatContextWindow',
   'embeddingModel',
   'baseUrl',
   'embeddingBaseUrl',

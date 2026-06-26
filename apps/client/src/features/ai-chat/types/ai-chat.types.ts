@@ -113,9 +113,14 @@ export interface IAiChatMessageRow {
     };
     // Current context size for the turn = final-step (input+output) tokens, i.e.
     // how much the conversation occupies in the model's context window after this
-    // turn. Distinct from `usage` (legacy cumulative totalUsage). Shown in the
-    // floating window's header badge.
+    // turn. Distinct from `usage` (legacy cumulative totalUsage). Shown as the
+    // numerator of the floating window's "current / max" header badge.
     contextTokens?: number;
+    // The model's context-window size (tokens), admin-configured in AI settings
+    // and stamped onto the turn server-side. The denominator of the header badge.
+    // Absent/0 (older rows, or no limit configured) → the badge hides the
+    // denominator and shows only the current context size (`contextTokens`).
+    maxContextTokens?: number;
     // Set on an assistant row whose turn ended in a provider/stream error; the
     // raw provider error text (e.g. "402: ...") for inline display in the thread.
     error?: string;

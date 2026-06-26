@@ -7,6 +7,7 @@ import {
   Button,
   Group,
   Modal,
+  NumberInput,
   Paper,
   PasswordInput,
   Select,
@@ -85,6 +86,9 @@ const formSchema = z.object({
   chatModel: z.string(),
   // Chat provider implementation (reasoning surfacing). Default openai-compatible.
   chatApiStyle: z.enum(["openai-compatible", "openai"]),
+  // Model context-window size (tokens) shown as the chat header badge's "max".
+  // Empty string = no limit (NumberInput emits "" when cleared).
+  chatContextWindow: z.union([z.number(), z.literal("")]),
   // Cheap model id for the anonymous public-share assistant; empty = use chatModel.
   publicShareChatModel: z.string(),
   // Agent-role id whose persona the public-share assistant adopts; empty =
@@ -312,6 +316,7 @@ export default function AiProviderSettings() {
     initialValues: {
       chatModel: "",
       chatApiStyle: "openai-compatible" as ChatApiStyle,
+      chatContextWindow: "" as number | "",
       publicShareChatModel: "",
       publicShareAssistantRoleId: "",
       embeddingModel: "",
@@ -335,6 +340,10 @@ export default function AiProviderSettings() {
     form.setValues({
       chatModel: settings.chatModel ?? "",
       chatApiStyle: settings.chatApiStyle ?? "openai-compatible",
+      // 0/unset = no limit → show an empty field (not a literal "0").
+      chatContextWindow: settings.chatContextWindow
+        ? settings.chatContextWindow
+        : "",
       publicShareChatModel: settings.publicShareChatModel ?? "",
       publicShareAssistantRoleId: settings.publicShareAssistantRoleId ?? "",
       embeddingModel: settings.embeddingModel ?? "",
@@ -365,6 +374,11 @@ export default function AiProviderSettings() {
       driver: "openai",
       chatModel: values.chatModel,
       chatApiStyle: values.chatApiStyle,
+      // Empty → 0, which clears the limit server-side (badge shows current only).
+      chatContextWindow:
+        typeof values.chatContextWindow === "number"
+          ? values.chatContextWindow
+          : 0,
       // Cheap model id for the anonymous public-share assistant; empty falls
       // back to chatModel server-side.
       publicShareChatModel: values.publicShareChatModel,
@@ -783,6 +797,22 @@ export default function AiProviderSettings() {
           allowDeselect={false}
           disabled={isLoading}
           {...form.getInputProps("chatApiStyle")}
+        />
+
+        <NumberInput
+          mt="sm"
+          label={t("Context window (tokens)")}
+          description={t(
+            "Shows used / total in the chat header badge; empty hides the total.",
+          )}
+          placeholder={t("e.g. 200000")}
+          min={0}
+          step={1000}
+          allowDecimal={false}
+          allowNegative={false}
+          thousandSeparator=" "
+          disabled={isLoading}
+          {...form.getInputProps("chatContextWindow")}
         />
 
         {/* Anonymous public-share assistant: a single master toggle + an

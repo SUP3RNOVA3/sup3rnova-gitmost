@@ -616,6 +616,9 @@ export class AiChatService implements OnModuleInit {
               contextTokens:
                 (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0) ||
                 undefined,
+              // Admin-configured context-window size for this model (badge max).
+              // Resolved once per turn above; written to metadata only when > 0.
+              maxContextTokens: resolved?.chatContextWindow,
             }),
           );
           // Lifecycle: release the external MCP clients leased for this turn.
@@ -1223,6 +1226,10 @@ export function flushAssistant(
     finishReason?: string;
     usage?: ChatStreamUsage | StreamUsage | undefined;
     contextTokens?: number;
+    // Admin-configured context-window size (tokens) for this turn's model; the
+    // denominator of the client's "current / max" header badge. Written only
+    // when > 0 (0/unset = no limit known → the badge shows current only).
+    maxContextTokens?: number;
     error?: string;
   },
 ): AssistantFlush {
@@ -1253,6 +1260,9 @@ export function flushAssistant(
       normalizeStreamUsage(extra.usage as StreamUsage) ?? extra.usage;
   }
   if (extra?.contextTokens) metadata.contextTokens = extra.contextTokens;
+  if (extra?.maxContextTokens && extra.maxContextTokens > 0) {
+    metadata.maxContextTokens = extra.maxContextTokens;
+  }
   if (extra?.error) metadata.error = extra.error;
 
   return {
