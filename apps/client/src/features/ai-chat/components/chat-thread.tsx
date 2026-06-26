@@ -182,9 +182,12 @@ export default function ChatThread({
   // LOCAL state so it is scoped to this conversation: it is cleared when the user
   // deliberately switches chat / starts a new chat (the parent remounts this via
   // `key`), but it SURVIVES in-place new-chat id adoption (no remount), so a
-  // message queued during a brand-new chat's first turn is not lost. On Stop or
-  // error the queue is intentionally preserved (onFinish does not fire then) so
-  // the user decides what to do with the pending messages.
+  // message queued during a brand-new chat's first turn is not lost. On a normal
+  // Stop / disconnect / error the queue is intentionally preserved (onFinish DOES
+  // fire on those — see the abort/disconnect/error branches below — but it leaves
+  // the queue intact) so the user decides what to do with the pending messages.
+  // The one exception is a deliberate "Send now" (which itself calls stop()): its
+  // abort branch in onFinish flushes the message it promoted to the head.
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
   // Mirror the queue in a ref so the `onFinish` flush always reads the latest
   // queue without a stale closure; `setQueue` updates BOTH the ref and the state.
@@ -316,6 +319,13 @@ export default function ChatThread({
   // Keep the flush helper pointed at the latest sendMessage instance.
   sendMessageRef.current = sendMessage;
 
+  // Mirror the live turn status in a ref so event handlers (sendNow) branch on the
+  // CURRENT status rather than a value captured in a stale render closure — a turn
+  // can finish between render and click, and arming the interrupt refs against a
+  // no-op stop() would leave them set to leak into a later, unrelated Stop.
+  const statusRef = useRef(status);
+  statusRef.current = status;
+
   // EARLY chat-id adoption (#174): the server streams the authoritative chat id
   // on the assistant message metadata at the `start` chunk (message.metadata.
   // chatId — see adopt-chat-id.ts / chatStreamMetadata). Forward it to the parent
@@ -352,7 +362,12 @@ export default function ChatThread({
   // after the new turn finishes.
   const sendNow = useCallback(
     (id: string) => {
-      if (isStreaming) {
+      // Branch on the LIVE status (statusRef), not the closure-captured isStreaming:
+      // the turn may have finished between render and click, in which case stop()
+      // is a no-op and arming the interrupt refs would strand them for a later turn.
+      const liveStreaming =
+        statusRef.current === "submitted" || statusRef.current === "streaming";
+      if (liveStreaming) {
         // Promote the chosen message to the head so the existing onFinish→flushNext
         // sends exactly it, then interrupt: the abort triggers onFinish below.
         setQueue(promoteToHead(queuedRef.current, id));
@@ -367,7 +382,7 @@ export default function ChatThread({
         sendMessageRef.current?.({ text: msg.text });
       }
     },
-    [isStreaming, setQueue, stop],
+    [setQueue, stop],
   );
 
   // Clear the stopped marker as soon as a new turn begins streaming, and drop any
