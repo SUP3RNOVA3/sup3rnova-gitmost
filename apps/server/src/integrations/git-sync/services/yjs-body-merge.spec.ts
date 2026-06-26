@@ -194,6 +194,125 @@ describe('yjs-body-merge', () => {
     });
   });
 
+  // Regression: start-of-document content duplicating on every two-way sync.
+  //
+  // The LIVE Docmost doc stamps a per-block UniqueID on every heading/paragraph;
+  // a body arriving FROM git is parsed from clean markdown and carries NO block
+  // ids. If the merge comparison key includes that `id`, an unchanged live block
+  // never matches the SAME block coming from git, so the three-way merge cannot
+  // anchor on it — and an incoming block with no anchor (content inserted at the
+  // TOP of the page) is RE-ADDED on every cycle, an unbounded duplication loop.
+  // These tests model that exact id-asymmetry and assert the reconciliation is
+  // IDEMPOTENT (no block growth). They are RED before excluding `id` from the
+  // key in `serializeXmlNode`.
+  describe('idempotent reconciliation with live block ids (start-of-doc dup)', () => {
+    // Build a fragment from block specs. `id` is set only when provided, mirroring
+    // the live doc (ids present) vs a git-parsed body (ids absent).
+    type Spec = { tag: 'heading' | 'paragraph'; text: string; id?: string };
+    function buildDoc(doc: Y.Doc, specs: Spec[]): Y.XmlFragment {
+      const frag = doc.getXmlFragment('default');
+      const blocks = specs.map((s) => {
+        const el = new Y.XmlElement(s.tag);
+        if (s.id) el.setAttribute('id', s.id);
+        if (s.tag === 'heading') el.setAttribute('level', '2');
+        const t = new Y.XmlText();
+        if (s.text) t.insert(0, s.text);
+        el.insert(0, [t]);
+        return el;
+      });
+      if (blocks.length) frag.insert(0, blocks);
+      return frag;
+    }
+    const textsOf = (frag: Y.XmlFragment): string[] =>
+      frag.toArray().map((el) =>
+        (el as Y.XmlElement)
+          .toArray()
+          .map((c) => (c as Y.XmlText).toString())
+          .join(''),
+      );
+
+    it('re-merging the SAME git body does NOT re-add the top block (idempotent)', () => {
+      // last-synced base (from git markdown): NO block ids.
+      const base = new Y.Doc();
+      const baseFrag = buildDoc(base, [
+        { tag: 'heading', text: 'Title' },
+        { tag: 'paragraph', text: 'Some paragraph.' },
+        { tag: 'paragraph', text: 'End block.' },
+      ]);
+      // live Docmost doc: SAME content, but every block carries a UniqueID.
+      const live = new Y.Doc();
+      const liveFrag = buildDoc(live, [
+        { tag: 'heading', text: 'Title', id: 'ida' },
+        { tag: 'paragraph', text: 'Some paragraph.', id: 'idb' },
+        { tag: 'paragraph', text: 'End block.', id: 'idc' },
+      ]);
+      // incoming git body: the user inserted a heading at the very TOP.
+      const buildTarget = (): Y.XmlFragment =>
+        buildDoc(new Y.Doc(), [
+          { tag: 'heading', text: 'TOPDUP' },
+          { tag: 'heading', text: 'Title' },
+          { tag: 'paragraph', text: 'Some paragraph.' },
+          { tag: 'paragraph', text: 'End block.' },
+        ]);
+
+      // First sync: the top block is added once.
+      live.transact(() =>
+        mergeXmlFragments3Way(liveFrag, buildTarget(), baseFrag),
+      );
+      expect(textsOf(liveFrag)).toEqual([
+        'TOPDUP',
+        'Title',
+        'Some paragraph.',
+        'End block.',
+      ]);
+
+      // Subsequent sync of the SAME git body against the SAME base must be a
+      // NO-OP — not a second copy of the top block. Before the fix this re-adds
+      // 'TOPDUP', growing the doc on every cycle.
+      live.transact(() =>
+        mergeXmlFragments3Way(liveFrag, buildTarget(), baseFrag),
+      );
+      expect(textsOf(liveFrag)).toEqual([
+        'TOPDUP',
+        'Title',
+        'Some paragraph.',
+        'End block.',
+      ]);
+      expect(textsOf(liveFrag).filter((t) => t === 'TOPDUP')).toHaveLength(1);
+    });
+
+    it('an unchanged git body (live ids, none in git) is a complete no-op', () => {
+      // base == git body (no pending git change); live is the same content with
+      // ids. With `id` in the key the whole body looks rewritten; the merge must
+      // still leave live byte-identical (block instances untouched).
+      const base = new Y.Doc();
+      const baseFrag = buildDoc(base, [
+        { tag: 'heading', text: 'Title' },
+        { tag: 'paragraph', text: 'Body.' },
+      ]);
+      const live = new Y.Doc();
+      const liveFrag = buildDoc(live, [
+        { tag: 'heading', text: 'Title', id: 'ida' },
+        { tag: 'paragraph', text: 'Body.', id: 'idb' },
+      ]);
+      const before = liveFrag.toArray();
+      let applied = -1;
+      live.transact(() => {
+        applied = mergeXmlFragments3Way(
+          liveFrag,
+          buildDoc(new Y.Doc(), [
+            { tag: 'heading', text: 'Title' },
+            { tag: 'paragraph', text: 'Body.' },
+          ]),
+          baseFrag,
+        );
+      });
+      expect(applied).toBe(0);
+      // Same live block instances (ids preserved) — nothing recreated.
+      expect(liveFrag.toArray()).toEqual(before);
+    });
+  });
+
   describe('cloneXmlNode', () => {
     it('preserves text marks (XmlText delta) across docs', () => {
       const src = new Y.Doc();

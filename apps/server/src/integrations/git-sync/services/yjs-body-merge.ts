@@ -27,9 +27,38 @@ import { buildLcsTable } from './lcs';
 type XmlNode = Y.XmlElement | Y.XmlText | Y.XmlHook;
 
 /**
+ * Node attributes that are VOLATILE identity (not content) and so must be
+ * excluded from the block comparison key.
+ *
+ * `id` is the per-block UniqueID the editor stamps on every heading/paragraph
+ * (and transclusionSource). It exists ONLY in the live Yjs document — a body
+ * arriving from git is parsed from clean markdown, which carries no block ids
+ * (`markdownToProseMirror` materializes `id: null`, which the Yjs transform then
+ * drops). If `id` were part of the key, an UNCHANGED live block (id "abc123")
+ * would never match the SAME block coming from git (no id), so the three-way
+ * merge's LCS could not anchor on it. The merge would then treat every live
+ * block as deleted-and-reinserted and, when an incoming block has no matching
+ * anchor (e.g. content inserted at the very TOP of the page), RE-ADD a copy of
+ * it on every sync cycle — a non-convergent, unbounded duplication loop
+ * (start-of-document content duplicating each push/pull cycle).
+ *
+ * Excluding `id` makes blocks compare by CONTENT, so an unchanged block matches
+ * across the git round-trip and the reconciliation is idempotent. Block identity
+ * is still preserved in the merged output: `diff3Plan` keeps the LIVE block
+ * INSTANCE (with its id) for an anchor — picks are by index, not by key — so the
+ * stable Yjs block (and any in-flight human edit on it) stays put. This mirrors
+ * `canonicalize.ts`, which already strips the regenerated block `id` from the
+ * round-trip idempotency comparison for exactly the same reason.
+ */
+const VOLATILE_KEY_ATTRS = new Set(['id']);
+
+/**
  * Canonical, comparable serialization of a Yjs XML node (structure + text +
  * marks + attributes), with attribute keys sorted so equal blocks always produce
- * an identical string regardless of attribute insertion order.
+ * an identical string regardless of attribute insertion order. The volatile
+ * block `id` (see `VOLATILE_KEY_ATTRS`) is excluded at every level so a block
+ * compares equal by CONTENT across the git round-trip (which carries no ids) —
+ * keeping the merge anchor-able and idempotent.
  */
 export function serializeXmlNode(node: unknown): unknown {
   if (node instanceof Y.XmlText) {
@@ -38,7 +67,10 @@ export function serializeXmlNode(node: unknown): unknown {
   if (node instanceof Y.XmlElement) {
     const attrs = node.getAttributes() as Record<string, unknown>;
     const sorted: Record<string, unknown> = {};
-    for (const k of Object.keys(attrs).sort()) sorted[k] = attrs[k];
+    for (const k of Object.keys(attrs).sort()) {
+      if (VOLATILE_KEY_ATTRS.has(k)) continue;
+      sorted[k] = attrs[k];
+    }
     return {
       n: node.nodeName,
       a: sorted,
