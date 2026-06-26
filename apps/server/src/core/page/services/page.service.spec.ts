@@ -3,6 +3,22 @@ import { PageService } from './page.service';
 import { MovePageDto } from '../dto/move-page.dto';
 import { Page } from '@docmost/db/types/entity.types';
 
+// A permissive chainable Proxy stands in for the locked Kysely trx so the
+// FOR-UPDATE lock query chains inside executeTx(this.db, ...) resolve. Shared by
+// every spec that drives a transactional write (movePage cycle guard, movePage
+// provenance, movePageToSpace).
+const makeChain = () => {
+  const c: any = new Proxy(function () {}, {
+    get: (_t, p) =>
+      p === 'then'
+        ? undefined
+        : p === 'execute' || p === 'executeTakeFirst'
+          ? () => Promise.resolve([])
+          : () => c,
+  });
+  return c;
+};
+
 // Direct instantiation with stub deps. The Test.createTestingModule form failed
 // to resolve the @InjectKysely()/@InjectQueue() tokens at compile(), and this
 // smoke test only needs the service to construct.
@@ -39,22 +55,8 @@ describe('PageService', () => {
     // Build a PageService whose pageRepo (findById/updatePage) and own
     // getPageBreadCrumbs are mockable, while every other collaborator stays a
     // bare stub. We only need to drive the three cycle-guard branches, so we
-    // mock minimally rather than standing up the whole DI graph.
-    // A permissive chainable Proxy stands in for the Kysely trx so the
-    // FOR-UPDATE lock query chain inside the transaction resolves. Mirrors the
-    // pattern used by the movePageToSpace() spec below.
-    const makeChain = () => {
-      const c: any = new Proxy(function () {}, {
-        get: (_t, p) =>
-          p === 'then'
-            ? undefined
-            : p === 'execute' || p === 'executeTakeFirst'
-              ? () => Promise.resolve([])
-              : () => c,
-      });
-      return c;
-    };
-
+    // mock minimally rather than standing up the whole DI graph. The trx stub
+    // comes from the shared module-level `makeChain` helper.
     const makeService = (overrides?: {
       breadcrumbs?: Array<{ id: string }>;
     }) => {
@@ -78,7 +80,7 @@ describe('PageService', () => {
       // trxStub is the value handed to the callback (the locked transaction).
       const trxStub = makeChain();
       const db = {
-        transaction: () => ({ execute: (fn: any) => fn(trxStub) }),
+        transaction: jest.fn(() => ({ execute: (fn: any) => fn(trxStub) })),
       };
 
       const svc = new PageService(
@@ -103,7 +105,7 @@ describe('PageService', () => {
         .spyOn(svc, 'getPageBreadCrumbs')
         .mockResolvedValue((overrides?.breadcrumbs ?? []) as any);
 
-      return { svc, pageRepo, eventEmitter, trxStub };
+      return { svc, pageRepo, eventEmitter, trxStub, db };
     };
 
     // movePage takes `movedPage` as a param. Keep its parentPageId distinct from
@@ -208,6 +210,26 @@ describe('PageService', () => {
       // The update is written inside the same transaction (trx is the 3rd arg).
       expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
       expect(pageRepo.updatePage.mock.calls[0][2]).toBe(trxStub);
+    });
+
+    it('moves a page to root WITHOUT a transaction (no cycle possible)', async () => {
+      // A move-to-root (parentPageId === null) can never create a cycle, so it
+      // takes the unlocked else-branch: updatePage runs with NO trx and the
+      // db.transaction() serialization path is skipped entirely.
+      const { svc, pageRepo, db } = makeService();
+      const dto: MovePageDto = {
+        pageId: 'page-1',
+        position: VALID_POSITION,
+        parentPageId: null,
+      };
+
+      await expect(svc.movePage(dto, makeMovedPage())).resolves.not.toThrow();
+
+      // No FOR-UPDATE serialization: the transaction was never opened.
+      expect(db.transaction).not.toHaveBeenCalled();
+      // The update is written outside any transaction (3rd arg is undefined).
+      expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+      expect(pageRepo.updatePage.mock.calls[0][2]).toBeUndefined();
     });
   });
 
@@ -323,18 +345,7 @@ describe('PageService', () => {
     describe('movePage() → updatePage', () => {
       const VALID_POSITION = 'a0';
       // Re-parenting under a concrete parent runs through executeTx(this.db, ...);
-      // a permissive chainable Proxy stands in for the locked Kysely trx.
-      const makeChain = () => {
-        const c: any = new Proxy(function () {}, {
-          get: (_t, p) =>
-            p === 'then'
-              ? undefined
-              : p === 'execute' || p === 'executeTakeFirst'
-                ? () => Promise.resolve([])
-                : () => c,
-        });
-        return c;
-      };
+      // the shared `makeChain` helper stands in for the locked Kysely trx.
       const run = async (provenance: any) => {
         const pageRepo = {
           findById: jest.fn().mockResolvedValue({
@@ -395,20 +406,9 @@ describe('PageService', () => {
 
     describe('movePageToSpace() → root-page updatePage', () => {
       // movePageToSpace runs its writes inside executeTx(this.db, cb), which
-      // calls this.db.transaction().execute(fn => fn(trx)). A permissive
-      // chainable Proxy stands in for the Kysely trx so arbitrary chains resolve.
-      const makeChain = () => {
-        const c: any = new Proxy(function () {}, {
-          get: (_t, p) =>
-            p === 'then'
-              ? undefined
-              : p === 'execute' || p === 'executeTakeFirst'
-                ? () => Promise.resolve([])
-                : () => c,
-        });
-        return c;
-      };
-
+      // calls this.db.transaction().execute(fn => fn(trx)). The shared
+      // `makeChain` helper stands in for the Kysely trx so arbitrary chains
+      // resolve.
       const run = async (provenance: any) => {
         const trxStub = makeChain();
         const db = {

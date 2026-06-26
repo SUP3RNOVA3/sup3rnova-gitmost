@@ -939,8 +939,12 @@ export class PageService {
       // against the now-committed state.
       updateResult = await executeTx(this.db, async (trx) => {
         // Both opposing moves touch the same two rows {pageId, parentPageId};
-        // a fixed lock order forces one to wait for the other to commit.
-        const lockIds = [dto.pageId, parentPageId].sort();
+        // a fixed lock order forces one to wait for the other to commit. Lock by
+        // canonical UUIDs — `dto.pageId` can be a slugId (MovePageDto.pageId is a
+        // bare @IsString), so two opposing moves passing slugIds could sort into
+        // different lock orders and deadlock (AB-BA). `movedPage.id` is the
+        // resolved row UUID, matching `parentPageId`.
+        const lockIds = [movedPage.id, parentPageId].sort();
         for (const id of lockIds) {
           await this.pageRepo.findById(id, { withLock: true, trx });
         }

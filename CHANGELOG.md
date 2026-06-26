@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Footnote multi-backlinks.** A footnote referenced more than once now shows a
   back-link per reference (↩ a b c …), each scrolling to its own occurrence, like
   Pandoc/Wikipedia; a single-reference footnote keeps the plain ↩. (#168)
+- **Model-friendly AI-chat tool-input errors.** When the model calls an in-app
+  AI tool with bad arguments, the validation failure is now a concise,
+  human-readable message that NAMES each offending parameter (by its dotted
+  path) and appends a fixed retry hint ("include every REQUIRED parameter…, do
+  not drop ids like `pageId`"), instead of the raw zod text. This nudges the
+  model to re-issue the call correctly — particularly in parallel tool-call
+  batches where it tends to drop a repeated id. The required/optional contract
+  and unknown-key stripping are unchanged. (#190)
 
 ### Changed
 
@@ -92,6 +100,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer froze on the previous step's authoritative usage; the current step's
   estimate is combined per-component with `max`, so the count rises smoothly and
   never jumps backwards. (#163)
+- **Concurrent page moves can no longer lose a subtree to a cycle.** Two
+  opposing re-parents racing each other (A: X under Y, B: Y under X) could each
+  pass a cycle check built from a stale snapshot and commit a cycle, orphaning a
+  subtree. A genuine re-parent under a concrete parent now serializes: it locks
+  the moved page and the destination parent `FOR UPDATE` in a canonical
+  (UUID-sorted) order — so opposing moves can't deadlock — and re-runs the cycle
+  check INSIDE the transaction against the now-committed state. Same-parent
+  reorders and moves to root keep the lock-free path. (#159)
 
 ## [0.93.0] - 2026-06-21
 

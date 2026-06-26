@@ -78,6 +78,29 @@ describe('modelFriendlyInput', () => {
     );
   });
 
+  it('de-duplicates a parameter that produces MULTIPLE issues on the same path', async () => {
+    // A single field can fail several zod checks at once (here min-length AND a
+    // regex), yielding two issues with the SAME path. The friendly message must
+    // name that parameter only once (the `seen` dedup branch).
+    const multiIssueShape = {
+      code: z
+        .string()
+        .min(5)
+        .regex(/^[0-9]+$/),
+    };
+    const schema = modelFriendlyInput(
+      multiIssueShape,
+    ) as unknown as SchemaLike;
+    // "ab" violates BOTH the min(5) and the digit-only regex.
+    const result = await schema.validate!({ code: 'ab' });
+
+    expect(result.success).toBe(false);
+    const message = result.error?.message ?? '';
+    // The parameter name appears exactly once despite two underlying issues.
+    const occurrences = message.split('parameter "code"').length - 1;
+    expect(occurrences).toBe(1);
+  });
+
   it('handles a root-level type error with a "(root)" parameter name', async () => {
     const schema = modelFriendlyInput(shape) as unknown as SchemaLike;
     // Passing a non-object yields an issue with an empty path.
