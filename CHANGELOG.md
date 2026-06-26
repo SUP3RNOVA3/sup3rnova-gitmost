@@ -12,6 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Inline "Test" button per external MCP server.** Each server row in admin AI
+  settings now has its own "Test" button that runs an isolated connection check:
+  idle `Test` → green `OK · N` (with a tooltip listing the discovered tools, or
+  "No tools available") on success, or red `Failed` (tooltip with the sanitized
+  error) on a connection problem. State is per-row, so testing one server never
+  spins or recolours the others. (#170)
+
 - **Persistent AI-chat history as the source of truth + server-side export.**
   An assistant turn is now persisted to the database step by step: the row is
   inserted upfront as `streaming` and updated as each agent step finishes, then

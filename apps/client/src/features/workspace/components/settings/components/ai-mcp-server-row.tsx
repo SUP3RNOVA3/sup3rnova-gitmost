@@ -35,7 +35,10 @@ export default function AiMcpServerRow({
 
   // The result colour/label reflects the connection params at the time of the
   // test. The row is keyed by id and never remounts, so a stale "OK"/"Failed"
-  // would otherwise stick after the URL/transport/auth changes. Reset on those.
+  // would otherwise stick after the connection params change. Reset on those.
+  // Note: `hasHeaders` is a presence flag only (header values are write-only and
+  // never returned), so this resets on adding/removing auth headers, NOT on
+  // rotating a token's value — that value-only change is invisible to the client.
   useEffect(() => {
     testMutation.reset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -61,12 +64,25 @@ export default function AiMcpServerRow({
         ? result.tools.join(", ")
         : t("No tools available");
   } else if (result && "error" in result) {
+    // Server-reported failure ({ ok: false, error }, HTTP 200). The error string
+    // is already sanitized server-side (no secrets). The `"error" in result`
+    // guard is required: `result?.ok` optional-chaining doesn't narrow the union
+    // in the else branch, so a bare `else if (result)` fails to type-check.
     label = t("Failed");
     color = "red";
     variant = "light";
     icon = <IconX size={16} />;
-    // The error string is already sanitized server-side (no secrets).
     tooltip = result.error;
+  } else if (testMutation.isError) {
+    // The request itself rejected (401/403/500/network) — there is no result
+    // payload, so without this the row would silently revert to "Test".
+    label = t("Failed");
+    color = "red";
+    variant = "light";
+    icon = <IconX size={16} />;
+    tooltip =
+      testMutation.error?.["response"]?.data?.message ??
+      t("Failed to update data");
   }
 
   const testButton = (
@@ -78,9 +94,8 @@ export default function AiMcpServerRow({
       // (Test -> OK · 5 -> Failed).
       miw={88}
       leftSection={icon}
+      // Mantine disables the button automatically while loading.
       loading={testMutation.isPending}
-      // Only blocked while in flight — testing a disabled server is useful too.
-      disabled={testMutation.isPending}
       onClick={() => testMutation.mutate(server.id)}
     >
       {label}

@@ -40,24 +40,37 @@ const baseServer = (over?: Partial<IAiMcpServer>): IAiMcpServer => ({
   ...over,
 });
 
+function tree(server: IAiMcpServer, testid: string) {
+  return (
+    <div data-testid={testid}>
+      <AiMcpServerRow
+        server={server}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onToggleEnabled={vi.fn()}
+      />
+    </div>
+  );
+}
+
 function renderRow(server: IAiMcpServer, testid: string) {
   const client = new QueryClient({
     defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
   });
-  return render(
+  const utils = render(
     <QueryClientProvider client={client}>
-      <MantineProvider>
-        <div data-testid={testid}>
-          <AiMcpServerRow
-            server={server}
-            onEdit={vi.fn()}
-            onDelete={vi.fn()}
-            onToggleEnabled={vi.fn()}
-          />
-        </div>
-      </MantineProvider>
+      <MantineProvider>{tree(server, testid)}</MantineProvider>
     </QueryClientProvider>,
   );
+  // A rerender helper that swaps only the server prop (same QueryClient, so the
+  // row keeps its mutation state and the reset-on-change effect is exercised).
+  const rerenderWith = (next: IAiMcpServer) =>
+    utils.rerender(
+      <QueryClientProvider client={client}>
+        <MantineProvider>{tree(next, testid)}</MantineProvider>
+      </QueryClientProvider>,
+    );
+  return { ...utils, rerenderWith };
 }
 
 describe("AiMcpServerRow — inline Test button", () => {
@@ -92,6 +105,77 @@ describe("AiMcpServerRow — inline Test button", () => {
 
     await waitFor(() =>
       expect(within(row).getByRole("button", { name: "Failed" })).toBeDefined(),
+    );
+  });
+
+  it("shows 'Failed' when the request itself rejects (401/403/500/network)", async () => {
+    // A real reject yields no { ok:false } payload — the row must read isError,
+    // not just mutation.data, or it would spin then silently revert to "Test".
+    testAiMcpServer.mockRejectedValue(new Error("Request failed"));
+    renderRow(baseServer(), "row");
+    const row = screen.getByTestId("row");
+
+    fireEvent.click(within(row).getByRole("button", { name: "Test" }));
+
+    await waitFor(() =>
+      expect(within(row).getByRole("button", { name: "Failed" })).toBeDefined(),
+    );
+  });
+
+  it("shows 'OK · 0' and a 'No tools available' tooltip for an empty tool list", async () => {
+    testAiMcpServer.mockResolvedValue({ ok: true, tools: [] });
+    renderRow(baseServer(), "row");
+    const row = screen.getByTestId("row");
+
+    fireEvent.click(within(row).getByRole("button", { name: "Test" }));
+
+    await waitFor(() =>
+      expect(within(row).getByRole("button", { name: /OK · 0/ })).toBeDefined(),
+    );
+  });
+
+  it("resets a stale result when url / transport / hasHeaders change", async () => {
+    testAiMcpServer.mockResolvedValue({ ok: true, tools: ["a", "b", "c"] });
+    const { rerenderWith } = renderRow(baseServer(), "row");
+    const row = () => screen.getByTestId("row");
+
+    fireEvent.click(within(row()).getByRole("button", { name: "Test" }));
+    await waitFor(() =>
+      expect(within(row()).getByRole("button", { name: /OK · 3/ })).toBeDefined(),
+    );
+
+    // Changing the URL must drop the stale green result back to idle "Test".
+    rerenderWith(baseServer({ url: "https://changed.example.com/mcp" }));
+    await waitFor(() =>
+      expect(within(row()).getByRole("button", { name: "Test" })).toBeDefined(),
+    );
+
+    // Same for the transport.
+    fireEvent.click(within(row()).getByRole("button", { name: "Test" }));
+    await waitFor(() =>
+      expect(within(row()).getByRole("button", { name: /OK · 3/ })).toBeDefined(),
+    );
+    rerenderWith(
+      baseServer({ url: "https://changed.example.com/mcp", transport: "sse" }),
+    );
+    await waitFor(() =>
+      expect(within(row()).getByRole("button", { name: "Test" })).toBeDefined(),
+    );
+
+    // And for the presence of auth headers.
+    fireEvent.click(within(row()).getByRole("button", { name: "Test" }));
+    await waitFor(() =>
+      expect(within(row()).getByRole("button", { name: /OK · 3/ })).toBeDefined(),
+    );
+    rerenderWith(
+      baseServer({
+        url: "https://changed.example.com/mcp",
+        transport: "sse",
+        hasHeaders: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(within(row()).getByRole("button", { name: "Test" })).toBeDefined(),
     );
   });
 

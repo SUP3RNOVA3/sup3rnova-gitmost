@@ -1172,5 +1172,6 @@
   "OpenAI (official)": "OpenAI (официальный)",
   "Test": "Тест",
   "Failed": "Ошибка",
-  "OK · {{count}}": "OK · {{count}}"
+  "OK · {{count}}": "OK · {{count}}",
+  "No tools available": "Нет доступных инструментов"
 }
