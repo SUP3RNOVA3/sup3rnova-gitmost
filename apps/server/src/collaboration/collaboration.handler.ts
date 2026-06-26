@@ -8,6 +8,10 @@ import {
 import { setYjsMark, updateYjsMarkAttribute, YjsSelection } from './yjs.util';
 import * as Y from 'yjs';
 import { User } from '@docmost/db/types/entity.types';
+import {
+  mergeXmlFragments,
+  mergeXmlFragments3Way,
+} from '../integrations/git-sync/services/yjs-body-merge';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -108,6 +112,69 @@ export class CollaborationHandler {
               const yElements = newContent.map(prosemirrorNodeToYElement);
               const position = operation === 'prepend' ? 0 : fragment.length;
               fragment.insert(position, yElements);
+            }
+          },
+        );
+      },
+      /**
+       * Git-sync body write, applied as a block-level MERGE into the LIVE doc on
+       * the instance that OWNS it (routed here via the custom-event channel —
+       * see CollaborationGateway.writePageBody). Running on the owning instance
+       * is what makes a connected editor CONVERGE: the merge mutates the shared
+       * Document, whose update is broadcast to every connection, so the editor's
+       * CRDT applies the git change instead of silently reverting it on its next
+       * autosave (the data-loss bug this fixes).
+       *
+       * With a `baseProsemirrorJson` (the last-synced common ancestor) it does a
+       * THREE-WAY merge — a block only the human changed is kept, a block only
+       * git changed is taken (conflicts -> git). Without a base it falls back to
+       * the 2-way merge.
+       */
+      gitSyncWriteBody: async (
+        documentName: string,
+        payload: {
+          prosemirrorJson: any;
+          baseProsemirrorJson?: any;
+          userId: string;
+        },
+      ) => {
+        const { prosemirrorJson, baseProsemirrorJson, userId } = payload;
+
+        // Build the incoming (and base) Yjs docs BEFORE opening the connection /
+        // touching the live doc. If a transform throws (a malformed/unsupported
+        // doc) we must NOT have mutated the live body — otherwise a conversion
+        // failure could leave the page empty (crash-safe conversion).
+        const targetDoc = TiptapTransformer.toYdoc(
+          prosemirrorJson,
+          'default',
+          tiptapExtensions,
+        );
+        const baseDoc =
+          baseProsemirrorJson != null
+            ? TiptapTransformer.toYdoc(
+                baseProsemirrorJson,
+                'default',
+                tiptapExtensions,
+              )
+            : null;
+
+        // actor:'git-sync' + the service user flow into PersistenceExtension
+        // (lastUpdatedSource='git-sync', lastUpdatedById=userId).
+        await this.withYdocConnection(
+          hocuspocus,
+          documentName,
+          { actor: 'git-sync', user: { id: userId } },
+          (doc) => {
+            const liveFrag = doc.getXmlFragment('default');
+            const targetFrag = targetDoc.getXmlFragment('default');
+            if (baseDoc) {
+              mergeXmlFragments3Way(
+                liveFrag,
+                targetFrag,
+                baseDoc.getXmlFragment('default'),
+              );
+            } else {
+              mergeXmlFragments(liveFrag, targetFrag);
             }
           },
         );

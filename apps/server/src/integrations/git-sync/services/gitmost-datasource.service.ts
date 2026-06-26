@@ -1,5 +1,4 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { TiptapTransformer } from '@hocuspocus/transformer';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import type {
   GitSyncClient,
@@ -12,8 +11,6 @@ import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { PageService } from '../../../core/page/services/page.service';
 import { CollaborationGateway } from '../../../collaboration/collaboration.gateway';
-import { tiptapExtensions } from '../../../collaboration/collaboration.util';
-import { mergeXmlFragments, mergeXmlFragments3Way } from './yjs-body-merge';
 import { AuthProvenanceData } from '../../../common/decorators/auth-provenance.decorator';
 
 /**
@@ -387,15 +384,27 @@ export class GitmostDataSourceService {
   // --- linchpin: native body write (§3.3) -----------------------------------
 
   /**
-   * In-process body write — no loopback websocket, no service-user token. Mirrors
-   * the collab handler's 'replace' operation exactly: open a direct connection,
-   * drop the existing fragment, apply the converted doc, then disconnect.
+   * In-process body write — no loopback websocket, no service-user token.
    *
-   * The `{ actor: 'git-sync', user: { id: userId } }` context flows into
+   * Routes the write through `CollaborationGateway.writePageBody`, which applies
+   * the block-level MERGE on the instance that OWNS the live Y.Doc (via the
+   * custom-event channel) rather than opening a direct connection on this
+   * (api/worker) instance. That distinction is load-bearing: when an editor is
+   * connected to a different collab instance/process, a direct connection here
+   * mutates a SEPARATE, detached doc the editor never sees — the editor's next
+   * autosave then silently REVERTS the git change (data loss). Running on the
+   * owning instance broadcasts the merge as a Yjs update so the editor converges
+   * (see CollaborationGateway.writePageBody for the full rationale).
+   *
+   * The merge itself stays a block-level reconcile, not a full-body replace
+   * (review #5): only changed blocks are touched, concurrently-edited blocks are
+   * left untouched, and an unchanged resync is a 0-op write. With a `base` (the
+   * last-synced version) it is a THREE-WAY merge so a block ONLY the human
+   * changed is kept and a block ONLY git changed is taken (conflicts -> git);
+   * without a base (e.g. createPage) it falls back to the 2-way merge. The
+   * `{ actor: 'git-sync', user: { id: userId } }` context flows into
    * PersistenceExtension.onStoreDocument, which persists ydoc+content+textContent,
-   * stamps `lastUpdatedSource = 'git-sync'`, and broadcasts `page.updated`. The
-   * service user (`user.id`) stays the responsible `lastUpdatedById`; the actor
-   * marks provenance.
+   * stamps `lastUpdatedSource = 'git-sync'`, and broadcasts `page.updated`.
    */
   private async writeBody(
     pageId: string,
@@ -404,51 +413,10 @@ export class GitmostDataSourceService {
     baseProsemirrorJson?: unknown,
   ): Promise<void> {
     const documentName = `page.${pageId}`;
-
-    // Build the incoming (and base) Yjs docs BEFORE opening the connection /
-    // touching the live doc. If a transform throws (a malformed/unsupported doc)
-    // we must NOT have mutated the live body — otherwise a conversion failure
-    // could leave the page empty (review #5 — crash-safe conversion).
-    const targetDoc = TiptapTransformer.toYdoc(
+    await this.collabGateway.writePageBody(documentName, {
       prosemirrorJson,
-      'default',
-      tiptapExtensions,
-    );
-    const baseDoc =
-      baseProsemirrorJson != null
-        ? TiptapTransformer.toYdoc(baseProsemirrorJson, 'default', tiptapExtensions)
-        : null;
-
-    const conn = await this.collabGateway.openDirectConnection(documentName, {
-      actor: 'git-sync',
-      // PersistenceExtension reads `context.user.id` for lastUpdatedById, so the
-      // service user is required on the context (unlike the bare `{ actor }`
-      // sketch in issue #194).
-      user: { id: userId },
+      baseProsemirrorJson,
+      userId,
     });
-    try {
-      await conn.transact((doc) => {
-        const liveFrag = doc.getXmlFragment('default');
-        const targetFrag = targetDoc.getXmlFragment('default');
-        // Block-level MERGE rather than a full-body replace (review #5): diff the
-        // live body against the incoming git body and apply only the blocks that
-        // actually changed; concurrently-edited blocks are left untouched and an
-        // unchanged resync is a 0-op write. With a `base` (the last-synced
-        // version) do a THREE-WAY merge so a block ONLY the human changed is kept
-        // and a block ONLY git changed is taken (conflicts -> git). Without a base
-        // (e.g. createPage), fall back to the 2-way merge.
-        if (baseDoc) {
-          mergeXmlFragments3Way(
-            liveFrag,
-            targetFrag,
-            baseDoc.getXmlFragment('default'),
-          );
-        } else {
-          mergeXmlFragments(liveFrag, targetFrag);
-        }
-      });
-    } finally {
-      await conn.disconnect();
-    }
   }
 }

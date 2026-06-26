@@ -46,13 +46,7 @@ jest.mock('../git-sync.loader', () => ({
   })),
 }));
 
-import * as Y from 'yjs';
 import { GitmostDataSourceService } from './gitmost-datasource.service';
-// The body-write seam picks 2-way vs 3-way merge based on whether a base doc was
-// built. We spy on the real module exports (ts-jest CJS output references them
-// through the namespace object, so the spies intercept the SUT's calls) and let
-// them call through, so we assert WHICH merge ran without mocking the behaviour.
-import * as bodyMerge from './yjs-body-merge';
 
 // Focused unit/contract test for the native GitSyncClient adapter.
 // No DB, no real collab server: the repos/services/gateway are mocked and we
@@ -73,16 +67,9 @@ interface Mocks {
     movePage: AnyMock;
     removePage: AnyMock;
   };
-  collabGateway: { openDirectConnection: AnyMock };
+  collabGateway: { writePageBody: AnyMock };
   // Minimal Kysely-ish chainable mock for the direct-query paths.
   db: any;
-  // Captured collab connection (the fake conn the gateway returns).
-  conn: {
-    transact: AnyMock;
-    disconnect: AnyMock;
-    context?: any;
-    capturedFn?: (doc: any) => void;
-  };
 }
 
 function makeQueryBuilder(rows: any[]) {
@@ -99,13 +86,6 @@ function build(rows: any[] = []): {
   service: GitmostDataSourceService;
   mocks: Mocks;
 } {
-  const conn: Mocks['conn'] = {
-    transact: jest.fn(async (fn: (doc: any) => void) => {
-      conn.capturedFn = fn;
-    }),
-    disconnect: jest.fn(async () => undefined),
-  };
-
   const mocks: Mocks = {
     pageRepo: {
       findById: jest.fn(),
@@ -120,15 +100,11 @@ function build(rows: any[] = []): {
       removePage: jest.fn(async () => undefined),
     },
     collabGateway: {
-      openDirectConnection: jest.fn(async (_name: string, ctx: any) => {
-        conn.context = ctx;
-        return conn;
-      }),
+      writePageBody: jest.fn(async () => undefined),
     },
     db: {
       selectFrom: jest.fn(() => makeQueryBuilder(rows)),
     },
-    conn,
   };
 
   const service = new GitmostDataSourceService(
@@ -232,7 +208,7 @@ describe('GitmostDataSourceService', () => {
   });
 
   describe('importPageMarkdown', () => {
-    it('parses md, converts to ProseMirror, and writes body via collab', async () => {
+    it('parses md, converts to ProseMirror, and routes the body write to the owning instance', async () => {
       const { service, mocks } = build();
       mocks.pageRepo.findById.mockResolvedValue({
         id: 'p1',
@@ -243,77 +219,50 @@ describe('GitmostDataSourceService', () => {
         .bind(CTX)
         .importPageMarkdown('p1', '# Hello\n\nworld');
 
-      // writeBody opened a collab connection tagged git-sync + service user.
-      expect(mocks.collabGateway.openDirectConnection).toHaveBeenCalledTimes(1);
-      const [docName, ctx] = mocks.collabGateway.openDirectConnection.mock
-        .calls[0];
+      // writeBody routes through writePageBody (NOT openDirectConnection): the
+      // merge must run on the instance that owns the live doc so a connected
+      // editor converges instead of silently reverting the change. The service
+      // user rides on the payload as the responsible author.
+      expect(mocks.collabGateway.writePageBody).toHaveBeenCalledTimes(1);
+      const [docName, payload] = mocks.collabGateway.writePageBody.mock.calls[0];
       expect(docName).toBe('page.p1');
-      expect(ctx.actor).toBe('git-sync');
-      expect(ctx.user).toEqual({ id: 'svc-user' });
-
-      // transact ran and connection was disconnected (finally).
-      expect(mocks.conn.transact).toHaveBeenCalledTimes(1);
-      expect(mocks.conn.disconnect).toHaveBeenCalledTimes(1);
-      expect(typeof mocks.conn.capturedFn).toBe('function');
+      expect(payload.userId).toBe('svc-user');
+      // A converted ProseMirror doc was passed; no base on a plain import.
+      expect(payload.prosemirrorJson).toEqual(
+        expect.objectContaining({ type: 'doc' }),
+      );
+      expect(payload.baseProsemirrorJson).toBeUndefined();
 
       expect(res.updatedAt).toBe('2026-06-20T11:00:00.000Z');
     });
 
-    it('crash-safe: the incoming doc is built before the connection opens, and the captured merge applies content', async () => {
-      // The incoming Yjs doc is built BEFORE the connection opens, so a transform
-      // failure can never mutate the live body. Here we run the captured transact
-      // callback (the block-level merge) against a REAL empty Y.Doc and confirm it
-      // ends up with content — the write produces a non-empty body, never wipes it.
-      const { service, mocks } = build();
-      mocks.pageRepo.findById.mockResolvedValue({
-        id: 'p1',
-        updatedAt: new Date('2026-06-20T11:00:00.000Z'),
-      });
-      await service.bind(CTX).importPageMarkdown('p1', '# Hi\n\nthere');
-
-      const realDoc = new Y.Doc();
-      expect(() => mocks.conn.capturedFn?.(realDoc)).not.toThrow();
-      // The body fragment is non-empty: the incoming block was merged in.
-      expect(realDoc.getXmlFragment('default').length).toBeGreaterThan(0);
-    });
-
     // The 2-way path (no base) is covered above; this exercises the THREE-WAY
-    // branch that only fires when a `baseMarkdown` is supplied (review #5).
+    // branch that only fires when a `baseMarkdown` is supplied (review #5). The
+    // merge dispatch itself now lives in the collab handler (gitSyncWriteBody);
+    // here we assert the datasource forwards the base so the owning instance can
+    // run the 3-way reconcile.
     describe('with a baseMarkdown (three-way merge)', () => {
-      afterEach(() => jest.restoreAllMocks());
-
-      it('builds a base doc and dispatches to mergeXmlFragments3Way (not the 2-way merge)', async () => {
+      it('forwards the parsed base body so the owning instance can three-way merge', async () => {
         const { service, mocks } = build();
         mocks.pageRepo.findById.mockResolvedValue({
           id: 'p1',
           updatedAt: new Date('2026-06-20T11:00:00.000Z'),
         });
-        // Spy through to the real implementations so we observe the dispatch.
-        const merge3 = jest.spyOn(bodyMerge, 'mergeXmlFragments3Way');
-        const merge2 = jest.spyOn(bodyMerge, 'mergeXmlFragments');
 
         await service
           .bind(CTX)
           .importPageMarkdown('p1', '# Full\n\ngit', '# Base\n\nbase');
 
-        // The body write was staged through collab as before.
-        expect(mocks.conn.transact).toHaveBeenCalledTimes(1);
-        expect(typeof mocks.conn.capturedFn).toBe('function');
-
-        // Running the captured merge against a real live doc takes the 3-way path:
-        // the base was parsed/built and the 3-way helper is invoked with three
-        // fragments; the 2-way fallback is NOT used.
-        const liveDoc = new Y.Doc();
-        expect(() => mocks.conn.capturedFn?.(liveDoc)).not.toThrow();
-
-        expect(merge3).toHaveBeenCalledTimes(1);
-        expect(merge2).not.toHaveBeenCalled();
-        const [liveFrag, gitFrag, baseFrag] = merge3.mock.calls[0];
-        expect(liveFrag).toBeInstanceOf(Y.XmlFragment);
-        expect(gitFrag).toBeInstanceOf(Y.XmlFragment);
-        // The third arg is the BASE fragment — proof the base markdown was parsed
-        // and converted into its own doc for the common-ancestor comparison.
-        expect(baseFrag).toBeInstanceOf(Y.XmlFragment);
+        expect(mocks.collabGateway.writePageBody).toHaveBeenCalledTimes(1);
+        const [, payload] = mocks.collabGateway.writePageBody.mock.calls[0];
+        // Both the incoming body AND the last-synced base were converted and
+        // forwarded — proof the 3-way common-ancestor is plumbed through.
+        expect(payload.prosemirrorJson).toEqual(
+          expect.objectContaining({ type: 'doc' }),
+        );
+        expect(payload.baseProsemirrorJson).toEqual(
+          expect.objectContaining({ type: 'doc' }),
+        );
       });
     });
   });
@@ -337,9 +286,9 @@ describe('GitmostDataSourceService', () => {
         { spaceId: 'space-1', title: 'Title', parentPageId: 'parent-1' },
         { actor: 'git-sync', aiChatId: null },
       );
-      expect(mocks.collabGateway.openDirectConnection).toHaveBeenCalledWith(
+      expect(mocks.collabGateway.writePageBody).toHaveBeenCalledWith(
         'page.new-id',
-        expect.objectContaining({ actor: 'git-sync' }),
+        expect.objectContaining({ userId: 'svc-user' }),
       );
       expect(res).toEqual({
         data: { id: 'new-id' },
