@@ -48,6 +48,13 @@ export interface GitSyncRunStatus {
     | 'merge-in-progress';
   pull?: { written: number; deleted: number; conflict: boolean };
   push?: { mode: string; failures: number };
+  /**
+   * True when the push REFUSED to fast-forward a divergent `docmost` mirror
+   * (invariant §5 broken — `docmost` no longer mirrors what Docmost contains).
+   * Surfaced here (not just logged) so /status can report it. No data is lost,
+   * but it signals an operator-visible drift that needs attention.
+   */
+  divergentDocmost?: boolean;
   error?: string;
 }
 
@@ -200,11 +207,18 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
    * request behind a potentially long cycle). The receive-pack is NOT run when
    * the lock is held — we never write to the working tree concurrently with a
    * cycle.
+   *
+   * `runReceivePack` receives the per-space lock's lost-lock `AbortSignal`: a
+   * receive-pack writes `main`'s working tree (receive.denyCurrentBranch=
+   * updateInstead), so if the lock is lost mid-push (a long Redis outage drops the
+   * heartbeat CAS) the signal fires and the receive-pack's `git http-backend`
+   * child is killed — closing the window where another replica could grab the lock
+   * and start a cycle while this child is still writing the working tree.
    */
   async ingestExternalPush(
     spaceId: string,
     workspaceId: string,
-    runReceivePack: () => Promise<void>,
+    runReceivePack: (signal: AbortSignal) => Promise<void>,
   ): Promise<void> {
     if (!this.environmentService.isGitSyncEnabled()) {
       // The HTTP gate already checks this, but be defensive: never run a cycle
@@ -215,7 +229,9 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
 
     const result = await this.spaceLock.withSpaceLock(spaceId, async (signal) => {
       // 1) Stream the receive-pack to the client (durable commits land on main).
-      await runReceivePack();
+      // Pass the lost-lock signal so the receive-pack child is killed if the lock
+      // lapses mid-write (no concurrent working-tree writer across replicas).
+      await runReceivePack(signal);
 
       // 2) Reconcile the new commits into Docmost. A service user is required to
       // attribute the writes; without one we cannot run the cycle — the commits
@@ -292,6 +308,18 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       log: (line: string) => this.logger.log(`git-sync[${spaceId}] ${line}`),
     });
 
+    // §5 invariant breach: the push refused to fast-forward a divergent `docmost`
+    // mirror. No data is lost (the refusal is the safety), but the mirror no
+    // longer reflects Docmost and the next push will keep refusing until an
+    // operator reconciles it — so escalate from the engine's info `log` to a
+    // WARN with the spaceId, and surface the flag in the returned status (/status).
+    if (result.divergentDocmost) {
+      this.logger.warn(
+        `git-sync[${spaceId}] push refused to fast-forward a DIVERGENT 'docmost' ` +
+          `mirror (invariant §5 broken); manual reconciliation required`,
+      );
+    }
+
     return { spaceId, ...result };
   }
 
@@ -309,6 +337,18 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
    * ScheduleModule: forRoot() is registered ONCE globally by TelemetryModule;
    * GitSyncModule imports the plain ScheduleModule so SchedulerRegistry is
    * injectable without a duplicate forRoot.
+   *
+   * KNOWN MULTI-REPLICA LIMITATION (deferred — do not silently lose this):
+   * This is an IN-PROCESS `setInterval` running on EVERY replica. Cross-replica
+   * single-writer safety currently rests on the per-space Redis lock
+   * (SpaceLockService) plus best-effort abort-on-failed-heartbeat — NOT on true
+   * fencing. Under an adversarial schedule (lock TTL lapse during a GC/IO pause)
+   * two replicas could still briefly believe they hold a space's lock. The
+   * intended future direction is to move this orchestration to a BullMQ queue
+   * (one durable, deduplicated job per space instead of N independent interval
+   * timers) and add FENCING TOKENS so a stale writer's writes are rejected by the
+   * store. The author deferred fencing tokens; this comment is the breadcrumb so
+   * the gap is tracked rather than forgotten. See SpaceLockService.liveLocks.
    */
   onModuleInit(): void {
     if (!this.environmentService.isGitSyncEnabled()) return;

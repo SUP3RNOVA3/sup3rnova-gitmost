@@ -419,9 +419,4 @@ export class EnvironmentService {
   getGitSyncServiceUserId(): string | undefined {
     return this.configService.get<string>('GIT_SYNC_SERVICE_USER_ID');
   }
-
-  /** Optional path to the SSH key used for git remote access. */
-  getGitSyncSshKeyPath(): string | undefined {
-    return this.configService.get<string>('GIT_SYNC_SSH_KEY_PATH');
-  }
 }

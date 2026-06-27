@@ -46,33 +46,26 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
     space?.settings?.gitSync?.autoMergeConflicts ?? false,
   );
 
-  const handleGitSyncToggle = async (value: boolean) => {
-    const previous = gitSyncEnabled;
-    setGitSyncEnabled(value); // optimistic update
+  // One parameterized handler for both git-sync space toggles: they differ only by
+  // the local state setter, the mutation payload field, and the error label. The
+  // update is optimistic and reverts the local state on failure (the mutation
+  // surfaces a toast via onError; the raw error is still logged per AGENTS.md).
+  const handleToggle = async (
+    field: "gitSyncEnabled" | "autoMergeConflicts",
+    value: boolean,
+    previous: boolean,
+    setLocal: (next: boolean) => void,
+    errorLabel: string,
+  ) => {
+    setLocal(value); // optimistic update
     try {
       await updateSpaceMutation.mutateAsync({
         spaceId: space.id,
-        gitSyncEnabled: value,
+        [field]: value,
       });
     } catch (err) {
-      setGitSyncEnabled(previous); // revert on failure
-      // The mutation surfaces a toast via onError; still log the raw error so it
-      // is not silently swallowed (AGENTS.md).
-      console.error("Failed to toggle git-sync for space", err);
-    }
-  };
-
-  const handleAutoMergeConflictsToggle = async (value: boolean) => {
-    const previous = autoMergeConflicts;
-    setAutoMergeConflicts(value); // optimistic update
-    try {
-      await updateSpaceMutation.mutateAsync({
-        spaceId: space.id,
-        autoMergeConflicts: value,
-      });
-    } catch (err) {
-      setAutoMergeConflicts(previous); // revert on failure
-      console.error("Failed to toggle git-sync auto-merge-conflicts", err);
+      setLocal(previous); // revert on failure
+      console.error(errorLabel, err);
     }
   };
 
@@ -160,7 +153,13 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
           checked={gitSyncEnabled}
           disabled={readOnly || updateSpaceMutation.isPending}
           onChange={(event) =>
-            handleGitSyncToggle(event.currentTarget.checked)
+            handleToggle(
+              "gitSyncEnabled",
+              event.currentTarget.checked,
+              gitSyncEnabled,
+              setGitSyncEnabled,
+              "Failed to toggle git-sync for space",
+            )
           }
         />
 
@@ -173,7 +172,13 @@ export function EditSpaceForm({ space, readOnly }: EditSpaceFormProps) {
           checked={autoMergeConflicts}
           disabled={readOnly || updateSpaceMutation.isPending}
           onChange={(event) =>
-            handleAutoMergeConflictsToggle(event.currentTarget.checked)
+            handleToggle(
+              "autoMergeConflicts",
+              event.currentTarget.checked,
+              autoMergeConflicts,
+              setAutoMergeConflicts,
+              "Failed to toggle git-sync auto-merge-conflicts",
+            )
           }
         />
       </Box>

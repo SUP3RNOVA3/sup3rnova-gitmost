@@ -146,11 +146,18 @@ export class GitHttpBackendService {
    * child exited and its output was flushed), or after a 500 was sent on an
    * early failure. Never rejects — push ingestion relies on this resolving so
    * the lock-held cycle body can run afterwards.
+   *
+   * `signal` (optional) is the git-sync per-space lock's lost-lock abort signal.
+   * A receive-pack writes `main`'s working tree, so if the lock lapses mid-push
+   * (heartbeat CAS miss / Redis outage) the signal fires and we kill the child —
+   * preventing it from continuing to write the working tree while another replica
+   * may have taken over the lock and started a cycle (warning #3).
    */
   async run(
     parsed: GitHttpBackendRequest,
     rawReq: IncomingMessage,
     rawRes: ServerResponse,
+    signal?: AbortSignal,
   ): Promise<void> {
     const { vaultGitEnv } = await loadGitSync();
     const projectRoot = this.environmentService.getGitSyncDataDir();
@@ -162,11 +169,32 @@ export class GitHttpBackendService {
 
     return new Promise<void>((resolve) => {
       let settled = false;
+      // Set once the child exists so the abort handler can target it.
+      let onAbort: (() => void) | null = null;
       const done = () => {
         if (settled) return;
         settled = true;
+        // Detach the abort listener so a later lock loss does not fire into a
+        // request that already finished.
+        if (onAbort) {
+          signal?.removeEventListener('abort', onAbort);
+          onAbort = null;
+        }
         resolve();
       };
+
+      // Reject early if the lock was already lost before we even spawned: do not
+      // start writing the working tree after a possible lock takeover.
+      if (signal?.aborted) {
+        if (!rawRes.headersSent) this.send500(rawRes, 'lock-lost');
+        else
+          try {
+            rawRes.end();
+          } catch {
+            /* ignore */
+          }
+        return done();
+      }
 
       let child: ReturnType<typeof spawn>;
       try {
@@ -175,6 +203,39 @@ export class GitHttpBackendService {
         this.send500(rawRes, 'spawn-failed', err);
         return done();
       }
+
+      // Lost-lock abort: the per-space lock lapsed mid-request. Kill the child so
+      // a receive-pack stops writing `main`'s working tree before another replica
+      // (which may now hold the lock) starts a cycle. Mirrors the watchdog kill.
+      onAbort = () => {
+        this.logger.warn(
+          'git http-backend aborted (git-sync lock lost mid-request); killing child',
+        );
+        try {
+          child.kill('SIGTERM');
+          const sigkill = setTimeout(() => {
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              /* ignore */
+            }
+          }, 2000);
+          sigkill.unref?.();
+        } catch {
+          /* ignore */
+        }
+        if (!headerParsed && !rawRes.headersSent) {
+          this.send500(rawRes, 'lock-lost');
+        } else {
+          try {
+            rawRes.end();
+          } catch {
+            /* ignore */
+          }
+        }
+        done();
+      };
+      signal?.addEventListener('abort', onAbort);
 
       // Watchdog: a client that opens git-receive-pack and stalls keeps the
       // child alive forever, so run() never resolves and (because this runs

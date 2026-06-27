@@ -185,6 +185,13 @@ export class GitmostDataSourceService {
 
     await this.writeBody(pageId, doc, ctx.userId, baseDoc);
 
+    // CAVEAT: writeBody merges through collab, whose persistence is DEBOUNCED, so
+    // this `updatedAt` read can be STALE — it may reflect the row BEFORE the
+    // debounced flush lands. Currently harmless: the only consumer is the deferred
+    // §10 loop-guard, which is not yet wired. When that loop-guard is implemented
+    // it MUST NOT trust this timestamp as a read-after-write of the body change
+    // (it would misfire on the pre-flush value); it needs a post-flush read (or to
+    // key off the collab flush completion) instead.
     const page = await this.pageRepo.findById(pageId);
     return {
       updatedAt: page ? new Date(page.updatedAt).toISOString() : undefined,

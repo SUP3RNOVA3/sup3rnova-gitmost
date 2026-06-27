@@ -216,10 +216,6 @@ export class EnvironmentVariables {
   @IsNotEmpty()
   @IsString()
   GIT_SYNC_SERVICE_USER_ID: string;
-
-  @IsOptional()
-  @IsString()
-  GIT_SYNC_SSH_KEY_PATH: string;
 }
 
 export function validate(config: Record<string, any>) {

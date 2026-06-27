@@ -111,6 +111,7 @@ describe('decideGitHttpGate', () => {
     gitHttpEnabled: true,
     spaceExists: true,
     spaceGitSyncEnabled: true,
+    userIsSpaceMember: true,
     permissionGranted: true,
   };
 
@@ -160,14 +161,41 @@ describe('decideGitHttpGate', () => {
     });
   });
 
-  it('403 when authenticated but lacking the required permission (reader on write)', () => {
+  it('403 when a MEMBER lacks the required permission (reader on write)', () => {
+    // A member of the space (existence already known to them) who lacks the role:
+    // 403 leaks nothing new.
     expect(
       decideGitHttpGate({
         ...base,
         serviceKind: 'write',
+        userIsSpaceMember: true,
         permissionGranted: false,
       }),
     ).toEqual({ kind: 'forbidden' });
+  });
+
+  it('404 (NOT 403) when an authenticated NON-member hits a git-sync space', () => {
+    // SECURITY: a non-member must be indistinguishable from a missing/disabled
+    // space. If this returned 403, the 403↔404 difference would let any
+    // authenticated workspace user brute-force slugs to discover which spaces
+    // exist and which have git-sync enabled.
+    expect(
+      decideGitHttpGate({
+        ...base,
+        serviceKind: 'write',
+        userIsSpaceMember: false,
+        permissionGranted: false,
+      }),
+    ).toEqual({ kind: 'not-found' });
+    // Same for a read by a non-member.
+    expect(
+      decideGitHttpGate({
+        ...base,
+        serviceKind: 'read',
+        userIsSpaceMember: false,
+        permissionGranted: false,
+      }),
+    ).toEqual({ kind: 'not-found' });
   });
 
   it('still 401 (not 404) for missing creds against a disabled space', () => {

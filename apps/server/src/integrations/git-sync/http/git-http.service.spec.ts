@@ -8,7 +8,11 @@
 // come from WorkspaceRepo. If the handler regressed to reading
 // `req.raw.workspaceId`, the happy-path fetch test below would fail (the repo
 // would not be consulted and the request would 401).
-import { Logger, UnauthorizedException } from '@nestjs/common';
+import {
+  Logger,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import {
   SpaceCaslAction,
   SpaceCaslSubject,
@@ -295,6 +299,30 @@ describe('GitHttpService.handle', () => {
     expect(state.statusCode).toBe(403);
     expect(built.orchestrator.ingestExternalPush).not.toHaveBeenCalled();
     expect(built.backend.run).not.toHaveBeenCalled();
+  });
+
+  it('an authenticated NON-member of a git-sync space -> 404, NOT 403 (no existence leak)', async () => {
+    // createForUser throws NotFound when the user holds no role in the space (a
+    // non-member). The gate must return 404 — the SAME response a missing /
+    // sync-disabled space gives — so a 403↔404 difference cannot be used to
+    // brute-force which spaces exist / have git-sync enabled (the security fix).
+    const built = build({ abilityCan: false });
+    built.abilityFactory.createForUser.mockRejectedValue(
+      new NotFoundException('Space permissions not found'),
+    );
+    const { reply, state } = fakeReply();
+    const req = fakeRequest({
+      url: '/git/secret-space.git/info/refs?service=git-upload-pack',
+      method: 'GET',
+      authorization: basic('dev@example.com', 'pw'),
+    });
+
+    await built.service.handle(req, reply);
+
+    expect(built.abilityFactory.createForUser).toHaveBeenCalledTimes(1);
+    expect(state.statusCode).toBe(404);
+    expect(built.backend.run).not.toHaveBeenCalled();
+    expect(built.orchestrator.ingestExternalPush).not.toHaveBeenCalled();
   });
 
   it('a space that is not git-sync-enabled -> 404 (existence never revealed)', async () => {

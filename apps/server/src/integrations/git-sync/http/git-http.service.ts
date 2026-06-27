@@ -10,6 +10,7 @@ import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
 import { User } from '@docmost/db/types/entity.types';
 import { parseBasicAuth } from '../../mcp/mcp-auth.helpers';
+import { resolveRequestWorkspace } from '../../../common/helpers/resolve-request-workspace';
 import { EnvironmentService } from '../../environment/environment.service';
 import { VaultRegistryService } from '../services/vault-registry.service';
 import {
@@ -57,7 +58,8 @@ export class GitHttpService {
    * Resolve the workspace for a /git request the SAME way DomainMiddleware does,
    * because Nest middleware does NOT run for this raw root-mounted route (it is
    * registered under the global '/api' router), so `req.raw.workspaceId` is never
-   * populated here. We replicate DomainMiddleware / McpService:
+   * populated here. Delegates to the shared `resolveRequestWorkspace` helper (the
+   * SAME self-hosted/cloud branch DomainMiddleware uses) and returns just the id:
    *   - self-hosted (single workspace) -> workspaceRepo.findFirst();
    *   - cloud (multi-tenant)           -> resolve by the host-header subdomain.
    * Returns null when no workspace resolves; the gate then 404s (after the
@@ -65,17 +67,14 @@ export class GitHttpService {
    */
   private async resolveWorkspaceId(req: FastifyRequest): Promise<string | null> {
     try {
-      if (this.environmentService.isSelfHosted()) {
-        const workspace = await this.workspaceRepo.findFirst();
-        return workspace?.id ?? null;
-      }
-      if (this.environmentService.isCloud()) {
-        const host = this.headerValue(req.headers['host']);
-        const subdomain = host ? host.split('.')[0] : '';
-        if (!subdomain) return null;
-        const workspace = await this.workspaceRepo.findByHostname(subdomain);
-        return workspace?.id ?? null;
-      }
+      // Same self-hosted/cloud resolution DomainMiddleware uses — shared so the
+      // branch cannot drift between the two call sites.
+      const workspace = await resolveRequestWorkspace(
+        this.environmentService,
+        this.workspaceRepo,
+        this.headerValue(req.headers['host']),
+      );
+      return workspace?.id ?? null;
     } catch (err) {
       // A DB error resolving the workspace must not leak details; treat as
       // unresolvable (the gate will 404, unless creds are missing -> 401 first).
@@ -150,6 +149,12 @@ export class GitHttpService {
     let spaceExists = false;
     let spaceGitSyncEnabled = false;
     let spaceId: string | undefined;
+    // The user has SOME role in the space. SECURITY: a non-member must get the
+    // SAME 404 a missing/disabled space gets — never a 403 — or the 403↔404 split
+    // would let any authenticated user brute-force slugs to learn which spaces
+    // exist / have sync enabled (the leak this gate's contract forbids). 403 is
+    // reserved for a MEMBER who lacks the required role (existence already known).
+    let userIsSpaceMember = false;
     let permissionGranted = false;
     if (credentialsValid && user && workspaceId && parsedPath && serviceKind) {
       const space = await this.spaceRepo.findById(
@@ -170,6 +175,11 @@ export class GitHttpService {
               user,
               space.id,
             );
+            // createForUser RESOLVED -> the user holds a role in this space (it
+            // throws NotFound for a non-member). Record membership BEFORE the
+            // permission check: a member lacking the role -> 403; a non-member ->
+            // 404 (handled by the gate via userIsSpaceMember=false below).
+            userIsSpaceMember = true;
             const action =
               serviceKind === 'write'
                 ? SpaceCaslAction.Manage
@@ -177,7 +187,12 @@ export class GitHttpService {
             permissionGranted = ability.can(action, SpaceCaslSubject.Page);
           } catch {
             // createForUser throws NotFoundException when the user has no role in
-            // the space — that is simply "no permission" here.
+            // the space (a non-member). Leave userIsSpaceMember=false so the gate
+            // returns 404, NOT 403 — a non-member must not be able to tell this
+            // space apart from a non-existent one. (Any other error also falls
+            // here and is treated as non-member -> 404, the safe default that
+            // never reveals existence.)
+            userIsSpaceMember = false;
             permissionGranted = false;
           }
         }
@@ -193,6 +208,7 @@ export class GitHttpService {
       gitHttpEnabled: this.environmentService.isGitSyncHttpEnabled(),
       spaceExists,
       spaceGitSyncEnabled,
+      userIsSpaceMember,
       permissionGranted,
     });
 
@@ -268,8 +284,12 @@ export class GitHttpService {
 
     // Push: run the receive-pack under the space lock, then a Docmost cycle.
     try {
-      await this.orchestrator.ingestExternalPush(spaceId, workspaceId, () =>
-        this.backend.run(backendRequest, rawReq, rawRes),
+      await this.orchestrator.ingestExternalPush(
+        spaceId,
+        workspaceId,
+        // The lock's lost-lock signal is threaded into the backend so the
+        // receive-pack child is killed if the lock lapses mid-write (warning #3).
+        (signal) => this.backend.run(backendRequest, rawReq, rawRes, signal),
       );
     } catch (err) {
       if (err instanceof GitSyncLockHeldError) {

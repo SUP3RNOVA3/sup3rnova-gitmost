@@ -111,12 +111,24 @@ export type GitHttpGateDecision =
  *   2. credentials present but invalid             -> 401.
  *   3. unparseable git request shape               -> 400.
  *   4. git-sync globally disabled, or git-http disabled, or the space is missing
- *      / not git-sync-enabled                       -> 404 (never reveal existence).
- *   5. authenticated but lacking the required perm -> 403.
+ *      / not git-sync-enabled, OR the authenticated user is NOT a member of the
+ *      space (has no role at all)                   -> 404 (never reveal existence).
+ *   5. a MEMBER of the space who lacks the required perm (e.g. a reader trying to
+ *      push)                                        -> 403.
  *   6. otherwise                                    -> proceed.
  *
  * Note (4) is checked AFTER (1)/(2): an anonymous probe always gets 401 first;
- * an authenticated user hitting a hidden/disabled space gets 404 (not 403).
+ * an authenticated user hitting a hidden/disabled space — OR a space they are not
+ * a member of — gets 404 (not 403). Folding non-membership into the 404 branch is
+ * a SECURITY requirement: if a non-member got 403 here (as a "permission denied")
+ * while a non-existent / sync-disabled space got 404, the 403↔404 difference would
+ * let any authenticated workspace user brute-force slugs to discover which spaces
+ * exist and which have git-sync enabled — including spaces they cannot see. 403 is
+ * therefore reserved for the one case where existence is ALREADY known to the
+ * caller because they ARE a member (so it leaks nothing new): a member without the
+ * required role. `userIsSpaceMember` is the resolved "the user has SOME role in
+ * this space" boolean (false when SpaceAbilityFactory.createForUser throws
+ * NotFound / the user has no role).
  */
 export function decideGitHttpGate(input: {
   hasCredentials: boolean;
@@ -126,6 +138,8 @@ export function decideGitHttpGate(input: {
   gitHttpEnabled: boolean;
   spaceExists: boolean;
   spaceGitSyncEnabled: boolean;
+  /** The user has SOME role in the space (false = non-member -> 404, not 403). */
+  userIsSpaceMember: boolean;
   permissionGranted: boolean;
 }): GitHttpGateDecision {
   if (!input.hasCredentials) return { kind: 'unauthorized' };
@@ -136,7 +150,10 @@ export function decideGitHttpGate(input: {
     !input.gitSyncEnabled ||
     !input.gitHttpEnabled ||
     !input.spaceExists ||
-    !input.spaceGitSyncEnabled
+    !input.spaceGitSyncEnabled ||
+    // A non-member must be indistinguishable from a missing/disabled space: 404,
+    // never 403 (otherwise the 403↔404 split leaks space existence — see above).
+    !input.userIsSpaceMember
   ) {
     return { kind: 'not-found' };
   }

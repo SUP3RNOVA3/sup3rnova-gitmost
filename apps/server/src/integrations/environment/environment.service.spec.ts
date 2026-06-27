@@ -122,4 +122,54 @@ describe('EnvironmentService', () => {
       expect(withEnv('1').isGitSyncEnabled()).toBe(false);
     });
   });
+
+  // isGitSyncHttpEnabled is the master gate of the /git smart-HTTP trust boundary.
+  // When GIT_SYNC_HTTP_ENABLED is UNSET it FALLS BACK to isGitSyncEnabled(); when
+  // set it is honored verbatim ('true' -> on, anything else -> off). The fallback
+  // (default) branch is what these tests pin.
+  describe('isGitSyncHttpEnabled', () => {
+    const withEnv = (values: Record<string, string | undefined>) =>
+      new EnvironmentService({
+        get: (key: string, fallback?: string) => values[key] ?? fallback,
+      } as any);
+
+    it('DEFAULT branch: unset -> falls back to isGitSyncEnabled() === true', () => {
+      expect(
+        withEnv({ GIT_SYNC_ENABLED: 'true' }).isGitSyncHttpEnabled(),
+      ).toBe(true);
+    });
+
+    it('DEFAULT branch: unset -> falls back to isGitSyncEnabled() === false', () => {
+      // Neither key set: the fallback resolves to isGitSyncEnabled() which is
+      // false by default.
+      expect(withEnv({}).isGitSyncHttpEnabled()).toBe(false);
+      expect(
+        withEnv({ GIT_SYNC_ENABLED: 'false' }).isGitSyncHttpEnabled(),
+      ).toBe(false);
+    });
+
+    it('explicit "true" enables the host regardless of GIT_SYNC_ENABLED', () => {
+      expect(
+        withEnv({
+          GIT_SYNC_HTTP_ENABLED: 'true',
+          GIT_SYNC_ENABLED: 'false',
+        }).isGitSyncHttpEnabled(),
+      ).toBe(true);
+    });
+
+    it('explicit non-"true" disables the host even when sync is enabled', () => {
+      expect(
+        withEnv({
+          GIT_SYNC_HTTP_ENABLED: 'false',
+          GIT_SYNC_ENABLED: 'true',
+        }).isGitSyncHttpEnabled(),
+      ).toBe(false);
+      expect(
+        withEnv({
+          GIT_SYNC_HTTP_ENABLED: 'maybe',
+          GIT_SYNC_ENABLED: 'true',
+        }).isGitSyncHttpEnabled(),
+      ).toBe(false);
+    });
+  });
 });
