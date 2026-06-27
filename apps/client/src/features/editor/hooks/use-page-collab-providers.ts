@@ -24,7 +24,7 @@ import { IPage } from "@/features/page/types/page.types.ts";
 import { useParams } from "react-router-dom";
 import { extractPageSlugId } from "@/lib";
 import { FIVE_MINUTES } from "@/lib/constants.ts";
-import { jwtDecode } from "jwt-decode";
+import { collabTokenNeedsRefresh } from "@/features/editor/hooks/collab-token";
 
 export interface PageCollabProviders {
   ydoc: Y.Doc | null;
@@ -70,16 +70,6 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
   } | null>(null);
   const [providersReady, setProvidersReady] = useState(false);
 
-  // Mirror the local/remote sync flags into shared atoms so the header
-  // indicator can read them. These atoms are the single source of truth; the
-  // wrappers keep the existing call sites valid while driving only the atoms.
-  const setLocalSynced = (value: boolean) => {
-    setIsLocalSyncedAtom(value);
-  };
-  const setRemoteSynced = (value: boolean) => {
-    setIsRemoteSyncedAtom(value);
-  };
-
   useEffect(() => {
     if (!providersRef.current) {
       const documentName = `page.${pageId}`;
@@ -89,13 +79,13 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
         url: collaborationURL,
       });
       const onLocalSyncedHandler = () => {
-        setLocalSynced(true);
+        setIsLocalSyncedAtom(true);
       };
       const onStatusHandler = (event: onStatusParameters) => {
         setYjsConnectionStatus(event.status);
       };
       const onSyncedHandler = (event: onSyncedParameters) => {
-        setRemoteSynced(event.state);
+        setIsRemoteSyncedAtom(event.state);
       };
       const onStatelessHandler = ({ payload }: onStatelessParameters) => {
         try {
@@ -121,17 +111,7 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
         // a refetch. A missing/malformed token must NOT crash the handler —
         // jwtDecode(undefined) throws — so treat any decode failure as "needs
         // refresh" and proceed to refetch + reconnect instead of getting stuck.
-        const token = collabTokenRef.current;
-        let needsRefresh = true; // no/unparseable token -> fetch a fresh one and reconnect
-        if (token) {
-          try {
-            const payload = jwtDecode<{ exp: number }>(token);
-            needsRefresh = Date.now() / 1000 >= payload.exp;
-          } catch {
-            needsRefresh = true; // malformed token -> refresh
-          }
-        }
-        if (!needsRefresh) return;
+        if (!collabTokenNeedsRefresh(collabTokenRef.current)) return;
         refetchCollabToken().then((result) => {
           if (result.data?.token) {
             socket.disconnect();
@@ -166,8 +146,8 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
       providersRef.current?.local.destroy();
       providersRef.current = null;
       // Reset shared sync state on page change/unmount.
-      setLocalSynced(false);
-      setRemoteSynced(false);
+      setIsLocalSyncedAtom(false);
+      setIsRemoteSyncedAtom(false);
     };
   }, [pageId]);
 

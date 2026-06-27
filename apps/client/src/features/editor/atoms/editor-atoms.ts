@@ -17,8 +17,6 @@ export const isLocalSyncedAtom = atom<boolean>(false);
 // Remote (Hocuspocus) sync state for the current page's Y.Doc.
 export const isRemoteSyncedAtom = atom<boolean>(false);
 
-export const showAiMenuAtom = atom(false);
-
 export const showLinkMenuAtom = atom(false);
 
 // Current page's edit mode — initialized from the user's saved preference on

@@ -204,22 +204,11 @@ describe('EnvironmentService', () => {
   });
 
   describe('isSwaggerEnabled', () => {
-    it('is true for "true"', () => {
-      expect(makeService({ SWAGGER_ENABLED: 'true' }).isSwaggerEnabled()).toBe(
-        true,
-      );
-    });
-
-    it('is true case-insensitively for "TRUE"', () => {
-      expect(makeService({ SWAGGER_ENABLED: 'TRUE' }).isSwaggerEnabled()).toBe(
-        true,
-      );
-    });
-
-    it('is true for mixed-case "True"', () => {
-      expect(makeService({ SWAGGER_ENABLED: 'True' }).isSwaggerEnabled()).toBe(
-        true,
-      );
+    // Case-insensitive: "true" in any casing enables Swagger.
+    it.each(['true', 'TRUE', 'True'])('is true for "%s"', (value) => {
+      expect(
+        makeService({ SWAGGER_ENABLED: value }).isSwaggerEnabled(),
+      ).toBe(true);
     });
 
     it('defaults to false when absent', () => {

@@ -35,6 +35,20 @@ export default function useAuth() {
   const handleSignIn = async (data: ILogin) => {
     setIsLoading(true);
 
+    // Purge any previous user's offline data BEFORE signing in (mirrors logout).
+    // On a shared/kiosk device the prior session may have ended WITHOUT an
+    // explicit logout (cookie/JWT expiry, tab close, force-quit), leaving user
+    // A's persisted query cache (gitmost-rq-cache) and Yjs page bodies
+    // (page.<id>) in IndexedDB. Without this purge user B would briefly read A's
+    // cached currentUser/pages/comments on first render (UserProvider serves the
+    // cached user) and A's page bodies would stay readable offline. Best-effort:
+    // never block sign-in on cache cleanup.
+    try {
+      await clearOfflineCache();
+    } catch {
+      // best-effort: never block sign-in on cache cleanup
+    }
+
     try {
       await login(data);
       setIsLoading(false);

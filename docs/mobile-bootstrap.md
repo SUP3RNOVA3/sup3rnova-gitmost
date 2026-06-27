@@ -20,8 +20,8 @@ mobile app for Gitmost, per the first-step checklist in
   as `NetworkOnly` — offline reads are served by the persisted TanStack Query
   cache (IndexedDB) and `y-indexeddb` for the page Yjs doc, not by an SW HTTP
   cache. This lets the existing responsive web UI be installed and run as a
-  Progressive Web App. See [docs/offline-sync-plan.md](./offline-sync-plan.md) for
-  the full offline/sync design.
+  Progressive Web App. The offline/sync design (stages M0…M4) is summarized in
+  [mobile-app-plan.md](./mobile-app-plan.md).
 - **Backend mobile auth**: opt-in token return from the login flow. The login
   request accepts a `returnToken` flag (must be sent as a JSON boolean) that makes
   the server include the auth token in the response body, and the server already

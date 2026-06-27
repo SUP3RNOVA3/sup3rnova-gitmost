@@ -16,6 +16,7 @@ import { spaceByIdQueryOptions } from "@/features/space/queries/space-query";
 import { RQ_KEY } from "@/features/comment/queries/comment-query";
 import { getPageComments } from "@/features/comment/services/comment-service";
 import { getMyInfo } from "@/features/user/services/user-service";
+import { userKeys } from "@/features/user/hooks/use-current-user";
 import { IPage } from "@/features/page/types/page.types";
 import { IPagination } from "@/lib/types.ts";
 
@@ -32,7 +33,13 @@ import { IPagination } from "@/lib/types.ts";
  * but it is reported — the error is logged with context and `false` is returned
  * so the caller can record the failed step instead of silently succeeding.
  *
- * Returns true if the whole list was paginated and written, false on any error.
+ * Returns true ONLY if the cursor chain was fully exhausted and written. If the
+ * walk stops because it hit `maxPages` while a `nextCursor` is still pending,
+ * the cached list is truncated AND its last page keeps a nextCursor that cannot
+ * be re-fetched offline (hooks that gate on hasNextPage would spin forever), so
+ * that case is logged and returns false too — the caller records it as a failed
+ * warm instead of a silent truncated success. The (partial) cache is still
+ * written so what we did fetch is usable.
  *
  * Exported for unit testing of the cursor-walk / cache-write behavior.
  */
@@ -45,16 +52,31 @@ export async function warmInfiniteAll<T>(
     const pages: IPagination<T>[] = [];
     const pageParams: (string | undefined)[] = [];
     let cursor: string | undefined = undefined;
+    let exhausted = false;
 
     for (let i = 0; i < maxPages; i++) {
       const res = await fetchPage(cursor);
       pages.push(res);
       pageParams.push(cursor);
       cursor = res?.meta?.nextCursor ?? undefined;
-      if (!cursor) break;
+      if (!cursor) {
+        exhausted = true;
+        break;
+      }
     }
 
     queryClient.setQueryData(queryKey, { pages, pageParams });
+
+    if (!exhausted) {
+      // Stopped at maxPages with a cursor still pending: the list is truncated
+      // and the last cached page's nextCursor is un-fetchable offline. Report it
+      // as a failed warm rather than a silent truncated success.
+      console.error("warmInfiniteAll truncated at maxPages", {
+        queryKey,
+        maxPages,
+      });
+      return false;
+    }
     return true;
   } catch (error) {
     console.error("warmInfiniteAll failed", { queryKey, error });
@@ -101,7 +123,7 @@ export async function makePageAvailableOffline({
   // cache actually has an entry to restore.
   try {
     await queryClient.prefetchQuery({
-      queryKey: ["currentUser"],
+      queryKey: userKeys.currentUser(),
       queryFn: () => getMyInfo(),
     });
   } catch (error) {

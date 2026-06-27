@@ -104,11 +104,16 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
           color: "red",
         });
       }
-    } catch {
+    } catch (err) {
       // makePageAvailableOffline no longer throws, but warmPageYdoc and other
-      // unexpected failures stay guarded here.
+      // unexpected failures stay guarded here. Log the raw error and surface the
+      // real cause to the user instead of a bare generic string (AGENTS.md).
+      console.error("handleMakeAvailableOffline failed", err);
+      const reason =
+        (err as { response?: { data?: { message?: string } } })?.response?.data
+          ?.message ?? (err instanceof Error ? err.message : String(err));
       notifications.show({
-        message: t("Failed to make page available offline"),
+        message: `${t("Failed to make page available offline")}: ${reason}`,
         color: "red",
       });
     }

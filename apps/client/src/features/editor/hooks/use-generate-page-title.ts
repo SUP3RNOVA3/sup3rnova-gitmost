@@ -1,13 +1,9 @@
-import { useRef } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useAtomValue } from "jotai";
 import { notifications } from "@mantine/notifications";
 import { useTranslation } from "react-i18next";
 import { htmlToMarkdown } from "@docmost/editor-ext";
-import {
-  pageEditorAtom,
-  titleEditorAtom,
-} from "@/features/editor/atoms/editor-atoms.ts";
+import { pageEditorAtom } from "@/features/editor/atoms/editor-atoms.ts";
 import {
   updatePageData,
   useUpdateTitlePageMutation,
@@ -33,17 +29,8 @@ const MAX_CONTENT_CHARS = 20000;
 export function useGeneratePageTitle(pageId: string) {
   const { t } = useTranslation();
   const pageEditor = useAtomValue(pageEditorAtom);
-  const titleEditor = useAtomValue(titleEditorAtom);
   const { mutateAsync: updateTitle } = useUpdateTitlePageMutation();
   const emit = useQueryEmit();
-
-  // The page/title editors come from GLOBAL atoms that re-point when the user
-  // navigates to another page. The mutation below awaits the model for 1-3s, and
-  // its closure captures the editors from the render that started it. Keep a live
-  // reference so the post-generation write targets whatever page is on screen
-  // *now*, not the page the generation was started from.
-  const editorsRef = useRef({ pageEditor, titleEditor });
-  editorsRef.current = { pageEditor, titleEditor };
 
   return useMutation<void, Error, void>({
     mutationFn: async () => {
@@ -70,33 +57,15 @@ export function useGeneratePageTitle(pageId: string) {
       const page = await updateTitle({ pageId, title }); // POST /pages/update
       updatePageData(page); // refresh the react-query cache
 
-      // Reflect the new title in the field immediately. The button lives in the
-      // byline, so the title editor is not focused — setContent is safe and stays
-      // undoable through its History extension (Ctrl/Cmd+Z reverts the change).
-      //
-      // Guard against navigation during generation: if the user switched pages
-      // while the model ran, the (persistent) title editor now shows ANOTHER
-      // page, so writing here would drop page A's title into page B's visible
-      // field. page-editor.tsx stamps the live page editor with its pageId
-      // (`editor.storage.pageId`), mirroring TitleEditor's `activePageId !==
-      // pageId` guard — bail the visible write unless that live editor still
-      // belongs to the page this title was generated for. The DB write above is
-      // already correct (keyed by the captured `pageId`), and the broadcast below
-      // still propagates page A's change to other clients.
-      const livePageEditor = editorsRef.current.pageEditor;
-      const liveTitleEditor = editorsRef.current.titleEditor;
-      // `storage.pageId` is stamped untyped in page-editor.tsx's onCreate.
-      const livePageId = (livePageEditor?.storage as { pageId?: string })
-        ?.pageId;
-      const stillOnPage = livePageId === pageId;
-      if (
-        stillOnPage &&
-        liveTitleEditor &&
-        !liveTitleEditor.isDestroyed &&
-        !liveTitleEditor.isFocused
-      ) {
-        liveTitleEditor.commands.setContent(page.title);
-      }
+      // Do NOT write the title into the editor here. The title editor is bound to
+      // the Yjs `title` fragment and Yjs is the source of truth. The server REST
+      // /pages/update reseeds that fragment (writePageTitle → writeTitleFragment,
+      // a full clear+replace) and the reseed reaches the bound title editor on
+      // its own as a remote provider update. The old REST-era setContent here
+      // would race that reseed and double/garble the title (the "Yjs duplication
+      // trap"), so it is intentionally omitted. The DB write above is keyed by
+      // the captured `pageId`, so it stays correct even if the user navigated
+      // away during generation.
 
       // Broadcast to other clients, mirroring TitleEditor.saveTitle's event shape.
       const event: UpdateEvent = {

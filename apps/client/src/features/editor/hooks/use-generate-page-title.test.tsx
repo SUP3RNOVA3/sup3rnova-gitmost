@@ -139,7 +139,7 @@ describe("useGeneratePageTitle", () => {
     );
   });
 
-  it("happy path: applies the title, refreshes cache, writes the field, broadcasts", async () => {
+  it("happy path: applies the title, refreshes cache, broadcasts, and does NOT write the editor", async () => {
     const store = createStore();
     const titleEditor = makeTitleEditor();
     store.set(pageEditorAtom as never, makePageEditor("pageA"));
@@ -157,9 +157,11 @@ describe("useGeneratePageTitle", () => {
       title: "Generated Title",
     });
     expect(updatePageDataMock).toHaveBeenCalledWith(PAGE_A);
-    expect(titleEditor.commands.setContent).toHaveBeenCalledWith(
-      "Generated Title",
-    );
+    // The title editor is bound to the Yjs `title` fragment; the server REST
+    // update reseeds that fragment and the reseed reaches the bound editor on
+    // its own. Writing here too would double/garble the title, so the hook must
+    // NOT touch the editor (regression guard for the Yjs duplication trap).
+    expect(titleEditor.commands.setContent).not.toHaveBeenCalled();
     expect(localEmitMock).toHaveBeenCalled();
     expect(emitMock).toHaveBeenCalled();
     expect(notificationsShowMock).toHaveBeenCalledWith(
@@ -167,7 +169,7 @@ describe("useGeneratePageTitle", () => {
     );
   });
 
-  it("does NOT write the visible title field when the user navigated away during generation", async () => {
+  it("keeps the DB write keyed by the captured pageId and still broadcasts after navigation", async () => {
     const store = createStore();
     const titleEditor = makeTitleEditor(); // persistent across navigation
     store.set(pageEditorAtom as never, makePageEditor("pageA"));
@@ -203,55 +205,9 @@ describe("useGeneratePageTitle", () => {
       pageId: "pageA",
       title: "Generated Title",
     });
-    // ...but we must NOT stamp page A's title into page B's visible field.
+    // ...the hook never writes the editor regardless of navigation...
     expect(titleEditor.commands.setContent).not.toHaveBeenCalled();
-    // The change is still broadcast to other clients.
-    expect(emitMock).toHaveBeenCalled();
-  });
-
-  it("does NOT write the visible title field when the title editor is focused", async () => {
-    const store = createStore();
-    const titleEditor = makeTitleEditor();
-    store.set(pageEditorAtom as never, makePageEditor("pageA"));
-    store.set(titleEditorAtom as never, titleEditor);
-
-    // Resolve generation under our control so we can mark the live title editor
-    // as focused before the post-generation write runs.
-    let resolveTitle!: (t: string) => void;
-    generatePageTitleMock.mockReturnValue(
-      new Promise<string>((res) => {
-        resolveTitle = res;
-      }),
-    );
-    updateTitleMock.mockResolvedValue(PAGE_A);
-    const { result } = setup("pageA", store);
-
-    let pending!: Promise<void>;
-    act(() => {
-      pending = result.current.mutateAsync();
-    });
-
-    // The user clicked into the title field while the model ran — overwriting it
-    // now would clobber what they are actively typing.
-    act(() => {
-      (titleEditor as { isFocused: boolean }).isFocused = true;
-    });
-
-    await act(async () => {
-      resolveTitle("Generated Title");
-      await pending;
-    });
-
-    // The DB write still persists the value...
-    expect(updateTitleMock).toHaveBeenCalledWith({
-      pageId: "pageA",
-      title: "Generated Title",
-    });
-    expect(updatePageDataMock).toHaveBeenCalledWith(PAGE_A);
-    // ...but the visible field is left alone while it is focused.
-    expect(titleEditor.commands.setContent).not.toHaveBeenCalled();
-    // The change is still broadcast to other clients.
-    expect(localEmitMock).toHaveBeenCalled();
+    // ...and the change is still broadcast to other clients.
     expect(emitMock).toHaveBeenCalled();
   });
 

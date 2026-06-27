@@ -123,17 +123,25 @@ describe("warmInfiniteAll", () => {
     expect(payload.pageParams).toEqual([undefined, "c1", "c2"]);
   });
 
-  it("caps pagination at maxPages", async () => {
+  it("caps pagination at maxPages and reports the truncation (returns false)", async () => {
     // Always returns a non-null cursor — the cap is the only thing that stops it.
     const fetchPage = vi
       .fn()
       .mockResolvedValue({ items: [], meta: { nextCursor: "more" } });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
-    await warmInfiniteAll(["comments", "p1"], fetchPage, 2);
+    // Hitting maxPages with a cursor still pending is a truncated warm: the
+    // (partial) cache is still written, but the result is reported as false.
+    await expect(
+      warmInfiniteAll(["comments", "p1"], fetchPage, 2),
+    ).resolves.toBe(false);
 
     expect(fetchPage).toHaveBeenCalledTimes(2);
     const payload = setQueryData.mock.calls[0][1];
     expect(payload.pages).toHaveLength(2);
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 
   it("returns true on success", async () => {

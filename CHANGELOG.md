@@ -166,6 +166,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   JSON-compatible schema (no custom tags / no code execution) behind the same
   size-cap, redirect and path-traversal guards. The `AI_AGENT_ROLES_CATALOG_URL`
   base-URL contract is unchanged. (#229)
+- **CORS is now an explicit allowlist** (replaces the previous unconfigured
+  `app.enableCors()`). The same-origin web client is unaffected, but any
+  separately-hosted cross-domain client must now be listed in
+  `CORS_ALLOWED_ORIGINS` (native Capacitor/Ionic/localhost WebView origins are
+  allowed automatically). Requests with no `Origin` header (server-to-server)
+  are still allowed.
+
+### Added
+
+- **Offline reading support**: opened pages, their sidebar tree, breadcrumb
+  children, and comments are cached in IndexedDB (TanStack Query persister plus
+  `y-indexeddb` for the page's Yjs document), and a PWA service worker
+  (vite-plugin-pwa) serves an app shell so previously opened pages stay readable
+  offline. The offline cache (persisted query cache, Yjs page documents, and the
+  service-worker API cache) is cleared on logout AND on sign-in so a previous
+  user's private data does not remain in the browser.
+- **Mobile bootstrap**: a `returnToken` opt-in on login so native/mobile clients
+  can request the access JWT in the response body (`data.authToken`) in addition
+  to the httpOnly cookie (the web client stays cookie-only); an optional
+  OpenAPI/Swagger UI at `/api/docs` gated by `SWAGGER_ENABLED` (off by default);
+  and new env vars `CORS_ALLOWED_ORIGINS`, `SWAGGER_ENABLED`, `CAP_SERVER_URL`.
 
 ### Fixed
 
@@ -468,18 +489,6 @@ embeds — plus a large batch of security hardening and test coverage.
   injected into the `<head>` of public share pages only (for analytics such as
   Google Analytics or Yandex.Metrika), kept separate from the member-facing
   HTML-embed feature.
-- **Offline reading support**: opened pages, their sidebar tree, breadcrumb
-  children, and comments are cached in IndexedDB (TanStack Query persister plus
-  `y-indexeddb` for the page's Yjs document), and a PWA service worker
-  (vite-plugin-pwa) serves an app shell so previously opened pages stay readable
-  offline. The offline cache (persisted query cache, Yjs page documents, and the
-  service-worker API cache) is cleared on logout so a previous user's private
-  data does not remain in the browser.
-- **Mobile bootstrap**: a `returnToken` opt-in on login so native/mobile clients
-  can request the access JWT in the response body (`data.authToken`) in addition
-  to the httpOnly cookie (the web client stays cookie-only); an optional
-  OpenAPI/Swagger UI at `/api/docs` gated by `SWAGGER_ENABLED` (off by default);
-  and new env vars `CORS_ALLOWED_ORIGINS`, `SWAGGER_ENABLED`, `CAP_SERVER_URL`.
 - **MCP**: a hierarchical tree mode for `list_pages`, and per-user auth for the
   embedded `/mcp` endpoint.
 - **Page tree**: Expand all / Collapse all for the space tree, and
@@ -495,12 +504,6 @@ embeds — plus a large batch of security hardening and test coverage.
 
 ### Changed
 
-- **CORS is now an explicit allowlist** (replaces the previous unconfigured
-  `app.enableCors()`). The same-origin web client is unaffected, but any
-  separately-hosted cross-domain client must now be listed in
-  `CORS_ALLOWED_ORIGINS` (native Capacitor/Ionic/localhost WebView origins are
-  allowed automatically). Requests with no `Origin` header (server-to-server)
-  are still allowed.
 - HTML embed blocks now render inside a sandboxed iframe (separate origin) and,
   when the workspace HTML-embed toggle is on, can be inserted by any member
   (previously admin-only). Turning the toggle off hides existing embeds and

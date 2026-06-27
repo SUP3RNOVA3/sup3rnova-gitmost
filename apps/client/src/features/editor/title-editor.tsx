@@ -15,10 +15,8 @@ import { updatePageData } from "@/features/page/queries/page-query";
 import { useDebouncedCallback, getHotkeyHandler } from "@mantine/hooks";
 import { useAtom } from "jotai";
 import { useQueryEmit } from "@/features/websocket/use-query-emit.ts";
-import {
-  Collaboration,
-  isChangeOrigin,
-} from "@tiptap/extension-collaboration";
+import { Collaboration } from "@tiptap/extension-collaboration";
+import { shouldPropagateTitleChange } from "@/features/editor/title-collab";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
@@ -100,7 +98,7 @@ export function TitleEditor({
       onUpdate({ editor, transaction }) {
         // Drive URL + tree propagation only on genuine local edits; skip
         // remote/collab-origin Yjs updates to avoid feedback loops.
-        if (transaction && isChangeOrigin(transaction)) return;
+        if (!shouldPropagateTitleChange(transaction)) return;
         debouncedPropagateTitle(editor.getText());
       },
       editable: editable,
