@@ -26,6 +26,7 @@ import {
   queryPersister,
   shouldDehydrateOfflineQuery,
 } from "@/features/offline/query-persister";
+import { registerOfflineMutationDefaults } from "@/features/offline/offline-mutations";
 import { PwaUpdatePrompt } from "@/pwa/pwa-update-prompt";
 import { isCapacitorNativePlatform } from "@/pwa/is-capacitor";
 import posthog from "posthog-js";
@@ -43,6 +44,12 @@ export const queryClient = new QueryClient({
     },
   },
 });
+
+// Register default mutationFns for the offline-relevant structural mutations so
+// a paused mutation restored from IndexedDB after an offline reload still has a
+// mutationFn and is replayed by resumePausedMutations() on reconnect (instead
+// of silently no-op'ing and dropping the offline create/move/comment).
+registerOfflineMutationDefaults(queryClient);
 
 if (isCloud() && isPostHogEnabled) {
   posthog.init(getPostHogKey(), {

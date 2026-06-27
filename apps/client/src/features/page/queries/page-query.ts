@@ -43,6 +43,7 @@ import { treeModel } from "@/features/page/tree/model/tree-model";
 import { SpaceTreeNode } from "@/features/page/tree/types";
 import { useQueryEmit } from "@/features/websocket/use-query-emit";
 import { moveToTrashNotificationMessage } from "@/features/page/components/move-to-trash-notification";
+import { offlineMutationKeys } from "@/features/offline/offline-mutations";
 
 /**
  * Centralized React Query key factories for page queries. The hooks below and
@@ -95,6 +96,10 @@ export function usePageQuery(
 export function useCreatePageMutation() {
   const { t } = useTranslation();
   return useMutation<IPage, Error, Partial<IPageInput>>({
+    // Stable key so a paused create restored from IndexedDB after an offline
+    // reload finds its default mutationFn (registerOfflineMutationDefaults) and
+    // is replayed by resumePausedMutations() on reconnect instead of being lost.
+    mutationKey: offlineMutationKeys.createPage,
     mutationFn: (data) => createPage(data),
     onSuccess: (data) => {
       invalidateOnCreatePage(data);
@@ -216,6 +221,9 @@ export function useDeletePageMutation() {
 
 export function useMovePageMutation() {
   return useMutation<void, Error, IMovePage>({
+    // Stable key so a paused move restored from IndexedDB after an offline
+    // reload finds its default mutationFn and is replayed on reconnect.
+    mutationKey: offlineMutationKeys.movePage,
     mutationFn: (data) => movePage(data),
   });
 }

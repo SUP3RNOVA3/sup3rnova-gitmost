@@ -11,6 +11,7 @@ import { useTreeSocket } from "@/features/websocket/use-tree-socket.ts";
 import { useNotificationSocket } from "@/features/notification/hooks/use-notification-socket.ts";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import { Error404 } from "@/components/ui/error-404.tsx";
+import { OfflineFallback } from "@/features/offline/offline-fallback.tsx";
 import { queryClient } from "@/main.tsx";
 import { makeConnectHandler } from "@/features/user/connect-resync.ts";
 
@@ -70,14 +71,30 @@ export function UserProvider({ children }: React.PropsWithChildren) {
     document.documentElement.lang = i18n.resolvedLanguage || i18n.language || "en-US";
   }, [i18n.language, i18n.resolvedLanguage]);
 
-  if (isLoading) return <></>;
+  // First load with no cached user yet: render nothing briefly while the
+  // persisted ['currentUser'] cache hydrates (avoids flashing the offline
+  // fallback before restore). Once we have a user we render the app even if a
+  // refetch is still in flight.
+  if (isLoading && !data) return <></>;
 
   if (isError && error?.["response"]?.status === 404) {
     return <Error404 />;
   }
 
+  // We have a (possibly cached/stale) user — render the app. Offline, the
+  // POST /api/users/me refetch fails as a network error, but the persisted/
+  // hydrated user is enough to render the cached UI. Previously `if (error)
+  // return <></>` blanked every authenticated route on an offline reload even
+  // though the cached data was present (#237/#238).
+  if (data) {
+    return <>{children}</>;
+  }
+
+  // No user AND an error (offline cold boot of a page never warmed for offline,
+  // or no persisted cache to restore): show an explicit offline fallback rather
+  // than a blank white screen.
   if (error) {
-    return <></>;
+    return <OfflineFallback />;
   }
 
   return <>{children}</>;

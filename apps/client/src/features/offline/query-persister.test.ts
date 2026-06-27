@@ -27,6 +27,10 @@ describe("shouldDehydrateOfflineQuery", () => {
     expect(
       shouldDehydrateOfflineQuery(makeQuery("success", ["recent-changes"])),
     ).toBe(true);
+    // currentUser is persisted so the auth-gated Layout can hydrate offline.
+    expect(
+      shouldDehydrateOfflineQuery(makeQuery("success", ["currentUser"])),
+    ).toBe(true);
   });
 
   it("returns false when the status is not success (status gate)", () => {
@@ -60,7 +64,7 @@ describe("shouldDehydrateOfflineQuery", () => {
 });
 
 describe("OFFLINE_PERSIST_ROOTS", () => {
-  it("contains exactly the expected 8 navigation/read roots", () => {
+  it("contains exactly the expected 9 navigation/read roots", () => {
     const expected = [
       "pages",
       "sidebar-pages",
@@ -70,8 +74,9 @@ describe("OFFLINE_PERSIST_ROOTS", () => {
       "space",
       "spaces",
       "recent-changes",
+      "currentUser",
     ];
-    expect(OFFLINE_PERSIST_ROOTS.size).toBe(8);
+    expect(OFFLINE_PERSIST_ROOTS.size).toBe(9);
     for (const root of expected) {
       expect(OFFLINE_PERSIST_ROOTS.has(root)).toBe(true);
     }

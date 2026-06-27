@@ -15,6 +15,7 @@ import {
 import { spaceByIdQueryOptions } from "@/features/space/queries/space-query";
 import { RQ_KEY } from "@/features/comment/queries/comment-query";
 import { getPageComments } from "@/features/comment/services/comment-service";
+import { getMyInfo } from "@/features/user/services/user-service";
 import { IPage } from "@/features/page/types/page.types";
 import { IPagination } from "@/lib/types.ts";
 
@@ -69,7 +70,7 @@ export interface MakePageAvailableOfflineParams {
 /**
  * Outcome of {@link makePageAvailableOffline}. `ok` is true only when every warm
  * step succeeded; `failed` lists the labels of the steps that failed (a subset
- * of: "page", "space", "tree", "breadcrumbs", "comments").
+ * of: "currentUser", "page", "space", "tree", "breadcrumbs", "comments").
  */
 export interface MakePageAvailableOfflineResult {
   ok: boolean;
@@ -91,6 +92,25 @@ export async function makePageAvailableOffline({
   spaceId,
 }: MakePageAvailableOfflineParams): Promise<MakePageAvailableOfflineResult> {
   const failed: string[] = [];
+
+  // Warm the current user (['currentUser']) so the auth-gated <Layout> can
+  // hydrate offline. UserProvider blanks the whole app while useCurrentUser has
+  // no data, and the offline POST /api/users/me fails as a network error, so
+  // without a persisted user a pinned page still white-screens after relaunch
+  // (#238). Persisted via OFFLINE_PERSIST_ROOTS; warmed here so the persisted
+  // cache actually has an entry to restore.
+  try {
+    await queryClient.prefetchQuery({
+      queryKey: ["currentUser"],
+      queryFn: () => getMyInfo(),
+    });
+  } catch (error) {
+    console.error("makePageAvailableOffline: currentUser step failed", {
+      pageId,
+      error,
+    });
+    failed.push("currentUser");
+  }
 
   // Fetch the page document ONCE and write it under BOTH cache keys, exactly
   // like usePageQuery's onData effect. Every page consumer reads

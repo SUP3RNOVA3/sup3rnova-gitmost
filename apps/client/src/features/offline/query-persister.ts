@@ -31,6 +31,13 @@ export const queryPersister = createAsyncStoragePersister({
 
 // Only navigation/read query roots are persisted for offline reading.
 // Volatile/auth queries (collab tokens, trash lists) are intentionally excluded.
+//
+// `currentUser` IS persisted: UserProvider gates the entire <Layout> subtree on
+// useCurrentUser(), and offline the POST /api/users/me fails as a no-response
+// network error. Without the persisted/hydrated user the gate blanked every
+// authenticated route on an offline cold boot (#237/#238). It is the logged-in
+// user's own profile (already mirrored to localStorage["currentUser"]), so
+// persisting it to IndexedDB leaks nothing new while unlocking offline reads.
 export const OFFLINE_PERSIST_ROOTS = new Set<string>([
   "pages",
   "sidebar-pages",
@@ -40,6 +47,7 @@ export const OFFLINE_PERSIST_ROOTS = new Set<string>([
   "space",
   "spaces",
   "recent-changes",
+  "currentUser",
 ]);
 
 export function shouldDehydrateOfflineQuery(query: DehydratableQuery): boolean {

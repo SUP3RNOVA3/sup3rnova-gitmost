@@ -23,6 +23,7 @@ import { notifications } from "@mantine/notifications";
 import { IPagination } from "@/lib/types.ts";
 import { useTranslation } from "react-i18next";
 import { useEffect, useMemo } from "react";
+import { offlineMutationKeys } from "@/features/offline/offline-mutations";
 
 export const RQ_KEY = (pageId: string) => ["comments", pageId];
 
@@ -66,6 +67,9 @@ export function useCreateCommentMutation() {
   const { t } = useTranslation();
 
   return useMutation<IComment, Error, Partial<IComment>>({
+    // Stable key so a paused comment-create restored from IndexedDB after an
+    // offline reload finds its default mutationFn and is replayed on reconnect.
+    mutationKey: offlineMutationKeys.createComment,
     mutationFn: (data) => createComment(data),
     onSuccess: (newComment) => {
       const cache = queryClient.getQueryData(
