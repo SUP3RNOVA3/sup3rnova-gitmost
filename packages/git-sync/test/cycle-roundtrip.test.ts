@@ -129,7 +129,7 @@ describe("runCycle against a REAL VaultGit (integration)", () => {
     expect(onDisk).toContain("new-id");
   });
 
-  it("an unresolved merge short-circuits before any client call", async () => {
+  it("RECOVERS a vault left mid-merge instead of wedging the whole space", async () => {
     if (!available) return;
 
     dir = await mkdtemp(join(tmpdir(), "docmost-cycle-merge-"));
@@ -149,8 +149,9 @@ describe("runCycle against a REAL VaultGit (integration)", () => {
     await writeFile(join(dir, "C.md"), "main-side\n", "utf8");
     await git.stageAll();
     await git.commit("main edit", { authorName: "h", authorEmail: "h@l" });
-    // Start a conflicting merge and leave it unresolved.
+    // Start a conflicting merge and leave it unresolved (the wedged state).
     await execFileAsync("git", ["-C", dir, "merge", "docmost"]).catch(() => {});
+    expect(await git.isMergeInProgress()).toBe(true);
 
     const client = makeEmptyClientFake();
     const res = await runCycle({
@@ -162,8 +163,25 @@ describe("runCycle against a REAL VaultGit (integration)", () => {
       log: () => undefined,
     });
 
-    expect(res).toEqual({ ran: false, skipped: "merge-in-progress" });
-    expect(client.listSpaceTree).not.toHaveBeenCalled();
-    expect(client.createPage).not.toHaveBeenCalled();
+    // WEDGE FIX: the cycle does NOT skip forever — it aborts the stale merge and
+    // RUNS the full pull/push. The space is no longer frozen.
+    expect(res.ran).toBe(true);
+    expect(client.listSpaceTree).toHaveBeenCalled();
+    // And crucially, the vault is NOT left mid-merge afterward (the re-merge of a
+    // genuinely conflicting page is committed-with-markers, not wedged), so the
+    // next cycle can run too.
+    expect(await git.isMergeInProgress()).toBe(false);
+
+    // A SECOND cycle also runs cleanly (proves the wedge is gone for good).
+    const res2 = await runCycle({
+      spaceId: "space-1",
+      client: client as any,
+      vault: git,
+      settings: makeSettings(dir),
+      fs: nodeFs,
+      log: () => undefined,
+    });
+    expect(res2.ran).toBe(true);
+    expect(await git.isMergeInProgress()).toBe(false);
   });
 });

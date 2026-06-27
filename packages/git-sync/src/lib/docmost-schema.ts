@@ -49,8 +49,18 @@ function getStyleProperty(element: HTMLElement, propertyName: string): string | 
   return null;
 }
 
-/** Allowed Docmost callout types; anything else falls back to "info". */
-const CALLOUT_TYPES = ["info", "warning", "danger", "success"];
+/**
+ * Allowed Docmost callout types; anything else falls back to "info".
+ *
+ * This MUST stay in lockstep with the editor's canonical set
+ * (`getValidCalloutType` in `@docmost/editor-ext` callout/utils.ts:
+ * default | info | note | success | warning | danger). A type missing here is
+ * silently flattened to "info" on the markdown -> ProseMirror round-trip, so a
+ * `[!note]` / `[!default]` callout authored in the editor would come back as
+ * `[!info]` after a git sync (the QA "callout type -> [!info]" fidelity loss).
+ * `note` and `default` were previously absent and so were being flattened.
+ */
+const CALLOUT_TYPES = ["default", "info", "note", "success", "warning", "danger"];
 export const clampCalloutType = (value: string | null | undefined): string =>
   value && CALLOUT_TYPES.includes(value.toLowerCase())
     ? value.toLowerCase()

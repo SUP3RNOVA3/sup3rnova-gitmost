@@ -66,6 +66,10 @@ function makeGit(merge: { ok: boolean; conflict: boolean; output?: string } = {
       order.push('merge');
       return { ok: merge.ok, conflict: merge.conflict, output: merge.output ?? '' };
     }),
+    listUnmergedPaths: vi.fn(async () => ['Conflicted.md']),
+    commitMerge: vi.fn(async (subject: string) => {
+      order.push(`commitMerge:${subject}`);
+    }),
   };
   return {
     git,
@@ -403,7 +407,11 @@ describe('applyPullActions — commit subject reflects ACTUAL counts', () => {
 });
 
 describe('applyPullActions — merge result is surfaced, not swallowed', () => {
-  it('returns conflict:true on a conflicting merge (no auto-resolve)', async () => {
+  it('COMMITS a conflicting merge with markers (no wedge) and surfaces conflictedPaths', async () => {
+    // Regression for the WEDGE bug (QA #119): a conflicting docmost -> main merge
+    // must NOT be left mid-merge (which wedged the whole space). It is committed
+    // WITH markers so the rest of the space keeps syncing; the conflicted page is
+    // surfaced in `conflictedPaths` and isolated by the push side.
     const { client } = makeClient();
     const g = makeGit({ ok: false, conflict: true, output: 'CONFLICT' });
     const fs = makeFs();
@@ -415,6 +423,10 @@ describe('applyPullActions — merge result is surfaced, not swallowed', () => {
     );
     expect(res.merge.conflict).toBe(true);
     expect(res.merge.ok).toBe(false);
+    // The merge was COMMITTED (vault no longer mid-merge) and the bad page named.
+    expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
+    expect(res.conflictedPaths).toEqual(['Conflicted.md']);
+    expect(g.order.some((o) => o.startsWith('commitMerge:'))).toBe(true);
   });
 
   it('returns ok:false conflict:false on a non-conflict merge failure', async () => {

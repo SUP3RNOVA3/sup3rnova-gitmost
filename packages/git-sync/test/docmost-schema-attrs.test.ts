@@ -65,9 +65,21 @@ describe('clampCalloutType', () => {
     expect(clampCalloutType('success')).toBe('success');
   });
 
-  it('falls back to "info" for unknown types', () => {
-    expect(clampCalloutType('note')).toBe('info');
+  it('PRESERVES every editor-canonical type (note/default no longer flattened)', () => {
+    // Regression for the QA "callout type -> [!info]" fidelity loss: `note` and
+    // `default` are valid editor callout types and must survive the git
+    // round-trip, not collapse to `info`.
+    expect(clampCalloutType('note')).toBe('note');
+    expect(clampCalloutType('default')).toBe('default');
+    expect(clampCalloutType('info')).toBe('info');
+    expect(clampCalloutType('warning')).toBe('warning');
+    expect(clampCalloutType('danger')).toBe('danger');
+    expect(clampCalloutType('success')).toBe('success');
+  });
+
+  it('falls back to "info" for genuinely unknown types', () => {
     expect(clampCalloutType('tip')).toBe('info');
+    expect(clampCalloutType('banana')).toBe('info');
   });
 
   it('falls back to "info" for empty string and null', () => {

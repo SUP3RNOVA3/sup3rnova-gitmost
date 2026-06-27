@@ -218,7 +218,15 @@ export function computePullActions(input: PullActionsInput): PullActions {
  */
 export interface ApplyPullActionsDeps {
   client: Pick<GitSyncClient, "getPageJson">;
-  git: Pick<VaultGit, "stageAll" | "commit" | "checkout" | "merge">;
+  git: Pick<
+    VaultGit,
+    | "stageAll"
+    | "commit"
+    | "checkout"
+    | "merge"
+    | "listUnmergedPaths"
+    | "commitMerge"
+  >;
   /** Write a file by ABSOLUTE path (mkdir of the parent is done internally). */
   writeFile: (absPath: string, text: string) => Promise<void>;
   /** Recursive mkdir of an ABSOLUTE directory path. */
@@ -240,6 +248,13 @@ export interface ApplyResult {
   failed: number;
   committed: boolean;
   merge: { ok: boolean; conflict: boolean; output: string };
+  /**
+   * Vault-relative paths of the page(s) that CONFLICTED in the docmost -> main
+   * merge and were committed WITH conflict markers (so the rest of the space
+   * keeps syncing — SPEC §9 wedge fix). Empty on a clean merge. The push side
+   * isolates these (per-page failure when `autoMergeConflicts` is off).
+   */
+  conflictedPaths: string[];
 }
 
 /**
@@ -404,20 +419,47 @@ export async function applyPullActions(
     trailers: [SOURCE_TRAILER],
   });
 
-  // Merge docmost -> main. Conflicts are surfaced and left in git (SPEC §9);
-  // we never push to Docmost. Push to a git remote is deferred (SPEC §7).
+  // Merge docmost -> main. A CONFLICT must NOT wedge the whole space (the
+  // reported bug: ONE same-line conflict on ONE page froze sync for EVERY page
+  // in both directions because the next cycle's `isMergeInProgress` check kept
+  // skipping the entire space). So instead of leaving the vault mid-merge, we
+  // COMMIT the conflicted merge with markers in place (SPEC §9 wedge fix): the
+  // cleanly-merged pages land, the conflicted page carries its markers on `main`
+  // and is isolated by the push side (a per-page failure when `autoMergeConflicts`
+  // is off — the markers never reach Docmost), and the NEXT cycle is NOT wedged.
+  // Recovery: resolve the markers in git; the next push then sends the clean body.
   await git.checkout(DEFAULT_BRANCH);
   const merge = await git.merge(DOCMOST_BRANCH);
+  let conflictedPaths: string[] = [];
   if (merge.conflict) {
+    conflictedPaths = await git.listUnmergedPaths();
+    await git.commitMerge(
+      `docmost: sync with unresolved conflict in ${conflictedPaths.length} page(s)`,
+      {
+        authorName: BOT_AUTHOR_NAME,
+        authorEmail: BOT_AUTHOR_EMAIL,
+        trailers: [SOURCE_TRAILER],
+      },
+    );
     log(
-      "pull: merge of docmost -> main CONFLICTED. Conflict markers were left " +
-        "in the vault for manual resolution (SPEC §9). Nothing is pushed to " +
-        "Docmost (read-only). Resolve locally, then re-run.",
+      `pull: merge of docmost -> main CONFLICTED on ${conflictedPaths.length} ` +
+        `page(s): ${conflictedPaths.join(", ")}. Committed the merge WITH ` +
+        `conflict markers so the rest of the space keeps syncing (SPEC §9). The ` +
+        `conflicted page(s) are isolated on push (markers never reach Docmost); ` +
+        `resolve the markers in git to recover.`,
     );
   } else if (!merge.ok) {
     log(`pull: merge of docmost -> main failed: ${merge.output}`);
   }
   log("pull: git push to remote is DEFERRED in this increment (SPEC §7).");
 
-  return { written, movedApplied, deleted, failed, committed, merge };
+  return {
+    written,
+    movedApplied,
+    deleted,
+    failed,
+    committed,
+    merge,
+    conflictedPaths,
+  };
 }

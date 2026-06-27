@@ -415,6 +415,65 @@ export class VaultGit {
   }
 
   /**
+   * The vault-relative (forward-slash) paths with UNMERGED (conflicted) index
+   * entries after a conflicting merge. NUL-delimited + `core.quotepath=false`
+   * (the `runRaw` baseline) so Cyrillic/space paths come back verbatim. Used by
+   * the pull cycle to LOG and ISOLATE the conflicted page(s) when it commits a
+   * conflicted merge instead of leaving the whole vault wedged (SPEC §9 wedge
+   * fix). Returns `[]` on any error (best-effort diagnostics).
+   */
+  async listUnmergedPaths(): Promise<string[]> {
+    const r = await this.runRaw([
+      "diff",
+      "--name-only",
+      "--diff-filter=U",
+      "-z",
+    ]);
+    if (r.code !== 0) return [];
+    return r.stdout.split("\0").filter((p) => p.length > 0);
+  }
+
+  /**
+   * Commit an IN-PROGRESS (conflicted) merge AS-IS so the vault is NOT left
+   * wedged mid-merge (SPEC §9 wedge fix). A `git merge` that conflicts leaves
+   * `MERGE_HEAD` + unmerged index entries; the next cycle's `isMergeInProgress`
+   * check would then skip the ENTIRE space forever (the reported wedge). Instead
+   * we stage everything — including the conflicted file(s), whose conflict
+   * markers are PRESERVED in the committed tree — and record the two-parent merge
+   * commit. The cleanly-merged pages land normally; the conflicted page carries
+   * its markers on `main`, where the push side isolates it (a per-page push
+   * failure when `autoMergeConflicts` is off; the markers never reach Docmost)
+   * while every other page keeps syncing. Recovery: resolve the markers in git
+   * and the next push sends the clean body.
+   *
+   * `--allow-empty` guards the degenerate case where the staged conflict
+   * resolution nets to no tree change; while `MERGE_HEAD` exists `git commit`
+   * still records the merge commit so the half-merge is cleared.
+   */
+  async commitMerge(message: string, opts: CommitOptions): Promise<void> {
+    await this.run(["add", "-A"]);
+    await this.commitRaw(message, { ...opts, allowEmpty: true });
+  }
+
+  /**
+   * Abort an in-progress merge (`git merge --abort`), restoring the pre-merge
+   * working tree + index. Best-effort: a non-zero exit (e.g. no MERGE_HEAD) is
+   * swallowed. Used by the cycle's RECOVERY path to unwedge a vault that a
+   * PRIOR (pre-fix) cycle left mid-merge, so the fresh pull can re-run instead of
+   * skipping the space forever (SPEC §9 wedge recovery).
+   */
+  async abortMerge(): Promise<void> {
+    await this.runRaw(["merge", "--abort"]);
+  }
+
+  /** Hard-reset the working tree + index to HEAD (drops a stray half-merge that
+   * `merge --abort` could not clear — no MERGE_HEAD but lingering unmerged
+   * entries). Best-effort recovery primitive (SPEC §9). */
+  async resetHardToHead(): Promise<void> {
+    await this.runRaw(["reset", "--hard", "HEAD"]);
+  }
+
+  /**
    * List tracked files on the current branch (paths relative to the vault
    * root, forward-slash separated). An optional glob (a git pathspec) narrows
    * the listing, e.g. `"*.md"`.

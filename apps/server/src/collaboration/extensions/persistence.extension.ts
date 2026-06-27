@@ -2,6 +2,7 @@ import {
   afterUnloadDocumentPayload,
   Extension,
   onChangePayload,
+  onDisconnectPayload,
   onLoadDocumentPayload,
   onStoreDocumentPayload,
 } from '@hocuspocus/server';
@@ -162,6 +163,40 @@ export class PersistenceExtension implements Extension {
 
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
     return new Y.Doc();
+  }
+
+  /**
+   * LOSS-ON-FAST-CLOSE FIX (QA #119). When the LAST editor disconnects, FLUSH any
+   * pending (debounced) store to the DB IMMEDIATELY instead of waiting out the
+   * up-to-10s `debounce` window.
+   *
+   * The collab server runs with `unloadImmediately: false` (collaboration.gateway),
+   * so on a last-client disconnect Hocuspocus does NOT flush the debounced
+   * onStoreDocument — it relies on the timer firing later. A quick edit-then-close
+   * (closing the tab within the debounce window, ~3-18s) therefore left the edit
+   * only in the soon-to-be-unloaded in-memory Y.Doc; meanwhile git-sync mirrored
+   * the STALE/empty DB body to the vault (the reported "59-byte frontmatter-only"
+   * data loss). Running the already-scheduled store now closes that window.
+   *
+   * Gated tightly so it never adds a redundant write: only on the LAST disconnect
+   * (`clientsCount === 0`), only for a fully-loaded doc, and only when a store is
+   * actually pending (`isDebounced`). `executeNow` runs the SAME payload Hocuspocus
+   * scheduled (preserving the edit's context/actor) and clears the timer.
+   */
+  async onDisconnect(data: onDisconnectPayload) {
+    const { instance, document, documentName, clientsCount } = data;
+    if (clientsCount > 0) return;
+    if (!document || document.isLoading) return;
+    const debounceId = `onStoreDocument-${documentName}`;
+    if (!instance?.debouncer?.isDebounced(debounceId)) return;
+    try {
+      await instance.debouncer.executeNow(debounceId);
+    } catch (err) {
+      this.logger.error(
+        `onDisconnect flush failed for ${documentName}: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {

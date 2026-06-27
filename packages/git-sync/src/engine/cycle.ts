@@ -85,14 +85,30 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
   await vault.assertGitAvailable();
   await vault.ensureRepo();
 
-  // 2. Refuse to run on top of an unresolved merge (SPEC §9): a prior
-  //    conflicting pull leaves the vault mid-merge; the next checkout would fail.
+  // 2. RECOVER from a vault left mid-merge by a PRIOR cycle (SPEC §9 wedge fix).
+  //    A leftover merge used to WEDGE THE WHOLE SPACE: this check returned
+  //    `skipped: "merge-in-progress"` so EVERY later cycle skipped the entire
+  //    space (all pages, both directions) forever, with no recovery. The pull
+  //    phase below no longer leaves the vault mid-merge (it commits a conflicting
+  //    merge with markers and isolates the one bad page), but a vault wedged by a
+  //    PRE-FIX build (or a manual/interrupted git op) must still self-heal.
+  //    So instead of skipping, ABORT the stale half-merge and continue — the
+  //    fresh pull re-runs and, on a real conflict, commits-with-markers rather
+  //    than re-wedging. A stray unmerged index that `merge --abort` can't clear
+  //    (no MERGE_HEAD) is force-cleared with a hard reset to HEAD.
   if (await vault.isMergeInProgress()) {
     log(
-      `vault has an unresolved merge — resolve it (or 'git merge --abort') ` +
-        `and re-run (SPEC §9); skipping cycle.`,
+      `vault was left mid-merge by a prior cycle — aborting the stale merge and ` +
+        `continuing so the space is not wedged (SPEC §9 recovery).`,
     );
-    return { ran: false, skipped: "merge-in-progress" };
+    await vault.abortMerge();
+    if (await vault.isMergeInProgress()) {
+      log(
+        `vault still mid-merge after 'merge --abort' — hard-resetting to HEAD ` +
+          `to recover (SPEC §9).`,
+      );
+      await vault.resetHardToHead();
+    }
   }
 
   // 3. Pull writes happen on `docmost`; be on it BEFORE applying (see docstring).

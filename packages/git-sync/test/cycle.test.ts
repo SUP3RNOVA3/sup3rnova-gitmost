@@ -24,6 +24,10 @@ function fakeVault(overrides: Record<string, any> = {}) {
     stageAll: rec("stageAll"),
     commit: rec("commit", { committed: false }),
     merge: rec("merge", { ok: true, conflict: false, output: "" }),
+    listUnmergedPaths: vi.fn(async () => [] as string[]),
+    commitMerge: rec("commitMerge"),
+    abortMerge: rec("abortMerge"),
+    resetHardToHead: rec("resetHardToHead"),
     readRef: vi.fn(async () => null),
     revParse: vi.fn(async () => "0000000000000000000000000000000000000000"),
     diffNameStatus: vi.fn(async () => [] as any[]),
@@ -64,16 +68,47 @@ function baseDeps(vault: any, over: Partial<RunCycleDeps> = {}): RunCycleDeps {
 }
 
 describe("runCycle (composition)", () => {
-  it("short-circuits with skipped:'merge-in-progress' and runs no pull/push", async () => {
-    const vault = fakeVault({ isMergeInProgress: vi.fn(async () => true) });
+  it("RECOVERS from a vault left mid-merge: aborts the stale merge and continues (no wedge)", async () => {
+    // Regression for the WEDGE bug (QA #119): a vault left mid-merge by a prior
+    // cycle used to skip the WHOLE space forever. Now the cycle aborts the stale
+    // merge and proceeds so the space self-heals.
+    let midMerge = true;
+    const vault = fakeVault({
+      // mid-merge until `abortMerge` clears it (then the cycle continues).
+      isMergeInProgress: vi.fn(async () => midMerge),
+      abortMerge: vi.fn(async () => {
+        midMerge = false;
+      }),
+    });
     const deps = baseDeps(vault);
 
     const res = await runCycle(deps);
 
-    expect(res).toEqual({ ran: false, skipped: "merge-in-progress" });
-    // Never advanced to the pull (listSpaceTree) or push.
-    expect(deps.client.listSpaceTree).not.toHaveBeenCalled();
-    expect(vault.order).not.toContain("checkout:docmost");
+    // The stale merge was aborted and the cycle RAN (no permanent wedge).
+    expect(vault.abortMerge).toHaveBeenCalledTimes(1);
+    expect(res.ran).toBe(true);
+    expect(deps.client.listSpaceTree).toHaveBeenCalledTimes(1);
+    expect(vault.order).toContain("checkout:docmost");
+  });
+
+  it("hard-resets when 'merge --abort' cannot clear a stray unmerged index", async () => {
+    // abortMerge does NOT clear it (no MERGE_HEAD but stray unmerged entries);
+    // the cycle falls back to a hard reset, then proceeds.
+    let midMerge = true;
+    const vault = fakeVault({
+      isMergeInProgress: vi.fn(async () => midMerge),
+      abortMerge: vi.fn(async () => undefined), // leaves it mid-merge
+      resetHardToHead: vi.fn(async () => {
+        midMerge = false;
+      }),
+    });
+    const deps = baseDeps(vault);
+
+    const res = await runCycle(deps);
+
+    expect(vault.abortMerge).toHaveBeenCalledTimes(1);
+    expect(vault.resetHardToHead).toHaveBeenCalledTimes(1);
+    expect(res.ran).toBe(true);
   });
 
   it("stages ensureRepo -> ensureBranch(docmost,main) -> checkout(docmost) BEFORE pulling", async () => {
