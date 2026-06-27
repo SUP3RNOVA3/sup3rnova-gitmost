@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url';
+import { esmImport } from '../../../common/helpers/esm-import';
 
 /**
  * Minimal structural type for the `DocmostClient` class we consume from the
@@ -192,14 +193,8 @@ interface DocmostMcpModule {
   SHARED_TOOL_SPECS: Record<string, SharedToolSpec>;
 }
 
-// TS with module:commonjs downlevels a literal `import()` to `require()`, which
-// cannot load the ESM-only `@docmost/mcp` package. Indirect through Function so
-// the real dynamic `import()` survives compilation and can load ESM from
-// CommonJS at runtime (same trick as integrations/mcp/mcp.service.ts).
-const esmImport = new Function(
-  'specifier',
-  'return import(specifier)',
-) as (specifier: string) => Promise<unknown>;
+// The CJS->ESM dynamic-import bridge lives in one shared helper
+// (common/helpers/esm-import.ts). The typed `loadDocmostMcp()` wrapper stays here.
 
 // Memoize the in-flight/loaded module so the dynamic import runs at most once.
 let modulePromise: Promise<DocmostMcpModule> | null = null;

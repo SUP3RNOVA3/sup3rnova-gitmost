@@ -17,6 +17,13 @@
  * the human and/or git rewrote; resolve each region three-way. Stable anchor
  * blocks are emitted from LIVE so the applier keeps the existing Yjs block
  * instances (and the human's in-flight edits) in place.
+ *
+ * LOCATION (deferred): this and its `lcs.ts` sibling are pure, framework-free and
+ * could conceptually live in `packages/git-sync` (the engine). They are kept in
+ * the server integration on purpose: `packages/git-sync` is a VENDORED engine
+ * (pinned upstream, manually re-synced), so adding first-party files there
+ * complicates the re-sync story, and the only consumer today is the server. Move
+ * them into the engine only once the vendoring re-sync story is settled.
  */
 
 import { buildLcsTable } from './lcs';

@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url';
+import { esmImport } from '../../common/helpers/esm-import';
 import type {
   VaultGit as VaultGitClass,
   vaultGitEnv as vaultGitEnvFn,
@@ -21,16 +22,9 @@ interface GitSyncModule {
   markdownToProseMirror: typeof markdownToProseMirrorFn;
 }
 
-// TS with module:commonjs downlevels a literal `import()` to `require()`, which
-// cannot load the ESM-only `@docmost/git-sync` package. Indirect through
-// Function so the real dynamic `import()` survives compilation and can load ESM
-// from CommonJS at runtime (same trick as
-// apps/server/src/core/ai-chat/tools/docmost-client.loader.ts and
-// integrations/mcp/mcp.service.ts).
-const esmImport = new Function(
-  'specifier',
-  'return import(specifier)',
-) as (specifier: string) => Promise<unknown>;
+// The CJS->ESM dynamic-import bridge lives in one shared helper
+// (common/helpers/esm-import.ts); see it for why `import()` must be hidden from
+// the TS commonjs downleveler. The typed `loadGitSync()` wrapper stays here.
 
 // Memoize the in-flight/loaded module so the dynamic import runs at most once.
 let modulePromise: Promise<GitSyncModule> | null = null;

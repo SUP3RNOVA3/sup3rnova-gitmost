@@ -367,7 +367,13 @@ export class EnvironmentService {
     return `${dataDir.replace(/\/+$/, '')}/git-sync`;
   }
 
-  /** Optional remote template, e.g. `git@host:vault-{spaceId}.git`. */
+  /**
+   * Optional remote template, e.g. `git@host:vault-{spaceId}.git` (`{spaceId}` is
+   * substituted per-space in the orchestrator). SCAFFOLDING for the deferred
+   * remote-push feature: the vendored engine has no remote-push path yet (SPEC
+   * §7), so this value is currently inert — kept so the wiring is ready when the
+   * engine grows a push path.
+   */
   getGitSyncRemoteTemplate(): string | undefined {
     return this.configService.get<string>('GIT_SYNC_REMOTE_TEMPLATE');
   }
