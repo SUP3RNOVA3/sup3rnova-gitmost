@@ -1,4 +1,9 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  UnauthorizedException,
+} from '@nestjs/common';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { AuthService } from '../../../core/auth/services/auth.service';
 import SpaceAbilityFactory from '../../../core/casl/abilities/space-ability.factory';
@@ -9,7 +14,12 @@ import {
 import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
 import { User } from '@docmost/db/types/entity.types';
-import { parseBasicAuth } from '../../mcp/mcp-auth.helpers';
+import {
+  parseBasicAuth,
+  FailedLoginLimiter,
+  clientIp,
+  isCredentialsFailure,
+} from '../../mcp/mcp-auth.helpers';
 import { resolveRequestWorkspace } from '../../../common/helpers/resolve-request-workspace';
 import { EnvironmentService } from '../../environment/environment.service';
 import { VaultRegistryService } from '../services/vault-registry.service';
@@ -40,8 +50,23 @@ const WWW_AUTHENTICATE = 'Basic realm="gitmost"';
  * `/api` prefix does not apply). Never logs the password or Authorization header.
  */
 @Injectable()
-export class GitHttpService {
+export class GitHttpService implements OnModuleDestroy {
   private readonly logger = new Logger(GitHttpService.name);
+
+  /**
+   * In-process brute-force speed bump for the /git HTTP-Basic path. The raw
+   * `/git/*` Fastify route bypasses the Nest pipeline (so ThrottlerGuard, which is
+   * only on controllers, never runs) and there is no fastify rate-limit plugin, so
+   * without this `verifyUserCredentials` (bcrypt) would run unthrottled on every
+   * request once GIT_SYNC_HTTP_ENABLED is on. Mirrors the /mcp Basic path EXACTLY
+   * (FailedLoginLimiter, same 5/60s thresholds, the same per-IP / per-IP+email /
+   * global-per-email keys) so the two auth seams cannot diverge. A speed bump, not
+   * a hard boundary (in-process, per replica).
+   */
+  private readonly failedLogins = new FailedLoginLimiter(5, 60_000);
+  /** Periodic sweep to bound limiter memory (mirrors McpService / mcp http.ts). */
+  private readonly sweepIntervalMs = 60_000;
+  private readonly sweepTimer: NodeJS.Timeout;
 
   constructor(
     private readonly environmentService: EnvironmentService,
@@ -52,7 +77,21 @@ export class GitHttpService {
     private readonly vaultRegistry: VaultRegistryService,
     private readonly orchestrator: GitSyncOrchestrator,
     private readonly backend: GitHttpBackendService,
-  ) {}
+  ) {
+    this.sweepTimer = setInterval(() => {
+      try {
+        this.failedLogins.sweep();
+      } catch (err) {
+        this.logger.error('git-http failed-login limiter sweep failed', err as Error);
+      }
+    }, this.sweepIntervalMs);
+    // Never keep the event loop alive solely for the sweep timer.
+    this.sweepTimer.unref?.();
+  }
+
+  onModuleDestroy(): void {
+    clearInterval(this.sweepTimer);
+  }
 
   /**
    * Resolve the workspace for a /git request the SAME way DomainMiddleware does,
@@ -124,25 +163,84 @@ export class GitHttpService {
 
     let user: User | undefined;
     let credentialsValid = false;
+    let throttled = false;
     if (basic && workspaceId) {
-      try {
-        user = await this.authService.verifyUserCredentials(
-          { email: basic.email, password: basic.password },
-          workspaceId,
-        );
-        credentialsValid = true;
-      } catch (err) {
-        if (!(err instanceof UnauthorizedException)) {
-          // A non-credential failure (e.g. DB error): treat as invalid creds for
-          // the gate (a 401), and log without leaking the password/header.
-          this.logger.warn(
-            `git-http: credential check error: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
+      // Brute-force speed bump, mirroring the /mcp Basic path EXACTLY. Reserve
+      // ALL three keys ATOMICALLY and BEFORE bcrypt (tryReserve folds the check
+      // and the increment into one synchronous step), so the (threshold+1)-th
+      // attempt is rejected before verifyUserCredentials/bcrypt ever runs and
+      // concurrent attempts for one email cannot all observe count=0. The
+      // reservation IS the recorded failure: a genuine credential failure leaves
+      // it in place, a SUCCESS clears it (reset), a non-credential error releases
+      // it (so it cannot burn a victim's budget).
+      const emailLc = basic.email.toLowerCase();
+      const ip = clientIp(req);
+      const ipKey = `ip:${ip}`;
+      const ipEmailKey = `ip-email:${ip}:${emailLc}`;
+      // GLOBAL per-email backstop (no IP): the only key that survives IP / XFF
+      // rotation, so it is the real account-brute defense (see mcp-auth.helpers).
+      const emailKey = `email:${emailLc}`;
+      const ipOk = this.failedLogins.tryReserve(ipKey);
+      const ipEmailOk = this.failedLogins.tryReserve(ipEmailKey);
+      const emailOk = this.failedLogins.tryReserve(emailKey);
+      if (!ipOk || !ipEmailOk || !emailOk) {
+        // Blocked: release only the keys we actually reserved this call so an
+        // already-throttled request does not over-charge keys still under budget
+        // (matches the /mcp reserve model). Do NOT run bcrypt.
+        if (ipOk) this.failedLogins.release(ipKey);
+        if (ipEmailOk) this.failedLogins.release(ipEmailKey);
+        if (emailOk) this.failedLogins.release(emailKey);
+        throttled = true;
+      } else {
+        try {
+          user = await this.authService.verifyUserCredentials(
+            { email: basic.email, password: basic.password },
+            workspaceId,
           );
+          credentialsValid = true;
+          // Success: clear the per-IP and per-IP+email budgets fully; for the
+          // GLOBAL per-email key only release the one increment THIS request took
+          // (do not reset() it, or a victim's own success would wipe a parallel
+          // attacker's accumulated failures for that email — same rule as /mcp).
+          this.failedLogins.reset(ipKey);
+          this.failedLogins.reset(ipEmailKey);
+          this.failedLogins.release(emailKey);
+        } catch (err) {
+          // Only a genuine credentials failure (wrong email/password) keeps the
+          // reservation (it IS the recorded failure). Any other error — DB error,
+          // etc. — is NOT a password-guess signal, so release the reservation so
+          // it cannot burn a victim's limiter budget. credentialsValid stays
+          // false either way (the gate then 401s).
+          if (!isCredentialsFailure(err)) {
+            this.failedLogins.release(ipKey);
+            this.failedLogins.release(ipEmailKey);
+            this.failedLogins.release(emailKey);
+          }
+          if (!(err instanceof UnauthorizedException)) {
+            // A non-credential failure (e.g. DB error): treat as invalid creds
+            // for the gate (a 401), and log without leaking the password/header.
+            this.logger.warn(
+              `git-http: credential check error: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+          credentialsValid = false;
         }
-        credentialsValid = false;
       }
+    }
+
+    // Brute-force throttle tripped: reject BEFORE the gate (and before any space
+    // lookup), so a throttled attacker gets a uniform 429 with no bcrypt and no
+    // existence signal. WWW-Authenticate is still sent so a legitimate client
+    // re-prompts after the window.
+    if (throttled) {
+      reply
+        .header('WWW-Authenticate', WWW_AUTHENTICATE)
+        .header('Retry-After', '60')
+        .status(429)
+        .send('Too many failed authentication attempts. Try again later.');
+      return;
     }
 
     // --- resolve the space + per-space gating + CASL ------------------------

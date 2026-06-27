@@ -13,6 +13,7 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
+import { CREDENTIALS_MISMATCH_MESSAGE } from '../../../core/auth/auth.constants';
 import {
   SpaceCaslAction,
   SpaceCaslSubject,
@@ -487,5 +488,104 @@ describe('GitHttpService.handle', () => {
     expect(state.statusCode).toBe(401);
     expect(state.headers['WWW-Authenticate']).toBe('Basic realm="gitmost"');
     expect(built.backend.run).not.toHaveBeenCalled();
+  });
+
+  // --- brute-force throttle (must-fix #1, mirrors the /mcp Basic limiter) -----
+  describe('HTTP-Basic brute-force throttle', () => {
+    /** A request with wrong credentials for the given email. */
+    const wrongCredReq = (email = 'dev@example.com') =>
+      fakeRequest({
+        url: '/git/space-1.git/info/refs?service=git-upload-pack',
+        method: 'GET',
+        authorization: basic(email, 'wrong'),
+      });
+
+    it('rejects the (threshold+1)-th failed attempt with 429 BEFORE bcrypt', async () => {
+      const built = build();
+      // Realistic credential failure: verifyUserCredentials throws the SAME
+      // UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE) production throws, so
+      // isCredentialsFailure matches and the reservation is KEPT (counted).
+      built.authService.verifyUserCredentials.mockRejectedValue(
+        new UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE),
+      );
+
+      // 5 failed attempts (threshold = 5): each runs the credential check -> 401.
+      for (let i = 0; i < 5; i++) {
+        const { reply, state } = fakeReply();
+        await built.service.handle(wrongCredReq(), reply);
+        expect(state.statusCode).toBe(401);
+      }
+      expect(built.authService.verifyUserCredentials).toHaveBeenCalledTimes(5);
+
+      // The 6th attempt is throttled: 429, Retry-After, and bcrypt is NOT run.
+      const { reply, state } = fakeReply();
+      await built.service.handle(wrongCredReq(), reply);
+      expect(state.statusCode).toBe(429);
+      expect(state.headers['Retry-After']).toBe('60');
+      expect(state.headers['WWW-Authenticate']).toBe('Basic realm="gitmost"');
+      // Still 5 — the 6th never reached verifyUserCredentials (pre-bcrypt reject).
+      expect(built.authService.verifyUserCredentials).toHaveBeenCalledTimes(5);
+      expect(built.backend.run).not.toHaveBeenCalled();
+
+      built.service.onModuleDestroy();
+    });
+
+    it('a successful auth resets the limiter so later attempts are not throttled', async () => {
+      const built = build();
+      const verify = built.authService.verifyUserCredentials;
+      // First 4 attempts fail (credential mismatch), then one SUCCEEDS.
+      verify
+        .mockRejectedValueOnce(new UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE))
+        .mockRejectedValueOnce(new UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE))
+        .mockRejectedValueOnce(new UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE))
+        .mockRejectedValueOnce(new UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE))
+        .mockResolvedValueOnce({ id: 'user-1', email: 'dev@example.com' });
+
+      for (let i = 0; i < 4; i++) {
+        const { reply } = fakeReply();
+        await built.service.handle(wrongCredReq(), reply);
+      }
+      // 5th attempt succeeds -> proceeds (not throttled) and clears the budget.
+      const okReply = fakeReply();
+      await built.service.handle(
+        fakeRequest({
+          url: '/git/space-1.git/info/refs?service=git-upload-pack',
+          method: 'GET',
+          authorization: basic('dev@example.com', 'right'),
+        }),
+        okReply.reply,
+      );
+      expect(okReply.state.hijacked).toBe(true); // proceeded to the backend
+
+      // After the reset, a fresh wrong attempt is evaluated (401), NOT a 429 —
+      // proving the per-IP/per-IP+email budget was cleared by the success.
+      verify.mockRejectedValueOnce(
+        new UnauthorizedException(CREDENTIALS_MISMATCH_MESSAGE),
+      );
+      const { reply, state } = fakeReply();
+      await built.service.handle(wrongCredReq(), reply);
+      expect(state.statusCode).toBe(401);
+
+      built.service.onModuleDestroy();
+    });
+
+    it('a non-credential error releases the reservation (does not burn the budget)', async () => {
+      const built = build();
+      // A DB error (not a credentials mismatch) must NOT count toward the limiter.
+      built.authService.verifyUserCredentials.mockRejectedValue(
+        new Error('db down'),
+      );
+
+      // 10 such failures — far beyond the threshold — must all be 401, never 429,
+      // because each releases its reservation.
+      for (let i = 0; i < 10; i++) {
+        const { reply, state } = fakeReply();
+        await built.service.handle(wrongCredReq(), reply);
+        expect(state.statusCode).toBe(401);
+      }
+      expect(built.authService.verifyUserCredentials).toHaveBeenCalledTimes(10);
+
+      built.service.onModuleDestroy();
+    });
   });
 });

@@ -32,8 +32,17 @@ interface PageEventLike {
  * it to avoid a write -> event -> sync echo. The guard ALWAYS runs (the page row
  * is fetched for every event, structural ones included). This is the cheap first
  * guard; the full bodyHash + updatedAt loop-guard (consuming the push side's
- * `PushedPageRecord`) is a later hardening step — noted, not built
- * here. The poll-safety interval still converges anything this guard drops.
+ * `PushedPageRecord`) is a later hardening step — noted, not built here.
+ *
+ * KNOWN OVER-SKIP (latency, NOT data loss): the guard keys ONLY on
+ * `lastUpdatedSource`, and a user MOVE / RENAME / DELETE does NOT change that
+ * column (only body writes stamp it). So a genuine user move/rename/delete of a
+ * page whose BODY was last written by git-sync still reads
+ * `lastUpdatedSource === 'git-sync'` and is dropped on this fast debounced path.
+ * No change is lost: the poll-safety interval (~GIT_SYNC_POLL_INTERVAL_MS, default
+ * 15s) re-enumerates the space and reconciles it — the only cost is up to one poll
+ * interval of extra latency before that structural change reaches git. The
+ * bodyHash+updatedAt loop-guard above would close this gap precisely.
  */
 @Injectable()
 export class PageChangeListener implements OnModuleDestroy {
@@ -73,7 +82,10 @@ export class PageChangeListener implements OnModuleDestroy {
       if (!page) return;
 
       // Loop-guard: skip our own writes to avoid a write -> event -> sync echo
-      // (best-effort). Applies unconditionally now.
+      // (best-effort). Applies unconditionally now. NOTE this also over-skips a
+      // user move/rename/delete of a page whose BODY was last written by git-sync
+      // (those structural ops don't touch lastUpdatedSource) — that change is not
+      // lost, just deferred to the ~15s poll backstop (see class docstring).
       if (page.lastUpdatedSource === 'git-sync') return;
 
       // Prefer ids carried on the event; fall back to the row we already fetched.

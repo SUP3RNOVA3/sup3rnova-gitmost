@@ -26,6 +26,14 @@ import * as editorExt from "@docmost/editor-ext";
 // node/mark TYPE goes unmirrored. StarterKit-provided types (paragraph, bold,
 // heading, …) are contributed by @tiptap/starter-kit in the mirror rather than
 // by editor-ext, so they are naturally covered by the mirror's superset.
+//
+// NOT COVERED here (deferred): (1) the THIRD copy in `packages/mcp` — a separate
+// package guarded by its own surface snapshot; (2) attribute *behaviour* drift,
+// e.g. the details `open` attr read via getAttribute vs hasAttribute (PR #119
+// review #2) — a name-level compare cannot see parseHTML/renderHTML differences.
+// Mechanically guarding behavioural parity across all THREE copies needs the
+// single framework-free "schema core" refactor (deferred — see AGENTS.md); until
+// then each copy's header carries the manual keep-in-sync requirement.
 
 /** Tiptap Node/Mark instances expose a `.name` and a `.type` of 'node'|'mark'. */
 function isTiptapNodeOrMark(

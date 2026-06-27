@@ -251,6 +251,45 @@ describe('GitHttpBackendService.run', () => {
     expect(res.statusCode).toBe(500);
     expect(res.end).toHaveBeenCalledWith('Internal server error');
   });
+
+  it('(abort) an ALREADY-aborted signal -> no spawn, 500 lock-lost', async () => {
+    // The per-space lock was already lost before run() reached the spawn: we must
+    // NOT start writing the working tree after a possible lock takeover.
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService();
+    const res = fakeRes();
+
+    const controller = new AbortController();
+    controller.abort();
+    await service.run(baseRequest, fakeReq(), res, controller.signal);
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(500);
+    expect(res.end).toHaveBeenCalledWith('Internal server error');
+  });
+
+  it('(abort) a live signal aborted mid-request -> child SIGTERM + response closed', async () => {
+    // The lock lapses mid-push: the abort fires, the child is killed (SIGTERM,
+    // then SIGKILL on escalation), and the response is finished.
+    const child = fakeChild();
+    spawnMock.mockReturnValue(child);
+    const service = buildService();
+    const res = fakeRes();
+    const warnSpy = jest.spyOn(Logger.prototype, 'warn');
+
+    const controller = new AbortController();
+    const p = service.run(baseRequest, fakeReq(), res, controller.signal);
+    await flush(); // let run() reach the spawn + wire the abort listener
+    controller.abort();
+    await p;
+
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(warnSpy).toHaveBeenCalled();
+    // No headers were sent before the abort -> a clean 500 is sent and ended.
+    expect(res.statusCode).toBe(500);
+    expect(res.writableEnded).toBe(true);
+  });
 });
 
 describe('buildGitBackendCgiEnv', () => {

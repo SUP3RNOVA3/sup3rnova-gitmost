@@ -205,6 +205,14 @@ describe('GitmostDataSourceService', () => {
         content: { type: 'doc', content: [] },
       });
     });
+
+    it('throws NotFound when the page does not exist', async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue(undefined);
+      await expect(service.bind(CTX).getPageJson('gone')).rejects.toThrow(
+        /not found/i,
+      );
+    });
   });
 
   describe('importPageMarkdown', () => {
@@ -234,6 +242,20 @@ describe('GitmostDataSourceService', () => {
       expect(payload.baseProsemirrorJson).toBeUndefined();
 
       expect(res.updatedAt).toBe('2026-06-20T11:00:00.000Z');
+    });
+
+    it('returns updatedAt:undefined when the page row is gone after the write (stale-read branch)', async () => {
+      // writeBody succeeds, but the post-write findById returns nothing (e.g. the
+      // page was concurrently hard-deleted) -> the optional updatedAt is omitted.
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue(undefined);
+
+      const res = await service
+        .bind(CTX)
+        .importPageMarkdown('p1', '# Hello\n\nworld');
+
+      expect(mocks.collabGateway.writePageBody).toHaveBeenCalledTimes(1);
+      expect(res.updatedAt).toBeUndefined();
     });
 
     // The 2-way path (no base) is covered above; this exercises the THREE-WAY
@@ -295,6 +317,20 @@ describe('GitmostDataSourceService', () => {
         updatedAt: '2026-06-20T12:00:00.000Z',
       });
     });
+
+    it('returns updatedAt:undefined when the fresh page row is missing after create', async () => {
+      const { service, mocks } = build();
+      mocks.pageService.create.mockResolvedValue({ id: 'new-id' });
+      // The post-create findById returns nothing -> the optional updatedAt is
+      // omitted (the id is still returned from create()).
+      mocks.pageRepo.findById.mockResolvedValue(undefined);
+
+      const res = await service
+        .bind(CTX)
+        .createPage('Title', 'body md', 'space-1');
+
+      expect(res).toEqual({ data: { id: 'new-id' }, updatedAt: undefined });
+    });
   });
 
   describe('deletePage', () => {
@@ -348,6 +384,15 @@ describe('GitmostDataSourceService', () => {
       // db not consulted for a supplied position.
       expect(mocks.db.selectFrom).not.toHaveBeenCalled();
     });
+
+    it('throws NotFound and moves nothing when the page does not exist', async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue(undefined);
+      await expect(
+        service.bind(CTX).movePage('gone', 'parent-1'),
+      ).rejects.toThrow(/not found/i);
+      expect(mocks.pageService.movePage).not.toHaveBeenCalled();
+    });
   });
 
   describe('renamePage', () => {
@@ -363,6 +408,15 @@ describe('GitmostDataSourceService', () => {
       expect(dto.title).toBe('new title');
       expect(user).toEqual({ id: 'svc-user' });
       expect(provenance).toEqual({ actor: 'git-sync', aiChatId: null });
+    });
+
+    it('throws NotFound and renames nothing when the page does not exist', async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue(undefined);
+      await expect(
+        service.bind(CTX).renamePage('gone', 'whatever'),
+      ).rejects.toThrow(/not found/i);
+      expect(mocks.pageService.update).not.toHaveBeenCalled();
     });
   });
 

@@ -314,6 +314,40 @@ describe('GitSyncOrchestrator', () => {
       expect(deps.settings.autoMergeConflicts).toBe(false);
     });
 
+    it("escalates a divergent-`docmost` push refusal to WARN and surfaces the flag in the status", async () => {
+      const built = build();
+      const warnSpy = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      // The engine refused to fast-forward a divergent `docmost` mirror (§5).
+      runCycleMock.mockResolvedValue({ ...OK_CYCLE, divergentDocmost: true });
+
+      const res = await built.orchestrator.runOnce('space-1', 'ws-1');
+
+      // The flag is surfaced in the returned status (consumable by /status).
+      expect(res.divergentDocmost).toBe(true);
+      // And escalated from the engine's info `log` to a WARN naming the space.
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('DIVERGENT'),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('space-1'));
+    });
+
+    it("does NOT warn when the cycle is clean (divergentDocmost falsy)", async () => {
+      const built = build();
+      const warnSpy = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined);
+      runCycleMock.mockResolvedValue(OK_CYCLE);
+
+      const res = await built.orchestrator.runOnce('space-1', 'ws-1');
+
+      expect(res.divergentDocmost).toBeUndefined();
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining('DIVERGENT'),
+      );
+    });
+
     it("surfaces the engine's skipped status (e.g. merge-in-progress) verbatim", async () => {
       const built = build();
       runCycleMock.mockResolvedValue({ ran: false, skipped: 'merge-in-progress' });
@@ -459,6 +493,40 @@ describe('GitSyncOrchestrator', () => {
       // Per-space isolation: each space is reconciled with its OWN workspace id.
       expect(runOnce).toHaveBeenNthCalledWith(1, 'space-1', 'ws-1');
       expect(runOnce).toHaveBeenNthCalledWith(2, 'space-2', 'ws-2');
+    });
+
+    it('skips an overlapping tick while a previous pass is still in flight (re-entrancy guard)', async () => {
+      const built = build();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      // Stall the first pass inside enabledSpaces so a second tick fires while it
+      // is still running.
+      const enabledSpy = jest
+        .spyOn(built.orchestrator as any, 'enabledSpaces')
+        .mockImplementation(async () => {
+          await gate;
+          return [{ spaceId: 'space-1', workspaceId: 'ws-1' }];
+        });
+      const runOnce = jest
+        .spyOn(built.orchestrator, 'runOnce')
+        .mockResolvedValue({ spaceId: 'space-1', ran: true });
+
+      const first = (built.orchestrator as any).pollTick();
+      await Promise.resolve(); // let the first pass set polling=true + await gate
+
+      // A second tick during the first must be skipped: it never even enumerates.
+      await (built.orchestrator as any).pollTick();
+      expect(enabledSpy).toHaveBeenCalledTimes(1);
+
+      release();
+      await first;
+      expect(runOnce).toHaveBeenCalledTimes(1);
+
+      // After the first pass cleared the flag, a fresh tick runs normally.
+      await (built.orchestrator as any).pollTick();
+      expect(enabledSpy).toHaveBeenCalledTimes(2);
     });
 
     it('does NOT throw and runs nothing when the enabled-spaces query throws (try/catch backstop)', async () => {

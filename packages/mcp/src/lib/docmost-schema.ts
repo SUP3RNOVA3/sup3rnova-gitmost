@@ -6,6 +6,16 @@
  * (node ids, image sizing, link targets). Every code path that converts
  * to or from ProseMirror JSON must use THIS set, otherwise a round-trip
  * loses content.
+ *
+ * PROVENANCE / KEEP IN SYNC: this is ONE of THREE hand-synced copies of the
+ * canonical Docmost document schema — `@docmost/editor-ext` is canonical, plus
+ * this `packages/mcp` mirror and the `packages/git-sync` mirror. The node / mark /
+ * attribute surface (AND the attribute parseHTML/renderHTML behaviour, e.g. the
+ * details `open` boolean read via hasAttribute, not getAttribute) MUST be kept in
+ * lockstep across all three: a divergence silently degrades a round-trip (data
+ * loss). There is no mechanical cross-copy behavioural guard yet — the long-term
+ * fix is a single framework-free "schema core" both mirrors import (deferred,
+ * see the PR #119 review / AGENTS.md). Until then, sync by hand on every change.
  */
 import StarterKit from "@tiptap/starter-kit";
 import Image from "@tiptap/extension-image";
@@ -512,7 +522,11 @@ const Details = Node.create({
     return {
       open: {
         default: false,
-        parseHTML: (el: HTMLElement) => el.getAttribute("open"),
+        // Mirror the canon (@docmost/editor-ext details.ts:42) + the git-sync
+        // copy: a bare `<details open>` has an empty-string `open` attribute, so
+        // getAttribute("open") returns "" (falsy) and dropped the open state;
+        // hasAttribute is the correct boolean read. Keep the three copies in sync.
+        parseHTML: (el: HTMLElement) => el.hasAttribute("open"),
         renderHTML: (attrs: Record<string, any>) =>
           attrs.open ? { open: "" } : {},
       },

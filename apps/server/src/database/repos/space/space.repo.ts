@@ -122,9 +122,15 @@ export class SpaceRepo {
     return db
       .updateTable('spaces')
       .set({
+        // The jsonb key is a BOUND PARAMETER (`${prefKey}::text`), not
+        // `sql.raw(prefKey)`. The callers here only ever pass the literals
+        // 'enabled' / 'autoMergeConflicts', but sql.raw would splice the string
+        // straight into the statement — a latent SQL-injection footgun the moment
+        // a future caller passes a request-derived key. Parameterizing closes it
+        // with no behaviour change for the current literal callers.
         settings: sql`COALESCE(settings, '{}'::jsonb)
           || jsonb_build_object('gitSync', COALESCE(settings->'gitSync', '{}'::jsonb)
-          || jsonb_build_object('${sql.raw(prefKey)}', ${sql.lit(prefValue)}))`,
+          || jsonb_build_object(${prefKey}::text, ${sql.lit(prefValue)}))`,
         updatedAt: new Date(),
       })
       .where('id', '=', spaceId)

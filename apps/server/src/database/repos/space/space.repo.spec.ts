@@ -111,8 +111,9 @@ describe('SpaceRepo.updateGitSyncSettings — jsonb merge SQL', () => {
     expect(sql).toContain(
       `jsonb_build_object('gitSync', COALESCE(settings->'gitSync', '{}'::jsonb) ||`,
     );
-    // The pref key is set via jsonb_build_object on the inner object.
-    expect(sql).toContain(`jsonb_build_object('enabled',`);
+    // The pref key is set via jsonb_build_object on the inner object, with the
+    // key as a BOUND, ::text-cast PARAMETER (not sql.raw) — security fix #5.
+    expect(sql).toMatch(/jsonb_build_object\(\$\d+::text,/);
     // Scoped to the row + workspace.
     expect(sql).toContain(`where "id" =`);
     expect(sql).toContain(`and "workspaceId" =`);
@@ -121,21 +122,25 @@ describe('SpaceRepo.updateGitSyncSettings — jsonb merge SQL', () => {
     // `set "settings" = jsonb_build_object(` without the COALESCE/merge).
     expect(sql).not.toContain(`set "settings" = jsonb_build_object(`);
 
-    // The pref VALUE is inlined via sql.lit (matches the repo's sql.lit usage);
-    // updatedAt + id + workspaceId are the only bound parameters (the jsonb
-    // merge text is all literal). updatedAt is a Date, so assert id/workspaceId.
+    // The pref VALUE stays inlined via sql.lit, but the KEY is now a bound
+    // parameter, so id + workspaceId + the key are all bound (updatedAt is a Date).
     expect(compiled!.parameters).toContain('space-1');
     expect(compiled!.parameters).toContain('ws-1');
+    expect(compiled!.parameters).toContain('enabled');
   });
 
-  it('inlines the prefKey/prefValue literally (sql.raw key, sql.lit value)', async () => {
+  it('binds the prefKey as a ::text parameter (no sql.raw splice) and inlines prefValue via sql.lit', async () => {
     const { repo, getCaptured } = makeRepoCapturingSql();
 
     await repo.updateGitSyncSettings('space-1', 'ws-1', 'enabled', false);
 
-    const sql = getCaptured()!.sql.replace(/\s+/g, ' ');
-    // key via sql.raw + value via sql.lit -> both appear literally in the
-    // inner build object (no bound parameter for either).
-    expect(sql).toContain(`jsonb_build_object('enabled', false)`);
+    const compiled = getCaptured()!;
+    const sql = compiled.sql.replace(/\s+/g, ' ');
+    // The key is a bound `$N::text` parameter; the value is the sql.lit literal.
+    expect(sql).toMatch(/jsonb_build_object\(\$\d+::text, false\)/);
+    // The literal key must NOT be spliced into the statement text (the footgun).
+    expect(sql).not.toContain(`'enabled'`);
+    // The key rides as a bound parameter instead.
+    expect(compiled.parameters).toContain('enabled');
   });
 });

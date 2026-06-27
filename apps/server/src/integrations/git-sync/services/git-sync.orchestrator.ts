@@ -384,28 +384,45 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** True while a pollTick pass is in flight (re-entrancy guard). */
+  private polling = false;
+
   /**
    * One poll tick: catches events missed by the listener and reconciles after
    * downtime. Gated on GIT_SYNC_ENABLED (defensive — the interval is only
    * registered when enabled). Each enabled space runs under its own lock
    * (overlaps skipped). Never throws (runOnce swallows per-space errors).
+   *
+   * Re-entrancy guard: a batch of cycles can take LONGER than the poll interval
+   * (many spaces, slow pushes), so the next interval tick could fire while this
+   * pass is still running. The per-space lock already prevents overlapping cycles
+   * for one space, but an overlapping tick still re-runs enabledSpaces() and
+   * redundant per-space lock attempts for every space. The `polling` flag skips a
+   * tick while one is already in flight; it is in-process only (each replica
+   * guards its own ticks — cross-replica overlap is handled by the Redis lock).
    */
   private async pollTick(): Promise<void> {
     if (!this.environmentService.isGitSyncEnabled()) return;
-    let spaces: EnabledSpace[];
+    if (this.polling) return;
+    this.polling = true;
     try {
-      spaces = await this.enabledSpaces();
-    } catch (err) {
-      this.logger.error(
-        `git-sync: failed to enumerate enabled spaces: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-      return;
-    }
-    for (const { spaceId, workspaceId } of spaces) {
-      // runOnce never throws; a per-space error is logged and returned in status.
-      await this.runOnce(spaceId, workspaceId);
+      let spaces: EnabledSpace[];
+      try {
+        spaces = await this.enabledSpaces();
+      } catch (err) {
+        this.logger.error(
+          `git-sync: failed to enumerate enabled spaces: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return;
+      }
+      for (const { spaceId, workspaceId } of spaces) {
+        // runOnce never throws; a per-space error is logged and returned in status.
+        await this.runOnce(spaceId, workspaceId);
+      }
+    } finally {
+      this.polling = false;
     }
   }
 }

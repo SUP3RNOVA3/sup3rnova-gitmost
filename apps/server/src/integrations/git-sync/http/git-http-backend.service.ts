@@ -171,9 +171,13 @@ export class GitHttpBackendService {
       let settled = false;
       // Set once the child exists so the abort handler can target it.
       let onAbort: (() => void) | null = null;
+      // The watchdog timer; cleared centrally in done() so EVERY settle path
+      // (close, error, timeout, abort) tears it down exactly once.
+      let watchdogTimer: ReturnType<typeof setTimeout> | undefined;
       const done = () => {
         if (settled) return;
         settled = true;
+        if (watchdogTimer) clearTimeout(watchdogTimer);
         // Detach the abort listener so a later lock loss does not fire into a
         // request that already finished.
         if (onAbort) {
@@ -206,34 +210,17 @@ export class GitHttpBackendService {
 
       // Lost-lock abort: the per-space lock lapsed mid-request. Kill the child so
       // a receive-pack stops writing `main`'s working tree before another replica
-      // (which may now hold the lock) starts a cycle. Mirrors the watchdog kill.
+      // (which may now hold the lock) starts a cycle. Same kill+finish path the
+      // watchdog uses (extracted into terminateChild).
       onAbort = () => {
-        this.logger.warn(
+        this.terminateChild(
+          child,
+          rawRes,
+          headerParsed,
+          'lock-lost',
           'git http-backend aborted (git-sync lock lost mid-request); killing child',
+          done,
         );
-        try {
-          child.kill('SIGTERM');
-          const sigkill = setTimeout(() => {
-            try {
-              child.kill('SIGKILL');
-            } catch {
-              /* ignore */
-            }
-          }, 2000);
-          sigkill.unref?.();
-        } catch {
-          /* ignore */
-        }
-        if (!headerParsed && !rawRes.headersSent) {
-          this.send500(rawRes, 'lock-lost');
-        } else {
-          try {
-            rawRes.end();
-          } catch {
-            /* ignore */
-          }
-        }
-        done();
       };
       signal?.addEventListener('abort', onAbort);
 
@@ -241,40 +228,20 @@ export class GitHttpBackendService {
       // child alive forever, so run() never resolves and (because this runs
       // inside withSpaceLock) the per-space lock is held + heartbeat-refreshed
       // indefinitely. Bound the request: on expiry kill the child, send a clean
-      // 500 if nothing was sent yet, and settle the promise. The log carries no
-      // client echo / credentials / body. `.unref()` so the timer never keeps the
-      // event loop alive; ALWAYS cleared in the close/error handlers below.
-      const timer = setTimeout(() => {
-        this.logger.warn(
+      // 500 if nothing was sent yet, and settle the promise. `.unref()` so the
+      // timer never keeps the event loop alive; ALWAYS cleared in done().
+      watchdogTimer = setTimeout(() => {
+        this.terminateChild(
+          child,
+          rawRes,
+          headerParsed,
+          'timeout',
           `git http-backend timed out after ` +
             `${this.environmentService.getGitSyncBackendTimeoutMs()}ms; killing child`,
+          done,
         );
-        try {
-          child.kill('SIGTERM');
-          // Escalate to SIGKILL shortly after in case SIGTERM is ignored.
-          const sigkill = setTimeout(() => {
-            try {
-              child.kill('SIGKILL');
-            } catch {
-              /* ignore */
-            }
-          }, 2000);
-          sigkill.unref?.();
-        } catch {
-          /* ignore */
-        }
-        if (!headerParsed && !rawRes.headersSent) {
-          this.send500(rawRes, 'timeout');
-        } else {
-          try {
-            rawRes.end();
-          } catch {
-            /* ignore */
-          }
-        }
-        done();
       }, this.environmentService.getGitSyncBackendTimeoutMs());
-      timer.unref?.();
+      watchdogTimer.unref?.();
 
       // Accumulate stdout until we have the full CGI header block, then write the
       // parsed status/headers and start streaming the remaining body bytes.
@@ -321,7 +288,7 @@ export class GitHttpBackendService {
       });
 
       child.on('error', (err) => {
-        clearTimeout(timer);
+        // The watchdog timer is cleared centrally in done().
         if (!headerParsed && !rawRes.headersSent) {
           this.send500(rawRes, 'child-error', err);
         } else {
@@ -336,7 +303,7 @@ export class GitHttpBackendService {
       });
 
       child.on('close', (code) => {
-        clearTimeout(timer);
+        // The watchdog timer is cleared centrally in done().
         if (!headerParsed && !rawRes.headersSent) {
           // The child exited before emitting a complete CGI header block.
           this.logger.error(
@@ -375,6 +342,49 @@ export class GitHttpBackendService {
         /* ignore broken-pipe on stdin */
       });
     });
+  }
+
+  /**
+   * Kill the child (SIGTERM, then SIGKILL after a grace period if it ignores the
+   * term) and finish the HTTP response cleanly, then settle. Shared by the two
+   * forced-termination paths — the watchdog timeout and the lost-lock abort —
+   * which differ ONLY by the log line and the send500 `reason`. If no response
+   * has started a clean 500 is sent; otherwise the in-flight stream is just
+   * ended. Never throws (a thrown kill/end would crash the request).
+   */
+  private terminateChild(
+    child: ReturnType<typeof spawn>,
+    rawRes: ServerResponse,
+    responseStarted: boolean,
+    send500Reason: string,
+    logMessage: string,
+    done: () => void,
+  ): void {
+    this.logger.warn(logMessage);
+    try {
+      child.kill('SIGTERM');
+      // Escalate to SIGKILL shortly after in case SIGTERM is ignored.
+      const sigkill = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }, 2000);
+      sigkill.unref?.();
+    } catch {
+      /* ignore */
+    }
+    if (!responseStarted && !rawRes.headersSent) {
+      this.send500(rawRes, send500Reason);
+    } else {
+      try {
+        rawRes.end();
+      } catch {
+        /* ignore */
+      }
+    }
+    done();
   }
 
   /** Send a clean 500 without leaking credentials or the request body. */
