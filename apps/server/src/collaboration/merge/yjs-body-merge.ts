@@ -2,7 +2,7 @@ import * as Y from 'yjs';
 import { getSchema } from '@tiptap/core';
 import type { Schema } from '@tiptap/pm/model';
 
-import { tiptapExtensions } from '../../../collaboration/collaboration.util';
+import { tiptapExtensions } from '../collaboration.util';
 import { diff3Plan } from './three-way-merge';
 import { buildLcsTable } from './lcs';
 

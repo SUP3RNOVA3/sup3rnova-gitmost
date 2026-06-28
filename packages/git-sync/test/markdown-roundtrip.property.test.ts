@@ -14,7 +14,7 @@ import { convertProseMirrorToMarkdown } from '../src/lib/markdown-converter.js';
 // global DOM via jsdom at module load time — this is expected and required for
 // @tiptap/html's generateJSON to run under Node.
 import { markdownToProseMirror } from '../src/lib/markdown-to-prosemirror.js';
-import { stripBlockIds } from '../src/engine/roundtrip-helpers.js';
+import { stripBlockIds } from './roundtrip-helpers.js';
 
 // ---------------------------------------------------------------------------
 // WHY THIS TEST EXISTS (SPEC §11 / "Задача №0")

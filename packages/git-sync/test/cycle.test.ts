@@ -61,6 +61,10 @@ function baseDeps(vault: any, over: Partial<RunCycleDeps> = {}): RunCycleDeps {
       writeFile: vi.fn(async () => undefined),
       mkdir: vi.fn(async () => undefined),
       rm: vi.fn(async () => undefined),
+      // Default: nothing is a symlink and everything resolves in place (no
+      // escape). The symlink-guard tests below override these.
+      lstat: vi.fn(async () => ({ isSymbolicLink: false })),
+      realpath: vi.fn(async (p: string) => p),
     },
     log: vi.fn(),
     ...over,
@@ -152,6 +156,32 @@ describe("runCycle (composition)", () => {
     expect(deps.client.listSpaceTree).toHaveBeenCalledTimes(1);
     expect(vault.order).not.toContain("merge:main");
     expect(vault.diffNameStatus).not.toHaveBeenCalled();
+  });
+
+  it("SYMLINK GUARD: never reads a tracked .md that is a symlink (no .env/passwd disclosure)", async () => {
+    // Security regression (PR #119 review): a writer who pushes `leak.md` as a
+    // SYMLINK to a server file (e.g. `.env`) must NOT have its target read and
+    // published. readExisting reads each tracked .md to recover its gitmost_id;
+    // the guard refuses the symlink BEFORE the raw read, so the target's bytes
+    // are never touched and the cycle keeps running for the rest of the space.
+    const vault = fakeVault({
+      listTrackedFiles: vi.fn(async () => ["leak.md"]),
+    });
+    const deps = baseDeps(vault);
+    const rawReadFile = vi.fn(async () => "GIT_SYNC_SECRET=topsecret");
+    deps.fs.readFile = rawReadFile as any;
+    // `/vault/leak.md` is reported as a symlink by lstat.
+    deps.fs.lstat = vi.fn(async (p: string) =>
+      p === "/vault/leak.md"
+        ? { isSymbolicLink: true }
+        : { isSymbolicLink: false },
+    ) as any;
+
+    const res = await runCycle(deps);
+
+    expect(res.ran).toBe(true);
+    // The poisoned symlink's target was NEVER read (the guard short-circuited).
+    expect(rawReadFile).not.toHaveBeenCalled();
   });
 
   it("throws BEFORE the push apply when the signal aborts during the pull phase", async () => {

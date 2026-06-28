@@ -3,13 +3,19 @@ import { GitSyncClient } from "./client.types.js";
 import { Settings } from "./settings.js";
 import { readExisting, computePullActions, applyPullActions } from "./pull.js";
 import { runPush } from "./push.js";
+import { assertVaultPathSafe, type PathGuardIo } from "./path-guard.js";
 
 /**
  * Absolute-path filesystem primitives the cycle needs. Injected (not imported)
  * so the engine stays IO-free and unit-testable. `mkdir` is recursive; `rm` is
  * force (a missing file is a no-op).
+ *
+ * `lstat`/`realpath` back the SYMLINK GUARD (see ./path-guard.ts): every
+ * read/write/mkdir is screened so a pushed symlink (e.g. `leak.md -> /etc/passwd`
+ * or `-> .env`) cannot be followed to publish or overwrite a file outside the
+ * vault. Both MUST resolve to `null` on ENOENT and reject on any other error.
  */
-export interface CycleFs {
+export interface CycleFs extends PathGuardIo {
   readFile: (absPath: string) => Promise<string>;
   writeFile: (absPath: string, text: string) => Promise<void>;
   mkdir: (absDir: string) => Promise<void>;
@@ -80,6 +86,31 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
   const vaultRoot = settings.vaultPath;
   const abs = (relPath: string) => `${vaultRoot}/${relPath}`;
 
+  // SYMLINK GUARD (defense-in-depth, see ./path-guard.ts). Wrap the injected
+  // read/write/mkdir primitives so EVERY engine file access is screened: a path
+  // that is — or traverses — a symlink, or whose realpath escapes the vault, is
+  // refused. `rm` is deliberately NOT wrapped: removing a path only deletes the
+  // link itself (force, non-recursive), never the target, and we WANT to be able
+  // to clean up a stray pushed symlink. A refusal THROWS; the pull/push loops
+  // already isolate per-file errors (skip + log), so a single poisoned entry is
+  // skipped while the rest of the space keeps syncing.
+  const guard = (p: string) => assertVaultPathSafe(fs, vaultRoot, p);
+  const safeFs = {
+    readFile: async (p: string): Promise<string> => {
+      await guard(p);
+      return fs.readFile(p);
+    },
+    writeFile: async (p: string, text: string): Promise<void> => {
+      await guard(p);
+      return fs.writeFile(p, text);
+    },
+    mkdir: async (p: string): Promise<void> => {
+      await guard(p);
+      return fs.mkdir(p);
+    },
+    rm: (p: string): Promise<void> => fs.rm(p),
+  };
+
   // 1. The engine state store is git: make sure the repo + branches exist
   //    before any tracked-file listing or diff.
   await vault.assertGitAvailable();
@@ -118,7 +149,7 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
   // 4. PULL --------------------------------------------------------------------
   const existing = await readExisting({
     listTracked: () => vault.listTrackedFiles("*.md"),
-    readFile: (relPath) => fs.readFile(abs(relPath)),
+    readFile: (relPath) => safeFs.readFile(abs(relPath)),
   });
 
   const tree = await client.listSpaceTree(spaceId);
@@ -135,9 +166,9 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
     {
       client,
       git: vault,
-      writeFile: (absPath, text) => fs.writeFile(absPath, text),
-      mkdir: (absDir) => fs.mkdir(absDir),
-      rm: (absPath) => fs.rm(absPath),
+      writeFile: (absPath, text) => safeFs.writeFile(absPath, text),
+      mkdir: (absDir) => safeFs.mkdir(absDir),
+      rm: (absPath) => safeFs.rm(absPath),
       log,
     },
     pullActions,
@@ -149,8 +180,8 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
     settings,
     git: vault,
     makeClient: () => client,
-    readFile: (relPath: string) => fs.readFile(abs(relPath)),
-    writeFile: (relPath: string, text: string) => fs.writeFile(abs(relPath), text),
+    readFile: (relPath: string) => safeFs.readFile(abs(relPath)),
+    writeFile: (relPath: string, text: string) => safeFs.writeFile(abs(relPath), text),
     log,
   };
 

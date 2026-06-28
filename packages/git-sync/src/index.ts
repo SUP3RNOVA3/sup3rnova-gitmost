@@ -116,4 +116,11 @@ export type {
   CycleFs,
 } from "./engine/cycle.js";
 
+export {
+  assertVaultPathSafe,
+  isWithinRoot,
+  VaultPathUnsafeError,
+} from "./engine/path-guard.js";
+export type { PathGuardIo, VaultPathUnsafeReason } from "./engine/path-guard.js";
+
 export { parsePageFile, serializePageFile } from "./lib/page-file.js";

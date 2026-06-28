@@ -889,9 +889,6 @@ importers:
 
   packages/git-sync:
     dependencies:
-      '@fellow/prosemirror-recreate-transform':
-        specifier: ^1.2.3
-        version: 1.2.3
       '@tiptap/core':
         specifier: 3.20.4
         version: 3.20.4(@tiptap/pm@3.20.4)

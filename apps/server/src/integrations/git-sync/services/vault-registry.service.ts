@@ -62,10 +62,20 @@ export class VaultRegistryService {
    *     rewrite the engine's history on `main`.
    *   - http.receivepack=true / http.uploadpack=true — explicitly allow the
    *     receive/upload services over HTTP.
+   *   - core.symlinks=false — SECURITY (PR #119 review). A writer could push a
+   *     `.md` entry that is a SYMLINK (e.g. `leak.md -> /etc/passwd` or
+   *     `-> .env`); with symlinks enabled `updateInstead` would materialize a
+   *     real link in the working tree, and the next push cycle would follow it
+   *     and PUBLISH the target's contents as a Docmost page (server-file
+   *     disclosure), or use a symlinked directory to write OUTSIDE the vault on
+   *     pull. With `core.symlinks=false` git checks out such a blob as a PLAIN
+   *     FILE containing the link text, never a real link, defusing the primitive
+   *     at the git layer. (The engine's per-access lstat/realpath guard is the
+   *     second layer — see path-guard.ts.)
    *
-   * All four are set idempotently (plain `git config` overwrites the local
-   * value). Returns the absolute vault path. Idempotent and safe to call before
-   * every request.
+   * All are set idempotently (plain `git config` overwrites the local value).
+   * Returns the absolute vault path. Idempotent and safe to call before every
+   * request.
    */
   async ensureServable(spaceId: string): Promise<string> {
     const { vaultGitEnv } = await loadGitSync();
@@ -81,13 +91,21 @@ export class VaultRegistryService {
       ['receive.denyNonFastForwards', 'true'],
       ['http.receivepack', 'true'],
       ['http.uploadpack', 'true'],
+      ['core.symlinks', 'false'],
     ];
+    // Bound each `git config` (review suggestion): this runs in the request path
+    // BEFORE the watchdog, so a wedged git (a stale `.git/config.lock`) would
+    // otherwise hang the request indefinitely. Mirror the engine's GIT_EXEC
+    // bound via the configured backend timeout.
+    const timeout = this.environmentService.getGitSyncBackendTimeoutMs();
     for (const [key, value] of configs) {
       await execFileAsync('git', ['config', key, value], {
         cwd: path,
         // Use the engine's cwd-isolated env (strips GIT_DIR / GIT_WORK_TREE) so
         // the config is written to THIS vault's local config, nothing else.
         env: vaultGitEnv(),
+        timeout,
+        maxBuffer: 10 * 1024 * 1024,
       });
     }
 

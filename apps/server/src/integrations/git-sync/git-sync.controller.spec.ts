@@ -3,7 +3,7 @@
 // guard (non-admin -> ForbiddenException, no orchestrator call), that trigger
 // uses the workspace from request context (never the body), and that status
 // returns the env-derived object.
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import {
   WorkspaceCaslAction,
   WorkspaceCaslSubject,
@@ -18,10 +18,11 @@ interface Built {
   env: Record<string, AnyMock>;
   workspaceAbility: { createForUser: AnyMock };
   ability: { cannot: AnyMock };
+  spaceRepo: { findById: AnyMock };
 }
 
-function build(opts: { cannot?: boolean } = {}): Built {
-  const { cannot = false } = opts;
+function build(opts: { cannot?: boolean; spaceFound?: boolean } = {}): Built {
+  const { cannot = false, spaceFound = true } = opts;
   const ability = { cannot: jest.fn(() => cannot) };
   const workspaceAbility = { createForUser: jest.fn(() => ability) };
 
@@ -35,13 +36,17 @@ function build(opts: { cannot?: boolean } = {}): Built {
     getGitSyncDebounceMs: jest.fn(() => 2000),
     getGitSyncServiceUserId: jest.fn(() => 'svc-user'),
   };
+  const spaceRepo = {
+    findById: jest.fn(async () => (spaceFound ? { id: 'space-1' } : undefined)),
+  };
 
   const controller = new GitSyncController(
     orchestrator as any,
     env as any,
     workspaceAbility as any,
+    spaceRepo as any,
   );
-  return { controller, orchestrator, env, workspaceAbility, ability };
+  return { controller, orchestrator, env, workspaceAbility, ability, spaceRepo };
 }
 
 const USER = { id: 'user-1' } as any;
@@ -68,7 +73,7 @@ describe('GitSyncController', () => {
     });
 
     it('admin: calls runOnce(dto.spaceId, workspace.id) using the workspace from context', async () => {
-      const { controller, orchestrator } = build({ cannot: false });
+      const { controller, orchestrator, spaceRepo } = build({ cannot: false });
 
       // The body carries an attacker-controlled workspaceId that must be ignored.
       const res = await controller.trigger(
@@ -77,8 +82,26 @@ describe('GitSyncController', () => {
         WORKSPACE,
       );
 
+      // The space is resolved workspace-scoped (context workspace, not the body).
+      expect(spaceRepo.findById).toHaveBeenCalledWith('space-1', 'ctx-ws');
       expect(orchestrator.runOnce).toHaveBeenCalledWith('space-1', 'ctx-ws');
       expect(res).toEqual({ spaceId: 'space-1', ran: true });
+    });
+
+    it('admin: 404s a spaceId that is not in the workspace and never calls runOnce', async () => {
+      // A foreign/non-existent space must be rejected BEFORE buildSettings runs
+      // (which would otherwise create an empty per-space vault directory).
+      const { controller, orchestrator, spaceRepo } = build({
+        cannot: false,
+        spaceFound: false,
+      });
+
+      await expect(
+        controller.trigger({ spaceId: 'foreign' } as any, USER, WORKSPACE),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(spaceRepo.findById).toHaveBeenCalledWith('foreign', 'ctx-ws');
+      expect(orchestrator.runOnce).not.toHaveBeenCalled();
     });
   });
 

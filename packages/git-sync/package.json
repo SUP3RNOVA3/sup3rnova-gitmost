@@ -20,7 +20,6 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@fellow/prosemirror-recreate-transform": "^1.2.3",
     "@tiptap/core": "3.20.4",
     "@tiptap/extension-highlight": "3.20.4",
     "@tiptap/extension-image": "3.20.4",

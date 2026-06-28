@@ -4,7 +4,7 @@ import type { ApplyPushDeps, PushActions } from '../src/engine/push';
 import { planReconciliation } from '../src/engine/reconcile';
 import { buildVaultLayout, type PageNode } from '../src/engine/layout';
 import { sanitizeTitle } from '../src/engine/sanitize';
-import { firstDivergence } from '../src/engine/roundtrip-helpers';
+import { firstDivergence } from './roundtrip-helpers';
 import { applyPullActions } from '../src/engine/pull';
 import type { PullActions, ApplyPullActionsDeps } from '../src/engine/pull';
 import type { DeletionDecision } from '../src/engine/reconcile';

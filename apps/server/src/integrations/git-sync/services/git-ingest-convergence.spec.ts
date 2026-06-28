@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 
-import { mergeXmlFragments3Way } from './yjs-body-merge';
+import { mergeXmlFragments3Way } from '../../../collaboration/merge/yjs-body-merge';
 
 /**
  * Convergence repro for the git-ingest "silent revert" data-loss bug.

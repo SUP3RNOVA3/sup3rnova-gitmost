@@ -5,7 +5,14 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { SchedulerRegistry } from '@nestjs/schedule';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import {
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { sql } from 'kysely';
@@ -303,11 +310,31 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       vault,
       settings,
       // ABSOLUTE-path fs primitives the engine cycle injects (it stays IO-free).
+      // `lstat`/`realpath` back the engine's symlink guard: both MUST yield
+      // `null` on ENOENT (a not-yet-created file is the normal write case) so the
+      // guard can tell "absent" (safe to create) from "is a symlink" (refuse).
+      // `lstat` does NOT follow the final link; `realpath` resolves it.
       fs: {
         readFile: (absPath) => readFile(absPath, 'utf8'),
         writeFile: (absPath, text) => writeFile(absPath, text, 'utf8'),
         mkdir: (absDir) => mkdir(absDir, { recursive: true }).then(() => undefined),
         rm: (absPath) => rm(absPath, { force: true }),
+        lstat: (absPath) =>
+          lstat(absPath).then(
+            (st) => ({ isSymbolicLink: st.isSymbolicLink() }),
+            (err: NodeJS.ErrnoException) => {
+              if (err && err.code === 'ENOENT') return null;
+              throw err;
+            },
+          ),
+        realpath: (absPath) =>
+          realpath(absPath).then(
+            (p) => p,
+            (err: NodeJS.ErrnoException) => {
+              if (err && err.code === 'ENOENT') return null;
+              throw err;
+            },
+          ),
       },
       // Every cycle logs its full push plan + per-action lines + completion
       // counts (created/updated/deleted/skipped/failures) through this `log`, so

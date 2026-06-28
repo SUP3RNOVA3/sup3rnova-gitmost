@@ -4,6 +4,7 @@ import {
   ForbiddenException,
   HttpCode,
   HttpStatus,
+  NotFoundException,
   Post,
   Get,
   UseGuards,
@@ -12,6 +13,7 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
 import { User, Workspace } from '@docmost/db/types/entity.types';
+import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import WorkspaceAbilityFactory from '../../core/casl/abilities/workspace-ability.factory';
 import {
   WorkspaceCaslAction,
@@ -47,6 +49,7 @@ export class GitSyncController {
     private readonly orchestrator: GitSyncOrchestrator,
     private readonly environmentService: EnvironmentService,
     private readonly workspaceAbility: WorkspaceAbilityFactory,
+    private readonly spaceRepo: SpaceRepo,
   ) {}
 
   /** Throw unless the caller is a workspace admin (Manage Settings). */
@@ -67,6 +70,15 @@ export class GitSyncController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<GitSyncRunStatus> {
     this.assertAdmin(user, workspace);
+    // Verify the client-supplied spaceId BELONGS to this workspace before doing
+    // any work (review): without this, `runOnce` -> `buildSettings` reads the
+    // raw `spaces` row and creates an empty per-space vault directory for a
+    // foreign/non-existent space before the content read finally 404s. Resolve
+    // it workspace-scoped and 404 early.
+    const space = await this.spaceRepo.findById(dto.spaceId, workspace.id);
+    if (!space) {
+      throw new NotFoundException('Space not found');
+    }
     // Use the workspace from the request context (never client-supplied).
     return this.orchestrator.runOnce(dto.spaceId, workspace.id);
   }

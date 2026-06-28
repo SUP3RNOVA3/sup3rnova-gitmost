@@ -5,7 +5,7 @@ import {
   convertProseMirrorToMarkdown,
 } from '@docmost/git-sync';
 
-import { tiptapExtensions } from '../../../collaboration/collaboration.util';
+import { tiptapExtensions } from '../collaboration.util';
 import { mergeXmlFragments, mergeXmlFragments3Way } from './yjs-body-merge';
 
 /**

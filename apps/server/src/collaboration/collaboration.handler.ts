@@ -11,7 +11,7 @@ import { User } from '@docmost/db/types/entity.types';
 import {
   mergeXmlFragments,
   mergeXmlFragments3Way,
-} from '../integrations/git-sync/services/yjs-body-merge';
+} from './merge/yjs-body-merge';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']

@@ -54,6 +54,26 @@ const nodeFs: CycleFs = {
     const fs = await import("node:fs/promises");
     await fs.rm(absPath, { force: true });
   },
+  // Real symlink-guard primitives (ENOENT -> null), mirroring the server wiring.
+  lstat: async (absPath) => {
+    const fs = await import("node:fs/promises");
+    try {
+      const st = await fs.lstat(absPath);
+      return { isSymbolicLink: st.isSymbolicLink() };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw err;
+    }
+  },
+  realpath: async (absPath) => {
+    const fs = await import("node:fs/promises");
+    try {
+      return await fs.realpath(absPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw err;
+    }
+  },
 };
 
 /** A minimal recording client; empty Docmost so the pull is a no-op. */

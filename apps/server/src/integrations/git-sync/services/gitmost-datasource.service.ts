@@ -76,7 +76,7 @@ export class GitmostDataSourceService {
         this.createPage(ctx, title, content, spaceId, parentPageId),
       deletePage: (pageId) => this.deletePage(ctx, pageId),
       movePage: (pageId, parentPageId, position) =>
-        this.movePage(pageId, parentPageId, position),
+        this.movePage(ctx, pageId, parentPageId, position),
       renamePage: (pageId, title) => this.renamePage(ctx, pageId, title),
       listRecentSince: (spaceId, sinceIso, hardPageCap) =>
         this.listRecentSince(spaceId, sinceIso, hardPageCap),
@@ -252,6 +252,7 @@ export class GitmostDataSourceService {
    * §3.2 / §14.4).
    */
   private async movePage(
+    ctx: GitSyncBindContext,
     pageId: string,
     parentPageId: string | null,
     position?: string,
@@ -268,6 +269,10 @@ export class GitmostDataSourceService {
       { pageId, parentPageId: parentPageId ?? null, position: resolvedPosition },
       page,
       GIT_SYNC_PROVENANCE,
+      // Attribute the git-initiated move to the service user (lastUpdatedById),
+      // matching create/delete/rename — the contract is "git-operations are
+      // attributed to the service account".
+      ctx.userId,
     );
     return { id: pageId };
   }

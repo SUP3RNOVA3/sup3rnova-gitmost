@@ -1,7 +1,7 @@
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import * as Y from 'yjs';
 
-import { tiptapExtensions } from '../../../collaboration/collaboration.util';
+import { tiptapExtensions } from '../collaboration.util';
 import { mergeXmlFragments, mergeXmlFragments3Way } from './yjs-body-merge';
 
 /**

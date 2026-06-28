@@ -362,13 +362,17 @@ describe('GitmostDataSourceService', () => {
       await service.bind(CTX).movePage('p1', 'parent-1');
 
       expect(mocks.pageService.movePage).toHaveBeenCalledTimes(1);
-      const [dto, page, provenance] = mocks.pageService.movePage.mock.calls[0];
+      const [dto, page, provenance, actorUserId] =
+        mocks.pageService.movePage.mock.calls[0];
       expect(dto.pageId).toBe('p1');
       expect(dto.parentPageId).toBe('parent-1');
       expect(typeof dto.position).toBe('string');
       expect(dto.position.length).toBeGreaterThan(0);
       expect(page).toEqual({ id: 'p1', spaceId: 'space-1' });
       expect(provenance).toEqual({ actor: 'git-sync', aiChatId: null });
+      // The git-initiated move is attributed to the service user (lastUpdatedById
+      // parity with create/delete/rename).
+      expect(actorUserId).toBe('svc-user');
     });
 
     it('passes through an explicit position unchanged', async () => {

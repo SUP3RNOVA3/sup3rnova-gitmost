@@ -16,8 +16,8 @@ jest.mock('node:fs/promises', () => ({
 
 // ensureServable shells out via `promisify(execFile)`; mock execFile with a
 // callback-style fn so promisify resolves. Each `git config <key> <value>` call
-// is recorded so the four config writes (incl. the security-critical
-// receive.denyNonFastForwards=true) can be asserted.
+// is recorded so the config writes (incl. the security-critical
+// receive.denyNonFastForwards=true and core.symlinks=false) can be asserted.
 jest.mock('node:child_process', () => ({
   execFile: jest.fn((_cmd: string, _args: string[], _opts: any, cb: any) =>
     cb(null, { stdout: '', stderr: '' }),
@@ -54,6 +54,7 @@ void loadGitSync;
 function build(dataDir: string): { service: VaultRegistryService } {
   const env = {
     getGitSyncDataDir: jest.fn(() => dataDir),
+    getGitSyncBackendTimeoutMs: jest.fn(() => 120000),
   };
   const service = new VaultRegistryService(env as any);
   return { service };
@@ -96,7 +97,7 @@ describe('VaultRegistryService', () => {
   });
 
   describe('ensureServable', () => {
-    it('ensures the repo then writes the four force-push-protection git configs', async () => {
+    it('ensures the repo then writes the force-push-protection + symlink-guard git configs', async () => {
       const { service } = build('/vaults');
 
       const path = await service.ensureServable('space-1');
@@ -117,12 +118,18 @@ describe('VaultRegistryService', () => {
         ['receive.denyNonFastForwards', 'true'],
         ['http.receivepack', 'true'],
         ['http.uploadpack', 'true'],
+        // Security-critical (PR #119 review): a pushed symlink is checked out as
+        // a plain file, never a real link, so it cannot be followed to leak/
+        // overwrite a file outside the vault.
+        ['core.symlinks', 'false'],
       ]);
 
-      // Every config write targets THIS vault's cwd.
+      // Every config write targets THIS vault's cwd and is time-bounded so a
+      // wedged git cannot hang the request path.
       for (const [cmd, args, opts] of execFileMock.mock.calls) {
         if (cmd === 'git' && args[0] === 'config') {
           expect(opts.cwd).toBe('/vaults/space-1');
+          expect(opts.timeout).toBe(120000);
         }
       }
     });

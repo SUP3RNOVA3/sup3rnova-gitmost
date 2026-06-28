@@ -12,6 +12,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native two-way Docmost ↔ git Markdown sync.** Opt-in per space (Space
+  settings → a git-sync toggle, plus an `autoMergeConflicts` toggle that controls
+  whether a still-conflicted page is held back or pushed with its conflict
+  markers stripped): each enabled space is mirrored to an on-disk git "vault" of
+  Markdown files and reconciled in both directions (Docmost → vault and vault →
+  Docmost) on a debounced + poll-backstop cycle, under a per-space lock, writing
+  through the collaboration layer so concurrent human edits aren't clobbered.
+  Git-originated changes are attributed to a configurable service account and
+  carry a "git-sync" provenance badge in page history. Optionally exposes a `/git`
+  smart-HTTP host so you can `git clone`/`fetch`/`push` a space directly (HTTP
+  Basic auth, space-permission authorized). Off by default and configured via the
+  `GIT_SYNC_*` environment variables, including `GIT_SYNC_ENABLED`,
+  `GIT_SYNC_SERVICE_USER_ID`, and `GIT_SYNC_HTTP_ENABLED` (see `.env.example`).
+  (#119)
 - **Quick-create regular and temporary notes from the Home and Space screens.**
   The Home screen now shows a second action next to "New note" that creates a
   *temporary* note (one that auto-moves to Trash after the workspace lifetime),

@@ -157,6 +157,25 @@ describe('preprocessCallouts: nested callouts + code-fenced ":::"', () => {
     expect(allText(callout)).toContain('before code');
     expect(allText(callout)).toContain('after code');
   });
+
+  it('(c) an UNCLOSED ":::" opener is treated as a literal line, not a callout', async () => {
+    // Realistic input: a hand-edited vault file with a `:::info` opener and no
+    // matching closing `:::`. The fallback emits the opener as a LITERAL line
+    // rather than swallowing the rest of the document into a phantom callout —
+    // previously uncovered (markdown-to-prosemirror.ts).
+    const md = [':::info', 'orphan body line', 'another line'].join('\n');
+
+    const docNode = await markdownToProseMirror(md);
+
+    // No callout node was created (the opener never closed).
+    expect(findAll(docNode, 'callout')).toHaveLength(0);
+    // The opener survives as literal text and the body lines are preserved (the
+    // rest of the document was NOT eaten by an unterminated callout).
+    const text = allText(docNode);
+    expect(text).toContain(':::info');
+    expect(text).toContain('orphan body line');
+    expect(text).toContain('another line');
+  });
 });
 
 // ---------------------------------------------------------------------------

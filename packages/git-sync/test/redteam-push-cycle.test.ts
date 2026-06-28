@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
-import { runPush, LAST_PUSHED_REF, DOCMOST_BRANCH } from '../src/engine/push';
+import {
+  runPush,
+  LAST_PUSHED_REF,
+  DOCMOST_BRANCH,
+  CONFLICT_MARKERS_FAILURE_REASON,
+} from '../src/engine/push';
 import type { PushDeps } from '../src/engine/push';
 import type { Settings } from '../src/engine/settings';
 import { runCycle, type RunCycleDeps } from '../src/engine/cycle';
@@ -138,6 +143,59 @@ describe('#13 conflict markers reach Docmost', () => {
     expect(pushedBody).not.toContain('>>>>>>>');
     expect(pushedBody).toContain('my line');
     expect(pushedBody).toContain('their line');
+  });
+
+  it('CREATE branch (autoMergeConflicts off): does NOT create a page from a conflicted NEW file; records a create failure', async () => {
+    // The conflict-markers guard is DUPLICATED on the CREATE path (a brand-new
+    // .md with NO gitmost_id, status 'A') and was previously untested — only the
+    // UPDATE branch had coverage. Without this, a regression would SILENTLY push
+    // `<<<<<<<`/`>>>>>>>` into a freshly-created page. Assert the create path
+    // isolates it exactly like update: no createPage, a kind:'create' failure
+    // with the conflict reason, and the refs held.
+    const { git, calls } = makePushGit({
+      changes: [{ status: 'A', path: 'New.md' }],
+    });
+    const createPage = vi.fn(async () => ({ data: { id: 'new-1' } }));
+    const client = {
+      listSpaceTree: vi.fn(async () => ({ pages: [], complete: true })),
+      importPageMarkdown: vi.fn(),
+      createPage,
+      deletePage: vi.fn(),
+      movePage: vi.fn(),
+      renamePage: vi.fn(),
+    };
+    const deps: PushDeps = {
+      // makeSettings() leaves autoMergeConflicts undefined -> the SAFE default.
+      settings: makeSettings(),
+      git,
+      makeClient: () => client as any,
+      // Raw conflict body with NO gitmost_id frontmatter -> classified as CREATE.
+      readFile: vi.fn(async (path: string) => {
+        if (path === 'New.md') return conflictBody;
+        throw new Error(`no such file: ${path}`);
+      }),
+      writeFile: vi.fn(async () => {}),
+      log: () => {},
+    };
+
+    const res = await runPush(deps, { dryRun: false });
+    expect(res.mode).toBe('apply');
+
+    // No page was created from the conflicted content.
+    expect(createPage).not.toHaveBeenCalled();
+
+    // Recorded as a CREATE failure with the conflict-markers reason.
+    expect(res.applied?.failures).toEqual([
+      expect.objectContaining({
+        kind: 'create',
+        path: 'New.md',
+        error: CONFLICT_MARKERS_FAILURE_REASON,
+      }),
+    ]);
+
+    // A failure prevents advancing the last-pushed ref.
+    expect(res.applied?.lastPushedAdvanced).toBe(false);
+    expect(calls.updateRef).toHaveLength(0);
   });
 });
 
