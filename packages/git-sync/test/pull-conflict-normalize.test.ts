@@ -198,14 +198,22 @@ describe('pull merge — spurious vs genuine conflict (real git)', () => {
   });
 
   // ===========================================================================
-  // NULL-EDGE coverage (round-? review F1): the genuine-conflict resolution is
-  // `resolved = ours ?? theirs`. The two cases where a merge stage is ABSENT are
-  // the data-preservation core on the published `main` and were untested — the
-  // existing cases above only feed conflicts where BOTH sides are non-null.
-  //   (i)  modify/delete (stage 2 absent) -> keep THEIRS (don't drop content)
-  //   (ii) delete/delete (stages 2 AND 3 absent) -> write nothing; stage the delete
-  // These build REAL 3-way index stages (not fakes) so the production code path
-  // is exercised end-to-end against git itself.
+  // NULL-EDGE coverage (round-2 review F1): in production the genuine-conflict
+  // resolution is `resolved = ours ?? theirs`. The two cases where a merge stage
+  // is ABSENT (modify/delete, delete/delete) drive that null branch; the existing
+  // cases above only feed conflicts where BOTH sides are non-null. These tests
+  // build REAL 3-way index stages and run the production path against an actual
+  // git repo — but be precise about WHAT they verify:
+  //   (i)  modify/delete (stage 2 absent) -> the auto-resolve produces a clean,
+  //        marker-free body on `main` that still contains THEIRS. Caveat: this is
+  //        a HAPPY-PATH assertion, NOT an F1 regression-guard. For modify/delete,
+  //        git already leaves theirs in the working tree (stage 3), so commitMerge's
+  //        `git add -A` would stage it even if production dropped the `?? theirs`
+  //        fallback — the assertions below would still pass on the broken logic.
+  //        The guard that actually fails without `?? theirs` is the fake-fs unit
+  //        test in apply-pull-actions.test.ts, which records ONLY production writes.
+  //   (ii) delete/delete (stages 2 AND 3 absent) -> nothing is written and the
+  //        deletion is staged (this real-git case is a valid guard on its own).
 
   it('NULL-EDGE modify/delete (real git): our side DELETED, their side MODIFIED -> keeps THEIRS, clean on main', async () => {
     if (!available) return;
@@ -240,8 +248,10 @@ describe('pull merge — spurious vs genuine conflict (real git)', () => {
     expect(res.conflictedPaths).toEqual([file]);
     expect(await git.isMergeInProgress()).toBe(false);
 
-    // CONTENT PRESERVED: `ours` is null (we deleted) so `ours ?? theirs` keeps the
-    // surviving Docmost body on `main` instead of dropping it. No markers.
+    // CONTENT PRESERVED on `main`, marker-free. NOTE: git itself leaves theirs in
+    // the working tree for a modify/delete (stage 3), so this asserts the clean-merge
+    // happy path rather than the `?? theirs` fallback in isolation — that branch is
+    // guarded by the fake-fs unit test in apply-pull-actions.test.ts.
     const onMain = await readFile(join(dir, file), 'utf8');
     expect(onMain).toContain('Modified on DOCMOST');
     expect(onMain).not.toContain('<<<<<<<');

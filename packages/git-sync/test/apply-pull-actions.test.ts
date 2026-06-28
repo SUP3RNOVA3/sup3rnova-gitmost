@@ -496,7 +496,7 @@ describe('applyPullActions — merge result is surfaced, not swallowed', () => {
     expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
   });
 
-  // NULL-EDGE coverage (round-? review F1): the genuine-conflict branch resolves
+  // NULL-EDGE coverage (round-2 review F1): the genuine-conflict branch resolves
   // to `ours ?? theirs`. The two cases where a stage is ABSENT are the
   // data-preservation core on the published `main` and were previously untested.
   it('NULL-EDGE modify/delete (ours absent): keeps THEIRS so the surviving edit is not dropped', async () => {
