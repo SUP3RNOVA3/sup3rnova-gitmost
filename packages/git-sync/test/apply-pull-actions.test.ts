@@ -496,6 +496,77 @@ describe('applyPullActions — merge result is surfaced, not swallowed', () => {
     expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
   });
 
+  // NULL-EDGE coverage (round-? review F1): the genuine-conflict branch resolves
+  // to `ours ?? theirs`. The two cases where a stage is ABSENT are the
+  // data-preservation core on the published `main` and were previously untested.
+  it('NULL-EDGE modify/delete (ours absent): keeps THEIRS so the surviving edit is not dropped', async () => {
+    // modify/delete conflict: OUR side (main) deleted the page (stage 2 absent),
+    // but THEIR side (docmost) still has a modified body. Losing the `?? theirs`
+    // fallback here would silently drop a surviving Docmost edit. The resolution
+    // must keep theirs — marker-free — on `main`.
+    const { client } = makeClient();
+    const g = makeGit(
+      { ok: false, conflict: true, output: 'CONFLICT (modify/delete)' },
+      {
+        unmerged: ['Gone.md'],
+        stages: {
+          'Gone.md': { ours: null, theirs: 'surviving docmost body\n' },
+        },
+      },
+    );
+    const fs = makeFs();
+
+    const res = await applyPullActions(
+      deps(client, g.git, fs),
+      actions({ toWrite: [] }),
+      VAULT,
+    );
+
+    expect(res.merge.conflict).toBe(true);
+    expect(res.merge.ok).toBe(true);
+    expect(res.conflictedPaths).toEqual(['Gone.md']);
+    // `resolved = ours ?? theirs` fell through to THEIRS (content preserved).
+    const w = fs.writes.find((x) => x.abs === '/vault/Gone.md');
+    expect(w?.text).toBe('surviving docmost body\n');
+    expect(w?.text).not.toContain('<<<<<<<');
+    expect(w?.text).not.toContain('>>>>>>>');
+    // The merge was committed clean (no wedge).
+    expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
+  });
+
+  it('NULL-EDGE delete/delete (both absent): writes NOTHING; commitMerge stages the deletion', async () => {
+    // delete/delete conflict: BOTH sides removed the path (stage 2 AND 3 absent),
+    // so `resolved = ours ?? theirs` is null. The file must NOT be re-created;
+    // commitMerge's `git add -A` stages the deletion. A regression that wrongly
+    // wrote on the both-null path would resurrect a page both sides deleted.
+    const { client } = makeClient();
+    const g = makeGit(
+      { ok: false, conflict: true, output: 'CONFLICT' },
+      {
+        unmerged: ['Both.md'],
+        stages: {
+          'Both.md': { ours: null, theirs: null },
+        },
+      },
+    );
+    const fs = makeFs();
+
+    const res = await applyPullActions(
+      deps(client, g.git, fs),
+      actions({ toWrite: [] }),
+      VAULT,
+    );
+
+    // The path is surfaced as a resolved conflict, the merge committed clean...
+    expect(res.merge.conflict).toBe(true);
+    expect(res.merge.ok).toBe(true);
+    expect(res.conflictedPaths).toEqual(['Both.md']);
+    // ...but NOTHING was written for it (resolved === null): no re-creation.
+    expect(fs.writes.find((x) => x.abs === '/vault/Both.md')).toBeUndefined();
+    expect(fs.writes).toEqual([]);
+    expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
+  });
+
   it('returns ok:false conflict:false on a non-conflict merge failure', async () => {
     const { client } = makeClient();
     const g = makeGit({ ok: false, conflict: false, output: 'some error' });

@@ -196,4 +196,110 @@ describe('pull merge — spurious vs genuine conflict (real git)', () => {
     const onDocmost = await git.showFileAtRef('docmost', file);
     expect(onDocmost).toContain('Edited by DOCMOST');
   });
+
+  // ===========================================================================
+  // NULL-EDGE coverage (round-? review F1): the genuine-conflict resolution is
+  // `resolved = ours ?? theirs`. The two cases where a merge stage is ABSENT are
+  // the data-preservation core on the published `main` and were untested — the
+  // existing cases above only feed conflicts where BOTH sides are non-null.
+  //   (i)  modify/delete (stage 2 absent) -> keep THEIRS (don't drop content)
+  //   (ii) delete/delete (stages 2 AND 3 absent) -> write nothing; stage the delete
+  // These build REAL 3-way index stages (not fakes) so the production code path
+  // is exercised end-to-end against git itself.
+
+  it('NULL-EDGE modify/delete (real git): our side DELETED, their side MODIFIED -> keeps THEIRS, clean on main', async () => {
+    if (!available) return;
+    dir = await mkdtemp(join(tmpdir(), 'docmost-conflict-'));
+    const git = new VaultGit(dir);
+    await git.ensureRepo();
+    await git.ensureBranch('docmost', 'main');
+    const file = 'Doc.md';
+
+    // Shared base on main, then re-fork docmost (merge-base = base).
+    await writeFile(join(dir, file), PAGE('Base body'), 'utf8');
+    await commitOn(git, 'base');
+    await execFileAsync('git', ['branch', '-f', 'docmost', 'main'], { cwd: dir });
+
+    // docmost MODIFIES the page (the surviving edit).
+    await git.checkout('docmost');
+    await writeFile(join(dir, file), PAGE('Modified on DOCMOST'), 'utf8');
+    await commitOn(git, 'docmost: modify');
+
+    // main DELETES the page -> a real modify/delete 3-way: stage 2 (ours) absent.
+    await git.checkout('main');
+    await rm(join(dir, file), { force: true });
+    await commitOn(git, 'local: delete');
+
+    // The cycle runs on `docmost`.
+    await git.checkout('docmost');
+    const res = await applyPullActions(realDeps(git), actions(), dir);
+
+    // modify/delete is a GENUINE conflict, auto-resolved + committed clean.
+    expect(res.merge.conflict).toBe(true);
+    expect(res.merge.ok).toBe(true);
+    expect(res.conflictedPaths).toEqual([file]);
+    expect(await git.isMergeInProgress()).toBe(false);
+
+    // CONTENT PRESERVED: `ours` is null (we deleted) so `ours ?? theirs` keeps the
+    // surviving Docmost body on `main` instead of dropping it. No markers.
+    const onMain = await readFile(join(dir, file), 'utf8');
+    expect(onMain).toContain('Modified on DOCMOST');
+    expect(onMain).not.toContain('<<<<<<<');
+    expect(onMain).not.toContain('=======');
+    expect(onMain).not.toContain('>>>>>>>');
+    // It is actually committed on `main` (recoverable from the ref, not just disk).
+    expect(await git.showFileAtRef('main', file)).toContain('Modified on DOCMOST');
+  });
+
+  it('NULL-EDGE delete/delete (real git): both sides removed the base path -> nothing written, deletion committed', async () => {
+    if (!available) return;
+    dir = await mkdtemp(join(tmpdir(), 'docmost-conflict-'));
+    const git = new VaultGit(dir);
+    await git.ensureRepo();
+    await git.ensureBranch('docmost', 'main');
+
+    // Shared base: a single page `orig.md`.
+    await writeFile(join(dir, 'orig.md'), PAGE('Base body'), 'utf8');
+    await commitOn(git, 'base');
+    await execFileAsync('git', ['branch', '-f', 'docmost', 'main'], { cwd: dir });
+
+    // A rename/rename(1to2) of the SAME base file makes git record the ORIGINAL
+    // path `orig.md` as BOTH-DELETED (DD): stage 1 only, stages 2 AND 3 absent ->
+    // the `ours === null && theirs === null` edge. (The two rename targets A/B
+    // are themselves modify/delete halves that exercise `ours ?? theirs` too.)
+    await git.checkout('docmost');
+    await rm(join(dir, 'orig.md'), { force: true });
+    await writeFile(join(dir, 'B.md'), PAGE('Base body'), 'utf8');
+    await commitOn(git, 'docmost: rename orig -> B');
+
+    await git.checkout('main');
+    await rm(join(dir, 'orig.md'), { force: true });
+    await writeFile(join(dir, 'A.md'), PAGE('Base body'), 'utf8');
+    await commitOn(git, 'local: rename orig -> A');
+
+    // The cycle runs on `docmost`.
+    await git.checkout('docmost');
+    const res = await applyPullActions(realDeps(git), actions(), dir);
+
+    // Conflicted -> auto-resolved + COMMITTED clean (no wedge).
+    expect(res.merge.ok).toBe(true);
+    expect(await git.isMergeInProgress()).toBe(false);
+    // The both-deleted base path is surfaced among the resolved conflicts...
+    expect(res.conflictedPaths).toContain('orig.md');
+
+    // ...and on the both-null edge NOTHING is written for it: it stays DELETED on
+    // main (no stray re-creation), and commitMerge's `git add -A` staged the
+    // deletion so it is gone from the committed `main` tree too.
+    await expect(readFile(join(dir, 'orig.md'), 'utf8')).rejects.toThrow();
+    expect(await git.showFileAtRef('main', 'orig.md')).toBeNull();
+
+    // The two rename targets are each a modify/delete null-edge: `ours ?? theirs`
+    // preserved the surviving side for both, marker-free.
+    for (const t of ['A.md', 'B.md']) {
+      const body = await readFile(join(dir, t), 'utf8');
+      expect(body).toContain('Base body');
+      expect(body).not.toContain('<<<<<<<');
+      expect(body).not.toContain('>>>>>>>');
+    }
+  });
 });
