@@ -25,6 +25,8 @@ import { useParams } from "react-router-dom";
 import { extractPageSlugId } from "@/lib";
 import { FIVE_MINUTES } from "@/lib/constants.ts";
 import { collabTokenNeedsRefresh } from "@/features/editor/hooks/collab-token";
+import { pageYdocName } from "@/features/editor/page-ydoc-name";
+import { pageKeys } from "@/features/page/queries/page-query";
 
 export interface PageCollabProviders {
   ydoc: Y.Doc | null;
@@ -72,7 +74,7 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
 
   useEffect(() => {
     if (!providersRef.current) {
-      const documentName = `page.${pageId}`;
+      const documentName = pageYdocName(pageId);
       const ydoc = new Y.Doc();
       const local = new IndexeddbPersistence(documentName, ydoc);
       const socket = new HocuspocusProviderWebsocket({
@@ -91,9 +93,11 @@ export function usePageCollabProviders(pageId: string): PageCollabProviders {
         try {
           const message = JSON.parse(payload);
           if (message?.type !== "page.updated" || !message.updatedAt) return;
-          const pageData = queryClient.getQueryData<IPage>(["pages", slugId]);
+          const pageData = queryClient.getQueryData<IPage>(
+            pageKeys.detail(slugId),
+          );
           if (pageData) {
-            queryClient.setQueryData(["pages", slugId], {
+            queryClient.setQueryData(pageKeys.detail(slugId), {
               ...pageData,
               updatedAt: message.updatedAt,
               ...(message.lastUpdatedBy && {

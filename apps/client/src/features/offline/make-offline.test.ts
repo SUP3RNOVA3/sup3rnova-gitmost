@@ -219,6 +219,113 @@ describe("makePageAvailableOffline", () => {
 
     errorSpy.mockRestore();
   });
+
+  // Helper: the page-ids passed to the sidebar-children warm (its query key is
+  // ["sidebar-pages", { pageId, spaceId }]) — i.e. which nodes were prefetched.
+  const warmedSidebarIds = () =>
+    prefetchQuery.mock.calls
+      .map((c) => c[0])
+      .filter((opts: any) => opts?.queryKey?.[0] === "sidebar-pages")
+      .map((opts: any) => opts.queryKey[1]?.pageId);
+
+  it("warms the page + every ancestor's children once and skips the self-ancestor guard", async () => {
+    (getPageById as ReturnType<typeof vi.fn>).mockResolvedValue(okPage);
+    // Breadcrumbs include two real ancestors, the page's OWN id (must be skipped
+    // by the ancestorId === pageId guard so it is not warmed twice), and a
+    // malformed entry with no id (also skipped).
+    (getPageBreadcrumbs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "anc-1" },
+      { id: "uuid-1" }, // === pageId -> guard
+      { id: "anc-2" },
+      {}, // no id -> skipped
+    ]);
+    (getSidebarPages as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+    (getPageComments as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+
+    const result = await makePageAvailableOffline({
+      pageId: "uuid-1",
+      spaceId: "space-uuid",
+    });
+
+    const ids = warmedSidebarIds();
+    // The page's own children (warmSidebarChildren(pageId)) plus each real
+    // ancestor — exactly once each. The self-ancestor (uuid-1 in breadcrumbs) is
+    // NOT a second warm: uuid-1 appears once (from the page's own children call).
+    expect(ids).toEqual(["uuid-1", "anc-1", "anc-2"]);
+    expect(ids.filter((id: string) => id === "uuid-1")).toHaveLength(1);
+    expect(result).toEqual({ ok: true, failed: [] });
+  });
+
+  it("dedupes repeated tree failures into a single 'tree' label", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    (getPageById as ReturnType<typeof vi.fn>).mockResolvedValue(okPage);
+    (getPageBreadcrumbs as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: "anc-1" },
+      { id: "anc-2" },
+    ]);
+    (getSidebarPages as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+    (getPageComments as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+    // Fail ONLY the sidebar-children prefetches (page-own + both ancestors = 3
+    // failures); the currentUser/space prefetches still resolve.
+    prefetchQuery.mockImplementation(async (opts: any) => {
+      if (opts?.queryKey?.[0] === "sidebar-pages") throw new Error("network");
+      return undefined;
+    });
+
+    const result = await makePageAvailableOffline({
+      pageId: "uuid-1",
+      spaceId: "space-uuid",
+    });
+
+    // Three node warms failed but the contract collapses them to one "tree".
+    expect(result.ok).toBe(false);
+    expect(result.failed).toEqual(["tree"]);
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+  });
+
+  it("records 'breadcrumbs' (not 'tree') when the breadcrumbs lookup rejects", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    (getPageById as ReturnType<typeof vi.fn>).mockResolvedValue(okPage);
+    // Ancestor discovery fails -> the ancestor-walk is recorded as "breadcrumbs".
+    (getPageBreadcrumbs as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("network"),
+    );
+    (getSidebarPages as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+    (getPageComments as ReturnType<typeof vi.fn>).mockResolvedValue({
+      items: [],
+      meta: { nextCursor: null },
+    });
+
+    const result = await makePageAvailableOffline({
+      pageId: "uuid-1",
+      spaceId: "space-uuid",
+    });
+
+    // The page's own children still warmed fine (prefetch resolves), so the only
+    // failure is the breadcrumbs lookup.
+    expect(result.ok).toBe(false);
+    expect(result.failed).toEqual(["breadcrumbs"]);
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
+  });
 });
 
 describe("warmPageYdoc", () => {

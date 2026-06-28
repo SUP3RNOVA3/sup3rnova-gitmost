@@ -7,7 +7,6 @@ import {
   prosemirrorNodeToYElement,
   buildTitleSeedYdoc,
   jsonToText,
-  tiptapExtensions,
 } from './collaboration.util';
 import { Node } from '@tiptap/pm/model';
 
@@ -283,11 +282,5 @@ describe('buildTitleSeedYdoc', () => {
 
     expect(text1).toBe(title);
     expect(text2).toBe(text1);
-  });
-
-  // Touch tiptapExtensions so the import is exercised (mirrors the brief's import
-  // list and guards against accidental tree-shaking of the schema dependency).
-  it('uses the shared tiptap extensions schema', () => {
-    expect(Array.isArray(tiptapExtensions)).toBe(true);
   });
 });

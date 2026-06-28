@@ -19,6 +19,7 @@ import { getMyInfo } from "@/features/user/services/user-service";
 import { userKeys } from "@/features/user/hooks/use-current-user";
 import { IPage } from "@/features/page/types/page.types";
 import { IPagination } from "@/lib/types.ts";
+import { pageYdocName } from "@/features/editor/page-ydoc-name";
 
 /**
  * Fully paginate an infinite query and write the @tanstack InfiniteData cache
@@ -258,7 +259,7 @@ export async function warmPageYdoc(
   let remote: HocuspocusProvider | null = null;
 
   try {
-    const documentName = `page.${pageId}`;
+    const documentName = pageYdocName(pageId);
     ydoc = new Y.Doc();
     local = new IndexeddbPersistence(documentName, ydoc);
     remote = new HocuspocusProvider({

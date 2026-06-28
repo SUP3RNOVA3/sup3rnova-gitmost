@@ -11,10 +11,9 @@ import {
   pageEditorAtom,
   titleEditorAtom,
 } from "@/features/editor/atoms/editor-atoms";
-import { updatePageData } from "@/features/page/queries/page-query";
+import { pageKeys, updatePageData } from "@/features/page/queries/page-query";
 import { useDebouncedCallback, getHotkeyHandler } from "@mantine/hooks";
 import { useAtom } from "jotai";
-import { useQueryEmit } from "@/features/websocket/use-query-emit.ts";
 import { Collaboration } from "@tiptap/extension-collaboration";
 import { shouldPropagateTitleChange } from "@/features/editor/title-collab";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
@@ -49,7 +48,6 @@ export function TitleEditor({
   const { t } = useTranslation();
   const pageEditor = useAtomValue(pageEditorAtom);
   const [, setTitleEditor] = useAtom(titleEditorAtom);
-  const emit = useQueryEmit();
   const navigate = useNavigate();
   const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
 
@@ -146,8 +144,8 @@ export function TitleEditor({
     });
 
     const page =
-      queryClient.getQueryData<IPage>(["pages", slugId]) ??
-      queryClient.getQueryData<IPage>(["pages", pageId]);
+      queryClient.getQueryData<IPage>(pageKeys.detail(slugId)) ??
+      queryClient.getQueryData<IPage>(pageKeys.detail(pageId));
     if (!page) return;
 
     const updatedPage: IPage = { ...page, title: titleText };
@@ -166,8 +164,11 @@ export function TitleEditor({
     };
 
     updatePageData(updatedPage);
+    // Drive the local (same-tab) tree/breadcrumb update. The cross-user tree
+    // refresh is handled server-side: the collab process extracts the renamed
+    // 'title' Yjs fragment and broadcasts a treeUpdate. The previous socket
+    // `emit(event)` here was a no-op (the gateway ignores it) and was removed.
     localEmitter.emit("message", event);
-    emit(event);
   }, 500);
 
   useTitleAutofocus(titleEditor, pageId);

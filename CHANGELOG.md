@@ -171,7 +171,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   separately-hosted cross-domain client must now be listed in
   `CORS_ALLOWED_ORIGINS` (native Capacitor/Ionic/localhost WebView origins are
   allowed automatically). Requests with no `Origin` header (server-to-server)
-  are still allowed.
+  are still allowed. **Upgrade note:** the old bare `app.enableCors()` reflected
+  *any* origin (with `credentials:false`), so any previously-working cross-domain
+  REST/browser client is now rejected until its origin is added to
+  `CORS_ALLOWED_ORIGINS` (see `.env.example`).
 
 ### Added
 
@@ -179,9 +182,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   children, and comments are cached in IndexedDB (TanStack Query persister plus
   `y-indexeddb` for the page's Yjs document), and a PWA service worker
   (vite-plugin-pwa) serves an app shell so previously opened pages stay readable
-  offline. The offline cache (persisted query cache, Yjs page documents, and the
-  service-worker API cache) is cleared on logout AND on sign-in so a previous
-  user's private data does not remain in the browser.
+  offline. The two offline stores (the persisted query cache and the Yjs page
+  documents) are cleared on logout AND on sign-in so a previous user's private
+  data does not remain in the browser; the same purge also defensively drops any
+  legacy service-worker `api-get-cache` left by older clients (current builds
+  serve `/api` as NetworkOnly, so there is no active service-worker API cache).
 - **Mobile bootstrap**: a `returnToken` opt-in on login so native/mobile clients
   can request the access JWT in the response body (`data.authToken`) in addition
   to the httpOnly cookie (the web client stays cookie-only); an optional

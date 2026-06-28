@@ -2,6 +2,7 @@ import { del } from "idb-keyval";
 
 import { queryClient } from "@/main.tsx";
 import { OFFLINE_CACHE_KEY } from "./query-persister";
+import { PAGE_YDOC_NAME_PREFIX } from "@/features/editor/page-ydoc-name";
 
 /**
  * Best-effort purge of all of the current user's offline data from the browser.
@@ -55,7 +56,8 @@ export async function clearOfflineCache(): Promise<void> {
       const dbs = await indexedDB.databases();
       for (const db of dbs) {
         const name = db?.name;
-        if (typeof name !== "string" || !name.startsWith("page.")) continue;
+        if (typeof name !== "string" || !name.startsWith(PAGE_YDOC_NAME_PREFIX))
+          continue;
         try {
           // Fire-and-forget delete; await a thin wrapper so a slow delete does
           // not race the page teardown, but never reject on it.
