@@ -9,6 +9,7 @@ import { useGetSpaceBySlugQuery } from "@/features/space/queries/space-query.ts"
 import { useTranslation } from "react-i18next";
 import React from "react";
 import { EmptyState } from "@/components/ui/empty-state.tsx";
+import { OfflineFallback } from "@/features/offline/offline-fallback.tsx";
 import { IconAlertTriangle, IconFileOff } from "@tabler/icons-react";
 import { Button } from "@mantine/core";
 import { Link } from "react-router-dom";
@@ -62,7 +63,19 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
   }
 
   if (isError || !page) {
-    if ([401, 403, 404].includes(error?.["status"])) {
+    // An offline fetch of a page that was never saved for offline use yields a
+    // network error with NO HTTP status (status is undefined), which would
+    // otherwise fall through to the generic "Error fetching page data." state.
+    // When we are offline (or the failure is a network error with no status),
+    // show the dedicated "You're offline — this page isn't saved for offline"
+    // fallback instead, so the user understands why the page won't load.
+    const httpStatus = error?.["status"];
+    const isOffline =
+      typeof navigator !== "undefined" && navigator.onLine === false;
+    if (isOffline || (isError && httpStatus == null)) {
+      return <OfflineFallback />;
+    }
+    if ([401, 403, 404].includes(httpStatus)) {
       return (
         <EmptyState
           icon={IconFileOff}

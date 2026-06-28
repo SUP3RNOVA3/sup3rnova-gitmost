@@ -11,7 +11,7 @@ import { MantineProvider } from "@mantine/core";
 import { BrowserRouter } from "react-router-dom";
 import { ModalsProvider } from "@mantine/modals";
 import { Notifications } from "@mantine/notifications";
-import { QueryClient } from "@tanstack/react-query";
+import { QueryClient, onlineManager } from "@tanstack/react-query";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
 import { HelmetProvider } from "react-helmet-async";
 import "./i18n";
@@ -48,8 +48,20 @@ export const queryClient = new QueryClient({
 // Register default mutationFns for the offline-relevant structural mutations so
 // a paused mutation restored from IndexedDB after an offline reload still has a
 // mutationFn and is replayed by resumePausedMutations() on reconnect (instead
-// of silently no-op'ing and dropping the offline create/move/comment).
+// of silently no-op'ing and dropping the offline create/move/comment). MUST run
+// before any resumePausedMutations() so rehydrated paused mutations have a fn.
 registerOfflineMutationDefaults(queryClient);
+
+// Seed TanStack Query's onlineManager from the REAL connectivity state at boot.
+// It defaults to `online: true` and only flips on window online/offline events,
+// so a tab that COLD-BOOTS offline would wrongly believe it is online: paused
+// mutations restored from IndexedDB would never get a later offline->online
+// transition to trigger their replay, and the offline UI affordances could not
+// tell they are offline. Seeding here makes the first real `online` event a true
+// transition that auto-resumes the rehydrated paused mutations (#120 data loss).
+if (typeof navigator !== "undefined" && "onLine" in navigator) {
+  onlineManager.setOnline(navigator.onLine);
+}
 
 if (isCloud() && isPostHogEnabled) {
   posthog.init(getPostHogKey(), {
@@ -80,6 +92,16 @@ root.render(
             dehydrateOptions: {
               shouldDehydrateQuery: shouldDehydrateOfflineQuery,
             },
+          }}
+          // After the persister finishes rehydrating, replay any paused
+          // mutations restored from IndexedDB. If we are back online this fires
+          // them immediately; if still offline they stay paused and TanStack's
+          // onlineManager auto-resumes them on the next online transition (which
+          // is now a true transition thanks to the onlineManager seeding above).
+          // Without this, a paused mutation persisted while offline and then
+          // reloaded would never resume and the user's work would be lost (#120).
+          onSuccess={() => {
+            queryClient.resumePausedMutations();
           }}
         >
           <Notifications position="bottom-center" limit={3} zIndex={10000} />

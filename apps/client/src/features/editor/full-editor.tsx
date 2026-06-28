@@ -82,14 +82,18 @@ export function FullEditor({
   // AI title generation is gated by the general AI chat flag (the same toggle
   // that enables the chat agent); the server enforces it too (#199).
   const isTitleGenEnabled = workspace?.settings?.ai?.chat === true;
-  const fullPageWidth = user.settings?.preferences?.fullPageWidth;
+  // `user` can momentarily be null during logout teardown (the currentUser atom
+  // is reset before this subtree unmounts). Optional-chain every access so the
+  // teardown render does not throw "Cannot read properties of null (reading
+  // 'settings')".
+  const fullPageWidth = user?.settings?.preferences?.fullPageWidth;
   const editorToolbarEnabled =
-    user.settings?.preferences?.editorToolbar ?? false;
+    user?.settings?.preferences?.editorToolbar ?? false;
   const [currentPageEditMode, setCurrentPageEditMode] = useAtom(
     currentPageEditModeAtom,
   );
   const userPageEditMode =
-    user.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
+    user?.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
   const isEditMode = currentPageEditMode === PageEditMode.Edit;
 
   // Single shared Y.Doc + HocuspocusProvider for both the title and body

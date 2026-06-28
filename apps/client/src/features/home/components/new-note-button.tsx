@@ -3,6 +3,8 @@ import { IconHourglass, IconPlus } from "@tabler/icons-react";
 import { ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
+import { onlineManager } from "@tanstack/react-query";
+import { notifications } from "@mantine/notifications";
 import { useGetSpacesQuery } from "@/features/space/queries/space-query.ts";
 import { useCreatePageMutation } from "@/features/page/queries/page-query.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
@@ -36,21 +38,39 @@ function CreateNoteButton({
   const createPageMutation = useCreatePageMutation();
 
   const createNote = async (space: ISpace) => {
+    // `spaceId`/`temporary` are accepted by the create-page endpoint but are
+    // not part of the shared `IPageInput` type; cast to satisfy the mutation
+    // signature.
+    const variables = {
+      spaceId: space.id,
+      ...(temporary ? { temporary: true } : {}),
+    } as any;
+
+    if (!onlineManager.isOnline()) {
+      // Offline: the create is PAUSED and queued — its promise will not resolve
+      // until we are back online, so awaiting it here would spin the button
+      // forever. Fire it without awaiting (it persists and replays on reconnect)
+      // and tell the user it was saved offline instead of leaving a dead spinner.
+      createPageMutation.mutate(variables);
+      notifications.show({
+        color: "blue",
+        message: t("You're offline. This note will be created once you reconnect."),
+      });
+      return;
+    }
+
     try {
-      // `spaceId`/`temporary` are accepted by the create-page endpoint but are
-      // not part of the shared `IPageInput` type; cast to satisfy the mutation
-      // signature.
-      const createdPage = await createPageMutation.mutateAsync({
-        spaceId: space.id,
-        ...(temporary ? { temporary: true } : {}),
-      } as any);
+      const createdPage = await createPageMutation.mutateAsync(variables);
       navigate(buildPageUrl(space.slug, createdPage.slugId, createdPage.title));
     } catch {
       // useCreatePageMutation already surfaces a red notification on error.
     }
   };
 
-  const isPending = createPageMutation.isPending;
+  // A paused (offline) mutation stays `isPending`, so gate the spinner on it NOT
+  // being paused — otherwise the button would spin forever after an offline
+  // create. The offline path above gives its own "saved offline" feedback.
+  const isPending = createPageMutation.isPending && !createPageMutation.isPaused;
 
   // Exactly one writable space → create directly, no picker needed.
   if (writableSpaces.length === 1) {

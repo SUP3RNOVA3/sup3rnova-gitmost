@@ -1,7 +1,11 @@
 import { del } from "idb-keyval";
 
 import { queryClient } from "@/main.tsx";
-import { OFFLINE_CACHE_KEY } from "./query-persister";
+import {
+  OFFLINE_CACHE_KEY,
+  freezeOfflinePersistence,
+  unfreezeOfflinePersistence,
+} from "./query-persister";
 import { PAGE_YDOC_NAME_PREFIX } from "@/features/editor/page-ydoc-name";
 
 /**
@@ -31,19 +35,27 @@ import { PAGE_YDOC_NAME_PREFIX } from "@/features/editor/page-ydoc-name";
  *     service-worker-capable browsers).
  */
 export async function clearOfflineCache(): Promise<void> {
-  // 1a. Drop the in-memory query cache immediately.
-  try {
-    queryClient.clear();
-  } catch {
-    // best-effort: ignore in-memory cache reset failures
-  }
+  // Freeze the throttled persister BEFORE touching the cache so the
+  // queryClient.clear() below cannot trigger a late re-write of the (still
+  // nearly-full) dehydrated snapshot after we del() the key — which would
+  // otherwise resurrect the previous user's persisted data in IndexedDB.
+  // Re-enabled in `finally` so the next (sign-in) session persists normally.
+  freezeOfflinePersistence();
 
-  // 1b. Delete the persisted RQ cache from IndexedDB.
   try {
-    await del(OFFLINE_CACHE_KEY);
-  } catch {
-    // best-effort: ignore persisted-cache deletion failures
-  }
+    // 1a. Drop the in-memory query cache immediately.
+    try {
+      queryClient.clear();
+    } catch {
+      // best-effort: ignore in-memory cache reset failures
+    }
+
+    // 1b. Delete the persisted RQ cache from IndexedDB.
+    try {
+      await del(OFFLINE_CACHE_KEY);
+    } catch {
+      // best-effort: ignore persisted-cache deletion failures
+    }
 
   // 2. Delete the Yjs page IndexedDB databases (`page.<id>`).
   // `indexedDB.databases()` is not implemented everywhere (e.g. Firefox); when
@@ -90,5 +102,11 @@ export async function clearOfflineCache(): Promise<void> {
     }
   } catch {
     // best-effort: ignore Cache Storage failures
+  }
+  } finally {
+    // Re-enable persistence for the next session (sign-in continues running in
+    // the same tab; logout reloads via window.location.replace, so this is a
+    // harmless no-op there).
+    unfreezeOfflinePersistence();
   }
 }

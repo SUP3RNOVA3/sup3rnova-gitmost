@@ -1,7 +1,19 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
+
+// In-memory idb-keyval so we can observe whether the persister actually writes.
+const h = vi.hoisted(() => ({
+  get: vi.fn(() => Promise.resolve(undefined)),
+  set: vi.fn(() => Promise.resolve()),
+  del: vi.fn(() => Promise.resolve()),
+}));
+vi.mock("idb-keyval", () => h);
+
 import {
   shouldDehydrateOfflineQuery,
   OFFLINE_PERSIST_ROOTS,
+  queryPersister,
+  freezeOfflinePersistence,
+  unfreezeOfflinePersistence,
 } from "./query-persister";
 
 // Small helper to build the structural query shape the predicate reads.
@@ -85,5 +97,32 @@ describe("OFFLINE_PERSIST_ROOTS", () => {
   it("does NOT contain volatile/auth keys", () => {
     expect(OFFLINE_PERSIST_ROOTS.has("collab-token")).toBe(false);
     expect(OFFLINE_PERSIST_ROOTS.has("trash")).toBe(false);
+  });
+});
+
+describe("freeze/unfreeze persistence (logout no-late-write guard)", () => {
+  const dummyClient = {
+    timestamp: Date.now(),
+    buster: "",
+    clientState: { mutations: [], queries: [] },
+  } as any;
+
+  afterEach(() => {
+    // Always leave persistence enabled so other tests/sessions persist normally.
+    unfreezeOfflinePersistence();
+    h.set.mockClear();
+  });
+
+  it("does NOT write to storage while frozen", async () => {
+    freezeOfflinePersistence();
+    await queryPersister.persistClient(dummyClient);
+    expect(h.set).not.toHaveBeenCalled();
+  });
+
+  it("resumes writing to storage once unfrozen", async () => {
+    freezeOfflinePersistence();
+    unfreezeOfflinePersistence();
+    await queryPersister.persistClient(dummyClient);
+    expect(h.set).toHaveBeenCalledTimes(1);
   });
 });

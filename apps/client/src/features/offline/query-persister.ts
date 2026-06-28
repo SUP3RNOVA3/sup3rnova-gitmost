@@ -23,11 +23,37 @@ const idbStorage = {
   removeItem: (key: string) => del(key),
 };
 
-export const queryPersister = createAsyncStoragePersister({
+const basePersister = createAsyncStoragePersister({
   storage: idbStorage,
   key: OFFLINE_CACHE_KEY,
   throttleTime: 1000,
 });
+
+// When frozen, persistClient becomes a no-op so no new dehydrated snapshot is
+// written to IndexedDB. This closes a logout data-leak race: clearing the cache
+// (queryClient.clear()) fires `removed` cache events, each of which the persist
+// subscription turns into a throttled persistClient call. The FIRST such call
+// dehydrates a still-nearly-full snapshot and its async write can land AFTER the
+// del() that clears the key, resurrecting the previous user's data (~180KB) in
+// IndexedDB. Freezing before clear()/del() prevents any such rewrite. Re-enabled
+// afterwards so the next (sign-in) session persists normally. See
+// clear-offline-cache.ts.
+let persistFrozen = false;
+
+export function freezeOfflinePersistence(): void {
+  persistFrozen = true;
+}
+
+export function unfreezeOfflinePersistence(): void {
+  persistFrozen = false;
+}
+
+export const queryPersister = {
+  persistClient: (persistedClient: Parameters<typeof basePersister.persistClient>[0]) =>
+    persistFrozen ? Promise.resolve() : basePersister.persistClient(persistedClient),
+  restoreClient: () => basePersister.restoreClient(),
+  removeClient: () => basePersister.removeClient(),
+};
 
 // Only navigation/read query roots are persisted for offline reading.
 // Volatile/auth queries (collab tokens, trash lists) are intentionally excluded.
