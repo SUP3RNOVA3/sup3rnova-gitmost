@@ -27,6 +27,7 @@ import {
   writeTitleFragment,
 } from './collaboration.handler';
 import { User } from '@docmost/db/types/entity.types';
+import * as Y from 'yjs';
 
 @Injectable()
 export class CollaborationGateway {
@@ -223,7 +224,32 @@ export class CollaborationGateway {
       context ?? {},
     );
     try {
-      await connection.transact((doc) => writeTitleFragment(doc, title));
+      // Write the new title into the in-memory 'title' fragment AND capture the
+      // resulting full doc state so we can persist it directly below.
+      let ydocState: Buffer | null = null;
+      await connection.transact((doc) => {
+        writeTitleFragment(doc, title);
+        ydocState = Buffer.from(Y.encodeStateAsUpdate(doc));
+      });
+
+      // F1 (variant C): persist the 'title' fragment to `page.ydoc` DIRECTLY,
+      // bypassing onStoreDocument. PageService.update already wrote the new title
+      // to the page.title COLUMN before calling this, so onStoreDocument's no-op
+      // fast-path (titleText === column) would NOT persist the in-memory fragment
+      // on disconnect — leaving the stored ydoc with the OLD title, which a later
+      // body edit would then revert the column back to. Writing the ydoc here
+      // makes BOTH column and persisted fragment consistent (NEW = NEW).
+      //
+      // Safe with or without a live editor: the write is idempotent and carries
+      // no tree snapshot (no double broadcast); when an editor is connected, the
+      // normal onStoreDocument flow still persists the (superset) state later and
+      // the live clients receive the title change through the transact above.
+      if (ydocState) {
+        await this.persistenceExtension.persistTitleFragmentYdoc(
+          pageId,
+          ydocState,
+        );
+      }
     } finally {
       await connection.disconnect();
     }

@@ -271,15 +271,26 @@ describe('CollaborationGateway.writePageTitle — Redis-independent path', () =>
     // redisSync is intentionally null — this is the no-Redis scenario.
     gateway.redisSync = null;
     gateway.hocuspocus = { openDirectConnection } as any;
+    // F1 (variant C): writePageTitle persists the 'title' fragment directly so a
+    // later body edit can't revert the rename (see title-rename-durability.spec).
+    const persistTitleFragmentYdoc = jest.fn().mockResolvedValue(undefined);
+    gateway.persistenceExtension = { persistTitleFragmentYdoc } as any;
 
-    return { gateway, openDirectConnection, transact, disconnect };
+    return {
+      gateway,
+      openDirectConnection,
+      transact,
+      disconnect,
+      persistTitleFragmentYdoc,
+    };
   };
 
   it('writes the new title via openDirectConnection and disconnects', async () => {
     const doc = new Y.Doc();
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(buildTitleSeedYdoc('Old Title')));
 
-    const { gateway, openDirectConnection, disconnect } = makeGateway(doc);
+    const { gateway, openDirectConnection, disconnect, persistTitleFragmentYdoc } =
+      makeGateway(doc);
 
     await gateway.writePageTitle('page-1', 'New Title', { user: { id: 'u1' } });
 
@@ -288,6 +299,11 @@ describe('CollaborationGateway.writePageTitle — Redis-independent path', () =>
       expect.objectContaining({ user: { id: 'u1' } }),
     );
     expect(readTitleText(doc)).toBe('New Title');
+    // The renamed fragment is persisted directly to page.ydoc (F1 variant C).
+    expect(persistTitleFragmentYdoc).toHaveBeenCalledWith(
+      'page-1',
+      expect.any(Buffer),
+    );
     expect(disconnect).toHaveBeenCalledTimes(1);
   });
 

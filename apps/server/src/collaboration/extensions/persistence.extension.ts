@@ -328,6 +328,35 @@ export class PersistenceExtension implements Extension {
     }
   }
 
+  /**
+   * Persist an already-encoded Y.Doc state directly to `page.ydoc`, mirroring the
+   * `pageRepo.updatePage({ ydoc })` write that onStoreDocument uses.
+   *
+   * Used by the gateway's writePageTitle (F1, variant C). A REST/MCP/agent rename
+   * with no live editor writes the new title into the in-memory 'title' fragment,
+   * but onStoreDocument's no-op fast-path (page.title column already equals the
+   * new title) does NOT persist that in-memory fragment, so the stored `page.ydoc`
+   * keeps the OLD title — and a later body edit then reverts the rename (loads the
+   * OLD fragment, sees it differs from the column, overwrites the column back to
+   * OLD). Writing the ydoc here keeps the persisted fragment consistent with the
+   * column so the rename survives.
+   *
+   * Broadcast-safe / no double broadcast: this carries no `treeUpdate`, so the
+   * tree WS + redis listeners (which gate on `treeUpdate`) do NOT re-broadcast the
+   * rename — only PageService.update's own PAGE_UPDATED does. The only extra
+   * side-effect is an idempotent search reindex.
+   *
+   * Idempotent and lock-free, so it is safe whether or not a live editor is
+   * connected: Yjs state is cumulative, so a concurrent onStoreDocument simply
+   * persists a superset of this state later.
+   */
+  async persistTitleFragmentYdoc(
+    pageId: string,
+    ydocState: Buffer,
+  ): Promise<void> {
+    await this.pageRepo.updatePage({ ydoc: ydocState }, pageId);
+  }
+
   async onStoreDocument(data: onStoreDocumentPayload) {
     // #355 — time the full store (persist + post-store side effects) into
     // collab_store_duration_seconds. No-op when METRICS_PORT is unset.
