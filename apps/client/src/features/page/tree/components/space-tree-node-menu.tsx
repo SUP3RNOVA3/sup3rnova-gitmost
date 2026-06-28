@@ -98,9 +98,10 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
       } else {
         // Partial warm — the page may still be partly usable offline, but some
         // queries failed to cache, so surface it as an error rather than a
-        // silent success.
+        // silent success. Name the failed step(s) (AGENTS.md: errors must be
+        // specific, never a bare generic string); `result.failed` carries them.
         notifications.show({
-          message: t("Failed to make page available offline"),
+          message: `${t("Failed to make page available offline")}: ${result.failed.join(", ")}`,
           color: "red",
         });
       }

@@ -68,18 +68,22 @@ export default defineConfig(({ mode }) => {
           // segments are consistently excluded from the SPA fallback, mirroring
           // the runtimeCaching urlPattern regexes below.
           //
-          // `/share`, `/mcp`, and `/robots.txt` mirror the server static-serve
-          // exclude list (apps/server/src/main.ts setGlobalPrefix `exclude`):
-          // robots.txt, the SEO/OG/analytics-injected public share HTML, and the
-          // embedded MCP endpoint are served by server controllers, so the SW must
-          // never shadow them with the precached index.html app shell (doing so
-          // would break SEO and MCP).
+          // `/share`, `/mcp`, `/l`, and `/robots.txt` mirror the server
+          // static-serve exclude list (apps/server/src/main.ts setGlobalPrefix
+          // `exclude`): robots.txt, the SEO/OG/analytics-injected public share
+          // HTML, the embedded MCP endpoint, and the `l/:alias` vanity short-link
+          // (a server 302 to a share page) are served by server controllers, so
+          // the SW must never shadow them with the precached index.html app shell.
+          // For `/l/:alias` the client router has NO matching route, so serving
+          // the app shell would dead-end on Error404 and break the public link;
+          // it must reach the server to perform the redirect.
           navigateFallbackDenylist: [
             /^\/api(\/|$)/,
             /^\/collab(\/|$)/,
             /^\/socket\.io(\/|$)/,
             /^\/share(\/|$)/,
             /^\/mcp(\/|$)/,
+            /^\/l(\/|$)/,
             /^\/robots\.txt$/,
           ],
           cleanupOutdatedCaches: true,
