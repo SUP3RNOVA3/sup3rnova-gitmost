@@ -306,6 +306,53 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Serve a git smart-HTTP READ ADVERTISEMENT (`GET info/refs?service=git-upload-pack`
+   * or a dumb `GET HEAD`) with the repo's symbolic `HEAD` deterministically pinned
+   * to `main` (bug #3). The advertised `HEAD` symref decides a clone's default
+   * branch; the engine transiently checks out the read-only `docmost` mirror during
+   * a cycle, so an unsynchronized advertisement could route a clone to `docmost`
+   * (~1/4 of clones under continuous syncing).
+   *
+   * Running the pin + the advertisement under the SAME per-space lock the cycle
+   * uses guarantees no cycle is mid-flight while we pin (HEAD cannot flap) and that
+   * the pin never corrupts a cycle's checkout. The advertisement is cheap (a ref
+   * listing, no pack stream), so holding the lock for it is fine. A bounded
+   * retry-acquire absorbs a brief overlap with a cycle; if the lock still cannot be
+   * taken (a long cycle), we fall back to serving WITHOUT the pin — the cycle's
+   * finally-restore leaves HEAD on `main` between cycles, so the advertisement is
+   * still almost always correct (degrades only under sustained contention).
+   */
+  async serveReadAdvertisement(
+    spaceId: string,
+    serve: () => Promise<void>,
+  ): Promise<void> {
+    if (!this.environmentService.isGitSyncEnabled()) {
+      await serve();
+      return;
+    }
+    const result = await this.spaceLock.withSpaceLock(
+      spaceId,
+      async () => {
+        const vault = await this.vaultRegistry.getVault(spaceId);
+        await vault.pinHeadToMain();
+        await serve();
+      },
+      {
+        acquireRetry: {
+          timeoutMs: GIT_SYNC_PUSH_LOCK_RETRY_TOTAL_MS,
+          baseMs: GIT_SYNC_PUSH_LOCK_RETRY_BASE_MS,
+          maxMs: GIT_SYNC_PUSH_LOCK_RETRY_MAX_MS,
+        },
+      },
+    );
+    // Lock contended for the whole budget (in-progress / another replica): serve
+    // anyway. `serve` (backend.run) never ran inside the lock in this case.
+    if (typeof result === 'object' && result !== null && 'skipped' in result) {
+      await serve();
+    }
+  }
+
+  /**
    * Drive ONE reconcile cycle for a space. The PULL->PUSH branch choreography
    * lives in the engine's `runCycle` (so it can never drift from the engine it
    * ships with); the orchestrator owns only the lock (its caller) and the

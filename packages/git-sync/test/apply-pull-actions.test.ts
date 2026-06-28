@@ -44,12 +44,24 @@ function makeClient(opts?: { failFor?: Set<string> }) {
 }
 
 /** A git fake recording the order of ops; merge result is configurable. */
-function makeGit(merge: { ok: boolean; conflict: boolean; output?: string } = {
-  ok: true,
-  conflict: false,
-}) {
+function makeGit(
+  merge: { ok: boolean; conflict: boolean; output?: string } = {
+    ok: true,
+    conflict: false,
+  },
+  conflictStages?: {
+    unmerged?: string[];
+    /** path -> { ours, theirs } blob content for showStage(2|3, path). */
+    stages?: Record<string, { ours: string | null; theirs: string | null }>;
+  },
+) {
   const order: string[] = [];
   let committedSubject: string | undefined;
+  const unmerged = conflictStages?.unmerged ?? ['Conflicted.md'];
+  // Default stages: genuinely-different ours/theirs (a real same-block conflict).
+  const stages = conflictStages?.stages ?? {
+    'Conflicted.md': { ours: 'git side\n', theirs: 'docmost side\n' },
+  };
   const git = {
     stageAll: vi.fn(async () => {
       order.push('stageAll');
@@ -66,7 +78,12 @@ function makeGit(merge: { ok: boolean; conflict: boolean; output?: string } = {
       order.push('merge');
       return { ok: merge.ok, conflict: merge.conflict, output: merge.output ?? '' };
     }),
-    listUnmergedPaths: vi.fn(async () => ['Conflicted.md']),
+    listUnmergedPaths: vi.fn(async () => unmerged),
+    showStage: vi.fn(async (stage: 1 | 2 | 3, path: string) => {
+      const s = stages[path];
+      if (!s) return null;
+      return stage === 2 ? s.ours : stage === 3 ? s.theirs : null;
+    }),
     commitMerge: vi.fn(async (subject: string) => {
       order.push(`commitMerge:${subject}`);
     }),
@@ -407,13 +424,22 @@ describe('applyPullActions — commit subject reflects ACTUAL counts', () => {
 });
 
 describe('applyPullActions — merge result is surfaced, not swallowed', () => {
-  it('COMMITS a conflicting merge with markers (no wedge) and surfaces conflictedPaths', async () => {
-    // Regression for the WEDGE bug (QA #119): a conflicting docmost -> main merge
-    // must NOT be left mid-merge (which wedged the whole space). It is committed
-    // WITH markers so the rest of the space keeps syncing; the conflicted page is
-    // surfaced in `conflictedPaths` and isolated by the push side.
+  it('GENUINE conflict: auto-resolves to OURS (git wins), no markers, surfaces conflictedPaths', async () => {
+    // QA #119 round-2: a genuine same-block docmost -> main conflict must NOT be
+    // committed with raw markers onto `main` (external clones would see them and
+    // the body re-conflicts forever). It is auto-resolved to the git/main side
+    // (git wins, SPEC §9), the conflicted page is surfaced in `conflictedPaths`,
+    // and the merge is committed CLEAN (no wedge).
     const { client } = makeClient();
-    const g = makeGit({ ok: false, conflict: true, output: 'CONFLICT' });
+    const g = makeGit(
+      { ok: false, conflict: true, output: 'CONFLICT' },
+      {
+        unmerged: ['Conflicted.md'],
+        stages: {
+          'Conflicted.md': { ours: 'git wins body\n', theirs: 'docmost body\n' },
+        },
+      },
+    );
     const fs = makeFs();
 
     const res = await applyPullActions(
@@ -421,12 +447,53 @@ describe('applyPullActions — merge result is surfaced, not swallowed', () => {
       actions({ toWrite: [{ pageId: 'p1', relPath: 'A.md' }] }),
       VAULT,
     );
+    // A genuine conflict was detected and auto-resolved (git won): reported as a
+    // (now-clean) committed merge with the conflicting page surfaced.
     expect(res.merge.conflict).toBe(true);
-    expect(res.merge.ok).toBe(false);
-    // The merge was COMMITTED (vault no longer mid-merge) and the bad page named.
-    expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
+    expect(res.merge.ok).toBe(true);
     expect(res.conflictedPaths).toEqual(['Conflicted.md']);
+    // The conflicted file was rewritten with OURS (git side) — NO markers.
+    const resolved = fs.writes.find((w) => w.abs === '/vault/Conflicted.md');
+    expect(resolved?.text).toBe('git wins body\n');
+    expect(resolved?.text).not.toContain('<<<<<<<');
+    expect(resolved?.text).not.toContain('>>>>>>>');
+    // The merge was COMMITTED (vault no longer mid-merge).
+    expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
     expect(g.order.some((o) => o.startsWith('commitMerge:'))).toBe(true);
+  });
+
+  it('SPURIOUS conflict (trailing-blank only): normalizes clean, NOT reported as a conflict', async () => {
+    // Root-cause fix: when the two sides differ ONLY in trailing/empty lines (the
+    // normalize-on-write form vs a user's blank-line append), the conflict is
+    // spurious — both normalize to the same text. It is resolved to the normalized
+    // form (no markers) and NOT counted as a conflict (so /status does not cry wolf).
+    const { client } = makeClient();
+    const g = makeGit(
+      { ok: false, conflict: true, output: 'CONFLICT' },
+      {
+        unmerged: ['Trailing.md'],
+        stages: {
+          // Same content; OURS has a double-blank-line append, THEIRS is normalized.
+          'Trailing.md': { ours: 'Hello world\n\n\n', theirs: 'Hello world\n' },
+        },
+      },
+    );
+    const fs = makeFs();
+
+    const res = await applyPullActions(
+      deps(client, g.git, fs),
+      actions({ toWrite: [{ pageId: 'p1', relPath: 'A.md' }] }),
+      VAULT,
+    );
+    // No GENUINE conflict — reported clean.
+    expect(res.merge.conflict).toBe(false);
+    expect(res.merge.ok).toBe(true);
+    expect(res.conflictedPaths).toEqual([]);
+    // The file was rewritten to the canonical normalized form (single trailing \n).
+    const resolved = fs.writes.find((w) => w.abs === '/vault/Trailing.md');
+    expect(resolved?.text).toBe('Hello world\n');
+    // Still committed (clears the merge), but as a clean merge.
+    expect(g.git.commitMerge).toHaveBeenCalledTimes(1);
   });
 
   it('returns ok:false conflict:false on a non-conflict merge failure', async () => {

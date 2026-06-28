@@ -118,6 +118,7 @@ function build(opts: BuildOptions = {}): Built {
     ensureBranch: jest.fn(async () => undefined),
     checkout: jest.fn(async () => undefined),
     listTrackedFiles: jest.fn(async () => []),
+    pinHeadToMain: jest.fn(async () => undefined),
     ...(vaultOverrides as Record<string, AnyMock>),
   };
   const vaultRegistry = {
@@ -380,6 +381,11 @@ describe('GitSyncOrchestrator', () => {
       expect(order).toEqual(['receive-pack', 'cycle']);
     });
 
+    // Explicit timeout: ingestExternalPush exhausts the full bounded
+    // acquire-retry budget (GIT_SYNC_PUSH_LOCK_RETRY_TOTAL_MS = 5_000ms) before it
+    // gives up and throws, which races jest's DEFAULT 5_000ms test timeout — flaky
+    // on a loaded/slow runner. Give it headroom so it deterministically observes
+    // the eventual LockHeldError instead of timing out first.
     it('throws GitSyncLockHeldError and does NOT run the receive-pack when the lock is held', async () => {
       const built = build();
       built.redis.set.mockResolvedValue(null); // acquire fails → lock-held
@@ -392,7 +398,7 @@ describe('GitSyncOrchestrator', () => {
       // We must never write to the working tree concurrently with a cycle.
       expect(runReceivePack).not.toHaveBeenCalled();
       expect(runCycleMock).not.toHaveBeenCalled();
-    });
+    }, 15_000);
 
     it('swallows a post-push cycle error (the push is durable; poll retries)', async () => {
       jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
@@ -441,6 +447,37 @@ describe('GitSyncOrchestrator', () => {
       await built.orchestrator.runOnce('space-42', 'ws-1');
       const [deps] = runCycleMock.mock.calls[0];
       expect(deps.settings.gitRemote).toBe('git@h:vault-space-42.git');
+    });
+  });
+
+  describe('serveReadAdvertisement (bug #3 — stable advertised HEAD)', () => {
+    it('pins HEAD to main and serves under the space lock', async () => {
+      const built = build();
+      const serve = jest.fn(async () => undefined);
+
+      await built.orchestrator.serveReadAdvertisement('space-1', serve);
+
+      // The lock was taken (redis SET NX) and released (CAS eval).
+      expect(built.redis.set).toHaveBeenCalledTimes(1);
+      expect(built.redis.eval).toHaveBeenCalled();
+      // HEAD pinned BEFORE serving, on the right vault.
+      expect(built.vaultRegistry.getVault).toHaveBeenCalledWith('space-1');
+      expect(built.vault.pinHeadToMain).toHaveBeenCalledTimes(1);
+      expect(serve).toHaveBeenCalledTimes(1);
+      const pinOrder = built.vault.pinHeadToMain.mock.invocationCallOrder[0];
+      const serveOrder = serve.mock.invocationCallOrder[0];
+      expect(pinOrder).toBeLessThan(serveOrder);
+    });
+
+    it('serves WITHOUT a pin/lock when git-sync is globally disabled', async () => {
+      const built = build({ enabled: false });
+      const serve = jest.fn(async () => undefined);
+
+      await built.orchestrator.serveReadAdvertisement('space-1', serve);
+
+      expect(serve).toHaveBeenCalledTimes(1);
+      expect(built.redis.set).not.toHaveBeenCalled();
+      expect(built.vault.pinHeadToMain).not.toHaveBeenCalled();
     });
   });
 

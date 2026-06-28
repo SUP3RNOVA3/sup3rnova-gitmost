@@ -376,7 +376,25 @@ export class GitHttpService implements OnModuleDestroy {
     const isReceivePack =
       req.method === 'POST' && parsedPath.subpath === 'git-receive-pack';
     if (serviceKind === 'read' || !isReceivePack) {
-      await this.backend.run(backendRequest, rawReq, rawRes);
+      // The clone's default branch comes from the HEAD symref advertised by the
+      // upload-pack ref advertisement (or a dumb `GET HEAD`). The engine
+      // transiently checks out the read-only `docmost` mirror mid-cycle, so serve
+      // THAT advertisement with HEAD pinned to `main` under the per-space lock so
+      // a clone never defaults to `docmost` (bug #3). Pack streaming and every
+      // other read are resolved by object SHA and need no pin, so they stream
+      // directly (no lock) as before.
+      const isReadAdvertise =
+        req.method === 'GET' &&
+        ((parsedPath.subpath === 'info/refs' &&
+          service === 'git-upload-pack') ||
+          parsedPath.subpath === 'HEAD');
+      if (isReadAdvertise) {
+        await this.orchestrator.serveReadAdvertisement(spaceId, () =>
+          this.backend.run(backendRequest, rawReq, rawRes),
+        );
+      } else {
+        await this.backend.run(backendRequest, rawReq, rawRes);
+      }
       return;
     }
 

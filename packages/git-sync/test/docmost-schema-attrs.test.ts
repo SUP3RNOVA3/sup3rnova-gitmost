@@ -77,8 +77,20 @@ describe('clampCalloutType', () => {
     expect(clampCalloutType('success')).toBe('success');
   });
 
+  it('maps GitHub/Obsidian alert ALIASES to the editor banner (not flatly info)', () => {
+    // The editor schema has no tip/caution/important callout node — they are input
+    // aliases the editor's own paste path maps onto the supported set
+    // (GITHUB_ALERT_TYPE_MAP in editor-ext). git-sync mirrors that aliasing so an
+    // ingested `> [!tip]` / `> [!caution]` lands on the closest real banner instead
+    // of collapsing everything to `info`.
+    expect(clampCalloutType('tip')).toBe('success');
+    expect(clampCalloutType('TIP')).toBe('success');
+    expect(clampCalloutType('caution')).toBe('danger');
+    expect(clampCalloutType('important')).toBe('info');
+  });
+
   it('falls back to "info" for genuinely unknown types', () => {
-    expect(clampCalloutType('tip')).toBe('info');
+    expect(clampCalloutType('question')).toBe('info');
     expect(clampCalloutType('banana')).toBe('info');
   });
 

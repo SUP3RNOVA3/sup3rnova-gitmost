@@ -683,6 +683,43 @@ export class VaultGit {
     if (r.code !== 0) return null;
     return r.stdout;
   }
+
+  /**
+   * Read ONE side of a conflicted file from the merge index (`git show :N:path`),
+   * where the stage `N` is the standard 3-way merge slot:
+   *   1 = merge BASE (common ancestor), 2 = OURS (the current branch = `main`),
+   *   3 = THEIRS (the merged-in branch = `docmost`).
+   * Returns the blob text, or `null` when that stage is absent (e.g. an add/add
+   * conflict has no base, a modify/delete conflict has only one content side).
+   *
+   * Used by the pull cycle (SPEC §9) to RESOLVE a conflicted docmost->main merge
+   * deterministically instead of committing raw conflict markers onto the
+   * published `main`: a conflict whose two sides differ ONLY in trailing/empty
+   * lines is SPURIOUS (normalize -> identical -> clean), and a genuine conflict is
+   * resolved to a clean side (no `<<<<<<<`/`>>>>>>>` markers ever reach `main`).
+   */
+  async showStage(stage: 1 | 2 | 3, path: string): Promise<string | null> {
+    const r = await this.runRaw(["show", `:${stage}:${path}`]);
+    if (r.code !== 0) return null;
+    return r.stdout;
+  }
+
+  /**
+   * Pin the repo's symbolic `HEAD` to `main` WITHOUT touching the working tree or
+   * index (`git symbolic-ref HEAD refs/heads/main`). The smart-HTTP host advertises
+   * whatever `HEAD` resolves to as the clone's default branch, so a clone that
+   * races a cycle mid-pull (when the engine has transiently checked out the
+   * read-only `docmost` mirror) would otherwise default to `docmost`. Pinning HEAD
+   * back to the canonical writable branch makes the advertised symref deterministic.
+   *
+   * symbolic-ref only rewrites `.git/HEAD`; it does NOT move the working tree, so
+   * it must only ever run when the working tree is ALREADY on `main` (between
+   * cycles / under the per-space lock with no cycle in flight) — otherwise HEAD and
+   * the index would desync. Callers serialize this with the engine via the lock.
+   */
+  async pinHeadToMain(): Promise<void> {
+    await this.run(["symbolic-ref", "HEAD", `refs/heads/${DEFAULT_BRANCH}`]);
+  }
 }
 
 /**

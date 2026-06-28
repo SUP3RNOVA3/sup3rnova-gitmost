@@ -65,6 +65,26 @@ function relToAbs(vaultRoot: string, relPath: string): string {
   return [vaultRoot, ...relPath.split("/")].join("/");
 }
 
+/**
+ * Canonicalize a file's TRAILING whitespace: drop any trailing blank /
+ * whitespace-only lines (and trailing spaces on the last line) and end with
+ * exactly one newline; an empty body becomes a single "\n". This matches
+ * `serializePageFile`'s trailing form (`body.trim()` + a single "\n").
+ *
+ * Why (SPEC §9 spurious-conflict fix): the engine writes pages in their
+ * normalize-on-write form (one trailing newline), but a user can push a `.md` to
+ * `main` with EXTRA trailing/empty lines (e.g. a double-blank-line append). When
+ * the docmost mirror (normalized) and `main` (raw) both change near end-of-file,
+ * git's line-based 3-way merge reports a CONFLICT even though the only difference
+ * is trailing blank lines. Normalizing BOTH sides before comparing collapses that
+ * difference to nothing, so the pull cycle can recognize the conflict as SPURIOUS
+ * and resolve it cleanly instead of committing raw conflict markers onto `main`.
+ */
+function normalizeTrailingWhitespace(text: string): string {
+  const body = text.replace(/[\s﻿]+$/, "");
+  return body.length > 0 ? `${body}\n` : "\n";
+}
+
 /** Convert an absolute/relative segment list under the vault to a relPath. */
 function segmentsToRelPath(segments: string[], stem: string): string {
   return [...segments, `${stem}.md`].join("/");
@@ -226,6 +246,7 @@ export interface ApplyPullActionsDeps {
     | "merge"
     | "listUnmergedPaths"
     | "commitMerge"
+    | "showStage"
   >;
   /** Write a file by ABSOLUTE path (mkdir of the parent is done internally). */
   writeFile: (absPath: string, text: string) => Promise<void>;
@@ -249,10 +270,13 @@ export interface ApplyResult {
   committed: boolean;
   merge: { ok: boolean; conflict: boolean; output: string };
   /**
-   * Vault-relative paths of the page(s) that CONFLICTED in the docmost -> main
-   * merge and were committed WITH conflict markers (so the rest of the space
-   * keeps syncing — SPEC §9 wedge fix). Empty on a clean merge. The push side
-   * isolates these (per-page failure when `autoMergeConflicts` is off).
+   * Vault-relative paths of the page(s) that had a GENUINE same-block conflict in
+   * the docmost -> main merge and were AUTO-RESOLVED to the git/main side (git
+   * wins, SPEC §9) — committed CLEAN, never with raw conflict markers. Empty on a
+   * clean merge AND when the only conflicts were spurious trailing-whitespace
+   * differences (those are normalized, not reported). Surfaced for logging /
+   * /status visibility; the docmost-side content stays recoverable via the
+   * `docmost` branch + page history.
    */
   conflictedPaths: string[];
 }
@@ -422,32 +446,88 @@ export async function applyPullActions(
   // Merge docmost -> main. A CONFLICT must NOT wedge the whole space (the
   // reported bug: ONE same-line conflict on ONE page froze sync for EVERY page
   // in both directions because the next cycle's `isMergeInProgress` check kept
-  // skipping the entire space). So instead of leaving the vault mid-merge, we
-  // COMMIT the conflicted merge with markers in place (SPEC §9 wedge fix): the
-  // cleanly-merged pages land, the conflicted page carries its markers on `main`
-  // and is isolated by the push side (a per-page failure when `autoMergeConflicts`
-  // is off — the markers never reach Docmost), and the NEXT cycle is NOT wedged.
-  // Recovery: resolve the markers in git; the next push then sends the clean body.
+  // skipping the entire space). It must ALSO never commit raw `<<<<<<<`/`>>>>>>>`
+  // markers onto the published `main` (round-1 round-2: external clones would see
+  // the markers AND the body re-conflicts every cycle while git and Docmost
+  // silently diverge). So on a conflict we RESOLVE each conflicted file to a
+  // clean, marker-free form and commit that (SPEC §9):
+  //
+  //   - SPURIOUS conflict — the ROOT CAUSE of the leak: the two sides differ ONLY
+  //     in trailing/empty-line normalization (the engine writes one trailing
+  //     newline; a user pushed extra blank lines). Once both sides are
+  //     `normalizeTrailingWhitespace`d they are IDENTICAL, so this is no real
+  //     conflict at all: write the normalized form. Content stays in sync; git
+  //     and the page never diverge.
+  //   - GENUINE same-block conflict: resolve to OURS (the `main`/git side), so git
+  //     wins the published branch — mirroring the live-doc 3-way "git wins" rule.
+  //     The docmost-side content is preserved on the `docmost` branch and remains
+  //     recoverable via page history; the next push carries git's body to Docmost,
+  //     so both sides converge. No markers ever reach `main`.
   await git.checkout(DEFAULT_BRANCH);
   const merge = await git.merge(DOCMOST_BRANCH);
   let conflictedPaths: string[] = [];
+  let mergeResult = merge;
   if (merge.conflict) {
-    conflictedPaths = await git.listUnmergedPaths();
+    const unmerged = await git.listUnmergedPaths();
+    const genuine: string[] = [];
+    for (const rel of unmerged) {
+      const ours = await git.showStage(2, rel); // main side
+      const theirs = await git.showStage(3, rel); // docmost side
+      if (
+        ours !== null &&
+        theirs !== null &&
+        normalizeTrailingWhitespace(ours) === normalizeTrailingWhitespace(theirs)
+      ) {
+        // SPURIOUS: identical once trailing/empty-line normalization is applied.
+        // Commit the canonical (normalized) form — no conflict, no markers.
+        await deps.writeFile(
+          relToAbs(vaultRoot, rel),
+          normalizeTrailingWhitespace(theirs),
+        );
+      } else {
+        // GENUINE conflict: resolve to the non-null side (OURS preferred so git
+        // wins the published branch; THEIRS kept when OURS is absent — e.g. a
+        // modify/delete conflict — to avoid dropping the remaining content). If
+        // BOTH are null (delete/delete) leave it; commitMerge's `git add -A`
+        // stages the deletion.
+        genuine.push(rel);
+        const resolved = ours ?? theirs;
+        if (resolved !== null) {
+          await deps.writeFile(relToAbs(vaultRoot, rel), resolved);
+        }
+      }
+    }
+    conflictedPaths = genuine;
     await git.commitMerge(
-      `docmost: sync with unresolved conflict in ${conflictedPaths.length} page(s)`,
+      genuine.length > 0
+        ? `docmost: sync, ${genuine.length} page(s) auto-resolved (git wins, SPEC §9)`
+        : `docmost: sync (trailing-whitespace conflicts normalized, SPEC §9)`,
       {
         authorName: BOT_AUTHOR_NAME,
         authorEmail: BOT_AUTHOR_EMAIL,
         trailers: [SOURCE_TRAILER],
       },
     );
-    log(
-      `pull: merge of docmost -> main CONFLICTED on ${conflictedPaths.length} ` +
-        `page(s): ${conflictedPaths.join(", ")}. Committed the merge WITH ` +
-        `conflict markers so the rest of the space keeps syncing (SPEC §9). The ` +
-        `conflicted page(s) are isolated on push (markers never reach Docmost); ` +
-        `resolve the markers in git to recover.`,
-    );
+    // The committed tree is CLEAN (every conflicted file was overwritten with a
+    // marker-free resolution). `conflict` now reflects only the GENUINE conflicts
+    // that were auto-resolved (git won); a merge that conflicted ONLY on trailing
+    // whitespace is reported as clean so /status does not cry wolf.
+    mergeResult = { ok: true, conflict: genuine.length > 0, output: merge.output };
+    if (genuine.length > 0) {
+      log(
+        `pull: merge of docmost -> main had ${genuine.length} GENUINE conflict(s) ` +
+          `auto-resolved to the git/main side (git wins, SPEC §9): ` +
+          `${genuine.join(", ")}. NO conflict markers were written to main; the ` +
+          `docmost-side content is on the 'docmost' branch and recoverable via ` +
+          `page history, and the next push reconciles Docmost to the git body.`,
+      );
+    } else {
+      log(
+        `pull: merge of docmost -> main conflicted ONLY on trailing/empty-line ` +
+          `normalization (${unmerged.length} file(s)) — auto-normalized, no ` +
+          `markers, content stays in sync (SPEC §9 spurious-conflict fix).`,
+      );
+    }
   } else if (!merge.ok) {
     log(`pull: merge of docmost -> main failed: ${merge.output}`);
   }
@@ -459,7 +539,7 @@ export async function applyPullActions(
     deleted,
     failed,
     committed,
-    merge,
+    merge: mergeResult,
     conflictedPaths,
   };
 }

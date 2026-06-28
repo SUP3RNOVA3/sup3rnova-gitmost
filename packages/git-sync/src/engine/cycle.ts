@@ -1,4 +1,4 @@
-import { VaultGit } from "./git.js";
+import { VaultGit, DEFAULT_BRANCH } from "./git.js";
 import { GitSyncClient } from "./client.types.js";
 import { Settings } from "./settings.js";
 import { readExisting, computePullActions, applyPullActions } from "./pull.js";
@@ -142,67 +142,87 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
     }
   }
 
-  // 3. Pull writes happen on `docmost`; be on it BEFORE applying (see docstring).
-  await vault.ensureBranch("docmost", "main");
-  await vault.checkout("docmost");
+  try {
+    // 3. Pull writes happen on `docmost`; be on it BEFORE applying (see docstring).
+    await vault.ensureBranch("docmost", "main");
+    await vault.checkout("docmost");
 
-  // 4. PULL --------------------------------------------------------------------
-  const existing = await readExisting({
-    listTracked: () => vault.listTrackedFiles("*.md"),
-    readFile: (relPath) => safeFs.readFile(abs(relPath)),
-  });
+    // 4. PULL ------------------------------------------------------------------
+    const existing = await readExisting({
+      listTracked: () => vault.listTrackedFiles("*.md"),
+      readFile: (relPath) => safeFs.readFile(abs(relPath)),
+    });
 
-  const tree = await client.listSpaceTree(spaceId);
-  const pullActions = computePullActions({
-    pages: tree.pages,
-    treeComplete: tree.complete,
-    existing,
-  });
+    const tree = await client.listSpaceTree(spaceId);
+    const pullActions = computePullActions({
+      pages: tree.pages,
+      treeComplete: tree.complete,
+      existing,
+    });
 
-  // Bail before the first destructive write phase if the lock was lost.
-  signal?.throwIfAborted();
+    // Bail before the first destructive write phase if the lock was lost.
+    signal?.throwIfAborted();
 
-  const pullResult = await applyPullActions(
-    {
-      client,
+    const pullResult = await applyPullActions(
+      {
+        client,
+        git: vault,
+        writeFile: (absPath, text) => safeFs.writeFile(absPath, text),
+        mkdir: (absDir) => safeFs.mkdir(absDir),
+        rm: (absPath) => safeFs.rm(absPath),
+        log,
+      },
+      pullActions,
+      vaultRoot,
+    );
+
+    // 5. PUSH ------------------------------------------------------------------
+    const pushDeps = {
+      settings,
       git: vault,
-      writeFile: (absPath, text) => safeFs.writeFile(absPath, text),
-      mkdir: (absDir) => safeFs.mkdir(absDir),
-      rm: (absPath) => safeFs.rm(absPath),
+      makeClient: () => client,
+      readFile: (relPath: string) => safeFs.readFile(abs(relPath)),
+      writeFile: (relPath: string, text: string) =>
+        safeFs.writeFile(abs(relPath), text),
       log,
-    },
-    pullActions,
-    vaultRoot,
-  );
+    };
 
-  // 5. PUSH --------------------------------------------------------------------
-  const pushDeps = {
-    settings,
-    git: vault,
-    makeClient: () => client,
-    readFile: (relPath: string) => safeFs.readFile(abs(relPath)),
-    writeFile: (relPath: string, text: string) => safeFs.writeFile(abs(relPath), text),
-    log,
-  };
+    // Bail before pushing to Docmost if the lock was lost during pull.
+    signal?.throwIfAborted();
 
-  // Bail before pushing to Docmost if the lock was lost during pull.
-  signal?.throwIfAborted();
+    const pushResult = await runPush(pushDeps, { dryRun: false });
 
-  const pushResult = await runPush(pushDeps, { dryRun: false });
-
-  return {
-    ran: true,
-    pull: {
-      written: pullResult.written,
-      deleted: pullResult.deleted,
-      conflict: pullResult.merge.conflict,
-    },
-    push: {
-      mode: pushResult.mode,
-      failures: pushResult.failures?.length ?? 0,
-    },
-    // Forward a divergent-`docmost` escalation so the caller can act on the §5
-    // invariant breach without scraping logs (red-team #15).
-    divergentDocmost: pushResult.divergentDocmost ?? false,
-  };
+    return {
+      ran: true,
+      pull: {
+        written: pullResult.written,
+        deleted: pullResult.deleted,
+        conflict: pullResult.merge.conflict,
+      },
+      push: {
+        mode: pushResult.mode,
+        failures: pushResult.failures?.length ?? 0,
+      },
+      // Forward a divergent-`docmost` escalation so the caller can act on the §5
+      // invariant breach without scraping logs (red-team #15).
+      divergentDocmost: pushResult.divergentDocmost ?? false,
+    };
+  } finally {
+    // STABLE SERVED HEAD (bug #3). The pull transiently checks out the read-only
+    // `docmost` mirror, and the smart-HTTP host advertises whatever HEAD resolves
+    // to — so a clone racing a cycle could default to `docmost`. The happy path
+    // already ends on `main` (runPush), but a throw mid-pull would leave HEAD on
+    // `docmost`; restore it here so the advertised default branch is `main` BETWEEN
+    // cycles. Best-effort: skipped if the lock was lost (do not write the working
+    // tree after a possible takeover), and a failing checkout (e.g. a dirty tree
+    // from an aborted write) is swallowed — the next cycle's recovery resyncs and
+    // the read advertisement pins HEAD under the lock regardless.
+    if (!signal?.aborted) {
+      try {
+        await vault.checkout(DEFAULT_BRANCH);
+      } catch {
+        /* best-effort: next cycle recovers; advertisement pins HEAD under lock */
+      }
+    }
+  }
 }

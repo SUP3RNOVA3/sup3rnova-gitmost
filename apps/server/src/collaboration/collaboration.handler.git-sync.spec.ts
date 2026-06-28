@@ -147,6 +147,86 @@ describe('CollaborationHandler.gitSyncWriteBody (owner-routed body write)', () =
     ]);
   });
 
+  it('FLUSHES the pending debounced store BEFORE merging so an in-flight edit survives (finding #2)', async () => {
+    // QA #119 finding #2: the 3-way merge must run against the latest live-doc
+    // state. A concurrent UI edit that is still in-flight (the store is debounced)
+    // must be drained into the live doc BEFORE git merges, or git clean-applies and
+    // the edit is silently dropped — even on a DIFFERENT block. Model the drain via
+    // the pending-store flush: when it runs, the in-flight block-0 edit lands.
+    const shared = new Y.Doc();
+    const frag = shared.getXmlFragment('default');
+    shared.transact(() => {
+      frag.insert(
+        0,
+        [
+          { text: 'alpha', id: 'p1' },
+          { text: 'beta', id: 'p2' },
+        ].map((s) => {
+          const el = new Y.XmlElement('paragraph');
+          el.setAttribute('id', s.id);
+          const t = new Y.XmlText();
+          t.insert(0, s.text);
+          el.insert(0, [t]);
+          return el;
+        }),
+      );
+    });
+
+    const order: string[] = [];
+    const debouncer = {
+      isDebounced: jest.fn(() => true),
+      executeNow: jest.fn(async () => {
+        order.push('flush');
+        // The in-flight client edit to block 0 only lands once the pending store
+        // is flushed (i.e. the event loop is drained) — BEFORE the merge.
+        shared.transact(() =>
+          ((frag.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(5, ' EDIT'),
+        );
+      }),
+    };
+    const openDirectConnection = jest.fn(async () => ({
+      transact: async (fn: (doc: Y.Doc) => void) => {
+        order.push('merge');
+        fn(shared);
+      },
+      disconnect: jest.fn(async () => undefined),
+    }));
+    const hocuspocus = { openDirectConnection, debouncer } as any;
+
+    const handler = new CollaborationHandler();
+    await handler.getHandlers(hocuspocus).gitSyncWriteBody('page.x', {
+      prosemirrorJson: pmDoc('alpha', 'beta2'), // git changes block 1
+      baseProsemirrorJson: pmDoc('alpha', 'beta'),
+      userId: 'svc-user',
+    });
+
+    // The flush ran, and it ran BEFORE the merge transaction.
+    expect(debouncer.executeNow).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(['flush', 'merge']);
+    // Both the in-flight block-0 edit and git's block-1 change survive — the
+    // pre-flush bug would have produced ['alpha', 'beta2'] (UI edit dropped).
+    expect(texts(shared.getXmlFragment('default'))).toEqual([
+      'alpha EDIT',
+      'beta2',
+    ]);
+  });
+
+  it('does not flush when no store is pending (isDebounced false)', async () => {
+    const { hocuspocus, shared } = fakeHocuspocus([{ text: 'a', id: 'p1' }]);
+    const executeNow = jest.fn();
+    (hocuspocus as any).debouncer = {
+      isDebounced: jest.fn(() => false),
+      executeNow,
+    };
+    const handler = new CollaborationHandler();
+    await handler.getHandlers(hocuspocus).gitSyncWriteBody('page.x', {
+      prosemirrorJson: pmDoc('a', 'b'),
+      userId: 'svc-user',
+    });
+    expect(executeNow).not.toHaveBeenCalled();
+    expect(texts(shared.getXmlFragment('default'))).toEqual(['a', 'b']);
+  });
+
   it('crash-safe: a transform failure never opens the connection or mutates the live doc', async () => {
     const { hocuspocus, shared } = fakeHocuspocus([{ text: 'alpha', id: 'p1' }]);
     const before = texts(shared.getXmlFragment('default'));

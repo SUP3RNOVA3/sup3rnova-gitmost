@@ -152,8 +152,18 @@ describe('git-sync callout type fidelity (QA "callout type -> [!info]")', () => 
     });
   }
 
+  it('maps a known GitHub/Obsidian alias to the editor banner (tip -> success)', async () => {
+    // `tip` is not a schema callout type — it is an input alias the editor itself
+    // maps onto the supported set (GITHUB_ALERT_TYPE_MAP: tip -> success). git-sync
+    // mirrors that so the ingest lands on the closest banner instead of flatly info.
+    const content = editorPage('tip');
+    const gitContent = await gitRoundTrip(content);
+    const co = gitContent.find((b: any) => b.type === 'callout');
+    expect(co?.attrs?.type).toBe('success');
+  });
+
   it('flattens a genuinely unknown callout type to info', async () => {
-    const content = editorPage('tip'); // not an editor-canonical type
+    const content = editorPage('banana'); // not a type and not a known alias
     const gitContent = await gitRoundTrip(content);
     const co = gitContent.find((b: any) => b.type === 'callout');
     expect(co?.attrs?.type).toBe('info');

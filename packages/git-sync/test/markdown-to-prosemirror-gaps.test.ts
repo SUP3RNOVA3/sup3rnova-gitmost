@@ -307,22 +307,32 @@ describe('import: highlight/textStyle color sanitization (parseHTML)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Spec 2. Importing an unsupported callout fence clamps the type to 'info'.
+// Spec 2. Importing a non-schema callout fence resolves the type via the editor's
+// alias map (known GitHub/Obsidian aliases) or clamps to 'info' (unknown).
 //
-// preprocessCallouts emits div[data-type=callout][data-callout-type=tip]; the
-// schema's Callout.type parseHTML pipes 'tip' through clampCalloutType, which
-// maps the unknown type to the 'info' default. End-to-end import-side clamp.
+// preprocessCallouts emits div[data-type=callout][data-callout-type=<type>]; the
+// schema's Callout.type parseHTML pipes it through clampCalloutType. A known alias
+// (`tip`) maps to the editor's banner (`success`); a genuinely unknown type
+// (`banana`) clamps to the 'info' default. End-to-end import-side resolution.
 // ---------------------------------------------------------------------------
-describe('import: unsupported callout fence clamps type to info', () => {
-  it("imports ':::tip' as a callout whose attrs.type === 'info'", async () => {
+describe('import: non-schema callout fence resolves via alias map / clamps to info', () => {
+  it("imports ':::tip' as a callout whose attrs.type === 'success' (alias)", async () => {
     const doc = await markdownToProseMirror(':::tip\nhello\n:::');
     const callouts = findAll(doc, 'callout');
     expect(callouts).toHaveLength(1);
-    expect(callouts[0].attrs.type).toBe('info');
+    expect(callouts[0].attrs.type).toBe('success');
     // The body paragraph survived inside the callout.
     expect(allText(callouts[0])).toContain('hello');
     const paras = findAll(callouts[0], 'paragraph');
     expect(paras.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("imports ':::banana' (unknown) as a callout whose attrs.type === 'info'", async () => {
+    const doc = await markdownToProseMirror(':::banana\nhello\n:::');
+    const callouts = findAll(doc, 'callout');
+    expect(callouts).toHaveLength(1);
+    expect(callouts[0].attrs.type).toBe('info');
+    expect(allText(callouts[0])).toContain('hello');
   });
 });
 

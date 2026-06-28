@@ -59,12 +59,43 @@ function getStyleProperty(element: HTMLElement, propertyName: string): string | 
  * `[!note]` / `[!default]` callout authored in the editor would come back as
  * `[!info]` after a git sync (the QA "callout type -> [!info]" fidelity loss).
  * `note` and `default` were previously absent and so were being flattened.
+ *
+ * The editor SCHEMA genuinely only supports these six banner types — there is no
+ * `tip`/`caution`/`important`/`question` callout node. So those are NOT first-
+ * class types we can round-trip literally; they are INPUT ALIASES (GitHub/Obsidian
+ * alert syntax). The editor's own paste/import path maps them onto the supported
+ * set (see `GITHUB_ALERT_TYPE_MAP` in
+ * `@docmost/editor-ext` markdown/utils/github-callout.marked.ts:
+ * tip -> success, caution -> danger, important -> info). We mirror that aliasing
+ * here so an ingested `> [!tip]` / `> [!caution]` lands on the closest real banner
+ * (success / danger) instead of flatly collapsing to `info` — matching exactly how
+ * the editor itself would interpret the same alias. A schema type always maps to
+ * itself first (idempotent round-trip); the alias map only rewrites NON-schema
+ * names; anything still unknown falls back to `info`.
  */
 const CALLOUT_TYPES = ["default", "info", "note", "success", "warning", "danger"];
-export const clampCalloutType = (value: string | null | undefined): string =>
-  value && CALLOUT_TYPES.includes(value.toLowerCase())
-    ? value.toLowerCase()
-    : "info";
+/**
+ * NON-schema callout aliases -> their closest supported banner. Mirrors the
+ * editor's `GITHUB_ALERT_TYPE_MAP` for the names that are NOT already schema
+ * types (a schema type is preserved as-is and never consulted here). Keeping
+ * these in lockstep means git-sync ingest and an editor paste interpret the same
+ * `> [!alias]` identically.
+ */
+const CALLOUT_TYPE_ALIASES: Record<string, string> = {
+  tip: "success",
+  caution: "danger",
+  important: "info",
+};
+export const clampCalloutType = (value: string | null | undefined): string => {
+  if (!value) return "info";
+  const lower = value.toLowerCase();
+  // A real schema type round-trips to itself (idempotent).
+  if (CALLOUT_TYPES.includes(lower)) return lower;
+  // A known GitHub/Obsidian alias maps to the editor's closest banner.
+  if (CALLOUT_TYPE_ALIASES[lower]) return CALLOUT_TYPE_ALIASES[lower];
+  // Anything else is collapsed to the safe default (matches the editor).
+  return "info";
+};
 
 /**
  * Allowlist guard for CSS color values imported from HTML.
