@@ -274,21 +274,30 @@ export class PersistenceExtension implements Extension {
             //this.logger.debug('Contributors error:' + err?.['message']);
           }
 
-          // Approach A — boundary snapshot before the agent's first edit.
-          // When this store is the agent's and the page's currently persisted
-          // state was authored by a human, pin that human state as its own
-          // history version BEFORE the agent overwrites it. `page` still holds
-          // the OLD content/provenance here, so saveHistory(page) captures the
-          // pre-agent state tagged 'user'. The agent's new content is
-          // snapshotted later by the debounced PAGE_HISTORY job ('agent'). Skip
-          // if the prior state is already agent-authored (boundary already
-          // pinned on the user->agent transition), if the page is effectively
-          // empty, or if the latest existing snapshot already equals this human
-          // state (avoid duplicates).
-          if (
-            lastUpdatedSource === 'agent' &&
-            page.lastUpdatedSource !== 'agent'
-          ) {
+          // Approach A — boundary snapshot before a MACHINE write overwrites a
+          // human (or other-source) baseline. When this store is from a machine
+          // source — the AGENT or GIT-SYNC — and the page's currently persisted
+          // state was authored by a DIFFERENT source, pin that prior state as its
+          // own history version BEFORE the machine write overwrites it. `page`
+          // still holds the OLD content/provenance here, so saveHistory(page)
+          // captures the pre-write state. The machine's new content is snapshotted
+          // later by the debounced PAGE_HISTORY job.
+          //
+          // For GIT-SYNC this is the OBSERVABLE-LOSS guard (SPEC §9 conflict
+          // contract): a git-sync body write is a block-level 3-way merge whose
+          // same-block rule is "git wins". Without this pin, a concurrent human
+          // edit to a block git also changed would be overwritten with NO trace.
+          // Pinning the pre-merge state here means the human's content is always
+          // RECOVERABLE via page history rather than silently lost — git still
+          // wins the live doc deterministically, but nothing is destroyed.
+          //
+          // Skip if the prior state was already authored by THIS machine source
+          // (boundary already pinned on the transition into it), if the page is
+          // effectively empty, or if the latest existing snapshot already equals
+          // the prior state (avoid duplicates).
+          const isMachineWrite =
+            lastUpdatedSource === 'agent' || lastUpdatedSource === 'git-sync';
+          if (isMachineWrite && page.lastUpdatedSource !== lastUpdatedSource) {
             const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
               pageId,
               { includeContent: true, trx },

@@ -162,6 +162,10 @@ describe('VaultGit (integration; temp repo)', () => {
     expect(await localConfig('commit.gpgsign')).toBe('false');
     expect(await localConfig('core.safecrlf')).toBe('false');
     expect(await localConfig('core.attributesFile')).toBe('/dev/null');
+    // merge.conflictStyle=merge keeps conflict markers to the canonical three
+    // (no diff3 `|||||||` base section) regardless of the operator's global
+    // config (bug #2 marker-leak determinism, SPEC §9).
+    expect(await localConfig('merge.conflictStyle')).toBe('merge');
 
     // Idempotent: a second run leaves the same single values (no duplicates).
     await git.ensureRepo();

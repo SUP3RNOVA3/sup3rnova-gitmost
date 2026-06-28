@@ -3,7 +3,7 @@ import { getSchema } from '@tiptap/core';
 import type { Schema } from '@tiptap/pm/model';
 
 import { tiptapExtensions } from '../collaboration.util';
-import { diff3Plan } from './three-way-merge';
+import { diff3PlanWithConflicts } from './three-way-merge';
 import { buildLcsTable } from './lcs';
 
 /**
@@ -295,6 +295,20 @@ export function mergeXmlFragments(
   return applied;
 }
 
+/** Outcome of a 3-way block merge: ops applied + same-block conflict count. */
+export interface Merge3WayResult {
+  /** Number of block insert/delete operations spliced into `live`. */
+  applied: number;
+  /**
+   * Regions where the human AND git rewrote the SAME base block. The rule is
+   * deterministic (GIT WINS the region), so the human's version of those blocks
+   * is dropped from the live doc. `conflicts > 0` is the OBSERVABLE signal the
+   * caller uses to LOG the loss and pin the human baseline to page history (so it
+   * is recoverable), instead of the edit vanishing silently.
+   */
+  conflicts: number;
+}
+
 /**
  * THREE-WAY block merge: reconcile `live` toward `target` using `base` (the
  * last-synced common ancestor) so a block only the human changed is KEPT and a
@@ -305,20 +319,40 @@ export function mergeXmlFragments(
  * target); we materialize that as a virtual target fragment and reuse the 2-way
  * `mergeXmlFragments` to splice it into `live` minimally (so untouched live block
  * instances — and their in-flight edits — stay put). MUST be called inside a Yjs
- * transaction. Returns the number of block operations applied.
+ * transaction. Returns the number of block operations applied. (Use
+ * `mergeXmlFragments3WayWithStats` when the SAME-BLOCK conflict count is needed.)
  */
 export function mergeXmlFragments3Way(
   live: Y.XmlFragment,
   target: Y.XmlFragment,
   base: Y.XmlFragment,
 ): number {
+  return mergeXmlFragments3WayWithStats(live, target, base).applied;
+}
+
+/**
+ * As `mergeXmlFragments3Way`, but also returns the SAME-BLOCK conflict count so
+ * the caller can make a "git won a concurrent same-block edit" event OBSERVABLE
+ * (the documented conflict contract: git wins deterministically, but the losing
+ * human content is never destroyed silently — it is logged and recoverable via
+ * page history).
+ */
+export function mergeXmlFragments3WayWithStats(
+  live: Y.XmlFragment,
+  target: Y.XmlFragment,
+  base: Y.XmlFragment,
+): Merge3WayResult {
   const liveKids = live.toArray();
   const targetKids = target.toArray();
   const liveKeys = liveKids.map(key);
   const targetKeys = targetKids.map(key);
   const baseKeys = base.toArray().map(key);
 
-  const plan = diff3Plan(baseKeys, liveKeys, targetKeys);
+  const { picks: plan, conflicts } = diff3PlanWithConflicts(
+    baseKeys,
+    liveKeys,
+    targetKeys,
+  );
 
   // Build the merged block sequence in a throwaway doc, cloning from whichever
   // side each pick came from, then 2-way merge it back into the live fragment.
@@ -331,5 +365,5 @@ export function mergeXmlFragments3Way(
   );
   if (nodes.length) mergedFrag.insert(0, nodes);
 
-  return mergeXmlFragments(live, mergedFrag);
+  return { applied: mergeXmlFragments(live, mergedFrag), conflicts };
 }

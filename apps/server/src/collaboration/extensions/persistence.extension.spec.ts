@@ -170,12 +170,27 @@ describe('PersistenceExtension.onStoreDocument — provenance precedence (#2)', 
     expect(sourceOf(pageRepo)).toBe('agent');
   });
 
-  // --- negative: a git-sync store must NOT pin a boundary history snapshot ----
-  // The boundary-snapshot branch only fires when the resolved source is 'agent'
-  // AND the prior persisted source is not 'agent'. A git-sync store resolves to
-  // 'git-sync', so saveHistory must NOT be called.
-  it('does NOT write a boundary history snapshot for a git-sync store', async () => {
+  // --- boundary snapshot for a git-sync store over a HUMAN baseline -----------
+  // SPEC §9 observable-loss guard (bug #2): a git-sync body write is a block-level
+  // 3-way merge whose same-block rule is "git wins". To keep a concurrent human
+  // edit RECOVERABLE rather than silently overwritten, a git-sync store over a
+  // prior NON-git-sync baseline pins that prior state to page history first —
+  // exactly like the agent path. So saveHistory MUST be called here.
+  it('DOES pin a boundary snapshot for a git-sync store over a prior human state', async () => {
     const { ext, pageHistoryRepo } = build({ lastUpdatedSource: 'user' });
+
+    await ext.onStoreDocument(
+      makeStorePayload({ user: { id: 'svc-user' }, actor: 'git-sync' }),
+    );
+
+    expect(pageHistoryRepo.saveHistory).toHaveBeenCalledTimes(1);
+  });
+
+  // --- negative: a git-sync store over a git-sync baseline does NOT re-pin -----
+  // The boundary is pinned once on the transition INTO git-sync; a subsequent
+  // git-sync store over an already-git-sync baseline must not churn history.
+  it('does NOT re-pin a boundary snapshot for a git-sync store over a git-sync baseline', async () => {
+    const { ext, pageHistoryRepo } = build({ lastUpdatedSource: 'git-sync' });
 
     await ext.onStoreDocument(
       makeStorePayload({ user: { id: 'svc-user' }, actor: 'git-sync' }),

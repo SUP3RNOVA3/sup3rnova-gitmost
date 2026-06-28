@@ -10,7 +10,7 @@ import * as Y from 'yjs';
 import { User } from '@docmost/db/types/entity.types';
 import {
   mergeXmlFragments,
-  mergeXmlFragments3Way,
+  mergeXmlFragments3WayWithStats,
 } from './merge/yjs-body-merge';
 
 export type CollabEventHandlers = ReturnType<
@@ -168,11 +168,24 @@ export class CollaborationHandler {
             const liveFrag = doc.getXmlFragment('default');
             const targetFrag = targetDoc.getXmlFragment('default');
             if (baseDoc) {
-              mergeXmlFragments3Way(
+              const { conflicts } = mergeXmlFragments3WayWithStats(
                 liveFrag,
                 targetFrag,
                 baseDoc.getXmlFragment('default'),
               );
+              // SAME-BLOCK conflict contract (SPEC §9): a block both the human
+              // and git changed resolves to GIT (deterministic). Make that
+              // OBSERVABLE rather than silent — log it. The losing human content
+              // is NOT destroyed: the persistence extension's boundary snapshot
+              // pins the pre-merge page state to history on this user->git-sync
+              // transition, so it stays recoverable.
+              if (conflicts > 0) {
+                this.logger.warn(
+                  `git-sync merge for ${documentName}: ${conflicts} same-block ` +
+                    `conflict(s) resolved to the git version; the prior page ` +
+                    `state is preserved in page history (recoverable).`,
+                );
+              }
             } else {
               mergeXmlFragments(liveFrag, targetFrag);
             }

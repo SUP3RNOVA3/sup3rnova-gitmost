@@ -3,6 +3,7 @@ import * as Y from 'yjs';
 import {
   mergeXmlFragments,
   mergeXmlFragments3Way,
+  mergeXmlFragments3WayWithStats,
   cloneXmlNode,
   diffBlocks,
 } from './yjs-body-merge';
@@ -177,6 +178,40 @@ describe('yjs-body-merge', () => {
         mergeXmlFragments3Way(liveFrag, targetFrag, baseFrag),
       );
       expect(texts(liveFrag)).toEqual(['a', 'GIT', 'c']);
+    });
+
+    // Bug #2 observability: the stats variant reports the same-block conflict so
+    // the handler can log it + the persistence layer can pin the human baseline.
+    it('reports the same-block conflict count via mergeXmlFragments3WayWithStats', () => {
+      const base = new Y.Doc();
+      const live = new Y.Doc();
+      const target = new Y.Doc();
+      const baseFrag = buildFragment(base, ['a', 'b', 'c']);
+      const liveFrag = buildFragment(live, ['a', 'HUMAN', 'c']);
+      const targetFrag = buildFragment(target, ['a', 'GIT', 'c']);
+
+      let result!: { applied: number; conflicts: number };
+      live.transact(() => {
+        result = mergeXmlFragments3WayWithStats(liveFrag, targetFrag, baseFrag);
+      });
+      expect(result.conflicts).toBe(1);
+      expect(texts(liveFrag)).toEqual(['a', 'GIT', 'c']);
+    });
+
+    it('reports 0 conflicts for a clean different-block 3-way merge', () => {
+      const base = new Y.Doc();
+      const live = new Y.Doc();
+      const target = new Y.Doc();
+      const baseFrag = buildFragment(base, ['a', 'b', 'c']);
+      const liveFrag = buildFragment(live, ['HUMAN', 'b', 'c']);
+      const targetFrag = buildFragment(target, ['a', 'b', 'GIT']);
+
+      let result!: { applied: number; conflicts: number };
+      live.transact(() => {
+        result = mergeXmlFragments3WayWithStats(liveFrag, targetFrag, baseFrag);
+      });
+      expect(result.conflicts).toBe(0);
+      expect(texts(liveFrag)).toEqual(['HUMAN', 'b', 'GIT']);
     });
 
     it('git change with no concurrent human edit (live == base) applies cleanly', () => {

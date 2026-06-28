@@ -145,6 +145,79 @@ describe('#13 conflict markers reach Docmost', () => {
     expect(pushedBody).toContain('their line');
   });
 
+  it('autoMergeConflicts on: rewrites the vault file with the CLEAN body so raw markers do not stay in the published vault (bug #2 marker-leak)', async () => {
+    // Previously the UPDATE path stripped markers for the body SENT to Docmost but
+    // left the file on `main` carrying raw `<<<<<<<`/`>>>>>>>` forever — the
+    // published vault external clients clone kept the markers and the page
+    // re-conflicted every cycle. The fix writes the cleaned body back + records it
+    // in writtenBack so runPush commits it on `main`.
+    const { deps, importPageMarkdown } = makeConflictDeps({
+      ...makeSettings(),
+      autoMergeConflicts: true,
+    });
+
+    const res = await runPush(deps, { dryRun: false });
+    expect(res.mode).toBe('apply');
+
+    // The clean body was imported into Docmost (no markers).
+    const pushedBody: string = importPageMarkdown.mock.calls[0][1] as any;
+    expect(pushedBody).not.toMatch(/[<>=]{7}/);
+
+    // The vault file was rewritten with the cleaned content (no raw markers).
+    const writeCalls = (deps.writeFile as any).mock.calls as [string, string][];
+    const docWrite = writeCalls.find(([p]) => p === 'Doc.md');
+    expect(docWrite).toBeDefined();
+    expect(docWrite![1]).not.toMatch(/[<>=]{7}/);
+    expect(docWrite![1]).toContain('my line');
+    expect(docWrite![1]).toContain('their line');
+
+    // It is recorded for the follow-up commit so `main` converges to clean bytes.
+    expect(res.applied?.writtenBack).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'Doc.md', pageId: 'p-1' }),
+      ]),
+    );
+  });
+
+  it('autoMergeConflicts on: strips diff3-style |||||||  base markers + base content (defense-in-depth)', async () => {
+    // A vault created before `merge.conflictStyle=merge` was pinned (or content a
+    // human committed in diff3 style) can carry a `||||||| base` section. The
+    // scrub must drop the `|||||||` marker AND the stale base region, keeping only
+    // the two live sides — otherwise `|||||||` + obsolete base lines leak into the
+    // Docmost page.
+    const diff3Body =
+      '<<<<<<< HEAD\nmy line\n||||||| base\nold base line\n=======\ntheir line\n>>>>>>> feature\n';
+    const file = serializePageFile('p-1', diff3Body);
+    const { git } = makePushGit({ changes: [{ status: 'M', path: 'Doc.md' }] });
+    const importPageMarkdown = vi.fn(async () => ({ success: true }));
+    const client = {
+      listSpaceTree: vi.fn(async () => ({ pages: [], complete: true })),
+      importPageMarkdown,
+      createPage: vi.fn(),
+      deletePage: vi.fn(),
+      movePage: vi.fn(),
+      renamePage: vi.fn(),
+    };
+    const deps: PushDeps = {
+      settings: { ...makeSettings(), autoMergeConflicts: true },
+      git,
+      makeClient: () => client as any,
+      readFile: vi.fn(async (p: string) => {
+        if (p === 'Doc.md') return file;
+        throw new Error(`no such file: ${p}`);
+      }),
+      writeFile: vi.fn(async () => {}),
+      log: () => {},
+    };
+
+    await runPush(deps, { dryRun: false });
+    const pushedBody: string = importPageMarkdown.mock.calls[0][1] as any;
+    expect(pushedBody).not.toContain('|||||||');
+    expect(pushedBody).not.toContain('old base line'); // stale base dropped
+    expect(pushedBody).toContain('my line');
+    expect(pushedBody).toContain('their line');
+  });
+
   it('CREATE branch (autoMergeConflicts off): does NOT create a page from a conflicted NEW file; records a create failure', async () => {
     // The conflict-markers guard is DUPLICATED on the CREATE path (a brand-new
     // .md with NO gitmost_id, status 'A') and was previously untested — only the

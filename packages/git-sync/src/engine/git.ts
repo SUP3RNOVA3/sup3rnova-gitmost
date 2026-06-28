@@ -220,6 +220,13 @@ export class VaultGit {
     //     that core.autocrlf=false does not cover). POSIX-only path, which is
     //     fine: the daemon runs on Linux (Docker) / macOS. A system
     //     /etc/gitattributes remains the host admin's domain (out of scope).
+    //   - merge.conflictStyle=merge — CRITICAL (SPEC §9, conflict-marker leak):
+    //     a global `merge.conflictStyle=diff3`/`zdiff3` makes a conflicting merge
+    //     emit an EXTRA `|||||||` base-marker section. The conflict-marker
+    //     scrub on the push side (`stripConflictMarkers`) handles `|||||||` too,
+    //     but pinning the classic `merge` style keeps the markers the engine
+    //     produces to the canonical three (`<<<<<<<`/`=======`/`>>>>>>>`) so
+    //     behavior is deterministic regardless of the operator's global config.
     // NOTE: these stay PERSISTED LOCAL config (not `-c` flags) on purpose — a
     // human running git by hand in the vault must inherit the same neutralized
     // behavior; a transient `-c` would not persist. (core.quotepath, by
@@ -230,6 +237,7 @@ export class VaultGit {
       await this.run(["config", "core.safecrlf", "false"]);
       await this.run(["config", "commit.gpgsign", "false"]);
       await this.run(["config", "core.attributesFile", "/dev/null"]);
+      await this.run(["config", "merge.conflictStyle", "merge"]);
     } catch (err: unknown) {
       const detail = err instanceof Error ? err.message : String(err);
       throw new Error(

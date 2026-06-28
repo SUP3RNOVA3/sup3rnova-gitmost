@@ -184,14 +184,45 @@ export interface Pick {
 }
 
 /**
+ * The merged block order PLUS how many regions resolved as a genuine SAME-BLOCK
+ * conflict (both sides rewrote the same base block — `tryMergeRegion` returned
+ * null and git won the whole region, so the live/human version of those blocks
+ * is NOT in `picks`). `conflicts > 0` is the OBSERVABLE signal the caller uses to
+ * surface "git won a concurrent same-block edit" (log it + pin the human
+ * baseline to page history) instead of dropping the human side silently.
+ */
+export interface Diff3Result {
+  picks: Pick[];
+  conflicts: number;
+}
+
+/**
  * Three-way merge of base `o`, live `a`, target `b` (arrays of block keys).
- * Returns the merged block order as picks from live/target.
+ * Returns the merged block order as picks from live/target. Thin wrapper over
+ * `diff3PlanWithConflicts` (kept for the existing pure-array callers/tests).
  */
 export function diff3Plan(o: string[], a: string[], b: string[]): Pick[] {
+  return diff3PlanWithConflicts(o, a, b).picks;
+}
+
+/**
+ * Like `diff3Plan` but also reports the SAME-BLOCK conflict count (see
+ * `Diff3Result`). A region where both the human and git rewrote the same base
+ * block cannot be merged automatically; the rule is deterministic — GIT WINS the
+ * whole region — but the human's version of those blocks is then absent from the
+ * picks, so we count it so the caller can make the loss observable/recoverable
+ * rather than silent (the documented conflict contract).
+ */
+export function diff3PlanWithConflicts(
+  o: string[],
+  a: string[],
+  b: string[],
+): Diff3Result {
   const oToA = matchMap(lcsPairs(o, a));
   const oToB = matchMap(lcsPairs(o, b));
 
   const res: Pick[] = [];
+  let conflicts = 0;
   let oi = 0;
   let ai = 0;
   let bi = 0;
@@ -223,6 +254,10 @@ export function diff3Plan(o: string[], a: string[], b: string[]): Pick[] {
         );
       }
     } else {
+      // SAME-BLOCK CONFLICT: count it ONLY when the human side actually had
+      // content in this region that git's win discards (live region non-empty).
+      // A region only git rewrote (live region empty) is not a human loss.
+      if (aEnd > ai) conflicts++;
       for (let k = bi; k < bEnd; k++) res.push({ src: 'target', index: k });
     }
 
@@ -235,5 +270,5 @@ export function diff3Plan(o: string[], a: string[], b: string[]): Pick[] {
     oi = anchor + 1;
   }
 
-  return res;
+  return { picks: res, conflicts };
 }

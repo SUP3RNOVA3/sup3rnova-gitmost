@@ -22,6 +22,11 @@ import { EnvironmentService } from '../../environment/environment.service';
 import { GitmostDataSourceService } from './gitmost-datasource.service';
 import { VaultRegistryService } from './vault-registry.service';
 import { SpaceLockService } from './space-lock.service';
+import {
+  GIT_SYNC_PUSH_LOCK_RETRY_BASE_MS,
+  GIT_SYNC_PUSH_LOCK_RETRY_MAX_MS,
+  GIT_SYNC_PUSH_LOCK_RETRY_TOTAL_MS,
+} from '../git-sync.constants';
 
 /** A space the poll loop should reconcile: its id + the workspace it lives in. */
 interface EnabledSpace {
@@ -244,7 +249,9 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     }
     const serviceUserId = this.environmentService.getGitSyncServiceUserId();
 
-    const result = await this.spaceLock.withSpaceLock(spaceId, async (signal) => {
+    const result = await this.spaceLock.withSpaceLock(
+      spaceId,
+      async (signal) => {
       // 1) Stream the receive-pack to the client (durable commits land on main).
       // Pass the lost-lock signal so the receive-pack child is killed if the lock
       // lapses mid-write (no concurrent working-tree writer across replicas).
@@ -273,7 +280,23 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
         );
       }
       return;
-    });
+      },
+      // BOUNDED retry-acquire (push path only): a push that briefly overlaps a
+      // poll cycle waits a moment (capped backoff up to the budget) instead of
+      // immediately 503-ing — the cycle releases the lock in well under a second
+      // for most spaces, so this turns a transient overlap into a SUCCESS rather
+      // than a spurious failure. A genuinely long/stuck cycle still skips after
+      // the bound -> GitSyncLockHeldError -> 503, and git retries the whole push
+      // (the receive-pack only runs once the lock is held, so there is never a
+      // half-applied ref on a 503).
+      {
+        acquireRetry: {
+          timeoutMs: GIT_SYNC_PUSH_LOCK_RETRY_TOTAL_MS,
+          baseMs: GIT_SYNC_PUSH_LOCK_RETRY_BASE_MS,
+          maxMs: GIT_SYNC_PUSH_LOCK_RETRY_MAX_MS,
+        },
+      },
+    );
 
     // The lock was held (in-progress or another replica) — surface to the caller
     // so the HTTP handler can answer 503 and let git retry.

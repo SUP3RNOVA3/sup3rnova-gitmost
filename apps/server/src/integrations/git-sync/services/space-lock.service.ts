@@ -120,41 +120,57 @@ export class SpaceLockService {
   }
 
   /**
-   * Run `fn` under the per-space lock: the in-process mutex (no overlapping
-   * cycles on this instance) AND the Redis leader lock (single writer across
-   * replicas). Returns `fn`'s result, or a skip sentinel when the lock could not
-   * be acquired — `{ skipped: 'in-progress' }` (this instance is mid-cycle) or
-   * `{ skipped: 'lock-held' }` (another replica holds the Redis lock). The mutex
-   * + Redis lock are always released in a `finally`, even when `fn` throws (the
-   * throw propagates to the caller). This is the single reusable wrapper shared
-   * by `runOnce` (the poll/admin cycle) and `ingestExternalPush` (a push from a
-   * git client over HTTP) so both serialize against each other identically.
+   * Options for `withSpaceLock`. `acquireRetry` (PUSH path only) bounds a
+   * retry-acquire loop: if the lock cannot be entered on the first try, keep
+   * retrying with a capped exponential backoff until `timeoutMs` elapses before
+   * returning the skip sentinel. The poll cycle holds the lock while it
+   * processes a whole space, so a legitimate external push that briefly overlaps
+   * a cycle should WAIT a moment rather than immediately 503 (bug: ~60% of
+   * pushes 503'd under continuous polling). The poll cycle passes NO retry (it
+   * just skips and the next tick reconciles).
    */
   async withSpaceLock<T>(
     spaceId: string,
     fn: (signal: AbortSignal) => Promise<T>,
+    options?: {
+      acquireRetry?: { timeoutMs: number; baseMs: number; maxMs: number };
+    },
   ): Promise<T | { skipped: 'lock-held' | 'in-progress' }> {
-    if (this.running.has(spaceId)) {
-      return { skipped: 'in-progress' };
-    }
-    // Cross-instance, same-process single-writer guard: another live holder (a
-    // different SpaceLockService in this process) is mid-cycle for this space.
-    // This survives a swallowed heartbeat / Redis TTL lapse, so a second writer
-    // in the process cannot race the working tree — it is rejected 'lock-held'.
-    if (SpaceLockService.liveLocks.has(spaceId)) {
-      return { skipped: 'lock-held' };
-    }
-    // Reserve the in-process slot synchronously (before any await) so two
-    // concurrent same-space calls on THIS instance cannot both pass the guard and
-    // race acquire(). Redis NX is already authoritative across replicas; this just
-    // closes the in-process TOCTOU window. Released in the outer finally on every
-    // path (acquire-failure, fn-throw, normal completion).
-    this.running.add(spaceId);
-    SpaceLockService.liveLocks.set(spaceId, this.instanceId);
-    try {
-      if (!(await this.acquire(spaceId))) {
+    const retry = options?.acquireRetry;
+    // Deadline for the bounded retry-acquire (push path). `Date.now()` once so a
+    // slow first attempt does not over-extend the budget.
+    const deadline = retry ? Date.now() + retry.timeoutMs : 0;
+    let attempt = 0;
+    for (;;) {
+      // Reserve the in-process slot synchronously (before any await) so two
+      // concurrent same-space calls on THIS instance cannot both pass the guard
+      // and race acquire(). On any failure this is released before we retry/skip.
+      const reservation = this.tryReserveInProcess(spaceId);
+      if (reservation) {
+        // Could not even reserve in-process (this instance mid-cycle, or another
+        // live holder in the process). Retry within the bound, else skip.
+        if (retry && Date.now() < deadline) {
+          await this.sleep(this.nextBackoff(attempt++, retry, deadline));
+          continue;
+        }
+        return reservation;
+      }
+      // Reserved in-process — now contend for the Redis leader lock. Release the
+      // in-process slot on EVERY non-running path so a retry/skip leaves no leak.
+      let acquired = false;
+      try {
+        acquired = await this.acquire(spaceId);
+      } finally {
+        if (!acquired) this.releaseInProcess(spaceId);
+      }
+      if (!acquired) {
+        if (retry && Date.now() < deadline) {
+          await this.sleep(this.nextBackoff(attempt++, retry, deadline));
+          continue;
+        }
         return { skipped: 'lock-held' };
       }
+      // Both locks held — run `fn` under the heartbeat, releasing in `finally`.
       // Lost-lock signal: a failed/CAS-missed heartbeat refresh aborts this so the
       // protected fn can stop instead of writing blind after our lock lapsed.
       const controller = new AbortController();
@@ -172,10 +188,64 @@ export class SpaceLockService {
       } finally {
         clearInterval(heartbeat);
         await this.release(spaceId);
+        this.releaseInProcess(spaceId);
       }
-    } finally {
-      this.running.delete(spaceId);
-      SpaceLockService.liveLocks.delete(spaceId);
     }
+  }
+
+  /**
+   * Synchronously try to reserve the in-process single-writer slot for a space.
+   * Returns a skip sentinel when another holder is live (this instance mid-cycle
+   * -> 'in-progress'; another SpaceLockService in this process -> 'lock-held'),
+   * or `null` when the slot was reserved (caller MUST `releaseInProcess` later).
+   * Both checks + the reservation happen with NO await between them so two
+   * concurrent same-space calls cannot both pass.
+   */
+  private tryReserveInProcess(
+    spaceId: string,
+  ): { skipped: 'lock-held' | 'in-progress' } | null {
+    if (this.running.has(spaceId)) {
+      return { skipped: 'in-progress' };
+    }
+    // Cross-instance, same-process single-writer guard: another live holder (a
+    // different SpaceLockService in this process) is mid-cycle for this space.
+    // This survives a swallowed heartbeat / Redis TTL lapse, so a second writer
+    // in the process cannot race the working tree — it is rejected 'lock-held'.
+    if (SpaceLockService.liveLocks.has(spaceId)) {
+      return { skipped: 'lock-held' };
+    }
+    this.running.add(spaceId);
+    SpaceLockService.liveLocks.set(spaceId, this.instanceId);
+    return null;
+  }
+
+  /** Release the in-process single-writer slot reserved by tryReserveInProcess. */
+  private releaseInProcess(spaceId: string): void {
+    this.running.delete(spaceId);
+    SpaceLockService.liveLocks.delete(spaceId);
+  }
+
+  /**
+   * Backoff (ms) before the next push lock-acquire attempt: capped exponential
+   * (`baseMs * 2^attempt`, ceilinged at `maxMs`) clamped so it never overshoots
+   * the retry `deadline`. Deterministic (no jitter) so the bound is testable.
+   */
+  private nextBackoff(
+    attempt: number,
+    retry: { baseMs: number; maxMs: number },
+    deadline: number,
+  ): number {
+    const exp = retry.baseMs * 2 ** attempt;
+    const capped = Math.min(exp, retry.maxMs);
+    const remaining = Math.max(0, deadline - Date.now());
+    return Math.max(0, Math.min(capped, remaining));
+  }
+
+  /** Promise-based delay (extracted so tests can reason about the retry loop). */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const t = setTimeout(resolve, ms);
+      t.unref?.();
+    });
   }
 }

@@ -123,6 +123,65 @@ describe('SpaceLockService', () => {
     });
   });
 
+  // Bug #1 (push 503 starvation): the PUSH path passes a bounded acquireRetry so a
+  // transient overlap with a poll cycle is retried (and succeeds) instead of an
+  // immediate 503. A genuinely stuck lock still skips after the bound. The poll
+  // cycle passes NO retry (immediate skip), so only the push path waits.
+  describe('bounded acquire-retry (push path)', () => {
+    const retry = { timeoutMs: 5_000, baseMs: 100, maxMs: 500 };
+
+    it('retries the acquire and SUCCEEDS when the lock is briefly held then released', async () => {
+      const { service, redis } = build();
+      // First acquire attempt fails (lock briefly held by a cycle), the next
+      // succeeds — the bounded retry must turn this into a SUCCESS, not a skip.
+      redis.set
+        .mockResolvedValueOnce(null) // attempt 1: held
+        .mockResolvedValueOnce(null) // attempt 2: still held
+        .mockResolvedValue('OK'); // attempt 3+: released -> acquired
+      const fn = jest.fn(async () => 'pushed');
+
+      const result = await service.withSpaceLock('space-1', fn, {
+        acquireRetry: retry,
+      });
+
+      expect(result).toBe('pushed');
+      expect(fn).toHaveBeenCalledTimes(1);
+      expect(redis.set.mock.calls.length).toBeGreaterThanOrEqual(3);
+      // The acquired lock is released in finally (DEL-CAS eval).
+      expect(redis.eval).toHaveBeenCalledTimes(1);
+      expect(redis.eval.mock.calls[0][0]).toContain('del');
+    });
+
+    it('still skips (lock-held) after the bound when the lock stays stuck — and never runs fn', async () => {
+      const { service, redis } = build();
+      redis.set.mockResolvedValue(null); // permanently held
+      const fn = jest.fn(async () => 'pushed');
+
+      const result = await service.withSpaceLock('space-1', fn, {
+        acquireRetry: { timeoutMs: 300, baseMs: 50, maxMs: 100 },
+      });
+
+      expect(result).toEqual({ skipped: 'lock-held' });
+      expect(fn).not.toHaveBeenCalled();
+      // It retried more than once before giving up (bound > one interval).
+      expect(redis.set.mock.calls.length).toBeGreaterThan(1);
+      // Never acquired -> never released.
+      expect(redis.eval).not.toHaveBeenCalled();
+    });
+
+    it('without acquireRetry (poll path) a held lock skips IMMEDIATELY (single attempt)', async () => {
+      const { service, redis } = build();
+      redis.set.mockResolvedValue(null);
+      const fn = jest.fn(async () => 'cycle');
+
+      const result = await service.withSpaceLock('space-1', fn);
+
+      expect(result).toEqual({ skipped: 'lock-held' });
+      expect(redis.set).toHaveBeenCalledTimes(1); // no retry
+      expect(fn).not.toHaveBeenCalled();
+    });
+  });
+
   describe('fn throwing', () => {
     it('propagates the throw AND still releases (eval) in finally', async () => {
       const { service, redis } = build();

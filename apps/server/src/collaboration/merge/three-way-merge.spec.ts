@@ -1,4 +1,8 @@
-import { diff3Plan, type Pick } from './three-way-merge';
+import {
+  diff3Plan,
+  diff3PlanWithConflicts,
+  type Pick,
+} from './three-way-merge';
 
 // Materialize a plan into the merged key sequence for assertion.
 function apply(plan: Pick[], live: string[], target: string[]): string[] {
@@ -29,6 +33,49 @@ describe('diff3Plan (block-level three-way merge)', () => {
       'H',
       '3',
     ]);
+  });
+
+  // Bug #2 observability: diff3PlanWithConflicts reports SAME-BLOCK conflicts so
+  // the caller can surface the "git wins" loss (log + history pin) instead of
+  // dropping the human side silently.
+  describe('diff3PlanWithConflicts (same-block conflict reporting)', () => {
+    it('reports 0 conflicts when sides changed DIFFERENT blocks (clean merge)', () => {
+      const r = diff3PlanWithConflicts(
+        ['1', '2', '3'],
+        ['H', '2', '3'],
+        ['1', '2', 'G'],
+      );
+      expect(r.conflicts).toBe(0);
+      expect(apply(r.picks, ['H', '2', '3'], ['1', '2', 'G'])).toEqual([
+        'H',
+        '2',
+        'G',
+      ]);
+    });
+
+    it('reports 1 conflict and git wins when BOTH rewrote the SAME block', () => {
+      const r = diff3PlanWithConflicts(
+        ['1', '2', '3'],
+        ['1', 'H', '3'], // human rewrote block 2
+        ['1', 'G', '3'], // git rewrote block 2
+      );
+      expect(r.conflicts).toBe(1);
+      // Git wins the contested block; the human 'H' is NOT in the picks.
+      expect(apply(r.picks, ['1', 'H', '3'], ['1', 'G', '3'])).toEqual([
+        '1',
+        'G',
+        '3',
+      ]);
+    });
+
+    it('does NOT count a git-only region (no human content to lose) as a conflict', () => {
+      const r = diff3PlanWithConflicts(
+        ['1', '2', '3'],
+        ['1', '2', '3'], // human unchanged
+        ['1', '9', '3'], // git rewrote block 2
+      );
+      expect(r.conflicts).toBe(0);
+    });
   });
 
   it('human and git changed DIFFERENT blocks -> both preserved', () => {

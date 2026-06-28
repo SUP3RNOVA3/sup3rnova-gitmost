@@ -699,19 +699,39 @@ export async function applyPushActions(
         });
         continue;
       }
+      const conflicted = hasConflictMarkers(rawBody);
       const body = stripConflictMarkers(rawBody);
       // The last-synced version of this file (pre-image) is the common ancestor
       // for a 3-way merge against the live page, so concurrent human edits are
       // not clobbered (review #5). Null when the file is new at last-pushed. Its
-      // body is stripped the SAME way so the merge compares body-to-body.
+      // body is stripped the SAME way (frontmatter AND conflict markers) so the
+      // merge compares clean body-to-body: a base that itself carried markers
+      // (from a prior conflict commit) must never reintroduce marker syntax or a
+      // stale diff3 base region into the 3-way merge.
       const baseFull = await deps.git.showFileAtRef(LAST_PUSHED_REF, u.path);
-      const baseMarkdown = baseFull === null ? null : parsePageFile(baseFull).body;
+      const baseMarkdown =
+        baseFull === null
+          ? null
+          : stripConflictMarkers(parsePageFile(baseFull).body);
       const result = await client.importPageMarkdown(
         u.pageId,
         body,
         baseMarkdown,
       );
       updated++;
+      // CONFLICT VAULT-CLEAN (autoMergeConflicts ON, SPEC §9 marker leak). On ON
+      // a conflicted page is auto-merged INTO Docmost (the clean `body` above),
+      // but the file on `main` still carries the raw `<<<<<<<`/`>>>>>>>` markers
+      // the pull-side `commitMerge` committed. Left as-is they would (1) stay in
+      // the PUBLISHED vault forever (external clones see raw markers) and (2)
+      // re-conflict every cycle. So write the CLEAN body back to the vault file
+      // and record it in `writtenBack` — `runPush` step 7a commits it on `main`
+      // and re-advances the refs, so the published vault converges to the merged
+      // content. Only conflicted files are rewritten (no churn for clean updates).
+      if (conflicted) {
+        await deps.writeFile(u.path, serializePageFile(u.pageId, body));
+        writtenBack.push({ path: u.path, pageId: u.pageId });
+      }
       // §10 loop-guard data: hash the BODY we pushed + capture `updatedAt`.
       pushed.push({
         pageId: u.pageId,
@@ -1083,13 +1103,23 @@ export function isPageFile(path: string): boolean {
  * Docmost). A body is treated as conflicted only when it carries BOTH a begin
  * (`<<<<<<<`) and an end (`>>>>>>>`) marker line, so a legitimate Markdown setext
  * heading underline (`=======`) is not mistaken for a conflict. When conflicted,
- * the three marker line types are removed while BOTH sides' content is preserved
- * (no data loss): the marker SYNTAX never reaches Docmost, but the human's content
- * does — where the conflict is visible and fixable rather than silently dropped.
+ * every marker line type is removed while the human-visible content is preserved
+ * (no data loss): the marker SYNTAX never reaches Docmost, but the content does —
+ * where the conflict is visible and fixable rather than silently dropped.
+ *
+ * `diff3`/`zdiff3` style: a conflict in that style adds a `|||||||` base section
+ * (`|||||||` line + the merge-BASE content + `=======`). `ensureRepo` pins
+ * `merge.conflictStyle=merge` so the engine never produces it, but a vault that
+ * predates the pin — or content arriving via an external push that a human
+ * committed in diff3 style — could still carry it. So we ALSO recognize the
+ * `|||||||` marker and DROP the stale base region it introduces (between
+ * `|||||||` and `=======`): the base text is neither side's current content, so
+ * keeping it would inject obsolete lines AND leak a raw `|||||||` marker.
  */
 const CONFLICT_BEGIN_RE = /^<{7}/m;
 const CONFLICT_END_RE = /^>{7}/m;
 const CONFLICT_BEGIN_LINE_RE = /^<{7}/;
+const CONFLICT_BASE_LINE_RE = /^\|{7}/;
 const CONFLICT_SEP_LINE_RE = /^={7}/;
 const CONFLICT_END_LINE_RE = /^>{7}/;
 
@@ -1099,23 +1129,37 @@ export function hasConflictMarkers(body: string): boolean {
 
 function stripConflictMarkers(body: string): string {
   if (!hasConflictMarkers(body)) return body;
-  // Remove ONLY the three marker line types, and treat a `=======` line as a
-  // conflict separator ONLY when we are between a `<<<<<<<` begin and a `>>>>>>>`
-  // end — so a legitimate Markdown setext heading underline (`=======`) outside a
-  // conflict block is preserved (review finding). Both conflict sides' content is
-  // kept; only the marker SYNTAX is dropped.
-  let inBlock = false;
+  // Track where we are inside a conflict block so a `=======` line is treated as
+  // a conflict separator ONLY between a `<<<<<<<` begin and a `>>>>>>>` end — a
+  // legitimate Markdown setext heading underline (`=======`) outside a conflict
+  // block is preserved (review finding). State machine over the block:
+  //   'no'   — outside any conflict block.
+  //   'ours' — after `<<<<<<<`, before `|||||||`/`=======` (our side: KEEP).
+  //   'base' — after `|||||||`, before `=======` (diff3 base region: DROP).
+  //   'theirs' — after `=======`, before `>>>>>>>` (their side: KEEP).
+  // Every marker LINE itself is dropped; only the base region's content is also
+  // dropped (it is stale and not part of either current side).
+  let state: "no" | "ours" | "base" | "theirs" = "no";
   const out: string[] = [];
   for (const line of body.split("\n")) {
     if (CONFLICT_BEGIN_LINE_RE.test(line)) {
-      inBlock = true;
+      state = "ours";
       continue;
     }
-    if (CONFLICT_END_LINE_RE.test(line)) {
-      inBlock = false;
+    if (state !== "no" && CONFLICT_END_LINE_RE.test(line)) {
+      state = "no";
       continue;
     }
-    if (inBlock && CONFLICT_SEP_LINE_RE.test(line)) {
+    if (state === "ours" && CONFLICT_BASE_LINE_RE.test(line)) {
+      state = "base";
+      continue;
+    }
+    if ((state === "ours" || state === "base") && CONFLICT_SEP_LINE_RE.test(line)) {
+      state = "theirs";
+      continue;
+    }
+    // Drop the diff3 base region's content (stale, neither current side).
+    if (state === "base") {
       continue;
     }
     out.push(line);
