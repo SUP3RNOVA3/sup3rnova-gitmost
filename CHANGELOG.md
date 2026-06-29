@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GIT_SYNC_*` environment variables, including `GIT_SYNC_ENABLED`,
   `GIT_SYNC_SERVICE_USER_ID`, and `GIT_SYNC_HTTP_ENABLED` (see `.env.example`).
   (#119)
+- **Editable captions for images.** Images gain an optional caption shown
+  below them, edited inline from the image bubble menu and stored as a `caption` attribute. Captions round-trip
+  losslessly through markdown as a `data-caption` attribute on the image, so
+  they survive export/import unchanged. (#221)
+
 - **Quick-create regular and temporary notes from the Home and Space screens.**
   The Home screen now shows a second action next to "New note" that creates a
   *temporary* note (one that auto-moves to Trash after the workspace lifetime),
@@ -81,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nosniff` + restrictive CSP + attachment disposition for non-image mimes) and
   are RAM-only, bound to the instance that created them. Tunable via five
   `SANDBOX_*` env vars (see `.env.example`). (#243)
+- **Inline spoiler mark — hide text behind click-to-reveal blur.** Selected text
+  can be marked as a spoiler from a new bubble-menu toggle, or typed Discord-style
+  with the `||text||` input rule; the rendered span blurs until clicked to reveal.
+  The mark is preserved losslessly through Markdown export/import (as a raw
+  `<span data-spoiler="true">…</span>`) and on public shares. (#259)
 
 ### Changed
 
@@ -138,6 +148,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "This address is in use. Saving will move it to this page." — and keeps Save
   enabled, so the existing reassign-confirm flow (`409 ALIAS_REASSIGN_REQUIRED` →
   "Move custom address?") is discoverable instead of reading as terminal. (#227)
+- **A non-empty page can no longer be silently lost to a momentarily-empty live
+  document.** The server's persistence guard now refuses to overwrite non-empty
+  persisted content with an empty live Y.Doc — a transient emptiness from a
+  glitch, a bad merge, or an emptying transclusion no longer wipes the saved
+  page. A *deliberate* clear still works: a select-all + Delete in the editor
+  emits a single-use "intentional clear" signal that lets exactly that one empty
+  write through the guard, so genuinely emptying a page is persisted while
+  accidental empties are blocked. (#248, #251)
 
 ### Security
 

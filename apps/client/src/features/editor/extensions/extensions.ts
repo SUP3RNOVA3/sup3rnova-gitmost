@@ -53,6 +53,7 @@ import {
   Subpages,
   Heading,
   Highlight,
+  Spoiler,
   Indent,
   UniqueID,
   SharedStorage,
@@ -116,6 +117,7 @@ import mentionRenderItems from "@/features/editor/components/mention/mention-sug
 import { ReactNodeViewRenderer, ReactMarkViewRenderer } from "@tiptap/react";
 import MentionView from "@/features/editor/components/mention/mention-view.tsx";
 import LinkView from "@/features/editor/components/link/link-view.tsx";
+import SpoilerView from "@/features/editor/components/spoiler/spoiler-view.tsx";
 import i18n from "@/i18n.ts";
 import { MarkdownClipboard } from "@/features/editor/extensions/markdown-clipboard.ts";
 import EmojiCommand from "./emoji-command";
@@ -123,6 +125,7 @@ import { countWords } from "alfaaz";
 import AutoJoiner from "@/features/editor/extensions/autojoiner.ts";
 import GlobalDragHandle from "@/features/editor/extensions/drag-handle.ts";
 import { CleanStyles } from "@/features/editor/extensions/clean-styles.ts";
+import { IntentionalClear } from "@/features/editor/extensions/intentional-clear.ts";
 
 const lowlight = createLowlight(common);
 lowlight.register("mermaid", plaintext);
@@ -236,6 +239,11 @@ export const mainExtensions = [
   SubScript,
   Highlight.configure({
     multicolor: true,
+  }),
+  Spoiler.configure({}).extend({
+    addMarkView() {
+      return ReactMarkViewRenderer(SpoilerView);
+    },
   }),
   Typography,
   TrailingNode,
@@ -485,5 +493,11 @@ export const collabExtensions: CollabExtensions = (provider, user) => [
       name: user.name,
       color: randomElement(userColors),
     },
+  }),
+  // #251 — emit an intentional-clear signal to the server when the user
+  // deliberately empties the page, so the #248 store-side empty-guard lets that
+  // one clear through while still blocking accidental empties.
+  IntentionalClear.configure({
+    provider,
   }),
 ];
