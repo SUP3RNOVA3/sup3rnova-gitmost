@@ -269,6 +269,17 @@ const DocmostAttributes = Extension.create({
                 ? { "data-aspect-ratio": attrs.aspectRatio }
                 : {},
           },
+          // Plain-text image caption (issue #221). editor-ext's image node
+          // serializes it as `data-caption` on the <img>; mirror that mapping so
+          // a captioned image survives the markdown <-> ProseMirror round-trip.
+          // Emit data-caption only when set, so caption-less images stay clean.
+          caption: {
+            default: null,
+            parseHTML: (el: HTMLElement) =>
+              el.getAttribute("data-caption") || null,
+            renderHTML: (attrs: Record<string, any>) =>
+              attrs.caption ? { "data-caption": attrs.caption } : {},
+          },
           height: { default: null },
           placeholder: { default: null },
           size: {
@@ -325,6 +336,25 @@ const Comment = Mark.create({
   },
   renderHTML({ HTMLAttributes }) {
     return ["span", { class: "comment-mark", ...HTMLAttributes }, 0];
+  },
+});
+
+/**
+ * Inline spoiler mark (issue #259). Mirrors the @docmost/editor-ext `spoiler`
+ * mark so a document carrying a spoiler survives the git-sync round-trip.
+ * Markdown has no native spoiler syntax, so the markdown-converter emits it as
+ * raw inline HTML (`<span data-spoiler="true">…</span>`); without this mark the
+ * span re-parses as plain text and the spoiler is silently dropped on import.
+ * It parses span[data-spoiler] and re-renders the same span[data-spoiler][class].
+ */
+const Spoiler = Mark.create({
+  name: "spoiler",
+  inclusive: false,
+  parseHTML() {
+    return [{ tag: "span[data-spoiler]" }];
+  },
+  renderHTML({ HTMLAttributes }) {
+    return ["span", { "data-spoiler": "true", class: "spoiler", ...HTMLAttributes }, 0];
   },
 });
 
@@ -1466,6 +1496,7 @@ export const docmostExtensions = [
   // generateJSON drops <span style="color: ...">, defeating the color import.
   TextStyle,
   Comment,
+  Spoiler,
   Callout,
   Table,
   TableRow,

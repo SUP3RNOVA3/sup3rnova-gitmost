@@ -196,6 +196,13 @@ export function convertProseMirrorToMarkdown(content: any): string {
                   textContent = `<span style="color: ${escapeAttr(mark.attrs.color)}">${textContent}</span>`;
                 }
                 break;
+              case "spoiler":
+                // Markdown has no native spoiler syntax, so emit the same raw
+                // inline HTML the editor-ext/MCP stack uses. The schema's Spoiler
+                // mark parses span[data-spoiler] back on import, so the mark
+                // survives the PM -> MD -> PM round-trip.
+                textContent = `<span data-spoiler="true">${textContent}</span>`;
+                break;
               case "comment": {
                 // Emit the inline comment anchor so highlights round-trip. The
                 // schema's Comment mark parses span[data-comment-id] (attrs
@@ -294,7 +301,12 @@ export function convertProseMirrorToMarkdown(content: any): string {
           imgAttrs.align ||
           imgAttrs.size != null ||
           imgAttrs.attachmentId ||
-          imgAttrs.aspectRatio != null;
+          imgAttrs.aspectRatio != null ||
+          // A caption (issue #221) cannot be expressed by markdown `![](src)`,
+          // so route a captioned image through imageToHtml's raw <img> form
+          // (data-caption) — the same lossless form used for the other
+          // Docmost-specific image attrs.
+          imgAttrs.caption;
         if (hasLayoutAttrs) {
           return imageToHtml(node);
         }
@@ -304,8 +316,9 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // and let a stored src inject following markdown/HTML. Percent-encode
         // them so the URL stays a single inert token.
         const imgSrc = encodeMdUrl(imgAttrs.src);
-        // No "caption" attribute exists in the Docmost image schema, so we do
-        // not emit one (the previous caption branch was dead).
+        // A bare image (only src/alt, optionally a title) has no caption, so the
+        // lighter markdown form is lossless here; captioned images took the
+        // imageToHtml branch above.
         return `![${imgAlt}](${imgSrc})`;
       }
 
@@ -840,6 +853,9 @@ export function convertProseMirrorToMarkdown(content: any): string {
       parts.push(`data-attachment-id="${escapeAttr(attrs.attachmentId)}"`);
     if (attrs.aspectRatio != null)
       parts.push(`data-aspect-ratio="${escapeAttr(attrs.aspectRatio)}"`);
+    // Plain-text caption (issue #221). Markdown `![](src)` cannot carry it, so
+    // emit it as data-caption; the schema's image `caption` attr parses it back.
+    if (attrs.caption) parts.push(`data-caption="${escapeAttr(attrs.caption)}"`);
     return `<img ${parts.join(" ")}>`;
   };
 
