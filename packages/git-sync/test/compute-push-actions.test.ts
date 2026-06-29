@@ -304,6 +304,31 @@ describe('computePushActions — ghost-move coalescing (data-loss guard)', () =>
     ]);
   });
 
+  it('D(old)+M(new) of the SAME pageId -> rename/move, NOT a delete (M-side reshuffle)', () => {
+    // A reshuffle: an ALREADY-existing path (`New.md`) takes on a new pageId while
+    // the old path (`Old.md`) is deleted — git reports the surviving side as `M`
+    // (the path was occupied), not `A`. Same pageId on both sides, so it is one
+    // page that relocated: the M-side ghost-move coalescing path.
+    const changes: DiffEntry[] = [
+      { status: 'D', path: 'Old.md' },
+      { status: 'M', path: 'New.md' },
+    ];
+    const metaAt = metaTable({
+      'Old.md|prev': meta({ pageId: 'p1', title: 'Old', spaceId: 'sp1' }),
+      'New.md|current': meta({ pageId: 'p1', title: 'New', spaceId: 'sp1' }),
+    });
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.deletes).toEqual([]); // the page is NEVER trashed
+    // The coalesced move ALSO carries a body update for the new path (F4); the
+    // merge base resolves from the OLD path, not null and not the new path.
+    expect(actions.updates).toEqual([
+      { pageId: 'p1', path: 'New.md', basePath: 'Old.md' },
+    ]);
+    expect(actions.renamesMoves).toEqual([
+      { pageId: 'p1', oldPath: 'Old.md', newPath: 'New.md' },
+    ]);
+  });
+
   it('a real delete (no matching add) is STILL a delete', () => {
     const changes: DiffEntry[] = [{ status: 'D', path: 'Gone.md' }];
     const metaAt = metaTable({

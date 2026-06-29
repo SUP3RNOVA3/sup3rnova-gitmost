@@ -238,6 +238,28 @@ export interface PushActionsInput {
 }
 
 /**
+ * Emit the action PAIR a move/rename needs (F4): a `renamesMoves` entry (the
+ * relocation, applied later as a move/rename — those ops are content-free) AND a
+ * body `updates` entry for the NEW path, so a body edit riding along in the SAME
+ * diff is not lost. `importPageMarkdown` targets by pageId and is a near-no-op for
+ * a pure relocation. The merge BASE is taken from the OLD path (`basePath`): the
+ * file lives at its NEW `path` in the working tree, but at last-pushed it was at
+ * `oldPath`, so the 3-way base must be looked up THERE — otherwise it resolves to
+ * null and the merge degrades to a 2-way, clobbering a concurrent Docmost-side
+ * edit. A PURE relocation is then a no-op that PRESERVES the live page. Shared by
+ * all three emit sites (ghost-move A, ghost-move M, and R/C).
+ */
+function emitMoveWithBody(
+  actions: PushActions,
+  pageId: string,
+  oldPath: string,
+  newPath: string,
+): void {
+  actions.renamesMoves.push({ pageId, oldPath, newPath });
+  actions.updates.push({ pageId, path: newPath, basePath: oldPath });
+}
+
+/**
  * PURE push planner (SPEC §4/§6/§8). Classifies each diff row into a Docmost
  * action by `pageId` identity, with NO IO (the `metaAt` resolver is injected).
  *
@@ -321,25 +343,14 @@ export function computePushActions(input: PushActionsInput): PushActions {
         const pageId = meta?.pageId;
         if (pageId && ghostMove.has(pageId)) {
           // Half of a git-undetected move (a matching DELETE exists): record it
-          // as a rename/move (like a real `R`); the `D` side is suppressed so the
-          // page is never soft-deleted.
-          actions.renamesMoves.push({
+          // as a rename/move (like a real `R`) PLUS a body update for the new path
+          // (F4); the `D` side is suppressed so the page is never soft-deleted.
+          emitMoveWithBody(
+            actions,
             pageId,
-            oldPath: ghostMove.get(pageId)!.oldPath,
-            newPath: change.path,
-          });
-          // ...and ALSO push the body as an UPDATE for the new path (F4). A move
-          // can ride along with a body edit in the SAME diff; the move/rename ops
-          // never touch page CONTENT, so without this the edit is silently lost.
-          // `importPageMarkdown` targets by pageId and is a near-no-op for a pure
-          // relocation whose body is unchanged. The merge BASE is resolved from the
-          // OLD path (where the file lived at last-pushed) so the 3-way merge has a
-          // real common ancestor and a concurrent Docmost-side edit is preserved.
-          actions.updates.push({
-            pageId,
-            path: change.path,
-            basePath: ghostMove.get(pageId)!.oldPath,
-          });
+            ghostMove.get(pageId)!.oldPath,
+            change.path,
+          );
         } else if (pageId) {
           // Added but already carries a pageId (restored/copied file): the page
           // exists in Docmost, so push content as an UPDATE — never a duplicate.
@@ -367,22 +378,14 @@ export function computePushActions(input: PushActionsInput): PushActions {
         if (pageId && ghostMove.has(pageId)) {
           // This path's occupant changed pageId: the previous page left and THIS
           // page relocated here (a reshuffle). Its old file was DELETED elsewhere
-          // — coalesce into a rename/move so the page is never trashed.
-          actions.renamesMoves.push({
+          // — coalesce into a rename/move (plus a body update for the new path, F4)
+          // so the page is never trashed.
+          emitMoveWithBody(
+            actions,
             pageId,
-            oldPath: ghostMove.get(pageId)!.oldPath,
-            newPath: change.path,
-          });
-          // ...and ALSO push the body as an UPDATE for the new path (F4): the move
-          // op carries no content, so a body edit accompanying the relocation
-          // would otherwise be lost. Idempotent for a pure relocation. The merge
-          // BASE is resolved from the OLD path (the pre-image location at
-          // last-pushed) for an honest 3-way merge that preserves concurrent edits.
-          actions.updates.push({
-            pageId,
-            path: change.path,
-            basePath: ghostMove.get(pageId)!.oldPath,
-          });
+            ghostMove.get(pageId)!.oldPath,
+            change.path,
+          );
         } else if (pageId) {
           actions.updates.push({ pageId, path: change.path });
         } else {
@@ -441,29 +444,12 @@ export function computePushActions(input: PushActionsInput): PushActions {
         const pageId = meta?.pageId;
         const oldPath = change.oldPath ?? change.path;
         if (pageId) {
-          actions.renamesMoves.push({
-            pageId,
-            oldPath,
-            newPath: change.path,
-          });
-          // git `-M` reports a rename+edit as a SINGLE `R` row, but the move/rename
-          // ops never carry page CONTENT — so ALSO emit an UPDATE for the new path
-          // (F4). Otherwise a body edit made in the same commit as a rename/move is
-          // silently and permanently lost (the refs advance, the mirror claims the
-          // new body, the next pull reads the old body back). `importPageMarkdown`
-          // targets by pageId and is a near-no-op for a pure rename (body unchanged).
-          // The merge BASE must come from the OLD path: the file lives at the NEW
-          // `path` now, but at last-pushed it was at `oldPath`, so resolving the
-          // base there (not at the new path, where it returns null) gives an honest
-          // 3-way merge — a PURE rename is then a no-op that PRESERVES any
-          // concurrent Docmost-side edit instead of clobbering it to git's body.
-          // For a `C` copy `oldPath` is the SOURCE, which exists in the ref tree,
-          // so the copy's body 3-way-merges against its source's last-pushed text.
-          actions.updates.push({
-            pageId,
-            path: change.path,
-            basePath: oldPath,
-          });
+          // Record the rename/move PLUS a body update for the new path (F4): git
+          // `-M` reports a rename+edit as a SINGLE `R` row, so a body edit made in
+          // the same commit as the move would otherwise be lost. For a `C` copy
+          // `oldPath` is the SOURCE (it exists in the ref tree), so the copy's body
+          // 3-way-merges against its source's last-pushed text.
+          emitMoveWithBody(actions, pageId, oldPath, change.path);
         } else {
           actions.skipped.push({
             path: change.path,
