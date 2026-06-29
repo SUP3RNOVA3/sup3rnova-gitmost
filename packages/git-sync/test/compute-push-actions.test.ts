@@ -162,10 +162,42 @@ describe('computePushActions — R/C (renamed/moved)', () => {
     expect(actions.renamesMoves).toEqual([
       { pageId: 'p-moved', oldPath: 'Old/Path.md', newPath: 'New/Path.md' },
     ]);
-    // It is NOT also recorded as a create/update/delete.
+    // It is ALSO recorded as an UPDATE for the new path (F4) so a body edit
+    // riding along the rename in the same diff is pushed, not lost. The update
+    // carries `basePath = oldPath` so the 3-way merge base is resolved from where
+    // the file lived at last-pushed (the OLD path), not the new path (which would
+    // return null and degrade to a 2-way clobber). Never a create/delete though.
     expect(actions.creates).toEqual([]);
-    expect(actions.updates).toEqual([]);
+    expect(actions.updates).toEqual([
+      { pageId: 'p-moved', path: 'New/Path.md', basePath: 'Old/Path.md' },
+    ]);
     expect(actions.deletes).toEqual([]);
+  });
+
+  it('rename + body edit in one diff -> emits BOTH a rename/move action AND a body update (F4)', () => {
+    // git `-M` reports a rename WITH a body edit as a single `R` row. The
+    // move/rename ops never carry page content, so the body edit must ALSO be
+    // emitted as an UPDATE targeting the NEW path + same pageId — otherwise it is
+    // silently and permanently lost (F4, the critical data-loss bug).
+    const changes: DiffEntry[] = [
+      { status: 'R', path: 'New/Path.md', oldPath: 'Old/Path.md', score: 75 },
+    ];
+    const metaAt = metaTable({
+      'New/Path.md|current': meta({ pageId: 'p-edited' }),
+    });
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.renamesMoves).toEqual([
+      { pageId: 'p-edited', oldPath: 'Old/Path.md', newPath: 'New/Path.md' },
+    ]);
+    // The body update carries the NEW path so importPageMarkdown reads the moved
+    // file and targets the moved page by its (stable) pageId; `basePath` is the OLD
+    // path so the merge base is the pre-rename file (honest 3-way merge).
+    expect(actions.updates).toEqual([
+      { pageId: 'p-edited', path: 'New/Path.md', basePath: 'Old/Path.md' },
+    ]);
+    expect(actions.creates).toEqual([]);
+    expect(actions.deletes).toEqual([]);
+    expect(actions.skipped).toEqual([]);
   });
 
   it('copy (C) is recorded like a rename for the deferred apply', () => {
@@ -178,6 +210,13 @@ describe('computePushActions — R/C (renamed/moved)', () => {
     const actions = computePushActions({ changes, metaAt });
     expect(actions.renamesMoves).toEqual([
       { pageId: 'p-copy', oldPath: 'Src.md', newPath: 'Copy.md' },
+    ]);
+    // The body also rides along as an UPDATE for the new path (F4). For a COPY the
+    // `basePath` is the SOURCE path (`Src.md`): the source still exists in the
+    // last-pushed tree, so the copy's body 3-way-merges against its source's
+    // last-synced text — a real common ancestor, not a null 2-way base.
+    expect(actions.updates).toEqual([
+      { pageId: 'p-copy', path: 'Copy.md', basePath: 'Src.md' },
     ]);
   });
 
@@ -212,9 +251,14 @@ describe('computePushActions — mixed batch', () => {
     const actions = computePushActions({ changes, metaAt });
 
     expect(actions.creates).toEqual([{ path: 'Fresh.md' }]);
+    // The R row contributes BOTH a rename/move AND a body update for the new path
+    // (F4), so `p-mv` appears in updates too — in diff-row order, last.
     expect(actions.updates).toEqual([
       { pageId: 'p-rest', path: 'Restored.md' },
       { pageId: 'p-edit', path: 'Edited.md' },
+      // The rename-derived body update carries basePath = the OLD path (`Srcc.md`)
+      // for an honest 3-way merge; the plain A/M updates carry no basePath.
+      { pageId: 'p-mv', path: 'Dst.md', basePath: 'Srcc.md' },
     ]);
     expect(actions.deletes).toEqual([{ pageId: 'p-rm' }]);
     expect(actions.renamesMoves).toEqual([
@@ -241,7 +285,12 @@ describe('computePushActions — ghost-move coalescing (data-loss guard)', () =>
     });
     const actions = computePushActions({ changes, metaAt });
     expect(actions.deletes).toEqual([]); // the page is NEVER trashed
-    expect(actions.updates).toEqual([]); // not a spurious update either
+    // The coalesced move ALSO carries a body update for the new path (F4): a body
+    // edit accompanying the relocation must be pushed, not lost. `basePath` is the
+    // OLD (deleted) path so the 3-way merge base is the pre-move file, not null.
+    expect(actions.updates).toEqual([
+      { pageId: 'p1', path: '_.md', basePath: '_ ~slug.md' },
+    ]);
     expect(actions.renamesMoves).toEqual([
       { pageId: 'p1', oldPath: '_ ~slug.md', newPath: '_.md' },
     ]);

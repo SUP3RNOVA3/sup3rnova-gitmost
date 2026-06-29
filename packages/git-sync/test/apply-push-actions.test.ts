@@ -187,6 +187,76 @@ describe('applyPushActions — update (collab path, SPEC §2/§15.6)', () => {
     );
     expect(git.showFileAtRef).toHaveBeenCalledWith(LAST_PUSHED_REF, 'Doc.md');
   });
+
+  it('RENAME-derived update resolves the 3-way base from the OLD path (basePath), not the new path', async () => {
+    // The residual flaw after F4: a rename+edit emits an UPDATE whose `path` is the
+    // NEW path, but at refs/docmost/last-pushed the file lived at the OLD path. If
+    // the base were looked up at the NEW path it would return null and the merge
+    // would degrade to a 2-way (clobbering a concurrent Docmost-side edit). The fix
+    // threads `basePath = oldPath` so the base is the pre-rename file (honest 3-way).
+    const client = makeClient();
+    // The pre-image tree only has the OLD path; the NEW path does NOT exist there.
+    const { git } = makeGit({
+      prevTree: { 'Old/Path.md': fileFor('p-mv', 'base body') },
+    });
+    // The working tree has the file at its NEW path with the EDITED body.
+    const fs = makeFs({ 'New/Path.md': fileFor('p-mv', 'edited body') });
+
+    await applyPushActions(
+      deps(client, git, fs),
+      actions({
+        updates: [
+          { pageId: 'p-mv', path: 'New/Path.md', basePath: 'Old/Path.md' },
+        ],
+      }),
+    );
+
+    // The BODY is read from the NEW path (working tree) -> the EDITED body is pushed
+    // (not lost). The BASE is resolved from the OLD path -> a NON-NULL common
+    // ancestor ('base body'), so importPageMarkdown does an honest 3-way merge and
+    // a concurrent Docmost-side edit to a different block is preserved (not rolled
+    // back to git's body, which a null 2-way base would have done).
+    expect(client.importPageMarkdown).toHaveBeenCalledWith(
+      'p-mv',
+      'edited body',
+      'base body',
+    );
+    // The base lookup hit the OLD path, NOT the new path (the core of the fix).
+    expect(git.showFileAtRef).toHaveBeenCalledWith(LAST_PUSHED_REF, 'Old/Path.md');
+    expect(git.showFileAtRef).not.toHaveBeenCalledWith(
+      LAST_PUSHED_REF,
+      'New/Path.md',
+    );
+  });
+
+  it('PURE rename (no body edit) still 3-way merges against the old-path base (no 2-way clobber)', async () => {
+    // Even a rename with NO body change pushes a body update (F4). Before this fix
+    // its base would be null (new path absent at last-pushed) -> a 2-way merge that
+    // could roll a concurrent Docmost edit back to git's body. With basePath=oldPath
+    // the base equals the (unchanged) body, so the 3-way merge of
+    // (base=oldBody, incoming=oldBody) is a no-op and any live Docmost edit survives.
+    const client = makeClient();
+    const { git } = makeGit({
+      prevTree: { 'Old.md': fileFor('p-pure', 'same body') },
+    });
+    const fs = makeFs({ 'New.md': fileFor('p-pure', 'same body') });
+
+    await applyPushActions(
+      deps(client, git, fs),
+      actions({
+        updates: [{ pageId: 'p-pure', path: 'New.md', basePath: 'Old.md' }],
+      }),
+    );
+
+    // Incoming body == base body == 'same body' -> the 3-way merge is a no-op AND
+    // preserves any concurrent live edit (the base is the real ancestor, not null).
+    expect(client.importPageMarkdown).toHaveBeenCalledWith(
+      'p-pure',
+      'same body',
+      'same body',
+    );
+    expect(git.showFileAtRef).toHaveBeenCalledWith(LAST_PUSHED_REF, 'Old.md');
+  });
 });
 
 describe('applyPushActions — create (assigned pageId written back to meta)', () => {

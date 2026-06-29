@@ -270,6 +270,61 @@ describe('#13 conflict markers reach Docmost', () => {
     expect(res.applied?.lastPushedAdvanced).toBe(false);
     expect(calls.updateRef).toHaveLength(0);
   });
+
+  it('CREATE branch (autoMergeConflicts on): strips the markers and createPage gets a CLEAN body; the vault file is rewritten clean', async () => {
+    // The CREATE path strips conflict markers (stripConflictMarkers(rawBody)) and
+    // passes the CLEANED body to createPage — but only the OFF-case (no createPage)
+    // and the UPDATE-ON case were covered. A regression passing the RAW body to
+    // createPage would publish `<<<<<<<`/`=======`/`>>>>>>>` into a brand-new page
+    // with NO test catching it. Pin: createPage IS called with a marker-free body
+    // that preserves BOTH sides, and the file on disk is rewritten with that body.
+    const { git } = makePushGit({
+      changes: [{ status: 'A', path: 'New.md' }],
+    });
+    const createPage = vi.fn(async () => ({ data: { id: 'new-1' } }));
+    const client = {
+      listSpaceTree: vi.fn(async () => ({ pages: [], complete: true })),
+      importPageMarkdown: vi.fn(),
+      createPage,
+      deletePage: vi.fn(),
+      movePage: vi.fn(),
+      renamePage: vi.fn(),
+    };
+    const deps: PushDeps = {
+      settings: { ...makeSettings(), autoMergeConflicts: true },
+      git,
+      makeClient: () => client as any,
+      // Raw conflict body with NO gitmost_id frontmatter -> classified as CREATE.
+      readFile: vi.fn(async (path: string) => {
+        if (path === 'New.md') return conflictBody;
+        throw new Error(`no such file: ${path}`);
+      }),
+      writeFile: vi.fn(async () => {}),
+      log: () => {},
+    };
+
+    const res = await runPush(deps, { dryRun: false });
+    expect(res.mode).toBe('apply');
+
+    // The page WAS created. The body (2nd positional arg) is marker-free but keeps
+    // both sides' content.
+    expect(createPage).toHaveBeenCalledTimes(1);
+    const createdBody: string = createPage.mock.calls[0][1] as any;
+    expect(createdBody).not.toContain('<<<<<<<');
+    expect(createdBody).not.toContain('=======');
+    expect(createdBody).not.toContain('>>>>>>>');
+    expect(createdBody).toContain('my line');
+    expect(createdBody).toContain('their line');
+
+    // The file on disk is rewritten with the CLEAN body (no raw markers) so the
+    // published vault never carries the conflict syntax.
+    const writeCalls = (deps.writeFile as any).mock.calls as [string, string][];
+    const newWrite = writeCalls.find(([p]) => p === 'New.md');
+    expect(newWrite).toBeDefined();
+    expect(newWrite![1]).not.toMatch(/[<>=]{7}/);
+    expect(newWrite![1]).toContain('my line');
+    expect(newWrite![1]).toContain('their line');
+  });
 });
 
 // ---------------------------------------------------------------------------
