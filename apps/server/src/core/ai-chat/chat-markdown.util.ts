@@ -15,6 +15,7 @@
  */
 
 import type { AiChatMessage } from '@docmost/db/types/entity.types';
+import { escapeAttr } from './ai-chat.prompt';
 
 /** Supported export label languages. Defaults to English. */
 export type ExportLang = 'en' | 'ru';
@@ -109,6 +110,24 @@ const LABELS: Record<
       'Пользователь изменил страницу перед этим ходом; дифф, который видел агент:',
   },
 };
+
+/**
+ * Make an untrusted title safe to interpolate into a Markdown blockquote
+ * HEADING. escapeAttr() neutralizes the XML/HTML breakers (`<` `>` `"`) and
+ * collapses whitespace for the PROMPT sink (`page="…"`), but this export sink is
+ * MARKDOWN — link/image syntax survives escapeAttr. So additionally backslash-
+ * escape `[` and `]`: that disables both `[text](url)` links and `![text](url)`
+ * images, so a cross-user title like `![x](http://evil)` or `[phish](http://evil)`
+ * cannot inject a remote (auto-loading) image or a clickable link into the
+ * downloaded .md disguised as a trusted system annotation. A bare `(url)` with no
+ * preceding `[]` is inert Markdown, so brackets are the only security-critical
+ * characters here. (We leave backticks to escapeAttr's whitespace pass — a title
+ * shown as inline code cannot escape the blockquote line or load a resource, so
+ * it is not a security concern for this sink.)
+ */
+function markdownHeadingSafe(title: string): string {
+  return escapeAttr(title).replace(/[[\]]/g, (m) => `\\${m}`);
+}
 
 /** True for AI SDK tool parts (static `tool-*` or `dynamic-tool`). */
 function isToolPart(type: string): boolean {
@@ -293,8 +312,17 @@ export function buildChatMarkdown(args: {
     // warning the model received.
     const pc = pageChangedOf(row);
     if (pc) {
-      const heading = pc.title
-        ? `${L.pageEditedByUser} ("${pc.title}")`
+      // The page title is UNTRUSTED cross-user data (a collaborative page's title
+      // controllable by another user). escapeAttr() alone (the prompt sink) is
+      // INSUFFICIENT here: this is a MARKDOWN sink, so we neutralize link/image
+      // syntax too (backslash-escaping `[`/`]`) before interpolating it into this
+      // `> **…**` blockquote heading — otherwise `![x](url)` / `[phish](url)` would
+      // inject a remote image or clickable link into the downloaded .md. An
+      // all-`<>"` title escapes to empty and correctly falls to the bare heading.
+      // The diff body is already safe via fence(). (#288 review F1.)
+      const safeTitle = markdownHeadingSafe(pc.title);
+      const heading = safeTitle
+        ? `${L.pageEditedByUser} ("${safeTitle}")`
         : L.pageEditedByUser;
       blocks.push(`> **📝 ${heading}**\n\n${fence(pc.diff, 'diff')}`);
     }
