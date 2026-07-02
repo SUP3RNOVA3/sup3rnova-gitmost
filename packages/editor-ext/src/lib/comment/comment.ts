@@ -178,6 +178,14 @@ export const Comment = Mark.create<ICommentOptions, ICommentStorage>({
     // interactive live-DOM branch below is browser-only. This stops server-side
     // HTML/Markdown export (happy-dom DOMSerializer) from appending a foreign
     // jsdom node into a happy-dom tree.
+    // Safe in the browser: Vite substitutes only `process.env` (a member
+    // expression), NOT the bare `process` object, so `typeof process` is
+    // "undefined" in the client bundle → isNodeRuntime is false → the interactive
+    // live-DOM branch below still runs and comment marks stay clickable in the
+    // editor. This browser-safety is load-bearing and NOT covered by a test
+    // (client vitest runs under jsdom→node, where isNodeRuntime is true). Do NOT
+    // add a `process` polyfill (e.g. vite-plugin-node-polyfills) without
+    // revisiting this guard, or comment interactivity dies silently.
     const isNodeRuntime =
       typeof process !== "undefined" && !!process.versions?.node;
 
