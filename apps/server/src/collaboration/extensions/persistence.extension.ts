@@ -329,17 +329,25 @@ export class PersistenceExtension implements Extension {
           // flag via that same hoisted consume (a "cleared then retyped"
           // sequence can't leave a usable one behind).
           const incomingEmpty = isEmptyParagraphDoc(tiptapJson as any);
+          // A git-sync write is authoritative and its content IS the vault file:
+          // an empty incoming doc there means the user DELIBERATELY cleared the
+          // page's markdown in git (there is no "transient glitch empty" for a
+          // file-sourced write). Honor it, otherwise the empty-guard rejects the
+          // clear, the vault ref has already advanced past the empty commit, and
+          // vault<->Docmost diverge permanently (review warning). This mirrors the
+          // #251 intentional-clear allowance for a different authoritative source.
+          const gitSyncClear = lastUpdatedSource === 'git-sync';
           if (
             incomingEmpty &&
             page.content &&
             !isEmptyParagraphDoc(page.content as any)
           ) {
-            if (allowIntentionalClear) {
+            if (allowIntentionalClear || gitSyncClear) {
               this.logger.debug(
                 `Intentional clear for ${pageId}: persisting empty doc over ` +
-                  `non-empty content (user-signalled)`,
+                  `non-empty content (${gitSyncClear ? 'git-sync' : 'user-signalled'})`,
               );
-              // fall through — the empty write is allowed exactly once.
+              // fall through — the empty write is allowed.
             } else {
               this.logger.warn(
                 `Skipping store for ${pageId}: empty live doc would overwrite ` +
