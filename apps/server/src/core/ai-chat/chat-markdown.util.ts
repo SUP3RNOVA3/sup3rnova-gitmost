@@ -63,6 +63,7 @@ const LABELS: Record<
     tools: Record<string, string>;
     ranTool: (name: string) => string;
     stillGenerating: string;
+    pageEditedByUser: string;
   }
 > = {
   en: {
@@ -83,6 +84,8 @@ const LABELS: Record<
     ranTool: (name) => `Ran tool ${name}`,
     stillGenerating:
       'This message is still being generated — the export captured a partial, in-progress response.',
+    pageEditedByUser:
+      'The user edited this page before this turn; the diff the agent saw:',
   },
   ru: {
     untitled: 'Без названия',
@@ -102,6 +105,8 @@ const LABELS: Record<
     ranTool: (name) => `Выполнил инструмент ${name}`,
     stillGenerating:
       'Это сообщение всё ещё генерируется — экспорт захватил частичный, незавершённый ответ.',
+    pageEditedByUser:
+      'Пользователь изменил страницу перед этим ходом; дифф, который видел агент:',
   },
 };
 
@@ -208,6 +213,23 @@ function rowParts(row: AiChatMessage): ExportPart[] {
     : [{ type: 'text', text: row.content ?? '' }];
 }
 
+/** The persisted page-change diff the agent saw this turn (#274), when any. */
+function pageChangedOf(
+  row: AiChatMessage,
+): { title: string; diff: string } | undefined {
+  const meta = (row.metadata ?? {}) as {
+    pageChanged?: { title?: string; diff?: string };
+  };
+  const pc = meta.pageChanged;
+  if (pc && typeof pc.diff === 'string' && pc.diff.trim().length > 0) {
+    return {
+      title: typeof pc.title === 'string' ? pc.title : '',
+      diff: pc.diff,
+    };
+  }
+  return undefined;
+}
+
 /**
  * Serialize a chat to a Markdown string from its persisted rows. Source = DB
  * ONLY (no live client state). A row whose `status` is still 'streaming' is an
@@ -264,6 +286,17 @@ export function buildChatMarkdown(args: {
           ? row.createdAt.toISOString()
           : String(row.createdAt);
       blocks.push(`<!-- ${iso} -->`);
+    }
+
+    // Page-change observability (#274): show the diff the agent saw at the start
+    // of this turn, before its response, so the export reflects the stale-page
+    // warning the model received.
+    const pc = pageChangedOf(row);
+    if (pc) {
+      const heading = pc.title
+        ? `${L.pageEditedByUser} ("${pc.title}")`
+        : L.pageEditedByUser;
+      blocks.push(`> **📝 ${heading}**\n\n${fence(pc.diff, 'diff')}`);
     }
 
     blocks.push(...renderMessageParts(rowParts(row), lang));

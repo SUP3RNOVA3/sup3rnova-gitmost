@@ -269,6 +269,44 @@ describe('buildChatMarkdown (server) — structure', () => {
     expect(md).toContain('**⚠️ Error:** 401: Unauthorized');
   });
 
+  // #274 observability: an assistant row whose turn started with a user edit to
+  // the open page carries metadata.pageChanged = { title, diff }; the export
+  // renders the diff the agent saw, before the message body.
+  it('renders the persisted page-change diff block for an assistant row', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [
+        row({
+          role: 'assistant',
+          content: 'answer',
+          metadata: {
+            pageChanged: { title: 'Doc', diff: '@@ -1 +1 @@\n-old\n+new' },
+          } as never,
+        }),
+      ],
+    });
+    expect(md).toContain(
+      'The user edited this page before this turn; the diff the agent saw:',
+    );
+    expect(md).toContain('("Doc")');
+    expect(md).toContain('-old');
+    expect(md).toContain('+new');
+    // The diff sits before the message body (chronological: change, then reply).
+    expect(md.indexOf('-old')).toBeLessThan(md.indexOf('answer'));
+  });
+
+  it('does not render the page-change block when metadata.pageChanged is absent', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [row({ role: 'assistant', content: 'answer' })],
+    });
+    expect(md).not.toContain(
+      'The user edited this page before this turn; the diff the agent saw:',
+    );
+  });
+
   it('escapes embedded triple-backtick fences with a longer delimiter', () => {
     const md = buildChatMarkdown({
       title: 'T',

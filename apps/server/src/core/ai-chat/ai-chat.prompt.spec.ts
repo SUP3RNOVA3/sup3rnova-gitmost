@@ -303,6 +303,11 @@ describe('buildSystemPrompt page-changed note (#274)', () => {
     expect(prompt).toContain(NOTE_MARKER);
     expect(prompt).toContain('-old line');
     expect(prompt).toContain('+new line');
+    // Strengthened note (#274): instructs a fresh re-read via getPage and steers
+    // the agent toward small, targeted edits instead of a full-page overwrite.
+    expect(prompt).toContain('getPage');
+    expect(prompt.toLowerCase()).toContain('targeted');
+    expect(prompt).toContain('editPageText');
     // Inside the safety sandwich: the trailing SAFETY block follows the note.
     expect(prompt.lastIndexOf(SAFETY_MARKER)).toBeGreaterThan(
       prompt.indexOf(NOTE_MARKER),
