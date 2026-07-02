@@ -88,7 +88,13 @@ export default function GlobalAppShell({
       header={{ height: 45 }}
       navbar={{
         width: isSpaceRoute ? sidebarWidth : 300,
-        breakpoint: "sm",
+        // `md` (not `sm`): below 992px the fixed ~300px sidebar leaves too little
+        // room for content — the settings tables (Members/…) overflow the offset
+        // content area on tablet (~768px) and clip the Role/actions columns
+        // off-screen with no horizontal scroll. Collapsing the navbar to a toggle
+        // drawer across the whole tablet band frees the full width for content
+        // (the mobile drawer is closed by default, so nothing overlaps on load).
+        breakpoint: "md",
         collapsed: {
           mobile: !mobileOpened,
           desktop: !desktopOpened,
@@ -97,7 +103,7 @@ export default function GlobalAppShell({
       aside={
         isPageRoute && {
           width: 420,
-          breakpoint: "sm",
+          breakpoint: "md",
           collapsed: { mobile: !isAsideOpen, desktop: !isAsideOpen },
         }
       }
