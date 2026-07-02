@@ -313,13 +313,29 @@ export class GitmostDataSourceService {
     if (!page) {
       throw new NotFoundException(`Page ${pageId} not found`);
     }
+    // Defensive de-pollution of the cosmetic ` ~<slugId>` disambiguation suffix.
+    // When two sibling pages share a title, the vault layout appends ` ~<slugId>`
+    // to the colliding file's stem (engine `disambiguate(name, slugId)` = exactly
+    // `${name} ~${slugId}`) so two pages never map to one `.md`. That suffix is a
+    // LOCAL filesystem artifact and must NEVER become the page's real Docmost
+    // title. A filename-derived title can carry it back in on ingest (observed:
+    // intermittent same-title collision left a page permanently titled
+    // "Title ~<slugId>"). Strip it at this single choke point every git-sync
+    // title write funnels through — but ONLY when the trailing token equals THIS
+    // page's own slugId, so a genuine user title that legitimately ends in
+    // ` ~token` is never corrupted (slugId is a random nanoid; no real collision).
+    const suffix = ` ~${page.slugId}`;
+    const cleanTitle =
+      page.slugId && title.endsWith(suffix)
+        ? title.slice(0, -suffix.length)
+        : title;
     // PageService.update takes a User; the git-sync service user is the
     // responsible author. Only the id is read off it for lastUpdatedById.
     // `pageId` satisfies the UpdatePageDto type; PageService.update reads the
     // page id off `page`, not the DTO. Only `title` is applied here.
     await this.pageService.update(
       page,
-      { pageId, title },
+      { pageId, title: cleanTitle },
       { id: ctx.userId } as any,
       GIT_SYNC_PROVENANCE,
     );
