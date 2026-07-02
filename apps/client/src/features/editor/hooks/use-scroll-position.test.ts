@@ -100,7 +100,7 @@ describe("useScrollPosition", () => {
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
   });
 
-  it("(a3) restores at most once per mount even if called again", () => {
+  it("(a3) is idempotent: re-asserting the same target does not scroll again", () => {
     vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}once`, "500");
     setScrollHeight(2000); // tall enough to restore synchronously
@@ -111,8 +111,12 @@ describe("useScrollPosition", () => {
     });
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
 
+    // Simulate the browser now being at the restored position.
+    setScrollY(500);
+
     // A second call (e.g. the wiring effect re-running on [showStatic, editor,
-    // restoreScrollPosition]) must NOT scroll again and yank the reader.
+    // restoreScrollPosition]) must NOT scroll again: the redundancy guard sees
+    // the window is already at the target and does nothing.
     act(() => {
       result.current.restoreScrollPosition();
     });
@@ -159,6 +163,84 @@ describe("useScrollPosition", () => {
     act(() => {
       vi.advanceTimersByTime(5000);
     });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("(g) does not restore if the reader scrolled (wheel) before restore fires", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}g1`, "500");
+    setScrollHeight(2000); // tall enough to restore synchronously
+
+    const { result } = renderHook(() => useScrollPosition("g1"));
+
+    // The reader shows scroll intent before restore is triggered.
+    act(() => {
+      window.dispatchEvent(new Event("wheel"));
+    });
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("(h) aborts an in-flight restore poll when the reader scrolls", () => {
+    vi.useFakeTimers();
+    window.sessionStorage.setItem(`${KEY_PREFIX}h1`, "500");
+    setInnerHeight(800);
+    setScrollHeight(100); // maxScroll = -700: target not reachable yet, so it polls.
+
+    const { result } = renderHook(() => useScrollPosition("h1"));
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled(); // still polling
+
+    // The reader takes over mid-poll: this cancels the in-flight poll.
+    act(() => {
+      window.dispatchEvent(new Event("wheel"));
+    });
+
+    // Content of the page grows tall enough and time passes: the cancelled poll
+    // must NOT resurrect and yank the reader.
+    setScrollHeight(2000);
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("(i) a non-scroll keydown does NOT abort restore", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}i1`, "500");
+    setScrollHeight(2000); // tall enough to restore synchronously
+
+    const { result } = renderHook(() => useScrollPosition("i1"));
+
+    // A non-scroll key (e.g. typing, a shortcut) must NOT count as scroll intent.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "a" }));
+    });
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    // Restore still happens: the innocuous keypress did not disable it.
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
+  });
+
+  it("(j) a scroll keydown (Space) DOES abort restore", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}j1`, "500");
+    setScrollHeight(2000); // tall enough to restore synchronously
+
+    const { result } = renderHook(() => useScrollPosition("j1"));
+
+    // Space scrolls the page: this is real scroll intent and must abort restore.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    });
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
     expect(window.scrollTo).not.toHaveBeenCalled();
   });
 

@@ -13,6 +13,18 @@ const RESTORE_POLL_MS = 100;
 // "remember where I was reading" feature (self-limiting, no cross-tab leak).
 const STORAGE_PREFIX = "gitmost:scroll-position:";
 
+// Keys that scroll the window. Only these count as scroll intent for keydown;
+// other keys (shortcuts, modifiers, typing) must NOT disable scroll restore.
+const SCROLL_KEYS = new Set([
+  "ArrowUp",
+  "ArrowDown",
+  "PageUp",
+  "PageDown",
+  "Home",
+  "End",
+  " ", // Space (and Shift+Space) scroll the page
+]);
+
 function storageKey(pageId: string): string {
   return `${STORAGE_PREFIX}${pageId}`;
 }
@@ -48,32 +60,41 @@ function writeStorage(pageId: string, scrollY: number): void {
  * Persists and restores the window scroll position per page so a reader keeps
  * their place across a reload (F5) or reopening the document.
  *
- * Returns `restoreScrollPosition`, which the page editor calls once the live
- * (non-static) content is laid out. The two scroll mechanisms are mutually
- * exclusive: if the URL has a `#hash` anchor, the existing anchor-scroll logic
- * wins and restore is a no-op.
+ * Returns `restoreScrollPosition`, which the page editor calls from two triggers
+ * (early, while the static/cached content is laid out, and again after the
+ * static->live editor swap); it is idempotent, so re-asserting the same target is
+ * a no-op. The two scroll mechanisms are mutually exclusive: if the URL has a
+ * `#hash` anchor, the existing anchor-scroll logic wins and restore is a no-op.
  */
 export function useScrollPosition(pageId: string): {
   restoreScrollPosition: () => void;
 } {
   // CONTRACT: this hook assumes PageEditor REMOUNTS per page — page.tsx renders
   // `<MemoizedFullEditor key={page.id} ...>`, so switching pages creates a fresh
-  // hook instance with fresh refs. These refs latch per-mount and are NOT reset
-  // when `pageId` changes in place (only the effect re-runs on [pageId]). If that
-  // `key={page.id}` is ever removed, restore would silently break on the 2nd page
-  // (refs would hold the first page's target / already-restored flag) — in that
-  // case the refs must be reset on a pageId change.
+  // hook instance with fresh refs. Restore is idempotent and interaction-gated
+  // (not single-shot): it may be called from several triggers and re-asserts the
+  // SAME captured target, which is a no-op once the window is already positioned.
+  // The per-mount refs that latch are `initialTargetRef` (the captured target)
+  // and `userInteractedRef` (the reader has taken over scrolling). They are NOT
+  // reset when `pageId` changes in place (only the effect re-runs on [pageId]).
+  // If that `key={page.id}` is ever removed, restore would silently break on the
+  // 2nd page (refs would hold the first page's target / interaction flag) — in
+  // that case the refs must be reset on a pageId change.
   //
   // The target Y captured synchronously at mount, BEFORE any scroll/visibility
   // handler can overwrite the stored value with a fresh 0 (the page starts
   // scrolled to top on load). `null` means "not yet captured".
   const initialTargetRef = useRef<number | null>(null);
-  // Guards so restore runs at most once per page mount.
-  const hasRestoredRef = useRef(false);
+  // Set once the reader shows unambiguous scroll intent; restore must never yank
+  // a reader who has already started scrolling.
+  const userInteractedRef = useRef(false);
   // Holds the in-flight restore poll timer so the cleanup can cancel it: without
   // this, a fast SPA navigation away mid-poll would let the old page's poll fire
   // window.scrollTo against the NEW page's document (visible wrong-page scroll).
   const pollTimerRef = useRef<number | null>(null);
+  // Timestamp of the FIRST restore attempt so re-triggers (e.g. the static→live
+  // editor swap) share ONE bounded timeout budget instead of restarting it.
+  const restoreStartRef = useRef<number | null>(null);
 
   // Capture the previously-saved value synchronously during render, before the
   // effect below registers handlers that would persist the current (0) scrollY.
@@ -114,14 +135,43 @@ export function useScrollPosition(pageId: string): {
       }
     };
 
+    // User scroll-intent signals. wheel and touch are unconditional scroll
+    // intent; keydown is filtered to actual scroll keys only (SCROLL_KEYS) so
+    // shortcuts, lone modifiers, and typing do not abort restore. Our own
+    // window.scrollTo does NOT emit these, so restore can never self-abort via
+    // them. Once the reader shows intent we mark it and cancel any in-flight
+    // restore poll so restore can never yank them back. (Scrollbar-drag via
+    // pointer is an accepted small gap — it is not covered here.)
+    const onUserIntent = (event: Event) => {
+      // wheel/touchstart are unambiguous scroll intent; for keydown, only real
+      // scroll keys count — a shortcut or typing must not abort restore.
+      if (
+        event.type === "keydown" &&
+        !SCROLL_KEYS.has((event as KeyboardEvent).key)
+      ) {
+        return;
+      }
+      userInteractedRef.current = true;
+      if (pollTimerRef.current !== null) {
+        window.clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+
     window.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("pagehide", onPageHide);
     document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("wheel", onUserIntent, { passive: true });
+    window.addEventListener("touchstart", onUserIntent, { passive: true });
+    window.addEventListener("keydown", onUserIntent);
 
     return () => {
       window.removeEventListener("scroll", onScroll);
       window.removeEventListener("pagehide", onPageHide);
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("wheel", onUserIntent);
+      window.removeEventListener("touchstart", onUserIntent);
+      window.removeEventListener("keydown", onUserIntent);
       if (throttleTimer !== null) {
         window.clearTimeout(throttleTimer);
         throttleTimer = null;
@@ -137,9 +187,8 @@ export function useScrollPosition(pageId: string): {
   }, [pageId]);
 
   const restoreScrollPosition = useCallback(() => {
-    // Run at most once per page mount.
-    if (hasRestoredRef.current) return;
-    hasRestoredRef.current = true;
+    // The reader took over — never yank them back.
+    if (userInteractedRef.current) return;
 
     // Anchor priority: a `#hash` in the URL is handled by useEditorScroll.
     if (window.location.hash) return;
@@ -148,9 +197,26 @@ export function useScrollPosition(pageId: string): {
     // Nothing meaningful to restore to.
     if (targetY <= 0) return;
 
-    const start = Date.now();
+    // Cancel any in-flight poll before (re)starting, so overlapping triggers can
+    // never run two concurrent polls against the same target.
+    if (pollTimerRef.current !== null) {
+      window.clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+
+    // Share one timeout budget across re-triggers instead of restarting it.
+    if (restoreStartRef.current === null) {
+      restoreStartRef.current = Date.now();
+    }
+    const start = restoreStartRef.current;
 
     const tryRestore = () => {
+      // Bail mid-poll if the reader started scrolling while we were waiting.
+      if (userInteractedRef.current) {
+        pollTimerRef.current = null;
+        return;
+      }
+
       const maxScroll =
         document.documentElement.scrollHeight - window.innerHeight;
       const timedOut = Date.now() - start >= MAX_RESTORE_WAIT_MS;
@@ -158,10 +224,12 @@ export function useScrollPosition(pageId: string): {
       // Restore once the content is tall enough to reach the target, or bail out
       // after the timeout and scroll as far as currently possible.
       if (maxScroll >= targetY || timedOut) {
-        window.scrollTo({
-          top: Math.min(targetY, Math.max(maxScroll, 0)),
-          behavior: "auto",
-        });
+        const top = Math.min(targetY, Math.max(maxScroll, 0));
+        // Redundancy guard: re-asserting the SAME target when already positioned
+        // is a no-op, so this hook can be called from multiple triggers safely.
+        if (Math.abs(window.scrollY - top) > 1) {
+          window.scrollTo({ top, behavior: "auto" });
+        }
         pollTimerRef.current = null;
         return;
       }

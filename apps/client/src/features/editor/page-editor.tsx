@@ -2,6 +2,7 @@ import "@/features/editor/styles/index.css";
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -482,8 +483,17 @@ export default function PageEditor({
     }
   }, [yjsConnectionStatus, isSynced]);
 
-  // Restore the saved reading position once the live content is laid out.
-  useEffect(() => {
+  // Restore as early as the static (cached) content is laid out, before paint,
+  // so the reader's position is applied without a visible jump. Aborts itself if
+  // the reader has already started scrolling (handled inside the hook).
+  useLayoutEffect(() => {
+    restoreScrollPosition();
+  }, [restoreScrollPosition]);
+
+  // Re-assert once after the static -> live editor swap in case the swap reset
+  // the window scroll. Idempotent: a no-op when the position is already correct,
+  // and a no-op after the reader has interacted.
+  useLayoutEffect(() => {
     if (!showStatic && editor) restoreScrollPosition();
   }, [showStatic, editor, restoreScrollPosition]);
 
