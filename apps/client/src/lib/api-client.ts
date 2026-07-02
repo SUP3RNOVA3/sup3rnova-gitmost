@@ -1,6 +1,7 @@
 import axios, { AxiosInstance } from "axios";
 import APP_ROUTE from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
+import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
 
 const api: AxiosInstance = axios.create({
   baseURL: "/api",
@@ -71,6 +72,12 @@ function redirectToLogin() {
     "/invites",
   ];
   if (!exemptPaths.some((path) => window.location.pathname.startsWith(path))) {
+    // Forced logout (401 / expired session) must purge the persisted sidebar
+    // tree caches too: they contain page titles, and on a shared machine most
+    // sessions end via cookie expiry — not the logout button — so this is the
+    // only cleanup that runs on that path. It also disables further cache
+    // persistence until the full page load below.
+    clearPersistedTreeCaches();
     const redirectTo = window.location.pathname;
     if (redirectTo === APP_ROUTE.HOME) {
       window.location.href = APP_ROUTE.AUTH.LOGIN;

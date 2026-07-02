@@ -199,45 +199,66 @@ const SpaceTree = forwardRef<SpaceTreeApi, SpaceTreeProps>(function SpaceTree(
   const openIdsRef = useRef(openIds);
   openIdsRef.current = openIds;
 
-  // Reconnect refresh (#159 #8): on a socket reconnect, re-fetch and reconcile
-  // the children of every currently-open, already-loaded branch of THIS space,
+  // Re-fetch and reconcile the children of every currently-open, already-loaded
+  // branch of THIS space. Shared by the socket reconnect handler and the
+  // post-load cache refresh below. The ROOT level is reconciled separately by
+  // the root-query refetch + mergeRootTrees; an UNLOADED branch is skipped
+  // (lazy-load fetches it fresh on expand). Reads refs so it always sees the
+  // latest tree/open-state/space without re-creating the callback.
+  const refreshOpenBranches = useCallback(async () => {
+    const effectSpaceId = spaceIdRef.current;
+    const branchIds = loadedOpenBranchIds(
+      dataRef.current.filter((n) => n?.spaceId === effectSpaceId),
+      openIdsRef.current,
+    );
+    if (branchIds.length === 0) return;
+    for (const id of branchIds) {
+      try {
+        // `fresh: true` bypasses the 30-min sidebar-pages cache so the
+        // reconcile sees the server's CURRENT children (handler-order
+        // independent — no reliance on the global reconnect invalidation).
+        const fresh = await fetchAllAncestorChildren(
+          { pageId: id, spaceId: effectSpaceId },
+          { fresh: true },
+        );
+        if (spaceIdRef.current !== effectSpaceId) return; // space switched
+        setData((prev) => treeModel.reconcileChildren(prev, id, fresh));
+      } catch (err) {
+        console.error("[tree] open branch refresh failed", err);
+      }
+    }
+  }, [setData]);
+
+  // Reconnect refresh (#159 #8): on a socket reconnect, refresh open branches
   // so a move/rename/delete that happened INSIDE a loaded branch while events
   // were missed (laptop sleep / wifi gap) is reflected instead of left stale.
-  // The ROOT level is reconciled separately by the root-query refetch +
-  // mergeRootTrees; an UNLOADED branch is skipped (lazy-load fetches it fresh on
-  // expand). No first-connect guard is needed: space-tree usually mounts AFTER
-  // the initial connect, so every `connect` it sees is a reconnect; the rare
+  // No first-connect guard is needed: space-tree usually mounts AFTER the
+  // initial connect, so every `connect` it sees is a reconnect; the rare
   // initial-connect case has an empty tree, so the refresh is a harmless no-op.
   useEffect(() => {
     if (!socket) return;
-    const onConnect = async () => {
-      const effectSpaceId = spaceIdRef.current;
-      const branchIds = loadedOpenBranchIds(
-        dataRef.current.filter((n) => n?.spaceId === effectSpaceId),
-        openIdsRef.current,
-      );
-      if (branchIds.length === 0) return;
-      for (const id of branchIds) {
-        try {
-          // `fresh: true` bypasses the 30-min sidebar-pages cache so the
-          // reconcile sees the server's CURRENT children (handler-order
-          // independent — no reliance on the global reconnect invalidation).
-          const fresh = await fetchAllAncestorChildren(
-            { pageId: id, spaceId: effectSpaceId },
-            { fresh: true },
-          );
-          if (spaceIdRef.current !== effectSpaceId) return; // space switched
-          setData((prev) => treeModel.reconcileChildren(prev, id, fresh));
-        } catch (err) {
-          console.error("[tree] reconnect branch refresh failed", err);
-        }
-      }
+    const onConnect = () => {
+      refreshOpenBranches();
     };
     socket.on("connect", onConnect);
     return () => {
       socket.off("connect", onConnect);
     };
-  }, [socket, setData]);
+  }, [socket, refreshOpenBranches]);
+
+  // Post-load cache refresh: the sidebar paints instantly from the
+  // localStorage-cached tree, so children of open branches may be stale. Once
+  // the server root set has been merged for this space (isDataLoaded flips
+  // true), refresh every open, already-loaded branch ONCE per space per mount.
+  // dataRef.current is already up to date here: refs are assigned during
+  // render, and this effect runs after the merge-triggered re-render commit.
+  const refreshedSpacesRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!isDataLoaded) return;
+    if (refreshedSpacesRef.current.has(spaceId)) return;
+    refreshedSpacesRef.current.add(spaceId);
+    refreshOpenBranches();
+  }, [isDataLoaded, spaceId, refreshOpenBranches]);
 
   const handleToggle = useCallback(
     async (id: string, isOpen: boolean) => {
@@ -333,12 +354,17 @@ const SpaceTree = forwardRef<SpaceTreeApi, SpaceTreeProps>(function SpaceTree(
 
   return (
     <div className={classes.treeContainer}>
+      {/* "No pages yet" only after the SERVER confirmed the space is empty —
+          never while just the localStorage cache is empty. */}
       {isDataLoaded && filteredData.length === 0 && (
         <Text size="xs" c="dimmed" py="xs" px="sm">
           {t("No pages yet")}
         </Text>
       )}
-      {isDataLoaded && filteredData.length > 0 && (
+      {/* Cache-first paint: render as soon as ANY data exists (synchronous
+          localStorage hydration) instead of waiting for the server round-trip;
+          the background merge/refresh reconciles it afterwards. */}
+      {filteredData.length > 0 && (
         <DocTree<SpaceTreeNode>
           data={filteredData}
           openIds={openIds}

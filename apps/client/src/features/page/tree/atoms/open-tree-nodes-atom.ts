@@ -13,20 +13,30 @@ export type OpenMap = Record<string, boolean>;
 // `OpenMap | Promise<OpenMap>` and break the functional-updater setter below).
 const openTreeNodesStorage = createJSONStorage<OpenMap>(() => localStorage);
 
+// Single source of truth for the open-map localStorage key prefix. Exported so
+// the logout cache sweep (tree-data-atom.ts) removes keys by the SAME prefix
+// used to write them — a rename here can never silently desync the cleanup.
+export const OPEN_TREE_NODES_KEY_PREFIX = "openTreeNodes:";
+
 // One persisted open/closed map per (workspace, user). Scoping the localStorage
 // key prevents accounts that share a browser origin from leaking tree state.
 // `getOnInit: true` reads localStorage synchronously at atom init (not on mount),
 // so the first render already has the saved state — no collapse-then-expand
 // flicker on reload, and writes never run against an un-hydrated empty map.
 const openTreeNodesFamily = atomFamily((scopeKey: string) =>
-  atomWithStorage<OpenMap>(`openTreeNodes:${scopeKey}`, {}, openTreeNodesStorage, {
-    getOnInit: true,
-  }),
+  atomWithStorage<OpenMap>(
+    `${OPEN_TREE_NODES_KEY_PREFIX}${scopeKey}`,
+    {},
+    openTreeNodesStorage,
+    { getOnInit: true },
+  ),
 );
 
 // Resolve the storage scope from the current user. Fall back to "anon" for the
 // workspace/user parts when nothing is loaded yet (logged out / first paint).
-const scopeKeyAtom = atom((get) => {
+// Shared by the open-map atom below and the persisted tree-data atom
+// (tree-data-atom.ts) so both caches are scoped identically.
+export const scopeKeyAtom = atom((get) => {
   const currentUser = get(currentUserAtom);
   const workspaceId = currentUser?.workspace?.id ?? "anon";
   const userId = currentUser?.user?.id ?? "anon";
