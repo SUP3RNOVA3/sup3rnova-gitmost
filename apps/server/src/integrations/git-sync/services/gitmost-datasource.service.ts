@@ -47,6 +47,34 @@ const GIT_SYNC_PROVENANCE: AuthProvenanceData = {
 };
 
 /**
+ * Recursively serialize a JSON value with object keys sorted, so two values that
+ * differ ONLY in key order (or are otherwise structurally identical) compare
+ * equal. Arrays keep their order (order is meaningful in ProseMirror docs).
+ * Used to detect a semantically no-op body ingest despite an unstable
+ * markdown<->ProseMirror round-trip (see importPageMarkdown guard #2).
+ */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalize((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** True iff `a` and `b` are equal ignoring object key order. */
+function canonicalJsonEqual(a: unknown, b: unknown): boolean {
+  try {
+    return JSON.stringify(canonicalize(a)) === JSON.stringify(canonicalize(b));
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Native, in-process implementation of the engine's `GitSyncClient` seam
  * Reads go through repositories (PageRepo/SpaceRepo); body writes go
  * through collab `openDirectConnection` (§3.3); structural mutations
@@ -181,9 +209,55 @@ export class GitmostDataSourceService {
     fullMarkdown: string,
     baseMarkdown?: string | null,
   ): Promise<{ updatedAt?: string }> {
+    // Idempotency guard #1 (fixes GS-EDIT-REVERT + idle re-ingest churn). The
+    // reconcile can call this every poll cycle for a page whose vault file did
+    // NOT actually change since the last sync (non-idempotent change-detection
+    // upstream). Each such call re-imports the SAME vault body into the live
+    // collab doc — a no-op at idle, but it CLOBBERS a concurrent human edit that
+    // is still in the (debounced, not-yet-flushed) Yjs doc, silently reverting
+    // it within one poll. When `baseMarkdown` (the last-synced version) is
+    // byte-identical to the current file, there is genuinely nothing to ingest.
+    // A real git-side change makes the strings differ, so legitimate
+    // git->Docmost ingests still proceed.
+    const currentPage = await this.pageRepo.findById(pageId, {
+      includeContent: true,
+    });
+    if (baseMarkdown != null && fullMarkdown === baseMarkdown) {
+      return {
+        updatedAt: currentPage
+          ? new Date(currentPage.updatedAt).toISOString()
+          : undefined,
+      };
+    }
+
     const { parseDocmostMarkdown, markdownToProseMirror } = await loadGitSync();
     const { body } = parseDocmostMarkdown(fullMarkdown);
     const doc = await markdownToProseMirror(body);
+
+    // Idempotency guard #2 (defense-in-depth). Even when the vault file text
+    // differs cosmetically, the PARSED body can be SEMANTICALLY identical to the
+    // page's current Docmost content — the markdown<->ProseMirror round-trip is
+    // not byte-stable (e.g. JSON key order `{text,type}` vs `{type,text}`,
+    // default attrs), so upstream change-detection mis-flags such pages as
+    // changed every cycle. Compare by CANONICAL JSON (recursively key-sorted); if
+    // the incoming body already equals current content, this ingest is a no-op —
+    // skip it so a concurrent live edit is never clobbered and the vault never
+    // churns. A genuine content change is not canonically equal, so it proceeds.
+    const currentContent =
+      typeof currentPage?.content === 'string'
+        ? (() => {
+            try {
+              return JSON.parse(currentPage.content as unknown as string);
+            } catch {
+              return currentPage?.content;
+            }
+          })()
+        : currentPage?.content;
+    if (currentContent && canonicalJsonEqual(doc, currentContent)) {
+      return {
+        updatedAt: new Date(currentPage!.updatedAt).toISOString(),
+      };
+    }
 
     let baseDoc: unknown;
     if (baseMarkdown != null) {
@@ -346,12 +420,10 @@ export class GitmostDataSourceService {
     // LOCAL filesystem artifact and must NEVER become the page's real Docmost
     // title. A filename-derived title can carry it back in on ingest (observed:
     // intermittent same-title collision left a page permanently titled
-    // "Title ~<slugId>"). Strip it here, on the rename/update title-write path —
-    // NOTE this is NOT every git-sync title write: createPage's filename-derived
-    // title does not funnel through here. Strip ONLY when the trailing token
-    // equals THIS page's own slugId, so a genuine user title that legitimately
-    // ends in ` ~token` is never corrupted (slugId is a random nanoid; no real
-    // collision).
+    // "Title ~<slugId>"). Strip it at this single choke point every git-sync
+    // title write funnels through — but ONLY when the trailing token equals THIS
+    // page's own slugId, so a genuine user title that legitimately ends in
+    // ` ~token` is never corrupted (slugId is a random nanoid; no real collision).
     const suffix = ` ~${page.slugId}`;
     const cleanTitle =
       page.slugId && title.endsWith(suffix)
