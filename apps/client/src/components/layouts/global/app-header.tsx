@@ -53,7 +53,13 @@ export function AppHeader() {
               aria-label={t("Sidebar toggle")}
               opened={mobileOpened}
               onClick={toggleMobile}
-              hiddenFrom="sm"
+              // Must match the AppShell navbar breakpoint (md). The navbar
+              // collapses to the MOBILE drawer below md, so the mobile toggle
+              // (which flips mobileOpened) must be the one visible across the
+              // whole <md band — otherwise at 768-991 the desktop toggle showed
+              // but flipped the wrong atom, leaving the drawer unopenable (the
+              // regression from the initial sm->md navbar change).
+              hiddenFrom="md"
               size="sm"
             />
           </Tooltip>
@@ -63,7 +69,7 @@ export function AppHeader() {
               aria-label={t("Sidebar toggle")}
               opened={desktopOpened}
               onClick={toggleDesktop}
-              visibleFrom="sm"
+              visibleFrom="md"
               size="sm"
             />
           </Tooltip>
