@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { normalizeTableColumnWidths } from "./markdown-clipboard";
+import {
+  normalizeTableColumnWidths,
+  classifyClipboardSelection,
+} from "./markdown-clipboard";
 
 // normalizeTableColumnWidths mutates a DOM subtree (jsdom provides document).
 function root(html: string): HTMLElement {
@@ -122,5 +125,49 @@ describe("normalizeTableColumnWidths", () => {
     expect(
       Array.from(rows[1].children).map((c) => c.getAttribute("colwidth")),
     ).toEqual([null, null]);
+  });
+});
+
+describe("classifyClipboardSelection", () => {
+  it("serializes a list of 2+ items as markdown", () => {
+    expect(
+      classifyClipboardSelection([{ name: "bulletList", childCount: 2 }]),
+    ).toEqual({ asMarkdown: true, wrapBareRows: false });
+  });
+
+  it("leaves a single-item list as plain text", () => {
+    expect(
+      classifyClipboardSelection([{ name: "bulletList", childCount: 1 }]),
+    ).toEqual({ asMarkdown: false, wrapBareRows: false });
+  });
+
+  it("serializes a whole table without wrapping bare rows", () => {
+    expect(
+      classifyClipboardSelection([{ name: "table", childCount: 3 }]),
+    ).toEqual({ asMarkdown: true, wrapBareRows: false });
+  });
+
+  it("serializes a partial cell selection (bare rows) and flags wrapping", () => {
+    expect(
+      classifyClipboardSelection([
+        { name: "tableRow", childCount: 2 },
+        { name: "tableRow", childCount: 2 },
+      ]),
+    ).toEqual({ asMarkdown: true, wrapBareRows: true });
+  });
+
+  it("leaves plain paragraphs as plain text", () => {
+    expect(
+      classifyClipboardSelection([{ name: "paragraph", childCount: 1 }]),
+    ).toEqual({ asMarkdown: false, wrapBareRows: false });
+  });
+
+  it("does not wrap when rows are mixed with other block types", () => {
+    expect(
+      classifyClipboardSelection([
+        { name: "tableRow", childCount: 2 },
+        { name: "paragraph", childCount: 1 },
+      ]),
+    ).toEqual({ asMarkdown: false, wrapBareRows: false });
   });
 });

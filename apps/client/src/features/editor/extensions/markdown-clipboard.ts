@@ -27,24 +27,36 @@ export const MarkdownClipboard = Extension.create({
         key: new PluginKey("markdownClipboard"),
         props: {
           clipboardTextSerializer: (slice) => {
-            const listTypes = ["bulletList", "orderedList", "taskList"];
-            let topLevelCount = 0;
-            let hasList = false;
+            const topLevelNodes: { name: string; childCount: number }[] = [];
             slice.content.forEach((node) => {
-              if (listTypes.includes(node.type.name)) {
-                hasList = true;
-                topLevelCount += node.childCount;
-              } else {
-                topLevelCount++;
-              }
+              topLevelNodes.push({
+                name: node.type.name,
+                childCount: node.childCount,
+              });
             });
 
-            if (!hasList || topLevelCount < 2) return null;
+            const { asMarkdown, wrapBareRows } =
+              classifyClipboardSelection(topLevelNodes);
+            if (!asMarkdown) return null;
 
             const div = document.createElement("div");
             const serializer = DOMSerializer.fromSchema(this.editor.schema);
             const fragment = serializer.serializeFragment(slice.content);
-            div.appendChild(fragment);
+
+            if (wrapBareRows) {
+              // A partial table cell-selection serializes to bare <tr> nodes
+              // (prosemirror-tables returns the whole `table` node only when the
+              // entire table is selected). Bare <tr> would be foster-parented
+              // away by the HTML parser inside htmlToMarkdown, so wrap them in
+              // <table><tbody> first for the GFM turndown rule to detect them.
+              const table = document.createElement("table");
+              const tbody = document.createElement("tbody");
+              tbody.appendChild(fragment);
+              table.appendChild(tbody);
+              div.appendChild(table);
+            } else {
+              div.appendChild(fragment);
+            }
             return htmlToMarkdown(div.innerHTML);
           },
           handlePaste: (view, event, slice) => {
@@ -152,6 +164,55 @@ export const MarkdownClipboard = Extension.create({
     ];
   },
 });
+
+/**
+ * Decide whether a copied slice's plain-text clipboard payload should be
+ * serialized as Markdown (instead of ProseMirror's default text serializer,
+ * which joins block leaves with newlines — the "one value per line" bug for
+ * tables).
+ *
+ * Serialize as Markdown for structured content:
+ *  - lists with 2+ total items (a single copied bullet stays literal text);
+ *  - a whole table (top-level `table` node);
+ *  - a partial table cell-selection, which prosemirror-tables copies as bare
+ *    `tableRow` nodes (only a full-table selection yields a `table` node).
+ *
+ * `wrapBareRows` flags the bare-rows case so the caller wraps the serialized
+ * <tr> nodes in <table><tbody> before the HTML->Markdown step. Plain paragraphs
+ * return asMarkdown=false so a simple text copy stays literal, and internal
+ * copy/paste keeps using the richer text/html clipboard payload.
+ */
+export function classifyClipboardSelection(
+  nodes: { name: string; childCount: number }[],
+): { asMarkdown: boolean; wrapBareRows: boolean } {
+  const listTypes = ["bulletList", "orderedList", "taskList"];
+  let topLevelCount = 0;
+  let hasList = false;
+  let hasTable = false;
+  let tableRowCount = 0;
+  let nonRowCount = 0;
+
+  for (const node of nodes) {
+    if (listTypes.includes(node.name)) {
+      hasList = true;
+      topLevelCount += node.childCount;
+      nonRowCount++;
+    } else {
+      if (node.name === "table") hasTable = true;
+      if (node.name === "tableRow") tableRowCount++;
+      else nonRowCount++;
+      topLevelCount++;
+    }
+  }
+
+  // Bare tableRow nodes at the top level only occur for a partial cell
+  // selection; a slice never mixes bare rows with other block types, so
+  // "every top-level node is a row" is a safe signal to wrap-and-serialize.
+  const wrapBareRows = tableRowCount > 0 && nonRowCount === 0;
+  const asMarkdown =
+    (hasList && topLevelCount >= 2) || hasTable || wrapBareRows;
+  return { asMarkdown, wrapBareRows };
+}
 
 /**
  * Reorder/dedup the footnotes of a SELF-CONTAINED pasted markdown block to the
