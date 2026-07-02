@@ -86,6 +86,11 @@ export interface GitHttpBackendRequest {
   contentType: string;
   /** The Git-Protocol request header value, or undefined when absent. */
   gitProtocol?: string;
+  /** Content-Encoding request header (e.g. `gzip`), or undefined when absent.
+   * git gzips RPC bodies >1KiB; http-backend only inflates when HTTP_CONTENT_ENCODING
+   * is present, so it MUST be forwarded or a non-trivial `git pull` fails with
+   * `fatal: expected 'packfile'` (review #4). */
+  contentEncoding?: string;
   /** Authenticated user email — used as REMOTE_USER (reflog identity). */
   remoteUser: string;
 }
@@ -130,6 +135,14 @@ export function buildGitBackendCgiEnv(
   // GIT_PROTOCOL is only set when the client sent the Git-Protocol header.
   if (parsed.gitProtocol) {
     cgiEnv.GIT_PROTOCOL = parsed.gitProtocol;
+  }
+  // HTTP_CONTENT_ENCODING must be forwarded so git http-backend inflates a
+  // gzip'd RPC body (git compresses receive-pack/upload-pack bodies >1KiB).
+  // Without it a non-trivial `git pull` negotiation fails deterministically with
+  // `fatal: expected 'packfile'` (review #4). The body is piped to stdin as-is
+  // (no upstream decompression), so the CGI must do the inflate.
+  if (parsed.contentEncoding) {
+    cgiEnv.HTTP_CONTENT_ENCODING = parsed.contentEncoding;
   }
   return cgiEnv;
 }

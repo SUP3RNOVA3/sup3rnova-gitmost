@@ -345,6 +345,9 @@ export class GitHttpService implements OnModuleDestroy {
       queryString: this.extractQueryString(req.url),
       contentType: this.headerValue(req.headers['content-type']) ?? '',
       gitProtocol: this.headerValue(req.headers['git-protocol']),
+      // Forward Content-Encoding so http-backend inflates gzip'd RPC bodies
+      // (review #4) — else a non-trivial `git pull` fails with expected 'packfile'.
+      contentEncoding: this.headerValue(req.headers['content-encoding']),
       remoteUser: user.email,
     };
 
@@ -389,9 +392,30 @@ export class GitHttpService implements OnModuleDestroy {
           service === 'git-upload-pack') ||
           parsedPath.subpath === 'HEAD');
       if (isReadAdvertise) {
-        await this.orchestrator.serveReadAdvertisement(spaceId, () =>
-          this.backend.run(backendRequest, rawReq, rawRes),
-        );
+        // The read-advertise path runs under the space lock (to pin HEAD=main).
+        // AFTER reply.hijack() Fastify no longer manages this response, so a
+        // rejection here (e.g. SpaceLockService.acquire when Redis is down) would
+        // otherwise leave the socket open forever — every clone/fetch hangs until
+        // the client times out (review #5). Mirror the push branch: catch, answer
+        // 500 if nothing was written yet, and always end the raw socket.
+        try {
+          await this.orchestrator.serveReadAdvertisement(spaceId, () =>
+            this.backend.run(backendRequest, rawReq, rawRes),
+          );
+        } catch (err) {
+          this.logger.error(
+            `git-sync: read advertisement failed for space ${spaceId}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          if (!rawRes.headersSent) {
+            rawRes.statusCode = 500;
+            rawRes.setHeader('Content-Type', 'text/plain');
+            rawRes.end('Internal server error');
+          } else if (!rawRes.writableEnded) {
+            rawRes.end();
+          }
+        }
       } else {
         await this.backend.run(backendRequest, rawReq, rawRes);
       }
