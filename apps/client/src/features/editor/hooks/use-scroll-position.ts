@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import type { Editor } from "@tiptap/react";
 
 // Throttle interval for persisting the scroll position while the user reads.
 const SAVE_THROTTLE_MS = 250;
@@ -242,4 +243,38 @@ export function useScrollPosition(pageId: string): {
   }, []);
 
   return { restoreScrollPosition };
+}
+
+/**
+ * Wires `useScrollPosition` to the page editor's static->live swap lifecycle.
+ *
+ * Extracted from PageEditor so the exact restore triggers (their deps and the
+ * post-swap `&& editor` guard) are directly unit-testable rather than mirrored.
+ * Behaviour is unchanged: `restoreScrollPosition` is idempotent, so re-asserting
+ * the same target from either trigger is a no-op.
+ *
+ * @param pageId      the page whose scroll position is persisted/restored.
+ * @param editor      the tiptap editor instance, or `null` until it is ready.
+ * @param showStatic  whether the static (cached) content is still shown.
+ */
+export function useScrollRestoreOnSwap(
+  pageId: string,
+  editor: Editor | null,
+  showStatic: boolean,
+): void {
+  const { restoreScrollPosition } = useScrollPosition(pageId);
+
+  // Restore as early as the static (cached) content is laid out, before paint,
+  // so the reader's position is applied without a visible jump. Aborts itself if
+  // the reader has already started scrolling (handled inside the hook).
+  useLayoutEffect(() => {
+    restoreScrollPosition();
+  }, [restoreScrollPosition]);
+
+  // Re-assert once after the static -> live editor swap in case the swap reset
+  // the window scroll. Idempotent: a no-op when the position is already correct,
+  // and a no-op after the reader has interacted.
+  useLayoutEffect(() => {
+    if (!showStatic && editor) restoreScrollPosition();
+  }, [showStatic, editor, restoreScrollPosition]);
 }

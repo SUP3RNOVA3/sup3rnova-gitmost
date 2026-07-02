@@ -2,7 +2,6 @@ import "@/features/editor/styles/index.css";
 import React, {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -79,7 +78,7 @@ import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
-import { useScrollPosition } from "./hooks/use-scroll-position";
+import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
@@ -144,7 +143,6 @@ export default function PageEditor({
     [isComponentMounted],
   );
   const { handleScrollTo } = useEditorScroll({ canScroll });
-  const { restoreScrollPosition } = useScrollPosition(pageId);
   // Providers only created once per pageId
   const providersRef = useRef<{
     local: IndexeddbPersistence;
@@ -483,19 +481,10 @@ export default function PageEditor({
     }
   }, [yjsConnectionStatus, isSynced]);
 
-  // Restore as early as the static (cached) content is laid out, before paint,
-  // so the reader's position is applied without a visible jump. Aborts itself if
-  // the reader has already started scrolling (handled inside the hook).
-  useLayoutEffect(() => {
-    restoreScrollPosition();
-  }, [restoreScrollPosition]);
-
-  // Re-assert once after the static -> live editor swap in case the swap reset
-  // the window scroll. Idempotent: a no-op when the position is already correct,
-  // and a no-op after the reader has interacted.
-  useLayoutEffect(() => {
-    if (!showStatic && editor) restoreScrollPosition();
-  }, [showStatic, editor, restoreScrollPosition]);
+  // Restore the reader's scroll position across the static -> live editor swap.
+  // The wiring (early pre-paint restore + post-swap re-assert) lives in the hook
+  // so its triggers/guard are directly unit-testable.
+  useScrollRestoreOnSwap(pageId, editor, showStatic);
 
   return (
     <TransclusionLookupProvider>
