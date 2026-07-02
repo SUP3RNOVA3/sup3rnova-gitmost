@@ -71,3 +71,22 @@
   }
 }
 
+/* Inline image rows (#284): center the anonymous line boxes formed by
+   consecutive [data-image-align="inline"] node-view containers. A row has no
+   DOM wrapper of its own, so its horizontal placement is controlled by the
+   text-align of the nearest block ancestor (the editor root or a nested
+   block container: blockquote, callout, list item, table cell, details).
+   Centering is enabled only in containers that actually hold an inline
+   image (:has), and every other child of such a container gets its default
+   alignment back so ordinary text is unaffected. Explicit per-block
+   alignment from the toolbar is an inline style and still wins. Browsers
+   without :has() degrade to left-pinned rows. */
+.ProseMirror:has(> [data-image-align="inline"]),
+.ProseMirror :has(> [data-image-align="inline"]) {
+  text-align: center;
+}
+
+.ProseMirror:has(> [data-image-align="inline"]) > :not([data-image-align="inline"]),
+.ProseMirror :has(> [data-image-align="inline"]) > :not([data-image-align="inline"]) {
+  text-align: start;
+}

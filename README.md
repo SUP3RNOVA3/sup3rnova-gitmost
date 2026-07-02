@@ -104,7 +104,7 @@ community feature, with no enterprise license. Open it from the page header; the
 - ✅ **Page templates** — flag a page as a template and embed its whole content live into other pages; edits to the template propagate to every place it is inserted (whole-page transclusion on top of the existing synced blocks).
 - ✅ **Public-share AI assistant** — anonymous visitors of a shared page can ask the AI agent, scoped strictly to that share's page tree (read-only, share-scoped search), behind a workspace toggle.
 - ✅ **Footnotes** — academic-style footnotes: a numbered superscript reference inline (read it in place via a hover popover), with the note text living as a real, editable block at the bottom of the page; auto-numbered, collaboration-safe, and round-trips through Markdown export/import and the AI agent / MCP.
-- ✅ **Temporary notes** — mark a note as temporary and it auto-moves to Trash after a configurable per-workspace lifetime (default 24h) unless made permanent first; create one in a click from the Home screen, any space overview, or the space sidebar, with a "Make permanent" rescue banner on the open note.
+- ✅ **Temporary notes** — create a note as temporary and it auto-moves to Trash after a configurable per-workspace lifetime (default 24h) unless made permanent first; create one in a click from the Home screen, any space overview.
 
 ### In progress
 
@@ -187,14 +187,17 @@ start the new migrations apply on top of your existing schema (`CREATE EXTENSION
 - Spaces
 - Permissions management
 - Groups
-- Comments (with resolve / re-open)
+- Comments (with resolve / re-open and hover tooltips showing the comment text)
 - Page history
 - Search
 - File attachments
 - Embeds (Airtable, Loom, Miro and more)
 - Translations (10+ languages)
 - Embedded MCP server (`/mcp`)
-- AI agent chat over your wiki (read + write, RAG search, external MCP / web access)
+- AI agent chat over your wiki (read + write, RAG search, external MCP / web access); the chat window docks into the side menu, and the agent is told about your in-page edits between turns
+- Code-block buttons as an overlay, with the language selector revealed on hover
+- Stress-accent button (U+0301) in the bubble menu
+- Reading scroll position restored on reload
 
 ### Screenshots
 
