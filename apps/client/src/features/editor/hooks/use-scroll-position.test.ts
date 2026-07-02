@@ -303,6 +303,55 @@ describe("useScrollPosition", () => {
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 200, behavior: "auto" });
   });
 
+  it("(k) shares ONE timeout budget across re-triggers (does not restart the clock)", () => {
+    // The static->live editor swap re-invokes restore. The shared budget
+    // (restoreStartRef) must measure the MAX_RESTORE_WAIT_MS (5000) deadline
+    // from the FIRST trigger, not restart it on every re-trigger. This pins
+    // the `if (restoreStartRef.current === null)` guard: a mutant that resets
+    // `restoreStartRef.current = Date.now()` on every trigger would push the
+    // deadline out to t=8000 (3000 + 5000) and fail the t=5000 assertion below.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    window.sessionStorage.setItem(`${KEY_PREFIX}k1`, "5000");
+    setInnerHeight(800);
+    setScrollHeight(1000); // maxScroll = 200, never reaches 5000 -> it polls.
+
+    const { result } = renderHook(() => useScrollPosition("k1"));
+
+    // First trigger at t=0: starts the shared budget and begins polling.
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // Advance to t=3000 (still polling: content short, not yet timed out).
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // Second trigger at t=3000 (the swap re-assert). Under the real code the
+    // budget is shared, so `start` stays 0; under the reset-mutant it becomes 3000.
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    // At t=4900 the FIRST budget has not yet elapsed (4900 - 0 < 5000): no clamp.
+    act(() => {
+      vi.advanceTimersByTime(1900);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // At t=5000 the shared budget (measured from t=0) times out and clamps to the
+    // furthest reachable position (maxScroll = 200). The reset-mutant, measuring
+    // from t=3000, would still be waiting (5000 - 3000 = 2000 < 5000) and would
+    // NOT have scrolled here -> this assertion fails against that mutant.
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 200, behavior: "auto" });
+  });
+
   it("(e) never throws when storage access throws", () => {
     const err = new Error("storage denied");
     vi.spyOn(window.sessionStorage, "getItem").mockImplementation(() => {
