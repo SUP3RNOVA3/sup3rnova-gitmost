@@ -8,9 +8,6 @@
  */
 
 export type Settings = {
-  docmostApiUrl: string;
-  docmostEmail: string;
-  docmostPassword: string;
   docmostSpaceId: string;
   vaultPath: string;
   gitRemote?: string;

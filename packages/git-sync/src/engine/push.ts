@@ -486,9 +486,10 @@ export const LAST_PUSHED_REF = "refs/docmost/last-pushed";
 export const DOCMOST_BRANCH = "docmost";
 
 /**
- * Injectable IO for `applyPushActions`. The real `main` (NEXT increment) wires
- * these to the live client, `node:fs/promises`, and the vault git wrapper; this
- * increment drives them only through FAKES in tests (no live destructive run).
+ * Injectable IO for `applyPushActions`. In production these are wired to the live
+ * client (the native GitmostDataSource), `node:fs/promises`, and the vault git
+ * wrapper — `applyPushActions` runs LIVE via runPush -> runCycle -> the
+ * orchestrator's driveCycle. Tests substitute FAKES through the same seam.
  *   - `client`: the create/update/delete/move/rename subset of `GitSyncClient`.
  *   - `readFile`/`writeFile`: read a changed file's body / write a file back
  *     (by vault-relative path; the applier does not resolve absolute paths so
@@ -645,13 +646,13 @@ export interface ApplyPushResult {
 }
 
 /**
- * THIN IO applier for the COMMON push cases (create/update/delete). Exercised
- * via FAKES only in this increment — there is no live wiring.
+ * THIN IO applier for the COMMON push cases (create/update/delete). Runs LIVE in
+ * production (via runPush -> runCycle -> orchestrator); tests drive it with FAKES.
  *
  *   - UPDATE: read the file body, then `client.importPageMarkdown(pageId, body)`.
  *     This is the collab/Yjs write path (SPEC §2/§15.6) — NEVER a raw jsonb
- *     overwrite. The full self-contained markdown (meta + body) is sent as-is;
- *     `importPageMarkdown` parses the meta/body itself.
+ *     overwrite. The file's markdown is sent as-is; `importPageMarkdown` parses
+ *     the meta/body itself.
  *   - CREATE: derive title/spaceId/parentPageId from the file's current meta,
  *     `client.createPage(...)`, take the assigned pageId from the result, and
  *     write it BACK as the file's `gitmost_id` frontmatter (re-serialized via
@@ -1379,8 +1380,8 @@ function extractUpdatedAt(result: unknown): { updatedAt?: string } {
 // Docmost writes, NO ref advance); an explicit `--apply` is the ONLY path that
 // builds a client and mutates Docmost.
 //
-// Every external effect is injected (`PushDeps`) so the whole orchestration is
-// driven by FAKES in tests — no live Docmost, git, fs, or network.
+// Every external effect is injected (`PushDeps`): production wires the live
+// Docmost client, git, and fs; tests substitute FAKES through the same seam.
 
 /**
  * The human ("local") git identity used for engine-made commits on `main` in the

@@ -20,11 +20,13 @@ import { buildLcsTable } from './lcs';
  * no-op (zero Yjs operations). Yjs then CRDT-merges the minimal ops with any
  * concurrent edits.
  *
- * Limitation (honest): this is a 2-way merge (live vs incoming). For a block that
- * BOTH sides changed since the last sync it cannot tell which is newer without a
- * common ancestor, so the incoming (git) version wins for that one block. A full
- * 3-way merge would need the last-synced base plumbed from the engine; the common
- * cases — unchanged resync, and edits to DIFFERENT blocks — are handled losslessly.
+ * Merge mode: a THREE-WAY merge (live vs incoming vs base) runs whenever the
+ * engine plumbs the last-synced base (`baseMarkdown` from refs/docmost/last-pushed)
+ * — which it now does end-to-end — so a block both sides changed is a genuine
+ * conflict resolved deterministically (git wins that block; the prior state is
+ * preserved in page history). Only when NO base is available (a brand-new file)
+ * does it fall back to a 2-way merge (live vs incoming). Common cases — unchanged
+ * resync and edits to DIFFERENT blocks — are lossless in both modes.
  */
 
 type XmlNode = Y.XmlElement | Y.XmlText | Y.XmlHook;

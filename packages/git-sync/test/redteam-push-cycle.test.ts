@@ -15,9 +15,6 @@ import { serializePageFile } from '../src/lib/page-file';
 
 function makeSettings(): Settings {
   return {
-    docmostApiUrl: 'https://docmost.example.com',
-    docmostEmail: 'you@example.com',
-    docmostPassword: 'secret',
     docmostSpaceId: 'space-1',
     vaultPath: '/vault',
     pollIntervalMs: 15000,

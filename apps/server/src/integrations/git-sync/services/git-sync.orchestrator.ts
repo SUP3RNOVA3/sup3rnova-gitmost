@@ -140,10 +140,9 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
   // --- one sync cycle for a space -------------------------------
 
   /**
-   * Build the engine `Settings` for a space. The engine's REST-era fields
-   * (docmostApiUrl/email/password) are unused on the native path — the
-   * datasource writes in-process — so they are placeholders; only `vaultPath`
-   * and the tunables are load-bearing today.
+   * Build the engine `Settings` for a space. The datasource writes in-process,
+   * so only `vaultPath`, `docmostSpaceId` and the tunables are load-bearing; the
+   * dead REST-era fields (docmostApiUrl/email/password) were removed (review).
    *
    * `gitRemote` is NOT yet consumed: the vendored engine has no remote-push path
    * (see engine/git.ts, engine/pull.ts, SPEC §7 — remote push is deferred), so
@@ -174,9 +173,6 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       .where('id', '=', spaceId)
       .executeTakeFirst();
     return {
-      docmostApiUrl: 'http://native.local',
-      docmostEmail: 'native@local',
-      docmostPassword: 'native',
       docmostSpaceId: spaceId,
       vaultPath: this.vaultRegistry.vaultPath(spaceId),
       gitRemote,
@@ -492,6 +488,17 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
    */
   onModuleInit(): void {
     if (!this.environmentService.isGitSyncEnabled()) return;
+
+    // GIT_SYNC_REMOTE_TEMPLATE is inert scaffolding: the vendored engine has no
+    // remote-push path yet (SPEC §7), so setting it does nothing today. Warn once
+    // at startup so an operator who configured it isn't left with a silent no-op
+    // (review). Remove this warning when the engine grows a remote-push path.
+    if (this.environmentService.getGitSyncRemoteTemplate()) {
+      this.logger.warn(
+        'git-sync: GIT_SYNC_REMOTE_TEMPLATE is set but NOT yet consumed — ' +
+          'remote push is deferred (SPEC §7); this value currently has no effect.',
+      );
+    }
 
     const ms = this.environmentService.getGitSyncPollIntervalMs();
     const handle = setInterval(() => {

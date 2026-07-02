@@ -33,9 +33,6 @@ async function gitAvailable(): Promise<boolean> {
 /** A minimal valid Settings fixture (only fields runPush reads matter). */
 function makeSettings(vaultPath: string): Settings {
   return {
-    docmostApiUrl: 'https://docmost.example.com',
-    docmostEmail: 'you@example.com',
-    docmostPassword: 'secret',
     docmostSpaceId: 'space-1',
     vaultPath,
     pollIntervalMs: 15000,

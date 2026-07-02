@@ -70,14 +70,16 @@ export interface GitSyncClient {
   // --- writes (push) --------------------------------------------------------
 
   /**
-   * Merge a page's body from a self-contained markdown file (meta + body). The
-   * collab/Yjs write path (SPEC §2/§15.6) — never a raw jsonb overwrite.
-   * `applyPushActions` reads only an optional `updatedAt` off the result
-   * (via `extractUpdatedAt`, tolerant of extra fields).
+   * Merge a page's markdown BODY into the live page. `applyPushActions` passes
+   * the file's body with the frontmatter AND any git conflict markers already
+   * stripped — NOT the raw self-contained file — so `fullMarkdown` here is clean
+   * body text (the datasource re-parses defensively). The collab/Yjs write path
+   * (SPEC §2/§15.6) — never a raw jsonb overwrite. `applyPushActions` reads only
+   * an optional `updatedAt` off the result (via `extractUpdatedAt`).
    *
-   * `baseMarkdown` is the last-synced version of the file (`refs/docmost/
-   * last-pushed`), the common ancestor for a THREE-WAY merge against the live
-   * doc so concurrent human edits survive (review #5). Optional/null -> 2-way.
+   * `baseMarkdown` is the last-synced body (from `refs/docmost/last-pushed`,
+   * likewise stripped), the common ancestor for a THREE-WAY merge against the
+   * live doc so concurrent human edits survive (review #5). Optional/null -> 2-way.
    */
   importPageMarkdown(
     pageId: string,

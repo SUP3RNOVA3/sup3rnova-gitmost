@@ -31,9 +31,6 @@ async function gitAvailable(): Promise<boolean> {
 
 function makeSettings(vaultPath: string): Settings {
   return {
-    docmostApiUrl: "https://docmost.example.com",
-    docmostEmail: "you@example.com",
-    docmostPassword: "secret",
     docmostSpaceId: "space-1",
     vaultPath,
     pollIntervalMs: 15000,
