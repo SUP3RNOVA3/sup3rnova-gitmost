@@ -85,11 +85,17 @@ const INTERRUPT_NOTE =
 const PAGE_CHANGED_NOTE =
   'NOTE: The user edited the open page AFTER your last response in this ' +
   'conversation, so any copy of that page you produced or remember from earlier ' +
-  'is now STALE. The unified diff below shows exactly what changed since you last ' +
-  'spoke (lines starting with "-" were removed, "+" were added) and is the source ' +
-  'of truth. Preserve the user\'s edits: build on the current page, do not revert ' +
-  'or overwrite their changes. If you need the full up-to-date page, re-read it ' +
-  'with the getPage tool before editing.';
+  'is now STALE and must not be reused. Before you edit the page, you MUST first ' +
+  're-read its current content with the getPage tool and base your work on that ' +
+  'live version — never on your earlier copy or on the transcript. The unified ' +
+  'diff below shows exactly what the user changed since you last spoke (lines ' +
+  'starting with "-" were removed, "+" were added) and is the source of truth. ' +
+  'Preserve every one of the user\'s edits: make the smallest change that ' +
+  'satisfies the request using the targeted edit tools (editPageText, patchNode, ' +
+  'insertNode, deleteNode) rather than replacing the whole page, and do not ' +
+  'revert, drop, or overwrite anything the user changed. If a full rewrite is ' +
+  'truly unavoidable, start from the current getPage content and carry over all ' +
+  'of the user\'s edits.';
 
 /**
  * Sanitize a value interpolated into a prompt XML-ish attribute (e.g.

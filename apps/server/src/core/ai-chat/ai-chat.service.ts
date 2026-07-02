@@ -685,7 +685,7 @@ export class AiChatService implements OnModuleInit {
     // no-op (guarded below) so the turn still streams to the user.
     let assistantId: string | undefined;
     try {
-      const seed = flushAssistant([], '', 'streaming');
+      const seed = flushAssistant([], '', 'streaming', { pageChanged });
       const seeded = await this.aiChatMessageRepo.insert({
         chatId,
         workspaceId: workspace.id,
@@ -720,7 +720,7 @@ export class AiChatService implements OnModuleInit {
         await this.aiChatMessageRepo.update(
           assistantId,
           workspace.id,
-          flushAssistant(capturedSteps, '', 'streaming'),
+          flushAssistant(capturedSteps, '', 'streaming', { pageChanged }),
           { onlyIfStreaming: true },
         );
       } catch (err) {
@@ -860,6 +860,7 @@ export class AiChatService implements OnModuleInit {
               // resolved from the admin-configured provider settings (in
               // closure scope here). Omitted/0 = no limit.
               maxContextTokens: resolved?.chatContextWindow,
+              pageChanged,
             }),
           );
           // Lifecycle: release the external MCP clients leased for this turn.
@@ -911,6 +912,7 @@ export class AiChatService implements OnModuleInit {
           await finalizeAssistant(
             flushAssistant(capturedSteps, inProgressText, 'error', {
               error: errorText,
+              pageChanged,
             }),
           );
           await closeExternalClients();
@@ -940,7 +942,9 @@ export class AiChatService implements OnModuleInit {
               `steps=${steps.length}`,
           );
           await finalizeAssistant(
-            flushAssistant(capturedSteps, inProgressText, 'aborted'),
+            flushAssistant(capturedSteps, inProgressText, 'aborted', {
+              pageChanged,
+            }),
           );
           await closeExternalClients();
           // Advance the page snapshot even on abort (#274): an agent edit that
@@ -1506,6 +1510,7 @@ export function flushAssistant(
     contextTokens?: number;
     maxContextTokens?: number;
     error?: string;
+    pageChanged?: { title: string; diff: string } | null;
   },
 ): AssistantFlush {
   const finished = capturedSteps ?? [];
@@ -1538,6 +1543,15 @@ export function flushAssistant(
   if (extra?.maxContextTokens)
     metadata.maxContextTokens = extra.maxContextTokens;
   if (extra?.error) metadata.error = extra.error;
+  // Persist the page-change diff the agent saw this turn (#274 observability),
+  // so history / the Markdown export can show what the user changed. Only when
+  // a non-empty diff was actually injected into the prompt this turn.
+  if (extra?.pageChanged && extra.pageChanged.diff?.trim().length) {
+    metadata.pageChanged = {
+      title: extra.pageChanged.title,
+      diff: extra.pageChanged.diff,
+    };
+  }
 
   return {
     content: stepsText + trailing,

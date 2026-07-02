@@ -269,6 +269,168 @@ describe('buildChatMarkdown (server) — structure', () => {
     expect(md).toContain('**⚠️ Error:** 401: Unauthorized');
   });
 
+  // #274 observability: an assistant row whose turn started with a user edit to
+  // the open page carries metadata.pageChanged = { title, diff }; the export
+  // renders the diff the agent saw, before the message body.
+  it('renders the persisted page-change diff block for an assistant row', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [
+        row({
+          role: 'assistant',
+          content: 'answer',
+          metadata: {
+            pageChanged: { title: 'Doc', diff: '@@ -1 +1 @@\n-old\n+new' },
+          } as never,
+        }),
+      ],
+    });
+    expect(md).toContain(
+      'The user edited this page before this turn; the diff the agent saw:',
+    );
+    expect(md).toContain('("Doc")');
+    expect(md).toContain('-old');
+    expect(md).toContain('+new');
+    // The diff sits before the message body (chronological: change, then reply).
+    expect(md.indexOf('-old')).toBeLessThan(md.indexOf('answer'));
+  });
+
+  it('does not render the page-change block when metadata.pageChanged is absent', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [row({ role: 'assistant', content: 'answer' })],
+    });
+    expect(md).not.toContain(
+      'The user edited this page before this turn; the diff the agent saw:',
+    );
+  });
+
+  // #288 F1/F2: an empty page title must render the BARE heading with no
+  // `("…")` suffix (the `pc.title ? … : …` false branch).
+  it('renders the page-change heading with no title suffix when title is empty', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [
+        row({
+          role: 'assistant',
+          content: 'answer',
+          metadata: {
+            pageChanged: { title: '', diff: '@@ -1 +1 @@\n-old\n+new' },
+          } as never,
+        }),
+      ],
+    });
+    // Bare heading, single line, no parenthesized title.
+    expect(md).toContain(
+      '> **📝 The user edited this page before this turn; the diff the agent saw:**',
+    );
+    expect(md).not.toContain('("');
+    expect(md).toContain('-old');
+  });
+
+  // #288 F1: the page title is UNTRUSTED cross-user data, so a title carrying a
+  // newline / backtick / `"` / `<`/`>` must be neutralized by escapeAttr before
+  // it is interpolated into the `> **…**` blockquote heading — otherwise it
+  // could break the blockquote onto multiple lines or inject markup/HTML into
+  // the downloaded .md. escapeAttr strips `<>"` and collapses whitespace runs to
+  // a single space, so `Ev"il\n> `x` <b>` becomes ``Evil `x` b``.
+  it('escapes an untrusted page title in the page-change heading', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [
+        row({
+          role: 'assistant',
+          content: 'answer',
+          metadata: {
+            pageChanged: {
+              title: 'Ev"il\n> `x` <b>',
+              diff: '@@ -1 +1 @@\n-old\n+new',
+            },
+          } as never,
+        }),
+      ],
+    });
+    // The heading stays a single blockquote line with the escaped title.
+    expect(md).toContain(
+      '> **📝 The user edited this page before this turn; the diff the agent saw: ("Evil `x` b")**',
+    );
+    // No raw attribute/markup breakers survived from the title.
+    expect(md).not.toContain('Ev"il');
+    expect(md).not.toContain('<b>');
+  });
+
+  // #288 review F1: escapeAttr ALONE is insufficient for this MARKDOWN sink —
+  // link/image syntax survives it. A cross-user title with `![x](url)` /
+  // `[phish](url)` must NOT become a working remote image or clickable link in
+  // the downloaded .md; markdownHeadingSafe backslash-escapes `[`/`]` so both are
+  // inert. (Non-vacuous: fails against the escapeAttr-only version, which left
+  // `](https://` intact.)
+  it('neutralizes markdown link/image syntax in an untrusted page title', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [
+        row({
+          role: 'assistant',
+          content: 'answer',
+          metadata: {
+            pageChanged: {
+              title:
+                '![x](https://attacker.example/t.png) and [click](https://phish.example)',
+              diff: '@@ -1 +1 @@\n-old\n+new',
+            },
+          } as never,
+        }),
+      ],
+    });
+    // No WORKING image/link syntax survives — the `[…]` sits escaped as `\[…\]`,
+    // so the unescaped `![x](` image and `[click](` link markers are gone. (We
+    // deliberately do NOT assert `not.toContain('](https://')`: after escaping the
+    // literal `\](https://` still contains `](https://` as a raw substring — that
+    // check would false-fail even though the link is inert.)
+    expect(md).not.toContain('![x](');
+    expect(md).not.toContain('[click](');
+    // The brackets are backslash-escaped, so `[text](url)`/`![text](url)` are inert.
+    expect(md).toContain('\\[');
+    expect(md).toContain('\\]');
+    // The heading stays a SINGLE blockquote line (no newline injected).
+    const headingLine = md
+      .split('\n')
+      .find((l) => l.includes('the diff the agent saw:'));
+    expect(headingLine).toBeDefined();
+    expect(headingLine).toContain('\\[x\\]');
+    expect(headingLine).toContain('\\[click\\]');
+  });
+
+  // #288 internal review Finding 2: a NON-empty title made up entirely of
+  // escapeAttr breakers (`<>"`) escapes to '' — the ternary must then fall to the
+  // BARE heading with NO `("…")` suffix. Locks the ternary-on-escaped-value
+  // behavior (distinct from the empty-string input test above).
+  it('renders the bare heading for a title that escapes to empty', () => {
+    const md = buildChatMarkdown({
+      title: 'T',
+      chatId: 'c',
+      rows: [
+        row({
+          role: 'assistant',
+          content: 'answer',
+          metadata: {
+            pageChanged: { title: '<>"', diff: '@@ -1 +1 @@\n-old\n+new' },
+          } as never,
+        }),
+      ],
+    });
+    expect(md).toContain(
+      '> **📝 The user edited this page before this turn; the diff the agent saw:**',
+    );
+    expect(md).not.toContain('("');
+    expect(md).toContain('-old');
+  });
+
   it('escapes embedded triple-backtick fences with a longer delimiter', () => {
     const md = buildChatMarkdown({
       title: 'T',
