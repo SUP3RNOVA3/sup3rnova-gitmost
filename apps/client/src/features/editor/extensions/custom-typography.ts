@@ -16,7 +16,9 @@ interface UndoGuardRange {
   to: number;
 }
 
-const undoGuardKey = new PluginKey<UndoGuardRange | null>(
+// Exported for tests: the plugin key lets a test read the armed guard state,
+// and the two pure helpers below are unit-tested directly.
+export const undoGuardKey = new PluginKey<UndoGuardRange | null>(
   "typographyUndoGuard",
 );
 
@@ -47,7 +49,7 @@ interface DocChange {
 // remote change) arrives as a whole-document replace step, so the transaction
 // step maps are useless — diff the docs to recover the real minimal change.
 // Returns null when the docs are identical.
-const findChangedRange = (
+export const findChangedRange = (
   oldState: EditorState,
   newState: EditorState,
 ): DocChange | null => {
@@ -57,10 +59,15 @@ const findChangedRange = (
     return null;
   }
   let { a: oldTo, b: newTo } = end;
-  // Normalize overlapping diff bounds (repeated-content edge case).
-  if (oldTo < start) {
-    newTo += start - oldTo;
-    oldTo = start;
+  // findDiffEnd can report an end BEFORE the diff start when the changed text
+  // abuts repeated content (insertion -> oldTo<start, deletion -> newTo<start).
+  // Push both ends forward by the same delta so the range stays non-degenerate
+  // (from <= oldTo and from <= newTo), matching ProseMirror's own diff bounds.
+  const minTo = Math.min(oldTo, newTo);
+  if (minTo < start) {
+    const delta = start - minTo;
+    oldTo += delta;
+    newTo += delta;
   }
   return { from: start, oldTo, newTo };
 };
@@ -68,7 +75,7 @@ const findChangedRange = (
 // Map an armed guard range across a single document change described by a diff.
 // Returns null when the change touches the guarded text itself (the restored
 // substitution was edited, so the guard must be released).
-const mapRangeThroughChange = (
+export const mapRangeThroughChange = (
   range: UndoGuardRange,
   change: DocChange,
 ): UndoGuardRange | null => {
