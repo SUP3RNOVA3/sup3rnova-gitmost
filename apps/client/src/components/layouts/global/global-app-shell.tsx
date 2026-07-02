@@ -6,6 +6,7 @@ import SettingsSidebar from "@/components/settings/settings-sidebar.tsx";
 import { useAtom } from "jotai";
 import {
   APP_NAVBAR_ID,
+  NAVBAR_COLLAPSE_BREAKPOINT,
   asideStateAtom,
   desktopSidebarAtom,
   mobileSidebarAtom,
@@ -94,7 +95,7 @@ export default function GlobalAppShell({
         // off-screen with no horizontal scroll. Collapsing the navbar to a toggle
         // drawer across the whole tablet band frees the full width for content
         // (the mobile drawer is closed by default, so nothing overlaps on load).
-        breakpoint: "md",
+        breakpoint: NAVBAR_COLLAPSE_BREAKPOINT,
         collapsed: {
           mobile: !mobileOpened,
           desktop: !desktopOpened,

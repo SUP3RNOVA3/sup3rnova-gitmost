@@ -12,6 +12,7 @@ import TopMenu from "@/components/layouts/global/top-menu.tsx";
 import { Link } from "react-router-dom";
 import { useAtom } from "jotai";
 import {
+  NAVBAR_COLLAPSE_BREAKPOINT,
   desktopSidebarAtom,
   mobileSidebarAtom,
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
@@ -59,7 +60,7 @@ export function AppHeader() {
               // whole <md band — otherwise at 768-991 the desktop toggle showed
               // but flipped the wrong atom, leaving the drawer unopenable (the
               // regression from the initial sm->md navbar change).
-              hiddenFrom="md"
+              hiddenFrom={NAVBAR_COLLAPSE_BREAKPOINT}
               size="sm"
             />
           </Tooltip>
@@ -69,7 +70,7 @@ export function AppHeader() {
               aria-label={t("Sidebar toggle")}
               opened={desktopOpened}
               onClick={toggleDesktop}
-              visibleFrom="md"
+              visibleFrom={NAVBAR_COLLAPSE_BREAKPOINT}
               size="sm"
             />
           </Tooltip>
