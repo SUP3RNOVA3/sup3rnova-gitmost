@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GIT_SYNC_*` environment variables, including `GIT_SYNC_ENABLED`,
   `GIT_SYNC_SERVICE_USER_ID`, and `GIT_SYNC_HTTP_ENABLED` (see `.env.example`).
   (#119)
+- **Place several images side by side in a row.** A new "Inline (side by
+  side)" alignment mode in the image bubble menu renders consecutive inline
+  images as a row that wraps onto the next line on narrow screens. Unlike the
+  float modes, text does not wrap around inline images. The mode round-trips
+  losslessly through markdown as `data-align`, like the other alignment
+  values.
+
 - **Editable captions for images.** Images gain an optional caption shown
   below them, edited inline from the image bubble menu and stored as a `caption` attribute. Captions round-trip
   losslessly through markdown as a `data-caption` attribute on the image, so
@@ -528,6 +535,7 @@ knowledge layer, an embedded MCP server, and the Gitmost rebrand.
 - Build: drop the private EE submodule, retarget CI to GHCR, and update the
   Docker image to the GHCR registry.
 
-[Unreleased]: https://github.com/vvzvlad/gitmost/compare/v0.93.0...HEAD
+[Unreleased]: https://github.com/vvzvlad/gitmost/compare/v0.94.0...HEAD
+[0.94.0]: https://github.com/vvzvlad/gitmost/compare/v0.93.0...v0.94.0
 [0.93.0]: https://github.com/vvzvlad/gitmost/compare/v0.91.0...v0.93.0
 [0.91.0]: https://github.com/vvzvlad/gitmost/compare/v0.90.1...v0.91.0

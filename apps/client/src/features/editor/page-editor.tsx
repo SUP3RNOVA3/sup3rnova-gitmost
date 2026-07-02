@@ -42,6 +42,7 @@ import {
   showReadOnlyCommentPopupAtom,
 } from "@/features/comment/atoms/comment-atom";
 import CommentDialog from "@/features/comment/components/comment-dialog";
+import CommentHoverPreview from "@/features/comment/components/comment-hover-preview";
 import { EditorBubbleMenu } from "@/features/editor/components/bubble-menu/bubble-menu";
 import { ReadonlyBubbleMenu } from "@/features/editor/components/bubble-menu/readonly-bubble-menu";
 import TableMenu from "@/features/editor/components/table/table-menu.tsx";
@@ -77,6 +78,7 @@ import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
+import { useScrollPosition } from "./hooks/use-scroll-position";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
@@ -141,6 +143,7 @@ export default function PageEditor({
     [isComponentMounted],
   );
   const { handleScrollTo } = useEditorScroll({ canScroll });
+  const { restoreScrollPosition } = useScrollPosition(pageId);
   // Providers only created once per pageId
   const providersRef = useRef<{
     local: IndexeddbPersistence;
@@ -479,6 +482,11 @@ export default function PageEditor({
     }
   }, [yjsConnectionStatus, isSynced]);
 
+  // Restore the saved reading position once the live content is laid out.
+  useEffect(() => {
+    if (!showStatic && editor) restoreScrollPosition();
+  }, [showStatic, editor, restoreScrollPosition]);
+
   return (
     <TransclusionLookupProvider>
       <PageEmbedLookupProvider>
@@ -525,6 +533,11 @@ export default function PageEditor({
         <div className="editor-container" style={{ position: "relative" }}>
           <div ref={menuContainerRef}>
             <EditorContent editor={editor} />
+
+            <CommentHoverPreview
+              pageId={pageId}
+              containerRef={menuContainerRef}
+            />
 
             {editor && (
               <SearchAndReplaceDialog editor={editor} editable={editable} />
