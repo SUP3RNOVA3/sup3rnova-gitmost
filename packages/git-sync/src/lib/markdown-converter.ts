@@ -97,7 +97,12 @@ export function convertProseMirrorToMarkdown(content: any): string {
         const text = nodeContent.map(processNode).join("");
         const align = node.attrs?.textAlign;
         if (align && align !== "left") {
-          return `<div align="${escapeAttr(align)}">${text}</div>`;
+          // Emit alignment as a styled `<p>` (review #10). The old
+          // `<div align="…">` had NO matching import parse rule — the div was
+          // unwrapped and alignment lost on every round trip. A styled `<p>`
+          // round-trips: the paragraph parse rule (tag:"p") matches and the
+          // textAlign global-attribute parseHTML (docmost-schema) reads the style.
+          return `<p style="text-align:${escapeAttr(align)}">${text}</p>`;
         }
         return text || "";
 

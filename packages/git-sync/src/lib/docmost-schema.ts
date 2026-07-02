@@ -238,7 +238,19 @@ const DocmostAttributes = Extension.create({
         attributes: {
           id: { default: null },
           indent: { default: null },
-          textAlign: { default: null },
+          // textAlign must round-trip the exported `<p style="text-align:…">`
+          // (and the legacy `<... align="…">`) form (review #10). Without an
+          // explicit parseHTML the default reads a bare `textAlign` attribute
+          // (never present), so alignment was silently dropped on every import.
+          textAlign: {
+            default: null,
+            parseHTML: (el: HTMLElement) =>
+              el.style?.textAlign || el.getAttribute("align") || null,
+            renderHTML: (attrs: Record<string, any>) =>
+              attrs.textAlign
+                ? { style: `text-align: ${attrs.textAlign}` }
+                : {},
+          },
         },
       },
       {
