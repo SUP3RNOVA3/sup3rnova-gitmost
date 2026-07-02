@@ -8,6 +8,7 @@ import {
   closeIds,
   mergeRootTrees,
   loadedOpenBranchIds,
+  pruneCollapsedChildren,
   sortPositionKeys,
   pageToTreeNode,
 } from "./utils";
@@ -436,5 +437,64 @@ describe("loadedOpenBranchIds (#159 #8 reconnect refresh targets)", () => {
     const tree = [n("a", [n("a1", [n("a1a")])])];
     const ids = loadedOpenBranchIds(tree, new Set(["a", "a1"]));
     expect(ids.sort()).toEqual(["a", "a1"]);
+  });
+});
+
+describe("pruneCollapsedChildren", () => {
+  // Signature: pruneCollapsedChildren(tree: SpaceTreeNode[], openIds:
+  // ReadonlySet<string>): SpaceTreeNode[]. Collapsed nodes (id NOT in openIds)
+  // are reset to `children: []` (hasChildren untouched); open nodes keep their
+  // children but are recursed into so a collapsed branch nested under an open
+  // one is still pruned.
+  //
+  // Fixture:
+  //   open "p" (in openIds, hasChildren)
+  //     └─ collapsed "c" (NOT in openIds) with STALE child "g"
+  //   collapsed "t" (NOT in openIds) with child "t1"
+  // Only "p" is open.
+  function fixture() {
+    const grandchild = treeNode("g"); // stale, cached under the collapsed child
+    const collapsedChild = treeNode("c", [grandchild]);
+    const openParent = treeNode("p", [collapsedChild]);
+    const topCollapsed = treeNode("t", [treeNode("t1")]);
+    return { openParent, collapsedChild, topCollapsed };
+  }
+
+  it("keeps an OPEN parent's children and recurses to prune a nested collapsed branch; prunes a top-level collapsed node", () => {
+    const { openParent, topCollapsed } = fixture();
+    const tree = [openParent, topCollapsed];
+    const result = pruneCollapsedChildren(tree, new Set(["p"]));
+
+    // (a) OPEN parent keeps its children (not cleared) and hasChildren stays true.
+    const p = result[0];
+    expect(p.id).toBe("p");
+    expect(p.hasChildren).toBe(true);
+    expect(p.children).toHaveLength(1);
+
+    // (b) The nested COLLAPSED child under the open parent is pruned to
+    // `children: []` by the recursion, with hasChildren preserved. This is the
+    // open-keep + recurse branch that F1's empty-open-set fixture never hits.
+    const c = p.children[0];
+    expect(c.id).toBe("c");
+    expect(c.children).toEqual([]);
+    expect(c.hasChildren).toBe(true);
+
+    // (c) The top-level collapsed node is pruned to `children: []`, hasChildren kept.
+    const t = result[1];
+    expect(t.id).toBe("t");
+    expect(t.children).toEqual([]);
+    expect(t.hasChildren).toBe(true);
+  });
+
+  it("does not mutate the input tree (returns fresh nodes)", () => {
+    const { openParent, collapsedChild, topCollapsed } = fixture();
+    const tree = [openParent, topCollapsed];
+    pruneCollapsedChildren(tree, new Set(["p"]));
+
+    // Originals are untouched: the collapsed child still carries its stale grandchild.
+    expect(collapsedChild.children).toHaveLength(1);
+    expect(collapsedChild.children[0].id).toBe("g");
+    expect(openParent.children[0]).toBe(collapsedChild);
+    expect(topCollapsed.children).toHaveLength(1);
   });
 });
