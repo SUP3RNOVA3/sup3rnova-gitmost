@@ -119,6 +119,9 @@ function build(rows: any[] = []): {
 }
 
 const CTX = { workspaceId: 'ws-1', userId: 'svc-user' };
+// A bound context that carries the reconciling spaceId, enabling deletePage's
+// cross-space MOVE guard (the `if (ctx.spaceId)` branch).
+const CTX_SPACE = { ...CTX, spaceId: 'space-1' };
 
 describe('GitmostDataSourceService', () => {
   describe('listSpaceTree', () => {
@@ -348,6 +351,78 @@ describe('GitmostDataSourceService', () => {
       // No forceDelete on the service surface used here.
       expect((mocks.pageService as any).forceDelete).toBeUndefined();
     });
+
+    // The cross-space MOVE guard fires only when ctx.spaceId is bound. It re-reads
+    // the page and SKIPS the soft-delete when the page has already moved to a
+    // DIFFERENT space (otherwise a move-out would trash the page from both vaults).
+    describe('cross-space move guard (ctx.spaceId bound)', () => {
+      it("skips removePage when the page moved to another space (move-out)", async () => {
+        const { service, mocks } = build();
+        mocks.pageRepo.findById.mockResolvedValue({
+          id: 'p1',
+          deletedAt: null,
+          spaceId: 'space-2',
+        });
+
+        const res = await service.bind(CTX_SPACE).deletePage('p1');
+
+        // The page still lives in space-2 — it must NOT be trashed.
+        expect(mocks.pageService.removePage).not.toHaveBeenCalled();
+        expect(res).toEqual({ id: 'p1', skipped: 'moved-to-other-space' });
+      });
+
+      it('soft-deletes when the page is still in the reconciling space (genuine delete)', async () => {
+        const { service, mocks } = build();
+        mocks.pageRepo.findById.mockResolvedValue({
+          id: 'p1',
+          deletedAt: null,
+          spaceId: 'space-1',
+        });
+
+        await service.bind(CTX_SPACE).deletePage('p1');
+
+        // Same space -> a real deletion; removePage runs with git-sync provenance.
+        expect(mocks.pageService.removePage).toHaveBeenCalledWith(
+          'p1',
+          'svc-user',
+          'ws-1',
+          { actor: 'git-sync', aiChatId: null },
+        );
+      });
+
+      it('soft-deletes when the page row is not found (guard must not swallow a real delete)', async () => {
+        const { service, mocks } = build();
+        mocks.pageRepo.findById.mockResolvedValue(undefined);
+
+        await service.bind(CTX_SPACE).deletePage('p1');
+
+        expect(mocks.pageService.removePage).toHaveBeenCalledWith(
+          'p1',
+          'svc-user',
+          'ws-1',
+          { actor: 'git-sync', aiChatId: null },
+        );
+      });
+
+      it('soft-deletes when the page is already soft-deleted (deletedAt non-null)', async () => {
+        const { service, mocks } = build();
+        mocks.pageRepo.findById.mockResolvedValue({
+          id: 'p1',
+          deletedAt: new Date('2026-06-20T10:00:00.000Z'),
+          spaceId: 'space-2',
+        });
+
+        await service.bind(CTX_SPACE).deletePage('p1');
+
+        // deletedAt is non-null -> not treated as a live move-out; removePage runs.
+        expect(mocks.pageService.removePage).toHaveBeenCalledWith(
+          'p1',
+          'svc-user',
+          'ws-1',
+          { actor: 'git-sync', aiChatId: null },
+        );
+      });
+    });
   });
 
   describe('movePage', () => {
@@ -412,6 +487,36 @@ describe('GitmostDataSourceService', () => {
       expect(dto.title).toBe('new title');
       expect(user).toEqual({ id: 'svc-user' });
       expect(provenance).toEqual({ actor: 'git-sync', aiChatId: null });
+    });
+
+    it("strips the ` ~<slugId>` disambiguation suffix when it matches the page's OWN slugId", async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'p1',
+        slugId: 's1',
+        title: 'old',
+      });
+
+      await service.bind(CTX).renamePage('p1', 'Real Title ~s1');
+
+      const [, dto] = mocks.pageService.update.mock.calls[0];
+      // The trailing ` ~s1` equals this page's own slugId -> a vault artifact; strip.
+      expect(dto.title).toBe('Real Title');
+    });
+
+    it('leaves a FOREIGN ` ~<slugId>` tail untouched (only the own slugId is stripped)', async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'p1',
+        slugId: 's1',
+        title: 'old',
+      });
+
+      await service.bind(CTX).renamePage('p1', 'Real Title ~other');
+
+      const [, dto] = mocks.pageService.update.mock.calls[0];
+      // ` ~other` is not this page's slugId -> a genuine title; must not be corrupted.
+      expect(dto.title).toBe('Real Title ~other');
     });
 
     it('throws NotFound and renames nothing when the page does not exist', async () => {

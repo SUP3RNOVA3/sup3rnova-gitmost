@@ -346,10 +346,12 @@ export class GitmostDataSourceService {
     // LOCAL filesystem artifact and must NEVER become the page's real Docmost
     // title. A filename-derived title can carry it back in on ingest (observed:
     // intermittent same-title collision left a page permanently titled
-    // "Title ~<slugId>"). Strip it at this single choke point every git-sync
-    // title write funnels through — but ONLY when the trailing token equals THIS
-    // page's own slugId, so a genuine user title that legitimately ends in
-    // ` ~token` is never corrupted (slugId is a random nanoid; no real collision).
+    // "Title ~<slugId>"). Strip it here, on the rename/update title-write path —
+    // NOTE this is NOT every git-sync title write: createPage's filename-derived
+    // title does not funnel through here. Strip ONLY when the trailing token
+    // equals THIS page's own slugId, so a genuine user title that legitimately
+    // ends in ` ~token` is never corrupted (slugId is a random nanoid; no real
+    // collision).
     const suffix = ` ~${page.slugId}`;
     const cleanTitle =
       page.slugId && title.endsWith(suffix)

@@ -294,10 +294,12 @@ describe('GitSyncOrchestrator', () => {
       expect(deps.vault).toBe(built.vault);
       expect(deps.client).toBe(built.client);
       expect(deps.settings.vaultPath).toBe('/vaults/space-1');
-      // The bound datasource identity is the (workspace, service-user) pair.
+      // The bound datasource identity is the (workspace, service-user) pair,
+      // plus the reconciling spaceId used by deletePage's cross-move guard.
       expect(built.dataSource.bind).toHaveBeenCalledWith({
         workspaceId: 'ws-1',
         userId: 'svc-user',
+        spaceId: 'space-1',
       });
     });
 
