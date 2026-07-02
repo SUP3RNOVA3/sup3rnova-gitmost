@@ -70,6 +70,51 @@ export function convertProseMirrorToMarkdown(content: any): string {
   // `.map(processNode)`, which would otherwise pass the array index as a second
   // argument; the wrapper ignores extra arguments so that is harmless.
   let nodeDepth = 0;
+
+  // A table cell whose content is NOT a single plain paragraph — a list, code
+  // block, blockquote, multiple paragraphs, etc. A GFM pipe cell can only hold
+  // inline content on one line, so such a cell must force the HTML <table> form
+  // or its structure is flattened/lost on round trip (review #8).
+  const cellIsMultiBlock = (cell: any): boolean => {
+    const blocks = cell.content || [];
+    if (blocks.length > 1) return true;
+    const only = blocks[0];
+    return only != null && only.type !== "paragraph";
+  };
+
+  // Render a whole table as raw HTML `<table>` (round-trips via the schema's
+  // table-family parseHTML). Used when a GFM pipe table would be wrong: merged
+  // cells (colspan/rowspan), multi-block cells (#8), OR the table sits inside a
+  // raw-HTML container like a column (marked does not parse markdown inside raw
+  // HTML, so a GFM pipe table there becomes literal "| a | b |" text — #7).
+  // `blockToHtml` is referenced lazily (defined below; only called at runtime).
+  const tableToHtml = (tableRows: any[]): string => {
+    const renderHtmlCell = (cell: any): string => {
+      const tag = cell.type === "tableHeader" ? "th" : "td";
+      const a = cell.attrs || {};
+      const cellParts: string[] = [];
+      if ((a.colspan ?? 1) > 1)
+        cellParts.push(`colspan="${escapeAttr(a.colspan)}"`);
+      if ((a.rowspan ?? 1) > 1)
+        cellParts.push(`rowspan="${escapeAttr(a.rowspan)}"`);
+      if (a.align) cellParts.push(`align="${escapeAttr(a.align)}"`);
+      const open = cellParts.length
+        ? `<${tag} ${cellParts.join(" ")}>`
+        : `<${tag}>`;
+      const inner = (cell.content || [])
+        .map((block: any) => blockToHtml(block))
+        .join("");
+      return `${open}${inner}</${tag}>`;
+    };
+    const htmlRows = tableRows
+      .map(
+        (row: any) =>
+          `<tr>${(row.content || []).map(renderHtmlCell).join("")}</tr>`,
+      )
+      .join("");
+    return `<table><tbody>${htmlRows}</tbody></table>`;
+  };
+
   const processNode = (node: any): string => {
     if (nodeDepth >= MAX_NODE_DEPTH) {
       // Bail out of deeper recursion without throwing. A text node still has
@@ -387,36 +432,15 @@ export function convertProseMirrorToMarkdown(content: any): string {
               (cell.attrs?.colspan ?? 1) > 1 || (cell.attrs?.rowspan ?? 1) > 1,
           ),
         );
+        // A GFM pipe table also cannot hold a cell with block content (a list,
+        // code block, paragraphs) — it would be flattened to one line and lost
+        // (review #8). Force the HTML form for those too.
+        const hasMultiBlockCell = tableRows.some((row: any) =>
+          (row.content || []).some((cell: any) => cellIsMultiBlock(cell)),
+        );
 
-        if (hasSpan) {
-          // Render each cell's block children to HTML (marked does NOT parse
-          // markdown inside a raw HTML block, so emitting markdown here would
-          // leak literal ** / `` into the cell). blockToHtml mirrors the schema
-          // HTML so inner formatting re-parses into the right marks/nodes.
-          const renderHtmlCell = (cell: any): string => {
-            const tag = cell.type === "tableHeader" ? "th" : "td";
-            const a = cell.attrs || {};
-            const cellParts: string[] = [];
-            if ((a.colspan ?? 1) > 1)
-              cellParts.push(`colspan="${escapeAttr(a.colspan)}"`);
-            if ((a.rowspan ?? 1) > 1)
-              cellParts.push(`rowspan="${escapeAttr(a.rowspan)}"`);
-            if (a.align) cellParts.push(`align="${escapeAttr(a.align)}"`);
-            const open = cellParts.length
-              ? `<${tag} ${cellParts.join(" ")}>`
-              : `<${tag}>`;
-            const inner = (cell.content || [])
-              .map((block: any) => blockToHtml(block))
-              .join("");
-            return `${open}${inner}</${tag}>`;
-          };
-          const htmlRows = tableRows
-            .map(
-              (row: any) =>
-                `<tr>${(row.content || []).map(renderHtmlCell).join("")}</tr>`,
-            )
-            .join("");
-          return `<table><tbody>${htmlRows}</tbody></table>`;
+        if (hasSpan || hasMultiBlockCell) {
+          return tableToHtml(tableRows);
         }
 
         // No merged cells: emit a GFM table (header row + separator) so the
@@ -964,9 +988,13 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // A bare taskItem (outside a taskList) still needs a wrapping list so
         // the schema parses it; wrap it in a single-item taskList.
         return taskListToHtml({ content: [block] });
-      // table (incl. spanned), columns/column, math, media, embed, attachment,
-      // mention, etc. already emit schema-matching HTML from processNode.
+      // A table nested in a raw-HTML block (e.g. inside a column) MUST be the
+      // HTML <table> form — a GFM pipe table here would not be re-parsed by
+      // marked and would round-trip as literal "| a | b |" text (review #7).
       case "table":
+        return tableToHtml(block.content || []);
+      // columns/column, math, media, embed, attachment, mention, etc. already
+      // emit schema-matching HTML from processNode.
       case "columns":
       case "column":
       case "mathBlock":
