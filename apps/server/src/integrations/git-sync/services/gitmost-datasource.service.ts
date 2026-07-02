@@ -47,34 +47,6 @@ const GIT_SYNC_PROVENANCE: AuthProvenanceData = {
 };
 
 /**
- * Recursively serialize a JSON value with object keys sorted, so two values that
- * differ ONLY in key order (or are otherwise structurally identical) compare
- * equal. Arrays keep their order (order is meaningful in ProseMirror docs).
- * Used to detect a semantically no-op body ingest despite an unstable
- * markdown<->ProseMirror round-trip (see importPageMarkdown guard #2).
- */
-function canonicalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      out[key] = canonicalize((value as Record<string, unknown>)[key]);
-    }
-    return out;
-  }
-  return value;
-}
-
-/** True iff `a` and `b` are equal ignoring object key order. */
-function canonicalJsonEqual(a: unknown, b: unknown): boolean {
-  try {
-    return JSON.stringify(canonicalize(a)) === JSON.stringify(canonicalize(b));
-  } catch {
-    return false;
-  }
-}
-
-/**
  * Native, in-process implementation of the engine's `GitSyncClient` seam
  * Reads go through repositories (PageRepo/SpaceRepo); body writes go
  * through collab `openDirectConnection` (§3.3); structural mutations
@@ -222,6 +194,28 @@ export class GitmostDataSourceService {
     const currentPage = await this.pageRepo.findById(pageId, {
       includeContent: true,
     });
+    // Cross-space confused-deputy guard (review S2). The target `pageId` comes
+    // from THIS space's vault file frontmatter, but a file in space A could carry
+    // space B's page id. Without this check that file could resurrect (via
+    // restorePage), overwrite the body (writeBody), or clear the content of B's
+    // page — a cross-space write the reconciling space has no authority over.
+    // Mirror deletePage's guard (same `ctx.spaceId` source, same fail-safe
+    // direction): when the reconciling space is known and the resolved page
+    // already lives in a DIFFERENT space, skip — touch nothing. Only applies when
+    // the page exists; a not-found page (no currentPage) still proceeds as before
+    // so a legitimate same-space ingest is unaffected.
+    if (
+      ctx.spaceId &&
+      currentPage &&
+      currentPage.spaceId !== ctx.spaceId
+    ) {
+      this.logger.log(
+        `git-sync[${ctx.spaceId}] skip import of page ${pageId}: page lives in space ${currentPage.spaceId} (cross-space vault reference; page preserved)`,
+      );
+      return {
+        updatedAt: new Date(currentPage.updatedAt).toISOString(),
+      };
+    }
     // Revert-of-delete undelete (review warning). If the target page is currently
     // SOFT-DELETED, this ingest is a git-revert that re-added the page's file
     // (the push classifier saw an add carrying a known pageId -> UPDATE). Writing
@@ -246,19 +240,26 @@ export class GitmostDataSourceService {
       };
     }
 
-    const { parseDocmostMarkdown, markdownToProseMirror } = await loadGitSync();
+    const { parseDocmostMarkdown, markdownToProseMirror, docsCanonicallyEqual } =
+      await loadGitSync();
     const { body } = parseDocmostMarkdown(fullMarkdown);
     const doc = await markdownToProseMirror(body);
 
     // Idempotency guard #2 (defense-in-depth). Even when the vault file text
     // differs cosmetically, the PARSED body can be SEMANTICALLY identical to the
     // page's current Docmost content — the markdown<->ProseMirror round-trip is
-    // not byte-stable (e.g. JSON key order `{text,type}` vs `{type,text}`,
-    // default attrs), so upstream change-detection mis-flags such pages as
-    // changed every cycle. Compare by CANONICAL JSON (recursively key-sorted); if
-    // the incoming body already equals current content, this ingest is a no-op —
-    // skip it so a concurrent live edit is never clobbered and the vault never
-    // churns. A genuine content change is not canonically equal, so it proceeds.
+    // not byte-stable, so upstream change-detection mis-flags such pages as
+    // changed every cycle. But the divergence is NOT just JSON key order: a fresh
+    // `markdownToProseMirror(doc)` carries new/null block ids and materialized
+    // schema default attrs, whereas `currentContent` (from the DB) carries the
+    // real per-block uuids (to which comments are anchored) and KNOWN_DEFAULTS.
+    // A key-order-only compare therefore NEVER matches a real collab page, so use
+    // the package's authoritative `docsCanonicallyEqual` — the same equality the
+    // converter's round-trip losslessness tests use, which strips block ids and
+    // normalizes KNOWN_DEFAULTS. If the incoming body already equals current
+    // content, this ingest is a no-op — skip it so a concurrent live edit is
+    // never clobbered and the vault never churns. A genuine content change is not
+    // canonically equal, so it proceeds.
     const currentContent =
       typeof currentPage?.content === 'string'
         ? (() => {
@@ -269,7 +270,7 @@ export class GitmostDataSourceService {
             }
           })()
         : currentPage?.content;
-    if (currentContent && canonicalJsonEqual(doc, currentContent)) {
+    if (currentContent && docsCanonicallyEqual(doc, currentContent)) {
       return {
         updatedAt: new Date(currentPage!.updatedAt).toISOString(),
       };
@@ -447,10 +448,12 @@ export class GitmostDataSourceService {
     // LOCAL filesystem artifact and must NEVER become the page's real Docmost
     // title. A filename-derived title can carry it back in on ingest (observed:
     // intermittent same-title collision left a page permanently titled
-    // "Title ~<slugId>"). Strip it at this single choke point every git-sync
-    // title write funnels through — but ONLY when the trailing token equals THIS
-    // page's own slugId, so a genuine user title that legitimately ends in
-    // ` ~token` is never corrupted (slugId is a random nanoid; no real collision).
+    // "Title ~<slugId>"). Strip it here on the RENAME path (this is where a
+    // filename-derived title lands as a page's real title); other title-write
+    // paths (e.g. createPage / importPageMarkdown) are separate and not covered
+    // by this choke point. Strip ONLY when the trailing token equals THIS page's
+    // own slugId, so a genuine user title that legitimately ends in ` ~token` is
+    // never corrupted (slugId is a random nanoid; no real collision).
     const suffix = ` ~${page.slugId}`;
     const cleanTitle =
       page.slugId && title.endsWith(suffix)

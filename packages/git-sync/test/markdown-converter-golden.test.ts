@@ -129,10 +129,16 @@ describe('inline-mark matrix (underline/sub/sup/highlight±color/textStyle/comme
   });
 });
 
-describe('paragraph.textAlign -> <div align>', () => {
-  it('non-default alignment wraps the paragraph in <div align="...">', () => {
+describe('paragraph.textAlign -> <p style="text-align:...">', () => {
+  it('non-default alignment emits an HTML <p style="text-align:...">', () => {
+    // #7 fix: a non-default paragraph alignment now round-trips. It is exported
+    // as an HTML `<p style="text-align:center">` (the schema's paragraph
+    // parseHTML reads `style="text-align"` back onto `textAlign` on import), so
+    // the alignment survives instead of collapsing to bare text. (The old
+    // `<div align="center">` form was NOT re-parsed onto the paragraph and was
+    // therefore lossy.)
     expect(c({ type: 'paragraph', attrs: { textAlign: 'center' }, content: [text('x')] })).toBe(
-      '<div align="center">x</div>',
+      '<p style="text-align:center">x</p>',
     );
   });
 
@@ -190,10 +196,14 @@ describe('escaping idempotence (SPEC §11 phantom-diff guard)', () => {
   });
 });
 
-describe('table-cell sanitization (| and newline must not corrupt the GFM row)', () => {
-  it('escapes a literal pipe and collapses an inter-block newline in a cell', () => {
-    // A cell with a pipe in one paragraph and a second block paragraph: the pipe
-    // is escaped to \| and the block join (a space) keeps the row intact.
+describe('multi-block table cell -> HTML <table> (#8: GFM pipes cannot hold block content)', () => {
+  it('emits the whole table as HTML <table> so a multi-paragraph cell survives', () => {
+    // A cell holding TWO block paragraphs cannot be represented by a GFM pipe
+    // row (one inline line only) — the old GFM path collapsed the two blocks
+    // into one line ("a\|b c"), losing the block boundary and forcing a fragile
+    // pipe-escape. #8 emits the WHOLE table as raw HTML <table> instead: the
+    // schema's table-family parseHTML round-trips it, each paragraph stays its
+    // own <p>, and the literal pipe needs no escaping inside HTML text.
     const out = c({
       type: 'table',
       content: [
@@ -205,7 +215,9 @@ describe('table-cell sanitization (| and newline must not corrupt the GFM row)',
         ]},
       ],
     });
-    expect(out).toBe('| H |\n| --- |\n| a\\|b c |');
+    expect(out).toBe(
+      '<table><tbody><tr><th><p>H</p></th></tr><tr><td><p>a|b</p><p>c</p></td></tr></tbody></table>',
+    );
   });
 });
 

@@ -256,9 +256,11 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
     expect(out).toBe('> ```js\n> a\n> b\n> ```');
   });
 
-  // 4. A GFM body cell with TWO block children (paragraph + bulletList): joined
-  //    by a space, the list's newline collapsed so the row stays intact.
-  it('a GFM body cell with paragraph+list joins them by a space (no "p1- a")', () => {
+  // 4. A body cell with TWO block children (paragraph + bulletList) cannot be a
+  //    GFM pipe row (inline-only). #8 emits the WHOLE table as HTML <table> so
+  //    the paragraph and the list each survive as their own block instead of
+  //    being lossily flattened into one "p1 - a" pipe cell.
+  it('a table cell with paragraph+list emits an HTML <table> (blocks preserved)', () => {
     const out = convertProseMirrorToMarkdown(
       doc({
         type: 'table',
@@ -285,7 +287,9 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
         ],
       }),
     );
-    expect(out).toBe('| h |\n| --- |\n| p1 - a |');
+    expect(out).toBe(
+      '<table><tbody><tr><th><p>h</p></th></tr><tr><td><p>p1</p><ul><li><p>a</p></li></ul></td></tr></tbody></table>',
+    );
   });
 
   // 5. code + link co-occur: the schema's `code` mark excludes all other marks
@@ -391,8 +395,11 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
     expect(out).toBe('> - x\n> - y');
   });
 
-  // 11. GFM (non-spanned) cell: multi-block space-join + pipe-escape + newline-collapse.
-  it('a GFM cell escapes a literal pipe and collapses newlines across two paragraphs', () => {
+  // 11. A non-spanned cell with TWO block paragraphs: #8 emits the whole table
+  //     as HTML <table>, so each paragraph stays its own <p> and the literal
+  //     pipe needs no escaping inside HTML text (the old GFM path space-joined
+  //     the blocks into one line and escaped the pipe to \|).
+  it('a table cell with two paragraphs emits an HTML <table> (blocks kept, no pipe-escape)', () => {
     const out = convertProseMirrorToMarkdown(
       doc({
         type: 'table',
@@ -413,7 +420,9 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
         ],
       }),
     );
-    expect(out).toBe('| h |\n| --- |\n| a\\|b c |');
+    expect(out).toBe(
+      '<table><tbody><tr><th><p>h</p></th></tr><tr><td><p>a|b</p><p>c</p></td></tr></tbody></table>',
+    );
   });
 });
 
@@ -773,5 +782,64 @@ describe('converter gap coverage — raw-HTML container round-trips (specs 15–
       '<p>eq: <span data-type="mathInline" data-katex="true" text="x_i"></span></p>',
     );
     expect(md1).not.toContain('$x_i$');
+  });
+});
+
+// ===========================================================================
+// 30. heading.textAlign round-trip (A1). The paragraph case already exports a
+// non-default alignment as a styled `<p style="text-align:…">` that re-parses
+// losslessly; headings used to emit only the bare `## text` form, silently
+// DROPPING textAlign on export. The heading case is now symmetric: an aligned
+// heading exports as `<hN style="text-align:…">` and re-parses back to a heading
+// carrying BOTH the level and the textAlign, so the round-trip is lossless; an
+// UNaligned heading still emits the bare `## text` markdown form (no churn).
+// ===========================================================================
+const alignedHeading = (level: number, align: string, ...inline: any[]) => ({
+  type: 'heading',
+  attrs: { level, textAlign: align },
+  content: inline,
+});
+
+describe('heading.textAlign round-trip (A1)', () => {
+  it('an aligned heading exports as <hN style="text-align:…"> (not bare ##)', () => {
+    expect(convertProseMirrorToMarkdown(doc(alignedHeading(2, 'center', text('Title'))))).toBe(
+      '<h2 style="text-align:center">Title</h2>',
+    );
+  });
+
+  it('survives export -> import -> export losslessly (level AND textAlign preserved)', async () => {
+    const input = alignedHeading(2, 'center', text('Title'));
+    const { md1, doc2, md2 } = await roundTrip(input);
+    // Export direction: a styled <hN>, injection-safe via escapeAttr.
+    expect(md1).toBe('<h2 style="text-align:center">Title</h2>');
+    // Import direction: re-parses to a heading node with the level AND textAlign
+    // (the raw <hN style> HTML block flows through marked -> generateJSON, where
+    // the heading parse rule matches and the textAlign global attr reads the
+    // style back). Byte-stable second export closes the loop.
+    const h = doc2.content[0];
+    expect(h.type).toBe('heading');
+    expect(h.attrs.level).toBe(2);
+    expect(h.attrs.textAlign).toBe('center');
+    expect(md2).toBe(md1);
+    // Canonical equality of the re-parsed doc against the original input doc.
+    expect(docsCanonicallyEqual(doc2, doc(input))).toBe(true);
+  });
+
+  it('a right-aligned h3 round-trips its level and alignment', async () => {
+    const { doc2 } = await roundTrip(alignedHeading(3, 'right', text('Head')));
+    const h = doc2.content[0];
+    expect(h.type).toBe('heading');
+    expect(h.attrs.level).toBe(3);
+    expect(h.attrs.textAlign).toBe('right');
+  });
+
+  it('an UNaligned heading still emits the bare "## text" form (no HTML churn)', () => {
+    const bare = convertProseMirrorToMarkdown(doc(heading(2, text('Plain'))));
+    expect(bare).toBe('## Plain');
+    expect(bare).not.toContain('<h2');
+    // The default "left" alignment is likewise NOT wrapped.
+    expect(
+      convertProseMirrorToMarkdown(doc(alignedHeading(2, 'left', text('Plain')))),
+    ).toBe('## Plain');
   });
 });

@@ -43,10 +43,26 @@ jest.mock('../git-sync.loader', () => ({
       type: 'doc',
       content: [{ type: 'paragraph' }],
     }),
+    // renamePage funnels the current title through sanitizeTitle to detect the
+    // sanitized-stem echo; identity is the correct default here (none of the
+    // rename fixtures use filename-hostile chars, so the sanitized form equals
+    // the input and the guard never fires).
+    sanitizeTitle: (title: string) => title,
+    // importPageMarkdown guard #2 uses docsCanonicallyEqual to skip a no-op
+    // re-ingest. A key-order-insensitive JSON compare is a sufficient stand-in
+    // for the unit tests (the real semantic equality is covered by the
+    // @docmost/git-sync converter tests); returning false for genuinely
+    // different docs lets the write paths under test proceed.
+    docsCanonicallyEqual: (a: unknown, b: unknown) =>
+      JSON.stringify(a) === JSON.stringify(b),
   })),
 }));
 
 import { GitmostDataSourceService } from './gitmost-datasource.service';
+// The loader is mocked above; this binding is the hoisted jest.fn, so a single
+// test can swap the runtime bridge (e.g. a smarter `docsCanonicallyEqual`) via
+// `mockResolvedValueOnce` without perturbing the default used by every other test.
+import { loadGitSync } from '../git-sync.loader';
 
 // Focused unit/contract test for the native GitSyncClient adapter.
 // No DB, no real collab server: the repos/services/gateway are mocked and we
@@ -261,6 +277,79 @@ describe('GitmostDataSourceService', () => {
       expect(res.updatedAt).toBeUndefined();
     });
 
+    // F5 acceptance, criterion (b): guard #2 (docsCanonicallyEqual) must SKIP the
+    // re-ingest when the freshly-parsed doc is canonically equal to the page's
+    // current DB content even though the two are NOT byte-identical — the DB copy
+    // carries the real per-block uuids (comments anchor to them) while a fresh
+    // parse has none. Skipping is what protects a concurrent, not-yet-flushed
+    // human edit from being clobbered by an idempotent poll re-ingest.
+    //
+    // NON-VACUITY: `currentContent` here differs from `doc` in raw JSON (it has an
+    // `attrs.id` uuid `doc` lacks). The default mock `docsCanonicallyEqual` is a
+    // plain `JSON.stringify` compare — it would return FALSE for these inputs, so
+    // if guard #2 were removed (or reverted to a canonicalJsonEqual that does not
+    // strip ids) writePageBody WOULD be called and this test would fail. We model
+    // the package's authoritative id-stripping equality (returns TRUE here) by
+    // swapping in a `docsCanonicallyEqual` that normalizes away block ids, proving
+    // it is the SEMANTIC equality — not a byte compare — that suppresses the write.
+    it('does NOT call writePageBody (guard #2) when content is canonically equal despite differing block ids (F5 criterion b)', async () => {
+      const { service, mocks } = build();
+      const realUuid = '11111111-1111-4111-8111-111111111111';
+      // The DB row's content carries a REAL per-block uuid; a fresh parse does not.
+      // These two docs are canonically equal (id-only difference) but NOT
+      // byte-identical, so a naive JSON compare treats the page as "changed".
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'p1',
+        updatedAt: new Date('2026-06-20T11:00:00.000Z'),
+        content: {
+          type: 'doc',
+          content: [{ type: 'paragraph', attrs: { id: realUuid } }],
+        },
+      });
+      // Swap the runtime bridge for THIS call only: same passthrough parse/convert
+      // as the default mock (so `doc` is the id-less `{type:'doc',[paragraph]}`),
+      // but `docsCanonicallyEqual` strips block ids before comparing — the real
+      // converter's semantics. It returns TRUE for (doc, currentContent) here.
+      const stripIds = (node: any): any => {
+        if (Array.isArray(node)) return node.map(stripIds);
+        if (node && typeof node === 'object') {
+          const out: any = {};
+          for (const [k, v] of Object.entries(node)) {
+            if (k === 'attrs' && v && typeof v === 'object') {
+              const { id: _id, ...rest } = v as Record<string, unknown>;
+              if (Object.keys(rest).length) out.attrs = stripIds(rest);
+            } else {
+              out[k] = stripIds(v);
+            }
+          }
+          return out;
+        }
+        return node;
+      };
+      (loadGitSync as jest.Mock).mockResolvedValueOnce({
+        parseDocmostMarkdown: (md: string) => ({ meta: {}, body: md }),
+        markdownToProseMirror: async () => ({
+          type: 'doc',
+          content: [{ type: 'paragraph' }],
+        }),
+        sanitizeTitle: (title: string) => title,
+        docsCanonicallyEqual: (a: unknown, b: unknown) =>
+          JSON.stringify(stripIds(a)) === JSON.stringify(stripIds(b)),
+      });
+
+      // No baseMarkdown -> guard #1 (fullMarkdown === baseMarkdown) cannot fire, so
+      // the outcome is decided purely by guard #2.
+      const res = await service
+        .bind(CTX)
+        .importPageMarkdown('p1', '# Hello\n\nworld');
+
+      // Guard #2 fired: the redundant re-ingest is skipped, so the concurrent
+      // human edit in the live doc is NOT clobbered.
+      expect(mocks.collabGateway.writePageBody).not.toHaveBeenCalled();
+      // The unchanged page's updatedAt is still surfaced from the DB row.
+      expect(res.updatedAt).toBe('2026-06-20T11:00:00.000Z');
+    });
+
     // The 2-way path (no base) is covered above; this exercises the THREE-WAY
     // branch that only fires when a `baseMarkdown` is supplied (review #5). The
     // merge dispatch itself now lives in the collab handler (gitSyncWriteBody);
@@ -288,6 +377,43 @@ describe('GitmostDataSourceService', () => {
         expect(payload.baseProsemirrorJson).toEqual(
           expect.objectContaining({ type: 'doc' }),
         );
+      });
+    });
+
+    // The cross-space confused-deputy guard (review S2) fires only when
+    // ctx.spaceId is bound. A vault file in space A can carry space B's pageId;
+    // without this check the reconciling space could overwrite B's page body — a
+    // write it has no authority over. When the resolved page already lives in a
+    // DIFFERENT space, the import is SKIPPED (writePageBody not called) and the
+    // page's own updatedAt is returned unchanged.
+    describe('cross-space guard (ctx.spaceId bound, review S2)', () => {
+      it('does NOT call writePageBody when the target page lives in another space', async () => {
+        const { service, mocks } = build();
+        // The resolved page is in space-2, but the reconciling context is space-1.
+        // Its content DIFFERS from the parsed doc, so guard #2 (docsCanonicallyEqual)
+        // cannot be what suppresses the write — proving NON-VACUITY: without the S2
+        // guard the flow would reach writeBody and writePageBody WOULD be called.
+        mocks.pageRepo.findById.mockResolvedValue({
+          id: 'p1',
+          deletedAt: null,
+          spaceId: 'space-2',
+          updatedAt: new Date('2026-06-21T09:00:00.000Z'),
+          content: {
+            type: 'doc',
+            content: [
+              { type: 'paragraph', content: [{ type: 'text', text: 'B body' }] },
+            ],
+          },
+        });
+
+        const res = await service
+          .bind(CTX_SPACE)
+          .importPageMarkdown('p1', '# Hello\n\nworld');
+
+        // The cross-space page is preserved: no body write happened.
+        expect(mocks.collabGateway.writePageBody).not.toHaveBeenCalled();
+        // Early-return shape: only the page's own updatedAt is surfaced.
+        expect(res).toEqual({ updatedAt: '2026-06-21T09:00:00.000Z' });
       });
     });
   });

@@ -111,6 +111,17 @@ const CORPUS: Record<string, any> = {
     para(text('Second paragraph.')),
   ),
 
+  // A non-default paragraph alignment now round-trips (item #7 fix): it exports
+  // as `<p style="text-align:center">` and the schema's paragraph parseHTML
+  // reads `style="text-align"` back onto `textAlign` on import, so the alignment
+  // survives the full editor-ext write path. Promoted from the old KNOWN
+  // DIVERGENCE block (which only heading alignment still occupies).
+  'aligned paragraph (textAlign center)': doc({
+    type: 'paragraph',
+    attrs: { textAlign: 'center' },
+    content: [text('centered')],
+  }),
+
   'inline marks (bold/italic/strike/code)': doc(
     para(
       text('normal '),
@@ -446,40 +457,20 @@ describe('git-sync converter §13.1 image dimensions preserved (was KNOWN DIVERG
 });
 
 // ---------------------------------------------------------------------------
-// KNOWN DIVERGENCE — text alignment (item #7; isolated, not silently dropped).
+// KNOWN DIVERGENCE — HEADING text alignment (item #7; isolated, not silently
+// dropped). PARAGRAPH alignment now round-trips (exported as
+// `<p style="text-align:...">`, re-parsed by the paragraph parseHTML) and lives
+// in the green CORPUS above; only HEADING alignment still diverges:
 //
-// editor-ext registers TextAlign for heading+paragraph, and the SERVER schema
-// fully supports it — the loss is intrinsic to the MARKDOWN transport:
+//   • A heading's `textAlign` is NOT exported at all — a heading emits plain
+//     markdown `## text` with no alignment syntax — so any non-default heading
+//     alignment is dropped on a full round trip.
 //
-//   • A paragraph's `textAlign` is EXPORTED as `<div align="...">text</div>`
-//     (markdown-converter case "paragraph"), but on import the converter's
-//     docmost-schema declares `textAlign` WITHOUT a parseHTML mapping, so the
-//     `align` attribute is never recovered -> it imports as `textAlign:null`
-//     and canonicalizes away. A heading's alignment is not even exported.
-//   • Therefore any non-default alignment is dropped on a full round trip.
-//
-// If the converter is ever taught to parse `align`/`text-align` back onto the
-// block, this assertion flips and an aligned-paragraph fixture should be
-// promoted into the green CORPUS above.
+// If the converter is ever taught to export + re-parse heading alignment, this
+// assertion flips and an aligned-heading fixture should be promoted into the
+// green CORPUS above.
 // ---------------------------------------------------------------------------
-describe('git-sync converter §13.1 KNOWN DIVERGENCE (text alignment dropped)', () => {
-  it('drops a paragraph textAlign on the markdown round trip', async () => {
-    const alignedDoc = doc({
-      type: 'paragraph',
-      attrs: { textAlign: 'center' },
-      content: [text('centered')],
-    });
-
-    const { canonNormalized } = await runGate(alignedDoc);
-
-    // The round-tripped paragraph carries no alignment.
-    expect(canonNormalized).toEqual({
-      type: 'doc',
-      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'centered' }] }],
-    });
-    expect(docsCanonicallyEqual(alignedDoc, canonNormalized)).toBe(false);
-  });
-
+describe('git-sync converter §13.1 KNOWN DIVERGENCE (heading text alignment dropped)', () => {
   it('drops a heading textAlign (headings do not export alignment at all)', async () => {
     const alignedHeading = doc({
       type: 'heading',

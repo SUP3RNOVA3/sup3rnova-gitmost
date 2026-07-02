@@ -1373,11 +1373,12 @@ function extractUpdatedAt(result: unknown): { updatedAt?: string } {
 
 // --- runnable push orchestration (`runPush`) ---------------------------------
 //
-// `runPush` is the FS->Docmost twin of `pull.ts`'s `main`: it wires the VaultGit
+// `runPush` is the FS->Docmost twin of the pull direction: it wires the VaultGit
 // diff/ref primitives + the PURE `computePushActions` planner + the THIN
-// `applyPushActions` applier into one runnable cycle. SAFE BY DEFAULT — the
-// engine's FIRST write path to Docmost defaults to DRY-RUN (plan only, NO
-// Docmost writes, NO ref advance); an explicit `--apply` is the ONLY path that
+// `applyPushActions` applier into one runnable cycle. It is driven IN-PROCESS by
+// the NestJS server (there is no standalone CLI). SAFE BY DEFAULT — a cycle
+// defaults to DRY-RUN (plan only, NO Docmost writes, NO ref advance) unless the
+// caller passes `opts.dryRun === false`; that apply path is the ONLY one that
 // builds a client and mutates Docmost.
 //
 // Every external effect is injected (`PushDeps`): production wires the live
@@ -1388,7 +1389,7 @@ function extractUpdatedAt(result: unknown): { updatedAt?: string } {
  * push direction (SPEC §7.3). The provenance is carried by the trailer (below),
  * which the loop-guard keys on; the identity is for history readability only.
  * When the vault repo already has a configured `user.name`/`user.email`, git
- * uses that for the working-tree commit; this is the fallback the daemon stamps.
+ * uses that for the working-tree commit; this is the fallback the engine stamps.
  */
 export const LOCAL_AUTHOR_NAME = "Local";
 export const LOCAL_AUTHOR_EMAIL = "local@local";
@@ -1400,7 +1401,7 @@ export const LOCAL_SOURCE_TRAILER = "Docmost-Sync-Source: local";
  * Injectable deps for `runPush` (mirrors `pull.ts`'s wiring; everything that
  * touches the outside world is here so tests pass fakes). `makeClient` is a
  * FACTORY, not a client — a dry-run must build NO client at all (it is never
- * called), and only `--apply` invokes it.
+ * called), and only the apply path (`opts.dryRun === false`) invokes it.
  */
 export interface PushDeps {
   settings: Settings;
@@ -1420,7 +1421,7 @@ export interface PushDeps {
     | "fastForwardBranch"
     | "listTrackedFiles"
   >;
-  /** Build a real client — called ONLY on `--apply`, never on dry-run. */
+  /** Build a real client — called ONLY on the apply path, never on dry-run. */
   makeClient: (settings: Settings) => ApplyPushDeps["client"];
   /** Read a file's full text by its vault-relative (forward-slash) path. */
   readFile: (path: string) => Promise<string>;
@@ -1448,12 +1449,12 @@ export interface PushRunResult {
     renamesMoves: number;
     skipped: number;
   };
-  /** The applier's structured result — ONLY present on the `--apply` path. */
+  /** The applier's structured result — ONLY present on the apply path. */
   applied?: ApplyPushResult;
   /**
    * True when `applyPushActions` REFUSED to fast-forward a divergent `docmost`
-   * mirror (SPEC §5 invariant broken). Escalated (logged prominently) and folded
-   * into the CLI's non-zero exit.
+   * mirror (SPEC §5 invariant broken). Logged prominently and surfaced on this
+   * result so the caller (the server orchestrator) escalates it.
    */
   divergentDocmost?: boolean;
   /** Per-page failures from the applier (empty/absent on a clean run). */
@@ -1461,11 +1462,13 @@ export interface PushRunResult {
 }
 
 /**
- * Run one FS->Docmost push cycle (SPEC §6 "FS -> Docmost"), DRY-RUN BY DEFAULT.
+ * Run one FS->Docmost push cycle (SPEC §6 "FS -> Docmost"), DRY-RUN BY DEFAULT
+ * (the apply path runs only when `opts.dryRun === false`).
  *
  * Steps (mirrors `pull.ts`):
  *   1. Preflight git: `assertGitAvailable` + `ensureRepo`; ABORT (clear message +
- *      non-zero-ish result) if a merge is in progress — never push on top of an
+ *      an `aborted: "merge-in-progress"` result) if a merge is in progress —
+ *      never push on top of an
  *      unresolved conflict (SPEC §9/§12). Conflict markers must NEVER reach
  *      Docmost (SPEC §9).
  *   2. Checkout `main` (the human-facing branch the push reads from).
@@ -1478,12 +1481,12 @@ export interface PushRunResult {
  *      the PURE `computePushActions`.
  *   6. DRY-RUN (default): LOG the full plan and RETURN — NO client, NO Docmost
  *      calls, NO ref advance.
- *   7. `--apply`: build the client, run `applyPushActions(..., pushedCommit=main)`,
+ *   7. Apply path (`opts.dryRun === false`): build the client, run `applyPushActions(..., pushedCommit=main)`,
  *      then (a) if any pageIds were written back (creates), commit them on `main`
  *      with the `local` trailer and RE-advance `refs/docmost/last-pushed` to the
  *      new commit so the recorded pageIds are persisted in what Docmost mirrors;
  *      (b) ESCALATE a divergent-`docmost` ff refusal (SPEC §5) with a prominent
- *      WARNING and a non-zero-ish flag. Then log a one-line summary.
+ *      WARNING and the `divergentDocmost` result flag. Then log a one-line summary.
  */
 export async function runPush(
   deps: PushDeps,
@@ -1492,8 +1495,8 @@ export async function runPush(
   const { git, settings, log } = deps;
   const dryRun = opts.dryRun;
 
-  // 1. Preflight git. Fail fast (actionable message via main().catch) if the git
-  //    binary is missing — the vault state store relies on it.
+  // 1. Preflight git. Fail fast (the thrown error propagates to the caller) if
+  //    the git binary is missing — the vault state store relies on it.
   await git.assertGitAvailable();
   await git.ensureRepo();
 
@@ -1622,7 +1625,7 @@ export async function runPush(
     return { mode: "dry-run", base, pushedCommit, planned };
   }
 
-  // 7. --apply: build the REAL client and execute. This is the ONLY write path.
+  // 7. Apply path: build the REAL client and execute. This is the ONLY write path.
   const client = deps.makeClient(settings);
   const applied = await applyPushActions(
     {

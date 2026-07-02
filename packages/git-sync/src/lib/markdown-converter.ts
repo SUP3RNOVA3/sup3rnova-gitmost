@@ -154,6 +154,21 @@ export function convertProseMirrorToMarkdown(content: any): string {
       case "heading":
         const level = node.attrs?.level || 1;
         const headingText = nodeContent.map(processNode).join("");
+        const headingAlign = node.attrs?.textAlign;
+        if (headingAlign && headingAlign !== "left") {
+          // Emit alignment as a styled `<hN>` so it round-trips losslessly,
+          // symmetric to the paragraph case above (review F5/A1). The bare
+          // `## text` markdown form carries NO alignment, so an aligned heading
+          // would silently drop textAlign on export. A styled `<hN>` re-parses:
+          // the heading parse rule (tag:"h1".."h6") matches and the textAlign
+          // global-attribute parseHTML (docmost-schema) reads the style back,
+          // preserving BOTH level and textAlign. escapeAttr keeps the align
+          // value injection-safe, exactly like the paragraph arm.
+          return `<h${level} style="text-align:${escapeAttr(headingAlign)}">${headingText}</h${level}>`;
+        }
+        // No alignment (or the default "left"): keep the plain `## text`
+        // markdown form — HTML-ifying an unaligned heading would be needless
+        // churn, exactly as the paragraph case keeps plain text when unaligned.
         return "#".repeat(level) + " " + headingText;
 
       case "text":

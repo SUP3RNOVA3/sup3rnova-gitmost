@@ -56,10 +56,19 @@ interface BuildOptions {
   vaultOverrides?: Record<string, unknown>;
   /**
    * The row `buildSettings` reads for the per-space `autoMergeConflicts` flag
-   * (`executeTakeFirst`). Default: the SAFE off value. Pass `undefined` to model
-   * a missing row (no space / no settings).
+   * (`executeTakeFirst` on the `autoMergeConflicts`-aliased query). Default: the
+   * SAFE off value. Pass `undefined` to model a missing row (no space / no
+   * settings).
    */
   settingsRow?: { autoMergeConflicts: boolean } | undefined;
+  /**
+   * The per-space opt-in flag `runOnce` reads via `isSpaceGitSyncEnabled`
+   * (`executeTakeFirst` on the `enabled`-aliased query — a DIFFERENT query from
+   * the `autoMergeConflicts` read above; commit c838fdee added it). Default
+   * `true` so a build() space passes the per-space gate and the cycle proceeds.
+   * Set `false` to model a space that did NOT opt in (skipped:'space-not-enabled').
+   */
+  spaceEnabled?: boolean;
 }
 
 interface Built {
@@ -83,6 +92,7 @@ function build(opts: BuildOptions = {}): Built {
     pollIntervalMs = 15000,
     debounceMs = 2000,
     vaultOverrides = {},
+    spaceEnabled = true,
   } = opts;
   // Distinguish "key omitted" (default off row) from "key present but undefined"
   // (a deliberately MISSING settings row).
@@ -138,15 +148,36 @@ function build(opts: BuildOptions = {}): Built {
   };
   const redisService = { getOrThrow: jest.fn(() => redis) };
 
-  // Chainable Kysely stub. `buildSettings` reads the space's
-  // `gitSync.autoMergeConflicts` flag via
-  // `selectFrom('spaces').select(...).where('id','=',id).executeTakeFirst()`;
-  // default it to the SAFE off value. `enabledSpaces` uses `.execute()`.
+  // Chainable Kysely stub. TWO distinct single-row queries run through the same
+  // builder and both end in `executeTakeFirst`, so the stub must tell them apart
+  // by the column ALIAS the real code selects (they are otherwise identical):
+  //   - `isSpaceGitSyncEnabled` (per-space opt-in gate in `runOnce`, added by
+  //     c838fdee): `.select(sql\`...->>'enabled' = 'true'\`.as('enabled'))` ->
+  //     the code reads `row?.enabled`. Return `{ enabled: spaceEnabled }`.
+  //   - `buildSettings`: `.select(sql\`...->>'autoMergeConflicts' = 'true'\`
+  //     .as('autoMergeConflicts'))` -> the code reads `row?.autoMergeConflicts`.
+  //     Return `settingsRow` (default SAFE off; `undefined` models a missing row).
+  // `enabledSpaces` uses `.select([...strings]).execute()` (no alias, no
+  // executeTakeFirst) and is stubbed/replaced in the tests that exercise it.
   const db = (() => {
+    let lastAlias: string | undefined;
+    const aliasOf = (sel: unknown): string | undefined => {
+      try {
+        const node = (sel as { toOperationNode?: () => any })?.toOperationNode?.();
+        return node?.kind === 'AliasNode' ? node.alias?.name : undefined;
+      } catch {
+        return undefined;
+      }
+    };
     const builder: any = {
-      select: () => builder,
+      select: (sel: unknown) => {
+        const alias = aliasOf(sel);
+        if (alias) lastAlias = alias;
+        return builder;
+      },
       where: () => builder,
-      executeTakeFirst: async () => settingsRow,
+      executeTakeFirst: async () =>
+        lastAlias === 'enabled' ? { enabled: spaceEnabled } : settingsRow,
       execute: async () => [],
     };
     return { selectFrom: () => builder };
