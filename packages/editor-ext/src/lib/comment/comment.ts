@@ -172,7 +172,20 @@ export const Comment = Mark.create<ICommentOptions, ICommentStorage>({
     const commentId = HTMLAttributes?.["data-comment-id"] || null;
     const resolved = HTMLAttributes?.["data-resolved"] || false;
 
-    if (typeof window === "undefined" || typeof document === "undefined") {
+    // The in-process MCP module injects a jsdom `global.document` into the Node
+    // server, so `typeof document === "undefined"` is not enough to detect SSR.
+    // On any Node runtime always return a plain, serializable spec array; the
+    // interactive live-DOM branch below is browser-only. This stops server-side
+    // HTML/Markdown export (happy-dom DOMSerializer) from appending a foreign
+    // jsdom node into a happy-dom tree.
+    const isNodeRuntime =
+      typeof process !== "undefined" && !!process.versions?.node;
+
+    if (
+      typeof window === "undefined" ||
+      typeof document === "undefined" ||
+      isNodeRuntime
+    ) {
       return [
         "span",
         mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, {
