@@ -49,7 +49,13 @@ function writeNow(key: string, value: SpaceTreeNode[]): void {
   try {
     const serialized = JSON.stringify(value);
     if (serialized.length > MAX_SERIALIZED_LENGTH) {
-      console.warn("[tree] cached tree too large to persist; skipping", key);
+      // Warn ONCE, like the quota branch below: a >4M-char tree re-serializes on
+      // every ~500ms debounce tick while it's edited, so an un-gated warn would
+      // spam the console on each flush.
+      if (!writeFailureWarned) {
+        writeFailureWarned = true;
+        console.warn("[tree] cached tree too large to persist; skipping", key);
+      }
       return;
     }
     localStorage.setItem(key, serialized);

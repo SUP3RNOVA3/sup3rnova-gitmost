@@ -205,6 +205,39 @@ describe("treeDataAtom (localStorage-persisted)", () => {
     expect(persistedTreeDataKeys()).toEqual([]);
   });
 
+  it("skips persisting a tree over the size cap and warns exactly once", async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const setItemSpy = vi.spyOn(localStorage, "setItem");
+
+    const { treeDataAtom, flushPendingTreeDataWrites } = await freshImport();
+    const store = createStore();
+
+    // One node whose name alone serializes to > MAX_SERIALIZED_LENGTH (~4M).
+    const huge = node("big");
+    huge.name = "x".repeat(4_000_001);
+
+    store.set(treeDataAtom, [huge]);
+    vi.advanceTimersByTime(DEBOUNCE_MS + 100);
+
+    // The oversized serialization is skipped: the key is never written.
+    expect(localStorage.getItem(ANON_KEY)).toBeNull();
+    expect(setItemSpy).not.toHaveBeenCalled();
+
+    // Editing the still-oversized tree fires another debounced write, but the
+    // "too large" warn is gated by the once-flag — no per-tick console spam.
+    store.set(treeDataAtom, [huge, node("big2")]);
+    vi.advanceTimersByTime(DEBOUNCE_MS + 100);
+    flushPendingTreeDataWrites();
+
+    expect(localStorage.getItem(ANON_KEY)).toBeNull();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[tree] cached tree too large to persist; skipping",
+      ANON_KEY,
+    );
+  });
+
   it("disables persistence after clearPersistedTreeCaches: NEW writes never reach storage", async () => {
     vi.useFakeTimers();
 

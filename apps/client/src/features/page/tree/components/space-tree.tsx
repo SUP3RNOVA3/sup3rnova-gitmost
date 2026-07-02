@@ -30,6 +30,7 @@ import {
   openBranches,
   closeIds,
   loadedOpenBranchIds,
+  pruneCollapsedChildren,
 } from "@/features/page/tree/utils/utils.ts";
 import { SpaceTreeNode } from "@/features/page/tree/types.ts";
 import { treeModel } from "@/features/page/tree/model/tree-model";
@@ -198,6 +199,21 @@ const SpaceTree = forwardRef<SpaceTreeApi, SpaceTreeProps>(function SpaceTree(
   dataRef.current = data;
   const openIdsRef = useRef(openIds);
   openIdsRef.current = openIds;
+
+  // Boot-cache hygiene (#159 #8): the localStorage-hydrated tree carries the
+  // children of every branch ever expanded, including ones now COLLAPSED. Their
+  // first expand would skip the lazy-load and render stale children (a
+  // rename/move/delete missed while offline). Drop the cached children of every
+  // COLLAPSED branch ONCE at mount so its first expand fetches fresh via
+  // handleToggle — exactly as it did before the tree was cached. OPEN branches
+  // keep their children and are refreshed by refreshOpenBranches instead, so
+  // this runs before any expand and never double-fetches an open branch.
+  const prunedBootCacheRef = useRef(false);
+  useEffect(() => {
+    if (prunedBootCacheRef.current) return;
+    prunedBootCacheRef.current = true;
+    setData((prev) => pruneCollapsedChildren(prev, openIdsRef.current));
+  }, [setData]);
 
   // Re-fetch and reconcile the children of every currently-open, already-loaded
   // branch of THIS space. Shared by the socket reconnect handler and the

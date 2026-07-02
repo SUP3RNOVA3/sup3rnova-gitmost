@@ -123,8 +123,10 @@ export default function useAuth() {
 
   const handleLogout = async () => {
     setCurrentUser(RESET);
-    // Purge the persisted sidebar tree caches (they contain page titles) so
-    // nothing readable is left in localStorage on a shared machine.
+    // Purge the persisted sidebar tree caches (they contain page titles) so the
+    // cached page titles aren't left readable in localStorage on a shared
+    // machine. (Only the tree caches are swept; other localStorage entries
+    // remain.)
     clearPersistedTreeCaches();
     await logout();
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
