@@ -100,7 +100,7 @@ describe("useScrollPosition", () => {
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
   });
 
-  it("(a3) restores at most once per mount even if called again", () => {
+  it("(a3) is idempotent: re-asserting the same target does not scroll again", () => {
     vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}once`, "500");
     setScrollHeight(2000); // tall enough to restore synchronously
@@ -111,8 +111,12 @@ describe("useScrollPosition", () => {
     });
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
 
+    // Simulate the browser now being at the restored position.
+    setScrollY(500);
+
     // A second call (e.g. the wiring effect re-running on [showStatic, editor,
-    // restoreScrollPosition]) must NOT scroll again and yank the reader.
+    // restoreScrollPosition]) must NOT scroll again: the redundancy guard sees
+    // the window is already at the target and does nothing.
     act(() => {
       result.current.restoreScrollPosition();
     });
@@ -159,6 +163,84 @@ describe("useScrollPosition", () => {
     act(() => {
       vi.advanceTimersByTime(5000);
     });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("(g) does not restore if the reader scrolled (wheel) before restore fires", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}g1`, "500");
+    setScrollHeight(2000); // tall enough to restore synchronously
+
+    const { result } = renderHook(() => useScrollPosition("g1"));
+
+    // The reader shows scroll intent before restore is triggered.
+    act(() => {
+      window.dispatchEvent(new Event("wheel"));
+    });
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("(h) aborts an in-flight restore poll when the reader scrolls", () => {
+    vi.useFakeTimers();
+    window.sessionStorage.setItem(`${KEY_PREFIX}h1`, "500");
+    setInnerHeight(800);
+    setScrollHeight(100); // maxScroll = -700: target not reachable yet, so it polls.
+
+    const { result } = renderHook(() => useScrollPosition("h1"));
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled(); // still polling
+
+    // The reader takes over mid-poll: this cancels the in-flight poll.
+    act(() => {
+      window.dispatchEvent(new Event("wheel"));
+    });
+
+    // Content of the page grows tall enough and time passes: the cancelled poll
+    // must NOT resurrect and yank the reader.
+    setScrollHeight(2000);
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("(i) a non-scroll keydown does NOT abort restore", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}i1`, "500");
+    setScrollHeight(2000); // tall enough to restore synchronously
+
+    const { result } = renderHook(() => useScrollPosition("i1"));
+
+    // A non-scroll key (e.g. typing, a shortcut) must NOT count as scroll intent.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "a" }));
+    });
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    // Restore still happens: the innocuous keypress did not disable it.
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
+  });
+
+  it("(j) a scroll keydown (Space) DOES abort restore", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}j1`, "500");
+    setScrollHeight(2000); // tall enough to restore synchronously
+
+    const { result } = renderHook(() => useScrollPosition("j1"));
+
+    // Space scrolls the page: this is real scroll intent and must abort restore.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
+    });
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
     expect(window.scrollTo).not.toHaveBeenCalled();
   });
 
@@ -218,6 +300,55 @@ describe("useScrollPosition", () => {
       vi.advanceTimersByTime(5000);
     });
 
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 200, behavior: "auto" });
+  });
+
+  it("(k) shares ONE timeout budget across re-triggers (does not restart the clock)", () => {
+    // The static->live editor swap re-invokes restore. The shared budget
+    // (restoreStartRef) must measure the MAX_RESTORE_WAIT_MS (5000) deadline
+    // from the FIRST trigger, not restart it on every re-trigger. This pins
+    // the `if (restoreStartRef.current === null)` guard: a mutant that resets
+    // `restoreStartRef.current = Date.now()` on every trigger would push the
+    // deadline out to t=8000 (3000 + 5000) and fail the t=5000 assertion below.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    window.sessionStorage.setItem(`${KEY_PREFIX}k1`, "5000");
+    setInnerHeight(800);
+    setScrollHeight(1000); // maxScroll = 200, never reaches 5000 -> it polls.
+
+    const { result } = renderHook(() => useScrollPosition("k1"));
+
+    // First trigger at t=0: starts the shared budget and begins polling.
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // Advance to t=3000 (still polling: content short, not yet timed out).
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // Second trigger at t=3000 (the swap re-assert). Under the real code the
+    // budget is shared, so `start` stays 0; under the reset-mutant it becomes 3000.
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    // At t=4900 the FIRST budget has not yet elapsed (4900 - 0 < 5000): no clamp.
+    act(() => {
+      vi.advanceTimersByTime(1900);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // At t=5000 the shared budget (measured from t=0) times out and clamps to the
+    // furthest reachable position (maxScroll = 200). The reset-mutant, measuring
+    // from t=3000, would still be waiting (5000 - 3000 = 2000 < 5000) and would
+    // NOT have scrolled here -> this assertion fails against that mutant.
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 200, behavior: "auto" });
   });
 
