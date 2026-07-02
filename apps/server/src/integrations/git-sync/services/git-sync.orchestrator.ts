@@ -368,7 +368,11 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
     const { runCycle } = await loadGitSync();
     const settings = await this.buildSettings(spaceId);
     const vault = await this.vaultRegistry.getVault(spaceId);
-    const client = this.dataSource.bind({ workspaceId, userId: serviceUserId });
+    const client = this.dataSource.bind({
+      workspaceId,
+      userId: serviceUserId,
+      spaceId,
+    });
 
     const result = await runCycle({
       // Cooperative-abort signal from the per-space lock: if a heartbeat refresh

@@ -23,6 +23,14 @@ import { AuthProvenanceData } from '../../../common/decorators/auth-provenance.d
 export interface GitSyncBindContext {
   workspaceId: string;
   userId: string;
+  /**
+   * The space this cycle reconciles. Used to distinguish a genuine page deletion
+   * from a cross-space MOVE: when a page leaves space A, A's vault file is removed
+   * and the push phase would otherwise soft-delete the page — but the page still
+   * lives in space B. `deletePage` skips the soft-delete when the page's current
+   * space differs from the reconciling space. Optional for back-compat.
+   */
+  spaceId?: string;
 }
 
 /**
@@ -237,6 +245,24 @@ export class GitmostDataSourceService {
     ctx: GitSyncBindContext,
     pageId: string,
   ): Promise<unknown> {
+    // Cross-space MOVE guard. A push-phase delete fires when a page's file
+    // disappears from THIS space's vault. That happens for a genuine deletion —
+    // but ALSO when the page was moved to another space (source vault file
+    // removed, page recreated in the destination vault). In the move case the
+    // page still exists and must NOT be trashed: soft-deleting it here loses the
+    // page from BOTH vaults and dumps it in Trash (observed data-loss on
+    // move-to-space with git-sync enabled). If the page's CURRENT space differs
+    // from the space we're reconciling, this is a move-out — drop only the vault
+    // file (already done by the engine), never the page.
+    if (ctx.spaceId) {
+      const page = await this.pageRepo.findById(pageId);
+      if (page && page.deletedAt == null && page.spaceId !== ctx.spaceId) {
+        this.logger.log(
+          `git-sync[${ctx.spaceId}] skip delete of page ${pageId}: moved to space ${page.spaceId} (vault file removed, page preserved)`,
+        );
+        return { id: pageId, skipped: 'moved-to-other-space' };
+      }
+    }
     await this.pageService.removePage(
       pageId,
       ctx.userId,
