@@ -955,11 +955,28 @@ export function convertProseMirrorToMarkdown(content: any): string {
   const blockToHtml = (block: any): string => {
     const children = block.content || [];
     switch (block.type) {
-      case "paragraph":
-        return `<p>${inlineToHtml(children)}</p>`;
+      case "paragraph": {
+        // Carry textAlign here too (symmetric with the processNode paragraph
+        // case): a paragraph nested inside an HTML container (column/table/
+        // callout) would otherwise drop its alignment on the round trip.
+        const pAlign = block.attrs?.textAlign;
+        const pStyle =
+          pAlign && pAlign !== "left"
+            ? ` style="text-align:${escapeAttr(pAlign)}"`
+            : "";
+        return `<p${pStyle}>${inlineToHtml(children)}</p>`;
+      }
       case "heading": {
-        const level = block.attrs?.level || 1;
-        return `<h${level}>${inlineToHtml(children)}</h${level}>`;
+        // Same for a heading nested in an HTML container: emit the alignment as
+        // an inline style (symmetric with the processNode heading case) so it is
+        // not silently dropped. Clamp the level to a valid HTML heading tag.
+        const level = Math.min(6, Math.max(1, block.attrs?.level || 1));
+        const hAlign = block.attrs?.textAlign;
+        const hStyle =
+          hAlign && hAlign !== "left"
+            ? ` style="text-align:${escapeAttr(hAlign)}"`
+            : "";
+        return `<h${level}${hStyle}>${inlineToHtml(children)}</h${level}>`;
       }
       case "bulletList":
         return `<ul>${children

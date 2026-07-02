@@ -248,6 +248,67 @@ const CORPUS: Record<string, any> = {
     ],
   }),
 
+  // #8 — a table with a MULTI-BLOCK cell (two paragraphs). A GFM pipe table
+  // cannot hold two blocks without flattening them; the converter emits a
+  // lossless HTML <table> instead, and the two blocks must survive the round trip.
+  'table (multi-block cell, #8)': doc({
+    type: 'table',
+    content: [
+      {
+        type: 'tableRow',
+        content: [
+          {
+            type: 'tableHeader',
+            attrs: { colspan: 1, rowspan: 1, colwidth: null },
+            content: [para(text('H'))],
+          },
+        ],
+      },
+      {
+        type: 'tableRow',
+        content: [
+          {
+            type: 'tableCell',
+            attrs: { colspan: 1, rowspan: 1, colwidth: null },
+            content: [para(text('first')), para(text('second'))],
+          },
+        ],
+      },
+    ],
+  }),
+
+  // #7 — a table nested inside a column. Columns render as HTML containers, and a
+  // table inside one must stay an HTML <table> (a GFM pipe table cannot live
+  // inside an HTML block), round-tripping without being unwrapped or lost.
+  // `widthMode` is pre-authored at its materialized `normal` default (SPEC §11).
+  'table inside a column (#7)': doc({
+    type: 'columns',
+    attrs: { layout: 'two', widthMode: 'normal' },
+    content: [
+      {
+        type: 'column',
+        content: [
+          {
+            type: 'table',
+            content: [
+              {
+                type: 'tableRow',
+                content: [
+                  {
+                    type: 'tableHeader',
+                    attrs: { colspan: 1, rowspan: 1, colwidth: null },
+                    content: [para(text('C7'))],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      { type: 'column', content: [para(text('right'))] },
+    ],
+  }),
+
   // --- editor-ext nodes/marks beyond the original corpus (item #7) ----------
   // Each of these was verified to round-trip CLEANLY through the real gate
   // (export -> markdown -> import -> editor-ext Yjs write path). Fixtures are
@@ -457,21 +518,14 @@ describe('git-sync converter §13.1 image dimensions preserved (was KNOWN DIVERG
 });
 
 // ---------------------------------------------------------------------------
-// KNOWN DIVERGENCE — HEADING text alignment (item #7; isolated, not silently
-// dropped). PARAGRAPH alignment now round-trips (exported as
-// `<p style="text-align:...">`, re-parsed by the paragraph parseHTML) and lives
-// in the green CORPUS above; only HEADING alignment still diverges:
-//
-//   • A heading's `textAlign` is NOT exported at all — a heading emits plain
-//     markdown `## text` with no alignment syntax — so any non-default heading
-//     alignment is dropped on a full round trip.
-//
-// If the converter is ever taught to export + re-parse heading alignment, this
-// assertion flips and an aligned-heading fixture should be promoted into the
-// green CORPUS above.
+// HEADING text alignment — now round-trips (item A1; formerly a KNOWN DIVERGENCE).
+// Symmetric with the paragraph fix: a heading's non-default `textAlign` is
+// exported as a styled `<hN style="text-align:…">` (was a bare ATX `## text`
+// that dropped it) and re-parsed by the heading + textAlign parseHTML on import,
+// so a non-default heading alignment SURVIVES a full round trip.
 // ---------------------------------------------------------------------------
-describe('git-sync converter §13.1 KNOWN DIVERGENCE (heading text alignment dropped)', () => {
-  it('drops a heading textAlign (headings do not export alignment at all)', async () => {
+describe('git-sync converter §13.1 heading text alignment round-trips', () => {
+  it('preserves a heading textAlign across the markdown round trip', async () => {
     const alignedHeading = doc({
       type: 'heading',
       attrs: { level: 2, textAlign: 'center' },
@@ -480,9 +534,11 @@ describe('git-sync converter §13.1 KNOWN DIVERGENCE (heading text alignment dro
 
     const { md, canonNormalized } = await runGate(alignedHeading);
 
-    // Export is a plain markdown heading — no alignment syntax.
-    expect(md.trim()).toBe('## centered heading');
-    expect(docsCanonicallyEqual(alignedHeading, canonNormalized)).toBe(false);
+    // Export is a styled <h2> (was a lossy bare `## centered heading`).
+    expect(md.trim()).toBe(
+      '<h2 style="text-align:center">centered heading</h2>',
+    );
+    expect(docsCanonicallyEqual(alignedHeading, canonNormalized)).toBe(true);
   });
 });
 
