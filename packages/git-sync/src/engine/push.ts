@@ -1159,15 +1159,47 @@ export function isPageFile(path: string): boolean {
  * `|||||||` and `=======`): the base text is neither side's current content, so
  * keeping it would inject obsolete lines AND leak a raw `|||||||` marker.
  */
-const CONFLICT_BEGIN_RE = /^<{7}/m;
-const CONFLICT_END_RE = /^>{7}/m;
 const CONFLICT_BEGIN_LINE_RE = /^<{7}/;
 const CONFLICT_BASE_LINE_RE = /^\|{7}/;
 const CONFLICT_SEP_LINE_RE = /^={7}/;
 const CONFLICT_END_LINE_RE = /^>{7}/;
 
+// A code-fence open/close line (``` or ~~~), matching markdown-to-prosemirror's
+// CODE_FENCE_RE. Used to make conflict-marker detection fence-aware.
+const CONFLICT_CODE_FENCE_RE = /^(\s*)(`{3,}|~{3,})/;
+
 export function hasConflictMarkers(body: string): boolean {
-  return CONFLICT_BEGIN_RE.test(body) && CONFLICT_END_RE.test(body);
+  // Fence-aware scan (review #9). A page documenting git (a ```-fenced block that
+  // literally contains `<<<<<<< HEAD` ... `>>>>>>>`) must NOT be flagged as a
+  // conflict: with autoMergeConflicts OFF the all-or-nothing gate would then jam
+  // the ENTIRE space's refs forever, re-failing the batch every cycle. Only count
+  // begin/end marker lines that live OUTSIDE a fenced code block.
+  let inFence = false;
+  let fenceMarker = "";
+  let sawBegin = false;
+  for (const line of body.split("\n")) {
+    const fence = line.match(CONFLICT_CODE_FENCE_RE);
+    if (inFence) {
+      // Close on a fence line of the same marker char, length >= the opener.
+      if (
+        fence &&
+        fence[2][0] === fenceMarker[0] &&
+        fence[2].length >= fenceMarker.length
+      ) {
+        inFence = false;
+        fenceMarker = "";
+      }
+      continue; // everything inside a fence is inert
+    }
+    if (fence) {
+      inFence = true;
+      fenceMarker = fence[2];
+      continue;
+    }
+    if (CONFLICT_BEGIN_LINE_RE.test(line)) sawBegin = true;
+    else if (sawBegin && CONFLICT_END_LINE_RE.test(line)) return true;
+  }
+  return false;
 }
 
 function stripConflictMarkers(body: string): string {

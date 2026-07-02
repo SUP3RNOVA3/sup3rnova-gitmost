@@ -57,6 +57,7 @@ export interface GitSyncRunStatus {
     | 'in-progress'
     | 'disabled'
     | 'no-service-user'
+    | 'space-not-enabled'
     | 'merge-in-progress';
   pull?: { written: number; deleted: number; conflict: boolean };
   push?: { mode: string; failures: number };
@@ -116,6 +117,24 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
       .where('deletedAt', 'is', null)
       .where(sql<boolean>`settings->'gitSync'->>'enabled' = 'true'`)
       .execute();
+  }
+
+  /**
+   * Authoritative per-space opt-in check used by the EVENT path (runOnce), which
+   * — unlike the poll path — is not pre-filtered by enabledSpaces(). Same STRICT
+   * `settings.gitSync.enabled === 'true'` semantics; a missing/soft-deleted space
+   * or any non-'true' value returns false (review #3).
+   */
+  private async isSpaceGitSyncEnabled(spaceId: string): Promise<boolean> {
+    const row = await this.db
+      .selectFrom('spaces')
+      .select(
+        sql<boolean>`settings->'gitSync'->>'enabled' = 'true'`.as('enabled'),
+      )
+      .where('id', '=', spaceId)
+      .where('deletedAt', 'is', null)
+      .executeTakeFirst();
+    return row?.enabled ?? false;
   }
 
   // --- one sync cycle for a space -------------------------------
@@ -186,6 +205,16 @@ export class GitSyncOrchestrator implements OnModuleInit, OnModuleDestroy {
         'git-sync: GIT_SYNC_SERVICE_USER_ID is required when GIT_SYNC_ENABLED — skipping',
       );
       return { spaceId, ran: false, skipped: 'no-service-user' };
+    }
+    // Per-space opt-in gate (review #3). The global GIT_SYNC_ENABLED env switch is
+    // NOT sufficient — sync must also be turned on for THIS space
+    // (`space.settings.gitSync.enabled === true`). The poll path filters via
+    // enabledSpaces(), but the event path (page-change listener) calls runOnce
+    // directly; without this check an edit in ANY space would `git init` a vault
+    // and export that space's whole history, violating the module's opt-in
+    // contract (orchestrator docstring §79-86). STRICT: anything but 'true' skips.
+    if (!(await this.isSpaceGitSyncEnabled(spaceId))) {
+      return { spaceId, ran: false, skipped: 'space-not-enabled' };
     }
 
     // Run the full cycle under the per-space lock. withSpaceLock owns the

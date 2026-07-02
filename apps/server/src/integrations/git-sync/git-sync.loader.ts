@@ -6,6 +6,7 @@ import type {
   runCycle as runCycleFn,
   parseDocmostMarkdown as parseDocmostMarkdownFn,
   markdownToProseMirror as markdownToProseMirrorFn,
+  sanitizeTitle as sanitizeTitleFn,
 } from '@docmost/git-sync';
 
 /**
@@ -20,6 +21,7 @@ interface GitSyncModule {
   runCycle: typeof runCycleFn;
   parseDocmostMarkdown: typeof parseDocmostMarkdownFn;
   markdownToProseMirror: typeof markdownToProseMirrorFn;
+  sanitizeTitle: typeof sanitizeTitleFn;
 }
 
 // The CJS->ESM dynamic-import bridge lives in one shared helper

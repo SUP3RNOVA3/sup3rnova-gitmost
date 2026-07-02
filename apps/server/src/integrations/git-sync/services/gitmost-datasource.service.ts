@@ -362,6 +362,17 @@ export class GitmostDataSourceService {
       throw new NotFoundException(`Page ${pageId} not found`);
     }
 
+    // GS-MOVE-ECHO guard (review #6). A drag-move in Docmost echoes back through
+    // git-sync as movePage(pageId, sameParent) WITHOUT a position. Recomputing a
+    // position here would append the page to the end of its sibling list,
+    // clobbering the position the user just chose. If the parent is unchanged and
+    // no explicit position was provided, there is nothing to reparent — skip, so
+    // the user's ordering is preserved. A real reparent (parent differs) or an
+    // explicit position still proceeds.
+    if (position == null && parentPageId === (page.parentPageId ?? null)) {
+      return { id: pageId, skipped: 'no-op-move-echo' };
+    }
+
     const resolvedPosition =
       position ?? (await this.computeMovePosition(page.spaceId, parentPageId));
 
@@ -429,6 +440,26 @@ export class GitmostDataSourceService {
       page.slugId && title.endsWith(suffix)
         ? title.slice(0, -suffix.length)
         : title;
+    // GS-TITLE-SANITIZE guard (review Critical #2). A rename in Docmost to a
+    // title with filename-hostile chars (`:` `/` `"` `|`, newlines, double
+    // spaces, >120 chars) is pulled to a SANITIZED file stem; the same cycle then
+    // sees an R(ename) line and would call renamePage with that sanitized stem,
+    // PERMANENTLY replacing the real title with its sanitized form (e.g.
+    // "Project: Plan" -> "Project- Plan"). In that echo the incoming title equals
+    // `sanitizeTitle(current title)`, so skip the write — the sanitized stem is a
+    // local filesystem artifact, never the page's real Docmost title. A genuine
+    // retitle does NOT equal the sanitized current title, so it still applies.
+    const { sanitizeTitle } = await loadGitSync();
+    if (
+      page.title &&
+      cleanTitle !== page.title &&
+      sanitizeTitle(page.title) === cleanTitle
+    ) {
+      this.logger.log(
+        `git-sync: skip rename of page ${pageId}: incoming title is the sanitized form of current title (filesystem artifact; real title preserved)`,
+      );
+      return { id: pageId };
+    }
     // PageService.update takes a User; the git-sync service user is the
     // responsible author. Only the id is read off it for lastUpdatedById.
     // `pageId` satisfies the UpdatePageDto type; PageService.update reads the

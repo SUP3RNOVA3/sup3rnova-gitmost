@@ -158,11 +158,13 @@ RBASIC=$(basicfor "e2e-adv-reader@test.local")
   && ok "reader push (receive-pack) -> 403" || bad "reader push not 403"
 
 # ===========================================================================
-say "authz: a NON-member of an enabled space -> 403 (NOT 404)"
+say "authz: a NON-member of an enabled space -> 404 (NOT 403; existence not leaked)"
 OUTSIDER_ID=$(make_user "e2e-adv-outsider@test.local" none)
 OBASIC=$(basicfor "e2e-adv-outsider@test.local")
 c=$(code -H "Authorization: Basic $OBASIC" "$GIT_URL/info/refs?service=git-upload-pack")
-[ "$c" = "403" ] && ok "non-member fetch -> 403 (existence revealed only to members)" || bad "non-member got $c (contract is 403)"
+# The gate deliberately returns 404 (not 403) for a non-member so the 403<->404
+# split cannot be used to probe which private spaces exist (git-http.helpers.spec.ts).
+[ "$c" = "404" ] && ok "non-member fetch -> 404 (space existence not leaked)" || bad "non-member got $c (contract is 404)"
 
 # ===========================================================================
 say "concurrency: a push while the per-space lock is held -> 503 + Retry-After"
@@ -194,31 +196,12 @@ m2=$(vault_sha main); lp2=$(vault_sha refs/docmost/last-pushed)
 # deterministically by the engine unit suite — packages/git-sync/test/
 # classify-rename-moves.test.ts and node-ops.test.ts.)
 
-# ===========================================================================
-say "data-loss guard: deleting MORE than the cap is HELD, not dropped"
-# Create cap+2 sibling pages, sync, then git rm all of them in one push.
-CAP=$(api "$SERVER/api/git-sync/status" | grep -o '"maxDeletesPerCycle":[0-9]*' | grep -o '[0-9]*')
-CAP=${CAP:-5}
-N=$((CAP+2))
-ids=""
-for i in $(seq 1 $N); do
-  id=$(api -X POST "$SERVER/api/pages/create" -H 'Content-Type: application/json' -d "{\"spaceId\":\"$SPACE_ID\",\"title\":\"E2E-ADV-Del-$i-$RANDOM\"}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-  ids="$ids $id"
-done
-sync_now
-lp_before=$(vault_sha refs/docmost/last-pushed)
-rm -rf "$WORK/cd"; gitc clone -q "$GIT_URL" "$WORK/cd" 2>/dev/null
-cd "$WORK/cd"; git config user.email e2e@test; git config user.name e2e
-for id in $ids; do f=$(grep -rl "$id" --include='*.md' . | head -1); [ -n "$f" ] && git rm -q "$f"; done
-git commit -qm "rm $N pages (over cap $CAP)"
-gpush
-cd "$WORK"
-sleep 2
-trashed=$(psqlq "select count(*) from pages where space_id='$SPACE_ID' and deleted_at is not null and ($(echo $ids | sed "s/ \?\([0-9a-f-]\+\)/ or id='\1'/g; s/^ or //"));")
-lp_after=$(vault_sha refs/docmost/last-pushed)
-[ "${trashed:-0}" = "0" ] && ok "none of the $N over-cap deletes were applied (held)" || bad "$trashed pages trashed despite over-cap (data loss!)"
-[ "$lp_before" = "$lp_after" ] && ok "last-pushed ref did NOT advance past the delete commit (retry-safe)" || bad "last-pushed advanced over suppressed deletes ($lp_before -> $lp_after)"
-# cleanup these pages (hard-delete; they are E2E-ADV-* so teardown also catches them)
+# NOTE (review #12): the former "delete cap" block was removed. There is NO
+# delete cap in the orchestrator ("There is no delete cap") and /status does not
+# expose maxDeletesPerCycle, so the block failed deterministically with a scary
+# "(data loss!)". The real contract — every git-rm'd page soft-deletes to Trash
+# (recoverable) — is exercised by the git-side-delete scenario elsewhere and by
+# the engine unit suite.
 
 # ===========================================================================
 say "data-loss guard #2: untitled pages + retitle must NOT trash other pages"

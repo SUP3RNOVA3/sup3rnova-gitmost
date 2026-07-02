@@ -125,6 +125,16 @@ function tryMergeRegion(
   a: string[],
   b: string[],
 ): LocalPick[] | null {
+  // Agreement short-circuit (review #11). When live (a) and target (b) are
+  // identical, both sides converged on the SAME result — diff3 "agreement", NOT
+  // a conflict. This is the dominant echo case (live == target != base) that
+  // otherwise trips the overlap check below and is logged as a false "N same-block
+  // conflict(s) resolved to the git version", masking REAL data-loss signals.
+  // Emit the region straight from live (which equals target); no conflict.
+  if (a.length === b.length && a.every((v, i) => v === b[i])) {
+    return a.map((_v, i) => ({ src: 'live', local: i }) as LocalPick);
+  }
+
   const aHunks = buildHunks(o, a);
   const bHunks = buildHunks(o, b);
 
