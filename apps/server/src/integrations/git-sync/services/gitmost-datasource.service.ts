@@ -222,7 +222,23 @@ export class GitmostDataSourceService {
     const currentPage = await this.pageRepo.findById(pageId, {
       includeContent: true,
     });
-    if (baseMarkdown != null && fullMarkdown === baseMarkdown) {
+    // Revert-of-delete undelete (review warning). If the target page is currently
+    // SOFT-DELETED, this ingest is a git-revert that re-added the page's file
+    // (the push classifier saw an add carrying a known pageId -> UPDATE). Writing
+    // the body to a trashed page leaves it in Trash, and the next pull re-deletes
+    // the file — the git revert is silently nullified. Restore the page FIRST so
+    // the revert actually brings it back, then apply the body below. (restorePage
+    // stamps git-sync provenance so the loop-guard skips its own echo.)
+    if (currentPage?.deletedAt != null) {
+      await this.restorePage(ctx, pageId);
+    }
+    // Skip the early no-op return when we just restored (the page must still get
+    // its body write below); only short-circuit for a live, unchanged page.
+    if (
+      currentPage?.deletedAt == null &&
+      baseMarkdown != null &&
+      fullMarkdown === baseMarkdown
+    ) {
       return {
         updatedAt: currentPage
           ? new Date(currentPage.updatedAt).toISOString()
