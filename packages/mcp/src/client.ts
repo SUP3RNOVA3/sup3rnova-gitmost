@@ -56,7 +56,11 @@ import {
 } from "./lib/json-edit.js";
 import { getCollabToken, performLogin } from "./lib/auth-utils.js";
 import { diffDocs, summarizeChange } from "./lib/diff.js";
-import { applyAnchorInDoc, canAnchorInDoc } from "./lib/comment-anchor.js";
+import {
+  applyAnchorInDoc,
+  canAnchorInDoc,
+  countAnchorMatches,
+} from "./lib/comment-anchor.js";
 import {
   blockText,
   walk,
@@ -2395,10 +2399,28 @@ export class DocmostClient {
     type: "page" | "inline" = "page",
     selection?: string,
     parentCommentId?: string,
+    suggestedText?: string,
   ) {
     await this.ensureAuthenticated();
 
     const isReply = !!parentCommentId;
+    const hasSuggestion =
+      suggestedText !== undefined && suggestedText !== null;
+    // Defense in depth mirroring the server DTO/service: a suggested edit rewrites
+    // the exact anchored text, so it is only meaningful on a top-level inline
+    // comment that carries a selection.
+    if (hasSuggestion) {
+      if (isReply) {
+        throw new Error(
+          "create_comment: a suggested edit (suggestedText) cannot be attached to a reply; it applies only to a top-level inline comment.",
+        );
+      }
+      if (!selection || !selection.trim()) {
+        throw new Error(
+          "create_comment: a suggested edit (suggestedText) requires a 'selection' to anchor and rewrite.",
+        );
+      }
+    }
     // Only top-level comments are inline-anchored, so they are stored as
     // "inline". Replies carry no inline selection, so they keep the historical
     // general ("page") type — both backward-compatible and semantically correct.
@@ -2418,18 +2440,40 @@ export class DocmostClient {
     if (!isReply && selection) {
       try {
         const page = await this.getPageJson(pageId);
-        if (!canAnchorInDoc(page.content, selection)) {
+        if (hasSuggestion) {
+          // A suggestion's anchor MUST be unambiguous: applying it rewrites the
+          // exact anchored text, and ordinary anchoring silently takes the first
+          // occurrence, so 0 matches -> not found and >=2 -> ambiguous, both
+          // rejected BEFORE creating the comment.
+          const matches = countAnchorMatches(page.content, selection);
+          if (matches === 0) {
+            throw new Error(
+              "create_comment: could not find the selection text in the page to anchor the comment. " +
+                "Provide the EXACT contiguous text from a single paragraph/block (<=250 chars).",
+            );
+          }
+          if (matches >= 2) {
+            throw new Error(
+              `create_comment: the suggestion's selection is ambiguous — it occurs ${matches} times in the page. ` +
+                "A suggested edit must anchor to a UNIQUE location; expand the selection with surrounding context " +
+                "(still <=250 chars) so it appears exactly once.",
+            );
+          }
+        } else if (!canAnchorInDoc(page.content, selection)) {
           throw new Error(
             "create_comment: could not find the selection text in the page to anchor the comment. " +
               "Provide the EXACT contiguous text from a single paragraph/block (<=250 chars).",
           );
         }
       } catch (e) {
-        // Rethrow our own "not found" error; swallow read/network errors so the
-        // live anchor step can still try (and enforce) the anchoring.
+        // Rethrow our own "not found"/"ambiguous" errors; swallow read/network
+        // errors so the live anchor step can still try (and enforce) anchoring.
         if (
           e instanceof Error &&
-          e.message.startsWith("create_comment: could not find the selection")
+          (e.message.startsWith("create_comment: could not find the selection") ||
+            e.message.startsWith(
+              "create_comment: the suggestion's selection is ambiguous",
+            ))
         ) {
           throw e;
         }
@@ -2454,6 +2498,10 @@ export class DocmostClient {
     };
     if (!isReply && selection) payload.selection = selection;
     if (parentCommentId) payload.parentCommentId = parentCommentId;
+    // Only a top-level inline comment (with a selection) may carry a suggestion.
+    if (!isReply && selection && hasSuggestion) {
+      payload.suggestedText = suggestedText;
+    }
 
     const response = await this.client.post("/comments/create", payload);
     const comment = response.data.data || response.data;
@@ -2485,12 +2533,18 @@ export class DocmostClient {
       );
     }
     let anchored = false;
+    // Set inside the transform when a suggestion's live anchor is ambiguous
+    // (>=2 occurrences), so the rollback path can surface the right error.
+    let ambiguousInLiveDoc = false;
     try {
       const collabToken = await this.getCollabTokenWithReauth();
       // Open the collab doc by the canonical UUID, never the slugId (#260). The
       // /comments/create REST call above keeps the agent-supplied id.
       const pageUuid = await this.resolvePageId(pageId);
-      const mutation = await mutatePageContent(
+      // Route through the mutatePage seam (not the free function) so this
+      // wrapper's uniqueness gate + rollback can be unit-tested without a live
+      // Hocuspocus collab socket.
+      const mutation = await this.mutatePage(
         pageUuid,
         collabToken,
         this.apiUrl,
@@ -2499,6 +2553,19 @@ export class DocmostClient {
             liveDoc && liveDoc.type === "doc"
               ? liveDoc
               : { type: "doc", content: [] };
+          if (hasSuggestion) {
+            // Authoritative uniqueness check against the LIVE document: a
+            // suggestion must anchor to EXACTLY ONE occurrence, otherwise
+            // "Apply" would rewrite the wrong/ambiguous text. If the live doc
+            // no longer has exactly one occurrence (it changed since the
+            // pre-check), abort so the just-created comment is rolled back
+            // rather than mis-anchored to the first occurrence.
+            const liveCount = countAnchorMatches(doc, selection as string);
+            if (liveCount !== 1) {
+              ambiguousInLiveDoc = liveCount >= 2;
+              return null;
+            }
+          }
           if (applyAnchorInDoc(doc, selection as string, newCommentId)) {
             anchored = true;
             return doc;
@@ -2517,11 +2584,14 @@ export class DocmostClient {
     }
 
     if (!anchored) {
-      // Mutation aborted because the selection was not found in the live
-      // document. Roll back the comment and surface a hard error.
+      // Mutation aborted because the selection was not found (or, for a
+      // suggestion, was ambiguous) in the live document. Roll back the comment
+      // and surface a hard error.
       await this.safeDeleteComment(newCommentId);
       throw new Error(
-        "create_comment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
+        ambiguousInLiveDoc
+          ? "create_comment: the suggestion's selection is ambiguous in the live document (multiple occurrences); the comment was rolled back. Expand the selection with surrounding context so it is unique."
+          : "create_comment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
       );
     }
 

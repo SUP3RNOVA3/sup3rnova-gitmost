@@ -722,7 +722,10 @@ server.registerTool(
       "A top-level comment REQUIRES an exact `selection`; if the selection " +
       "cannot be found in the page the call fails (no orphan comment is left). " +
       "Replies (parentCommentId set) inherit the parent's anchor and take no " +
-      "selection.",
+      "selection. You may also attach a `suggestedText` proposing a replacement " +
+      "for the `selection`; a human applies (or rejects) it from the UI. When " +
+      "`suggestedText` is set the `selection` MUST occur exactly once in the " +
+      "page — expand it with surrounding context if it is ambiguous.",
     inputSchema: {
       pageId: z.string().describe("ID of the page to comment on"),
       content: z.string().min(1).describe("Comment content in Markdown format"),
@@ -741,13 +744,37 @@ server.registerTool(
         .string()
         .optional()
         .describe("Parent comment ID to create a reply (max 2 nesting levels)"),
+      suggestedText: z
+        .string()
+        .min(1)
+        .max(2000)
+        .optional()
+        .describe(
+          "Optional proposed replacement (PLAIN TEXT) for the `selection`, " +
+            "applied by a human via the UI (never auto-applied). REQUIRES a " +
+            "`selection`; NOT allowed on a reply. When set, the `selection` must " +
+            "be UNIQUE in the page — expand it with surrounding context (still " +
+            "<=250 chars) if it occurs more than once, or the call is refused.",
+        ),
     },
   },
-  async ({ pageId, content, selection, parentCommentId }) => {
+  async ({ pageId, content, selection, parentCommentId, suggestedText }) => {
     if (!parentCommentId && (!selection || !selection.trim())) {
       throw new Error(
         "create_comment: a 'selection' (exact text to anchor on) is required for a top-level comment; omit it only when replying via parentCommentId.",
       );
+    }
+    if (suggestedText !== undefined) {
+      if (parentCommentId) {
+        throw new Error(
+          "create_comment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
+        );
+      }
+      if (!selection || !selection.trim()) {
+        throw new Error(
+          "create_comment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
+        );
+      }
     }
     const result = await docmostClient.createComment(
       pageId,
@@ -755,6 +782,7 @@ server.registerTool(
       "inline",
       selection,
       parentCommentId,
+      suggestedText,
     );
     return jsonContent(result);
   },

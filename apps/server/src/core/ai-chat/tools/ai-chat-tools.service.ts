@@ -450,8 +450,10 @@ export class AiChatToolsService {
           "new top-level comment REQUIRES a `selection`. Replies inherit the " +
           "parent's anchor and take no selection. If the call fails with a " +
           '"selection not found" error, retry with a corrected EXACT selection ' +
-          'copied verbatim from a single paragraph/block. Reversible via the ' +
-          'comment UI.',
+          'copied verbatim from a single paragraph/block. You may also attach a ' +
+          '`suggestedText` proposing a replacement for the `selection` (a human ' +
+          'applies it from the UI); when set, the `selection` must occur exactly ' +
+          'once in the page. Reversible via the comment UI.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page to comment on.'),
           content: z.string().describe('The comment body as Markdown.'),
@@ -473,17 +475,49 @@ export class AiChatToolsService {
               'Optional id of a TOP-LEVEL comment to reply to (one level ' +
                 'of replies only).',
             ),
+          suggestedText: z
+            .string()
+            .min(1)
+            .max(2000)
+            .optional()
+            .describe(
+              'Optional proposed replacement (PLAIN TEXT) for the `selection`, ' +
+                'applied by a human via the UI (never auto-applied). REQUIRES a ' +
+                '`selection`; NOT allowed on a reply. When set, the `selection` ' +
+                'must be UNIQUE in the page — expand it with surrounding context ' +
+                '(still <=250 chars) if it occurs more than once, or the call is ' +
+                'refused.',
+            ),
         }),
-        execute: async ({ pageId, content, selection, parentCommentId }) => {
-          // createComment(pageId, content, type, selection?, parentCommentId?).
-          // Top-level comments are inline and must carry a selection to anchor
-          // on; replies inherit the parent's anchor (no selection). Throwing
-          // here surfaces a tool error to the model (Vercel `ai` SDK) so the
-          // agent retries with a better selection — do not catch/suppress it.
+        execute: async ({
+          pageId,
+          content,
+          selection,
+          parentCommentId,
+          suggestedText,
+        }) => {
+          // createComment(pageId, content, type, selection?, parentCommentId?,
+          // suggestedText?). Top-level comments are inline and must carry a
+          // selection to anchor on; replies inherit the parent's anchor (no
+          // selection). Throwing here surfaces a tool error to the model (Vercel
+          // `ai` SDK) so the agent retries with a better selection — do not
+          // catch/suppress it.
           if (!parentCommentId && (!selection || !selection.trim())) {
             throw new Error(
               "createComment requires a 'selection' (exact text to anchor on) for a new top-level comment.",
             );
+          }
+          if (suggestedText !== undefined) {
+            if (parentCommentId) {
+              throw new Error(
+                "createComment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
+              );
+            }
+            if (!selection || !selection.trim()) {
+              throw new Error(
+                "createComment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
+              );
+            }
           }
           const result = await client.createComment(
             pageId,
@@ -491,6 +525,7 @@ export class AiChatToolsService {
             'inline',
             selection,
             parentCommentId,
+            suggestedText,
           );
           const data = (result?.data ?? {}) as { id?: string };
           return { commentId: data.id, pageId };

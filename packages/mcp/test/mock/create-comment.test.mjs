@@ -229,3 +229,226 @@ test("a reply creates without selection or anchoring and is stored as type 'page
     "a reply must skip the pre-check/anchoring (no /pages/info read)",
   );
 });
+
+// -----------------------------------------------------------------------------
+// 4) suggestedText + a DUPLICATE selection is refused BEFORE creating anything:
+//    a suggestion must anchor to a unique location, so >=2 occurrences throws the
+//    ambiguity error (the /pages/info pre-check short-circuits before create).
+// -----------------------------------------------------------------------------
+test("suggestedText with an ambiguous selection is refused before creating", async () => {
+  let createCalls = 0;
+  let infoCalls = 0;
+
+  const { baseURL } = await spawn(async (req, res) => {
+    await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    if (req.url === "/api/pages/info") {
+      infoCalls++;
+      // "target" appears in two blocks -> ambiguous for a suggestion.
+      sendJson(res, 200, {
+        data: {
+          id: "page-1",
+          content: {
+            type: "doc",
+            content: [
+              { type: "paragraph", content: [{ type: "text", text: "first target here" }] },
+              { type: "paragraph", content: [{ type: "text", text: "second target here" }] },
+            ],
+          },
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/create") {
+      createCalls++;
+      sendJson(res, 200, { data: { id: "should-not-happen" } });
+      return;
+    }
+    sendJson(res, 404, { message: "not found" });
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+
+  await assert.rejects(
+    () =>
+      client.createComment(
+        "page-1",
+        "body",
+        "inline",
+        "target",
+        undefined,
+        "TARGET",
+      ),
+    /ambiguous/i,
+    "an ambiguous suggestion selection must reject with the ambiguity error",
+  );
+  assert.ok(infoCalls >= 1, "the pre-check must read the page via /pages/info");
+  assert.equal(
+    createCalls,
+    0,
+    "/comments/create must NEVER be called for an ambiguous suggestion",
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 5) suggestedText on a reply is refused immediately (before any HTTP).
+// -----------------------------------------------------------------------------
+test("suggestedText on a reply is rejected", async () => {
+  let anyCall = 0;
+  const { baseURL } = await spawn(async (req, res) => {
+    await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    anyCall++;
+    sendJson(res, 200, { data: { id: "x" } });
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+
+  await assert.rejects(
+    () =>
+      client.createComment(
+        "page-1",
+        "body",
+        "inline",
+        undefined,
+        "parent-1",
+        "replacement",
+      ),
+    /reply/i,
+    "suggestedText on a reply must be rejected",
+  );
+  assert.equal(anyCall, 0, "no create/info call for a rejected reply suggestion");
+});
+
+// -----------------------------------------------------------------------------
+// 6) suggestedText without a selection is refused immediately.
+// -----------------------------------------------------------------------------
+test("suggestedText without a selection is rejected", async () => {
+  const { baseURL } = await spawn(async (req, res) => {
+    await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    sendJson(res, 200, { data: { id: "x" } });
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+
+  await assert.rejects(
+    () =>
+      client.createComment(
+        "page-1",
+        "body",
+        "inline",
+        undefined,
+        undefined,
+        "replacement",
+      ),
+    /selection/i,
+    "suggestedText without a selection must be rejected",
+  );
+});
+
+// -----------------------------------------------------------------------------
+// 7) suggestedText + a UNIQUE selection succeeds: the pre-check passes, the
+//    create payload carries suggestedText, and the live anchoring step (stubbed
+//    via the mutatePage seam) writes the comment mark exactly once.
+// -----------------------------------------------------------------------------
+test("suggestedText with a unique selection succeeds and forwards the payload", async () => {
+  let createPayload = null;
+
+  const { baseURL } = await spawn(async (req, res) => {
+    const raw = await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    if (req.url === "/api/pages/info") {
+      // "brave" is unique in the page.
+      sendJson(res, 200, {
+        data: {
+          id: "11111111-1111-1111-1111-111111111111",
+          content: {
+            type: "doc",
+            content: [
+              { type: "paragraph", content: [{ type: "text", text: "Hello brave world" }] },
+            ],
+          },
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/create") {
+      createPayload = JSON.parse(raw);
+      sendJson(res, 200, {
+        data: {
+          id: "cmt-ok-1",
+          content: createPayload.content,
+          selection: createPayload.selection,
+          suggestedText: createPayload.suggestedText,
+          type: createPayload.type,
+        },
+      });
+      return;
+    }
+    sendJson(res, 404, { message: "not found" });
+  });
+
+  // Subclass to stub the collab write seam: no live Hocuspocus socket, but the
+  // wrapper's uniqueness gate + applyAnchorInDoc still run against `doc`.
+  class TestClient extends DocmostClient {
+    async getCollabTokenWithReauth() {
+      return "collab-token";
+    }
+    async resolvePageId(pageId) {
+      return "11111111-1111-1111-1111-111111111111";
+    }
+    async mutatePage(pageId, collabToken, apiUrl, transform) {
+      const doc = {
+        type: "doc",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "Hello brave world" }] },
+        ],
+      };
+      const out = transform(doc);
+      return { doc: out, verify: { ok: true } };
+    }
+  }
+
+  const client = new TestClient(baseURL, "user@example.com", "pw");
+
+  const result = await client.createComment(
+    "11111111-1111-1111-1111-111111111111",
+    "please rename",
+    "inline",
+    "brave",
+    undefined,
+    "bold",
+  );
+
+  assert.equal(result.success, true, "a unique suggestion must resolve");
+  assert.equal(result.anchored, true, "the comment must be anchored");
+  assert.ok(createPayload, "/comments/create must have been called");
+  assert.equal(
+    createPayload.suggestedText,
+    "bold",
+    "the create payload must carry suggestedText for a top-level inline comment",
+  );
+  assert.equal(createPayload.selection, "brave");
+  assert.equal(result.data.suggestedText, "bold", "filterComment surfaces suggestedText");
+});

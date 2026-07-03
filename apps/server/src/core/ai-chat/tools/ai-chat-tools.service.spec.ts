@@ -518,6 +518,20 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
     });
   });
 
+  it('createComment: accepts an optional suggestedText alongside a selection', async () => {
+    const tools = await buildTools();
+    const result = await inputSchemaOf(tools.createComment).validate({
+      pageId: '019efe44-0000-0000-0000-000000000000',
+      content: 'A remark',
+      selection: 'титановый проводник',
+      suggestedText: 'медный проводник',
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toMatchObject({
+      suggestedText: 'медный проводник',
+    });
+  });
+
   it('sharedTool-built tools (getOutline) also get the friendly message on a dropped pageId', async () => {
     const tools = await buildTools();
     const result = await inputSchemaOf(tools.getOutline).validate({});

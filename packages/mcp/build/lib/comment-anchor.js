@@ -211,6 +211,77 @@ function spliceCommentMark(blockContent, match, commentId) {
     blockContent.splice(startChild, endChild - startChild + 1, ...fragments);
 }
 /**
+ * Count how many times `selection` occurs across the whole document, using the
+ * same normalization and run-matching as findAnchorInBlock but WITHOUT stopping
+ * at the first hit: every non-overlapping occurrence within each block's text
+ * runs is counted and summed across all blocks (depth-first, the same traversal
+ * as canAnchorInDoc).
+ *
+ * This is the uniqueness gate for SUGGESTIONS: because applying a suggestion
+ * rewrites the exact anchored text, an ambiguous anchor (>1 occurrence) would
+ * silently edit the wrong place, so a suggestion is only allowed when this
+ * returns exactly 1. Ordinary comments keep first-occurrence anchoring and do
+ * not use this. (Note: counts OCCURRENCES, not just matching blocks, so two
+ * occurrences inside one block are correctly reported as 2.)
+ */
+export function countAnchorMatches(doc, selection) {
+    const normSel = normalizeForMatch(selection).norm.trim();
+    if (normSel.length === 0)
+        return 0;
+    // Count non-overlapping occurrences of the normalized selection within a
+    // single block's direct content, matching findAnchorInBlock's run building.
+    const countInBlock = (blockContent) => {
+        if (!Array.isArray(blockContent))
+            return 0;
+        let count = 0;
+        let i = 0;
+        while (i < blockContent.length) {
+            const node = blockContent[i];
+            if (!node || typeof node !== "object" || node.type !== "text") {
+                i++;
+                continue;
+            }
+            // Accumulate a maximal run of consecutive text nodes.
+            let rawRun = "";
+            let j = i;
+            while (j < blockContent.length) {
+                const n = blockContent[j];
+                if (!n || typeof n !== "object" || n.type !== "text")
+                    break;
+                rawRun += typeof n.text === "string" ? n.text : "";
+                j++;
+            }
+            const norm = normalizeForMatch(rawRun).norm;
+            // Count every non-overlapping occurrence in this run.
+            let from = 0;
+            for (;;) {
+                const idx = norm.indexOf(normSel, from);
+                if (idx === -1)
+                    break;
+                count++;
+                from = idx + normSel.length;
+            }
+            i = j > i ? j : i + 1;
+        }
+        return count;
+    };
+    let total = 0;
+    const visit = (node, depth) => {
+        if (depth > MAX_DEPTH || !node || typeof node !== "object")
+            return;
+        if (!Array.isArray(node.content))
+            return;
+        total += countInBlock(node.content);
+        for (const child of node.content) {
+            if (child && typeof child === "object" && Array.isArray(child.content)) {
+                visit(child, depth + 1);
+            }
+        }
+    };
+    visit(doc, 0);
+    return total;
+}
+/**
  * Depth-first (same order as canAnchorInDoc) over `doc`; on the FIRST block
  * whose content matches `selection`, splice the comment mark across the matched
  * range in place and return true. Returns false (and does NOT mutate) when no
