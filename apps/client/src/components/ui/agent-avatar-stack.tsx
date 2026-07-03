@@ -95,6 +95,7 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
   // `--avatar-bg` (which was falling back to the theme's violet for every agent).
   return (
     <Box
+      data-testid="agent-glyph"
       style={{
         width: GLYPH_SIZE,
         height: GLYPH_SIZE,
@@ -134,8 +135,10 @@ export interface AgentAvatarStackProps {
 }
 
 /**
- * The "agent avatar stack" (#300): the AGENT glyph in front, and — for an
- * internal AI chat — the HUMAN who launched it as a smaller avatar offset behind.
+ * The "agent avatar stack" (#300): the AGENT glyph, and — for an internal AI
+ * chat — the HUMAN who launched it as a smaller avatar badge on top, overhanging
+ * the glyph's top-right corner in FRONT (zIndex 2 > the glyph's zIndex 1) so the
+ * launcher stays fully visible rather than being half-hidden behind the glyph.
  * Replaces the old text `AI-agent` badge. When the item carries an `aiChatId` the
  * whole stack is a deep-link into that chat (the click the old badge owned moved
  * here); the click is contained (stopPropagation) so it does not also trigger an
