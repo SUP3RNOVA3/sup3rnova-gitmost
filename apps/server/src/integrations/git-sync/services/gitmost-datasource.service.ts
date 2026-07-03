@@ -276,14 +276,10 @@ export class GitmostDataSourceService {
     // page — a cross-space write the reconciling space has no authority over.
     // Mirror deletePage's guard (same `ctx.spaceId` source, same fail-safe
     // direction): when the reconciling space is known and the resolved page
-    // already lives in a DIFFERENT space, skip — touch nothing. Only applies when
-    // the page exists; a not-found page (no currentPage) still proceeds as before
-    // so a legitimate same-space ingest is unaffected.
-    if (
-      ctx.spaceId &&
-      currentPage &&
-      currentPage.spaceId !== ctx.spaceId
-    ) {
+    // already lives in a DIFFERENT space, skip — touch nothing. A null page is
+    // already handled by the N1-D1 guard above, so here `currentPage` is
+    // guaranteed non-null.
+    if (ctx.spaceId && currentPage.spaceId !== ctx.spaceId) {
       this.logger.log(
         `git-sync[${ctx.spaceId}] skip import of page ${pageId}: page lives in space ${currentPage.spaceId} (cross-space vault reference; page preserved)`,
       );
@@ -298,20 +294,18 @@ export class GitmostDataSourceService {
     // the file — the git revert is silently nullified. Restore the page FIRST so
     // the revert actually brings it back, then apply the body below. (restorePage
     // stamps git-sync provenance so the loop-guard skips its own echo.)
-    if (currentPage?.deletedAt != null) {
+    if (currentPage.deletedAt != null) {
       await this.restorePage(ctx, pageId);
     }
     // Skip the early no-op return when we just restored (the page must still get
     // its body write below); only short-circuit for a live, unchanged page.
     if (
-      currentPage?.deletedAt == null &&
+      currentPage.deletedAt == null &&
       baseMarkdown != null &&
       fullMarkdown === baseMarkdown
     ) {
       return {
-        updatedAt: currentPage
-          ? new Date(currentPage.updatedAt).toISOString()
-          : undefined,
+        updatedAt: new Date(currentPage.updatedAt).toISOString(),
       };
     }
 
@@ -336,18 +330,18 @@ export class GitmostDataSourceService {
     // never clobbered and the vault never churns. A genuine content change is not
     // canonically equal, so it proceeds.
     const currentContent =
-      typeof currentPage?.content === 'string'
+      typeof currentPage.content === 'string'
         ? (() => {
             try {
               return JSON.parse(currentPage.content as unknown as string);
             } catch {
-              return currentPage?.content;
+              return currentPage.content;
             }
           })()
-        : currentPage?.content;
+        : currentPage.content;
     if (currentContent && docsCanonicallyEqual(doc, currentContent)) {
       return {
-        updatedAt: new Date(currentPage!.updatedAt).toISOString(),
+        updatedAt: new Date(currentPage.updatedAt).toISOString(),
       };
     }
 
