@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
-import { useScrollPosition } from "./use-scroll-position";
+import { useScrollPosition, hasSavedReadingPosition } from "./use-scroll-position";
 
 const KEY_PREFIX = "gitmost:scroll-position:";
 
@@ -370,5 +370,25 @@ describe("useScrollPosition", () => {
       });
       unmount();
     }).not.toThrow();
+  });
+});
+
+describe("hasSavedReadingPosition", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+
+  it("returns false when nothing is saved for the page", () => {
+    expect(hasSavedReadingPosition("none")).toBe(false);
+  });
+
+  it("returns false when the saved value is 0 (page stays at the top)", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}zero`, "0");
+    expect(hasSavedReadingPosition("zero")).toBe(false);
+  });
+
+  it("returns true when a positive position is saved", () => {
+    window.sessionStorage.setItem(`${KEY_PREFIX}deep`, "500");
+    expect(hasSavedReadingPosition("deep")).toBe(true);
   });
 });
