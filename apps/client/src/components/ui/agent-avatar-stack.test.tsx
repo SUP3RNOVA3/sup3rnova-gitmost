@@ -13,6 +13,16 @@ import {
 
 type Props = React.ComponentProps<typeof AgentAvatarStack>;
 
+// The DOM normalizes an inline `background: hsl(...)` to `rgb(...)`. Push the
+// expected color through the same CSSOM path so the comparison stays exact and
+// non-vacuous (an empty string — i.e. no inline background, as in the pre-fix
+// Avatar approach — can never match a real color).
+function normalizeColor(value: string): string {
+  const probe = document.createElement("div");
+  probe.style.background = value;
+  return probe.style.background;
+}
+
 function renderStack(props: Props) {
   const store = createStore();
   store.set(aiChatDraftAtom, "leftover draft from another chat");
@@ -33,18 +43,21 @@ describe("agentGlyphBackground", () => {
     );
   });
 
-  it("differs by name and stays a fixed dark shade (readable emoji)", () => {
+  it("gives categorically different colors to different agents", () => {
+    // The two agents that looked identically violet in the report must differ.
+    expect(agentGlyphBackground("Структурный редактор")).not.toBe(
+      agentGlyphBackground("Фактчекер"),
+    );
     expect(agentGlyphBackground("Researcher")).not.toBe(
       agentGlyphBackground("Нарратор"),
     );
-    // Only the hue varies; saturation/lightness are pinned low so the glyph is
-    // always a dark circle.
-    expect(agentGlyphBackground("Нарратор")).toMatch(/^hsl\(\d+, 45%, 24%\)$/);
+    // Every color is a dark hsl circle drawn from the palette.
+    expect(agentGlyphBackground("Нарратор")).toMatch(/^hsl\(\d+, \d+%, \d+%\)$/);
   });
 });
 
 describe("AgentAvatarStack", () => {
-  it("internal chat WITH role: emoji glyph in front + human launcher behind", () => {
+  it("internal chat WITH role: emoji glyph + human launcher badge in front", () => {
     const { container } = renderStack({
       agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
       launcher: { name: "Alice", avatarUrl: null },
@@ -58,6 +71,63 @@ describe("AgentAvatarStack", () => {
     expect(screen.getByText("Researcher")).toBeDefined();
     expect(screen.getByText(/·/)).toBeDefined();
     expect(screen.getByText("Alice")).toBeDefined();
+  });
+
+  it("emoji glyph applies its per-agent color as an inline DOM background", () => {
+    // Pins the actual fix: the hashed color must reach the DOM as an inline
+    // `background` on the glyph Box. The pre-fix `Avatar variant="filled"` set no
+    // inline background (Mantine's --avatar-bg overrode it), so this fails there.
+    const agent = { name: "Researcher", emoji: "🔬", avatarUrl: null };
+    const { container } = renderStack({
+      agent,
+      launcher: { name: "Alice", avatarUrl: null },
+      aiChatId: "chat-1",
+    });
+
+    const glyph = container.querySelector<HTMLElement>(
+      '[data-testid="agent-glyph"]',
+    );
+    expect(glyph).not.toBeNull();
+    // Non-vacuous: compare against the function output (normalized the same way),
+    // not a frozen literal. Empty against the pre-fix Avatar (no inline bg).
+    expect(glyph!.style.background).not.toBe("");
+    expect(glyph!.style.background).toBe(
+      normalizeColor(agentGlyphBackground(agent.name)),
+    );
+  });
+
+  it("agents with distinct hashed colors reach the DOM as distinct backgrounds", () => {
+    // "Researcher" and "Нарратор" hash to different palette entries, so their
+    // applied DOM backgrounds must differ — pins "distinct colors reach the DOM".
+    expect(agentGlyphBackground("Researcher")).not.toBe(
+      agentGlyphBackground("Нарратор"),
+    );
+
+    const a = renderStack({
+      agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+      launcher: null,
+      aiChatId: null,
+    });
+    const b = renderStack({
+      agent: { name: "Нарратор", emoji: "📖", avatarUrl: null },
+      launcher: null,
+      aiChatId: null,
+    });
+
+    const glyphA = a.container.querySelector<HTMLElement>(
+      '[data-testid="agent-glyph"]',
+    );
+    const glyphB = b.container.querySelector<HTMLElement>(
+      '[data-testid="agent-glyph"]',
+    );
+    expect(glyphA!.style.background).toBe(
+      normalizeColor(agentGlyphBackground("Researcher")),
+    );
+    expect(glyphB!.style.background).toBe(
+      normalizeColor(agentGlyphBackground("Нарратор")),
+    );
+    // Different colors reach the DOM (the normalized rgb values also differ).
+    expect(glyphA!.style.background).not.toBe(glyphB!.style.background);
   });
 
   it("showName=false: renders only the avatars, no inline name label", () => {
@@ -91,7 +161,7 @@ describe("AgentAvatarStack", () => {
     expect(screen.getByText("Bob")).toBeDefined();
   });
 
-  it("external MCP: agent avatar in front, NO launcher behind", () => {
+  it("external MCP: agent avatar only, NO human launcher badge", () => {
     const { container } = renderStack({
       agent: { name: "MCP Bot", avatarUrl: "http://example.test/a.png" },
       launcher: null,
