@@ -1,7 +1,8 @@
 import { FC, useRef } from "react";
-import { Editor, useEditorState } from "@tiptap/react";
+import { Editor } from "@tiptap/react";
 import { useAtomValue } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
+import { dictationAvailabilityAtom } from "@/features/editor/atoms/editor-atoms.ts";
 import { MicButton } from "@/features/dictation/components/mic-button";
 
 interface Props {
@@ -16,20 +17,14 @@ export const DictationGroup: FC<Props> = ({ editor, color, iconSize }) => {
   const workspace = useAtomValue(workspaceAtom);
   const streamingDictation =
     workspace?.settings?.ai?.dictationStreaming === true;
+  // Cause-specific reason the mic is unavailable (published by the page editor).
+  const dictationAvailability = useAtomValue(dictationAvailabilityAtom);
   // Caret snapshot taken when dictation starts (where the first segment lands).
   const rangeRef = useRef<{ from: number; to: number } | null>(null);
   // Running insertion point: after each inserted segment we remember the caret
   // end so the NEXT segment appends right after it, contiguously, regardless of
   // where the user's caret currently is. Null until the first segment lands.
   const insertPosRef = useRef<number | null>(null);
-  // editor.isEditable is a mutable, non-reactive field — read it via
-  // useEditorState so the mic re-enables when the body flips to editable after
-  // collab sync (otherwise it stays stuck disabled). Mirrors the body's own
-  // reactive read.
-  const isEditable = useEditorState({
-    editor,
-    selector: (ctx) => ctx.editor?.isEditable ?? false,
-  });
 
   const handleStart = () => {
     const { from, to } = editor.state.selection;
@@ -88,7 +83,8 @@ export const DictationGroup: FC<Props> = ({ editor, color, iconSize }) => {
       streaming={streamingDictation}
       onStart={handleStart}
       onText={handleText}
-      disabled={!isEditable}
+      disabled={!dictationAvailability.isEditable}
+      unavailableReason={dictationAvailability.reason ?? undefined}
       color={color}
       iconSize={iconSize}
     />

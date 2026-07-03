@@ -27,11 +27,12 @@ import {
   collabExtensions,
   mainExtensions,
 } from "@/features/editor/extensions/extensions";
-import { useAtom, useAtomValue } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
   currentPageEditModeAtom,
+  dictationAvailabilityAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
@@ -88,6 +89,7 @@ import { PageEmbedAncestryProvider } from "@/features/editor/components/page-emb
 import PageEmbedPicker from "@/features/editor/components/page-embed/page-embed-picker";
 import { useTranslation } from "react-i18next";
 import {
+  computeDictationAvailability,
   isBodyEditable,
   isCollabSynced,
 } from "@/features/editor/editor-sync-state";
@@ -139,6 +141,7 @@ export default function PageEditor({
   const { pageSlug } = useParams();
   const slugId = extractPageSlugId(pageSlug);
   const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
+  const setDictationAvailability = useSetAtom(dictationAvailabilityAtom);
   const canScroll = useCallback(
     () => Boolean(isComponentMounted.current && editorRef.current),
     [isComponentMounted],
@@ -487,6 +490,26 @@ export default function PageEditor({
       }),
     );
   }, [currentPageEditMode, editor, editable, showStatic]);
+
+  // Publish whether dictation can start and, if not, the cause-specific reason
+  // the mic button surfaces. Recomputed on the same signals that drive body
+  // editability so the tooltip never lies about the current state.
+  useEffect(() => {
+    setDictationAvailability(
+      computeDictationAvailability({
+        editable,
+        inEditMode: currentPageEditMode === PageEditMode.Edit,
+        showStatic,
+        isDisconnected: yjsConnectionStatus === WebSocketStatus.Disconnected,
+      }),
+    );
+  }, [
+    editable,
+    currentPageEditMode,
+    showStatic,
+    yjsConnectionStatus,
+    setDictationAvailability,
+  ]);
 
   useEffect(() => {
     if (
