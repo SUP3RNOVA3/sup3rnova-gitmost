@@ -14,6 +14,7 @@ import { CommentService } from './comment.service';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
 import { ResolveCommentDto } from './dto/resolve-comment.dto';
+import { ApplySuggestionDto } from './dto/apply-suggestion.dto';
 import { PageIdDto, CommentIdDto } from './dto/comments.input';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
@@ -195,6 +196,42 @@ export class CommentController {
     });
 
     return updated;
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('apply-suggestion')
+  async applySuggestion(
+    @Body() dto: ApplySuggestionDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+    @AuthProvenance() provenance: AuthProvenanceData,
+  ) {
+    const comment = await this.commentRepo.findById(dto.commentId, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
+    if (!comment) {
+      throw new NotFoundException('Comment not found');
+    }
+
+    const page = await this.pageRepo.findById(comment.pageId);
+    if (!page || page.deletedAt) {
+      throw new NotFoundException('Page not found');
+    }
+
+    // Authorize BEFORE revealing any structural detail about the comment
+    // (metadata-disclosure hygiene). Applying a suggestion rewrites the page
+    // text, so require edit access (NOT just comment access). Running this
+    // first means a cross-workspace user with a guessed comment UUID gets a
+    // uniform 403 regardless of the comment's type or suggestion state — it can
+    // never distinguish those before the access check. The structural 400s
+    // (top-level / has-a-suggested-edit) are re-checked by the service below.
+    await this.pageAccessService.validateCanEdit(page, user);
+
+    // The service re-validates the comment's state, returns idempotent success
+    // for an already-applied suggestion, and lets ConflictException (409, with
+    // currentText in the payload) propagate untouched.
+    return this.commentService.applySuggestion(comment, user, provenance);
   }
 
   @HttpCode(HttpStatus.OK)

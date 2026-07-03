@@ -1,4 +1,12 @@
-import { IsIn, IsJSON, IsObject, IsOptional, IsString, IsUUID } from 'class-validator';
+import {
+  IsIn,
+  IsJSON,
+  IsObject,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+} from 'class-validator';
 import { z } from 'zod';
 
 const yjsIdSchema = z.object({
@@ -43,4 +51,12 @@ export class CreateCommentDto {
     anchor: any;
     head: any;
   };
+
+  // Optional suggested replacement for the selected text (a "suggested edit").
+  // Only valid on a top-level inline comment that carries a non-empty selection;
+  // enforced in CommentService.create.
+  @IsOptional()
+  @IsString()
+  @MaxLength(2000)
+  suggestedText?: string;
 }
