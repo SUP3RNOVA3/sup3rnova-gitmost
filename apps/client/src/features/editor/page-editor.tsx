@@ -27,14 +27,16 @@ import {
   collabExtensions,
   mainExtensions,
 } from "@/features/editor/extensions/extensions";
-import { useAtom, useAtomValue } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
   currentPageEditModeAtom,
+  dictationAvailabilityAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
+import type { DictationUnavailableReason } from "@/features/dictation/dictation-status";
 import { asideStateAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom";
 import {
   activeCommentIdAtom,
@@ -139,6 +141,7 @@ export default function PageEditor({
   const { pageSlug } = useParams();
   const slugId = extractPageSlugId(pageSlug);
   const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
+  const setDictationAvailability = useSetAtom(dictationAvailabilityAtom);
   const canScroll = useCallback(
     () => Boolean(isComponentMounted.current && editorRef.current),
     [isComponentMounted],
@@ -487,6 +490,34 @@ export default function PageEditor({
       }),
     );
   }, [currentPageEditMode, editor, editable, showStatic]);
+
+  // Publish whether dictation can start and, if not, the cause-specific reason
+  // the mic button surfaces. Recomputed on the same signals that drive body
+  // editability so the tooltip never lies about the current state.
+  useEffect(() => {
+    const inEditMode = currentPageEditMode === PageEditMode.Edit;
+    const isEditable = editable && inEditMode && !showStatic; // mirrors editor.isEditable
+    let reason: DictationUnavailableReason | null = null;
+    if (!isEditable) {
+      if (editable && inEditMode && showStatic) {
+        // Permitted to edit and in edit mode, but the collab doc hasn't synced yet.
+        reason =
+          yjsConnectionStatus === WebSocketStatus.Disconnected
+            ? "offline"
+            : "connecting";
+      } else {
+        // No edit permission or not in edit mode.
+        reason = "read-only";
+      }
+    }
+    setDictationAvailability({ isEditable, reason });
+  }, [
+    editable,
+    currentPageEditMode,
+    showStatic,
+    yjsConnectionStatus,
+    setDictationAvailability,
+  ]);
 
   useEffect(() => {
     if (
