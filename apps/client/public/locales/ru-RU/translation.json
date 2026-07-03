@@ -1229,5 +1229,10 @@
   "Updated to the latest version": "Обновлено до последней версии",
   "This role is no longer in the catalog": "Эта роль больше не представлена в каталоге",
   "This language is no longer available in the catalog": "Этот язык больше не доступен в каталоге",
-  "Connecting… (read-only)": "Подключение… (только чтение)"
+  "Connecting… (read-only)": "Подключение… (только чтение)",
+  "Apply": "Применить",
+  "Applied": "Применено",
+  "Suggestion applied": "Предложение применено",
+  "Failed to apply suggestion": "Не удалось применить предложение",
+  "The commented text changed since this suggestion was made; it was not applied.": "Прокомментированный текст изменился после создания предложения; оно не было применено."
 }

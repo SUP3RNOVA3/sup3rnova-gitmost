@@ -18,6 +18,13 @@ export async function resolveComment(data: IResolveComment): Promise<IComment> {
   return req.data;
 }
 
+export async function applySuggestion(commentId: string): Promise<IComment> {
+  // Mirrors resolveComment: let axios reject on non-2xx so the mutation can read
+  // the 409 body (`{ message, currentText }`) off err.response.data.
+  const req = await api.post("/comments/apply-suggestion", { commentId });
+  return req.data.data ?? req.data;
+}
+
 export async function updateComment(
   data: Partial<IComment>,
 ): Promise<IComment> {

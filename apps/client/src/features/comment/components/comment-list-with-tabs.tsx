@@ -49,8 +49,10 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const [isLoading, setIsLoading] = useState(false);
   const { data: space } = useGetSpaceBySlugQuery(page?.space?.slug);
 
+  const canEdit = page?.permissions?.canEdit ?? false;
+
   const canComment =
-    (page?.permissions?.canEdit ?? false) ||
+    canEdit ||
     (space?.settings?.comments?.allowViewerComments === true);
 
   // Separate active and resolved comments
@@ -137,6 +139,7 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
             comment={comment}
             pageId={page?.id}
             canComment={canComment}
+            canEdit={canEdit}
             userSpaceRole={space?.membership?.role}
           />
           <MemoizedChildComments
@@ -144,6 +147,7 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
             parentId={comment.id}
             pageId={page?.id}
             canComment={canComment}
+            canEdit={canEdit}
             userSpaceRole={space?.membership?.role}
           />
         </div>
@@ -160,7 +164,14 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
         )}
       </Paper>
     ),
-    [comments, handleAddReply, isLoading, space?.membership?.role, canComment],
+    [
+      comments,
+      handleAddReply,
+      isLoading,
+      space?.membership?.role,
+      canComment,
+      canEdit,
+    ],
   );
 
   if (isCommentsLoading) {
@@ -300,6 +311,7 @@ interface ChildCommentsProps {
   parentId: string;
   pageId: string;
   canComment: boolean;
+  canEdit?: boolean;
   userSpaceRole?: string;
 }
 const ChildComments = ({
@@ -307,6 +319,7 @@ const ChildComments = ({
   parentId,
   pageId,
   canComment,
+  canEdit,
   userSpaceRole,
 }: ChildCommentsProps) => {
   const getChildComments = useCallback(
@@ -325,6 +338,7 @@ const ChildComments = ({
             comment={childComment}
             pageId={pageId}
             canComment={canComment}
+            canEdit={canEdit}
             userSpaceRole={userSpaceRole}
           />
           <MemoizedChildComments
@@ -332,6 +346,7 @@ const ChildComments = ({
             parentId={childComment.id}
             pageId={pageId}
             canComment={canComment}
+            canEdit={canEdit}
             userSpaceRole={userSpaceRole}
           />
         </div>
