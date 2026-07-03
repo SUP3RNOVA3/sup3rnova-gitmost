@@ -4,6 +4,7 @@ import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useSetAtom } from "jotai";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
+import { avatarStyle, avatarBackgroundCss } from "@/lib/avatar-palette";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
@@ -29,54 +30,11 @@ const LAUNCHER_SIZE = 22;
 // sits as a small badge over that corner (above the glyph) and stays fully visible.
 const LAUNCHER_OVERHANG = 8;
 
-// Small deterministic string hash (same algorithm as custom-avatar's initials
-// hash) used to pick a stable per-agent glyph color.
-function hashName(input: string): number {
-  let hash = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    hash = (hash << 5) - hash + input.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash);
-}
-
-// A palette of categorically-DISTINCT dark circle colors for emoji/sparkles agent
-// glyphs. Every entry is intentionally dark (low lightness) so a bright emoji or
-// the white sparkles icon stays readable on top; the hues are spread across the
-// wheel (red → orange → amber → green → teal → cyan → blue → indigo → violet →
-// magenta + a neutral slate) so two different agents read as DIFFERENT colors,
-// not merely different shades of the same violet.
-const GLYPH_COLORS = [
-  "hsl(355, 60%, 34%)", // red
-  "hsl(18, 62%, 32%)", // vermilion
-  "hsl(32, 60%, 30%)", // orange
-  "hsl(45, 55%, 28%)", // amber
-  "hsl(75, 45%, 26%)", // olive-green
-  "hsl(140, 48%, 26%)", // green
-  "hsl(165, 52%, 26%)", // teal
-  "hsl(188, 58%, 28%)", // cyan
-  "hsl(205, 58%, 32%)", // sky blue
-  "hsl(225, 52%, 36%)", // blue
-  "hsl(250, 48%, 38%)", // indigo
-  "hsl(280, 46%, 36%)", // violet
-  "hsl(312, 48%, 34%)", // magenta
-  "hsl(210, 12%, 36%)", // slate / neutral
-];
-
-/**
- * Deterministic dark circle color for an emoji/sparkles agent glyph, picked from
- * GLYPH_COLORS by a hash of the agent name so distinct agents get categorically
- * distinct colors while every color stays dark enough to keep the glyph readable.
- */
-export function agentGlyphBackground(name: string): string {
-  return GLYPH_COLORS[hashName(name) % GLYPH_COLORS.length];
-}
-
 /**
  * The front avatar. Image-source priority (#300):
  *   1. agent.avatarUrl -> a real avatar image (external MCP agent account).
- *   2. agent.emoji     -> the role emoji on a per-agent dark circle.
- *   3. otherwise       -> the IconSparkles glyph on a per-agent dark circle (fallback).
+ *   2. agent.emoji     -> the role emoji on a per-agent gradient circle.
+ *   3. otherwise       -> the IconSparkles glyph on a per-agent gradient circle.
  */
 function AgentGlyph({ agent }: { agent: AgentInfo }) {
   if (agent.avatarUrl) {
@@ -89,10 +47,13 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
     );
   }
 
-  // Emoji/sparkles glyph on a per-agent dark circle (color hashed from the agent
-  // name). Rendered as a plain Box, NOT a Mantine `Avatar variant="filled"`, so
-  // the background is guaranteed instead of being overridden by Mantine's
-  // `--avatar-bg` (which was falling back to the theme's violet for every agent).
+  // Emoji/sparkles glyph on a per-agent gradient circle (color, gradient partner
+  // and split angle all hashed from the agent name via avatarStyle — see
+  // @/lib/avatar-palette). Rendered as a plain Box, NOT a Mantine
+  // `Avatar variant="filled"` — Mantine's `--avatar-bg` overrode the background
+  // (every agent fell back to the theme's violet). The foreground (the sparkles
+  // icon) uses the ring's WCAG-checked readable text color.
+  const style = avatarStyle(agent.name);
   return (
     <Box
       data-testid="agent-glyph"
@@ -100,8 +61,14 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
         width: GLYPH_SIZE,
         height: GLYPH_SIZE,
         borderRadius: "50%",
-        background: agentGlyphBackground(agent.name),
-        color: "var(--mantine-color-white)",
+        // Solid base color is the fallback (and the testable value); the gradient
+        // paints over it in browsers that support it.
+        backgroundColor: style.bg,
+        backgroundImage: avatarBackgroundCss(style),
+        color:
+          style.text === "white"
+            ? "var(--mantine-color-white)"
+            : "var(--mantine-color-black)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
