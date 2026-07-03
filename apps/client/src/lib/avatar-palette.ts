@@ -73,13 +73,13 @@ function gammaEncode(c: number): number {
   return c <= 0.0031308 ? 12.92 * c : 1.055 * c ** (1 / 2.4) - 0.055;
 }
 
-function oklchToSrgb(L: number, C: number, hDeg: number): [number, number, number] {
+export function oklchToSrgb(L: number, C: number, hDeg: number): [number, number, number] {
   const h = (hDeg * Math.PI) / 180;
   const [r, g, b] = oklabToLinearSrgb(L, C * Math.cos(h), C * Math.sin(h));
   return [gammaEncode(r), gammaEncode(g), gammaEncode(b)];
 }
 
-function isInGamut(rgb: readonly number[]): boolean {
+export function isInGamut(rgb: readonly number[]): boolean {
   return rgb.every((c) => c >= -1e-6 && c <= 1 + 1e-6);
 }
 
@@ -105,12 +105,12 @@ function toHex(rgb: readonly number[]): string {
 }
 
 /** WCAG relative luminance of an sRGB color (components 0..1). */
-function relativeLuminance(rgb: readonly number[]): number {
+export function relativeLuminance(rgb: readonly number[]): number {
   const lin = rgb.map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
   return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2];
 }
 
-function contrastRatio(l1: number, l2: number): number {
+export function contrastRatio(l1: number, l2: number): number {
   return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
 }
 

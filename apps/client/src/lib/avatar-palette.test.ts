@@ -5,7 +5,20 @@ import {
   avatarBackgroundCss,
   normalizeName,
   minPairwiseDistance,
+  relativeLuminance,
+  contrastRatio,
+  oklchToSrgb,
+  isInGamut,
 } from "./avatar-palette";
+
+/** Parse "#rrggbb" into sRGB components on the 0..1 scale relativeLuminance expects. */
+function hexToRgb01(hex: string): [number, number, number] {
+  return [
+    parseInt(hex.slice(1, 3), 16) / 255,
+    parseInt(hex.slice(3, 5), 16) / 255,
+    parseInt(hex.slice(5, 7), 16) / 255,
+  ];
+}
 
 describe("avatar-palette validation", () => {
   it("palette colors stay distinguishable", () => {
@@ -15,10 +28,31 @@ describe("avatar-palette validation", () => {
     expect(PALETTE.length).toBe(20);
   });
 
-  it("every palette entry is a hex with a valid WCAG text color", () => {
+  it("every palette entry is WCAG-readable and in sRGB gamut", () => {
+    // white text = luminance 1, black text = luminance 0 (per buildPalette).
+    const textLum = { white: 1, black: 0 } as const;
     for (const entry of PALETTE) {
       expect(entry.hex).toMatch(/^#[0-9a-f]{6}$/);
-      expect(["white", "black"]).toContain(entry.text);
+
+      // (a) The chosen text color really clears the code's 3:1 threshold on the
+      // actual background hex — recomputed independently from the hex, not from
+      // the build-time luminance. A slot that picked the wrong text (or a color
+      // too dim for either text) would fail here.
+      const hexLum = relativeLuminance(hexToRgb01(entry.hex));
+      const chosen = contrastRatio(textLum[entry.text], hexLum);
+      expect(chosen).toBeGreaterThanOrEqual(3);
+      // buildPalette prefers white and only falls back to black when white
+      // fails 3:1. Mirror that decision: black is used *only* when white would
+      // not clear the threshold — so a mis-assigned "black" on a dark color
+      // (where white was fine) fails here.
+      if (entry.text === "black") {
+        expect(contrastRatio(textLum.white, hexLum)).toBeLessThan(3);
+      }
+
+      // (b) The entry's OKLCH is inside the sRGB gamut after chroma clamping;
+      // an out-of-gamut slot (e.g. un-clamped chroma) would produce components
+      // outside [0,1] and fail here.
+      expect(isInGamut(oklchToSrgb(entry.L, entry.C, entry.h))).toBe(true);
     }
   });
 });
