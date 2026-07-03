@@ -28,6 +28,13 @@ export interface IComment {
   createdSource?: string;
   aiChatId?: string | null;
   resolvedSource?: string | null;
+  // Suggested-edit (#315): when an agent proposes a replacement for the
+  // commented `selection`, `suggestedText` holds the "стало" text. Once a user
+  // applies it server-side the backend stamps `suggestionAppliedAt` /
+  // `suggestionAppliedById` and auto-resolves the thread.
+  suggestedText?: string | null;
+  suggestionAppliedAt?: Date | string | null;
+  suggestionAppliedById?: string | null;
   // Server-normalized "agent avatar stack" provenance (#300), present only when
   // createdSource === "agent": `agent` is the front identity, `launcher` the
   // human behind it (null for an external MCP agent).

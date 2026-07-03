@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { IComment } from "@/features/comment/types/comment.types";
 
@@ -7,10 +7,15 @@ import { IComment } from "@/features/comment/types/comment.types";
 
 // The comment mutation hooks reach out to react-query/network — stub them so the
 // component renders in isolation. We only assert the AI-badge rendering branch.
+const applyMutateAsync = vi.fn();
 vi.mock("@/features/comment/queries/comment-query", () => ({
   useDeleteCommentMutation: () => ({ mutateAsync: vi.fn() }),
   useResolveCommentMutation: () => ({ mutateAsync: vi.fn() }),
   useUpdateCommentMutation: () => ({ mutateAsync: vi.fn() }),
+  useApplySuggestionMutation: () => ({
+    mutateAsync: applyMutateAsync,
+    isPending: false,
+  }),
 }));
 
 // CommentEditor pulls in the full TipTap editor stack; replace it with a stub.
@@ -19,6 +24,7 @@ vi.mock("@/features/comment/components/comment-editor", () => ({
 }));
 
 import CommentListItem from "./comment-list-item";
+import { canShowApply } from "@/features/comment/utils/suggestion";
 
 const baseComment = (over?: Partial<IComment>): IComment =>
   ({
@@ -32,10 +38,15 @@ const baseComment = (over?: Partial<IComment>): IComment =>
     ...over,
   }) as IComment;
 
-function renderItem(comment: IComment) {
+function renderItem(comment: IComment, canEdit = true) {
   return render(
     <MantineProvider>
-      <CommentListItem comment={comment} pageId="page-1" canComment={true} />
+      <CommentListItem
+        comment={comment}
+        pageId="page-1"
+        canComment={true}
+        canEdit={canEdit}
+      />
     </MantineProvider>,
   );
 }
@@ -86,4 +97,88 @@ describe("CommentListItem — agent avatar stack", () => {
   // The stack's own behaviors (glyph priority, launcher-behind, deep-link click)
   // are covered directly in agent-avatar-stack.test.tsx; this integration suite
   // only guards the insertion gate (agent → stack, user → no stack).
+});
+
+describe("CommentListItem — suggested edit (#315)", () => {
+  const suggestion = (over?: Partial<IComment>): IComment =>
+    baseComment({
+      selection: "old wording here",
+      suggestedText: "new wording here",
+      ...over,
+    });
+
+  it("renders the было→стало diff and an Apply button when canEdit and not applied/resolved", () => {
+    renderItem(suggestion(), true);
+    // Old text appears both as the selection quote and as the struck diff row.
+    expect(screen.getAllByText("old wording here").length).toBeGreaterThan(0);
+    expect(screen.getByText("new wording here")).toBeDefined();
+    // Apply button is present.
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDefined();
+    // No Applied badge yet.
+    expect(screen.queryByText("Applied")).toBeNull();
+  });
+
+  it("hides the Apply button when canEdit is false", () => {
+    renderItem(suggestion(), false);
+    // Diff still renders...
+    expect(screen.getByText("new wording here")).toBeDefined();
+    // ...but no Apply button.
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  });
+
+  it("shows an Applied badge (no Apply button) once suggestionAppliedAt is set", () => {
+    renderItem(suggestion({ suggestionAppliedAt: new Date() }), true);
+    expect(screen.getByText("Applied")).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  });
+
+  it("hides the Apply button once the thread is resolved", () => {
+    renderItem(suggestion({ resolvedAt: new Date() }), true);
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  });
+
+  it("calls the apply mutation when the Apply button is clicked", () => {
+    applyMutateAsync.mockClear();
+    renderItem(suggestion(), true);
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(applyMutateAsync).toHaveBeenCalledWith({
+      commentId: "c-1",
+      pageId: "page-1",
+    });
+  });
+
+  it("does not render the diff block for a reply (child) comment", () => {
+    renderItem(
+      suggestion({ parentCommentId: "c-0" }),
+      true,
+    );
+    expect(screen.queryByText("new wording here")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  });
+});
+
+describe("canShowApply predicate", () => {
+  const c = (over?: Partial<IComment>): IComment =>
+    ({ suggestedText: "x", ...over }) as IComment;
+
+  it("true when suggestion present, editable, not applied/resolved, top-level", () => {
+    expect(canShowApply(c(), true)).toBe(true);
+  });
+  it("false without edit permission", () => {
+    expect(canShowApply(c(), false)).toBe(false);
+  });
+  it("false when no suggestion", () => {
+    expect(canShowApply(c({ suggestedText: null }), true)).toBe(false);
+  });
+  it("false when already applied", () => {
+    expect(canShowApply(c({ suggestionAppliedAt: new Date() }), true)).toBe(
+      false,
+    );
+  });
+  it("false when resolved", () => {
+    expect(canShowApply(c({ resolvedAt: new Date() }), true)).toBe(false);
+  });
+  it("false for a reply comment", () => {
+    expect(canShowApply(c({ parentCommentId: "p" }), true)).toBe(false);
+  });
 });

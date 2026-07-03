@@ -149,6 +149,67 @@ export function findAnchorInBlock(blockContent, selection) {
     return null;
 }
 /**
+ * Reconstruct the RAW text spanned by an AnchorMatch inside one block's
+ * `content` array. `startChild..endChild` are all text nodes (guaranteed by
+ * findAnchorInBlock, which only builds runs of `text` nodes), so concatenate
+ * each node's text slice: from `startOffset` on the first node, up to
+ * `endOffset` on the last, and the whole `.text` for any node fully inside the
+ * range. Mirrors spliceCommentMark's per-node slicing so the string returned
+ * here is EXACTLY the characters the comment mark will cover.
+ */
+function reconstructRawText(blockContent, match) {
+    const { startChild, startOffset, endChild, endOffset } = match;
+    let out = "";
+    for (let k = startChild; k <= endChild; k++) {
+        const n = blockContent[k];
+        const text = typeof n.text === "string" ? n.text : "";
+        const sliceStart = k === startChild ? startOffset : 0;
+        const sliceEnd = k === endChild ? endOffset : text.length;
+        out += text.slice(sliceStart, sliceEnd);
+    }
+    return out;
+}
+/**
+ * Return the RAW document substring that `selection` would anchor to — the exact
+ * characters the comment mark will cover — or `null` when the selection cannot
+ * be anchored anywhere in `doc`.
+ *
+ * This mirrors canAnchorInDoc / applyAnchorInDoc EXACTLY (same depth-first,
+ * document-order traversal and the same findAnchorInBlock match on the FIRST
+ * matching block), but instead of a boolean / an in-place mutation it
+ * reconstructs the raw text spanned by the matched range. Because
+ * findAnchorInBlock maps the normalized selection back to raw text-node
+ * positions, the returned string is the document's ORIGINAL characters (smart
+ * quotes, em-dashes, nbsp, collapsed whitespace) — NOT the normalized ASCII
+ * agent input.
+ *
+ * Callers store THIS as the comment's `selection` so the stored value equals the
+ * text actually under the mark, which is what the apply-suggestion equality
+ * check (replaceYjsMarkedText's `joinedText !== expectedText`) compares against.
+ * Without it a suggestion whose anchor only matched via normalization would be
+ * un-appliable (spurious 409).
+ */
+export function getAnchoredText(doc, selection) {
+    const visit = (node, depth) => {
+        if (depth > MAX_DEPTH || !node || typeof node !== "object")
+            return null;
+        if (!Array.isArray(node.content))
+            return null;
+        const match = findAnchorInBlock(node.content, selection);
+        if (match)
+            return reconstructRawText(node.content, match);
+        for (const child of node.content) {
+            if (child && typeof child === "object" && Array.isArray(child.content)) {
+                const found = visit(child, depth + 1);
+                if (found !== null)
+                    return found;
+            }
+        }
+        return null;
+    };
+    return visit(doc, 0);
+}
+/**
  * Depth-first, document-order check for whether `selection` can be anchored
  * anywhere in `doc`. At each node with an array `content`, first try to match
  * within that node's own content, then recurse into children that themselves
@@ -209,6 +270,77 @@ function spliceCommentMark(blockContent, match, commentId) {
         }
     }
     blockContent.splice(startChild, endChild - startChild + 1, ...fragments);
+}
+/**
+ * Count how many times `selection` occurs across the whole document, using the
+ * same normalization and run-matching as findAnchorInBlock but WITHOUT stopping
+ * at the first hit: every non-overlapping occurrence within each block's text
+ * runs is counted and summed across all blocks (depth-first, the same traversal
+ * as canAnchorInDoc).
+ *
+ * This is the uniqueness gate for SUGGESTIONS: because applying a suggestion
+ * rewrites the exact anchored text, an ambiguous anchor (>1 occurrence) would
+ * silently edit the wrong place, so a suggestion is only allowed when this
+ * returns exactly 1. Ordinary comments keep first-occurrence anchoring and do
+ * not use this. (Note: counts OCCURRENCES, not just matching blocks, so two
+ * occurrences inside one block are correctly reported as 2.)
+ */
+export function countAnchorMatches(doc, selection) {
+    const normSel = normalizeForMatch(selection).norm.trim();
+    if (normSel.length === 0)
+        return 0;
+    // Count non-overlapping occurrences of the normalized selection within a
+    // single block's direct content, matching findAnchorInBlock's run building.
+    const countInBlock = (blockContent) => {
+        if (!Array.isArray(blockContent))
+            return 0;
+        let count = 0;
+        let i = 0;
+        while (i < blockContent.length) {
+            const node = blockContent[i];
+            if (!node || typeof node !== "object" || node.type !== "text") {
+                i++;
+                continue;
+            }
+            // Accumulate a maximal run of consecutive text nodes.
+            let rawRun = "";
+            let j = i;
+            while (j < blockContent.length) {
+                const n = blockContent[j];
+                if (!n || typeof n !== "object" || n.type !== "text")
+                    break;
+                rawRun += typeof n.text === "string" ? n.text : "";
+                j++;
+            }
+            const norm = normalizeForMatch(rawRun).norm;
+            // Count every non-overlapping occurrence in this run.
+            let from = 0;
+            for (;;) {
+                const idx = norm.indexOf(normSel, from);
+                if (idx === -1)
+                    break;
+                count++;
+                from = idx + normSel.length;
+            }
+            i = j > i ? j : i + 1;
+        }
+        return count;
+    };
+    let total = 0;
+    const visit = (node, depth) => {
+        if (depth > MAX_DEPTH || !node || typeof node !== "object")
+            return;
+        if (!Array.isArray(node.content))
+            return;
+        total += countInBlock(node.content);
+        for (const child of node.content) {
+            if (child && typeof child === "object" && Array.isArray(child.content)) {
+                visit(child, depth + 1);
+            }
+        }
+    };
+    visit(doc, 0);
+    return total;
 }
 /**
  * Depth-first (same order as canAnchorInDoc) over `doc`; on the FIRST block

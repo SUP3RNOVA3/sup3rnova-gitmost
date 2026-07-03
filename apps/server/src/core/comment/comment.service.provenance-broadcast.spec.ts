@@ -61,6 +61,8 @@ describe('CommentService — broadcast carries the agent avatar stack', () => {
     const generalQueue: any = { add: jest.fn(() => Promise.resolve()) };
     const notificationQueue: any = { add: jest.fn(async () => undefined) };
 
+    const auditService: any = { log: jest.fn() };
+
     const service = new CommentService(
       commentRepo,
       pageRepo,
@@ -68,6 +70,7 @@ describe('CommentService — broadcast carries the agent avatar stack', () => {
       collaborationGateway,
       generalQueue,
       notificationQueue,
+      auditService,
     );
 
     return { service, commentRepo, wsService };

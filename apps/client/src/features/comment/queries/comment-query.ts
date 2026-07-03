@@ -5,6 +5,7 @@ import {
   InfiniteData,
 } from "@tanstack/react-query";
 import {
+  applySuggestion,
   createComment,
   deleteComment,
   getPageComments,
@@ -174,6 +175,63 @@ function updateCommentInCache(
       ),
     })),
   };
+}
+
+export function useApplySuggestionMutation() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation<IComment, any, { commentId: string; pageId: string }>({
+    // No optimistic update: apply can fail with 409 (the commented text drifted),
+    // so we only mutate the cache once the server confirms.
+    mutationFn: ({ commentId }) => applySuggestion(commentId),
+    onSuccess: (data, variables) => {
+      const cache = queryClient.getQueryData(
+        RQ_KEY(variables.pageId),
+      ) as InfiniteData<IPagination<IComment>> | undefined;
+
+      if (cache) {
+        queryClient.setQueryData(
+          RQ_KEY(variables.pageId),
+          updateCommentInCache(cache, variables.commentId, (comment) => ({
+            ...comment,
+            suggestionAppliedAt: data.suggestionAppliedAt,
+            suggestionAppliedById: data.suggestionAppliedById,
+            // The server auto-resolves the thread on apply — carry that through.
+            resolvedAt: data.resolvedAt,
+            resolvedById: data.resolvedById,
+            resolvedBy: data.resolvedBy,
+          })),
+        );
+      }
+
+      notifications.show({ message: t("Suggestion applied") });
+    },
+    onError: (err: any) => {
+      // 409 => the commented text changed since the suggestion was made. Surface
+      // a specific message (with the current text) rather than a generic error.
+      const status = err?.response?.status;
+      const currentText = err?.response?.data?.currentText;
+      if (status === 409 && typeof currentText === "string") {
+        const shortText =
+          currentText.length > 80
+            ? `${currentText.slice(0, 80)}…`
+            : currentText;
+        notifications.show({
+          title: t(
+            "The commented text changed since this suggestion was made; it was not applied.",
+          ),
+          message: shortText,
+          color: "red",
+        });
+        return;
+      }
+      notifications.show({
+        message: t("Failed to apply suggestion"),
+        color: "red",
+      });
+    },
+  });
 }
 
 export function useResolveCommentMutation() {
