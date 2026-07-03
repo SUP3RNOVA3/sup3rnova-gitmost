@@ -120,9 +120,10 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
   //     hard crash / OOM-kill / abrupt container stop mid `git add`/`commit`/
   //     `checkout` leaves a `.git/index.lock` (or a ref `*.lock`); git then refuses
   //     every later op ("Unable to create '…/index.lock': File exists"), wedging the
-  //     space forever with no self-heal. The daemon holds the per-space Redis lock
-  //     and is the vault's only writer, so any leftover lock here is stale — remove
-  //     it before the merge check + any checkout/diff below.
+  //     space forever with no self-heal. Only locks OLDER than the staleness
+  //     threshold are removed (a fresh lock from a concurrent replica in the
+  //     TTL-lapse window is preserved), before the merge check + any checkout/diff
+  //     below.
   await vault.clearStaleGitLocks();
 
   // 1c. RESTORE a missing `main` branch (bug D3-N1). Ref-store damage can leave an

@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile, utimes } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -149,12 +149,18 @@ describe('VaultGit (integration; temp repo)', () => {
 
     // Simulate an interrupted git op: a stale index.lock left behind. Git now
     // refuses index-touching operations.
-    await writeFile(join(vault, '.git', 'index.lock'), '');
+    const lockPath = join(vault, '.git', 'index.lock');
+    await writeFile(lockPath, '');
+    // Backdate the lock beyond the staleness threshold so it is treated as a
+    // genuine crash-leftover (a live/fresh lock is preserved — see the test
+    // below); mtime gating only removes locks older than the threshold.
+    const anHourAgo = Date.now() / 1000 - 3600;
+    await utimes(lockPath, anHourAgo, anHourAgo);
     await expect(
       execFileAsync('git', ['add', '-A'], { cwd: vault }),
     ).rejects.toThrow(/index\.lock/);
 
-    // The preflight clears it (the daemon is the vault's sole writer, so it is stale).
+    // The preflight clears it (stale by mtime, no live git process holds it).
     await git.clearStaleGitLocks();
 
     // The lock is gone and git ops succeed again.
@@ -164,6 +170,26 @@ describe('VaultGit (integration; temp repo)', () => {
 
     // Idempotent / safe when no lock exists.
     await expect(git.clearStaleGitLocks()).resolves.toBeUndefined();
+  });
+
+  it('clearStaleGitLocks PRESERVES a fresh index.lock (a concurrent replica may hold it) (bug D3-N3 / F1)', async () => {
+    if (!available) return;
+    const vault = await freshDir();
+    const git = new VaultGit(vault);
+    await git.ensureRepo();
+
+    // A FRESH lock (current mtime) — as a concurrently-running replica would
+    // hold mid `git add`/`commit` during the multi-replica TTL-lapse window.
+    // Removing it would corrupt the index/refs, so it MUST be preserved.
+    const lockPath = join(vault, '.git', 'index.lock');
+    await writeFile(lockPath, '');
+
+    await git.clearStaleGitLocks();
+
+    // Still there: a fresh (possibly live) lock is never deleted.
+    await expect(
+      execFileAsync('git', ['add', '-A'], { cwd: vault }),
+    ).rejects.toThrow(/index\.lock/);
   });
 
   it('ensureMainBranch restores a deleted main from the docmost mirror (bug D3-N1)', async () => {
@@ -190,6 +216,53 @@ describe('VaultGit (integration; temp repo)', () => {
     ).resolves.toBeDefined();
     // Idempotent when main already exists.
     await expect(git.ensureMainBranch()).resolves.toBeUndefined();
+  });
+
+  it('ensureMainBranch restores a deleted main from HEAD when docmost is gone too (bug D3-N1)', async () => {
+    if (!available) return;
+    const vault = await freshDir();
+    const git = new VaultGit(vault);
+    await git.ensureRepo();
+
+    // The reachable HEAD commit that main should be restored to.
+    const { stdout: headSha } = await execFileAsync(
+      'git',
+      ['rev-parse', 'HEAD'],
+      { cwd: vault },
+    );
+    const expectedSha = headSha.trim();
+
+    // Ref damage: BOTH main AND docmost are gone, only HEAD/a commit is
+    // reachable. Detach HEAD (so we can delete main), then delete both branches.
+    await execFileAsync('git', ['checkout', '--detach', 'HEAD'], { cwd: vault });
+    await git.ensureBranch('docmost', 'main');
+    await execFileAsync('git', ['branch', '-D', 'main', 'docmost'], {
+      cwd: vault,
+    });
+    expect(await git.branchExists('main')).toBe(false);
+    expect(await git.branchExists('docmost')).toBe(false);
+
+    // The preflight re-creates main from the HEAD commit.
+    await git.ensureMainBranch();
+    expect(await git.branchExists('main')).toBe(true);
+    const { stdout: restored } = await execFileAsync(
+      'git',
+      ['rev-parse', 'main'],
+      { cwd: vault },
+    );
+    expect(restored.trim()).toBe(expectedSha);
+  });
+
+  it('ensureMainBranch is a no-op on a repo with no commit at all (bug D3-N1)', async () => {
+    if (!available) return;
+    const vault = await freshDir();
+    // A bare `git init` — no commit, so no branch/HEAD to restore from.
+    await execFileAsync('git', ['init'], { cwd: vault });
+    const git = new VaultGit(vault);
+
+    // Nothing to do (ensureRepo's fresh-init path owns this case); must not throw.
+    await expect(git.ensureMainBranch()).resolves.toBeUndefined();
+    expect(await git.branchExists('main')).toBe(false);
   });
 
   it('ensureRepo neutralizes correctness-affecting LOCAL config', async () => {

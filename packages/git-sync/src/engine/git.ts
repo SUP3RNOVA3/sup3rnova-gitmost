@@ -19,7 +19,7 @@
  *   - "nothing to commit" is treated as a graceful no-op, not an error.
  */
 import { execFile } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, rm, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -29,6 +29,13 @@ const execFileAsync = promisify(execFile);
 // bound; it only prevents an indefinitely-stuck subprocess from wedging a sync
 // cycle (the same risk the http-backend watchdog guards on the server side).
 const GIT_EXEC_TIMEOUT_MS = 120_000;
+
+// A live git op holds a lock for at most GIT_EXEC_TIMEOUT_MS (then it is killed),
+// so a lock whose mtime is older than a few multiples of that cannot have a live
+// holder — it is a genuine crash-leftover, safe to remove. A fresh lock from a
+// concurrently-running replica (mtime within the timeout) is preserved so we never
+// delete a lock a live git process still holds.
+const STALE_LOCK_MIN_AGE_MS = GIT_EXEC_TIMEOUT_MS * 3; // 6 min, >> max git-op duration
 
 /** Bot identity used for engine-authored vault commits (SPEC §7.3). */
 export const BOT_AUTHOR_NAME = "Docmost Sync";
@@ -345,17 +352,37 @@ export class VaultGit {
    * failure deep inside `checkout`. This is what makes re-runs converge
    * (resumability, SPEC §12).
    */
+  async isMergeInProgress(): Promise<boolean> {
+    // MERGE_HEAD exists exactly while a merge is in progress.
+    const mergeHead = await this.runRaw([
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      "MERGE_HEAD",
+    ]);
+    if (mergeHead.code === 0 && mergeHead.stdout.trim().length > 0) return true;
+    // Fallback / belt-and-suspenders: any unmerged index entries also mean the
+    // working tree is mid-conflict and a checkout would refuse.
+    const unmerged = await this.runRaw(["ls-files", "-u"]);
+    return unmerged.code === 0 && unmerged.stdout.trim().length > 0;
+  }
+
   /**
    * Remove STALE git lock files left by an INTERRUPTED git operation (a hard
    * crash / OOM-kill / abrupt container stop mid `git add`/`commit`/`checkout`
    * leaves `.git/index.lock`; interrupted ref updates leave `*.lock` files). Git
    * then refuses EVERY subsequent operation ("Unable to create '…/index.lock':
    * File exists"), which WEDGES the space's sync loop indefinitely with no
-   * self-heal (bug D3-N3). The daemon holds the per-space Redis lock and is the
-   * vault's ONLY writer, so any leftover `*.lock` reaching a fresh cycle is
-   * necessarily stale (no live git process holds it) — clear them best-effort in
-   * the cycle preflight, alongside the mid-merge recovery. Missing files are a
-   * no-op (`force: true`).
+   * self-heal (bug D3-N3). We target the known/fixed set of index + ref lock
+   * files this engine itself writes (a hardcoded list, NOT a `*.lock` glob), and
+   * remove a lock ONLY when it is provably stale by mtime: a lock older than
+   * STALE_LOCK_MIN_AGE_MS cannot have a live holder (a live git op is killed
+   * after GIT_EXEC_TIMEOUT_MS), so it is a genuine crash-leftover. A FRESH lock —
+   * e.g. one a concurrently-running replica still holds during the documented
+   * multi-replica TTL-lapse window — is PRESERVED, so we never delete a lock a
+   * live git process is still using (which would corrupt the index/refs). Clear
+   * them best-effort in the cycle preflight, alongside the mid-merge recovery.
+   * Missing files are a no-op.
    */
   async clearStaleGitLocks(): Promise<void> {
     const gitDir = `${this.vaultPath}/.git`;
@@ -371,25 +398,20 @@ export class VaultGit {
       "refs/docmost/last-pushed.lock",
     ];
     await Promise.all(
-      locks.map((rel) =>
-        rm(`${gitDir}/${rel}`, { force: true }).catch(() => undefined),
-      ),
+      locks.map(async (rel) => {
+        const path = `${gitDir}/${rel}`;
+        try {
+          const stats = await stat(path);
+          // Only remove a lock old enough that no live git process can hold it.
+          // A fresh lock (mtime within the staleness window) is left in place.
+          if (Date.now() - stats.mtimeMs >= STALE_LOCK_MIN_AGE_MS) {
+            await rm(path, { force: true }).catch(() => undefined);
+          }
+        } catch {
+          // Missing lock (ENOENT) or unreadable — nothing to clear.
+        }
+      }),
     );
-  }
-
-  async isMergeInProgress(): Promise<boolean> {
-    // MERGE_HEAD exists exactly while a merge is in progress.
-    const mergeHead = await this.runRaw([
-      "rev-parse",
-      "--verify",
-      "--quiet",
-      "MERGE_HEAD",
-    ]);
-    if (mergeHead.code === 0 && mergeHead.stdout.trim().length > 0) return true;
-    // Fallback / belt-and-suspenders: any unmerged index entries also mean the
-    // working tree is mid-conflict and a checkout would refuse.
-    const unmerged = await this.runRaw(["ls-files", "-u"]);
-    return unmerged.code === 0 && unmerged.stdout.trim().length > 0;
   }
 
   /**

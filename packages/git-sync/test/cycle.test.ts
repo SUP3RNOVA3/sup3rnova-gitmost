@@ -133,6 +133,33 @@ describe("runCycle (composition)", () => {
     expect(deps.client.listSpaceTree).toHaveBeenCalledTimes(1);
   });
 
+  it("runs the self-heal preflight in a SAFE order: ensureRepo -> clearStaleGitLocks -> ensureMainBranch -> ensureBranch (bugs D3-N3/D3-N1)", async () => {
+    // The order is load-bearing for safety: clearStaleGitLocks MUST run AFTER
+    // ensureRepo (else it would delete ensureRepo's own transient lock) and
+    // BEFORE the checkout/diff; ensureMainBranch MUST run before the
+    // ensureBranch("docmost","main") + checkout that would otherwise throw on a
+    // missing `main`.
+    const vault = fakeVault();
+    const deps = baseDeps(vault);
+
+    const res = await runCycle(deps);
+    expect(res.ran).toBe(true);
+
+    const ensureRepoIdx = vault.order.indexOf("ensureRepo");
+    const clearStaleGitLocksIdx = vault.order.indexOf("clearStaleGitLocks");
+    const ensureMainBranchIdx = vault.order.indexOf("ensureMainBranch");
+    const ensureBranchIdx = vault.order.indexOf("ensureBranch:docmost,main");
+
+    expect(ensureRepoIdx).toBeGreaterThanOrEqual(0);
+    expect(clearStaleGitLocksIdx).toBeGreaterThanOrEqual(0);
+    expect(ensureMainBranchIdx).toBeGreaterThanOrEqual(0);
+    expect(ensureBranchIdx).toBeGreaterThanOrEqual(0);
+
+    expect(ensureRepoIdx).toBeLessThan(clearStaleGitLocksIdx);
+    expect(clearStaleGitLocksIdx).toBeLessThan(ensureMainBranchIdx);
+    expect(ensureMainBranchIdx).toBeLessThan(ensureBranchIdx);
+  });
+
   it("runs a SINGLE push planning pass (no dry-run; the delete-cap hook is gone)", async () => {
     const vault = fakeVault();
     const deps = baseDeps(vault);
