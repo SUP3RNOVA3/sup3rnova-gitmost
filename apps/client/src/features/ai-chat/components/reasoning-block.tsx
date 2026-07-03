@@ -34,15 +34,19 @@ function ReasoningBlock({ text, tokens }: ReasoningBlockProps) {
   // Authoritative count wins; otherwise estimate live from the streamed text.
   const count = tokens && tokens > 0 ? tokens : estimateTokens(text);
   const trimmed = text.trim();
-  // Memoize the markdown render so toggling `open` (or a parent re-render caused
-  // by an unrelated streamed delta) does not re-parse the reasoning text; it
-  // recomputes only when the reasoning text itself changes (while it streams in).
-  // collapseBlankLines collapses the blank-line gaps the model emits between every
-  // list item / paragraph so the reasoning renders compactly (tight lists, joined
-  // paragraphs) — ONLY here, not in the normal answer.
+  // Parse the reasoning markdown ONLY while the block is expanded. Collapsed is the
+  // default and the common case during a long "thinking" stream: reasoning text
+  // streams in and grows with every throttled delta (~20Hz), so a `[trimmed]`-only
+  // memo re-parses the whole, ever-growing text (marked + DOMPurify) on every delta
+  // — an O(n²) storm that pins the main thread and freezes the chat, all for a block
+  // the user isn't even looking at (the html is only shown inside <Collapse in={open}>
+  // below). Gating on `open` skips that hidden parsing entirely; expanding parses the
+  // current text once (an instant, user-initiated click), and further streaming while
+  // open is the normal per-delta append render, like the answer.
   const html = useMemo(
-    () => (trimmed ? renderChatMarkdown(collapseBlankLines(trimmed), {}) : ""),
-    [trimmed],
+    () =>
+      open && trimmed ? renderChatMarkdown(collapseBlankLines(trimmed), {}) : "",
+    [open, trimmed],
   );
 
   return (
