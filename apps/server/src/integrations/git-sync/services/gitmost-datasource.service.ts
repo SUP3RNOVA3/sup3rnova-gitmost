@@ -252,6 +252,23 @@ export class GitmostDataSourceService {
     const currentPage = await this.pageRepo.findById(pageId, {
       includeContent: true,
     });
+    // Unknown-page guard (bug N1-D1). `importPageMarkdown` is only ever called for a
+    // vault file that CARRIES a `gitmost_id`, so a null page means the id is a
+    // well-formed UUID that matches NO page — a stale id from a restored-from-backup
+    // file, or a copied/foreign id. Left unhandled it falls through to `writeBody()`
+    // on a non-existent page, which throws "Page … not found"; the push apply records
+    // that as a per-cycle failure that never clears, wedging the whole space's sync
+    // loop (same user-visible impact as C9-D1, but the id is a VALID uuid so the
+    // 22P02 guard does not catch it). Skip it as an inert no-op so the cycle succeeds
+    // and the rest of the space keeps syncing. (ADOPTING such a file as a fresh page
+    // — the restore-from-backup use case — is a separate design decision: the title
+    // lives in the filename, which the engine classifier holds, not this method.)
+    if (currentPage == null) {
+      this.logger.warn(
+        `git-sync[${ctx.spaceId ?? '-'}] skip import of page ${pageId}: no page with that id (stale/foreign gitmost_id; not adopted, no wedge)`,
+      );
+      return {};
+    }
     // Cross-space confused-deputy guard (review S2). The target `pageId` comes
     // from THIS space's vault file frontmatter, but a file in space A could carry
     // space B's page id. Without this check that file could resurrect (via

@@ -268,10 +268,16 @@ describe('GitmostDataSourceService', () => {
     });
 
     it('returns updatedAt:undefined when the page row is gone after the write (stale-read branch)', async () => {
-      // writeBody succeeds, but the post-write findById returns nothing (e.g. the
-      // page was concurrently hard-deleted) -> the optional updatedAt is omitted.
+      // The page EXISTS at import time (so the unknown-page guard N1-D1 does not
+      // fire), writeBody succeeds, but the POST-write findById returns nothing (e.g.
+      // the page was concurrently hard-deleted) -> the optional updatedAt is omitted.
       const { service, mocks } = build();
-      mocks.pageRepo.findById.mockResolvedValue(undefined);
+      mocks.pageRepo.findById
+        .mockResolvedValueOnce({
+          id: 'p1',
+          updatedAt: new Date('2026-06-20T11:00:00.000Z'),
+        }) // currentPage (import-time read) exists
+        .mockResolvedValue(undefined); // post-write read: page is gone
 
       const res = await service
         .bind(CTX)
@@ -279,6 +285,21 @@ describe('GitmostDataSourceService', () => {
 
       expect(mocks.collabGateway.writePageBody).toHaveBeenCalledTimes(1);
       expect(res.updatedAt).toBeUndefined();
+    });
+
+    it('skips (no writeBody) when the gitmost_id is a valid UUID matching NO page (bug N1-D1)', async () => {
+      // A well-formed but stale/foreign id (restore-from-backup, copied file) must
+      // NOT fall through to writeBody on a non-existent page (which throws "Page not
+      // found" and wedges the space's sync loop). It is skipped as an inert no-op.
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockResolvedValue(undefined);
+
+      const res = await service
+        .bind(CTX)
+        .importPageMarkdown('019f2500-face-7000-8000-000000000002', '# orphan');
+
+      expect(res).toEqual({});
+      expect(mocks.collabGateway.writePageBody).not.toHaveBeenCalled();
     });
 
     // F5 acceptance, criterion (b): guard #2 (docsCanonicallyEqual) must SKIP the
