@@ -12,6 +12,25 @@ import { executeWithCursorPagination } from '@docmost/db/pagination/cursor-pagin
 import { jsonArrayFrom, jsonObjectFrom } from 'kysely/helpers/postgres';
 import { ExpressionBuilder, sql } from 'kysely';
 import { DB } from '@docmost/db/types/db';
+import { resolveAgentProvenance } from '../agent-provenance';
+
+/**
+ * Role-resolution subquery for a page-history row's bound AI chat (#300). Joins
+ * pageHistory.lastUpdatedAiChatId -> ai_chats.role_id -> ai_agent_roles and
+ * selects the role's name + emoji. NO enabled/deletedAt filter: historical agent
+ * content must keep its signature even after the role is disabled or soft-deleted
+ * (same rule as AiAgentRoleRepo.findById, NOT findLiveEnabled). Exported so a
+ * unit test can assert the join never filters on enabled/deletedAt.
+ */
+export function pageHistoryAgentRoleQuery(
+  eb: ExpressionBuilder<DB, 'pageHistory'>,
+) {
+  return eb
+    .selectFrom('aiChats')
+    .innerJoin('aiAgentRoles', 'aiAgentRoles.id', 'aiChats.roleId')
+    .select(['aiAgentRoles.name', 'aiAgentRoles.emoji'])
+    .whereRef('aiChats.id', '=', 'pageHistory.lastUpdatedAiChatId');
+}
 
 @Injectable()
 export class PageHistoryRepo {
@@ -94,15 +113,18 @@ export class PageHistoryRepo {
       .select(this.baseFields)
       .select((eb) => this.withLastUpdatedBy(eb))
       .select((eb) => this.withContributors(eb))
+      .select((eb) => this.withAgentRole(eb))
       .where('pageId', '=', pageId);
 
-    return executeWithCursorPagination(query, {
+    const result = await executeWithCursorPagination(query, {
       perPage: pagination.limit,
       cursor: pagination.cursor,
       beforeCursor: pagination.beforeCursor,
       fields: [{ expression: 'id', direction: 'desc' }],
       parseCursor: (cursor) => ({ id: cursor.id }),
     });
+
+    return { ...result, items: result.items.map(attachPageHistoryAgent) };
   }
 
   async findPageLastHistory(
@@ -138,6 +160,12 @@ export class PageHistoryRepo {
     ).as('lastUpdatedBy');
   }
 
+  /** Select the row's resolved chat role (name + emoji) as `agentRole`, or null
+   *  when there is no internal chat / the chat has no role (#300). */
+  withAgentRole(eb: ExpressionBuilder<DB, 'pageHistory'>) {
+    return jsonObjectFrom(pageHistoryAgentRoleQuery(eb)).as('agentRole');
+  }
+
   withContributors(eb: ExpressionBuilder<DB, 'pageHistory'>) {
     return jsonArrayFrom(
       eb
@@ -150,4 +178,31 @@ export class PageHistoryRepo {
         ),
     ).as('contributors');
   }
+}
+
+/**
+ * Attach the normalized agent/launcher provenance (#300) to a page-history row
+ * and strip the internal `agentRole` join column. The trigger is
+ * `lastUpdatedSource === 'agent'`, the internal-chat discriminator is
+ * `lastUpdatedAiChatId`, and the human is `lastUpdatedBy`. Non-agent rows pass
+ * through unchanged (neither field added).
+ */
+function attachPageHistoryAgent<
+  R extends {
+    lastUpdatedSource?: string | null;
+    lastUpdatedAiChatId?: string | null;
+    lastUpdatedBy?: { name: string; avatarUrl?: string | null } | null;
+    agentRole?: { name: string; emoji?: string | null } | null;
+  },
+>(row: R) {
+  const { agentRole, ...rest } = row;
+  const provenance = resolveAgentProvenance({
+    isAgent: row.lastUpdatedSource === 'agent',
+    aiChatId: row.lastUpdatedAiChatId,
+    creator: row.lastUpdatedBy,
+    agentRole,
+  });
+  return provenance
+    ? { ...rest, agent: provenance.agent, launcher: provenance.launcher }
+    : rest;
 }

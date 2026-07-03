@@ -12,6 +12,24 @@ import { executeWithCursorPagination } from '@docmost/db/pagination/cursor-pagin
 import { ExpressionBuilder } from 'kysely';
 import { DB } from '@docmost/db/types/db';
 import { jsonObjectFrom } from 'kysely/helpers/postgres';
+import { resolveAgentProvenance } from '../agent-provenance';
+
+/**
+ * Role-resolution subquery for a comment's bound AI chat (#300). Joins
+ * comments.aiChatId -> ai_chats.role_id -> ai_agent_roles and selects the role's
+ * name + emoji. NO enabled/deletedAt filter: historical agent content must keep
+ * its signature even after the role is later disabled or soft-deleted — the same
+ * "resolve by id, ignore live/enabled" rule as AiAgentRoleRepo.findById (NOT
+ * findLiveEnabled). Exported so a unit test can assert the join binds only
+ * id<->roleId and never filters on enabled/deletedAt.
+ */
+export function commentAgentRoleQuery(eb: ExpressionBuilder<DB, 'comments'>) {
+  return eb
+    .selectFrom('aiChats')
+    .innerJoin('aiAgentRoles', 'aiAgentRoles.id', 'aiChats.roleId')
+    .select(['aiAgentRoles.name', 'aiAgentRoles.emoji'])
+    .whereRef('aiChats.id', '=', 'comments.aiChatId');
+}
 
 @Injectable()
 export class CommentRepo {
@@ -22,13 +40,30 @@ export class CommentRepo {
     commentId: string,
     opts?: { includeCreator: boolean; includeResolvedBy: boolean },
   ): Promise<Comment> {
-    return await this.db
+    const comment = await this.db
       .selectFrom('comments')
       .selectAll('comments')
       .$if(opts?.includeCreator, (qb) => qb.select(this.withCreator))
       .$if(opts?.includeResolvedBy, (qb) => qb.select(this.withResolvedBy))
+      // #300: enrich the single-row read with the agent-role subquery so the
+      // {agent,launcher} avatar stack is attached here too — the live websocket
+      // broadcasts (commentCreated/Updated/Resolved) return a comment loaded via
+      // findById, and must carry the SAME provenance as the list query
+      // findPageComments. Without this a freshly created / edited / resolved
+      // agent comment arrives un-enriched and the client's
+      // `createdSource === 'agent' && agent` gate drops the stack until a full
+      // refetch. Gated on includeCreator (mirroring findPageComments, which
+      // always selects the creator): the internal-chat launcher IS the creator,
+      // so the resolver needs it, and every broadcast caller passes
+      // includeCreator: true. Non-includeCreator callers keep the plain shape.
+      .$if(opts?.includeCreator, (qb) => qb.select(this.withAgentRole))
       .where('id', '=', commentId)
       .executeTakeFirst();
+
+    // Guard a missing row (don't destructure undefined in attachCommentAgent)
+    // and leave non-enriched callers' shape untouched.
+    if (!comment || !opts?.includeCreator) return comment;
+    return attachCommentAgent(comment) as Comment;
   }
 
   async findPageComments(pageId: string, pagination: PaginationOptions) {
@@ -37,15 +72,18 @@ export class CommentRepo {
       .selectAll('comments')
       .select((eb) => this.withCreator(eb))
       .select((eb) => this.withResolvedBy(eb))
+      .select((eb) => this.withAgentRole(eb))
       .where('pageId', '=', pageId);
 
-    return executeWithCursorPagination(query, {
+    const result = await executeWithCursorPagination(query, {
       perPage: pagination.limit,
       cursor: pagination.cursor,
       beforeCursor: pagination.beforeCursor,
       fields: [{ expression: 'id', direction: 'asc' }],
       parseCursor: (cursor) => ({ id: cursor.id }),
     });
+
+    return { ...result, items: result.items.map(attachCommentAgent) };
   }
 
   async updateComment(
@@ -82,6 +120,12 @@ export class CommentRepo {
     ).as('creator');
   }
 
+  /** Select the comment's resolved chat role (name + emoji) as `agentRole`, or
+   *  null when the comment has no internal chat / the chat has no role (#300). */
+  withAgentRole(eb: ExpressionBuilder<DB, 'comments'>) {
+    return jsonObjectFrom(commentAgentRoleQuery(eb)).as('agentRole');
+  }
+
   withResolvedBy(eb: ExpressionBuilder<DB, 'comments'>) {
     return jsonObjectFrom(
       eb
@@ -115,4 +159,31 @@ export class CommentRepo {
 
     return Number(result?.count) > 0;
   }
+}
+
+/**
+ * Attach the normalized agent/launcher provenance (#300) to a comment row and
+ * strip the internal `agentRole` join column. Non-agent rows pass through
+ * unchanged (neither field added — the client keeps the plain human avatar). The
+ * human author (`creator`) is the launcher for an internal chat, or the agent
+ * itself for external MCP; the resolver encodes both cases.
+ */
+function attachCommentAgent<
+  R extends {
+    createdSource?: string | null;
+    aiChatId?: string | null;
+    creator?: { name: string; avatarUrl?: string | null } | null;
+    agentRole?: { name: string; emoji?: string | null } | null;
+  },
+>(row: R) {
+  const { agentRole, ...rest } = row;
+  const provenance = resolveAgentProvenance({
+    isAgent: row.createdSource === 'agent',
+    aiChatId: row.aiChatId,
+    creator: row.creator,
+    agentRole,
+  });
+  return provenance
+    ? { ...rest, agent: provenance.agent, launcher: provenance.launcher }
+    : rest;
 }

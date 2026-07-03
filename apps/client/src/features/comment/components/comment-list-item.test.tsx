@@ -40,20 +40,30 @@ function renderItem(comment: IComment) {
   );
 }
 
-describe("CommentListItem — AI badge", () => {
-  it('renders the AI-agent badge when createdSource === "agent"', () => {
-    renderItem(baseComment({ createdSource: "agent", aiChatId: null }));
-    expect(screen.getByText("AI-agent")).toBeDefined();
+describe("CommentListItem — agent avatar stack", () => {
+  it('renders the agent avatar stack when createdSource === "agent"', () => {
+    // External-MCP shape: agent is the account itself, no launcher behind.
+    renderItem(
+      baseComment({
+        createdSource: "agent",
+        aiChatId: null,
+        agent: { name: "Service Bot", avatarUrl: null },
+        launcher: null,
+      }),
+    );
+    // The stack renders the agent name label (the creator name is also shown in
+    // the row header, so it appears more than once).
+    expect(screen.getAllByText("Service Bot").length).toBeGreaterThan(0);
+  });
+
+  it('does NOT render the stack for a normal user comment (createdSource "user")', () => {
+    const { container } = renderItem(baseComment({ createdSource: "user" }));
+    // No agent glyph (sparkles) is present for a plain human comment.
+    expect(container.querySelector(".tabler-icon-sparkles")).toBeNull();
     expect(screen.getByText("Service Bot")).toBeDefined();
   });
 
-  it('does NOT render the badge for a normal user comment (createdSource "user")', () => {
-    renderItem(baseComment({ createdSource: "user" }));
-    expect(screen.queryByText("AI-agent")).toBeNull();
-    expect(screen.getByText("Service Bot")).toBeDefined();
-  });
-
-  // The non-clickable (null aiChatId) branch is a property of AiAgentBadge itself
-  // and is covered in ai-agent-badge.test.tsx; this integration suite only needs
-  // the insertion gate (agent → badge, user → no badge) above (#143 review).
+  // The stack's own behaviors (glyph priority, launcher-behind, deep-link click)
+  // are covered directly in agent-avatar-stack.test.tsx; this integration suite
+  // only guards the insertion gate (agent → stack, user → no stack).
 });

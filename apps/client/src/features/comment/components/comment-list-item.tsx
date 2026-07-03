@@ -1,5 +1,5 @@
 import { Group, Text, Box } from "@mantine/core";
-import { AiAgentBadge } from "@/components/ui/ai-agent-badge.tsx";
+import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
 import React, { useEffect, useRef, useState } from "react";
 import classes from "./comment.module.css";
 import { useAtom, useAtomValue } from "jotai";
@@ -132,9 +132,10 @@ function CommentListItem({
                 {comment.creator.name}
               </Text>
 
-              {comment.createdSource === "agent" && (
-                <AiAgentBadge
-                  authorName={comment.creator?.name}
+              {comment.createdSource === "agent" && comment.agent && (
+                <AgentAvatarStack
+                  agent={comment.agent}
+                  launcher={comment.launcher}
                   aiChatId={comment.aiChatId}
                 />
               )}
