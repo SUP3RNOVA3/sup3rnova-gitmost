@@ -41,19 +41,39 @@ function renderItem(comment: IComment) {
 }
 
 describe("CommentListItem — agent avatar stack", () => {
-  it('renders the agent avatar stack when createdSource === "agent"', () => {
-    // External-MCP shape: agent is the account itself, no launcher behind.
+  it('flips the hierarchy for an agent comment: agent primary, launcher shown once', () => {
+    // Internal-chat shape with DISTINCT names so absence-of-duplication is
+    // assertable: creator is the human "Alice", the acting agent is "Researcher".
     renderItem(
       baseComment({
+        creator: { id: "user-1", name: "Alice", avatarUrl: null } as any,
+        createdSource: "agent",
+        aiChatId: "chat-1",
+        agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+        launcher: { name: "Alice", avatarUrl: null },
+      }),
+    );
+    // The AGENT is the primary label (the flipped hierarchy).
+    expect(screen.getByText("Researcher")).toBeDefined();
+    // The human launcher name shows exactly once — it is no longer duplicated as
+    // a separate creator name (that duplication is the bug this fixes).
+    expect(screen.getAllByText("Alice").length).toBe(1);
+  });
+
+  it('external MCP agent comment (no launcher): shows the agent name, no separator', () => {
+    // aiChatId null => external MCP: the agent IS the account, no human behind.
+    renderItem(
+      baseComment({
+        creator: { id: "bot-1", name: "MCP Bot", avatarUrl: null } as any,
         createdSource: "agent",
         aiChatId: null,
-        agent: { name: "Service Bot", avatarUrl: null },
+        agent: { name: "MCP Bot", avatarUrl: null },
         launcher: null,
       }),
     );
-    // The stack renders the agent name label (the creator name is also shown in
-    // the row header, so it appears more than once).
-    expect(screen.getAllByText("Service Bot").length).toBeGreaterThan(0);
+    expect(screen.getByText("MCP Bot")).toBeDefined();
+    // No launcher => no dimmed "·" separator in the header.
+    expect(screen.queryByText("·")).toBeNull();
   });
 
   it('does NOT render the stack for a normal user comment (createdSource "user")', () => {

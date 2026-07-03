@@ -43,6 +43,24 @@ describe("AgentAvatarStack", () => {
     expect(screen.getByText("Alice")).toBeDefined();
   });
 
+  it("showName=false: renders only the avatars, no inline name label", () => {
+    renderStack({
+      agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+      launcher: { name: "Alice", avatarUrl: null },
+      aiChatId: "chat-1",
+      showName: false,
+    });
+
+    // The agent glyph is still rendered...
+    expect(screen.getByText("🔬")).toBeDefined();
+    // ...but neither the agent NOR the launcher inline name label is rendered
+    // (they live only in the hover tooltip, which is not mounted in the initial
+    // DOM) — guards against suppressing only the agent name and leaking the
+    // launcher name.
+    expect(screen.queryByText("Researcher")).toBeNull();
+    expect(screen.queryByText("Alice")).toBeNull();
+  });
+
   it("internal chat WITHOUT role: sparkles fallback + 'AI agent' + launcher", () => {
     const { container } = renderStack({
       agent: { name: "AI agent", avatarUrl: null },

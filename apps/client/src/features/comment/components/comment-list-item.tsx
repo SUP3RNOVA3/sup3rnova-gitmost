@@ -119,25 +119,44 @@ function CommentListItem({
   return (
     <Box ref={ref} pb={6}>
       <Group gap="xs">
-        <CustomAvatar
-          size="sm"
-          avatarUrl={comment.creator.avatarUrl}
-          name={comment.creator.name}
-        />
+        {comment.createdSource === "agent" && comment.agent ? (
+          <AgentAvatarStack
+            agent={comment.agent}
+            launcher={comment.launcher}
+            aiChatId={comment.aiChatId}
+            showName={false}
+          />
+        ) : (
+          <CustomAvatar
+            size="sm"
+            avatarUrl={comment.creator.avatarUrl}
+            name={comment.creator.name}
+          />
+        )}
 
         <div style={{ flex: 1 }}>
           <Group justify="space-between" wrap="nowrap">
             <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-              <Text size="xs" fw={500} lineClamp={1} lh={1.2}>
-                {comment.creator.name}
-              </Text>
-
-              {comment.createdSource === "agent" && comment.agent && (
-                <AgentAvatarStack
-                  agent={comment.agent}
-                  launcher={comment.launcher}
-                  aiChatId={comment.aiChatId}
-                />
+              {comment.createdSource === "agent" && comment.agent ? (
+                <>
+                  <Text size="xs" fw={600} lineClamp={1} lh={1.2}>
+                    {comment.agent.name}
+                  </Text>
+                  {comment.launcher && (
+                    <>
+                      <Text size="xs" c="dimmed" fw={400} aria-hidden>
+                        ·
+                      </Text>
+                      <Text size="xs" c="dimmed" fw={400} lineClamp={1} lh={1.2}>
+                        {comment.launcher.name}
+                      </Text>
+                    </>
+                  )}
+                </>
+              ) : (
+                <Text size="xs" fw={500} lineClamp={1} lh={1.2}>
+                  {comment.creator.name}
+                </Text>
               )}
             </Group>
 

@@ -27,6 +27,9 @@ export interface LauncherInfo {
 const AGENT_COLOR = "violet";
 const GLYPH_SIZE = 38;
 const LAUNCHER_SIZE = 22;
+// How far the launcher avatar sticks out past the agent's bottom-right corner, so
+// the "human behind" reads as behind (lower z-index) yet stays clearly visible.
+const LAUNCHER_OVERHANG = 8;
 
 /**
  * The front avatar. Image-source priority (#300):
@@ -72,6 +75,9 @@ export interface AgentAvatarStackProps {
   // (e.g. the page-history row closes the history modal). Keeps this ui/ primitive
   // free of cross-feature coupling (inherited from the old AiAgentBadge, #143).
   onActivate?: () => void;
+  // Whether to render the inline name label next to the avatars (default true).
+  // Set false when the caller renders the name itself (e.g. the comment row).
+  showName?: boolean;
 }
 
 /**
@@ -87,6 +93,7 @@ export function AgentAvatarStack({
   launcher,
   aiChatId,
   onActivate,
+  showName = true,
 }: AgentAvatarStackProps) {
   const { t } = useTranslation();
   const setAiChatWindowOpen = useSetAtom(aiChatWindowOpenAtom);
@@ -117,13 +124,21 @@ export function AgentAvatarStack({
       })
     : t("AI agent {{name}}", { name: agent.name });
 
+  // The container is only enlarged when there is a launcher to overhang; with no
+  // human behind it stays tight at the agent glyph size.
+  const stackSize = launcher ? GLYPH_SIZE + LAUNCHER_OVERHANG : GLYPH_SIZE;
+
   const stack = (
     <Box
       pos="relative"
       style={{
-        width: GLYPH_SIZE,
-        height: GLYPH_SIZE,
+        width: stackSize,
+        height: stackSize,
         flexShrink: 0,
+        // Center the (in-flow) agent glyph vertically so it lines up with its
+        // name label; the absolutely-positioned launcher is unaffected by flex.
+        display: "flex",
+        alignItems: "center",
         cursor: clickable ? "pointer" : undefined,
       }}
       {...(clickable
@@ -150,7 +165,16 @@ export function AgentAvatarStack({
           />
         </Box>
       )}
-      <Box pos="relative" style={{ zIndex: 1 }}>
+      {/* Pin the agent glyph to the top-left at its own size; the launcher then
+          overhangs it by LAUNCHER_OVERHANG at the bottom-right and stays visible. */}
+      <Box
+        style={{
+          position: "relative",
+          zIndex: 1,
+          width: GLYPH_SIZE,
+          height: GLYPH_SIZE,
+        }}
+      >
         <AgentGlyph agent={agent} />
       </Box>
     </Box>
@@ -161,21 +185,23 @@ export function AgentAvatarStack({
       <Tooltip label={tooltip} withArrow>
         {stack}
       </Tooltip>
-      <Group gap={4} wrap="nowrap" style={{ minWidth: 0 }}>
-        <Text size="xs" fw={600} lineClamp={1} lh={1.2}>
-          {agent.name}
-        </Text>
-        {launcher && (
-          <>
-            <Text size="xs" c="dimmed" fw={400} aria-hidden>
-              ·
-            </Text>
-            <Text size="xs" c="dimmed" fw={400} lineClamp={1} lh={1.2}>
-              {launcher.name}
-            </Text>
-          </>
-        )}
-      </Group>
+      {showName && (
+        <Group gap={4} wrap="nowrap" style={{ minWidth: 0 }}>
+          <Text size="xs" fw={600} lineClamp={1} lh={1.2}>
+            {agent.name}
+          </Text>
+          {launcher && (
+            <>
+              <Text size="xs" c="dimmed" fw={400} aria-hidden>
+                ·
+              </Text>
+              <Text size="xs" c="dimmed" fw={400} lineClamp={1} lh={1.2}>
+                {launcher.name}
+              </Text>
+            </>
+          )}
+        </Group>
+      )}
     </Group>
   );
 }
