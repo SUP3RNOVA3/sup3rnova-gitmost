@@ -1274,6 +1274,7 @@
   "Voice dictation is not configured": "Voice dictation is not configured",
   "Microphone is unavailable or already in use": "Microphone is unavailable or already in use",
   "Audio recording is not available in this browser/context": "Audio recording is not available in this browser/context",
+  "Dictation": "Dictation",
   "Dictation becomes available once the page finishes connecting": "Dictation becomes available once the page finishes connecting",
   "No connection to the collaboration server — dictation unavailable": "No connection to the collaboration server — dictation unavailable",
   "This page is read-only": "This page is read-only",
