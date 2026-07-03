@@ -4,6 +4,7 @@ import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useSetAtom } from "jotai";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
+import { avatarStyle, avatarBackgroundCss } from "@/lib/avatar-palette";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
@@ -29,91 +30,6 @@ const LAUNCHER_SIZE = 22;
 // sits as a small badge over that corner (above the glyph) and stays fully visible.
 const LAUNCHER_OVERHANG = 8;
 
-// Normalize the name before hashing so "PM ", "pm", "Pm" all map to the same
-// avatar (unicode-normalized, trimmed, lower-cased, whitespace collapsed).
-function normalizeName(name: string): string {
-  return name.normalize("NFC").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-// cyrb53: deterministic 53-bit string hash with good avalanche, pure JS. A
-// language's BUILT-IN hash (Java hashCode, etc.) must NOT be used — those differ
-// across platforms/engines, which would make one name render as different avatars
-// on server vs client. This is stable everywhere.
-function cyrb53(str: string, seed = 0): number {
-  let h1 = 0xdeadbeef ^ seed;
-  let h2 = 0x41c6ce57 ^ seed;
-  for (let i = 0; i < str.length; i += 1) {
-    const ch = str.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 =
-    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
-    Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 =
-    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
-    Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
-}
-
-// Perceptually-even avatar palette built in OKLCH and clamped to the sRGB gamut:
-// 12 LIGHT colors (L≈0.70, black text) then 8 DARK colors (L≈0.50, white text).
-// The minimum pairwise ΔEOK ≈ 0.066 (~5 JNDs), so any two entries are either the
-// SAME color or clearly distinguishable — "almost identical" colors are
-// impossible by construction (that was the old raw-hue failure mode). Text
-// contrast is WCAG-checked: dark ring ≥ 5.6:1 white, light ring ≥ 7.3:1 black.
-export const AVATAR_PALETTE = [
-  // light ring (black text)
-  "#e87782", "#e57f4f", "#d0901e", "#aca220", "#77b154", "#22b988",
-  "#00b5b5", "#00afdc", "#5fa1f3", "#9690f1", "#bf82da", "#db78b2",
-  // dark ring (white text)
-  "#a03e43", "#8e5300", "#686800", "#007742",
-  "#007176", "#0068a5", "#6453a7", "#8f4280",
-];
-
-// Second gradient stop per palette entry (index-aligned): two hue-shifted (±25°)
-// partners. A separate hash channel picks which one, so two agents that collide
-// on the base color almost always still differ by their gradient.
-export const GRADIENT_PARTNERS = [
-  ["#de77ab", "#e67d58"], ["#e8777a", "#d58d25"], ["#e28247", "#b39f18"],
-  ["#cb9317", "#81af4b"], ["#a4a528", "#37b880"], ["#6cb35d", "#00b6af"],
-  ["#3cb693", "#26afd1"], ["#00b4bb", "#58a3ed"], ["#00ade4", "#8e93f3"],
-  ["#699ef5", "#b984df"], ["#9e8eef", "#d779ba"], ["#c480d4", "#e7768a"],
-  ["#9a3e67", "#9d4616"], ["#974a2e", "#7a6000"], ["#7e5e00", "#47712c"],
-  ["#4b7015", "#007465"], ["#1c7360", "#1c6d88"], ["#006f87", "#485daa"],
-  ["#3e5fad", "#7f4995"], ["#7a4b9a", "#9c3e60"],
-];
-
-export interface AvatarStyle {
-  bg: string; // base color / first gradient stop
-  bg2: string; // second gradient stop
-  angleDeg: number; // gradient direction
-  text: "white" | "black"; // readable foreground for the ring
-}
-
-/**
- * Deterministic, cross-platform avatar style for an agent glyph. Disjoint bit
- * ranges of ONE cyrb53 hash drive INDEPENDENT visual channels — palette color
- * (20) × gradient partner (2) × gradient angle (8) = 320 combinations — so even
- * when the base color repeats (unavoidable: humans reliably tell apart only
- * ~20-25 colors), the gradient — and the emoji drawn on top — still tell two
- * agents apart. Pure function of the normalized name: same name → same avatar on
- * every device, nothing persisted.
- */
-export function avatarStyle(agentName: string): AvatarStyle {
-  const h = cyrb53(normalizeName(agentName));
-  const idx = h % AVATAR_PALETTE.length; // which palette color
-  const rest = Math.floor(h / AVATAR_PALETTE.length);
-  const dir = rest % 2; // gradient partner: hue -25 or +25
-  const angleDeg = (Math.floor(rest / 2) % 8) * 45; // one of 8 gradient angles
-  return {
-    bg: AVATAR_PALETTE[idx],
-    bg2: GRADIENT_PARTNERS[idx][dir],
-    angleDeg,
-    text: idx < 12 ? "black" : "white",
-  };
-}
-
 /**
  * The front avatar. Image-source priority (#300):
  *   1. agent.avatarUrl -> a real avatar image (external MCP agent account).
@@ -131,8 +47,9 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
     );
   }
 
-  // Emoji/sparkles glyph on a per-agent gradient circle (color + gradient hashed
-  // from the agent name via avatarStyle). Rendered as a plain Box, NOT a Mantine
+  // Emoji/sparkles glyph on a per-agent gradient circle (color, gradient partner
+  // and split angle all hashed from the agent name via avatarStyle — see
+  // @/lib/avatar-palette). Rendered as a plain Box, NOT a Mantine
   // `Avatar variant="filled"` — Mantine's `--avatar-bg` overrode the background
   // (every agent fell back to the theme's violet). The foreground (the sparkles
   // icon) uses the ring's WCAG-checked readable text color.
@@ -147,7 +64,7 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
         // Solid base color is the fallback (and the testable value); the gradient
         // paints over it in browsers that support it.
         backgroundColor: style.bg,
-        backgroundImage: `linear-gradient(${style.angleDeg}deg, ${style.bg}, ${style.bg2})`,
+        backgroundImage: avatarBackgroundCss(style),
         color:
           style.text === "white"
             ? "var(--mantine-color-white)"

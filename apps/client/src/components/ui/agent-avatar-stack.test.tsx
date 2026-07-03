@@ -2,12 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { Provider, createStore } from "jotai";
-import {
-  AgentAvatarStack,
-  avatarStyle,
-  AVATAR_PALETTE,
-  GRADIENT_PARTNERS,
-} from "./agent-avatar-stack";
+import { AgentAvatarStack } from "./agent-avatar-stack";
+import { avatarStyle } from "@/lib/avatar-palette";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
@@ -42,36 +38,6 @@ function renderStack(props: Props) {
   );
   return { store, ...utils };
 }
-
-describe("avatarStyle", () => {
-  it("is deterministic and normalizes the name", () => {
-    // Same name → same style; casing / surrounding whitespace must not matter.
-    expect(avatarStyle("Researcher")).toEqual(avatarStyle("Researcher"));
-    expect(avatarStyle("  RESEARCHER ")).toEqual(avatarStyle("researcher"));
-  });
-
-  it("gives different agents different styles (incl. the report's pair)", () => {
-    // "Структурный редактор" and "Фактчекер" looked identically violet; their
-    // full styles must now differ.
-    expect(avatarStyle("Структурный редактор")).not.toEqual(
-      avatarStyle("Фактчекер"),
-    );
-  });
-
-  it("returns a valid palette color, gradient partner, angle and text", () => {
-    const s = avatarStyle("Нарратор");
-    const idx = AVATAR_PALETTE.indexOf(s.bg);
-    expect(idx).toBeGreaterThanOrEqual(0); // bg is a palette entry
-    // bg2 is one of the two hue-shifted partners of the chosen base color.
-    expect(GRADIENT_PARTNERS[idx]).toContain(s.bg2);
-    // angle is one of the 8 discrete directions (0,45,…,315).
-    expect(s.angleDeg % 45).toBe(0);
-    expect(s.angleDeg).toBeGreaterThanOrEqual(0);
-    expect(s.angleDeg).toBeLessThan(360);
-    // Light ring (first 12) → black text, dark ring → white text.
-    expect(s.text).toBe(idx < 12 ? "black" : "white");
-  });
-});
 
 describe("AgentAvatarStack", () => {
   it("internal chat WITH role: emoji glyph + human launcher badge in front", () => {
