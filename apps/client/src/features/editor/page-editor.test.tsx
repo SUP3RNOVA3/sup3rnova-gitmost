@@ -28,9 +28,11 @@ const KEY_PREFIX = "gitmost:scroll-position:";
 // guard the production code directly (verified: removing `&& editor` reddens the
 // first test).
 //
-// Both tests observe the real effect via `window.scrollTo`. The stubbed
-// `window.scrollTo` never mutates `window.scrollY`, and the target is left
-// unreached, so every restore invocation that passes the guard yields exactly one
+// Both tests observe the real effect via `window.scrollTo`. Restore is NOT
+// synchronous: it waits for the document height to settle (HEIGHT_STABLE_MS)
+// before scrolling, so the tests use fake timers and advance them with a steady,
+// reachable height to let the wait fire. The stubbed `window.scrollTo` never
+// mutates `window.scrollY`, so every restore that settles yields exactly one
 // `scrollTo` call — making the call count a faithful proxy for restore invocations.
 
 function setScrollY(value: number): void {
@@ -80,61 +82,69 @@ describe("PageEditor scroll-restore wiring (useScrollRestoreOnSwap)", () => {
     window.location.hash = "";
   });
 
-  it("re-invokes restore after the swap, with the [showStatic, editor] deps/guard", () => {
-    // Target is immediately reachable, so each restore that passes the guard
-    // scrolls synchronously. `window.scrollY` stays 0 (stubbed scrollTo never
-    // updates it), so scrollTo is called once per effective restore — a proxy for
-    // the restore invocation count.
+  it("early trigger restores once the layout settles; post-swap re-assert gated by && editor", () => {
+    // Restore WAITS for the document height to settle (HEIGHT_STABLE_MS), so tests
+    // advance fake timers. `window.scrollY` stays 0 (stubbed scrollTo never updates
+    // it), so scrollTo's call count proxies the number of effective restores.
+    vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}guard`, "500");
     setInnerHeight(800);
-    setScrollHeight(2000); // maxScroll = 1200 >= 500: reachable, no polling.
+    setScrollHeight(2000); // reachable + held steady -> the wait settles
 
-    // Pre-swap: static content shown, live editor not ready. Only the early
-    // pre-paint restore fires; the post-swap effect's guard (!showStatic) blocks it.
+    // Pre-swap: the early on-mount trigger's wait settles and restores once — this
+    // is the offline / collab-never-syncs path (no swap needed).
     const { rerender } = render(
       <Host pageId="guard" showStatic={true} editor={null} />,
     );
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
 
-    // Collab reports synced (showStatic flips false) but the editor is not ready
-    // yet: the swap effect re-runs (deps [showStatic, editor] changed) but the
-    // `&& editor` guard must keep it a no-op. The early effect does NOT re-fire
-    // (its dep [restoreScrollPosition] is a stable useCallback([])).
-    // (Pins the guard: dropping `&& editor` would restore against a null editor,
-    // producing a 2nd scrollTo and failing this expectation.)
+    // showStatic flips false but the editor is still null: the post-swap effect
+    // re-runs (deps [showStatic, editor] changed) but its `&& editor` guard must
+    // keep it a no-op. (Dropping `&& editor` would start a fresh wait against a
+    // null editor and produce a 2nd scrollTo, failing this expectation.)
     rerender(<Host pageId="guard" showStatic={false} editor={null} />);
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
 
     // The static -> live swap completes (showStatic false AND editor present): the
-    // post-swap effect re-asserts the restore exactly once more, driven solely by
-    // the [showStatic, editor] deps changing.
+    // post-swap effect re-invokes restore, whose fresh wait settles and re-asserts.
     rerender(<Host pageId="guard" showStatic={false} editor={fakeEditor} />);
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     expect(window.scrollTo).toHaveBeenCalledTimes(2);
   });
 
-  it("the post-swap re-assert drives a REAL restore (window.scrollTo) via the hook", () => {
-    // End-to-end through the real useScrollPosition (inside the hook): the swap
-    // re-invocation is the CAUSE of the scroll (nothing scrolls before it).
+  it("restore waits for the height to settle before scrolling (end-to-end via the hook)", () => {
     vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}peg`, "500");
     setInnerHeight(800);
-    setScrollHeight(100); // maxScroll = -700: target not reachable yet -> polls.
+    setScrollHeight(100); // maxScroll = -700: target not reachable yet.
 
-    // Pre-swap: the early restore runs but content is too short, so it starts
-    // polling (a pending timer) without scrolling. We never advance timers, so the
-    // early poll cannot fire on its own — isolating the swap as the sole cause.
+    // Mount + swap while the content is still too short: nothing scrolls, even as
+    // time passes — restore never fires against an unsettled/unreachable layout.
     const { rerender } = render(
       <Host pageId="peg" showStatic={true} editor={null} />,
     );
-    expect(window.scrollTo).not.toHaveBeenCalled();
-
-    // The live content is now laid out tall enough to reach the target.
-    setScrollHeight(2000); // maxScroll = 1200 >= 500
-
-    // The static -> live swap: the post-swap useLayoutEffect re-invokes the real
-    // hook, whose synchronous tryRestore now reaches the target and scrolls.
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     act(() => {
       rerender(<Host pageId="peg" showStatic={false} editor={fakeEditor} />);
+      vi.advanceTimersByTime(500);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled();
+
+    // The live content finally lays out tall enough and holds steady past the
+    // stable window -> restore fires exactly to the saved target.
+    setScrollHeight(2000);
+    act(() => {
+      vi.advanceTimersByTime(500);
     });
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
   });

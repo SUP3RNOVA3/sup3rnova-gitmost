@@ -8,6 +8,11 @@ const SAVE_THROTTLE_MS = 250;
 const MAX_RESTORE_WAIT_MS = 5000;
 // How often to re-check the document height while waiting for content to load.
 const RESTORE_POLL_MS = 100;
+// The document height must stay unchanged this long before we treat the layout
+// as settled and safe to restore against — restoring while content is still
+// rendering in lets scroll-anchoring drift the saved offset (and re-fire, which
+// is the residual reload "jitter" this replaces).
+const HEIGHT_STABLE_MS = 400;
 
 // sessionStorage key prefix. sessionStorage survives an F5 in the same tab and
 // is cleared on tab close, which is exactly the lifetime we want for an MVP
@@ -73,10 +78,13 @@ export function hasSavedReadingPosition(pageId: string): boolean {
  * their place across a reload (F5) or reopening the document.
  *
  * Returns `restoreScrollPosition`, which the page editor calls from two triggers
- * (early, while the static/cached content is laid out, and again after the
- * static->live editor swap); it is idempotent, so re-asserting the same target is
- * a no-op. The two scroll mechanisms are mutually exclusive: if the URL has a
- * `#hash` anchor, the existing anchor-scroll logic wins and restore is a no-op.
+ * (early on mount + after the static->live editor swap). It WAITS for the
+ * document height to stop changing (the layout to settle) and then scrolls once
+ * to the saved offset — so it never fires mid-render, where scroll-anchoring
+ * would drift the position. It is idempotent: a running wait suppresses a second
+ * trigger, and once positioned re-asserting is a no-op. The two scroll mechanisms
+ * are mutually exclusive: if the URL has a `#hash` anchor, the existing
+ * anchor-scroll logic wins and restore is a no-op.
  */
 export function useScrollPosition(pageId: string): {
   restoreScrollPosition: () => void;
@@ -104,9 +112,6 @@ export function useScrollPosition(pageId: string): {
   // this, a fast SPA navigation away mid-poll would let the old page's poll fire
   // window.scrollTo against the NEW page's document (visible wrong-page scroll).
   const pollTimerRef = useRef<number | null>(null);
-  // Timestamp of the FIRST restore attempt so re-triggers (e.g. the static→live
-  // editor swap) share ONE bounded timeout budget instead of restarting it.
-  const restoreStartRef = useRef<number | null>(null);
 
   // Capture the previously-saved value synchronously during render, before the
   // effect below registers handlers that would persist the current (0) scrollY.
@@ -209,36 +214,43 @@ export function useScrollPosition(pageId: string): {
     // Nothing meaningful to restore to.
     if (targetY <= 0) return;
 
-    // Cancel any in-flight poll before (re)starting, so overlapping triggers can
-    // never run two concurrent polls against the same target.
-    if (pollTimerRef.current !== null) {
-      window.clearTimeout(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
+    // Idempotent: if a restore poll is already running, do not start a second.
+    // Both triggers (early + post-swap) share it; a running poll suppresses the
+    // second, and once positioned the redundancy guard makes it a no-op.
+    if (pollTimerRef.current !== null) return;
 
-    // Share one timeout budget across re-triggers instead of restarting it.
-    if (restoreStartRef.current === null) {
-      restoreStartRef.current = Date.now();
-    }
-    const start = restoreStartRef.current;
+    const start = Date.now();
+    let lastHeight = -1;
+    let stableSince = start;
 
-    const tryRestore = () => {
-      // Bail mid-poll if the reader started scrolling while we were waiting.
+    // Restore ONCE the document height has been stable for HEIGHT_STABLE_MS AND
+    // the target is reachable, so the saved pixel offset lands on the same content
+    // the reader left. Restoring earlier — while the doc is still rendering in
+    // (progressive content / static->live swap) — lets scroll-anchoring drift the
+    // position and makes the restore re-fire (the reload jitter). The timeout is
+    // the only fallback that clamps to the furthest reachable position.
+    const tick = () => {
+      // Bail mid-wait if the reader started scrolling.
       if (userInteractedRef.current) {
         pollTimerRef.current = null;
         return;
       }
 
-      const maxScroll =
-        document.documentElement.scrollHeight - window.innerHeight;
-      const timedOut = Date.now() - start >= MAX_RESTORE_WAIT_MS;
+      const now = Date.now();
+      const height = document.documentElement.scrollHeight;
+      if (height !== lastHeight) {
+        lastHeight = height;
+        stableSince = now;
+      }
+      const maxScroll = height - window.innerHeight;
+      const settled = now - stableSince >= HEIGHT_STABLE_MS;
+      const reachable = maxScroll >= targetY;
+      const timedOut = now - start >= MAX_RESTORE_WAIT_MS;
 
-      // Restore once the content is tall enough to reach the target, or bail out
-      // after the timeout and scroll as far as currently possible.
-      if (maxScroll >= targetY || timedOut) {
+      if ((settled && reachable) || timedOut) {
         const top = Math.min(targetY, Math.max(maxScroll, 0));
-        // Redundancy guard: re-asserting the SAME target when already positioned
-        // is a no-op, so this hook can be called from multiple triggers safely.
+        // No-op when already there — avoids a redundant scroll and keeps the two
+        // triggers from double-scrolling.
         if (Math.abs(window.scrollY - top) > 1) {
           window.scrollTo({ top, behavior: "auto" });
         }
@@ -247,10 +259,10 @@ export function useScrollPosition(pageId: string): {
       }
 
       // Stored in a ref so the effect cleanup can cancel it on unmount.
-      pollTimerRef.current = window.setTimeout(tryRestore, RESTORE_POLL_MS);
+      pollTimerRef.current = window.setTimeout(tick, RESTORE_POLL_MS);
     };
 
-    tryRestore();
+    tick();
   }, []);
 
   return { restoreScrollPosition };
@@ -261,8 +273,9 @@ export function useScrollPosition(pageId: string): {
  *
  * Extracted from PageEditor so the exact restore triggers (their deps and the
  * post-swap `&& editor` guard) are directly unit-testable rather than mirrored.
- * Behaviour is unchanged: `restoreScrollPosition` is idempotent, so re-asserting
- * the same target from either trigger is a no-op.
+ * `restoreScrollPosition` waits for the layout to settle and is idempotent, so
+ * both triggers together produce a single restore (a running wait suppresses the
+ * second; once positioned re-asserting is a no-op).
  *
  * @param pageId      the page whose scroll position is persisted/restored.
  * @param editor      the tiptap editor instance, or `null` until it is ready.
@@ -275,16 +288,18 @@ export function useScrollRestoreOnSwap(
 ): void {
   const { restoreScrollPosition } = useScrollPosition(pageId);
 
-  // Restore as early as the static (cached) content is laid out, before paint,
-  // so the reader's position is applied without a visible jump. Aborts itself if
-  // the reader has already started scrolling (handled inside the hook).
+  // Early trigger: start the restore wait on mount, so a reload that never
+  // reaches the live editor (offline / collab never syncs — the static cache
+  // stays shown) still restores once the static layout settles. The wait itself
+  // holds off scrolling until the height is stable, and aborts if the reader
+  // starts scrolling (handled inside the hook).
   useLayoutEffect(() => {
     restoreScrollPosition();
   }, [restoreScrollPosition]);
 
-  // Re-assert once after the static -> live editor swap in case the swap reset
-  // the window scroll. Idempotent: a no-op when the position is already correct,
-  // and a no-op after the reader has interacted.
+  // Post-swap trigger: after the static -> live swap, (re)start the wait so it
+  // measures the final live layout. Idempotent: a no-op while the early wait is
+  // still running, and a no-op once already positioned or the reader interacted.
   useLayoutEffect(() => {
     if (!showStatic && editor) restoreScrollPosition();
   }, [showStatic, editor, restoreScrollPosition]);

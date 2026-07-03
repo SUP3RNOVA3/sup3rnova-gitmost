@@ -93,9 +93,10 @@ describe("useScrollPosition", () => {
     // Restore still scrolls to 500 (the captured target), NOT the clobbered 0.
     // If the capture were moved into an effect (after handlers register), it
     // would read the clobbered 0 and this assertion would fail.
-    setScrollHeight(2000); // maxScroll = 1200 >= 500
+    setScrollHeight(2000); // maxScroll = 1200 >= 500, held steady -> settles
     act(() => {
       result.current.restoreScrollPosition();
+      vi.advanceTimersByTime(500);
     });
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
   });
@@ -103,11 +104,12 @@ describe("useScrollPosition", () => {
   it("(a3) is idempotent: re-asserting the same target does not scroll again", () => {
     vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}once`, "500");
-    setScrollHeight(2000); // tall enough to restore synchronously
+    setScrollHeight(2000); // tall enough + steady -> settles
 
     const { result } = renderHook(() => useScrollPosition("once"));
     act(() => {
       result.current.restoreScrollPosition();
+      vi.advanceTimersByTime(500);
     });
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
 
@@ -119,6 +121,7 @@ describe("useScrollPosition", () => {
     // the window is already at the target and does nothing.
     act(() => {
       result.current.restoreScrollPosition();
+      vi.advanceTimersByTime(500);
     });
     expect(window.scrollTo).toHaveBeenCalledTimes(1);
   });
@@ -126,10 +129,10 @@ describe("useScrollPosition", () => {
   it("(b) does not restore when the URL has a #hash anchor", () => {
     vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}p2`, "500");
-    // Content is ALREADY tall enough (maxScroll = 2000 - 800 = 1200 >= 500), so
-    // without the hash guard tryRestore would call scrollTo synchronously on the
-    // first tick. The assertion below therefore genuinely proves the hash guard
-    // short-circuits before any scroll (not just that the poll has not fired).
+    // Content is ALREADY tall enough (maxScroll = 2000 - 800 = 1200 >= 500) and
+    // steady, so without the hash guard the wait would settle and scroll to the
+    // target. The assertion below therefore genuinely proves the hash guard
+    // short-circuits before any scroll (not just that the wait has not fired).
     setScrollHeight(2000);
     window.location.hash = "#some-heading";
 
@@ -168,7 +171,7 @@ describe("useScrollPosition", () => {
 
   it("(g) does not restore if the reader scrolled (wheel) before restore fires", () => {
     window.sessionStorage.setItem(`${KEY_PREFIX}g1`, "500");
-    setScrollHeight(2000); // tall enough to restore synchronously
+    setScrollHeight(2000); // tall enough (would settle and restore, absent the wheel)
 
     const { result } = renderHook(() => useScrollPosition("g1"));
 
@@ -210,8 +213,9 @@ describe("useScrollPosition", () => {
   });
 
   it("(i) a non-scroll keydown does NOT abort restore", () => {
+    vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}i1`, "500");
-    setScrollHeight(2000); // tall enough to restore synchronously
+    setScrollHeight(2000); // tall enough + steady -> settles
 
     const { result } = renderHook(() => useScrollPosition("i1"));
 
@@ -221,6 +225,7 @@ describe("useScrollPosition", () => {
     });
     act(() => {
       result.current.restoreScrollPosition();
+      vi.advanceTimersByTime(500);
     });
 
     // Restore still happens: the innocuous keypress did not disable it.
@@ -229,7 +234,7 @@ describe("useScrollPosition", () => {
 
   it("(j) a scroll keydown (Space) DOES abort restore", () => {
     window.sessionStorage.setItem(`${KEY_PREFIX}j1`, "500");
-    setScrollHeight(2000); // tall enough to restore synchronously
+    setScrollHeight(2000); // tall enough (would settle and restore, absent the scroll key)
 
     const { result } = renderHook(() => useScrollPosition("j1"));
 
@@ -261,7 +266,7 @@ describe("useScrollPosition", () => {
     expect(window.scrollTo).not.toHaveBeenCalled();
   });
 
-  it("(d) scrolls to the saved Y once the content is tall enough", () => {
+  it("(d) scrolls to the saved Y once the height settles tall enough", () => {
     vi.useFakeTimers();
     window.sessionStorage.setItem(`${KEY_PREFIX}p4`, "500");
     setInnerHeight(800);
@@ -270,17 +275,50 @@ describe("useScrollPosition", () => {
     const { result } = renderHook(() => useScrollPosition("p4"));
     act(() => {
       result.current.restoreScrollPosition();
+      vi.advanceTimersByTime(300);
     });
 
-    // Still polling: content not laid out yet.
+    // Still waiting: content not laid out tall enough yet.
     expect(window.scrollTo).not.toHaveBeenCalled();
 
-    // Content becomes tall enough: maxScroll = 2000 - 800 = 1200 >= 500.
+    // Content becomes tall enough and then holds steady past the stable window:
+    // maxScroll = 2000 - 800 = 1200 >= 500.
     setScrollHeight(2000);
     act(() => {
-      vi.advanceTimersByTime(100);
+      vi.advanceTimersByTime(500);
     });
 
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
+  });
+
+  it("(d3) waits for the height to STOP changing before restoring", () => {
+    vi.useFakeTimers();
+    window.sessionStorage.setItem(`${KEY_PREFIX}p4b`, "500");
+    setInnerHeight(800);
+    setScrollHeight(2000); // reachable from the start (maxScroll 1200 >= 500)...
+
+    const { result } = renderHook(() => useScrollPosition("p4b"));
+    act(() => {
+      result.current.restoreScrollPosition();
+    });
+
+    // ...but the height keeps changing every tick, so it never settles.
+    act(() => {
+      vi.advanceTimersByTime(100);
+      setScrollHeight(2500);
+      vi.advanceTimersByTime(100);
+      setScrollHeight(3000);
+      vi.advanceTimersByTime(100);
+      setScrollHeight(3500);
+      vi.advanceTimersByTime(100);
+    });
+    expect(window.scrollTo).not.toHaveBeenCalled(); // reachable, but not settled
+
+    // Height now holds steady past HEIGHT_STABLE_MS -> restore fires (to the
+    // fixed target, unaffected by the taller document).
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
   });
 
@@ -303,53 +341,39 @@ describe("useScrollPosition", () => {
     expect(window.scrollTo).toHaveBeenCalledWith({ top: 200, behavior: "auto" });
   });
 
-  it("(k) shares ONE timeout budget across re-triggers (does not restart the clock)", () => {
-    // The static->live editor swap re-invokes restore. The shared budget
-    // (restoreStartRef) must measure the MAX_RESTORE_WAIT_MS (5000) deadline
-    // from the FIRST trigger, not restart it on every re-trigger. This pins
-    // the `if (restoreStartRef.current === null)` guard: a mutant that resets
-    // `restoreStartRef.current = Date.now()` on every trigger would push the
-    // deadline out to t=8000 (3000 + 5000) and fail the t=5000 assertion below.
+  it("(k) a re-trigger while the wait is running does not start a second concurrent poll", () => {
+    // Both triggers (early on-mount + post-swap) call restore. The
+    // `if (pollTimerRef.current !== null) return` guard makes a re-trigger during
+    // an in-flight wait a no-op, so exactly ONE poll runs and scrolls exactly once.
+    // A mutant dropping that guard would start a second parallel poll; since the
+    // stubbed scrollTo never moves window.scrollY, the second poll would scroll
+    // again (redundancy guard sees scrollY still 0 != target) -> two calls, and
+    // this assertion would fail.
     vi.useFakeTimers();
-    vi.setSystemTime(0);
-    window.sessionStorage.setItem(`${KEY_PREFIX}k1`, "5000");
+    window.sessionStorage.setItem(`${KEY_PREFIX}k1`, "500");
     setInnerHeight(800);
-    setScrollHeight(1000); // maxScroll = 200, never reaches 5000 -> it polls.
+    setScrollHeight(100); // too short -> the first wait keeps polling (no scroll yet)
 
     const { result } = renderHook(() => useScrollPosition("k1"));
 
-    // First trigger at t=0: starts the shared budget and begins polling.
+    // First trigger: starts the wait.
     act(() => {
       result.current.restoreScrollPosition();
     });
-    expect(window.scrollTo).not.toHaveBeenCalled();
-
-    // Advance to t=3000 (still polling: content short, not yet timed out).
-    act(() => {
-      vi.advanceTimersByTime(3000);
-    });
-    expect(window.scrollTo).not.toHaveBeenCalled();
-
-    // Second trigger at t=3000 (the swap re-assert). Under the real code the
-    // budget is shared, so `start` stays 0; under the reset-mutant it becomes 3000.
+    // Second trigger while the first wait is still running: the guard suppresses it.
     act(() => {
       result.current.restoreScrollPosition();
     });
 
-    // At t=4900 the FIRST budget has not yet elapsed (4900 - 0 < 5000): no clamp.
+    // Content becomes reachable and holds steady past the stable window.
+    setScrollHeight(2000);
     act(() => {
-      vi.advanceTimersByTime(1900);
+      vi.advanceTimersByTime(500);
     });
-    expect(window.scrollTo).not.toHaveBeenCalled();
 
-    // At t=5000 the shared budget (measured from t=0) times out and clamps to the
-    // furthest reachable position (maxScroll = 200). The reset-mutant, measuring
-    // from t=3000, would still be waiting (5000 - 3000 = 2000 < 5000) and would
-    // NOT have scrolled here -> this assertion fails against that mutant.
-    act(() => {
-      vi.advanceTimersByTime(100);
-    });
-    expect(window.scrollTo).toHaveBeenCalledWith({ top: 200, behavior: "auto" });
+    // Exactly one scroll — the guard prevented a second concurrent poll.
+    expect(window.scrollTo).toHaveBeenCalledTimes(1);
+    expect(window.scrollTo).toHaveBeenCalledWith({ top: 500, behavior: "auto" });
   });
 
   it("(e) never throws when storage access throws", () => {
