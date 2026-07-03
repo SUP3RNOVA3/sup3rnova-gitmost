@@ -113,9 +113,15 @@ describe('SHARED_TOOL_SPECS contract parity', () => {
       const expectedKeys = Object.keys(shape).sort();
       expect(actualKeys).toEqual(expectedKeys);
 
-      // A non-.optional() field must surface as required in the advertised schema.
+      // A field that was NOT wrapped in `.optional()` must surface as required in
+      // the advertised schema. We test for the ZodOptional wrapper rather than
+      // `isOptional()`: `z.any()`/`z.unknown()` accept `undefined` and so report
+      // `isOptional() === true`, yet z.toJSONSchema still lists them under
+      // `required` (they carry no `.optional()`). Matching on the wrapper is what
+      // the emitted JSON schema actually does, so it stays correct for the
+      // registry's `node: z.any()` fields (patchNode/insertNode).
       const expectedRequired = Object.entries(shape)
-        .filter(([, field]) => !(field as z.ZodTypeAny).isOptional?.())
+        .filter(([, field]) => !(field instanceof z.ZodOptional))
         .map(([k]) => k)
         .sort();
       expect((json.required ?? []).slice().sort()).toEqual(expectedRequired);

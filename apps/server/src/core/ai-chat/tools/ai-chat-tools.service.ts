@@ -173,6 +173,11 @@ export class AiChatToolsService {
       });
 
     return {
+      // INTENTIONAL per-transport divergence (not in the shared registry): this
+      // in-app search runs a semantic + keyword hybrid (RRF) with in-process
+      // access control and a tuned schema (limit 1-20); the standalone MCP
+      // `search` is a plain REST full-text search (limit up to 100). Different
+      // behaviour AND schema, so kept per-layer.
       searchPages: tool({
         description:
           'Search the wiki for pages relevant to a query. Combines exact ' +
@@ -432,6 +437,10 @@ export class AiChatToolsService {
         },
       }),
 
+      // INTENTIONAL per-transport divergence (not shared): the description is
+      // tuned for the in-app agent (e.g. "retry with a corrected EXACT selection"
+      // and "Reversible via the comment UI"); the standalone MCP `create_comment`
+      // keeps its own wording. Kept per-layer.
       createComment: tool({
         description:
           'Add an INLINE comment to a page, or reply to an existing top-level ' +
@@ -519,6 +528,10 @@ export class AiChatToolsService {
         async () => await client.getSpaces(),
       ),
 
+      // INTENTIONAL per-transport divergence (not shared): keeps the `tree:true`
+      // hierarchy mode but is worded for the in-app agent; the standalone MCP
+      // `list_pages` carries its own wording. Kept per-layer so each side tunes
+      // its own guidance.
       listPages: tool({
         description:
           'List the most recent pages, optionally scoped to a single space. ' +
@@ -692,85 +705,25 @@ export class AiChatToolsService {
         async ({ pageId }) => await client.stashPage(pageId),
       ),
 
-      patchNode: tool({
-        description:
-          'Replace a single content block (by id) with a new ProseMirror ' +
-          'node; the replacement keeps the same nodeId. Example node: a ' +
-          'paragraph {"type":"paragraph","content":[{"type":"text","text":"Hello"}]} ' +
-          'or a heading {"type":"heading","attrs":{"level":2},"content":' +
-          '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
-          '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node arg ' +
-          'may be a JSON object or a JSON string (both accepted). Reversible: ' +
-          'the previous version is kept in page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          nodeId: z
-            .string()
-            .describe('The block id to replace (from getOutline/getPageJson).'),
-          node: z
-            .any()
-            .describe(
-              'The replacement ProseMirror node, e.g. ' +
-                '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
-                'JSON object or JSON string both accepted.',
-            ),
-        }),
-        execute: async ({ pageId, nodeId, node }) => {
-          // Parity with the standalone MCP server (index.ts patch_node): the
-          // model sometimes serializes the node as a JSON string. Parse it
-          // before the client's typeof-object guard rejects it.
+      // Schema + description from the shared registry (identical across both
+      // transports). The execute body keeps its OWN parseNodeArg normalization:
+      // the model sometimes serializes the node as a JSON string, and we parse it
+      // before the client's typeof-object guard rejects it (parity with the
+      // standalone MCP server, index.ts patch_node).
+      patchNode: sharedTool(
+        sharedToolSpecs.patchNode,
+        async ({ pageId, nodeId, node }) => {
           const parsedNode = parseNodeArg(node);
           return await client.patchNode(pageId, nodeId, parsedNode);
         },
-      }),
+      ),
 
-      insertNode: tool({
-        description:
-          'Insert a ProseMirror node relative to an anchor, or append it at ' +
-          'the top level. For before/after you MUST provide EXACTLY ONE of ' +
-          'anchorNodeId or anchorText. Example node: a paragraph ' +
-          '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
-          'heading {"type":"heading","attrs":{"level":2},"content":' +
-          '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
-          '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node arg ' +
-          'may be a JSON object or a JSON string (both accepted). Reversible ' +
-          'via page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          node: z
-            .any()
-            .describe(
-              'The ProseMirror node to insert, e.g. ' +
-                '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
-                'JSON object or JSON string both accepted.',
-            ),
-          position: z
-            .enum(['before', 'after', 'append'])
-            .describe('Where to insert relative to the anchor.'),
-          anchorNodeId: z
-            .string()
-            .optional()
-            .describe('Anchor block id (for before/after).'),
-          anchorText: z
-            .string()
-            .optional()
-            .describe(
-              'Anchor text fragment (for before/after), matched against the ' +
-                "block's literal rendered plain text (no markdown). " +
-                'Markdown/emoji are tolerated as a fallback; prefer plain text ' +
-                'or anchorNodeId.',
-            ),
-        }),
-        execute: async ({
-          pageId,
-          node,
-          position,
-          anchorNodeId,
-          anchorText,
-        }) => {
-          // Parity with the standalone MCP server (index.ts insert_node): the
-          // model sometimes serializes the node as a JSON string. Parse it
-          // before the client's typeof-object guard rejects it.
+      // Shared registry schema + description; execute retains parseNodeArg on the
+      // incoming node (parity with the standalone MCP server, index.ts
+      // insert_node).
+      insertNode: sharedTool(
+        sharedToolSpecs.insertNode,
+        async ({ pageId, node, position, anchorNodeId, anchorText }) => {
           const parsedNode = parseNodeArg(node);
           return await client.insertNode(pageId, parsedNode, {
             position,
@@ -778,7 +731,7 @@ export class AiChatToolsService {
             anchorText,
           });
         },
-      }),
+      ),
 
       deleteNode: sharedTool(
         sharedToolSpecs.deleteNode,
@@ -821,6 +774,10 @@ export class AiChatToolsService {
         },
       }),
 
+      // NOT in the shared registry: this layer names the table argument
+      // `tableRef`, while the standalone MCP tool names it `table` (index.ts).
+      // Sharing one buildShape would rename a model-facing parameter on one
+      // transport, so the table row/cell tools stay per-layer by design.
       tableInsertRow: tool({
         description:
           'Insert a row of plain-text cells into a table. Reversible via ' +
@@ -841,6 +798,8 @@ export class AiChatToolsService {
           await client.tableInsertRow(pageId, tableRef, cells, index),
       }),
 
+      // NOT shared — same `tableRef` (here) vs `table` (MCP) parameter-name
+      // divergence as tableInsertRow.
       tableDeleteRow: tool({
         description:
           'Delete a table row at a 0-based index. Reversible via page history.',
@@ -855,6 +814,8 @@ export class AiChatToolsService {
           await client.tableDeleteRow(pageId, tableRef, index),
       }),
 
+      // NOT shared — same `tableRef` (here) vs `table` (MCP) parameter-name
+      // divergence as tableInsertRow.
       tableUpdateCell: tool({
         description:
           'Set the plain-text content of a table cell at [row, col] (0-based). ' +
@@ -884,6 +845,10 @@ export class AiChatToolsService {
           await client.importPageMarkdown(pageId, markdown),
       ),
 
+      // INTENTIONAL per-transport divergence (not shared): adds a security
+      // confirmation framing ("Only share when the user explicitly asked, since
+      // this exposes the page to anyone with the link") for the in-app agent; the
+      // standalone MCP `share_page` keeps the plain public-URL wording.
       sharePage: tool({
         description:
           'Make a page PUBLICLY accessible and return its public URL. ' +
@@ -910,6 +875,10 @@ export class AiChatToolsService {
         async ({ historyId }) => await client.restorePageVersion(historyId),
       ),
 
+      // INTENTIONAL per-transport divergence (not shared): deliberately omits the
+      // `deleteComments` schema field (comment-deletion guardrail) and carries a
+      // much shorter description; the standalone MCP `docmost_transform` exposes
+      // the full helper catalogue. Different schema, so kept per-layer.
       transformPage: tool({
         description:
           'Run a sandboxed JS transform of the form `(doc, ctx) => doc` over a ' +

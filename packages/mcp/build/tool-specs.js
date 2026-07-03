@@ -80,6 +80,86 @@ export const SHARED_TOOL_SPECS = {
             nodeId: z.string().min(1),
         }),
     },
+    // --- single-block structural write (patch / insert) ---
+    //
+    // CANONICAL description merges both layers: the MCP copy's "WITHOUT resending
+    // the whole document" + "cheaper/safer than a full-document replace" guidance
+    // AND the in-app copy's "keeps the same node id" + "Reversible via page
+    // history" framing — nothing either side conveyed is dropped. Sibling tools are
+    // named in transport-neutral prose ("the page-JSON view", "a full-document
+    // replace") to match the rest of the registry, since the two layers expose
+    // those siblings under different (snake_case vs camelCase) identifiers.
+    patchNode: {
+        mcpName: 'patch_node',
+        inAppKey: 'patchNode',
+        description: 'Replace a single content block identified by its attrs.id with a new ' +
+            'ProseMirror node, WITHOUT resending the whole document; the replacement ' +
+            'keeps the same node id. Get the block id from the page-JSON view, then ' +
+            'pass a ProseMirror node to put in its place. Example node: a paragraph ' +
+            '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
+            'heading {"type":"heading","attrs":{"level":2},"content":' +
+            '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
+            '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
+            'JSON object or a JSON string (both accepted). Cheaper and safer than ' +
+            'replacing the whole document for one-block structural edits. Reversible: ' +
+            'the previous version is kept in page history.',
+        buildShape: (z) => ({
+            pageId: z.string().min(1).describe('ID of the page containing the block'),
+            nodeId: z
+                .string()
+                .min(1)
+                .describe('attrs.id of the block to replace (from the page outline or ' +
+                'page-JSON view)'),
+            node: z
+                .any()
+                .describe('ProseMirror node to put in place of the node with this id, e.g. ' +
+                '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
+                'JSON object or JSON string both accepted.'),
+        }),
+    },
+    insertNode: {
+        mcpName: 'insert_node',
+        inAppKey: 'insertNode',
+        description: 'Insert a block before/after another block (by attrs.id or anchor text) ' +
+            'or append it at the end (top level). For before/after you MUST provide ' +
+            'EXACTLY ONE of anchorNodeId or anchorText. Get anchor block ids from the ' +
+            'page-JSON view. Avoids resending the whole document. Can also insert ' +
+            'table structure: to add a tableRow, pass a tableRow node with position ' +
+            'before/after and anchor INSIDE the target table — anchorNodeId of any ' +
+            'block/cell in it, or anchorText matching the table; to add a ' +
+            'tableCell/tableHeader, use anchorNodeId of a block inside the target row ' +
+            '(anchorText only resolves top-level blocks, so it cannot target a row). ' +
+            "`anchorText` is matched against the block's literal rendered plain text " +
+            '(no markdown); markdown/emoji are tolerated as a fallback; prefer plain ' +
+            'text or anchorNodeId. Note: append is top-level only and rejects ' +
+            'structural table nodes. Example node: a paragraph ' +
+            '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
+            'heading {"type":"heading","attrs":{"level":2},"content":' +
+            '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
+            '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
+            'JSON object or a JSON string (both accepted). Reversible via page history.',
+        buildShape: (z) => ({
+            pageId: z.string().min(1),
+            node: z
+                .any()
+                .describe('ProseMirror node to insert, e.g. ' +
+                '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
+                'JSON object or JSON string both accepted.'),
+            position: z
+                .enum(['before', 'after', 'append'])
+                .describe('Where to insert relative to the anchor.'),
+            anchorNodeId: z
+                .string()
+                .optional()
+                .describe('Anchor block id (for before/after).'),
+            anchorText: z
+                .string()
+                .optional()
+                .describe("Anchor text fragment (for before/after), matched against the " +
+                "block's literal rendered plain text (no markdown). Markdown/emoji " +
+                'are tolerated as a fallback; prefer plain text or anchorNodeId.'),
+        }),
+    },
     // --- share management ---
     unsharePage: {
         mcpName: 'unshare_page',

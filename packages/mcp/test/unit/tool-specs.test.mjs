@@ -83,6 +83,63 @@ test("getNode builder produces exactly { pageId, nodeId }", () => {
   assert.deepEqual(Object.keys(shape).sort(), ["nodeId", "pageId"]);
 });
 
+test("patchNode spec exists, merges BOTH descriptions, builds { pageId, nodeId, node }", () => {
+  const spec = SHARED_TOOL_SPECS.patchNode;
+  assert.ok(spec, "patchNode spec missing");
+  assert.equal(spec.mcpName, "patch_node");
+  assert.equal(spec.inAppKey, "patchNode");
+
+  // The canonical description must carry the key guidance from BOTH originals:
+  //  - MCP-only: "WITHOUT resending the whole document" + the cheaper/safer note.
+  //  - in-app-only: "keeps the same node id" + the "Reversible ... page history"
+  //    framing the MCP copy lacked.
+  assert.match(spec.description, /WITHOUT resending the whole document/);
+  assert.match(spec.description, /Cheaper and safer/);
+  assert.match(spec.description, /keeps the same node id/i);
+  assert.match(spec.description, /Reversible/i);
+  assert.match(spec.description, /page history/i);
+
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["node", "nodeId", "pageId"]);
+  // A minimal valid input parses (node accepts an arbitrary object via z.any()).
+  const parsed = z.object(shape).parse({
+    pageId: "p1",
+    nodeId: "n1",
+    node: { type: "paragraph" },
+  });
+  assert.equal(parsed.pageId, "p1");
+  assert.equal(parsed.nodeId, "n1");
+});
+
+test("insertNode spec exists, merges BOTH descriptions, builds the full anchor shape", () => {
+  const spec = SHARED_TOOL_SPECS.insertNode;
+  assert.ok(spec, "insertNode spec missing");
+  assert.equal(spec.mcpName, "insert_node");
+  assert.equal(spec.inAppKey, "insertNode");
+
+  // Canonical description must keep BOTH sides' nuance:
+  //  - in-app-only: "EXACTLY ONE of anchorNodeId or anchorText" + "Reversible".
+  //  - MCP-only: the table-structure (tableRow/tableCell) insertion guidance.
+  assert.match(spec.description, /EXACTLY ONE of anchorNodeId or anchorText/);
+  assert.match(spec.description, /tableRow/);
+  assert.match(spec.description, /append is top-level only/);
+  assert.match(spec.description, /Reversible via page history/);
+
+  const shape = spec.buildShape(z);
+  assert.deepEqual(
+    Object.keys(shape).sort(),
+    ["anchorNodeId", "anchorText", "node", "pageId", "position"],
+  );
+  // before/after/append are the only accepted positions; anchors are optional.
+  const schema = z.object(shape);
+  assert.doesNotThrow(() =>
+    schema.parse({ pageId: "p1", node: { type: "paragraph" }, position: "append" }),
+  );
+  assert.throws(() =>
+    schema.parse({ pageId: "p1", node: {}, position: "sideways" }),
+  );
+});
+
 test("no-arg specs (getWorkspace/listSpaces/listShares) omit buildShape", () => {
   for (const key of ["getWorkspace", "listSpaces", "listShares"]) {
     assert.equal(SHARED_TOOL_SPECS[key].buildShape, undefined, `${key} should be no-arg`);
