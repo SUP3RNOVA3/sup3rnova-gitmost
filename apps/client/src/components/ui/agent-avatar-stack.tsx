@@ -1,4 +1,4 @@
-import { Avatar, Box, Group, Text, Tooltip } from "@mantine/core";
+import { Box, Group, Text, Tooltip } from "@mantine/core";
 import { IconSparkles } from "@tabler/icons-react";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
@@ -25,8 +25,8 @@ export interface LauncherInfo {
 
 const GLYPH_SIZE = 38;
 const LAUNCHER_SIZE = 22;
-// How far the launcher avatar sticks out past the agent's top-right corner, so
-// the "human behind" reads as behind (lower z-index) yet stays clearly visible.
+// How far the launcher avatar sticks out past the agent's top-right corner — it
+// sits as a small badge over that corner (above the glyph) and stays fully visible.
 const LAUNCHER_OVERHANG = 8;
 
 // Small deterministic string hash (same algorithm as custom-avatar's initials
@@ -40,15 +40,36 @@ function hashName(input: string): number {
   return Math.abs(hash);
 }
 
+// A palette of categorically-DISTINCT dark circle colors for emoji/sparkles agent
+// glyphs. Every entry is intentionally dark (low lightness) so a bright emoji or
+// the white sparkles icon stays readable on top; the hues are spread across the
+// wheel (red → orange → amber → green → teal → cyan → blue → indigo → violet →
+// magenta + a neutral slate) so two different agents read as DIFFERENT colors,
+// not merely different shades of the same violet.
+const GLYPH_COLORS = [
+  "hsl(355, 60%, 34%)", // red
+  "hsl(18, 62%, 32%)", // vermilion
+  "hsl(32, 60%, 30%)", // orange
+  "hsl(45, 55%, 28%)", // amber
+  "hsl(75, 45%, 26%)", // olive-green
+  "hsl(140, 48%, 26%)", // green
+  "hsl(165, 52%, 26%)", // teal
+  "hsl(188, 58%, 28%)", // cyan
+  "hsl(205, 58%, 32%)", // sky blue
+  "hsl(225, 52%, 36%)", // blue
+  "hsl(250, 48%, 38%)", // indigo
+  "hsl(280, 46%, 36%)", // violet
+  "hsl(312, 48%, 34%)", // magenta
+  "hsl(210, 12%, 36%)", // slate / neutral
+];
+
 /**
- * Deterministic DARK background for an emoji/sparkles agent glyph. The hue is
- * derived from the agent-name hash so distinct agents get distinct circles;
- * saturation and lightness are pinned low ("shifted into darkness") so a bright
- * emoji or the white sparkles icon stays legible on top (#300).
+ * Deterministic dark circle color for an emoji/sparkles agent glyph, picked from
+ * GLYPH_COLORS by a hash of the agent name so distinct agents get categorically
+ * distinct colors while every color stays dark enough to keep the glyph readable.
  */
 export function agentGlyphBackground(name: string): string {
-  const hue = hashName(name) % 360;
-  return `hsl(${hue}, 45%, 24%)`;
+  return GLYPH_COLORS[hashName(name) % GLYPH_COLORS.length];
 }
 
 /**
@@ -68,29 +89,32 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
     );
   }
 
-  // Emoji/sparkles glyphs sit on a per-agent dark circle (hashed from the agent
-  // name) so different agents are visually distinct, while the dark background
-  // keeps the emoji / white sparkles icon readable.
-  const bg = agentGlyphBackground(agent.name);
-  const glyphStyles = {
-    root: { background: bg },
-    placeholder: { background: bg, color: "var(--mantine-color-white)" },
-  };
-
-  if (agent.emoji) {
-    return (
-      <Avatar size={GLYPH_SIZE} radius="xl" variant="filled" styles={glyphStyles}>
+  // Emoji/sparkles glyph on a per-agent dark circle (color hashed from the agent
+  // name). Rendered as a plain Box, NOT a Mantine `Avatar variant="filled"`, so
+  // the background is guaranteed instead of being overridden by Mantine's
+  // `--avatar-bg` (which was falling back to the theme's violet for every agent).
+  return (
+    <Box
+      style={{
+        width: GLYPH_SIZE,
+        height: GLYPH_SIZE,
+        borderRadius: "50%",
+        background: agentGlyphBackground(agent.name),
+        color: "var(--mantine-color-white)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        lineHeight: 1,
+      }}
+    >
+      {agent.emoji ? (
         <span style={{ fontSize: Math.round(GLYPH_SIZE * 0.5) }} aria-hidden>
           {agent.emoji}
         </span>
-      </Avatar>
-    );
-  }
-
-  return (
-    <Avatar size={GLYPH_SIZE} radius="xl" variant="filled" styles={glyphStyles}>
-      <IconSparkles size={Math.round(GLYPH_SIZE * 0.55)} stroke={2} />
-    </Avatar>
+      ) : (
+        <IconSparkles size={Math.round(GLYPH_SIZE * 0.55)} stroke={2} />
+      )}
+    </Box>
   );
 }
 
@@ -185,7 +209,9 @@ export function AgentAvatarStack({
         : {})}
     >
       {launcher && (
-        <Box pos="absolute" top={0} right={0} style={{ zIndex: 0 }}>
+        // Launcher badge sits ABOVE the agent glyph (zIndex) at the top-right so
+        // it is fully visible, not half-hidden behind the agent circle.
+        <Box pos="absolute" top={0} right={0} style={{ zIndex: 2 }}>
           <CustomAvatar
             size={LAUNCHER_SIZE}
             avatarUrl={launcher.avatarUrl}

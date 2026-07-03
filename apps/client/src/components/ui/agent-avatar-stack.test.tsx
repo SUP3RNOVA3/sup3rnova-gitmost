@@ -33,13 +33,16 @@ describe("agentGlyphBackground", () => {
     );
   });
 
-  it("differs by name and stays a fixed dark shade (readable emoji)", () => {
+  it("gives categorically different colors to different agents", () => {
+    // The two agents that looked identically violet in the report must differ.
+    expect(agentGlyphBackground("Структурный редактор")).not.toBe(
+      agentGlyphBackground("Фактчекер"),
+    );
     expect(agentGlyphBackground("Researcher")).not.toBe(
       agentGlyphBackground("Нарратор"),
     );
-    // Only the hue varies; saturation/lightness are pinned low so the glyph is
-    // always a dark circle.
-    expect(agentGlyphBackground("Нарратор")).toMatch(/^hsl\(\d+, 45%, 24%\)$/);
+    // Every color is a dark hsl circle drawn from the palette.
+    expect(agentGlyphBackground("Нарратор")).toMatch(/^hsl\(\d+, \d+%, \d+%\)$/);
   });
 });
 
