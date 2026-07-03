@@ -173,6 +173,9 @@ export interface Comments {
   resolvedSource: string | null;
   selection: string | null;
   spaceId: string;
+  suggestedText: string | null;
+  suggestionAppliedAt: Timestamp | null;
+  suggestionAppliedById: string | null;
   type: string | null;
   updatedAt: Generated<Timestamp>;
   workspaceId: string;
