@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { Provider, createStore } from "jotai";
-import { AgentAvatarStack } from "./agent-avatar-stack";
+import { AgentAvatarStack, agentGlyphBackground } from "./agent-avatar-stack";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
@@ -25,6 +25,23 @@ function renderStack(props: Props) {
   );
   return { store, ...utils };
 }
+
+describe("agentGlyphBackground", () => {
+  it("is deterministic for a given agent name", () => {
+    expect(agentGlyphBackground("Researcher")).toBe(
+      agentGlyphBackground("Researcher"),
+    );
+  });
+
+  it("differs by name and stays a fixed dark shade (readable emoji)", () => {
+    expect(agentGlyphBackground("Researcher")).not.toBe(
+      agentGlyphBackground("Нарратор"),
+    );
+    // Only the hue varies; saturation/lightness are pinned low so the glyph is
+    // always a dark circle.
+    expect(agentGlyphBackground("Нарратор")).toMatch(/^hsl\(\d+, 45%, 24%\)$/);
+  });
+});
 
 describe("AgentAvatarStack", () => {
   it("internal chat WITH role: emoji glyph in front + human launcher behind", () => {

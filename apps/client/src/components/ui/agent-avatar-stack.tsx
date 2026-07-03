@@ -23,19 +23,39 @@ export interface LauncherInfo {
   avatarUrl?: string | null;
 }
 
-// Same violet token as the former AiAgentBadge (which used color="violet").
-const AGENT_COLOR = "violet";
 const GLYPH_SIZE = 38;
 const LAUNCHER_SIZE = 22;
-// How far the launcher avatar sticks out past the agent's bottom-right corner, so
+// How far the launcher avatar sticks out past the agent's top-right corner, so
 // the "human behind" reads as behind (lower z-index) yet stays clearly visible.
 const LAUNCHER_OVERHANG = 8;
+
+// Small deterministic string hash (same algorithm as custom-avatar's initials
+// hash) used to pick a stable per-agent glyph color.
+function hashName(input: string): number {
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash << 5) - hash + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+/**
+ * Deterministic DARK background for an emoji/sparkles agent glyph. The hue is
+ * derived from the agent-name hash so distinct agents get distinct circles;
+ * saturation and lightness are pinned low ("shifted into darkness") so a bright
+ * emoji or the white sparkles icon stays legible on top (#300).
+ */
+export function agentGlyphBackground(name: string): string {
+  const hue = hashName(name) % 360;
+  return `hsl(${hue}, 45%, 24%)`;
+}
 
 /**
  * The front avatar. Image-source priority (#300):
  *   1. agent.avatarUrl -> a real avatar image (external MCP agent account).
- *   2. agent.emoji     -> the role emoji on a violet circle.
- *   3. otherwise       -> the IconSparkles glyph on a violet circle (fallback).
+ *   2. agent.emoji     -> the role emoji on a per-agent dark circle.
+ *   3. otherwise       -> the IconSparkles glyph on a per-agent dark circle (fallback).
  */
 function AgentGlyph({ agent }: { agent: AgentInfo }) {
   if (agent.avatarUrl) {
@@ -48,9 +68,18 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
     );
   }
 
+  // Emoji/sparkles glyphs sit on a per-agent dark circle (hashed from the agent
+  // name) so different agents are visually distinct, while the dark background
+  // keeps the emoji / white sparkles icon readable.
+  const bg = agentGlyphBackground(agent.name);
+  const glyphStyles = {
+    root: { background: bg },
+    placeholder: { background: bg, color: "var(--mantine-color-white)" },
+  };
+
   if (agent.emoji) {
     return (
-      <Avatar size={GLYPH_SIZE} radius="xl" color={AGENT_COLOR} variant="filled">
+      <Avatar size={GLYPH_SIZE} radius="xl" variant="filled" styles={glyphStyles}>
         <span style={{ fontSize: Math.round(GLYPH_SIZE * 0.5) }} aria-hidden>
           {agent.emoji}
         </span>
@@ -59,7 +88,7 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
   }
 
   return (
-    <Avatar size={GLYPH_SIZE} radius="xl" color={AGENT_COLOR} variant="filled">
+    <Avatar size={GLYPH_SIZE} radius="xl" variant="filled" styles={glyphStyles}>
       <IconSparkles size={Math.round(GLYPH_SIZE * 0.55)} stroke={2} />
     </Avatar>
   );
@@ -156,7 +185,7 @@ export function AgentAvatarStack({
         : {})}
     >
       {launcher && (
-        <Box pos="absolute" bottom={0} right={0} style={{ zIndex: 0 }}>
+        <Box pos="absolute" top={0} right={0} style={{ zIndex: 0 }}>
           <CustomAvatar
             size={LAUNCHER_SIZE}
             avatarUrl={launcher.avatarUrl}
@@ -165,8 +194,8 @@ export function AgentAvatarStack({
           />
         </Box>
       )}
-      {/* Pin the agent glyph to the top-left at its own size; the launcher then
-          overhangs it by LAUNCHER_OVERHANG at the bottom-right and stays visible. */}
+      {/* The agent glyph keeps its own size (flex-centered in the container); the
+          launcher overhangs it by LAUNCHER_OVERHANG at the top-right and stays visible. */}
       <Box
         style={{
           position: "relative",
