@@ -58,6 +58,17 @@ function writeStorage(pageId: string, scrollY: number): void {
 }
 
 /**
+ * Whether a positive reading position is saved for this page — i.e. the page
+ * will be scrolled away from the top on load. Used by the title editor to avoid
+ * auto-focusing (and thus placing the caret in) the now-off-screen title.
+ * Returns false when nothing is saved or storage is unavailable.
+ */
+export function hasSavedReadingPosition(pageId: string): boolean {
+  const y = readStorage(pageId);
+  return typeof y === "number" && y > 0;
+}
+
+/**
  * Persists and restores the window scroll position per page so a reader keeps
  * their place across a reload (F5) or reopening the document.
  *
