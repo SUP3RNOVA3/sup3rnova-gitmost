@@ -46,9 +46,11 @@ export async function getAiChatMessages(
  * Resolve the chat bound to a document (the current user's most-recent chat
  * created on that page), or null when there is none. Drives auto-open-on-page.
  */
-export async function getBoundChat(pageId: string): Promise<string | null> {
+export async function getBoundChat(slugId: string): Promise<string | null> {
+  // The `pageId` body field accepts a page slugId or a uuid; the server resolves
+  // it to the real page uuid (the wire key stays `pageId` for the DTO).
   const req = await api.post<{ chatId: string | null }>("/ai-chat/bound-chat", {
-    pageId,
+    pageId: slugId,
   });
   return req.data.chatId;
 }

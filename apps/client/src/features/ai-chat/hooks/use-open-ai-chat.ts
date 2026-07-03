@@ -27,7 +27,9 @@ export function useOpenAiChatForCurrentPage() {
   // AiChatWindow lives in a pathless parent layout route, so useParams() can't
   // see :pageSlug — match the full path against the authenticated page route.
   const match = useMatch("/s/:spaceSlug/p/:pageSlug");
-  const pageId = extractPageSlugId(match?.params?.pageSlug);
+  // A page slugId (10-char nanoid), NOT a uuid; the server resolves it to the
+  // real page uuid (PageRepo.findById accepts slugId or uuid).
+  const slugId = extractPageSlugId(match?.params?.pageSlug);
 
   return useCallback(async () => {
     // Re-clicks while the window is already open (incl. minimized) must NOT
@@ -40,9 +42,9 @@ export function useOpenAiChatForCurrentPage() {
     // connection the first click reads as a hung control until the POST returns.
     setWindowOpen(true);
     let resolved: string | null = activeChatId; // off-a-page: keep current
-    if (pageId) {
+    if (slugId) {
       try {
-        resolved = await getBoundChat(pageId); // null => fresh chat
+        resolved = await getBoundChat(slugId); // null => fresh chat
       } catch {
         resolved = null; // fail-soft: a fresh chat is always a safe fallback
       }
@@ -58,7 +60,7 @@ export function useOpenAiChatForCurrentPage() {
   }, [
     windowOpen,
     activeChatId,
-    pageId,
+    slugId,
     setWindowOpen,
     setActiveChatId,
     setDraft,
