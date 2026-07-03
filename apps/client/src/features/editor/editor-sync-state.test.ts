@@ -81,4 +81,30 @@ describe("computeDictationAvailability (mic reason precedence, #309)", () => {
       computeDictationAvailability({ ...base, inEditMode: false }),
     ).toEqual({ isEditable: false, reason: "read-only" });
   });
+
+  // Lack of edit permission takes precedence over the pre-sync reason: a
+  // read-only viewer who is ALSO inside the pre-sync window (showStatic) must
+  // still read "read-only", never "offline"/"connecting". This pins the
+  // `opts.editable &&` guard on the pre-sync branch.
+  it("prefers 'read-only' over pre-sync when a read-only viewer is disconnected", () => {
+    expect(
+      computeDictationAvailability({
+        editable: false,
+        inEditMode: true,
+        showStatic: true,
+        isDisconnected: true,
+      }),
+    ).toEqual({ isEditable: false, reason: "read-only" });
+  });
+
+  it("prefers 'read-only' over pre-sync when a read-only viewer is still connecting", () => {
+    expect(
+      computeDictationAvailability({
+        editable: false,
+        inEditMode: true,
+        showStatic: true,
+        isDisconnected: false,
+      }),
+    ).toEqual({ isEditable: false, reason: "read-only" });
+  });
 });

@@ -77,4 +77,16 @@ describe("MicButton — disabled reason label", () => {
       screen.getByRole("button", { name: "Start dictation" }),
     ).toBeDefined();
   });
+
+  it("does not advertise 'Start dictation' when disabled with no reason", () => {
+    // A consumer passing bare `disabled` (e.g. the AI chat's isStreaming) with no
+    // unavailableReason must not get a hoverable mic whose tooltip invites
+    // "Start dictation" on a click that is rejected.
+    renderButton({ onText: () => {}, disabled: true });
+    expect(
+      screen.queryByRole("button", { name: "Start dictation" }),
+    ).toBeNull();
+    const button = screen.getByRole("button");
+    expect(button.getAttribute("data-disabled")).toBe("true");
+  });
 });

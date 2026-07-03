@@ -6,8 +6,7 @@ export type DictationUnavailableReason =
   | "connecting"
   | "offline"
   | "read-only"
-  | "unsupported"
-  | "busy";
+  | "unsupported";
 
 export type DictationErrorCode =
   | "no-media-devices"
@@ -105,9 +104,7 @@ export function resolveUnavailableLabel(
     case "read-only":
       return t("This page is read-only");
     case "unsupported":
-      return t("Audio recording is not available in this browser/context");
-    case "busy":
     default:
-      return t("Transcribing…");
+      return t("Audio recording is not available in this browser/context");
   }
 }

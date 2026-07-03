@@ -133,29 +133,44 @@ export const MicButton: FC<MicButtonProps> = ({
   const reason: DictationUnavailableReason | undefined = unsupported
     ? "unsupported"
     : unavailableReason;
-  const idleLabel =
-    isDisabled && reason
-      ? resolveUnavailableLabel(reason, t)
-      : t("Start dictation");
+  const reasonLabel = reason ? resolveUnavailableLabel(reason, t) : undefined;
+  // A disabled mic with a known reason surfaces it on hover; an enabled mic
+  // invites "Start dictation". But a mic disabled with NO reason (e.g. a
+  // consumer that passes bare `disabled` — the AI chat's isStreaming, with no
+  // unavailableReason) must NOT hover a misleading, actionable "Start dictation"
+  // tooltip on a control that rejects the click. In that case we render the icon
+  // without a Tooltip and give it a neutral accessible label instead.
+  const ariaLabel = reasonLabel ?? (isDisabled ? t("Dictation") : t("Start dictation"));
+  const icon = (
+    <ActionIcon
+      size={size}
+      variant="subtle"
+      color={color}
+      onClick={(e) => {
+        if (isDisabled) {
+          e.preventDefault();
+          return;
+        }
+        void start();
+      }}
+      data-disabled={isDisabled || undefined}
+      aria-disabled={isDisabled}
+      aria-label={ariaLabel}
+    >
+      <IconMicrophone size={resolvedIconSize} />
+    </ActionIcon>
+  );
+  // Suppress the tooltip on a disabled mic that has nothing to explain — hovering
+  // a grey, unclickable mic should not advertise "Start dictation".
+  if (isDisabled && !reasonLabel) {
+    return icon;
+  }
   return (
-    <Tooltip label={idleLabel} withArrow>
-      <ActionIcon
-        size={size}
-        variant="subtle"
-        color={color}
-        onClick={(e) => {
-          if (isDisabled) {
-            e.preventDefault();
-            return;
-          }
-          void start();
-        }}
-        data-disabled={isDisabled || undefined}
-        aria-disabled={isDisabled}
-        aria-label={idleLabel}
-      >
-        <IconMicrophone size={resolvedIconSize} />
-      </ActionIcon>
+    <Tooltip
+      label={reasonLabel ?? t("Start dictation")}
+      withArrow
+    >
+      {icon}
     </Tooltip>
   );
 };

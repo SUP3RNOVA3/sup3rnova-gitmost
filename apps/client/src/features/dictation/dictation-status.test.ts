@@ -146,7 +146,6 @@ describe("resolveUnavailableLabel", () => {
     expect(resolveUnavailableLabel("unsupported", t)).toBe(
       "Audio recording is not available in this browser/context",
     );
-    expect(resolveUnavailableLabel("busy", t)).toBe("Transcribing…");
   });
 });
 
