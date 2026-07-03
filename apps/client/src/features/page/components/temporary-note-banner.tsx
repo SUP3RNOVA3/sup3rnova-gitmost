@@ -1,4 +1,11 @@
-import { Button, Group, Paper, Text } from "@mantine/core";
+import {
+  ActionIcon,
+  Button,
+  Group,
+  Paper,
+  Text,
+  Tooltip,
+} from "@mantine/core";
 import { IconClockHour4, IconTrash } from "@tabler/icons-react";
 import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
@@ -70,7 +77,14 @@ export function TemporaryNoteBanner({ slugId }: TemporaryNoteBannerProps) {
   return (
     <Paper radius="sm" mb="md" px="md" py="xs" bg="orange.0">
       <Group justify="space-between" wrap="wrap" gap="sm">
-        <Group gap="xs" wrap="nowrap" style={{ flex: 1, minWidth: 0 }}>
+        {/* A non-zero flex-basis lets the outer wrap="wrap" drop the buttons to
+            their own row on narrow screens; flex:1 (basis 0) never wraps and
+            instead crushes the text into a one-word-per-line ladder. */}
+        <Group
+          gap="xs"
+          wrap="nowrap"
+          style={{ flex: "1 1 16rem", minWidth: 0 }}
+        >
           <IconClockHour4
             size={18}
             stroke={1.5}
@@ -87,28 +101,58 @@ export function TemporaryNoteBanner({ slugId }: TemporaryNoteBannerProps) {
           </Text>
         </Group>
         {canEdit && (
-          <Group gap="xs" wrap="nowrap">
-            <Button
-              size="xs"
-              variant="subtle"
-              color="red"
-              leftSection={<IconTrash size={16} />}
-              onClick={handleTrashNow}
-              loading={isDeleting}
-            >
-              {t("Move to trash")}
-            </Button>
-            <Button
-              size="xs"
-              variant="light"
-              color="orange"
-              leftSection={<IconClockHour4 size={16} />}
-              onClick={handleMakePermanent}
-              loading={toggleTemporary.isPending}
-            >
-              {t("Make permanent")}
-            </Button>
-          </Group>
+          <>
+            {/* Desktop: full labeled buttons. */}
+            <Group gap="xs" wrap="nowrap" visibleFrom="sm">
+              <Button
+                size="xs"
+                variant="subtle"
+                color="red"
+                leftSection={<IconTrash size={16} />}
+                onClick={handleTrashNow}
+                loading={isDeleting}
+              >
+                {t("Move to trash")}
+              </Button>
+              <Button
+                size="xs"
+                variant="light"
+                color="orange"
+                leftSection={<IconClockHour4 size={16} />}
+                onClick={handleMakePermanent}
+                loading={toggleTemporary.isPending}
+              >
+                {t("Make permanent")}
+              </Button>
+            </Group>
+            {/* Mobile: icon-only actions so they never overflow the narrow row. */}
+            <Group gap="xs" wrap="nowrap" hiddenFrom="sm">
+              <Tooltip label={t("Move to trash")} withArrow>
+                <ActionIcon
+                  size="lg"
+                  variant="subtle"
+                  color="red"
+                  onClick={handleTrashNow}
+                  loading={isDeleting}
+                  aria-label={t("Move to trash")}
+                >
+                  <IconTrash size={18} />
+                </ActionIcon>
+              </Tooltip>
+              <Tooltip label={t("Make permanent")} withArrow>
+                <ActionIcon
+                  size="lg"
+                  variant="light"
+                  color="orange"
+                  onClick={handleMakePermanent}
+                  loading={toggleTemporary.isPending}
+                  aria-label={t("Make permanent")}
+                >
+                  <IconClockHour4 size={18} />
+                </ActionIcon>
+              </Tooltip>
+            </Group>
+          </>
         )}
       </Group>
     </Paper>
