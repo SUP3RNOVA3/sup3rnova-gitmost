@@ -298,6 +298,29 @@ export class VaultGit {
     await this.run(["branch", name, fromBranch]);
   }
 
+  /**
+   * Re-create a MISSING `main` branch (bug D3-N1). Ref-store damage (a deleted
+   * `refs/heads/main`, a bad ref update) can leave an existing repo without
+   * `main`. Every cycle then throws (`ensureBranch("docmost","main")` /
+   * `checkout main` -> "pathspec 'main' did not match"), wedging the space
+   * FOREVER with no self-heal — `ensureRepo` only creates branches on a FRESH
+   * `git init`. Restore `main` in the preflight from the best available source:
+   * the `docmost` mirror branch if present (they track each other), else the
+   * current `HEAD` commit. If the repo has no commit at all, ensureRepo's
+   * fresh-init path owns it — nothing to do here.
+   */
+  async ensureMainBranch(): Promise<void> {
+    if (await this.branchExists(DEFAULT_BRANCH)) return;
+    if (await this.branchExists("docmost")) {
+      await this.run(["branch", DEFAULT_BRANCH, "docmost"]);
+      return;
+    }
+    const head = await this.runRaw(["rev-parse", "--verify", "--quiet", "HEAD"]);
+    if (head.code === 0 && head.stdout.trim().length > 0) {
+      await this.run(["branch", DEFAULT_BRANCH, head.stdout.trim()]);
+    }
+  }
+
   /** Name of the currently checked-out branch. */
   async currentBranch(): Promise<string> {
     return this.run(["rev-parse", "--abbrev-ref", "HEAD"]);

@@ -125,6 +125,12 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
   //     it before the merge check + any checkout/diff below.
   await vault.clearStaleGitLocks();
 
+  // 1c. RESTORE a missing `main` branch (bug D3-N1). Ref-store damage can leave an
+  //     existing repo without `main`; the ensureBranch("docmost","main") + checkout
+  //     below would then throw every cycle ("pathspec 'main' did not match"),
+  //     wedging the space forever. Re-create it from `docmost`/HEAD before use.
+  await vault.ensureMainBranch();
+
   // 2. RECOVER from a vault left mid-merge by a PRIOR cycle (SPEC §9 wedge fix).
   //    A leftover merge used to WEDGE THE WHOLE SPACE: this check returned
   //    `skipped: "merge-in-progress"` so EVERY later cycle skipped the entire

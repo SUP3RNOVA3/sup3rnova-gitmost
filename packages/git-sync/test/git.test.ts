@@ -166,6 +166,32 @@ describe('VaultGit (integration; temp repo)', () => {
     await expect(git.clearStaleGitLocks()).resolves.toBeUndefined();
   });
 
+  it('ensureMainBranch restores a deleted main from the docmost mirror (bug D3-N1)', async () => {
+    if (!available) return;
+    const vault = await freshDir();
+    const git = new VaultGit(vault);
+    await git.ensureRepo();
+    await git.ensureBranch('docmost', 'main');
+
+    // Ref damage: delete refs/heads/main (git refuses to delete the current
+    // branch, so move HEAD to docmost first — simulating a lost main ref).
+    await execFileAsync('git', ['symbolic-ref', 'HEAD', 'refs/heads/docmost'], {
+      cwd: vault,
+    });
+    await execFileAsync('git', ['branch', '-D', 'main'], { cwd: vault });
+    await expect(
+      execFileAsync('git', ['rev-parse', '--verify', 'main'], { cwd: vault }),
+    ).rejects.toThrow();
+
+    // The preflight re-creates main (from docmost).
+    await git.ensureMainBranch();
+    await expect(
+      execFileAsync('git', ['rev-parse', '--verify', 'main'], { cwd: vault }),
+    ).resolves.toBeDefined();
+    // Idempotent when main already exists.
+    await expect(git.ensureMainBranch()).resolves.toBeUndefined();
+  });
+
   it('ensureRepo neutralizes correctness-affecting LOCAL config', async () => {
     if (!available) return;
     const vault = await freshDir();
