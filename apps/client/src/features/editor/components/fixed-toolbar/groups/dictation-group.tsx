@@ -1,5 +1,5 @@
 import { FC, useRef } from "react";
-import type { Editor } from "@tiptap/react";
+import { Editor, useEditorState } from "@tiptap/react";
 import { useAtomValue } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { MicButton } from "@/features/dictation/components/mic-button";
@@ -22,6 +22,14 @@ export const DictationGroup: FC<Props> = ({ editor, color, iconSize }) => {
   // end so the NEXT segment appends right after it, contiguously, regardless of
   // where the user's caret currently is. Null until the first segment lands.
   const insertPosRef = useRef<number | null>(null);
+  // editor.isEditable is a mutable, non-reactive field — read it via
+  // useEditorState so the mic re-enables when the body flips to editable after
+  // collab sync (otherwise it stays stuck disabled). Mirrors the body's own
+  // reactive read.
+  const isEditable = useEditorState({
+    editor,
+    selector: (ctx) => ctx.editor?.isEditable ?? false,
+  });
 
   const handleStart = () => {
     const { from, to } = editor.state.selection;
@@ -80,7 +88,7 @@ export const DictationGroup: FC<Props> = ({ editor, color, iconSize }) => {
       streaming={streamingDictation}
       onStart={handleStart}
       onText={handleText}
-      disabled={!editor.isEditable}
+      disabled={!isEditable}
       color={color}
       iconSize={iconSize}
     />
