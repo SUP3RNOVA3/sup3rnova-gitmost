@@ -449,6 +449,16 @@ export default function PageEditor({
   const hasConnectedOnceRef = useRef(false);
   const [showStatic, setShowStatic] = useState(true);
 
+  // Reserved height held across the static -> live editor swap. The live editor
+  // lays out its content over a few frames, so replacing the (full-height) static
+  // copy with it momentarily shrinks the document; the browser then clamps window
+  // scroll to the top, which yanked the reader off their restored reading position
+  // (and threw their scroll to 0 if they were scrolling at that moment). Pinning a
+  // min-height on the swap wrapper keeps the document tall through the swap so the
+  // scroll position simply survives. `null` = no reservation active.
+  const swapWrapperRef = useRef<HTMLDivElement | null>(null);
+  const [reservedHeight, setReservedHeight] = useState<number | null>(null);
+
   useEffect(() => {
     const timeout = setTimeout(() => {
       if (yjsConnectionStatus === WebSocketStatus.Connecting || !isSynced) {
@@ -477,9 +487,39 @@ export default function PageEditor({
       isCollabSynced(yjsConnectionStatus, isSynced)
     ) {
       hasConnectedOnceRef.current = true;
+      // Capture the current (static, full-height) content height BEFORE the swap
+      // so the wrapper can reserve it while the live editor lays out — otherwise
+      // the transient shrink clamps window scroll to the top.
+      setReservedHeight(swapWrapperRef.current?.offsetHeight ?? null);
       setShowStatic(false);
     }
   }, [yjsConnectionStatus, isSynced]);
+
+  // Release the reserved height once the live editor's content has laid out to at
+  // least the reserved height (so removing the reservation cannot collapse the
+  // document). The primary release is that height match; the cap is only a
+  // last-resort so we never pin forever. The cap is generous (well past when the
+  // live content normally reaches the reserved height — it renders the SAME
+  // content as the static copy) so a slow load doesn't release mid-render and
+  // reintroduce the collapse. A shorter-than-reserved live doc (rare: stale/longer
+  // cache) releases at the cap, leaving only harmless bottom dead space until then.
+  useEffect(() => {
+    if (showStatic || reservedHeight == null) return;
+    let raf = 0;
+    const startedAt = Date.now();
+    const RELEASE_CAP_MS = 4000;
+    const check = () => {
+      const liveHeight =
+        (menuContainerRef.current as HTMLElement | null)?.scrollHeight ?? 0;
+      if (liveHeight >= reservedHeight || Date.now() - startedAt > RELEASE_CAP_MS) {
+        setReservedHeight(null);
+        return;
+      }
+      raf = requestAnimationFrame(check);
+    };
+    raf = requestAnimationFrame(check);
+    return () => cancelAnimationFrame(raf);
+  }, [showStatic, reservedHeight]);
 
   // Restore the reader's scroll position across the static -> live editor swap.
   // The wiring (early pre-paint restore + post-swap re-assert) lives in the hook
@@ -490,6 +530,12 @@ export default function PageEditor({
     <TransclusionLookupProvider>
       <PageEmbedLookupProvider>
         <PageEmbedAncestryProvider hostPageId={pageId}>
+      <div
+        ref={swapWrapperRef}
+        style={
+          reservedHeight != null ? { minHeight: reservedHeight } : undefined
+        }
+      >
       {showStatic ? (
         <div style={{ position: "relative" }}>
           {/* Surface the pre-sync read-only window so edits typed before the
@@ -577,6 +623,7 @@ export default function PageEditor({
           ></div>
         </div>
       )}
+      </div>
         </PageEmbedAncestryProvider>
       </PageEmbedLookupProvider>
     </TransclusionLookupProvider>
