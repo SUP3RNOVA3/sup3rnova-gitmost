@@ -19,7 +19,7 @@ import { Agent } from 'undici';
 const DEFAULT_STREAM_TIMEOUT_MS = 900_000;
 
 /**
- * Default keep-alive recycle window (10s). A pooled connection idle longer than
+ * Default keep-alive recycle window (4s). A pooled connection idle longer than
  * this is CLOSED rather than reused.
  *
  * Long agent turns leave gaps of tens of seconds between provider calls (one
@@ -30,17 +30,70 @@ const DEFAULT_STREAM_TIMEOUT_MS = 900_000;
  * the resets correlate with idleSincePrevCall ~42s, while a direct path to the
  * provider does NOT reset). Recycling idle sockets well below such a drop window
  * means a long-gap call opens a fresh connection instead of reusing a stale one.
+ * Kept comfortably under common ~5s upstream/middlebox idle cutoffs so undici
+ * recycles the socket before the network kills it, while still long enough to
+ * reuse a connection within a single burst of back-to-back calls (#310).
  * `keepAliveMaxTimeout` also caps a server-advertised keep-alive so the provider
  * cannot push the reuse window back up.
  */
-const DEFAULT_STREAM_KEEPALIVE_MS = 10_000;
+const DEFAULT_STREAM_KEEPALIVE_MS = 4_000;
 
 /**
- * How many times to retry a PRE-RESPONSE connection failure (a reset/timeout
- * before ANY response byte) on a fresh connection. Safe because `fetch()` only
- * rejects before the Response resolves — a started stream is never replayed.
+ * Default number of times to retry a PRE-RESPONSE connection failure (a
+ * reset/timeout before ANY response byte) on a fresh connection. Safe because
+ * `fetch()` only rejects before the Response resolves — a started stream is
+ * never replayed.
+ *
+ * Raised from 2 to 4 (total 5 attempts) so a short BURST of upstream/middlebox
+ * resets is absorbed without exhausting the budget: prod saw 2 of 3 attempts
+ * burned on a single turn, leaving no headroom (#310). Override with
+ * `AI_STREAM_PRE_RESPONSE_RETRIES`.
  */
-const PRE_RESPONSE_CONNECT_RETRIES = 2;
+const DEFAULT_PRE_RESPONSE_CONNECT_RETRIES = 4;
+
+/**
+ * Configured PRE-RESPONSE retry budget. Override with
+ * `AI_STREAM_PRE_RESPONSE_RETRIES`; a missing/invalid/negative value falls back
+ * to {@link DEFAULT_PRE_RESPONSE_CONNECT_RETRIES}. Total attempts = value + 1.
+ * 0 disables the retry (a single attempt).
+ */
+export function preResponseConnectRetries(): number {
+  // Read the raw string first: an empty/whitespace value coerces to 0 via
+  // Number(), which is a VALID setting here (0 = single attempt), so it must be
+  // treated as "unset" rather than "disable the retry".
+  const rawStr = process.env.AI_STREAM_PRE_RESPONSE_RETRIES;
+  if (rawStr === undefined || rawStr.trim() === '') {
+    return DEFAULT_PRE_RESPONSE_CONNECT_RETRIES;
+  }
+  const raw = Number(rawStr);
+  return Number.isFinite(raw) && raw >= 0
+    ? Math.floor(raw)
+    : DEFAULT_PRE_RESPONSE_CONNECT_RETRIES;
+}
+
+/** Base backoff before the first PRE-RESPONSE retry (ms). */
+const PRE_RESPONSE_BACKOFF_BASE_MS = 150;
+
+/** Cap on the exponential backoff window before jitter (ms). */
+const PRE_RESPONSE_BACKOFF_CAP_MS = 2_000;
+
+/**
+ * Backoff (ms) to wait before PRE-RESPONSE retry number `attempt` (0-based).
+ *
+ * Capped exponential with FULL jitter: `delay = random in [0, min(base*2^attempt,
+ * cap)]`. Full jitter spreads concurrent retries across the whole window so a
+ * burst of turns that all reset at once do not reconnect in lock-step and
+ * hammer the upstream in a thundering herd (#310); the exponential growth backs
+ * off harder as resets persist, and the cap keeps the wait bounded.
+ */
+export function preResponseBackoffMs(
+  attempt: number,
+  rand: () => number = Math.random,
+): number {
+  const exp = PRE_RESPONSE_BACKOFF_BASE_MS * 2 ** attempt;
+  const capped = Math.min(exp, PRE_RESPONSE_BACKOFF_CAP_MS);
+  return rand() * capped;
+}
 
 /** undici cause codes for a connection-level failure that occurred PRE-RESPONSE. */
 const RETRYABLE_CONNECT_CODES = new Set([
@@ -177,20 +230,19 @@ export function createStreamingFetch(): typeof fetch {
  */
 export function withPreResponseRetry(baseFetch: typeof fetch): typeof fetch {
   return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const maxRetries = preResponseConnectRetries();
     for (let attempt = 0; ; attempt++) {
       try {
         return await baseFetch(input, init);
       } catch (err) {
         const aborted = init?.signal?.aborted === true;
-        if (
-          aborted ||
-          attempt >= PRE_RESPONSE_CONNECT_RETRIES ||
-          !isRetryableConnectError(err)
-        ) {
+        if (aborted || attempt >= maxRetries || !isRetryableConnectError(err)) {
           throw err;
         }
-        // Brief backoff before the fresh-connection retry.
-        await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)));
+        // Jittered backoff before the fresh-connection retry (anti-thundering-herd).
+        await new Promise((resolve) =>
+          setTimeout(resolve, preResponseBackoffMs(attempt)),
+        );
       }
     }
   }) as typeof fetch;
