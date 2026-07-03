@@ -97,7 +97,7 @@ describe('computePushActions — M (modified)', () => {
     expect(actions.skipped).toEqual([]);
   });
 
-  it('modified file with NO pageId -> skipped (no target to update)', () => {
+  it('modified file with NO pageId in current OR pre-image -> skipped', () => {
     const changes: DiffEntry[] = [{ status: 'M', path: 'Untracked.md' }];
     const actions = computePushActions({ changes, metaAt: metaTable({}) });
     expect(actions.updates).toEqual([]);
@@ -105,9 +105,23 @@ describe('computePushActions — M (modified)', () => {
       {
         path: 'Untracked.md',
         status: 'M',
-        reason: 'modified file has no pageId in meta',
+        reason: 'modified file has no pageId in meta (nor in pre-image)',
       },
     ]);
+  });
+
+  it('modified file that DROPPED its pageId recovers it from the pre-image -> update (bug C10-D1)', () => {
+    // The current file lost its `gitmost_id` frontmatter (a tool rewrote the whole
+    // file), but the last-pushed version at this path still had it. Recover the id
+    // and apply the body edit instead of silently skipping+reverting it.
+    const changes: DiffEntry[] = [{ status: 'M', path: 'Doc.md' }];
+    const metaAt = metaTable({
+      // current side has no pageId; prev (pre-image) side does.
+      'Doc.md|prev': meta({ pageId: 'p-doc' }),
+    });
+    const actions = computePushActions({ changes, metaAt });
+    expect(actions.updates).toEqual([{ pageId: 'p-doc', path: 'Doc.md' }]);
+    expect(actions.skipped).toEqual([]);
   });
 });
 

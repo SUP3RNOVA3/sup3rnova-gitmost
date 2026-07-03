@@ -389,12 +389,25 @@ export function computePushActions(input: PushActionsInput): PushActions {
         } else if (pageId) {
           actions.updates.push({ pageId, path: change.path });
         } else {
-          // A modified file with no pageId has no Docmost target to update.
-          actions.skipped.push({
-            path: change.path,
-            status: "M",
-            reason: "modified file has no pageId in meta",
-          });
+          // The current file has no `gitmost_id` — but it was MODIFIED, so a prior
+          // version existed at this path. Recover the identity from the PRE-IMAGE
+          // (the last-pushed version at the same path, which still carried the id),
+          // mirroring the `D` branch. Without this, an edit that also dropped the
+          // frontmatter (e.g. a tool that rewrote the whole file) is silently
+          // skipped and then reverted by the next Docmost->git push — the edit is
+          // lost (bug C10-D1). The pushed-back re-serialize restores the frontmatter
+          // next cycle, so the file self-heals. If the pre-image ALSO lacked an id
+          // (a page never tracked), there is genuinely nothing to update -> skip.
+          const prevPageId = metaAt(change.path, "prev")?.pageId;
+          if (prevPageId && !ghostMove.has(prevPageId)) {
+            actions.updates.push({ pageId: prevPageId, path: change.path });
+          } else {
+            actions.skipped.push({
+              path: change.path,
+              status: "M",
+              reason: "modified file has no pageId in meta (nor in pre-image)",
+            });
+          }
         }
         break;
       }
