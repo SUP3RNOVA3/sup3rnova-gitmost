@@ -12,15 +12,15 @@ bundles:
       - en
     roles:
       - slug: structural-editor
-        version: 2
+        version: 3
       - slug: line-editor
-        version: 2
+        version: 3
       - slug: fact-checker
-        version: 3
+        version: 4
       - slug: proofreader
-        version: 3
+        version: 4
       - slug: narrator
-        version: 1
+        version: 2
   - id: research
     name:
       ru: Исследование

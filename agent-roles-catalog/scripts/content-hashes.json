@@ -1,26 +1,26 @@
 {
   "fact-checker": {
-    "version": 3,
-    "hash": "a94931fbd20272570a588c72159ac9e48a89c99bd8f718449cda5e7ca4280fdf"
+    "version": 4,
+    "hash": "9160ead04d86aaa5dc7a51dd7e971c272ce0ca97cb24bf2b6ee5779deb1b19c0"
   },
   "line-editor": {
-    "version": 2,
-    "hash": "cca324110dc6f96d2a8a239a2fb95b0ba09fad5806c9b6090a3c210ea7883ceb"
+    "version": 3,
+    "hash": "7f200863080799b08d5af5d1648befa0843cc5db79bb994b07baa5ad12df5123"
   },
   "narrator": {
-    "version": 1,
-    "hash": "36b38785fea6ae1c70bf6fb6b29ae5278bb86e389e61f7b9736675a589fa434c"
+    "version": 2,
+    "hash": "66fe653003b4f63ef3c3a5c5c48552fe47daeefffc16907c37c35f0e8da98851"
   },
   "proofreader": {
-    "version": 3,
-    "hash": "a36047c5cab837b2a727f63d4ddafc269b1fc44b90b365e770ecdb8f77e13952"
+    "version": 4,
+    "hash": "32a0aa68ed13266b02f9d2449999efd7e6af51d73a50090f8b27320372113be4"
   },
   "researcher": {
     "version": 1,
     "hash": "853658fda43ddbe0a4d08f2c6e50b5116d29a2e9ccd7f46e173e65920d8f6ace"
   },
   "structural-editor": {
-    "version": 2,
-    "hash": "83093baa7262aef8193871a1afcf2b43b11a56fe2d00cade41355cf66d972b74"
+    "version": 3,
+    "hash": "f6936e4c152c1b78980e74045658d87743f26f900c12f61fd7a45c6a0ec19425"
   }
 }
