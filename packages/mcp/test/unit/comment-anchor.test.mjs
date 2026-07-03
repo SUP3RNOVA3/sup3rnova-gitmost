@@ -7,6 +7,7 @@ import {
   canAnchorInDoc,
   applyAnchorInDoc,
   countAnchorMatches,
+  getAnchoredText,
 } from "../../build/lib/comment-anchor.js";
 
 const COMMENT_ID = "cmt-123";
@@ -273,4 +274,37 @@ test("countAnchorMatches applies the same normalization as anchoring", () => {
   // Smart quotes in the doc match ASCII quotes in the selection.
   const doc = paragraphDoc([{ type: "text", text: "say “hi” now" }]);
   assert.equal(countAnchorMatches(doc, '"hi"'), 1);
+});
+
+// -----------------------------------------------------------------------------
+// getAnchoredText: returns the RAW document substring the mark would cover (the
+// doc's original typographic characters), not the normalized ASCII selection.
+// This is what makes a suggestion's stored selection equal the apply-time
+// expectedText, so the strict equality in replaceYjsMarkedText holds.
+// -----------------------------------------------------------------------------
+test("getAnchoredText returns the RAW (typographic) doc substring for an ASCII selection", () => {
+  // Doc holds smart quotes; agent selection is the ASCII form.
+  const doc = paragraphDoc([{ type: "text", text: "he said “hello” loudly" }]);
+  assert.equal(getAnchoredText(doc, '"hello"'), "“hello”");
+});
+
+test("getAnchoredText undoes whitespace/dash normalization to the raw span", () => {
+  // Em-dash + nbsp in the doc; ASCII hyphen + single space in the selection.
+  const doc = paragraphDoc([{ type: "text", text: "a—b c" }]);
+  // selection "a-b c" (ascii dash) matches, raw substring keeps the em-dash+nbsp.
+  assert.equal(getAnchoredText(doc, "a-b c"), "a—b c");
+});
+
+test("getAnchoredText spans consecutive text nodes and returns their raw slices", () => {
+  const doc = paragraphDoc([
+    { type: "text", text: "Hello " },
+    { type: "text", text: "“brave”", marks: [{ type: "bold" }] },
+    { type: "text", text: " world" },
+  ]);
+  assert.equal(getAnchoredText(doc, '"brave" wor'), "“brave” wor");
+});
+
+test("getAnchoredText returns null when the selection does not anchor", () => {
+  const doc = paragraphDoc([{ type: "text", text: "hello world" }]);
+  assert.equal(getAnchoredText(doc, "not present"), null);
 });

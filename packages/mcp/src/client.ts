@@ -60,6 +60,7 @@ import {
   applyAnchorInDoc,
   canAnchorInDoc,
   countAnchorMatches,
+  getAnchoredText,
 } from "./lib/comment-anchor.js";
 import {
   blockText,
@@ -2433,6 +2434,17 @@ export class DocmostClient {
       );
     }
 
+    // For a SUGGESTION, the value we store as the comment's `selection` must be
+    // the RAW document substring the mark lands on (typographic quotes/dashes,
+    // nbsp, collapsed whitespace), NOT the agent's ASCII input. The anchor is
+    // placed via normalization, so when the doc was auto-converted to
+    // typographic the raw substring differs from the agent input; apply-time
+    // compares the stored selection to the marked doc text STRICTLY, so storing
+    // the raw substring is what makes "Apply" succeed instead of a spurious 409.
+    // Captured in the pre-check below (which already reads the page) and used as
+    // payload.selection. Ordinary comments keep sending the raw agent selection.
+    let anchoredSelection: string | null = null;
+
     // For a top-level comment, fail BEFORE creating anything when the selection
     // is not present in the persisted document — this avoids leaving an orphan
     // comment + notification behind. A read failure (network) is non-fatal: the
@@ -2459,6 +2471,11 @@ export class DocmostClient {
                 "(still <=250 chars) so it appears exactly once.",
             );
           }
+          // Exactly one match: capture the RAW anchored substring to store as the
+          // comment selection (so apply-time equality holds). If this returns
+          // null despite countAnchorMatches===1 (shouldn't happen), fall back to
+          // the raw agent selection below rather than crash.
+          anchoredSelection = getAnchoredText(page.content, selection);
         } else if (!canAnchorInDoc(page.content, selection)) {
           throw new Error(
             "create_comment: could not find the selection text in the page to anchor the comment. " +
@@ -2496,7 +2513,13 @@ export class DocmostClient {
       content: JSON.stringify(jsonContent),
       type: effectiveType,
     };
-    if (!isReply && selection) payload.selection = selection;
+    // For a suggestion, store the RAW anchored substring (anchoredSelection) so
+    // the stored selection === the text under the mark === apply-time
+    // expectedText. Ordinary comments (and the null fallback) keep the raw
+    // agent selection — their selection is only display/anchor and never used
+    // by apply, so their behavior is unchanged.
+    if (!isReply && selection)
+      payload.selection = anchoredSelection ?? selection;
     if (parentCommentId) payload.parentCommentId = parentCommentId;
     // Only a top-level inline comment (with a selection) may carry a suggestion.
     if (!isReply && selection && hasSuggestion) {

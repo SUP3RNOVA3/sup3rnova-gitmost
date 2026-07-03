@@ -149,6 +149,67 @@ export function findAnchorInBlock(blockContent, selection) {
     return null;
 }
 /**
+ * Reconstruct the RAW text spanned by an AnchorMatch inside one block's
+ * `content` array. `startChild..endChild` are all text nodes (guaranteed by
+ * findAnchorInBlock, which only builds runs of `text` nodes), so concatenate
+ * each node's text slice: from `startOffset` on the first node, up to
+ * `endOffset` on the last, and the whole `.text` for any node fully inside the
+ * range. Mirrors spliceCommentMark's per-node slicing so the string returned
+ * here is EXACTLY the characters the comment mark will cover.
+ */
+function reconstructRawText(blockContent, match) {
+    const { startChild, startOffset, endChild, endOffset } = match;
+    let out = "";
+    for (let k = startChild; k <= endChild; k++) {
+        const n = blockContent[k];
+        const text = typeof n.text === "string" ? n.text : "";
+        const sliceStart = k === startChild ? startOffset : 0;
+        const sliceEnd = k === endChild ? endOffset : text.length;
+        out += text.slice(sliceStart, sliceEnd);
+    }
+    return out;
+}
+/**
+ * Return the RAW document substring that `selection` would anchor to — the exact
+ * characters the comment mark will cover — or `null` when the selection cannot
+ * be anchored anywhere in `doc`.
+ *
+ * This mirrors canAnchorInDoc / applyAnchorInDoc EXACTLY (same depth-first,
+ * document-order traversal and the same findAnchorInBlock match on the FIRST
+ * matching block), but instead of a boolean / an in-place mutation it
+ * reconstructs the raw text spanned by the matched range. Because
+ * findAnchorInBlock maps the normalized selection back to raw text-node
+ * positions, the returned string is the document's ORIGINAL characters (smart
+ * quotes, em-dashes, nbsp, collapsed whitespace) — NOT the normalized ASCII
+ * agent input.
+ *
+ * Callers store THIS as the comment's `selection` so the stored value equals the
+ * text actually under the mark, which is what the apply-suggestion equality
+ * check (replaceYjsMarkedText's `joinedText !== expectedText`) compares against.
+ * Without it a suggestion whose anchor only matched via normalization would be
+ * un-appliable (spurious 409).
+ */
+export function getAnchoredText(doc, selection) {
+    const visit = (node, depth) => {
+        if (depth > MAX_DEPTH || !node || typeof node !== "object")
+            return null;
+        if (!Array.isArray(node.content))
+            return null;
+        const match = findAnchorInBlock(node.content, selection);
+        if (match)
+            return reconstructRawText(node.content, match);
+        for (const child of node.content) {
+            if (child && typeof child === "object" && Array.isArray(child.content)) {
+                const found = visit(child, depth + 1);
+                if (found !== null)
+                    return found;
+            }
+        }
+        return null;
+    };
+    return visit(doc, 0);
+}
+/**
  * Depth-first, document-order check for whether `selection` can be anchored
  * anywhere in `doc`. At each node with an array `content`, first try to match
  * within that node's own content, then recurse into children that themselves

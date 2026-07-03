@@ -87,7 +87,15 @@ export class CommentService {
       }
     }
 
-    const selection = createCommentDto?.selection?.substring(0, 250) ?? null;
+    // Do NOT lossily truncate at 250: for a suggestion the client sends the RAW
+    // anchored document substring (the exact text under the comment mark) as the
+    // selection, which can be LONGER than the agent's <=250-char typed input
+    // (normalization collapses whitespace/typographic runs, so the raw span can
+    // exceed the normalized selection). Truncating it shorter than the mark span
+    // would break the apply-time equality check and make the suggestion
+    // un-appliable. Keep a generous 2000-char safety bound (matching
+    // suggestedText) so a legitimate anchored substring is never cut.
+    const selection = createCommentDto?.selection?.substring(0, 2000) ?? null;
 
     // A suggested edit rewrites the exact text under an inline comment mark, so
     // it is only meaningful on a top-level inline comment that carries a
