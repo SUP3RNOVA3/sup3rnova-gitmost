@@ -5,7 +5,12 @@ import {
   prosemirrorNodeToYElement,
   tiptapExtensions,
 } from './collaboration.util';
-import { setYjsMark, updateYjsMarkAttribute, YjsSelection } from './yjs.util';
+import {
+  replaceYjsMarkedText,
+  setYjsMark,
+  updateYjsMarkAttribute,
+  YjsSelection,
+} from './yjs.util';
 import * as Y from 'yjs';
 import { User } from '@docmost/db/types/entity.types';
 
@@ -73,6 +78,35 @@ export class CollaborationHandler {
           },
         );
       },
+      applyCommentSuggestion: async (
+        documentName: string,
+        payload: {
+          commentId: string;
+          expectedText: string;
+          newText: string;
+          user: User;
+        },
+      ): Promise<{ applied: boolean; currentText: string | null }> => {
+        const { commentId, expectedText, newText, user } = payload;
+        // Run the check-and-replace inside the owning instance's Y transaction so
+        // the delete+insert are atomic. The verdict from replaceYjsMarkedText is
+        // returned to the API-server caller (cross-process via the Redis bridge,
+        // or locally when Redis is disabled — see collaboration.gateway.ts).
+        return this.withYdocConnection(
+          hocuspocus,
+          documentName,
+          { user },
+          (doc) => {
+            const fragment = doc.getXmlFragment('default');
+            return replaceYjsMarkedText(
+              fragment,
+              commentId,
+              expectedText,
+              newText,
+            );
+          },
+        );
+      },
       updatePageContent: async (
         documentName: string,
         payload: {
@@ -115,18 +149,28 @@ export class CollaborationHandler {
     };
   }
 
-  async withYdocConnection(
+  async withYdocConnection<T>(
     hocuspocus: Hocuspocus,
     documentName: string,
     context: any = {},
-    fn: (doc: Document) => void,
-  ): Promise<void> {
+    // `fn` MUST be synchronous: hocuspocus `connection.transact(fn)` runs fn
+    // synchronously and does NOT await it, so any mutations after an `await`
+    // inside fn would execute OUTSIDE the Yjs transaction and lose atomicity.
+    fn: (doc: Document) => T,
+  ): Promise<T> {
     const connection = await hocuspocus.openDirectConnection(
       documentName,
       context,
     );
     try {
-      await connection.transact(fn);
+      // hocuspocus `connection.transact(fn)` invokes fn(document) but does NOT
+      // forward fn's return value, so we capture it in a closure and return it
+      // after the transaction (and its storeDocument hooks) resolve.
+      let result: T;
+      await connection.transact((doc) => {
+        result = fn(doc);
+      });
+      return result!;
     } finally {
       await connection.disconnect();
     }
