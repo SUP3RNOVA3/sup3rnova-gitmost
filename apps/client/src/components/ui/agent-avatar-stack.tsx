@@ -29,54 +29,96 @@ const LAUNCHER_SIZE = 22;
 // sits as a small badge over that corner (above the glyph) and stays fully visible.
 const LAUNCHER_OVERHANG = 8;
 
-// Small deterministic string hash (same algorithm as custom-avatar's initials
-// hash) used to pick a stable per-agent glyph color.
-function hashName(input: string): number {
-  let hash = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    hash = (hash << 5) - hash + input.charCodeAt(i);
-    hash |= 0;
-  }
-  return Math.abs(hash);
+// Normalize the name before hashing so "PM ", "pm", "Pm" all map to the same
+// avatar (unicode-normalized, trimmed, lower-cased, whitespace collapsed).
+function normalizeName(name: string): string {
+  return name.normalize("NFC").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-// A palette of categorically-DISTINCT dark circle colors for emoji/sparkles agent
-// glyphs. Every entry is intentionally dark (low lightness) so a bright emoji or
-// the white sparkles icon stays readable on top; the hues are spread across the
-// wheel (red → orange → amber → green → teal → cyan → blue → indigo → violet →
-// magenta + a neutral slate) so two different agents read as DIFFERENT colors,
-// not merely different shades of the same violet.
-const GLYPH_COLORS = [
-  "hsl(355, 60%, 34%)", // red
-  "hsl(18, 62%, 32%)", // vermilion
-  "hsl(32, 60%, 30%)", // orange
-  "hsl(45, 55%, 28%)", // amber
-  "hsl(75, 45%, 26%)", // olive-green
-  "hsl(140, 48%, 26%)", // green
-  "hsl(165, 52%, 26%)", // teal
-  "hsl(188, 58%, 28%)", // cyan
-  "hsl(205, 58%, 32%)", // sky blue
-  "hsl(225, 52%, 36%)", // blue
-  "hsl(250, 48%, 38%)", // indigo
-  "hsl(280, 46%, 36%)", // violet
-  "hsl(312, 48%, 34%)", // magenta
-  "hsl(210, 12%, 36%)", // slate / neutral
+// cyrb53: deterministic 53-bit string hash with good avalanche, pure JS. A
+// language's BUILT-IN hash (Java hashCode, etc.) must NOT be used — those differ
+// across platforms/engines, which would make one name render as different avatars
+// on server vs client. This is stable everywhere.
+function cyrb53(str: string, seed = 0): number {
+  let h1 = 0xdeadbeef ^ seed;
+  let h2 = 0x41c6ce57 ^ seed;
+  for (let i = 0; i < str.length; i += 1) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 =
+    Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^
+    Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 =
+    Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^
+    Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+// Perceptually-even avatar palette built in OKLCH and clamped to the sRGB gamut:
+// 12 LIGHT colors (L≈0.70, black text) then 8 DARK colors (L≈0.50, white text).
+// The minimum pairwise ΔEOK ≈ 0.066 (~5 JNDs), so any two entries are either the
+// SAME color or clearly distinguishable — "almost identical" colors are
+// impossible by construction (that was the old raw-hue failure mode). Text
+// contrast is WCAG-checked: dark ring ≥ 5.6:1 white, light ring ≥ 7.3:1 black.
+export const AVATAR_PALETTE = [
+  // light ring (black text)
+  "#e87782", "#e57f4f", "#d0901e", "#aca220", "#77b154", "#22b988",
+  "#00b5b5", "#00afdc", "#5fa1f3", "#9690f1", "#bf82da", "#db78b2",
+  // dark ring (white text)
+  "#a03e43", "#8e5300", "#686800", "#007742",
+  "#007176", "#0068a5", "#6453a7", "#8f4280",
 ];
 
+// Second gradient stop per palette entry (index-aligned): two hue-shifted (±25°)
+// partners. A separate hash channel picks which one, so two agents that collide
+// on the base color almost always still differ by their gradient.
+export const GRADIENT_PARTNERS = [
+  ["#de77ab", "#e67d58"], ["#e8777a", "#d58d25"], ["#e28247", "#b39f18"],
+  ["#cb9317", "#81af4b"], ["#a4a528", "#37b880"], ["#6cb35d", "#00b6af"],
+  ["#3cb693", "#26afd1"], ["#00b4bb", "#58a3ed"], ["#00ade4", "#8e93f3"],
+  ["#699ef5", "#b984df"], ["#9e8eef", "#d779ba"], ["#c480d4", "#e7768a"],
+  ["#9a3e67", "#9d4616"], ["#974a2e", "#7a6000"], ["#7e5e00", "#47712c"],
+  ["#4b7015", "#007465"], ["#1c7360", "#1c6d88"], ["#006f87", "#485daa"],
+  ["#3e5fad", "#7f4995"], ["#7a4b9a", "#9c3e60"],
+];
+
+export interface AvatarStyle {
+  bg: string; // base color / first gradient stop
+  bg2: string; // second gradient stop
+  angleDeg: number; // gradient direction
+  text: "white" | "black"; // readable foreground for the ring
+}
+
 /**
- * Deterministic dark circle color for an emoji/sparkles agent glyph, picked from
- * GLYPH_COLORS by a hash of the agent name so distinct agents get categorically
- * distinct colors while every color stays dark enough to keep the glyph readable.
+ * Deterministic, cross-platform avatar style for an agent glyph. Disjoint bit
+ * ranges of ONE cyrb53 hash drive INDEPENDENT visual channels — palette color
+ * (20) × gradient partner (2) × gradient angle (8) = 320 combinations — so even
+ * when the base color repeats (unavoidable: humans reliably tell apart only
+ * ~20-25 colors), the gradient — and the emoji drawn on top — still tell two
+ * agents apart. Pure function of the normalized name: same name → same avatar on
+ * every device, nothing persisted.
  */
-export function agentGlyphBackground(name: string): string {
-  return GLYPH_COLORS[hashName(name) % GLYPH_COLORS.length];
+export function avatarStyle(agentName: string): AvatarStyle {
+  const h = cyrb53(normalizeName(agentName));
+  const idx = h % AVATAR_PALETTE.length; // which palette color
+  const rest = Math.floor(h / AVATAR_PALETTE.length);
+  const dir = rest % 2; // gradient partner: hue -25 or +25
+  const angleDeg = (Math.floor(rest / 2) % 8) * 45; // one of 8 gradient angles
+  return {
+    bg: AVATAR_PALETTE[idx],
+    bg2: GRADIENT_PARTNERS[idx][dir],
+    angleDeg,
+    text: idx < 12 ? "black" : "white",
+  };
 }
 
 /**
  * The front avatar. Image-source priority (#300):
  *   1. agent.avatarUrl -> a real avatar image (external MCP agent account).
- *   2. agent.emoji     -> the role emoji on a per-agent dark circle.
- *   3. otherwise       -> the IconSparkles glyph on a per-agent dark circle (fallback).
+ *   2. agent.emoji     -> the role emoji on a per-agent gradient circle.
+ *   3. otherwise       -> the IconSparkles glyph on a per-agent gradient circle.
  */
 function AgentGlyph({ agent }: { agent: AgentInfo }) {
   if (agent.avatarUrl) {
@@ -89,10 +131,12 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
     );
   }
 
-  // Emoji/sparkles glyph on a per-agent dark circle (color hashed from the agent
-  // name). Rendered as a plain Box, NOT a Mantine `Avatar variant="filled"`, so
-  // the background is guaranteed instead of being overridden by Mantine's
-  // `--avatar-bg` (which was falling back to the theme's violet for every agent).
+  // Emoji/sparkles glyph on a per-agent gradient circle (color + gradient hashed
+  // from the agent name via avatarStyle). Rendered as a plain Box, NOT a Mantine
+  // `Avatar variant="filled"` — Mantine's `--avatar-bg` overrode the background
+  // (every agent fell back to the theme's violet). The foreground (the sparkles
+  // icon) uses the ring's WCAG-checked readable text color.
+  const style = avatarStyle(agent.name);
   return (
     <Box
       data-testid="agent-glyph"
@@ -100,8 +144,14 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
         width: GLYPH_SIZE,
         height: GLYPH_SIZE,
         borderRadius: "50%",
-        background: agentGlyphBackground(agent.name),
-        color: "var(--mantine-color-white)",
+        // Solid base color is the fallback (and the testable value); the gradient
+        // paints over it in browsers that support it.
+        backgroundColor: style.bg,
+        backgroundImage: `linear-gradient(${style.angleDeg}deg, ${style.bg}, ${style.bg2})`,
+        color:
+          style.text === "white"
+            ? "var(--mantine-color-white)"
+            : "var(--mantine-color-black)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",

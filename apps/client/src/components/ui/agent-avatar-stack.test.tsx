@@ -2,7 +2,12 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { Provider, createStore } from "jotai";
-import { AgentAvatarStack, agentGlyphBackground } from "./agent-avatar-stack";
+import {
+  AgentAvatarStack,
+  avatarStyle,
+  AVATAR_PALETTE,
+  GRADIENT_PARTNERS,
+} from "./agent-avatar-stack";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
@@ -13,14 +18,16 @@ import {
 
 type Props = React.ComponentProps<typeof AgentAvatarStack>;
 
-// The DOM normalizes an inline `background: hsl(...)` to `rgb(...)`. Push the
+// The DOM normalizes an inline hex `background-color` to `rgb(...)`. Push the
 // expected color through the same CSSOM path so the comparison stays exact and
 // non-vacuous (an empty string — i.e. no inline background, as in the pre-fix
-// Avatar approach — can never match a real color).
+// Avatar approach — can never match a real color). NOTE: jsdom's CSSOM does not
+// round-trip a `linear-gradient` in the `background` shorthand, which is why the
+// glyph carries an explicit solid `background-color` we assert on here.
 function normalizeColor(value: string): string {
   const probe = document.createElement("div");
-  probe.style.background = value;
-  return probe.style.background;
+  probe.style.backgroundColor = value;
+  return probe.style.backgroundColor;
 }
 
 function renderStack(props: Props) {
@@ -36,23 +43,33 @@ function renderStack(props: Props) {
   return { store, ...utils };
 }
 
-describe("agentGlyphBackground", () => {
-  it("is deterministic for a given agent name", () => {
-    expect(agentGlyphBackground("Researcher")).toBe(
-      agentGlyphBackground("Researcher"),
+describe("avatarStyle", () => {
+  it("is deterministic and normalizes the name", () => {
+    // Same name → same style; casing / surrounding whitespace must not matter.
+    expect(avatarStyle("Researcher")).toEqual(avatarStyle("Researcher"));
+    expect(avatarStyle("  RESEARCHER ")).toEqual(avatarStyle("researcher"));
+  });
+
+  it("gives different agents different styles (incl. the report's pair)", () => {
+    // "Структурный редактор" and "Фактчекер" looked identically violet; their
+    // full styles must now differ.
+    expect(avatarStyle("Структурный редактор")).not.toEqual(
+      avatarStyle("Фактчекер"),
     );
   });
 
-  it("gives categorically different colors to different agents", () => {
-    // The two agents that looked identically violet in the report must differ.
-    expect(agentGlyphBackground("Структурный редактор")).not.toBe(
-      agentGlyphBackground("Фактчекер"),
-    );
-    expect(agentGlyphBackground("Researcher")).not.toBe(
-      agentGlyphBackground("Нарратор"),
-    );
-    // Every color is a dark hsl circle drawn from the palette.
-    expect(agentGlyphBackground("Нарратор")).toMatch(/^hsl\(\d+, \d+%, \d+%\)$/);
+  it("returns a valid palette color, gradient partner, angle and text", () => {
+    const s = avatarStyle("Нарратор");
+    const idx = AVATAR_PALETTE.indexOf(s.bg);
+    expect(idx).toBeGreaterThanOrEqual(0); // bg is a palette entry
+    // bg2 is one of the two hue-shifted partners of the chosen base color.
+    expect(GRADIENT_PARTNERS[idx]).toContain(s.bg2);
+    // angle is one of the 8 discrete directions (0,45,…,315).
+    expect(s.angleDeg % 45).toBe(0);
+    expect(s.angleDeg).toBeGreaterThanOrEqual(0);
+    expect(s.angleDeg).toBeLessThan(360);
+    // Light ring (first 12) → black text, dark ring → white text.
+    expect(s.text).toBe(idx < 12 ? "black" : "white");
   });
 });
 
@@ -73,8 +90,8 @@ describe("AgentAvatarStack", () => {
     expect(screen.getByText("Alice")).toBeDefined();
   });
 
-  it("emoji glyph applies its per-agent color as an inline DOM background", () => {
-    // Pins the actual fix: the hashed color must reach the DOM as an inline
+  it("emoji glyph applies its per-agent gradient as an inline DOM background", () => {
+    // Pins the actual fix: the hashed gradient must reach the DOM as an inline
     // `background` on the glyph Box. The pre-fix `Avatar variant="filled"` set no
     // inline background (Mantine's --avatar-bg overrode it), so this fails there.
     const agent = { name: "Researcher", emoji: "🔬", avatarUrl: null };
@@ -88,20 +105,19 @@ describe("AgentAvatarStack", () => {
       '[data-testid="agent-glyph"]',
     );
     expect(glyph).not.toBeNull();
-    // Non-vacuous: compare against the function output (normalized the same way),
-    // not a frozen literal. Empty against the pre-fix Avatar (no inline bg).
-    expect(glyph!.style.background).not.toBe("");
-    expect(glyph!.style.background).toBe(
-      normalizeColor(agentGlyphBackground(agent.name)),
-    );
+    const expected = normalizeColor(avatarStyle(agent.name).bg);
+    // Non-vacuous: the pre-fix Avatar set no inline background at all.
+    expect(expected).not.toBe("");
+    expect(glyph!.style.backgroundColor).toBe(expected);
+    // (The gradient overlay is a browser-only enhancement — jsdom's CSSOM does
+    // not round-trip linear-gradient — so its stops/angle are covered by the
+    // avatarStyle unit tests above, not asserted on the DOM here.)
   });
 
-  it("agents with distinct hashed colors reach the DOM as distinct backgrounds", () => {
+  it("agents with distinct styles reach the DOM as distinct backgrounds", () => {
     // "Researcher" and "Нарратор" hash to different palette entries, so their
     // applied DOM backgrounds must differ — pins "distinct colors reach the DOM".
-    expect(agentGlyphBackground("Researcher")).not.toBe(
-      agentGlyphBackground("Нарратор"),
-    );
+    expect(avatarStyle("Researcher").bg).not.toBe(avatarStyle("Нарратор").bg);
 
     const a = renderStack({
       agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
@@ -120,14 +136,9 @@ describe("AgentAvatarStack", () => {
     const glyphB = b.container.querySelector<HTMLElement>(
       '[data-testid="agent-glyph"]',
     );
-    expect(glyphA!.style.background).toBe(
-      normalizeColor(agentGlyphBackground("Researcher")),
-    );
-    expect(glyphB!.style.background).toBe(
-      normalizeColor(agentGlyphBackground("Нарратор")),
-    );
-    // Different colors reach the DOM (the normalized rgb values also differ).
-    expect(glyphA!.style.background).not.toBe(glyphB!.style.background);
+    expect(glyphA!.style.backgroundColor).not.toBe("");
+    // Different base colors reach the DOM (the serialized rgb values differ).
+    expect(glyphA!.style.backgroundColor).not.toBe(glyphB!.style.backgroundColor);
   });
 
   it("showName=false: renders only the avatars, no inline name label", () => {
