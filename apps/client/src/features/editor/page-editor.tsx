@@ -79,6 +79,7 @@ import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
+import { useSwapHeightReservation } from "./hooks/use-swap-height-reservation";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
@@ -449,6 +450,22 @@ export default function PageEditor({
   const hasConnectedOnceRef = useRef(false);
   const [showStatic, setShowStatic] = useState(true);
 
+  // Reserved height held across the static -> live editor swap. The live editor
+  // lays out its content over a few frames, so replacing the (full-height) static
+  // copy with it momentarily shrinks the document; the browser then clamps window
+  // scroll to the top, which yanked the reader off their restored reading position
+  // (and threw their scroll to 0 if they were scrolling at that moment). Pinning a
+  // min-height on the swap wrapper keeps the document tall through the swap so the
+  // scroll position simply survives. `null` = no reservation active.
+  const swapWrapperRef = useRef<HTMLDivElement | null>(null);
+  // Reserve/release wiring lives in the hook so its capture trigger and release
+  // guard/cap are directly unit-testable. Capture stays synchronous at the swap
+  // point (see the collab-sync effect below); the hook only owns the release.
+  const { reservedHeight, captureReservation } = useSwapHeightReservation(
+    showStatic,
+    menuContainerRef,
+  );
+
   useEffect(() => {
     const timeout = setTimeout(() => {
       if (yjsConnectionStatus === WebSocketStatus.Connecting || !isSynced) {
@@ -477,6 +494,10 @@ export default function PageEditor({
       isCollabSynced(yjsConnectionStatus, isSynced)
     ) {
       hasConnectedOnceRef.current = true;
+      // Capture the current (static, full-height) content height BEFORE the swap
+      // so the wrapper can reserve it while the live editor lays out — otherwise
+      // the transient shrink clamps window scroll to the top.
+      captureReservation(swapWrapperRef.current?.offsetHeight ?? null);
       setShowStatic(false);
     }
   }, [yjsConnectionStatus, isSynced]);
@@ -490,6 +511,12 @@ export default function PageEditor({
     <TransclusionLookupProvider>
       <PageEmbedLookupProvider>
         <PageEmbedAncestryProvider hostPageId={pageId}>
+      <div
+        ref={swapWrapperRef}
+        style={
+          reservedHeight != null ? { minHeight: reservedHeight } : undefined
+        }
+      >
       {showStatic ? (
         <div style={{ position: "relative" }}>
           {/* Surface the pre-sync read-only window so edits typed before the
@@ -577,6 +604,7 @@ export default function PageEditor({
           ></div>
         </div>
       )}
+      </div>
         </PageEmbedAncestryProvider>
       </PageEmbedLookupProvider>
     </TransclusionLookupProvider>
