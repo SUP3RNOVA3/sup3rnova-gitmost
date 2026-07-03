@@ -40,20 +40,50 @@ function renderItem(comment: IComment) {
   );
 }
 
-describe("CommentListItem — AI badge", () => {
-  it('renders the AI-agent badge when createdSource === "agent"', () => {
-    renderItem(baseComment({ createdSource: "agent", aiChatId: null }));
-    expect(screen.getByText("AI-agent")).toBeDefined();
+describe("CommentListItem — agent avatar stack", () => {
+  it('flips the hierarchy for an agent comment: agent primary, launcher shown once', () => {
+    // Internal-chat shape with DISTINCT names so absence-of-duplication is
+    // assertable: creator is the human "Alice", the acting agent is "Researcher".
+    renderItem(
+      baseComment({
+        creator: { id: "user-1", name: "Alice", avatarUrl: null } as any,
+        createdSource: "agent",
+        aiChatId: "chat-1",
+        agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+        launcher: { name: "Alice", avatarUrl: null },
+      }),
+    );
+    // The AGENT is the primary label (the flipped hierarchy).
+    expect(screen.getByText("Researcher")).toBeDefined();
+    // The human launcher name shows exactly once — it is no longer duplicated as
+    // a separate creator name (that duplication is the bug this fixes).
+    expect(screen.getAllByText("Alice").length).toBe(1);
+  });
+
+  it('external MCP agent comment (no launcher): shows the agent name, no separator', () => {
+    // aiChatId null => external MCP: the agent IS the account, no human behind.
+    renderItem(
+      baseComment({
+        creator: { id: "bot-1", name: "MCP Bot", avatarUrl: null } as any,
+        createdSource: "agent",
+        aiChatId: null,
+        agent: { name: "MCP Bot", avatarUrl: null },
+        launcher: null,
+      }),
+    );
+    expect(screen.getByText("MCP Bot")).toBeDefined();
+    // No launcher => no dimmed "·" separator in the header.
+    expect(screen.queryByText("·")).toBeNull();
+  });
+
+  it('does NOT render the stack for a normal user comment (createdSource "user")', () => {
+    const { container } = renderItem(baseComment({ createdSource: "user" }));
+    // No agent glyph (sparkles) is present for a plain human comment.
+    expect(container.querySelector(".tabler-icon-sparkles")).toBeNull();
     expect(screen.getByText("Service Bot")).toBeDefined();
   });
 
-  it('does NOT render the badge for a normal user comment (createdSource "user")', () => {
-    renderItem(baseComment({ createdSource: "user" }));
-    expect(screen.queryByText("AI-agent")).toBeNull();
-    expect(screen.getByText("Service Bot")).toBeDefined();
-  });
-
-  // The non-clickable (null aiChatId) branch is a property of AiAgentBadge itself
-  // and is covered in ai-agent-badge.test.tsx; this integration suite only needs
-  // the insertion gate (agent → badge, user → no badge) above (#143 review).
+  // The stack's own behaviors (glyph priority, launcher-behind, deep-link click)
+  // are covered directly in agent-avatar-stack.test.tsx; this integration suite
+  // only guards the insertion gate (agent → stack, user → no stack).
 });

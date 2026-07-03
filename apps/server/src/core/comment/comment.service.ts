@@ -207,17 +207,27 @@ export class CommentService {
       false,
     );
 
-    comment.content = commentContent;
-    comment.editedAt = editedAt;
-    comment.updatedAt = editedAt;
+    // Re-fetch the enriched comment before broadcasting, symmetric with
+    // create()/resolveComment(). updateComment() above has already persisted the
+    // new content/timestamps, so this single-row read reflects the edit AND
+    // carries the same {agent,launcher} avatar stack (via includeCreator) as the
+    // other two broadcasts. This deliberately does NOT reuse the caller's
+    // pre-loaded `comment`: relying on the controller happening to load it with
+    // includeCreator:true is exactly the fragile coupling that let the agent
+    // stack silently vanish on edit once already (#300/#304) — a future caller
+    // dropping that flag must not regress the broadcast.
+    const updatedComment = await this.commentRepo.findById(comment.id, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
 
     this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
       operation: 'commentUpdated',
       pageId: comment.pageId,
-      comment,
+      comment: updatedComment,
     });
 
-    return comment;
+    return updatedComment;
   }
 
   async resolveComment(
