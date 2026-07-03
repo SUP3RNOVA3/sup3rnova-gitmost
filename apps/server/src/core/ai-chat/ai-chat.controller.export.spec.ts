@@ -56,6 +56,7 @@ describe('AiChatController.export', () => {
       aiChatRepo as never,
       aiChatMessageRepo as never,
       {} as never,
+      {} as never,
     );
     return { controller, aiChatRepo, aiChatMessageRepo };
   }
