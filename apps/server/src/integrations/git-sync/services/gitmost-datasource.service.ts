@@ -1,5 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
+import { validate as isValidUUID } from 'uuid';
 import type {
   GitSyncClient,
   GitSyncPageNodeLite,
@@ -121,8 +122,14 @@ export class GitmostDataSourceService {
    * that throw as a per-cycle failure that NEVER clears — refs never advance, so
    * the WHOLE space's sync loops on the same failure indefinitely (bug C9-D1).
    * Swallow exactly that error as an inert no-op so the cycle succeeds and the rest
-   * of the space keeps syncing; re-throw anything else. `pageId` is the only
-   * user-influenced uuid in these ops, so a 22P02 here unambiguously means it.
+   * of the space keeps syncing; re-throw anything else. NOTE: `pageId` is NOT the
+   * only user-influenced uuid in these ops — `movePage` (and `createPage`) also
+   * carry a `parentPageId`, sourced from the PARENT folder-note's `gitmost_id`
+   * frontmatter. So a 22P02 caught here can originate from a malformed PARENT id,
+   * not the child `pageId`; the log message is therefore op-generic and does not
+   * attribute the bad id to a specific field. (createPage/movePage additionally
+   * COERCE a malformed `parentPageId` to root up-front — see those methods — so
+   * that variant self-heals and never reaches this catch.)
    */
   private async skipIfMalformedId<T>(
     op: string,
@@ -136,7 +143,7 @@ export class GitmostDataSourceService {
     } catch (err) {
       if ((err as { code?: string })?.code === '22P02') {
         this.logger.warn(
-          `git-sync[${ctx.spaceId ?? '-'}] skip ${op} of page '${pageId}': malformed (non-UUID) gitmost_id ignored (no wedge)`,
+          `git-sync[${ctx.spaceId ?? '-'}] skip ${op}: malformed (non-UUID) id reached a uuid predicate; ignored (no wedge)`,
         );
         return fallback;
       }
@@ -359,6 +366,26 @@ export class GitmostDataSourceService {
     spaceId: string,
     parentPageId?: string,
   ): Promise<{ data: { id: string }; updatedAt?: string }> {
+    // F1 self-heal (bug C9-D1, parent-id variant). `parentPageId` is a SECOND
+    // user-influenced uuid: the push planner derives it from the parent
+    // folder-note's `gitmost_id` frontmatter (resolveParentPageIdViaTree). A
+    // broken/hand-edited non-UUID value flows into pageService.create, whose
+    // findById(parentPageId) falls back to a slugId lookup (no row) and throws
+    // NotFoundException — a throw that lands in the push `failures` set. The
+    // wedge-gate only advances refs when failures is empty, so the WHOLE space
+    // loops forever re-attempting (same failure mode as the self-id C9-D1 bug,
+    // inside the same threat model). Do NOT skip the create (that would DROP the
+    // page); instead COERCE a malformed parent to root (undefined) so the page is
+    // created at the space root and self-heals, never wedging. Reuses the shared
+    // `uuid` validator — the same check pageRepo.findById uses to tell an id from
+    // a slugId — so a VALID parentPageId is left untouched.
+    if (parentPageId && !isValidUUID(parentPageId)) {
+      this.logger.warn(
+        `git-sync[${ctx.spaceId ?? '-'}] createPage: malformed (non-UUID) parentPageId '${parentPageId}' coerced to root (self-heal; no wedge)`,
+      );
+      parentPageId = undefined;
+    }
+
     const page = await this.pageService.create(
       ctx.userId,
       ctx.workspaceId,
@@ -428,6 +455,24 @@ export class GitmostDataSourceService {
     const page = await this.pageRepo.findById(pageId);
     if (!page) {
       throw new NotFoundException(`Page ${pageId} not found`);
+    }
+
+    // F1 self-heal (parent-id variant), mirror of createPage. `parentPageId` is a
+    // second user-influenced uuid (the DESTINATION parent folder-note's
+    // `gitmost_id`). A malformed value reaches `computeMovePosition`'s raw
+    // `where('parentPageId','=',parentPageId)` uuid predicate (22P02 — swallowed
+    // by skipIfMalformedId but MIS-attributed to the child `pageId`) when no
+    // position is supplied; and when a position IS supplied it reaches
+    // pageService.movePage's findById(parentPageId) -> NotFoundException, which is
+    // NOT a 22P02 and so is NOT caught by skipIfMalformedId -> the space wedges.
+    // Coerce a malformed parent to root (null) so the page becomes a root page
+    // (self-heal) rather than wedging or being silently swallowed. Same shared
+    // `uuid` validator as createPage; a valid parent is left untouched.
+    if (parentPageId && !isValidUUID(parentPageId)) {
+      this.logger.warn(
+        `git-sync[${ctx.spaceId ?? '-'}] movePage: malformed (non-UUID) parentPageId '${parentPageId}' coerced to root (self-heal; no wedge)`,
+      );
+      parentPageId = null;
     }
 
     // GS-MOVE-ECHO guard (review #6). A drag-move in Docmost echoes back through

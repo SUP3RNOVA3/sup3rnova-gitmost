@@ -138,6 +138,10 @@ const CTX = { workspaceId: 'ws-1', userId: 'svc-user' };
 // A bound context that carries the reconciling spaceId, enabling deletePage's
 // cross-space MOVE guard (the `if (ctx.spaceId)` branch).
 const CTX_SPACE = { ...CTX, spaceId: 'space-1' };
+// A syntactically VALID parent uuid. createPage/movePage now coerce a malformed
+// (non-UUID) parentPageId to root (F1), so tests exercising the normal
+// pass-through parent path must use a real uuid, not an arbitrary token.
+const PARENT_UUID = '11111111-1111-4111-8111-111111111111';
 
 describe('GitmostDataSourceService', () => {
   describe('listSpaceTree', () => {
@@ -468,12 +472,12 @@ describe('GitmostDataSourceService', () => {
 
       const res = await service
         .bind(CTX)
-        .createPage('Title', 'body md', 'space-1', 'parent-1');
+        .createPage('Title', 'body md', 'space-1', PARENT_UUID);
 
       expect(mocks.pageService.create).toHaveBeenCalledWith(
         'svc-user',
         'ws-1',
-        { spaceId: 'space-1', title: 'Title', parentPageId: 'parent-1' },
+        { spaceId: 'space-1', title: 'Title', parentPageId: PARENT_UUID },
         { actor: 'git-sync', aiChatId: null },
       );
       expect(mocks.collabGateway.writePageBody).toHaveBeenCalledWith(
@@ -498,6 +502,67 @@ describe('GitmostDataSourceService', () => {
         .createPage('Title', 'body md', 'space-1');
 
       expect(res).toEqual({ data: { id: 'new-id' }, updatedAt: undefined });
+    });
+
+    // F1 (bug C9-D1, parent-id variant): a parent folder-note carrying a broken
+    // non-UUID `gitmost_id` makes the push planner hand createPage a malformed
+    // parentPageId. Left as-is it flows into pageService.create -> findById
+    // (slugId fallback -> no row) -> NotFoundException, a throw that never clears
+    // the push `failures` set, so the WHOLE space wedges forever. The fix COERCES
+    // the malformed parent to root (undefined) so the page is created at the space
+    // root (self-heal) instead of being dropped — and never wedges.
+    //
+    // NON-VACUITY: the mocked pageService.create asserts it received
+    // `parentPageId: undefined`. Against the UNcoerced createPage the malformed
+    // string would flow straight through and this assertion would fail (create
+    // would be called with parentPageId:'[unclosed-broken-id'), so the test
+    // genuinely exercises the coercion.
+    it('coerces a malformed (non-UUID) parentPageId to root and does NOT wedge (F1)', async () => {
+      const { service, mocks } = build();
+      mocks.pageService.create.mockResolvedValue({ id: 'new-id' });
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'new-id',
+        updatedAt: new Date('2026-06-20T12:00:00.000Z'),
+      });
+
+      const res = await service
+        .bind(CTX)
+        .createPage('Title', 'body md', 'space-1', '[unclosed-broken-id');
+
+      // No throw propagated to `failures`; create ran with the parent coerced to
+      // root (undefined), NOT the malformed string — so create's findById /
+      // nextPagePosition never see a non-uuid and cannot 22P02 / NotFound.
+      expect(mocks.pageService.create).toHaveBeenCalledWith(
+        'svc-user',
+        'ws-1',
+        { spaceId: 'space-1', title: 'Title', parentPageId: undefined },
+        { actor: 'git-sync', aiChatId: null },
+      );
+      expect(res).toEqual({
+        data: { id: 'new-id' },
+        updatedAt: '2026-06-20T12:00:00.000Z',
+      });
+    });
+
+    it('leaves a VALID uuid parentPageId unchanged (only a malformed parent is coerced)', async () => {
+      const { service, mocks } = build();
+      mocks.pageService.create.mockResolvedValue({ id: 'new-id' });
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'new-id',
+        updatedAt: new Date('2026-06-20T12:00:00.000Z'),
+      });
+
+      await service
+        .bind(CTX)
+        .createPage('Title', 'body md', 'space-1', PARENT_UUID);
+
+      // A real uuid passes the isValidUUID check and is forwarded untouched.
+      expect(mocks.pageService.create).toHaveBeenCalledWith(
+        'svc-user',
+        'ws-1',
+        { spaceId: 'space-1', title: 'Title', parentPageId: PARENT_UUID },
+        { actor: 'git-sync', aiChatId: null },
+      );
     });
   });
 
@@ -599,13 +664,13 @@ describe('GitmostDataSourceService', () => {
         spaceId: 'space-1',
       });
 
-      await service.bind(CTX).movePage('p1', 'parent-1');
+      await service.bind(CTX).movePage('p1', PARENT_UUID);
 
       expect(mocks.pageService.movePage).toHaveBeenCalledTimes(1);
       const [dto, page, provenance, actorUserId] =
         mocks.pageService.movePage.mock.calls[0];
       expect(dto.pageId).toBe('p1');
-      expect(dto.parentPageId).toBe('parent-1');
+      expect(dto.parentPageId).toBe(PARENT_UUID);
       expect(typeof dto.position).toBe('string');
       expect(dto.position.length).toBeGreaterThan(0);
       expect(page).toEqual({ id: 'p1', spaceId: 'space-1' });
@@ -636,6 +701,37 @@ describe('GitmostDataSourceService', () => {
         service.bind(CTX).movePage('gone', 'parent-1'),
       ).rejects.toThrow(/not found/i);
       expect(mocks.pageService.movePage).not.toHaveBeenCalled();
+    });
+
+    // F1 (parent-id variant), mirror of the createPage case. A malformed
+    // (non-UUID) destination parentPageId would reach computeMovePosition's raw
+    // uuid predicate (22P02, swallowed but mis-logged) or — when a position is
+    // supplied — pageService.movePage's findById -> NotFoundException (NOT a
+    // 22P02, so NOT swallowed -> the space wedges). The fix coerces it to root
+    // (null) so the reparent targets root instead of wedging. The page here has a
+    // current parent, so coerced-root != current parent and the echo-guard does
+    // not short-circuit — the move proceeds against a null (root) parent.
+    //
+    // NON-VACUITY: the assertion is `dto.parentPageId === null`. Against the
+    // UNcoerced movePage the malformed string would flow through to
+    // pageService.movePage's dto and this would fail (it would be the raw
+    // '[broken-parent' token).
+    it('coerces a malformed (non-UUID) parentPageId to root and does NOT wedge (F1)', async () => {
+      const { service, mocks } = build([]); // no siblings -> fresh position key
+      mocks.pageRepo.findById.mockResolvedValue({
+        id: 'p1',
+        spaceId: 'space-1',
+        parentPageId: '22222222-2222-4222-8222-222222222222',
+      });
+
+      await service.bind(CTX).movePage('p1', '[broken-parent');
+
+      expect(mocks.pageService.movePage).toHaveBeenCalledTimes(1);
+      const [dto] = mocks.pageService.movePage.mock.calls[0];
+      expect(dto.pageId).toBe('p1');
+      // Coerced to root: the malformed parent never reaches the uuid predicate.
+      expect(dto.parentPageId).toBeNull();
+      expect(typeof dto.position).toBe('string');
     });
   });
 
