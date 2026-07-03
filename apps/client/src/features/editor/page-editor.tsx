@@ -79,6 +79,7 @@ import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
+import { useSwapHeightReservation } from "./hooks/use-swap-height-reservation";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
@@ -457,7 +458,13 @@ export default function PageEditor({
   // min-height on the swap wrapper keeps the document tall through the swap so the
   // scroll position simply survives. `null` = no reservation active.
   const swapWrapperRef = useRef<HTMLDivElement | null>(null);
-  const [reservedHeight, setReservedHeight] = useState<number | null>(null);
+  // Reserve/release wiring lives in the hook so its capture trigger and release
+  // guard/cap are directly unit-testable. Capture stays synchronous at the swap
+  // point (see the collab-sync effect below); the hook only owns the release.
+  const { reservedHeight, captureReservation } = useSwapHeightReservation(
+    showStatic,
+    menuContainerRef,
+  );
 
   useEffect(() => {
     const timeout = setTimeout(() => {
@@ -490,36 +497,10 @@ export default function PageEditor({
       // Capture the current (static, full-height) content height BEFORE the swap
       // so the wrapper can reserve it while the live editor lays out — otherwise
       // the transient shrink clamps window scroll to the top.
-      setReservedHeight(swapWrapperRef.current?.offsetHeight ?? null);
+      captureReservation(swapWrapperRef.current?.offsetHeight ?? null);
       setShowStatic(false);
     }
   }, [yjsConnectionStatus, isSynced]);
-
-  // Release the reserved height once the live editor's content has laid out to at
-  // least the reserved height (so removing the reservation cannot collapse the
-  // document). The primary release is that height match; the cap is only a
-  // last-resort so we never pin forever. The cap is generous (well past when the
-  // live content normally reaches the reserved height — it renders the SAME
-  // content as the static copy) so a slow load doesn't release mid-render and
-  // reintroduce the collapse. A shorter-than-reserved live doc (rare: stale/longer
-  // cache) releases at the cap, leaving only harmless bottom dead space until then.
-  useEffect(() => {
-    if (showStatic || reservedHeight == null) return;
-    let raf = 0;
-    const startedAt = Date.now();
-    const RELEASE_CAP_MS = 4000;
-    const check = () => {
-      const liveHeight =
-        (menuContainerRef.current as HTMLElement | null)?.scrollHeight ?? 0;
-      if (liveHeight >= reservedHeight || Date.now() - startedAt > RELEASE_CAP_MS) {
-        setReservedHeight(null);
-        return;
-      }
-      raf = requestAnimationFrame(check);
-    };
-    raf = requestAnimationFrame(check);
-    return () => cancelAnimationFrame(raf);
-  }, [showStatic, reservedHeight]);
 
   // Restore the reader's scroll position across the static -> live editor swap.
   // The wiring (early pre-paint restore + post-swap re-assert) lives in the hook
