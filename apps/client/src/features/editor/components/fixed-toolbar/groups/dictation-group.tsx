@@ -83,7 +83,7 @@ export const DictationGroup: FC<Props> = ({ editor, color, iconSize }) => {
       streaming={streamingDictation}
       onStart={handleStart}
       onText={handleText}
-      disabled={!editor.isEditable}
+      disabled={!dictationAvailability.isEditable}
       unavailableReason={dictationAvailability.reason ?? undefined}
       color={color}
       iconSize={iconSize}

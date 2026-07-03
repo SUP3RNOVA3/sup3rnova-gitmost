@@ -36,7 +36,6 @@ import {
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
-import type { DictationUnavailableReason } from "@/features/dictation/dictation-status";
 import { asideStateAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom";
 import {
   activeCommentIdAtom,
@@ -90,6 +89,7 @@ import { PageEmbedAncestryProvider } from "@/features/editor/components/page-emb
 import PageEmbedPicker from "@/features/editor/components/page-embed/page-embed-picker";
 import { useTranslation } from "react-i18next";
 import {
+  computeDictationAvailability,
   isBodyEditable,
   isCollabSynced,
 } from "@/features/editor/editor-sync-state";
@@ -495,22 +495,14 @@ export default function PageEditor({
   // the mic button surfaces. Recomputed on the same signals that drive body
   // editability so the tooltip never lies about the current state.
   useEffect(() => {
-    const inEditMode = currentPageEditMode === PageEditMode.Edit;
-    const isEditable = editable && inEditMode && !showStatic; // mirrors editor.isEditable
-    let reason: DictationUnavailableReason | null = null;
-    if (!isEditable) {
-      if (editable && inEditMode && showStatic) {
-        // Permitted to edit and in edit mode, but the collab doc hasn't synced yet.
-        reason =
-          yjsConnectionStatus === WebSocketStatus.Disconnected
-            ? "offline"
-            : "connecting";
-      } else {
-        // No edit permission or not in edit mode.
-        reason = "read-only";
-      }
-    }
-    setDictationAvailability({ isEditable, reason });
+    setDictationAvailability(
+      computeDictationAvailability({
+        editable,
+        inEditMode: currentPageEditMode === PageEditMode.Edit,
+        showStatic,
+        isDisconnected: yjsConnectionStatus === WebSocketStatus.Disconnected,
+      }),
+    );
   }, [
     editable,
     currentPageEditMode,
