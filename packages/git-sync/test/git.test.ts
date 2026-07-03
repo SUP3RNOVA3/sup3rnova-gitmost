@@ -141,6 +141,31 @@ describe('VaultGit (integration; temp repo)', () => {
     expect(count.trim()).toBe('1');
   });
 
+  it('clearStaleGitLocks removes a leftover index.lock so git ops work again (bug D3-N3)', async () => {
+    if (!available) return;
+    const vault = await freshDir();
+    const git = new VaultGit(vault);
+    await git.ensureRepo();
+
+    // Simulate an interrupted git op: a stale index.lock left behind. Git now
+    // refuses index-touching operations.
+    await writeFile(join(vault, '.git', 'index.lock'), '');
+    await expect(
+      execFileAsync('git', ['add', '-A'], { cwd: vault }),
+    ).rejects.toThrow(/index\.lock/);
+
+    // The preflight clears it (the daemon is the vault's sole writer, so it is stale).
+    await git.clearStaleGitLocks();
+
+    // The lock is gone and git ops succeed again.
+    await expect(
+      execFileAsync('git', ['add', '-A'], { cwd: vault }),
+    ).resolves.toBeDefined();
+
+    // Idempotent / safe when no lock exists.
+    await expect(git.clearStaleGitLocks()).resolves.toBeUndefined();
+  });
+
   it('ensureRepo neutralizes correctness-affecting LOCAL config', async () => {
     if (!available) return;
     const vault = await freshDir();

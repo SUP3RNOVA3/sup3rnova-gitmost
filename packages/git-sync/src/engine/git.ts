@@ -19,7 +19,7 @@
  *   - "nothing to commit" is treated as a graceful no-op, not an error.
  */
 import { execFile } from "node:child_process";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -322,6 +322,38 @@ export class VaultGit {
    * failure deep inside `checkout`. This is what makes re-runs converge
    * (resumability, SPEC §12).
    */
+  /**
+   * Remove STALE git lock files left by an INTERRUPTED git operation (a hard
+   * crash / OOM-kill / abrupt container stop mid `git add`/`commit`/`checkout`
+   * leaves `.git/index.lock`; interrupted ref updates leave `*.lock` files). Git
+   * then refuses EVERY subsequent operation ("Unable to create '…/index.lock':
+   * File exists"), which WEDGES the space's sync loop indefinitely with no
+   * self-heal (bug D3-N3). The daemon holds the per-space Redis lock and is the
+   * vault's ONLY writer, so any leftover `*.lock` reaching a fresh cycle is
+   * necessarily stale (no live git process holds it) — clear them best-effort in
+   * the cycle preflight, alongside the mid-merge recovery. Missing files are a
+   * no-op (`force: true`).
+   */
+  async clearStaleGitLocks(): Promise<void> {
+    const gitDir = `${this.vaultPath}/.git`;
+    const locks = [
+      "index.lock",
+      "HEAD.lock",
+      "config.lock",
+      "packed-refs.lock",
+      "MERGE_HEAD.lock",
+      "ORIG_HEAD.lock",
+      "refs/heads/main.lock",
+      "refs/heads/docmost.lock",
+      "refs/docmost/last-pushed.lock",
+    ];
+    await Promise.all(
+      locks.map((rel) =>
+        rm(`${gitDir}/${rel}`, { force: true }).catch(() => undefined),
+      ),
+    );
+  }
+
   async isMergeInProgress(): Promise<boolean> {
     // MERGE_HEAD exists exactly while a merge is in progress.
     const mergeHead = await this.runRaw([

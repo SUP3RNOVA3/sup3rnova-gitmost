@@ -116,6 +116,15 @@ export async function runCycle(deps: RunCycleDeps): Promise<RunCycleResult> {
   await vault.assertGitAvailable();
   await vault.ensureRepo();
 
+  // 1b. CLEAR stale git lock files left by an interrupted git op (bug D3-N3). A
+  //     hard crash / OOM-kill / abrupt container stop mid `git add`/`commit`/
+  //     `checkout` leaves a `.git/index.lock` (or a ref `*.lock`); git then refuses
+  //     every later op ("Unable to create '…/index.lock': File exists"), wedging the
+  //     space forever with no self-heal. The daemon holds the per-space Redis lock
+  //     and is the vault's only writer, so any leftover lock here is stale — remove
+  //     it before the merge check + any checkout/diff below.
+  await vault.clearStaleGitLocks();
+
   // 2. RECOVER from a vault left mid-merge by a PRIOR cycle (SPEC §9 wedge fix).
   //    A leftover merge used to WEDGE THE WHOLE SPACE: this check returned
   //    `skipped: "merge-in-progress"` so EVERY later cycle skipped the entire

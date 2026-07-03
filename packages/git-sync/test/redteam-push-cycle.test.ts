@@ -40,6 +40,7 @@ function makePushGit(opts: {
   const git: PushDeps['git'] = {
     assertGitAvailable: vi.fn(async () => {}),
     ensureRepo: vi.fn(async () => {}),
+    clearStaleGitLocks: vi.fn(async () => {}),
     isMergeInProgress: vi.fn(async () => false), // NO merge in progress
     checkout: vi.fn(async () => {}),
     stageAll: vi.fn(async () => {}),
@@ -342,6 +343,7 @@ function fakeVault(overrides: Record<string, any> = {}) {
     order,
     assertGitAvailable: rec('assertGitAvailable'),
     ensureRepo: rec('ensureRepo'),
+    clearStaleGitLocks: rec('clearStaleGitLocks'),
     isMergeInProgress: vi.fn(async () => false),
     ensureBranch: rec('ensureBranch'),
     checkout: rec('checkout'),

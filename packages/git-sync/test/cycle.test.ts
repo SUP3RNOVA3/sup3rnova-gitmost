@@ -16,6 +16,7 @@ function fakeVault(overrides: Record<string, any> = {}) {
     order,
     assertGitAvailable: rec("assertGitAvailable"),
     ensureRepo: rec("ensureRepo"),
+    clearStaleGitLocks: rec("clearStaleGitLocks"),
     isMergeInProgress: vi.fn(async () => false),
     ensureBranch: rec("ensureBranch"),
     checkout: rec("checkout"),
