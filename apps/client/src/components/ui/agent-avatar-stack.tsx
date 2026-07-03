@@ -54,8 +54,8 @@ export function agentGlyphBackground(name: string): string {
 /**
  * The front avatar. Image-source priority (#300):
  *   1. agent.avatarUrl -> a real avatar image (external MCP agent account).
- *   2. agent.emoji     -> the role emoji on a violet circle.
- *   3. otherwise       -> the IconSparkles glyph on a violet circle (fallback).
+ *   2. agent.emoji     -> the role emoji on a per-agent dark circle.
+ *   3. otherwise       -> the IconSparkles glyph on a per-agent dark circle (fallback).
  */
 function AgentGlyph({ agent }: { agent: AgentInfo }) {
   if (agent.avatarUrl) {
