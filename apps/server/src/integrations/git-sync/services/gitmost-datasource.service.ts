@@ -78,19 +78,70 @@ export class GitmostDataSourceService {
       listSpaceTree: (spaceId, rootPageId) =>
         this.listSpaceTree(ctx, spaceId, rootPageId),
       getPageJson: (pageId) => this.getPageJson(ctx, pageId),
+      // The id-scoped WRITE ops are wrapped so a malformed (non-UUID) `pageId`
+      // from a broken vault `gitmost_id` frontmatter cannot wedge the space's sync
+      // loop (bug C9-D1) — see `skipIfMalformedId`.
       importPageMarkdown: (pageId, fullMarkdown, baseMarkdown) =>
-        this.importPageMarkdown(ctx, pageId, fullMarkdown, baseMarkdown),
+        this.skipIfMalformedId(
+          'import',
+          pageId,
+          ctx,
+          () => this.importPageMarkdown(ctx, pageId, fullMarkdown, baseMarkdown),
+          {},
+        ),
       createPage: (title, content, spaceId, parentPageId) =>
         this.createPage(ctx, title, content, spaceId, parentPageId),
-      deletePage: (pageId) => this.deletePage(ctx, pageId),
+      deletePage: (pageId) =>
+        this.skipIfMalformedId('delete', pageId, ctx, () =>
+          this.deletePage(ctx, pageId),
+        ),
       movePage: (pageId, parentPageId, position) =>
-        this.movePage(ctx, pageId, parentPageId, position),
-      renamePage: (pageId, title) => this.renamePage(ctx, pageId, title),
+        this.skipIfMalformedId('move', pageId, ctx, () =>
+          this.movePage(ctx, pageId, parentPageId, position),
+        ),
+      renamePage: (pageId, title) =>
+        this.skipIfMalformedId('rename', pageId, ctx, () =>
+          this.renamePage(ctx, pageId, title),
+        ),
       listRecentSince: (spaceId, sinceIso, hardPageCap) =>
         this.listRecentSince(spaceId, sinceIso, hardPageCap),
       listTrash: (spaceId) => this.listTrash(spaceId),
-      restorePage: (pageId) => this.restorePage(ctx, pageId),
+      restorePage: (pageId) =>
+        this.skipIfMalformedId('restore', pageId, ctx, () =>
+          this.restorePage(ctx, pageId),
+        ),
     };
+  }
+
+  /**
+   * Run an id-scoped write op; if `pageId` was a malformed NON-UUID token (a
+   * broken/hand-edited vault `gitmost_id`, e.g. `gitmost_id: [unclosed`), Postgres
+   * rejects it at the `uuid` predicate with error code `22P02`
+   * ("invalid input syntax for type uuid"). Left unhandled, the push apply records
+   * that throw as a per-cycle failure that NEVER clears — refs never advance, so
+   * the WHOLE space's sync loops on the same failure indefinitely (bug C9-D1).
+   * Swallow exactly that error as an inert no-op so the cycle succeeds and the rest
+   * of the space keeps syncing; re-throw anything else. `pageId` is the only
+   * user-influenced uuid in these ops, so a 22P02 here unambiguously means it.
+   */
+  private async skipIfMalformedId<T>(
+    op: string,
+    pageId: string,
+    ctx: GitSyncBindContext,
+    run: () => Promise<T>,
+    fallback?: T,
+  ): Promise<T | undefined> {
+    try {
+      return await run();
+    } catch (err) {
+      if ((err as { code?: string })?.code === '22P02') {
+        this.logger.warn(
+          `git-sync[${ctx.spaceId ?? '-'}] skip ${op} of page '${pageId}': malformed (non-UUID) gitmost_id ignored (no wedge)`,
+        );
+        return fallback;
+      }
+      throw err;
+    }
   }
 
   // --- reads (pull) ---------------------------------------------------------

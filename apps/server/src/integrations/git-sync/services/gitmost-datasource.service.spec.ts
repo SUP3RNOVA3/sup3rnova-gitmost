@@ -418,6 +418,45 @@ describe('GitmostDataSourceService', () => {
     });
   });
 
+  // Bug C9-D1: a vault file with a malformed (non-UUID) `gitmost_id` frontmatter
+  // makes the id reach a Postgres `uuid` predicate, which throws error code
+  // '22P02'. Left unhandled the push apply records it as a per-cycle failure that
+  // never clears -> the whole space's sync loops forever. The bind() seam wraps the
+  // id-scoped writes so exactly that error is swallowed as an inert no-op.
+  describe('malformed-id guard (bug C9-D1: non-UUID gitmost_id must not wedge sync)', () => {
+    const pgInvalidUuid = Object.assign(
+      new Error('invalid input syntax for type uuid: "not-a-uuid"'),
+      { code: '22P02' },
+    );
+
+    it('importPageMarkdown swallows a 22P02 and does NOT write the body', async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockRejectedValue(pgInvalidUuid);
+      const res = await service
+        .bind(CTX)
+        .importPageMarkdown('not-a-uuid', '# x');
+      expect(res).toEqual({}); // inert no-op, no throw
+      expect(mocks.collabGateway.writePageBody).not.toHaveBeenCalled();
+    });
+
+    it('deletePage swallows the 22P02 thrown by the uuid predicate (no wedge)', async () => {
+      const { service, mocks } = build();
+      // The malformed id reaches removePage's `uuid` predicate, which throws 22P02.
+      mocks.pageService.removePage.mockRejectedValue(pgInvalidUuid);
+      await expect(
+        service.bind(CTX).deletePage('not-a-uuid'),
+      ).resolves.toBeUndefined();
+    });
+
+    it('re-throws a NON-22P02 error (does not mask real failures)', async () => {
+      const { service, mocks } = build();
+      mocks.pageRepo.findById.mockRejectedValue(new Error('db down'));
+      await expect(
+        service.bind(CTX).importPageMarkdown('not-a-uuid', '# x'),
+      ).rejects.toThrow('db down');
+    });
+  });
+
   describe('createPage', () => {
     it('creates the shell with git-sync provenance, writes body, returns id', async () => {
       const { service, mocks } = build();
