@@ -1,5 +1,8 @@
 import { encodeHtmlEmbedSource } from "./docmost-schema.js";
-import { attachedCommentFor } from "./attached-comment.js";
+import {
+  attachedCommentFor,
+  standaloneCommentFor,
+} from "./attached-comment.js";
 
 /**
  * Hard cap on processNode recursion depth (see the depth guard below).
@@ -722,22 +725,25 @@ export function convertProseMirrorToMarkdown(content: any): string {
       }
 
       case "pageBreak":
-        // Emit the schema-matching div[data-type="pageBreak"] so marked passes
-        // it through as a block and generateJSON rebuilds the pageBreak atom.
-        // Without this case the node fell through to `default` and rendered ""
-        // (the divider silently disappeared and could not round-trip).
-        return `<div data-type="pageBreak"></div>`;
+        // #293 canon #5: a pageBreak is a STANDALONE machinery comment on its
+        // own line — `<!--pagebreak-->` — which is invisible in any markdown
+        // renderer yet round-trips (the importer materializes it back into the
+        // pageBreak atom; see markdown-to-prosemirror's applyCommentDirectives).
+        // This keeps the markdown readable instead of leaking a raw <div>. The
+        // schema div-form is still emitted on the raw-HTML path (blockToHtml),
+        // because DOM parsers drop comment nodes inside columns/cells.
+        return standaloneCommentFor("pagebreak");
 
-      case "subpages": {
-        // Emit the schema-matching div[data-type="subpages"] so marked passes it
-        // through as a block and generateJSON rebuilds the subpages atom. The old
-        // `{{SUBPAGES}}` literal had no parseHTML inverse, so on import it stayed
-        // as plain text — the embed rendered as the literal "{{SUBPAGES}}" on the
-        // page after a round-trip (red-team: subpages round-trip data loss).
-        // `data-recursive` carries the recursive toggle so it round-trips too.
-        const recursive = node.attrs?.recursive ? ` data-recursive="true"` : "";
-        return `<div data-type="subpages"${recursive}></div>`;
-      }
+      case "subpages":
+        // #293 canon #5: a subpages block serializes as a STANDALONE comment —
+        // `<!--subpages-->` by default, or `<!--subpages {"recursive":true}-->`
+        // when the recursive toggle is set. Same rationale as pageBreak: readable
+        // markdown, invisible in renderers, re-materialized on import. The div
+        // form (`<div data-type="subpages">`) is retained on the raw-HTML path
+        // (blockToHtml) since comments cannot survive a DOM parse inside columns.
+        return node.attrs?.recursive
+          ? standaloneCommentFor("subpages", { recursive: true })
+          : standaloneCommentFor("subpages");
 
       case "status": {
         // Inline status pill. The schema reads the label from the element's
@@ -1033,6 +1039,19 @@ export function convertProseMirrorToMarkdown(content: any): string {
       // marked and would round-trip as literal "| a | b |" text (review #7).
       case "table":
         return tableToHtml(block.content || []);
+      // #293 canon #5: on the TOP-LEVEL path (processNode) subpages/pageBreak
+      // serialize as standalone `<!--...-->` comments, but a comment node is
+      // discarded by the DOM parse stage (jsdom/parse5) that reads back a raw-
+      // HTML block — so inside a column/cell the comment form would silently
+      // vanish (latent data loss; these atoms previously fell through to the
+      // `default` <div></div>). Here we KEEP the schema-matching div-form so the
+      // node survives the raw-HTML round trip.
+      case "pageBreak":
+        return `<div data-type="pageBreak"></div>`;
+      case "subpages": {
+        const recursive = block.attrs?.recursive ? ` data-recursive="true"` : "";
+        return `<div data-type="subpages"${recursive}></div>`;
+      }
       // columns/column, math, media, embed, attachment, mention, etc. already
       // emit schema-matching HTML from processNode.
       case "columns":

@@ -147,8 +147,8 @@ describe('paragraph.textAlign -> attached <!--attrs--> comment (#293 #9)', () =>
 });
 
 describe('subpages token + unknown-in-container fallback', () => {
-  it('subpages emits the schema-matching div (round-trips, unlike the old {{SUBPAGES}} literal)', () => {
-    expect(c({ type: 'subpages' })).toBe('<div data-type="subpages"></div>');
+  it('subpages emits the standalone comment (#293 #5, unlike the old {{SUBPAGES}} literal)', () => {
+    expect(c({ type: 'subpages' })).toBe('<!--subpages-->');
   });
 
   it('an unknown block inside a raw-HTML container is wrapped in <div> (never markdown)', () => {

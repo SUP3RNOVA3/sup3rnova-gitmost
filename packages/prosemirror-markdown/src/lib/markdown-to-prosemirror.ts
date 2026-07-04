@@ -329,36 +329,87 @@ function bridgeTaskLists(html: string): string {
  * comment it re-expresses the encoded attributes in a form the schema's
  * parseHTML already understands, then removes the comment so it cannot leak.
  *
- * For #9 the only handled name is `attrs`, and the only handled key is
- * `textAlign` on a paragraph/heading: it is written as an inline
- * `text-align` style on the parent element, which the docmost-schema textAlign
- * global attribute reads back. Fail-open everywhere: a malformed comment (null
- * from parseAttachedComment), an unknown name, a comment whose parent is not a
- * `<p>`/`<hN>`, or an unknown/empty attr value is left inert (the comment is
- * dropped by generateJSON anyway). Future decisions (#4/#8) extend the
- * per-name handling here without changing the parse primitive.
+ * This pass materializes BOTH comment conventions, discriminated by position:
+ *
+ *   - ATTACHED comments (#9 `attrs`): a comment sitting INSIDE a `<p>`/`<hN>`
+ *     (same rendered line as visible content). The only handled key is
+ *     `textAlign`, re-expressed as an inline `text-align` style on the parent,
+ *     which the docmost-schema textAlign global attribute reads back.
+ *   - STANDALONE machinery comments (#5 `subpages`/`pagebreak`): a lone comment
+ *     line, which `marked` renders as an HTML block so jsdom makes it a DIRECT
+ *     child of `<body>`. These are replaced with the schema-matching block div
+ *     (`<div data-type="pageBreak">` / `<div data-type="subpages" [data-recursive]>`)
+ *     that the schema's parseHTML rebuilds into the atom.
+ *
+ * Position determines legality: an `attrs` comment is honored only in attached
+ * position, a `subpages`/`pagebreak` comment only in standalone position; a
+ * comment in the wrong position is left INERT (generateJSON drops it). Fail-open
+ * everywhere: a malformed comment (null from parseAttachedComment), an unknown
+ * name, a wrong-position comment, or an unknown/empty attr value is ignored.
+ * Future decisions (#4/#8) extend the per-name handling here without changing
+ * the parse primitive.
  */
-function applyAttachedComments(html: string): string {
+function applyCommentDirectives(html: string): string {
   // Cheap early-out: no comments at all -> nothing to intercept.
   if (!html.includes("<!--")) return html;
   const dom = new JSDOM(html);
   const document = dom.window.document;
   const nodeFilter = dom.window.NodeFilter;
-  // Collect comment nodes first (mutating the tree while walking is unsafe).
-  const walker = document.createTreeWalker(
-    document.body,
-    nodeFilter.SHOW_COMMENT,
-  );
+  // Walk the WHOLE document, not just <body>: when a standalone machinery
+  // comment is the FIRST thing in the output (before any body content), the
+  // HTML parser places it at document level (a child of `#document`, before
+  // `<html>`), where it is outside `document.body` and would be lost. Attached
+  // attrs comments always live inside body, so this wider walk still finds them.
+  const walker = document.createTreeWalker(document, nodeFilter.SHOW_COMMENT);
   const comments: any[] = [];
   let current: any;
   while ((current = walker.nextNode())) comments.push(current);
 
+  // Standalone machinery comments that were parsed at document level (leading,
+  // before body content) must be MOVED into body — in document order — since we
+  // return `document.body.innerHTML`. Because the parser only puts LEADING
+  // comments at document level, prepending them to body preserves global order.
+  const leadingDivs: any[] = [];
+
   for (const comment of comments) {
     const parsed = parseAttachedComment(comment.data);
-    if (!parsed || parsed.name !== "attrs") continue; // inert / not for #9
+    if (!parsed) continue; // malformed -> inert (dropped by generateJSON)
     const parent = comment.parentElement as any;
-    if (!parent) continue;
-    const tag = String(parent.tagName || "").toLowerCase();
+    const tag = String(parent?.tagName || "").toLowerCase();
+
+    if (parsed.name === "subpages" || parsed.name === "pagebreak") {
+      // #293 canon #5 STANDALONE machinery. A lone comment line is rendered by
+      // marked as an HTML block; the parser places it either directly under
+      // <body> (when other content surrounds it) or at document level (when it
+      // leads the output). Both are STANDALONE position. A `subpages`/`pagebreak`
+      // comment sitting inside a `<p>`/`<hN>` (or any other element) is attached
+      // position -> INERT.
+      const standalone = tag === "" || tag === "body" || tag === "html";
+      if (!standalone) continue; // wrong position -> inert
+      const div = document.createElement("div");
+      if (parsed.name === "pagebreak") {
+        div.setAttribute("data-type", "pageBreak");
+      } else {
+        div.setAttribute("data-type", "subpages");
+        if (parsed.attrs.recursive === true) {
+          div.setAttribute("data-recursive", "true");
+        }
+      }
+      if (tag === "body") {
+        // In-body: replace in place so surrounding content keeps its order.
+        comment.replaceWith(div);
+      } else {
+        // Document-level (leading): drop the stray comment and queue the div to
+        // be prepended into body below.
+        comment.remove();
+        leadingDivs.push(div);
+      }
+      continue;
+    }
+
+    if (!parent) continue; // attrs comment must have an element parent
+    if (parsed.name !== "attrs") continue; // unknown name -> inert
+    // #293 canon #9 ATTACHED attrs: honored only in attached position.
     const isBlock = tag === "p" || /^h[1-6]$/.test(tag);
     if (!isBlock) continue; // misplaced comment -> inert
     const align = parsed.attrs.textAlign;
@@ -370,6 +421,11 @@ function applyAttachedComments(html: string): string {
     // Consume the marker regardless (unknown keys are simply ignored) so no
     // attached comment ever survives into the parsed body.
     comment.remove();
+  }
+  // Prepend any document-level (leading) standalone divs into body, preserving
+  // their document order relative to each other and ahead of existing content.
+  for (let i = leadingDivs.length - 1; i >= 0; i--) {
+    document.body.insertBefore(leadingDivs[i], document.body.firstChild);
   }
   return document.body.innerHTML;
 }
@@ -418,9 +474,10 @@ export async function markdownToProseMirror(
 ): Promise<any> {
   const withCallouts = await preprocessCallouts(markdownContent);
   const html = await marked.parse(withCallouts);
-  // Re-apply attached-comment attributes (#293 #9 textAlign, …) while the
-  // comment nodes still exist, before generateJSON drops them.
-  const withAttrs = applyAttachedComments(html);
+  // Materialize comment directives (#293 #9 attached textAlign; #5 standalone
+  // subpages/pageBreak) while the comment nodes still exist, before generateJSON
+  // drops them.
+  const withAttrs = applyCommentDirectives(html);
   const bridged = bridgeTaskLists(withAttrs);
   const doc = generateJSON(bridged, docmostExtensions);
   return stripEmptyParagraphs(doc);

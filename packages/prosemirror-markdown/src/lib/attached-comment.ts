@@ -51,12 +51,48 @@ const ATTACHED_COMMENT_RE = /^\s*([A-Za-z][\w-]*)(?:\s+(\{[\s\S]*\}))?\s*$/;
  * produces it), so a blanket replace over the stringified payload is safe.
  */
 export function attachedCommentFor(name: string, json: object): string {
-  const raw = JSON.stringify(json);
-  // Escape every hyphen that is part of a `--` pair. Scanning left-to-right and
-  // replacing each `--` handles odd runs too (`---` -> two escapes + one bare
-  // `-`, still `---` after JSON.parse).
-  const safe = raw.replace(/--/g, "\\u002d\\u002d");
-  return `<!--${name} ${safe}-->`;
+  return `<!--${name} ${escapeCommentJson(json)}-->`;
+}
+
+/**
+ * Compactly stringify `json` and defuse any `--` pair so the payload can never
+ * close the HTML comment early. Shared by `attachedCommentFor` (attached form)
+ * and `standaloneCommentFor` (standalone form) so both stay in sync.
+ *
+ * A string value may legitimately contain two consecutive hyphens `--`, which
+ * would prematurely close the comment (`-->`). We defuse that WITHOUT changing
+ * the decoded value: each hyphen of every `--` pair is rewritten as the JSON
+ * unicode escape `-`, so `JSON.parse` on the reading side restores the exact
+ * original hyphens. `--` can only occur inside a JSON string (structural JSON
+ * never produces it), so a blanket replace over the stringified payload is safe.
+ * Scanning left-to-right and replacing each `--` handles odd runs too (`---` ->
+ * two escapes + one bare `-`, still `---` after JSON.parse).
+ */
+function escapeCommentJson(json: object): string {
+  return JSON.stringify(json).replace(/--/g, "\\u002d\\u002d");
+}
+
+/**
+ * Build a STANDALONE machinery comment (#293 canon #5) for a block node that
+ * lives on its OWN line, e.g. `<!--pagebreak-->` or `<!--subpages-->`.
+ *
+ * Grammar is identical to the attached form (`<!--name {JSON?}-->`), but the
+ * JSON body is emitted ONLY when there are real attributes to carry:
+ *   - `standaloneCommentFor("pagebreak")`            -> `<!--pagebreak-->`
+ *   - `standaloneCommentFor("subpages")`             -> `<!--subpages-->`
+ *   - `standaloneCommentFor("subpages", {recursive:true})`
+ *                                    -> `<!--subpages {"recursive":true}-->`
+ *
+ * When `attrs` is undefined/null/empty-object the comment is name-only (no JSON,
+ * which parses back to default attrs). Otherwise the JSON body is emitted with
+ * the SAME `--`-escaping as `attachedCommentFor` (via `escapeCommentJson`), so
+ * the standalone and attached encoders can never diverge.
+ */
+export function standaloneCommentFor(name: string, attrs?: object | null): string {
+  if (!attrs || Object.keys(attrs).length === 0) {
+    return `<!--${name}-->`;
+  }
+  return `<!--${name} ${escapeCommentJson(attrs)}-->`;
 }
 
 /**

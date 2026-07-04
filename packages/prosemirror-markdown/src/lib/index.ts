@@ -29,6 +29,7 @@ export { docmostExtensions } from "./docmost-schema.js";
 // as trailing `<!--name {json}-->` comments.
 export {
   attachedCommentFor,
+  standaloneCommentFor,
   parseAttachedComment,
 } from "./attached-comment.js";
 export type { AttachedComment } from "./attached-comment.js";

@@ -36,29 +36,30 @@ async function roundTrip(node: any): Promise<{ md1: string; doc2: any; md2: stri
 // existing documented `it.fails` bugs in markdown-roundtrip.property.test.ts).
 // ---------------------------------------------------------------------------
 describe('pageBreak data loss (no converter case — SPEC §11 divergence)', () => {
-  it('exports a pageBreak node to the schema-matching block div', () => {
-    // FIXED: a standalone pageBreak now emits the block-level HTML div so the
-    // node survives instead of being erased to "".
+  it('exports a pageBreak node to the standalone comment (#293 #5)', () => {
+    // #293 canon #5: a standalone pageBreak now serializes as the readable,
+    // renderer-invisible comment `<!--pagebreak-->` (re-materialized on import),
+    // instead of the earlier raw <div> block.
     expect(convertProseMirrorToMarkdown(doc({ type: 'pageBreak' }))).toBe(
-      '<div data-type="pageBreak"></div>',
+      '<!--pagebreak-->',
     );
   });
 
   it('keeps a pageBreak sitting BETWEEN two paragraphs on export', () => {
-    // FIXED: with surrounding content the divider is emitted as its own block
+    // With surrounding content the divider is emitted as its own comment line
     // between the two paragraphs (joined by the doc "\n\n"), no longer dropped.
     const out = convertProseMirrorToMarkdown(
       doc(para(text('before')), { type: 'pageBreak' }, para(text('after'))),
     );
     expect(out).toBe(
-      'before\n\n<div data-type="pageBreak"></div>\n\nafter',
+      'before\n\n<!--pagebreak-->\n\nafter',
     );
-    expect(out).toContain('pageBreak');
+    expect(out).toContain('<!--pagebreak-->');
   });
 
   // FIXED: a pageBreak node now survives an export -> import -> export cycle
-  // because the FIRST export emits the schema-matching block div, which marked
-  // passes through and generateJSON rebuilds into a pageBreak node again.
+  // because the FIRST export emits the standalone comment, which the importer
+  // materializes back into a pageBreak node again.
   it('a pageBreak node round-trips (export -> import yields a pageBreak)', async () => {
     const { md1, doc2 } = await roundTrip({ type: 'pageBreak' });
     expect(md1).not.toBe('');
@@ -68,18 +69,18 @@ describe('pageBreak data loss (no converter case — SPEC §11 divergence)', () 
 });
 
 // ---------------------------------------------------------------------------
-// 2. subpages round-trip (`case "subpages"` emits the schema-matching div).
+// 2. subpages round-trip (#293 #5 standalone comment).
 //
 // It used to emit the literal `{{SUBPAGES}}`, which has no markdown/HTML meaning,
 // so on re-import the subpages BLOCK came back as a plain PARAGRAPH carrying the
 // literal string (the embed rendered as visible "{{SUBPAGES}}" text on the page
-// after a sync — data loss). It now emits `<div data-type="subpages">` like the
-// other embed nodes, so the schema's parseHTML rebuilds the subpages node.
+// after a sync — data loss). Per canon #5 it now emits the standalone comment
+// `<!--subpages-->`, which the importer materializes back into a subpages node.
 // ---------------------------------------------------------------------------
-describe('subpages round-trip (schema-matching div)', () => {
-  it('emits the subpages div and re-imports as a subpages node (no literal leak)', async () => {
+describe('subpages round-trip (standalone comment #293 #5)', () => {
+  it('emits the subpages comment and re-imports as a subpages node (no literal leak)', async () => {
     const { md1, doc2 } = await roundTrip({ type: 'subpages' });
-    expect(md1).toBe('<div data-type="subpages"></div>');
+    expect(md1).toBe('<!--subpages-->');
 
     const collect = (n: any): string[] => [
       n.type,
