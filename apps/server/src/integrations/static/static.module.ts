@@ -72,6 +72,32 @@ export class StaticModule implements OnModuleInit {
       await app.register(fastifyStatic, {
         root: clientDistPath,
         wildcard: false,
+        // Serve the build-time .br/.gz neighbour when the client accepts it
+        // (see vite-plugin-compression2 in apps/client/vite.config.ts).
+        preCompressed: true,
+        setHeaders: (res, filePath) => {
+          // Content-hashed files under /assets/ never change for a given URL,
+          // so they can be cached forever and skip revalidation entirely.
+          if (filePath.includes('/assets/')) {
+            res.setHeader(
+              'cache-control',
+              'public, max-age=31536000, immutable',
+            );
+            return;
+          }
+          // index.html is rewritten at boot (window.CONFIG injection) and on
+          // every deploy — it must be revalidated on every load.
+          if (filePath.endsWith('index.html')) {
+            res.setHeader(
+              'cache-control',
+              'no-cache, no-store, must-revalidate',
+            );
+            return;
+          }
+          // Everything else (locales, vad, icons, manifest) is NOT content-hashed
+          // and changes between deploys, so it keeps @fastify/static's default
+          // etag/last-modified revalidation — do NOT mark it immutable.
+        },
       });
 
       app.get(RENDER_PATH, (req: any, res: any) => {

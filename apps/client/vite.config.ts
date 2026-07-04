@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
+import { compression } from "vite-plugin-compression2";
 import * as path from "path";
 import { execSync } from "node:child_process";
 
@@ -53,7 +54,17 @@ export default defineConfig(({ mode }) => {
       },
       APP_VERSION: JSON.stringify(resolveAppVersion(envPath)),
     },
-    plugins: [react()],
+    plugins: [
+      react(),
+      // Emit .br and .gz next to every built asset so the server can serve the
+      // precompressed copy (see @fastify/static preCompressed in static.module.ts).
+      compression({
+        algorithms: ["brotliCompress", "gzip"],
+        // index.html is rewritten at server boot (window.CONFIG injection); a
+        // precompressed copy would go stale — NEVER precompress it.
+        exclude: [/index\.html$/],
+      }),
+    ],
     build: {
       rolldownOptions: {
         output: {
