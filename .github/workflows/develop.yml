@@ -18,12 +18,13 @@ env:
   IMAGE: ghcr.io/vvzvlad/gitmost
 
 jobs:
-  # Run the reusable test suite first so a failing test blocks the image build.
+  # Run the reusable test suite first so a failing test blocks the image build
+  # (the e2e jobs below gate the build as well).
   test:
     uses: ./.github/workflows/test.yml
 
   build:
-    needs: test
+    needs: [test, e2e-server, e2e-mcp]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -59,11 +60,8 @@ jobs:
           cache-from: type=gha,scope=develop-amd64
           cache-to: type=gha,scope=develop-amd64,mode=max,ignore-error=true
 
-  # e2e jobs run on every develop push but DO NOT gate the build/publish above:
-  # `build` stays `needs: test` only, so the :develop image still ships even if
-  # e2e fails. A failing e2e job turns the run red and triggers GitHub's email
-  # to the pusher — that red run + email is the intended notification, not a
-  # deploy block.
+  # e2e jobs gate the build: the :develop image is built and pushed only when
+  # unit tests AND both e2e suites pass (build.needs lists all three).
   e2e-server:
     runs-on: ubuntu-latest
     # Hard cap: the full-AppModule e2e leaks open handles and hung jest to the 6h max.
@@ -124,9 +122,7 @@ jobs:
       - name: Run server e2e
         run: pnpm --filter ./apps/server test:e2e
 
-  # Same rationale as e2e-server: this job is intentionally NOT in
-  # `build.needs`. Deploy of the :develop image must not be blocked by e2e;
-  # a red run plus GitHub's email to the pusher is the notification mechanism.
+  # Gates the build too — see the comment above e2e-server.
   e2e-mcp:
     runs-on: ubuntu-latest
     timeout-minutes: 20
