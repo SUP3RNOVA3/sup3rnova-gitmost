@@ -6,6 +6,7 @@ import {
   tiptapExtensions,
 } from './collaboration.util';
 import {
+  removeYjsMarkByAttribute,
   replaceYjsMarkedText,
   setYjsMark,
   updateYjsMarkAttribute,
@@ -74,6 +75,40 @@ export class CollaborationHandler {
               'comment',
               { name: 'commentId', value: commentId },
               { resolved },
+            );
+          },
+        );
+      },
+      deleteCommentMark: async (
+        documentName: string,
+        payload: {
+          commentId: string;
+          user: User;
+        },
+      ) => {
+        const { commentId, user } = payload;
+        // Ephemeral suggestions (#329): when a suggestion-edit is dismissed or an
+        // applied one has no replies, the comment is hard-deleted and its inline
+        // anchor must vanish too. Mirror resolveCommentMark exactly, but instead
+        // of flipping the mark's `resolved` attribute we STRIP the `comment` mark
+        // entirely via removeYjsMarkByAttribute so no orphan highlight remains in
+        // the collaborative document.
+        //
+        // Routing this through collaboration.gateway's handleYjsEvent means the
+        // COLLAB_DISABLE_REDIS path invokes this handler directly (never a silent
+        // no-op) and a missing live instance is a hard error — the same guarantee
+        // applyCommentSuggestion/resolveCommentMark rely on.
+        await this.withYdocConnection(
+          hocuspocus,
+          documentName,
+          { user },
+          (doc) => {
+            const fragment = doc.getXmlFragment('default');
+            removeYjsMarkByAttribute(
+              fragment,
+              'comment',
+              'commentId',
+              commentId,
             );
           },
         );

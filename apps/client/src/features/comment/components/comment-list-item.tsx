@@ -13,12 +13,14 @@ import { useHover } from "@mantine/hooks";
 import {
   useApplySuggestionMutation,
   useDeleteCommentMutation,
+  useDismissSuggestionMutation,
   useResolveCommentMutation,
   useUpdateCommentMutation,
 } from "@/features/comment/queries/comment-query";
 import { IComment } from "@/features/comment/types/comment.types";
 import {
   canShowApply,
+  canShowDismiss,
   computeSuggestionDiff,
 } from "@/features/comment/utils/suggestion";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
@@ -54,6 +56,7 @@ function CommentListItem({
   const deleteCommentMutation = useDeleteCommentMutation(comment.pageId);
   const resolveCommentMutation = useResolveCommentMutation();
   const applySuggestionMutation = useApplySuggestionMutation();
+  const dismissSuggestionMutation = useDismissSuggestionMutation();
   const [currentUser] = useAtom(currentUserAtom);
   const createdAtAgo = useTimeAgo(comment.createdAt);
 
@@ -127,6 +130,19 @@ function CommentListItem({
     } catch (error) {
       // Errors surface via the mutation's onError notification (incl. 409).
       console.error("Failed to apply suggestion:", error);
+    }
+  }
+
+  async function handleDismissSuggestion() {
+    try {
+      await dismissSuggestionMutation.mutateAsync({
+        commentId: comment.id,
+        pageId: comment.pageId,
+      });
+    } catch (error) {
+      // Idempotent races are reconciled to success in the mutation's onError;
+      // anything else surfaces there as a notification.
+      console.error("Failed to dismiss suggestion:", error);
     }
   }
 
@@ -286,18 +302,42 @@ function CommentListItem({
                 {t("Applied")}
               </Badge>
             ) : (
-              canShowApply(comment, canEdit) && (
-                <Button
-                  size="compact-xs"
-                  variant="light"
-                  color="green"
-                  mt={6}
-                  onClick={handleApplySuggestion}
-                  loading={applySuggestionMutation.isPending}
-                  disabled={applySuggestionMutation.isPending}
-                >
-                  {t("Apply")}
-                </Button>
+              (canShowApply(comment, canEdit) ||
+                canShowDismiss(comment, canComment)) && (
+                <Group gap="xs" mt={6}>
+                  {canShowApply(comment, canEdit) && (
+                    <Button
+                      size="compact-xs"
+                      variant="light"
+                      color="green"
+                      onClick={handleApplySuggestion}
+                      loading={applySuggestionMutation.isPending}
+                      disabled={
+                        applySuggestionMutation.isPending ||
+                        dismissSuggestionMutation.isPending
+                      }
+                    >
+                      {t("Apply")}
+                    </Button>
+                  )}
+                  {/* Dismiss ("Не применять", #329): removes the suggestion
+                      without changing the page text. Gated on canComment. */}
+                  {canShowDismiss(comment, canComment) && (
+                    <Button
+                      size="compact-xs"
+                      variant="subtle"
+                      color="gray"
+                      onClick={handleDismissSuggestion}
+                      loading={dismissSuggestionMutation.isPending}
+                      disabled={
+                        applySuggestionMutation.isPending ||
+                        dismissSuggestionMutation.isPending
+                      }
+                    >
+                      {t("Dismiss")}
+                    </Button>
+                  )}
+                </Group>
               )
             )}
           </Box>

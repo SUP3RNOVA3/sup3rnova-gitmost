@@ -13,17 +13,24 @@ import { AuditEvent, AuditResource } from '../../common/events/audit-events';
  *
  * The collaboration gateway verdict is the pivot of the whole flow, so each test
  * pins a specific { applied, currentText } and asserts the DB persistence,
- * auto-resolve, audit, ws broadcast, and error mapping that follow from it.
+ * settle (ephemeral delete vs. resolve), audit, ws broadcast, and error mapping
+ * that follow from it.
+ *
+ * Ephemeral rule (#329): once applied a suggestion DISAPPEARS (hard-delete +
+ * strip the inline anchor mark) UNLESS the thread has replies, in which case it
+ * is resolved to preserve the discussion. `hasChildren` selects the branch.
  */
 describe('CommentService — applySuggestion', () => {
   const UPDATED = { id: 'c-1', __updated: true } as any;
 
-  function makeService(verdict: unknown) {
+  function makeService(verdict: unknown, hasChildren = false) {
     const commentRepo: any = {
       // Both the applied-stamp re-read and resolveComment's re-read go through
       // findById; return a recognizable enriched row.
       findById: jest.fn(async () => UPDATED),
       updateComment: jest.fn(async () => undefined),
+      hasChildren: jest.fn(async () => hasChildren),
+      deleteComment: jest.fn(async () => undefined),
     };
     const pageRepo: any = {};
     const wsService: any = { emitCommentEvent: jest.fn() };
@@ -74,7 +81,9 @@ describe('CommentService — applySuggestion', () => {
       .map((c: any[]) => c[0])
       .find((patch: any) => 'suggestionAppliedAt' in patch);
 
-  it('applied=true → replaces text, persists applied stamps, auto-resolves, audits, returns updated', async () => {
+  // --- no replies → ephemeral delete branch -------------------------------
+
+  it('applied=true, no replies → replaces text, hard-deletes, strips the anchor mark, audits APPLIED, outcome=deleted', async () => {
     const { service, commentRepo, wsService, collaborationGateway, auditService } =
       makeService({ applied: true, currentText: 'new text' });
 
@@ -92,37 +101,34 @@ describe('CommentService — applySuggestion', () => {
       }),
     );
 
-    // Applied stamps persisted.
-    const patch = appliedPatch(commentRepo);
-    expect(patch.suggestionAppliedAt).toBeInstanceOf(Date);
-    expect(patch.suggestionAppliedById).toBe('user-1');
+    // Ephemeral: the redundant comment is hard-deleted and its inline anchor
+    // mark removed via the deleteCommentMark collab event.
+    expect(commentRepo.deleteComment).toHaveBeenCalledWith('c-1');
+    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
+      'deleteCommentMark',
+      'page.page-1',
+      expect.objectContaining({ commentId: 'c-1', user: expect.any(Object) }),
+    );
+    // No applied stamps are written for a row about to be deleted.
+    expect(appliedPatch(commentRepo)).toBeUndefined();
 
-    // Auto-resolved: resolveComment writes a resolvedAt/resolvedById patch too.
-    const resolvePatch = commentRepo.updateComment.mock.calls
-      .map((c: any[]) => c[0])
-      .find((p: any) => 'resolvedAt' in p);
-    expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
-    expect(resolvePatch.resolvedById).toBe('user-1');
-
-    // Audit + broadcast + return.
+    // Broadcast a deletion, audit the (still-applied) suggestion, report outcome.
+    expect(wsService.emitCommentEvent).toHaveBeenCalledWith(
+      'space-1',
+      'page-1',
+      expect.objectContaining({ operation: 'commentDeleted', commentId: 'c-1' }),
+    );
     expect(auditService.log).toHaveBeenCalledWith(
       expect.objectContaining({
         event: AuditEvent.COMMENT_SUGGESTION_APPLIED,
         resourceType: AuditResource.COMMENT,
         resourceId: 'c-1',
-        spaceId: 'space-1',
-        metadata: { pageId: 'page-1' },
       }),
     );
-    expect(wsService.emitCommentEvent).toHaveBeenCalledWith(
-      'space-1',
-      'page-1',
-      expect.objectContaining({ operation: 'commentUpdated', comment: UPDATED }),
-    );
-    expect(result).toBe(UPDATED);
+    expect(result.outcome).toBe('deleted');
   });
 
-  it('applied=false but currentText === suggestedText → idempotent success (no 409)', async () => {
+  it('applied=false but currentText === suggestedText, no replies → idempotent delete (no 409)', async () => {
     const { service, commentRepo, auditService } = makeService({
       applied: false,
       currentText: 'new text',
@@ -130,14 +136,54 @@ describe('CommentService — applySuggestion', () => {
 
     const result = await service.applySuggestion(suggestionComment(), user());
 
-    // The stamps are still persisted (reconciling a crash between the doc
-    // mutation and the DB write) and the call succeeds.
+    expect(commentRepo.deleteComment).toHaveBeenCalledWith('c-1');
+    expect(auditService.log).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe('deleted');
+  });
+
+  // --- has replies → resolve branch (discussion preserved) ----------------
+
+  it('applied=true, WITH replies → resolves (not delete), persists applied stamps, audits, outcome=resolved', async () => {
+    const { service, commentRepo, wsService, collaborationGateway, auditService } =
+      makeService({ applied: true, currentText: 'new text' }, true);
+
+    const result = await service.applySuggestion(suggestionComment(), user());
+
+    // Applied stamps persisted.
     const patch = appliedPatch(commentRepo);
     expect(patch.suggestionAppliedAt).toBeInstanceOf(Date);
     expect(patch.suggestionAppliedById).toBe('user-1');
-    expect(auditService.log).toHaveBeenCalledTimes(1);
-    expect(result).toBe(UPDATED);
+
+    // Auto-resolved (resolveComment writes the resolve patch + resolve mark).
+    const resolvePatch = commentRepo.updateComment.mock.calls
+      .map((c: any[]) => c[0])
+      .find((p: any) => 'resolvedAt' in p);
+    expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
+    expect(resolvePatch.resolvedById).toBe('user-1');
+
+    // NOT deleted; broadcast an update, not a deletion.
+    expect(commentRepo.deleteComment).not.toHaveBeenCalled();
+    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalledWith(
+      'deleteCommentMark',
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(wsService.emitCommentEvent).toHaveBeenCalledWith(
+      'space-1',
+      'page-1',
+      expect.objectContaining({ operation: 'commentUpdated', comment: UPDATED }),
+    );
+
+    expect(auditService.log).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: AuditEvent.COMMENT_SUGGESTION_APPLIED,
+      }),
+    );
+    expect(result.id).toBe('c-1');
+    expect(result.outcome).toBe('resolved');
   });
+
+  // --- error / rejection branches -----------------------------------------
 
   it('applied=false and currentText differs → ConflictException with currentText in payload', async () => {
     const { service, commentRepo, auditService } = makeService({
@@ -153,14 +199,14 @@ describe('CommentService — applySuggestion', () => {
     expect(err.getResponse()).toMatchObject({
       currentText: 'someone else edited this',
     });
-    // No persistence and no audit on a conflict.
-    expect(appliedPatch(commentRepo)).toBeUndefined();
+    // No delete and no audit on a conflict.
+    expect(commentRepo.deleteComment).not.toHaveBeenCalled();
     expect(auditService.log).not.toHaveBeenCalled();
   });
 
-  it('already-applied AND already-resolved → idempotent success, no collab call, no re-resolve (#315 double-click)', async () => {
+  it('already-applied WITH replies → idempotent success, no re-apply, resolve branch', async () => {
     const { service, collaborationGateway, commentRepo, auditService } =
-      makeService({ applied: true, currentText: 'new text' });
+      makeService({ applied: true, currentText: 'new text' }, true);
 
     const result = await service.applySuggestion(
       suggestionComment({
@@ -171,17 +217,20 @@ describe('CommentService — applySuggestion', () => {
       user(),
     );
 
-    // Idempotent SUCCESS, not a 409. The suggestion is already applied, so the
-    // collaborative document is never touched again and nothing is re-stamped
-    // or re-resolved.
-    expect(result).toBe(UPDATED);
-    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalled();
-    expect(commentRepo.updateComment).not.toHaveBeenCalled();
-    // Same success shape as the applied path (broadcast + audit).
+    // Idempotent SUCCESS. The suggestion is already applied, so the document is
+    // never re-mutated (no applyCommentSuggestion) and nothing is re-stamped.
+    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalledWith(
+      'applyCommentSuggestion',
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(appliedPatch(commentRepo)).toBeUndefined();
+    expect(commentRepo.deleteComment).not.toHaveBeenCalled();
     expect(auditService.log).toHaveBeenCalledTimes(1);
+    expect(result.outcome).toBe('resolved');
   });
 
-  it('already-applied but NOT resolved (crash window) → idempotent success, self-heals resolve, no re-apply', async () => {
+  it('already-applied, no replies (double-click after a delete) → deletes idempotently', async () => {
     const { service, collaborationGateway, commentRepo } = makeService({
       applied: true,
       currentText: 'new text',
@@ -192,28 +241,14 @@ describe('CommentService — applySuggestion', () => {
       user(),
     );
 
-    expect(result).toBe(UPDATED);
-
-    // The suggestion is NOT re-applied to the document…
+    // No re-apply to the document; the childless applied comment is removed.
     expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalledWith(
       'applyCommentSuggestion',
       expect.anything(),
       expect.anything(),
     );
-    // …but the open thread is self-healed to resolved via resolveComment, which
-    // writes the resolve patch and updates the resolve mark.
-    const resolvePatch = commentRepo.updateComment.mock.calls
-      .map((c: any[]) => c[0])
-      .find((p: any) => 'resolvedAt' in p);
-    expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
-    expect(resolvePatch.resolvedById).toBe('user-1');
-    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
-      'resolveCommentMark',
-      'page.page-1',
-      expect.objectContaining({ commentId: 'c-1', resolved: true }),
-    );
-    // The applied stamps are NOT re-written (already stamped).
-    expect(appliedPatch(commentRepo)).toBeUndefined();
+    expect(commentRepo.deleteComment).toHaveBeenCalledWith('c-1');
+    expect(result.outcome).toBe('deleted');
   });
 
   it('rejects a comment with no suggestedText', async () => {
@@ -238,8 +273,8 @@ describe('CommentService — applySuggestion', () => {
       service.applySuggestion(suggestionComment(), user()),
     ).rejects.toThrow(InternalServerErrorException);
 
-    // Nothing persisted, nothing audited.
-    expect(appliedPatch(commentRepo)).toBeUndefined();
+    // Nothing deleted, nothing audited.
+    expect(commentRepo.deleteComment).not.toHaveBeenCalled();
     expect(auditService.log).not.toHaveBeenCalled();
   });
 });

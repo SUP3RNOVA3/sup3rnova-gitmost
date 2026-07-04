@@ -8,12 +8,17 @@ import { IComment } from "@/features/comment/types/comment.types";
 // The comment mutation hooks reach out to react-query/network — stub them so the
 // component renders in isolation. We only assert the AI-badge rendering branch.
 const applyMutateAsync = vi.fn();
+const dismissMutateAsync = vi.fn();
 vi.mock("@/features/comment/queries/comment-query", () => ({
   useDeleteCommentMutation: () => ({ mutateAsync: vi.fn() }),
   useResolveCommentMutation: () => ({ mutateAsync: vi.fn() }),
   useUpdateCommentMutation: () => ({ mutateAsync: vi.fn() }),
   useApplySuggestionMutation: () => ({
     mutateAsync: applyMutateAsync,
+    isPending: false,
+  }),
+  useDismissSuggestionMutation: () => ({
+    mutateAsync: dismissMutateAsync,
     isPending: false,
   }),
 }));
@@ -24,7 +29,10 @@ vi.mock("@/features/comment/components/comment-editor", () => ({
 }));
 
 import CommentListItem from "./comment-list-item";
-import { canShowApply } from "@/features/comment/utils/suggestion";
+import {
+  canShowApply,
+  canShowDismiss,
+} from "@/features/comment/utils/suggestion";
 
 const baseComment = (over?: Partial<IComment>): IComment =>
   ({
@@ -38,13 +46,13 @@ const baseComment = (over?: Partial<IComment>): IComment =>
     ...over,
   }) as IComment;
 
-function renderItem(comment: IComment, canEdit = true) {
+function renderItem(comment: IComment, canEdit = true, canComment = true) {
   return render(
     <MantineProvider>
       <CommentListItem
         comment={comment}
         pageId="page-1"
-        canComment={true}
+        canComment={canComment}
         canEdit={canEdit}
       />
     </MantineProvider>,
@@ -159,6 +167,54 @@ describe("CommentListItem — suggested edit (#315)", () => {
   });
 });
 
+describe("CommentListItem — dismiss suggestion (#329)", () => {
+  const suggestion = (over?: Partial<IComment>): IComment =>
+    baseComment({
+      selection: "old wording here",
+      suggestedText: "new wording here",
+      ...over,
+    });
+
+  it("renders a Dismiss button alongside Apply when canEdit and canComment", () => {
+    renderItem(suggestion(), true, true);
+    expect(screen.getByRole("button", { name: "Apply" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeDefined();
+  });
+
+  it("shows Dismiss but NOT Apply for a commenter who cannot edit", () => {
+    renderItem(suggestion(), false, true);
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Dismiss" })).toBeDefined();
+  });
+
+  it("hides Dismiss when the viewer cannot comment", () => {
+    renderItem(suggestion(), false, false);
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  });
+
+  it("hides Dismiss once the thread is resolved", () => {
+    renderItem(suggestion({ resolvedAt: new Date() }), true, true);
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
+  });
+
+  it("hides Dismiss (shows the Applied badge) once applied", () => {
+    renderItem(suggestion({ suggestionAppliedAt: new Date() }), true, true);
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
+    expect(screen.getByText("Applied")).toBeDefined();
+  });
+
+  it("calls the dismiss mutation when the Dismiss button is clicked", () => {
+    dismissMutateAsync.mockClear();
+    renderItem(suggestion(), true, true);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(dismissMutateAsync).toHaveBeenCalledWith({
+      commentId: "c-1",
+      pageId: "page-1",
+    });
+  });
+});
+
 describe("canShowApply predicate", () => {
   const c = (over?: Partial<IComment>): IComment =>
     ({ suggestedText: "x", ...over }) as IComment;
@@ -182,5 +238,31 @@ describe("canShowApply predicate", () => {
   });
   it("false for a reply comment", () => {
     expect(canShowApply(c({ parentCommentId: "p" }), true)).toBe(false);
+  });
+});
+
+describe("canShowDismiss predicate", () => {
+  const c = (over?: Partial<IComment>): IComment =>
+    ({ suggestedText: "x", ...over }) as IComment;
+
+  it("true when suggestion present, can comment, not applied/resolved, top-level", () => {
+    expect(canShowDismiss(c(), true)).toBe(true);
+  });
+  it("false without comment permission", () => {
+    expect(canShowDismiss(c(), false)).toBe(false);
+  });
+  it("false when no suggestion", () => {
+    expect(canShowDismiss(c({ suggestedText: null }), true)).toBe(false);
+  });
+  it("false when already applied", () => {
+    expect(canShowDismiss(c({ suggestionAppliedAt: new Date() }), true)).toBe(
+      false,
+    );
+  });
+  it("false when resolved", () => {
+    expect(canShowDismiss(c({ resolvedAt: new Date() }), true)).toBe(false);
+  });
+  it("false for a reply comment", () => {
+    expect(canShowDismiss(c({ parentCommentId: "p" }), true)).toBe(false);
   });
 });

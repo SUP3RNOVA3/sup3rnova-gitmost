@@ -8,6 +8,7 @@ import {
   applySuggestion,
   createComment,
   deleteComment,
+  dismissSuggestion,
   getPageComments,
   resolveComment,
   updateComment,
@@ -16,6 +17,7 @@ import {
   ICommentParams,
   IComment,
   IResolveComment,
+  ISuggestionOutcome,
 } from "@/features/comment/types/comment.types";
 import { notifications } from "@mantine/notifications";
 import { IPagination } from "@/lib/types.ts";
@@ -177,40 +179,102 @@ function updateCommentInCache(
   };
 }
 
+function removeCommentFromCache(
+  cache: InfiniteData<IPagination<IComment>>,
+  commentId: string,
+): InfiniteData<IPagination<IComment>> {
+  return {
+    ...cache,
+    pages: cache.pages.map((page) => ({
+      ...page,
+      items: page.items.filter((comment) => comment.id !== commentId),
+    })),
+  };
+}
+
+// Reconcile the local comment cache with an ephemeral-suggestion outcome (#329)
+// returned by apply/dismiss: 'deleted' → drop the comment (it disappeared);
+// 'resolved' → the thread had replies and was resolved, so carry the resolved
+// state through (which relocates it to the resolved tab).
+function applySuggestionOutcomeToCache(
+  queryClient: ReturnType<typeof useQueryClient>,
+  pageId: string,
+  commentId: string,
+  data: ISuggestionOutcome,
+) {
+  const cache = queryClient.getQueryData(RQ_KEY(pageId)) as
+    | InfiniteData<IPagination<IComment>>
+    | undefined;
+  if (!cache) return;
+
+  if (data.outcome === "deleted") {
+    queryClient.setQueryData(RQ_KEY(pageId), removeCommentFromCache(cache, commentId));
+    return;
+  }
+
+  // 'resolved' (or an older server that omits outcome): reflect the resolved
+  // state and the applied stamps (apply sets them; dismiss leaves them null).
+  queryClient.setQueryData(
+    RQ_KEY(pageId),
+    updateCommentInCache(cache, commentId, (comment) => ({
+      ...comment,
+      suggestionAppliedAt: data.suggestionAppliedAt,
+      suggestionAppliedById: data.suggestionAppliedById,
+      resolvedAt: data.resolvedAt,
+      resolvedById: data.resolvedById,
+      resolvedBy: data.resolvedBy,
+    })),
+  );
+}
+
 export function useApplySuggestionMutation() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
-  return useMutation<IComment, any, { commentId: string; pageId: string }>({
+  return useMutation<
+    ISuggestionOutcome,
+    any,
+    { commentId: string; pageId: string }
+  >({
     // No optimistic update: apply can fail with 409 (the commented text drifted),
     // so we only mutate the cache once the server confirms.
     mutationFn: ({ commentId }) => applySuggestion(commentId),
     onSuccess: (data, variables) => {
-      const cache = queryClient.getQueryData(
-        RQ_KEY(variables.pageId),
-      ) as InfiniteData<IPagination<IComment>> | undefined;
-
-      if (cache) {
-        queryClient.setQueryData(
-          RQ_KEY(variables.pageId),
-          updateCommentInCache(cache, variables.commentId, (comment) => ({
-            ...comment,
-            suggestionAppliedAt: data.suggestionAppliedAt,
-            suggestionAppliedById: data.suggestionAppliedById,
-            // The server auto-resolves the thread on apply — carry that through.
-            resolvedAt: data.resolvedAt,
-            resolvedById: data.resolvedById,
-            resolvedBy: data.resolvedBy,
-          })),
-        );
-      }
+      // Ephemeral (#329): the server hard-deletes the applied suggestion when the
+      // thread has no replies ('deleted') or resolves it when it does ('resolved').
+      applySuggestionOutcomeToCache(
+        queryClient,
+        variables.pageId,
+        variables.commentId,
+        data,
+      );
 
       notifications.show({ message: t("Suggestion applied") });
     },
-    onError: (err: any) => {
+    onError: (err: any, variables) => {
+      const status = err?.response?.status;
+      // Idempotent races (double-click, or apply↔dismiss): after #329 an applied
+      // reply-less suggestion is hard-deleted, so a second/racing apply hits 404
+      // (already gone) or 400 (already resolved) BEFORE the server's applied
+      // idempotent branch. Drop it from the cache and report success — the user's
+      // intent is already satisfied — rather than a scary error (mirrors dismiss;
+      // restores the #315 apply idempotency the ephemeral delete would otherwise
+      // break).
+      if (status === 404 || status === 400) {
+        const cache = queryClient.getQueryData(RQ_KEY(variables.pageId)) as
+          | InfiniteData<IPagination<IComment>>
+          | undefined;
+        if (cache) {
+          queryClient.setQueryData(
+            RQ_KEY(variables.pageId),
+            removeCommentFromCache(cache, variables.commentId),
+          );
+        }
+        notifications.show({ message: t("Suggestion applied") });
+        return;
+      }
       // 409 => the commented text changed since the suggestion was made. Surface
       // a specific message (with the current text) rather than a generic error.
-      const status = err?.response?.status;
       const currentText = err?.response?.data?.currentText;
       if (status === 409 && typeof currentText === "string") {
         const shortText =
@@ -228,6 +292,55 @@ export function useApplySuggestionMutation() {
       }
       notifications.show({
         message: t("Failed to apply suggestion"),
+        color: "red",
+      });
+    },
+  });
+}
+
+export function useDismissSuggestionMutation() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation<
+    ISuggestionOutcome,
+    any,
+    { commentId: string; pageId: string }
+  >({
+    mutationFn: ({ commentId }) => dismissSuggestion(commentId),
+    onSuccess: (data, variables) => {
+      // Ephemeral (#329): dismiss hard-deletes the suggestion when the thread has
+      // no replies ('deleted') or resolves it when it does ('resolved').
+      applySuggestionOutcomeToCache(
+        queryClient,
+        variables.pageId,
+        variables.commentId,
+        data,
+      );
+
+      notifications.show({ message: t("Suggestion dismissed") });
+    },
+    onError: (err: any, variables) => {
+      // Idempotent races (double-click, or apply↔dismiss): the comment is already
+      // gone (404) or already resolved (400). Drop it from the cache and report
+      // success rather than a scary error — the user's intent (make it disappear)
+      // is satisfied either way.
+      const status = err?.response?.status;
+      if (status === 404 || status === 400) {
+        const cache = queryClient.getQueryData(RQ_KEY(variables.pageId)) as
+          | InfiniteData<IPagination<IComment>>
+          | undefined;
+        if (cache) {
+          queryClient.setQueryData(
+            RQ_KEY(variables.pageId),
+            removeCommentFromCache(cache, variables.commentId),
+          );
+        }
+        notifications.show({ message: t("Suggestion dismissed") });
+        return;
+      }
+      notifications.show({
+        message: t("Failed to dismiss suggestion"),
         color: "red",
       });
     },

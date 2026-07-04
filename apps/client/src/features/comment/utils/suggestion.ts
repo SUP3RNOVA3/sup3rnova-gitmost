@@ -115,3 +115,18 @@ export function computeSuggestionDiff(
 
   return { old: oldSegments, new: newSegments };
 }
+
+// Whether the suggested-edit (#329) "Не применять" (Dismiss) button should be
+// shown. Dismiss does NOT change the page text, so it is gated on canComment
+// (looser than canEdit): a viewer allowed to comment but not edit can still
+// dismiss a suggestion. Same not-applied/not-resolved/top-level conditions as
+// Apply.
+export function canShowDismiss(comment: IComment, canComment?: boolean): boolean {
+  return Boolean(
+    canComment &&
+      comment.suggestedText &&
+      !comment.suggestionAppliedAt &&
+      !comment.resolvedAt &&
+      !comment.parentCommentId,
+  );
+}
