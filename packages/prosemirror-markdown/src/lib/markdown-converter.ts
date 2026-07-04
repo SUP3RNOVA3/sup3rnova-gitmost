@@ -432,39 +432,24 @@ export function convertProseMirrorToMarkdown(content: any): string {
             textContent = `\`${textContent}\``;
             return textContent;
           }
-          const codeCombined = false;
           for (const mark of node.marks) {
             switch (mark.type) {
               case "bold":
-                textContent = codeCombined
-                  ? `<strong>${textContent}</strong>`
-                  : `**${textContent}**`;
+                textContent = `**${textContent}**`;
                 break;
               case "italic":
-                textContent = codeCombined
-                  ? `<em>${textContent}</em>`
-                  : `*${textContent}*`;
+                textContent = `*${textContent}*`;
                 break;
               case "code":
-                // When combined with another mark, wrap as <code> so the
-                // surrounding HTML marks can nest around it; otherwise use the
-                // plain backtick span.
-                textContent = codeCombined
-                  ? `<code>${textContent}</code>`
-                  : `\`${textContent}\``;
+                // A `code` run already returned above (hasCode early return), so
+                // this branch is only reached for a non-code run that somehow
+                // still lists `code`; emit the plain backtick span.
+                textContent = `\`${textContent}\``;
                 break;
               case "link": {
                 const href = mark.attrs?.href || "";
                 const title = mark.attrs?.title;
-                if (codeCombined) {
-                  // Emit an HTML anchor so it can wrap the nested <code>.
-                  const safeHref = escapeAttr(href);
-                  if (title) {
-                    textContent = `<a href="${safeHref}" title="${escapeAttr(String(title))}">${textContent}</a>`;
-                  } else {
-                    textContent = `<a href="${safeHref}">${textContent}</a>`;
-                  }
-                } else if (title) {
+                if (title) {
                   // Emit the optional markdown link title; escape an embedded
                   // double-quote so it cannot terminate the title string early.
                   const safeTitle = String(title).replace(/"/g, '\\"');
@@ -475,9 +460,7 @@ export function convertProseMirrorToMarkdown(content: any): string {
                 break;
               }
               case "strike":
-                textContent = codeCombined
-                  ? `<s>${textContent}</s>`
-                  : `~~${textContent}~~`;
+                textContent = `~~${textContent}~~`;
                 break;
               case "underline":
                 textContent = `<u>${textContent}</u>`;
@@ -1153,9 +1136,19 @@ export function convertProseMirrorToMarkdown(content: any): string {
             case "superscript":
               t = `<sup>${t}</sup>`;
               break;
-            case "link":
-              t = `<a href="${escapeAttr(mark.attrs?.href || "")}">${t}</a>`;
+            case "link": {
+              // Mirror the top-level link path: emit the optional `title` too
+              // (the schema's link mark carries a `title` attr — see
+              // DocmostAttributes link globals — so <a title> round-trips). A
+              // link with a title inside a column/spanned cell would otherwise
+              // drop it on re-import.
+              const linkTitle = mark.attrs?.title;
+              const titleAttr = linkTitle
+                ? ` title="${escapeAttr(String(linkTitle))}"`
+                : "";
+              t = `<a href="${escapeAttr(mark.attrs?.href || "")}"${titleAttr}>${t}</a>`;
               break;
+            }
             case "highlight":
               t = mark.attrs?.color
                 ? `<mark style="background-color: ${escapeAttr(mark.attrs.color)}">${t}</mark>`
@@ -1164,6 +1157,13 @@ export function convertProseMirrorToMarkdown(content: any): string {
             case "textStyle":
               if (mark.attrs?.color)
                 t = `<span style="color: ${escapeAttr(mark.attrs.color)}">${t}</span>`;
+              break;
+            case "spoiler":
+              // Emit the same raw inline HTML the top-level path uses. The
+              // schema's Spoiler mark parses span[data-spoiler] back on import,
+              // so a spoiler inside a column/spanned cell survives the round
+              // trip (without this case the mark was silently lost here).
+              t = `<span data-spoiler="true">${t}</span>`;
               break;
             case "comment":
               // Inline comment anchor inside a raw-HTML container (columns /
