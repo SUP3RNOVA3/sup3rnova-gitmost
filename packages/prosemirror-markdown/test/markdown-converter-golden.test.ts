@@ -129,20 +129,19 @@ describe('inline-mark matrix (underline/sub/sup/highlight±color/textStyle/comme
   });
 });
 
-describe('paragraph.textAlign -> <p style="text-align:...">', () => {
-  it('non-default alignment emits an HTML <p style="text-align:...">', () => {
-    // #7 fix: a non-default paragraph alignment now round-trips. It is exported
-    // as an HTML `<p style="text-align:center">` (the schema's paragraph
-    // parseHTML reads `style="text-align"` back onto `textAlign` on import), so
-    // the alignment survives instead of collapsing to bare text. (The old
-    // `<div align="center">` form was NOT re-parsed onto the paragraph and was
-    // therefore lossy.)
+describe('paragraph.textAlign -> attached <!--attrs--> comment (#293 #9)', () => {
+  it('non-default alignment emits a trailing <!--attrs {"textAlign":…}--> comment', () => {
+    // #293 canon #9: a non-default paragraph alignment now round-trips as an
+    // ATTACHED HTML comment at the END of the block line instead of the old
+    // `<p style="text-align:center">` wrapper (which the maintainer had to patch
+    // A14->A15->A16). The importer's applyAttachedComments step reads the comment
+    // back onto `textAlign` before the DOM stage drops it.
     expect(c({ type: 'paragraph', attrs: { textAlign: 'center' }, content: [text('x')] })).toBe(
-      '<p style="text-align:center">x</p>',
+      'x <!--attrs {"textAlign":"center"}-->',
     );
   });
 
-  it('textAlign "left" (the default) is NOT wrapped', () => {
+  it('textAlign "left" (the default) emits NO comment', () => {
     expect(c({ type: 'paragraph', attrs: { textAlign: 'left' }, content: [text('x')] })).toBe('x');
   });
 });

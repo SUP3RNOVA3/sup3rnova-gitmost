@@ -1,4 +1,5 @@
 import { encodeHtmlEmbedSource } from "./docmost-schema.js";
+import { attachedCommentFor } from "./attached-comment.js";
 
 /**
  * Hard cap on processNode recursion depth (see the depth guard below).
@@ -138,38 +139,45 @@ export function convertProseMirrorToMarkdown(content: any): string {
       case "doc":
         return nodeContent.map(processNode).join("\n\n");
 
-      case "paragraph":
+      case "paragraph": {
         const text = nodeContent.map(processNode).join("");
         const align = node.attrs?.textAlign;
-        if (align && align !== "left") {
-          // Emit alignment as a styled `<p>` (review #10). The old
-          // `<div align="…">` had NO matching import parse rule — the div was
-          // unwrapped and alignment lost on every round trip. A styled `<p>`
-          // round-trips: the paragraph parse rule (tag:"p") matches and the
-          // textAlign global-attribute parseHTML (docmost-schema) reads the style.
-          return `<p style="text-align:${escapeAttr(align)}">${text}</p>`;
+        // Non-default alignment round-trips as an ATTACHED HTML comment at the
+        // END of the block line (#293 canon #9):
+        //   `some text <!--attrs {"textAlign":"center"}-->`
+        // This replaces the old `<p style="text-align:…">` wrapper (review #10,
+        // itself a replacement for the never-parsed `<div align>`). The schema's
+        // textAlign default is `null`; "left" is the visual default the editor
+        // renders identically to null — neither emits a marker (no churn). The
+        // importer's applyAttachedComments step reads the comment back before the
+        // DOM stage drops it. We only attach when there is text to attach to: a
+        // lone comment on a blank line has no block to bind to on re-import.
+        if (align && align !== "left" && text) {
+          return `${text} ${attachedCommentFor("attrs", { textAlign: align })}`;
         }
         return text || "";
+      }
 
-      case "heading":
+      case "heading": {
         const level = node.attrs?.level || 1;
         const headingText = nodeContent.map(processNode).join("");
+        const headingLine = "#".repeat(level) + " " + headingText;
         const headingAlign = node.attrs?.textAlign;
-        if (headingAlign && headingAlign !== "left") {
-          // Emit alignment as a styled `<hN>` so it round-trips losslessly,
-          // symmetric to the paragraph case above (review F5/A1). The bare
-          // `## text` markdown form carries NO alignment, so an aligned heading
-          // would silently drop textAlign on export. A styled `<hN>` re-parses:
-          // the heading parse rule (tag:"h1".."h6") matches and the textAlign
-          // global-attribute parseHTML (docmost-schema) reads the style back,
-          // preserving BOTH level and textAlign. escapeAttr keeps the align
-          // value injection-safe, exactly like the paragraph arm.
-          return `<h${level} style="text-align:${escapeAttr(headingAlign)}">${headingText}</h${level}>`;
+        // A non-default heading alignment attaches the same trailing comment
+        // (#293 canon #9), keeping the readable `## text` markdown form:
+        //   `## Title <!--attrs {"textAlign":"center"}-->`
+        // Bare `## text` carries no alignment, so without this an aligned heading
+        // would silently drop textAlign on export. Replaces the old
+        // `<hN style="text-align:…">` HTML form. "left"/null stay bare (no churn).
+        // Require headingText so an empty aligned heading stays bare `##` rather
+        // than emitting a comment with no visible element to attach to (matches
+        // the paragraph guard's `text` check — a lone comment has no block to
+        // bind on re-import).
+        if (headingAlign && headingAlign !== "left" && headingText) {
+          return `${headingLine} ${attachedCommentFor("attrs", { textAlign: headingAlign })}`;
         }
-        // No alignment (or the default "left"): keep the plain `## text`
-        // markdown form — HTML-ifying an unaligned heading would be needless
-        // churn, exactly as the paragraph case keeps plain text when unaligned.
-        return "#".repeat(level) + " " + headingText;
+        return headingLine;
+      }
 
       case "text":
         let textContent = node.text || "";

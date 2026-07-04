@@ -24,6 +24,15 @@ export { markdownToProseMirror } from "./markdown-to-prosemirror.js";
 // schema the converter targets.
 export { docmostExtensions } from "./docmost-schema.js";
 
+// Attached-comment convention (#293 canon #9/#4/#8): the reusable primitives
+// the serializer/parser use to encode attrs that have no native markdown syntax
+// as trailing `<!--name {json}-->` comments.
+export {
+  attachedCommentFor,
+  parseAttachedComment,
+} from "./attached-comment.js";
+export type { AttachedComment } from "./attached-comment.js";
+
 export {
   canonicalizeContent,
   docsCanonicallyEqual,

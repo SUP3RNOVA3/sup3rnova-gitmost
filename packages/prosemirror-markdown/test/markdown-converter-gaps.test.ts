@@ -786,11 +786,11 @@ describe('converter gap coverage — raw-HTML container round-trips (specs 15–
 });
 
 // ===========================================================================
-// 30. heading.textAlign round-trip (A1). The paragraph case already exports a
-// non-default alignment as a styled `<p style="text-align:…">` that re-parses
-// losslessly; headings used to emit only the bare `## text` form, silently
-// DROPPING textAlign on export. The heading case is now symmetric: an aligned
-// heading exports as `<hN style="text-align:…">` and re-parses back to a heading
+// 30. heading.textAlign round-trip (A1). Bare `## text` markdown carries no
+// alignment, so an aligned heading used to silently DROP textAlign on export.
+// Per #293 canon #9 an aligned heading now keeps the readable `## text` form and
+// ATTACHES a trailing `<!--attrs {"textAlign":…}-->` comment (replacing the old
+// `<hN style="text-align:…">` HTML form). It re-parses back to a heading
 // carrying BOTH the level and the textAlign, so the round-trip is lossless; an
 // UNaligned heading still emits the bare `## text` markdown form (no churn).
 // ===========================================================================
@@ -801,21 +801,22 @@ const alignedHeading = (level: number, align: string, ...inline: any[]) => ({
 });
 
 describe('heading.textAlign round-trip (A1)', () => {
-  it('an aligned heading exports as <hN style="text-align:…"> (not bare ##)', () => {
+  it('an aligned heading keeps "## text" and attaches a <!--attrs--> comment (#293 #9)', () => {
     expect(convertProseMirrorToMarkdown(doc(alignedHeading(2, 'center', text('Title'))))).toBe(
-      '<h2 style="text-align:center">Title</h2>',
+      '## Title <!--attrs {"textAlign":"center"}-->',
     );
   });
 
   it('survives export -> import -> export losslessly (level AND textAlign preserved)', async () => {
     const input = alignedHeading(2, 'center', text('Title'));
     const { md1, doc2, md2 } = await roundTrip(input);
-    // Export direction: a styled <hN>, injection-safe via escapeAttr.
-    expect(md1).toBe('<h2 style="text-align:center">Title</h2>');
+    // Export direction: `## Title` plus the attached alignment comment (#293 #9).
+    expect(md1).toBe('## Title <!--attrs {"textAlign":"center"}-->');
     // Import direction: re-parses to a heading node with the level AND textAlign
-    // (the raw <hN style> HTML block flows through marked -> generateJSON, where
-    // the heading parse rule matches and the textAlign global attr reads the
-    // style back). Byte-stable second export closes the loop.
+    // (marked keeps the comment inside the <h2>; applyAttachedComments re-expresses
+    // it as an inline style before generateJSON, where the heading parse rule
+    // matches and the textAlign global attr reads it back). Byte-stable second
+    // export closes the loop.
     const h = doc2.content[0];
     expect(h.type).toBe('heading');
     expect(h.attrs.level).toBe(2);

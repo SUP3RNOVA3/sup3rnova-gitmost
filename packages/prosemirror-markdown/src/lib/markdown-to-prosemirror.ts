@@ -11,6 +11,7 @@ import { generateJSON } from "@tiptap/html";
 import { JSDOM } from "jsdom";
 import { marked } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
+import { parseAttachedComment } from "./attached-comment.js";
 
 // Setup DOM environment for Tiptap HTML parsing in Node.js
 const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>");
@@ -316,6 +317,64 @@ function bridgeTaskLists(html: string): string {
 }
 
 /**
+ * Re-apply ATTACHED HTML comments (#293 canon) before the DOM/generateJSON
+ * stage drops them.
+ *
+ * The serializer appends attributes that have no native markdown syntax as a
+ * trailing `<!--name {json}-->` comment on the block's line (see
+ * attached-comment.ts). `marked` keeps that comment as an HTML comment NODE
+ * inside the block element (`<p>text <!--attrs {…}--></p>`), but the next stage
+ * (parse5/jsdom via generateJSON) discards comment nodes, so the attributes
+ * would be lost. This pass runs on the post-`marked` HTML: for every attached
+ * comment it re-expresses the encoded attributes in a form the schema's
+ * parseHTML already understands, then removes the comment so it cannot leak.
+ *
+ * For #9 the only handled name is `attrs`, and the only handled key is
+ * `textAlign` on a paragraph/heading: it is written as an inline
+ * `text-align` style on the parent element, which the docmost-schema textAlign
+ * global attribute reads back. Fail-open everywhere: a malformed comment (null
+ * from parseAttachedComment), an unknown name, a comment whose parent is not a
+ * `<p>`/`<hN>`, or an unknown/empty attr value is left inert (the comment is
+ * dropped by generateJSON anyway). Future decisions (#4/#8) extend the
+ * per-name handling here without changing the parse primitive.
+ */
+function applyAttachedComments(html: string): string {
+  // Cheap early-out: no comments at all -> nothing to intercept.
+  if (!html.includes("<!--")) return html;
+  const dom = new JSDOM(html);
+  const document = dom.window.document;
+  const nodeFilter = dom.window.NodeFilter;
+  // Collect comment nodes first (mutating the tree while walking is unsafe).
+  const walker = document.createTreeWalker(
+    document.body,
+    nodeFilter.SHOW_COMMENT,
+  );
+  const comments: any[] = [];
+  let current: any;
+  while ((current = walker.nextNode())) comments.push(current);
+
+  for (const comment of comments) {
+    const parsed = parseAttachedComment(comment.data);
+    if (!parsed || parsed.name !== "attrs") continue; // inert / not for #9
+    const parent = comment.parentElement as any;
+    if (!parent) continue;
+    const tag = String(parent.tagName || "").toLowerCase();
+    const isBlock = tag === "p" || /^h[1-6]$/.test(tag);
+    if (!isBlock) continue; // misplaced comment -> inert
+    const align = parsed.attrs.textAlign;
+    if (typeof align === "string" && align) {
+      // Re-express as an inline style; the schema's textAlign parseHTML reads
+      // `el.style.textAlign` back onto the paragraph/heading node.
+      parent.style.textAlign = align;
+    }
+    // Consume the marker regardless (unknown keys are simply ignored) so no
+    // attached comment ever survives into the parsed body.
+    comment.remove();
+  }
+  return document.body.innerHTML;
+}
+
+/**
  * Recursively strip content-less paragraph nodes from a generated doc.
  *
  * A block-level atom whose markdown form is INLINE (e.g. the block `image`'s
@@ -359,7 +418,10 @@ export async function markdownToProseMirror(
 ): Promise<any> {
   const withCallouts = await preprocessCallouts(markdownContent);
   const html = await marked.parse(withCallouts);
-  const bridged = bridgeTaskLists(html);
+  // Re-apply attached-comment attributes (#293 #9 textAlign, …) while the
+  // comment nodes still exist, before generateJSON drops them.
+  const withAttrs = applyAttachedComments(html);
+  const bridged = bridgeTaskLists(withAttrs);
   const doc = generateJSON(bridged, docmostExtensions);
   return stripEmptyParagraphs(doc);
 }
