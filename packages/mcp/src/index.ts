@@ -381,6 +381,10 @@ registerShared(SHARED_TOOL_SPECS.deleteNode, async ({ pageId, nodeId }) => {
 });
 
 // Tool: insert_image
+// MCP-only by design (NOT in the shared registry): the in-app AI-chat agent
+// exposes no image tools (insert/replace), so there is no second layer to unify
+// — a SHARED_TOOL_SPECS entry's tier/catalogLine are in-app metadata and the
+// catalog-partition test forbids a spec without a live in-app tool (#294).
 server.registerTool(
   "insert_image",
   {
@@ -426,6 +430,7 @@ server.registerTool(
 );
 
 // Tool: replace_image
+// MCP-only by design (see insert_image): no in-app equivalent, stays inline.
 server.registerTool(
   "replace_image",
   {
@@ -790,6 +795,8 @@ server.registerTool(
 );
 
 // Tool: insert_footnote
+// MCP-only by design (see insert_image): the in-app AI-chat agent exposes no
+// footnote tool, so there is no second layer to unify — stays inline (#294).
 server.registerTool(
   "insert_footnote",
   {
