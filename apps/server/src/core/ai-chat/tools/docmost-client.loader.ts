@@ -56,7 +56,12 @@ export interface DocmostClientLike {
   getPageJson(pageId: string): Promise<Record<string, unknown>>;
   getNode(pageId: string, nodeId: string): Promise<Record<string, unknown>>;
   getTable(pageId: string, tableRef: string): Promise<Record<string, unknown>>;
-  listComments(pageId: string): Promise<unknown[]>;
+  // Returns `{ items, resolvedThreadsHidden }`. DEFAULT (includeResolved unset/
+  // false) hides resolved threads wholesale; pass true for the full feed.
+  listComments(
+    pageId: string,
+    includeResolved?: boolean,
+  ): Promise<{ items: unknown[]; resolvedThreadsHidden: number }>;
   getComment(
     commentId: string,
   ): Promise<{ data: Record<string, unknown>; success: boolean }>;
