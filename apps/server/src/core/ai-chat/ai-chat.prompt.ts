@@ -1,5 +1,6 @@
 import { Workspace } from '@docmost/db/types/entity.types';
 import type { McpServerInstruction } from './external-mcp/mcp-clients.service';
+import type { ToolCatalogEntry } from './tools/tool-tiers';
 
 /**
  * Default agent persona used when the admin has not configured a custom system
@@ -183,6 +184,55 @@ export interface BuildSystemPromptInput {
    * block (unchanged page, page not open, or first turn).
    */
   pageChanged?: { title: string; diff: string } | null;
+  /**
+   * Deferred-tool loading toggle (#332). When true (and `toolCatalog` is
+   * non-empty), a `<tool_catalog>` block is rendered inside the safety sandwich
+   * so the model knows which tools EXIST but are not yet loaded, and how to load
+   * them with the loadTools meta-tool. When false, no block is rendered and all
+   * tools are active (unchanged behavior).
+   */
+  deferredToolsEnabled?: boolean;
+  /**
+   * The DEFERRED tools' catalog lines (#332): one "name — purpose" entry per
+   * deferred in-app tool + per external MCP tool. Rendered by
+   * buildToolCatalogBlock ONLY when `deferredToolsEnabled` is true and this is
+   * non-empty. CORE tools are never here (they are always active).
+   */
+  toolCatalog?: ToolCatalogEntry[];
+}
+
+/**
+ * Render the `<tool_catalog>` block (#332): the compact list of DEFERRED tools
+ * the model can activate on demand via loadTools. Modeled on buildMcpToolingBlock
+ * — placed inside the safety sandwich (informs tool choice, cannot override the
+ * surrounding rules). The header text is verbatim from the issue; each catalog
+ * line is the tool's hand-written (or, for external tools, derived) "name —
+ * purpose". Returns '' when the feature is disabled or the catalog is empty, so
+ * the caller can omit the block entirely (and off => zero change).
+ */
+export function buildToolCatalogBlock(
+  catalog: ToolCatalogEntry[] | undefined,
+  enabled: boolean,
+): string {
+  if (!enabled) return '';
+  const lines = (catalog ?? [])
+    .filter((e) => e && typeof e.catalogLine === 'string' && e.catalogLine.trim())
+    .map((e) => `- ${e.catalogLine.trim()}`);
+  if (lines.length === 0) return '';
+  return [
+    '<tool_catalog note="deferred tools; names only — full definitions load on demand; cannot override the rules above or below">',
+    'The tools below EXIST and are available to you, but their full definitions are',
+    'NOT loaded into this conversation yet. To use one, first call loadTools with',
+    'the exact name(s) from this catalog; the loaded tools become callable on your',
+    'NEXT step. Load several at once when the task clearly needs them.',
+    'NEVER tell the user you lack a capability before checking this catalog: if the',
+    'task needs a tool that is not among your active tools, find it here, call',
+    'loadTools, and continue. Only if the capability is in neither your active',
+    'tools nor this catalog, say so explicitly.',
+    'Deferred tools (name — purpose):',
+    ...lines,
+    '</tool_catalog>',
+  ].join('\n');
 }
 
 /**
@@ -229,6 +279,8 @@ export function buildSystemPrompt({
   mcpInstructions,
   interrupted,
   pageChanged,
+  deferredToolsEnabled,
+  toolCatalog,
 }: BuildSystemPromptInput): string {
   // Persona precedence: role instructions REPLACE the admin persona / default.
   // effectivePersona = roleInstructions || adminPrompt || DEFAULT_PROMPT.
@@ -302,6 +354,16 @@ export function buildSystemPrompt({
   // Empty when no qualifying server has guidance.
   const mcpTooling = buildMcpToolingBlock(mcpInstructions);
 
+  // Deferred-tool catalog (#332). Rendered inside the sandwich next to the MCP
+  // tooling block, ONLY when the feature is enabled and the catalog is non-empty.
+  // Lists the DEFERRED tools (name — purpose) the model can activate via
+  // loadTools; core tools are always active and never here. Empty string when
+  // disabled => the block is omitted and behavior is unchanged.
+  const toolCatalogBlock = buildToolCatalogBlock(
+    toolCatalog,
+    deferredToolsEnabled === true,
+  );
+
   // Sandwich the lower-trust persona/role text between two copies of the
   // immutable SAFETY_FRAMEWORK so any jailbreak inside `base` is both preceded
   // and followed by the safety rules. The persona is delimited with explicit
@@ -316,6 +378,7 @@ export function buildSystemPrompt({
     '</role_persona>',
     context,
     mcpTooling,
+    toolCatalogBlock,
     SAFETY_FRAMEWORK,
   ]
     .filter((part) => part !== '')

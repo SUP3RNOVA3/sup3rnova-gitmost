@@ -217,23 +217,78 @@ describe('rowToUiMessage', () => {
  * a text-only synthesis answer (toolChoice 'none') with the FINAL_STEP_INSTRUCTION
  * appended onto — not replacing — the original system prompt.
  */
+// Narrowing helpers for the prepareAgentStep union return type.
+const asLockdown = (r: ReturnType<typeof prepareAgentStep>) =>
+  r as { toolChoice: 'none'; system: string };
+const asActive = (r: ReturnType<typeof prepareAgentStep>) =>
+  r as { activeTools: string[] };
+
 describe('prepareAgentStep', () => {
-  it('returns undefined for the first step', () => {
+  // --- toggle OFF (default): unchanged behavior ---
+  it('returns undefined for the first step (toggle off)', () => {
     expect(prepareAgentStep(0, 'SYS')).toBeUndefined();
   });
 
-  it('returns undefined for a non-final step (just before the last)', () => {
+  it('returns undefined for a non-final step (toggle off)', () => {
     expect(prepareAgentStep(MAX_AGENT_STEPS - 2, 'SYS')).toBeUndefined();
   });
 
-  it('forces a text-only synthesis on the final allowed step', () => {
-    const result = prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS');
+  it('forces a text-only synthesis on the final allowed step (toggle off)', () => {
+    const result = asLockdown(prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS'));
     expect(result).toBeDefined();
-    expect(result?.toolChoice).toBe('none');
+    expect(result.toolChoice).toBe('none');
     // The original persona is preserved (prefix), not replaced.
-    expect(result?.system.startsWith('SYS')).toBe(true);
+    expect(result.system.startsWith('SYS')).toBe(true);
     // The synthesis instruction is appended.
-    expect(result?.system).toContain(FINAL_STEP_INSTRUCTION);
+    expect(result.system).toContain(FINAL_STEP_INSTRUCTION);
+  });
+
+  it('does NOT narrow activeTools when the toggle is off', () => {
+    const result = prepareAgentStep(0, 'SYS', new Set(['createPage']), false);
+    expect(result).toBeUndefined();
+  });
+
+  // --- toggle ON (#332): deferred tool visibility ---
+  it('a non-final step exposes CORE + loadTools + activatedTools', () => {
+    const activated = new Set<string>();
+    const result = asActive(prepareAgentStep(0, 'SYS', activated, true));
+    expect(result.activeTools).toContain('searchPages'); // core
+    expect(result.activeTools).toContain('searchInPage'); // #330, core
+    expect(result.activeTools).toContain('editPageText'); // core
+    expect(result.activeTools).toContain('loadTools'); // meta-tool
+    // No deferred tool is active before it is loaded.
+    expect(result.activeTools).not.toContain('createPage');
+    expect(result.activeTools).not.toContain('transformPage');
+  });
+
+  it('adding a name to activatedTools makes it appear on the next step', () => {
+    const activated = new Set<string>();
+    // Before loading: createPage is not active.
+    expect(
+      asActive(prepareAgentStep(1, 'SYS', activated, true)).activeTools,
+    ).not.toContain('createPage');
+    // loadTools grows the SAME set…
+    activated.add('createPage');
+    // …so the next step sees it.
+    const next = asActive(prepareAgentStep(2, 'SYS', activated, true));
+    expect(next.activeTools).toContain('createPage');
+    expect(next.activeTools).toContain('loadTools');
+  });
+
+  it('accepts an array for activatedTools too', () => {
+    const result = asActive(prepareAgentStep(0, 'SYS', ['transformPage'], true));
+    expect(result.activeTools).toContain('transformPage');
+    expect(result.activeTools).toContain('loadTools');
+  });
+
+  it('final-step lockdown WINS even when the toggle is on', () => {
+    const result = asLockdown(
+      prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS', new Set(['createPage']), true),
+    );
+    // The lockdown shape (toolChoice none + synthesis) — not the activeTools shape.
+    expect(result.toolChoice).toBe('none');
+    expect(result.system).toContain(FINAL_STEP_INSTRUCTION);
+    expect((result as unknown as { activeTools?: string[] }).activeTools).toBeUndefined();
   });
 });
 

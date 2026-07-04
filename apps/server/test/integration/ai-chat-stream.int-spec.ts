@@ -1,5 +1,7 @@
 import * as http from 'node:http';
 import { Kysely } from 'kysely';
+import { tool } from 'ai';
+import { z } from 'zod';
 import { MockLanguageModelV3, convertArrayToReadableStream } from 'ai/test';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
@@ -146,6 +148,9 @@ describe('AiChatService.stream [integration]', () => {
       {} as any, // aiAgentRoleRepo (role is pre-resolved + passed in)
       {} as any, // pageRepo (only used when body.openPage is set)
       {} as any, // pageAccess (idem)
+      // environment (#332): keep deferred tool loading OFF for this lifecycle
+      // harness so the toolset/behavior is exactly as before.
+      { isAiChatDeferredToolsEnabled: () => false } as any,
     );
   }
 
@@ -314,5 +319,175 @@ describe('AiChatService.stream [integration]', () => {
     expect(rows.some((r) => r.role === 'user' && r.content === 'And what is 3+3?')).toBe(
       true,
     );
+  });
+
+  /**
+   * #332 deferred tool loading, the ON path. The riskiest property is that the
+   * per-turn `activatedTools` Set is created FRESH inside each stream() call, so a
+   * tool a previous turn activated via loadTools is NOT still active when the next
+   * turn starts — the new turn begins "cold" (CORE + loadTools only). The unit
+   * tests only exercise pure prepareAgentStep with hand-fed Sets; this pins the
+   * real wiring end-to-end (loadTools.execute -> activatedTools -> prepareStep ->
+   * per-step activeTools) against the real streamText loop, and proves there is no
+   * cross-turn leak. We drive a MockLanguageModelV3 whose step 1 calls
+   * loadTools(['createPage']) and assert, via the model's recorded per-step
+   * CallOptions.tools (the AI SDK filters the provider tool list by activeTools),
+   * that the deferred tool becomes active on the SAME turn's next step but NOT on a
+   * fresh turn's first step.
+   */
+  describe('deferred tool loading ON — per-turn activation, no leak (#332)', () => {
+    // A stub deferred (non-core) tool the agent can activate. Its execute is never
+    // called — the model only needs to SEE it become active — but it must be a
+    // valid AI-SDK tool so the SDK includes it in a step's tool list once active.
+    const createPageStub = tool({
+      description: 'create a new page',
+      inputSchema: z.object({ title: z.string() }),
+      execute: async () => ({ id: 'p-stub' }),
+    });
+
+    // A CORE tool in the toolset, so a cold step shows CORE tools ARE active while
+    // the deferred createPage is not. `searchPages` is in CORE_TOOL_SET.
+    const searchPagesStub = tool({
+      description: 'search the wiki',
+      inputSchema: z.object({ query: z.string() }),
+      execute: async () => [],
+    });
+
+    // Same lifecycle harness as buildService() above, but with deferred loading ON
+    // and a toolset that exposes exactly one deferred tool (createPage) so it is
+    // catalogued + loadable-by-name. Kept separate so the OFF scenarios are
+    // untouched.
+    function buildDeferredService(): AiChatService {
+      return new AiChatService(
+        { getChatModel: async () => null } as any,
+        aiChatRepo,
+        msgRepo,
+        {} as any,
+        { resolve: async () => null } as any,
+        {
+          forUser: async () => ({
+            searchPages: searchPagesStub,
+            createPage: createPageStub,
+          }),
+          getInAppDeferredCatalog: async () => [
+            { name: 'createPage', catalogLine: 'createPage — create a new page.' },
+          ],
+        } as any,
+        mcpClients as any,
+        {} as any,
+        {} as any,
+        {} as any,
+        // #332: deferred tool loading ON — the property under test.
+        { isAiChatDeferredToolsEnabled: () => true } as any,
+      );
+    }
+
+    // Drive ONE stream() turn against `model` and wait for the assistant row to
+    // settle (mirrors runStream, but builds the deferred-ON service).
+    async function runDeferredTurn(
+      model: MockLanguageModelV3,
+      chatId: string,
+      body: any,
+    ): Promise<void> {
+      closeCalls = 0;
+      const service = buildDeferredService();
+      const { res, cleanup } = await makeRealResponse();
+      try {
+        await service.stream({
+          user: { id: userId, workspaceId } as any,
+          workspace: { id: workspaceId, name: 'WS' } as any,
+          sessionId: 'sess-1',
+          body,
+          res: { raw: res } as any,
+          signal: new AbortController().signal,
+          model: model as any,
+          role: null,
+        } as any);
+        await waitFor(async () => {
+          const rows = await msgRepo.findAllByChat(chatId, workspaceId);
+          return rows.some(
+            (r) =>
+              r.role === 'assistant' &&
+              ['completed', 'error', 'aborted'].includes(r.status as string),
+          );
+        });
+        await waitFor(() => closeCalls > 0, { timeoutMs: 5_000 });
+      } finally {
+        await cleanup();
+      }
+    }
+
+    // Tool names the provider actually received for a recorded step (activeTools
+    // filters this list, so it reflects what was active that step).
+    const toolNames = (call: any): string[] =>
+      ((call?.tools ?? []) as any[]).map((t) => t?.name).filter(Boolean);
+
+    // A model that, on step 1, calls loadTools(['createPage']); on step 2, answers.
+    function loadThenAnswerModel(): MockLanguageModelV3 {
+      let step = 0;
+      return new MockLanguageModelV3({
+        doStream: async () => {
+          const n = step++;
+          if (n === 0) {
+            return {
+              stream: convertArrayToReadableStream([
+                { type: 'stream-start', warnings: [] },
+                {
+                  type: 'tool-call',
+                  toolCallId: 'lt1',
+                  toolName: 'loadTools',
+                  input: JSON.stringify({ names: ['createPage'] }),
+                },
+                {
+                  type: 'finish',
+                  finishReason: 'tool-calls',
+                  usage: { inputTokens: 5, outputTokens: 3, totalTokens: 8 },
+                },
+              ] as any),
+            };
+          }
+          return { stream: successStream() };
+        },
+      } as any);
+    }
+
+    it('activates a deferred tool for the SAME turn, and a NEW turn starts cold (no leak)', async () => {
+      const chatId = (await createChat(db, { workspaceId, creatorId: userId })).id;
+
+      // --- Turn 1: loadTools(createPage) on step 1, then answer on step 2. ---
+      const model1 = loadThenAnswerModel();
+      await runDeferredTurn(model1, chatId, {
+        chatId,
+        messages: [userUiMessage('Make me a page')],
+      });
+
+      // The turn ran at least two steps (the load round-trip + the answer).
+      expect(model1.doStreamCalls.length).toBeGreaterThanOrEqual(2);
+      const step1Tools = toolNames(model1.doStreamCalls[0]);
+      const step2Tools = toolNames(model1.doStreamCalls[1]);
+
+      // Step 1 starts cold: CORE tools + the loadTools meta-tool are active, but
+      // the deferred createPage is NOT yet.
+      expect(step1Tools).toContain('loadTools');
+      expect(step1Tools).toContain('searchPages'); // a CORE tool, always active
+      expect(step1Tools).not.toContain('createPage');
+      // Step 2 of the SAME turn sees the just-activated deferred tool.
+      expect(step2Tools).toContain('createPage');
+
+      // --- Turn 2 on the SAME chat: must start cold again. ---
+      const model2 = new MockLanguageModelV3({
+        doStream: async () => ({ stream: successStream() }),
+      } as any);
+      await runDeferredTurn(model2, chatId, {
+        chatId,
+        messages: [userUiMessage('And another thing')],
+      });
+
+      const nextTurnFirstStep = toolNames(model2.doStreamCalls[0]);
+      expect(nextTurnFirstStep).toContain('loadTools');
+      // The activated set is per-turn: the prior turn's createPage did NOT leak,
+      // so the fresh turn's first step sees it deferred again.
+      expect(nextTurnFirstStep).not.toContain('createPage');
+    });
   });
 });
