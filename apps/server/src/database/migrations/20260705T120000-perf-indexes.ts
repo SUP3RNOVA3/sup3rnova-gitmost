@@ -83,6 +83,17 @@ export async function up(db: Kysely<any>): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_comments_page_id_id
       ON comments (page_id, id)
   `.execute(db);
+
+  // page_access(workspace_id): #348 made hasRestrictedPagesInWorkspace uncached
+  // (F1 fix), so `EXISTS(SELECT 1 FROM page_access WHERE workspace_id=?)` now runs
+  // per-request on every whole-workspace list endpoint (global search + suggest,
+  // favorites, notifications, recent, created-by). page_access only had a
+  // space_id index → that EXISTS was a seq scan in the common zero-restriction
+  // case. This index makes it an index-only existence probe.
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_page_access_workspace_id
+      ON page_access (workspace_id)
+  `.execute(db);
 }
 
 export async function down(db: Kysely<any>): Promise<void> {
@@ -92,6 +103,7 @@ export async function down(db: Kysely<any>): Promise<void> {
   await sql`DROP INDEX IF EXISTS idx_groups_name_trgm`.execute(db);
   await sql`DROP INDEX IF EXISTS idx_page_history_page_id`.execute(db);
   await sql`DROP INDEX IF EXISTS idx_comments_page_id_id`.execute(db);
+  await sql`DROP INDEX IF EXISTS idx_page_access_workspace_id`.execute(db);
 
   // Restore the original two-arg (dictionary-named) f_unaccent body.
   await sql`
