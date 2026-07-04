@@ -623,17 +623,18 @@ export class CommentService {
    * bug #329 targets). Let the exception propagate (→ 5xx); the operation is
    * then repeatable with row + mark still consistent.
    *
-   * RACE (#338 F1): the caller read `hasChildren` BEFORE the (slow) mark
+   * RACE (#338 F4): the caller read `hasChildren` BEFORE the (slow) mark
    * removal, so a reply can land in that window. `comments.parent_comment_id` is
    * ON DELETE CASCADE, so an unconditional delete here would cascade-destroy the
    * just-added reply forever. Instead we use `deleteCommentIfChildless`, which
-   * re-checks childlessness inside the delete statement. If it removes the row
-   * (outcome 'deleted') we broadcast the deletion as before. If it removes 0
-   * rows (a reply interleaved) we do NOT hard-delete — we resolve the thread
-   * instead (outcome 'resolved'), preserving the discussion and the new reply.
-   * The anchor mark is already gone by then, an accepted degradation: the thread
-   * lands in the resolved tab without its inline highlight — far better than
-   * losing a reply.
+   * re-checks childlessness under a FOR UPDATE lock inside a transaction (a plain
+   * anti-join DELETE is NOT race-safe under READ COMMITTED — see the repo method
+   * docstring). If it removes the row (outcome 'deleted') we broadcast the
+   * deletion as before. If it removes 0 rows (a reply interleaved) we do NOT
+   * hard-delete — we resolve the thread instead (outcome 'resolved'), preserving
+   * the discussion and the new reply. The anchor mark is already gone by then, an
+   * accepted degradation: the thread lands in the resolved tab without its inline
+   * highlight — far better than losing a reply.
    */
   private async deleteEphemeralSuggestion(
     comment: Comment,

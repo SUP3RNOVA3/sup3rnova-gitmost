@@ -46,7 +46,12 @@ const baseComment = (over?: Partial<IComment>): IComment =>
     ...over,
   }) as IComment;
 
-function renderItem(comment: IComment, canEdit = true, canComment = true) {
+function renderItem(
+  comment: IComment,
+  canEdit = true,
+  canComment = true,
+  userSpaceRole?: string,
+) {
   return render(
     <MantineProvider>
       <CommentListItem
@@ -54,6 +59,7 @@ function renderItem(comment: IComment, canEdit = true, canComment = true) {
         pageId="page-1"
         canComment={canComment}
         canEdit={canEdit}
+        userSpaceRole={userSpaceRole}
       />
     </MantineProvider>,
   );
@@ -175,38 +181,49 @@ describe("CommentListItem — dismiss suggestion (#329)", () => {
       ...over,
     });
 
-  it("renders a Dismiss button alongside Apply when canEdit and canComment", () => {
-    renderItem(suggestion(), true, true);
+  // A space admin (userSpaceRole="admin") satisfies the owner-or-admin gate
+  // regardless of who authored the comment; the tests below use it as the lever
+  // since the currentUser atom is unseeded (null) in this harness.
+  it("renders a Dismiss button alongside Apply when canEdit and canComment (owner/admin)", () => {
+    renderItem(suggestion(), true, true, "admin");
     expect(screen.getByRole("button", { name: "Apply" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Dismiss" })).toBeDefined();
   });
 
-  it("shows Dismiss but NOT Apply for a commenter who cannot edit", () => {
-    renderItem(suggestion(), false, true);
+  it("shows Dismiss but NOT Apply for an admin commenter who cannot edit", () => {
+    renderItem(suggestion(), false, true, "admin");
     expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
     expect(screen.getByRole("button", { name: "Dismiss" })).toBeDefined();
   });
 
   it("hides Dismiss when the viewer cannot comment", () => {
-    renderItem(suggestion(), false, false);
+    renderItem(suggestion(), false, false, "admin");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
   });
 
+  it("hides Dismiss for a non-owner non-admin even with canComment (#338 F5: mirrors server 403)", () => {
+    // canComment=true but NOT a space admin and NOT the comment owner (the
+    // currentUser atom is null while the comment is authored by user-1), so the
+    // server would 403 a dismiss — the button must not be shown at all.
+    renderItem(suggestion(), false, true, "member");
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
+  });
+
   it("hides Dismiss once the thread is resolved", () => {
-    renderItem(suggestion({ resolvedAt: new Date() }), true, true);
+    renderItem(suggestion({ resolvedAt: new Date() }), true, true, "admin");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
   });
 
   it("hides Dismiss (shows the Applied badge) once applied", () => {
-    renderItem(suggestion({ suggestionAppliedAt: new Date() }), true, true);
+    renderItem(suggestion({ suggestionAppliedAt: new Date() }), true, true, "admin");
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
     expect(screen.getByText("Applied")).toBeDefined();
   });
 
   it("calls the dismiss mutation when the Dismiss button is clicked", () => {
     dismissMutateAsync.mockClear();
-    renderItem(suggestion(), true, true);
+    renderItem(suggestion(), true, true, "admin");
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(dismissMutateAsync).toHaveBeenCalledWith({
       commentId: "c-1",
@@ -245,24 +262,27 @@ describe("canShowDismiss predicate", () => {
   const c = (over?: Partial<IComment>): IComment =>
     ({ suggestedText: "x", ...over }) as IComment;
 
-  it("true when suggestion present, can comment, not applied/resolved, top-level", () => {
-    expect(canShowDismiss(c(), true)).toBe(true);
+  it("true when suggestion present, can comment, owner/admin, not applied/resolved, top-level", () => {
+    expect(canShowDismiss(c(), true, true)).toBe(true);
   });
   it("false without comment permission", () => {
-    expect(canShowDismiss(c(), false)).toBe(false);
+    expect(canShowDismiss(c(), false, true)).toBe(false);
+  });
+  it("false when not owner and not admin (#338 F5)", () => {
+    expect(canShowDismiss(c(), true, false)).toBe(false);
   });
   it("false when no suggestion", () => {
-    expect(canShowDismiss(c({ suggestedText: null }), true)).toBe(false);
+    expect(canShowDismiss(c({ suggestedText: null }), true, true)).toBe(false);
   });
   it("false when already applied", () => {
-    expect(canShowDismiss(c({ suggestionAppliedAt: new Date() }), true)).toBe(
+    expect(canShowDismiss(c({ suggestionAppliedAt: new Date() }), true, true)).toBe(
       false,
     );
   });
   it("false when resolved", () => {
-    expect(canShowDismiss(c({ resolvedAt: new Date() }), true)).toBe(false);
+    expect(canShowDismiss(c({ resolvedAt: new Date() }), true, true)).toBe(false);
   });
   it("false for a reply comment", () => {
-    expect(canShowDismiss(c({ parentCommentId: "p" }), true)).toBe(false);
+    expect(canShowDismiss(c({ parentCommentId: "p" }), true, true)).toBe(false);
   });
 });

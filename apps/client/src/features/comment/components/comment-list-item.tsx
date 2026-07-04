@@ -72,6 +72,12 @@ function CommentListItem({
     [comment.selection, comment.suggestedText],
   );
 
+  // Owner-or-space-admin gate (#338): mirrors the server authz for both the
+  // comment menu (edit/delete) and the suggestion Dismiss button, so we never
+  // render an action the server will 403.
+  const isOwnerOrAdmin =
+    currentUser?.user?.id === comment.creatorId || userSpaceRole === "admin";
+
   useEffect(() => {
     setContent(comment.content);
   }, [comment]);
@@ -221,7 +227,7 @@ function CommentListItem({
                 />
               )}
 
-              {(currentUser?.user?.id === comment.creatorId || userSpaceRole === 'admin') && (
+              {isOwnerOrAdmin && (
                 <CommentMenu
                   onEditComment={handleEditToggle}
                   onDeleteComment={handleDeleteComment}
@@ -303,7 +309,7 @@ function CommentListItem({
               </Badge>
             ) : (
               (canShowApply(comment, canEdit) ||
-                canShowDismiss(comment, canComment)) && (
+                canShowDismiss(comment, canComment, isOwnerOrAdmin)) && (
                 <Group gap="xs" mt={6}>
                   {canShowApply(comment, canEdit) && (
                     <Button
@@ -322,7 +328,7 @@ function CommentListItem({
                   )}
                   {/* Dismiss ("Не применять", #329): removes the suggestion
                       without changing the page text. Gated on canComment. */}
-                  {canShowDismiss(comment, canComment) && (
+                  {canShowDismiss(comment, canComment, isOwnerOrAdmin) && (
                     <Button
                       size="compact-xs"
                       variant="subtle"

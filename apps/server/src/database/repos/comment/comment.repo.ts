@@ -140,34 +140,62 @@ export class CommentRepo {
   }
 
   /**
-   * Atomic conditional delete for an ephemeral suggestion (#338 / #329 F1):
-   * delete the row ONLY if it is still childless, in a single statement, and
-   * return the number of rows removed (0 or 1). This closes a race: dismiss/apply
-   * read `hasChildren`, then remove the anchor mark (a collab round-trip of
-   * tens-to-hundreds of ms), then delete. `comments.parent_comment_id` is
-   * ON DELETE CASCADE, so if a reply lands in that window an unconditional delete
-   * would cascade-delete the just-added reply forever. The `NOT EXISTS` re-checks
-   * childlessness at delete time inside the same statement, so an interleaved
-   * reply makes this delete 0 rows and the caller can fall back to resolving the
-   * thread instead of destroying the discussion.
+   * Delete an ephemeral suggestion row ONLY if it is still childless, returning
+   * the number of rows removed (0 or 1). Closes the data-loss race in
+   * dismiss/apply (#338 F4): the service reads `hasChildren`, then removes the
+   * anchor mark (a collab round-trip of tens-to-hundreds of ms), then calls this.
+   * `comments.parent_comment_id` is ON DELETE CASCADE, so a reply landing in that
+   * window would be cascade-destroyed by a blind delete.
+   *
+   * A single anti-join `DELETE … WHERE NOT EXISTS(child)` is NOT sufficient under
+   * READ COMMITTED: if a reply INSERT (holding FOR KEY SHARE on the parent, not
+   * yet committed) interleaves, the DELETE's snapshot does not see the
+   * uncommitted child, so `NOT EXISTS` is true and the parent qualifies; the
+   * DELETE then blocks on the child's key-share lock, and when it wakes the row
+   * was only LOCKED (not modified), so EvalPlanQual does NOT re-evaluate the
+   * predicate → the parent is deleted and the just-committed reply cascades away.
+   *
+   * So we do a lock-then-recheck in ONE transaction:
+   *  1. `SELECT id … FOR UPDATE` on the parent. FOR UPDATE conflicts with the
+   *     FOR KEY SHARE a concurrent reply INSERT takes on its parent (FK), so a
+   *     reply in the window serializes against us: it either commits before we
+   *     acquire the lock, or it must wait until this tx ends.
+   *  2. Re-read childlessness with a FRESH statement in the SAME tx. Under RC a
+   *     new statement gets a new snapshot, so a reply that committed while we
+   *     waited on the lock is now visible.
+   *  3. Delete only if still childless (return 1); otherwise return 0 so the
+   *     caller resolves the thread instead. The FOR UPDATE lock is held to
+   *     end-of-tx, so no new reply can insert between the re-check and the delete.
    */
   async deleteCommentIfChildless(commentId: string): Promise<number> {
-    const result = await this.db
-      .deleteFrom('comments')
-      .where('id', '=', commentId)
-      .where((eb) =>
-        eb.not(
-          eb.exists(
-            eb
-              .selectFrom('comments as child')
-              .select('child.id')
-              .whereRef('child.parentCommentId', '=', 'comments.id'),
-          ),
-        ),
-      )
-      .executeTakeFirst();
+    return this.db.transaction().execute(async (trx) => {
+      const parent = await trx
+        .selectFrom('comments')
+        .select('id')
+        .where('id', '=', commentId)
+        .forUpdate()
+        .executeTakeFirst();
 
-    return Number(result?.numDeletedRows ?? 0n);
+      // Already gone (e.g. a racing delete won) → nothing to remove.
+      if (!parent) return 0;
+
+      const child = await trx
+        .selectFrom('comments')
+        .select('id')
+        .where('parentCommentId', '=', commentId)
+        .limit(1)
+        .executeTakeFirst();
+
+      // A reply exists (possibly one that just committed) → do NOT hard-delete;
+      // the cascade would destroy it. Caller falls back to resolving the thread.
+      if (child) return 0;
+
+      await trx
+        .deleteFrom('comments')
+        .where('id', '=', commentId)
+        .execute();
+      return 1;
+    });
   }
 
   async hasChildren(commentId: string): Promise<boolean> {
