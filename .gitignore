@@ -6,6 +6,10 @@ data
 /dist
 /node_modules
 
+# git-sync compiled output (built in CI/Docker via `pnpm build`, never committed,
+# so src/ and prod can never silently diverge).
+packages/git-sync/build/
+
 # Logs
 logs
 *.log
