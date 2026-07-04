@@ -63,6 +63,20 @@ export default defineConfig(({ mode }) => {
                 name: "vendor-mantine",
                 test: /[\\/]node_modules[\\/]@mantine[\\/]/,
               },
+              // NOTE: TipTap/ProseMirror/Yjs are intentionally NOT force-grouped
+              // into a single vendor chunk. Doing so backfires: rolldown co-locates
+              // a small module shared with the (eager) react-i18next runtime into
+              // that group chunk, which then drags the whole ~590KB editor engine
+              // into the eager modulepreload graph. Left to the default splitting,
+              // the editor engine stays in lazily-loaded chunks pulled only by the
+              // route-split editor/share pages. KaTeX is safe to group (nothing
+              // eager references it).
+              // KaTeX in its own stable chunk; loaded on demand by the lazy math
+              // node views (never in the startup path).
+              {
+                name: "vendor-katex",
+                test: /[\\/]node_modules[\\/]katex[\\/]/,
+              },
             ],
           },
         },

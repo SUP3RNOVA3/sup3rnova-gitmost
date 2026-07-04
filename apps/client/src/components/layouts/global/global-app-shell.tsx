@@ -1,9 +1,10 @@
 import { AppShell, Container } from "@mantine/core";
-import React, { useEffect, useRef, useState } from "react";
+import React, { Suspense, useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import SettingsSidebar from "@/components/settings/settings-sidebar.tsx";
-import { useAtom } from "jotai";
+import { useAtom, useAtomValue } from "jotai";
+import { aiChatWindowOpenAtom } from "@/features/ai-chat/atoms/ai-chat-atom.ts";
 import {
   APP_NAVBAR_ID,
   NAVBAR_COLLAPSE_BREAKPOINT,
@@ -14,14 +15,27 @@ import {
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { SpaceSidebar } from "@/features/space/components/sidebar/space-sidebar.tsx";
 import { AppHeader } from "@/components/layouts/global/app-header.tsx";
-import Aside from "@/components/layouts/global/aside.tsx";
-import AiChatWindow from "@/features/ai-chat/components/ai-chat-window.tsx";
 import GitmostGlobalBridge from "@/features/editor/gitmost/gitmost-global-bridge.tsx";
 import classes from "./app-shell.module.css";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 import GlobalSidebar from "@/components/layouts/global/global-sidebar.tsx";
 import { ASIDE_PANEL_ID } from "@/hooks/use-toggle-aside.tsx";
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
+
+// Lazily load the AI chat window so the AI SDK runtime it pulls in is fetched
+// only after the user first opens the chat, instead of for every authenticated
+// user on load. The window itself renders null while closed, so there is no
+// behavior difference — it simply is not mounted until first opened.
+const AiChatWindow = React.lazy(
+  () => import("@/features/ai-chat/components/ai-chat-window.tsx"),
+);
+
+// The right aside hosts the comment panel and table of contents, both of which
+// pull in TipTap. It only ever renders on page routes, so lazy-loading it keeps
+// the whole editor engine out of the eager global-shell startup graph.
+const Aside = React.lazy(
+  () => import("@/components/layouts/global/aside.tsx"),
+);
 
 export default function GlobalAppShell({
   children,
@@ -36,6 +50,15 @@ export default function GlobalAppShell({
   const [sidebarWidth, setSidebarWidth] = useAtom(sidebarWidthAtom);
   const [isResizing, setIsResizing] = useState(false);
   const sidebarRef = useRef(null);
+
+  // Latch: once the AI chat window has been opened, keep it mounted so an
+  // in-flight stream is never torn down. Before the first open the AI chat chunk
+  // is never fetched.
+  const aiChatOpen = useAtomValue(aiChatWindowOpenAtom);
+  const [aiChatEverOpened, setAiChatEverOpened] = useState(false);
+  useEffect(() => {
+    if (aiChatOpen) setAiChatEverOpened(true);
+  }, [aiChatOpen]);
 
   const startResizing = React.useCallback((mouseDownEvent) => {
     mouseDownEvent.preventDefault();
@@ -160,13 +183,21 @@ export default function GlobalAppShell({
                   : undefined
           }
         >
-          <Aside />
+          <Suspense fallback={null}>
+            <Aside />
+          </Suspense>
         </AppShell.Aside>
       )}
     </AppShell>
-    {/* Floating AI chat window. Mounted once globally; it is position: fixed
-        and self-hides when closed, so its place in the tree is not critical. */}
-    <AiChatWindow />
+    {/* Floating AI chat window. Mounted once globally on first open; it is
+        position: fixed and self-hides when closed, so its place in the tree is
+        not critical. Kept mounted after the first open so a live stream is not
+        aborted. */}
+    {aiChatEverOpened && (
+      <Suspense fallback={null}>
+        <AiChatWindow />
+      </Suspense>
+    )}
       {/* Global gitmost native bridge: registers listSpaces / listPages /
           createPageWithRecording on window.gitmost so the native host can
           create a page with a recording even when no page editor is open. */}

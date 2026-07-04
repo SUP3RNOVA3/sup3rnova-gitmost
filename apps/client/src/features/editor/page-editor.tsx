@@ -59,7 +59,7 @@ import {
   handlePaste,
 } from "@/features/editor/components/common/editor-paste-handler.tsx";
 import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu-lazy";
-import DrawioMenu from "./components/drawio/drawio-menu";
+import DrawioMenu from "./components/drawio/drawio-menu-lazy";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
 import { useDebouncedCallback, useDocumentVisibility } from "@mantine/hooks";
