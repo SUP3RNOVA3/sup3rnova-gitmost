@@ -411,9 +411,11 @@ export function useRecentChangesQuery(spaceId?: string) {
     getNextPageParam: (lastPage) =>
       lastPage.meta.hasNextPage ? lastPage.meta.nextCursor : undefined,
     // KEEP refetchOnMount:true (against the global default false): recent-changes
-    // is invalidated only while a mounted observer exists, and the widget isn't
-    // always mounted — an event that lands while it's unmounted marks it stale but
-    // the global refetchOnMount:false would not re-fetch on remount → stale list.
+    // IS invalidated on page create/update/move/delete, but invalidateQueries only
+    // marks an UNMOUNTED query stale — it doesn't refetch it. The widget isn't
+    // always mounted, so an event that lands while it's unmounted leaves it stale,
+    // and the global refetchOnMount:false would not re-fetch on remount. The mount
+    // refetch closes that gap.
     refetchOnMount: true,
   });
 }
@@ -447,10 +449,12 @@ export function useDeletedPagesQuery(
     enabled: !!spaceId,
     placeholderData: keepPreviousData,
     staleTime: 0,
-    // KEEP refetchOnMount:true: the "trash-list" key is never invalidated (no
-    // socket/mutation path), so opening the trash after deleting/restoring a page
-    // must refetch on mount — the global refetchOnMount:false would show a stale
-    // trash missing the just-deleted page until a hard reload.
+    // KEEP refetchOnMount:true: ["trash-list"] IS invalidated by the
+    // move-to-trash / delete / restore mutations, but invalidateQueries only marks
+    // an unmounted query stale — it doesn't refetch it. The trash panel isn't
+    // usually mounted when a page is trashed, so on opening it the global
+    // refetchOnMount:false would show a stale list; the mount refetch closes that.
+    // (Do NOT remove the three trash-list invalidations — they are not dead code.)
     refetchOnMount: true,
   });
 }

@@ -41,7 +41,7 @@ function getTitle(name: string, icon: string) {
  * visually unchanged, so the breadcrumb no longer re-renders on every tree
  * event (it previously subscribed to the whole treeDataAtom).
  */
-function breadcrumbPathEqual(
+export function breadcrumbPathEqual(
   a: SpaceTreeNode[] | null,
   b: SpaceTreeNode[] | null,
 ): boolean {
