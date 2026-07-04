@@ -45,6 +45,7 @@ const HOST_CONTRACT_METHODS = [
   "getOutline",
   "getPageJson",
   "getNode",
+  "searchInPage",
   "getTable",
   "listComments",
   "getComment",

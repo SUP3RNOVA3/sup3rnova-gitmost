@@ -55,6 +55,11 @@ export interface DocmostClientLike {
   getOutline(pageId: string): Promise<Record<string, unknown>>;
   getPageJson(pageId: string): Promise<Record<string, unknown>>;
   getNode(pageId: string, nodeId: string): Promise<Record<string, unknown>>;
+  searchInPage(
+    pageId: string,
+    query: string,
+    opts?: { regex?: boolean; caseSensitive?: boolean; limit?: number },
+  ): Promise<Record<string, unknown>>;
   getTable(pageId: string, tableRef: string): Promise<Record<string, unknown>>;
   listComments(pageId: string): Promise<unknown[]>;
   getComment(

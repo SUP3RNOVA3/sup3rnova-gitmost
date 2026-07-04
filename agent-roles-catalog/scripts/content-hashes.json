@@ -1,7 +1,7 @@
 {
   "fact-checker": {
-    "version": 5,
-    "hash": "d7769872968109a1ccfb58d71bc3f3564a750b91766156f59031762848de4f24"
+    "version": 6,
+    "hash": "6bb22a9e5a5079b5cb287b5b26addbd36b9afeb7c9508287dcad9343fc53d685"
   },
   "line-editor": {
     "version": 4,
@@ -12,8 +12,8 @@
     "hash": "66fe653003b4f63ef3c3a5c5c48552fe47daeefffc16907c37c35f0e8da98851"
   },
   "proofreader": {
-    "version": 7,
-    "hash": "fdf8e0a443fa3c4102095e024146401363629a3f9015fb938c7bac2642825e56"
+    "version": 8,
+    "hash": "cef39fed321779631ddd1077fcba53399adf0e48b301df281c71eb042610900d"
   },
   "researcher": {
     "version": 1,

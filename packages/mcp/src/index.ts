@@ -46,7 +46,7 @@ const VERSION = packageJson.version;
 // Exported for that test.
 export const SERVER_INSTRUCTIONS =
   "Docmost editing guide — choose the tool by intent.\n" +
-  "READ: find a page -> search (workspace-wide full-text); list -> list_pages / list_spaces. Locate blocks and their ids CHEAPLY -> get_outline (compact top-level map; start here, not get_page_json). One block's subtree -> get_node (by attrs.id, or \"#<index>\" for tables, which carry no id). Whole page -> get_page (Markdown, lossy; inline <span data-comment-id> tags are comment anchors — markup, not text) or get_page_json (lossless ProseMirror with block ids). Hand a huge page (with images) to an external consumer without pulling it through the model context -> stash_page (returns a short-lived anonymous URL).\n" +
+  "READ: find a page -> search (workspace-wide full-text); list -> list_pages / list_spaces. Locate blocks and their ids CHEAPLY -> get_outline (compact top-level map; start here, not get_page_json). One block's subtree -> get_node (by attrs.id, or \"#<index>\" for tables, which carry no id). Find every occurrence of a string/regex ON a page (and where each is) -> search_in_page, NOT block-by-block get_node — it returns each hit's node ref + block index + context for a targeted comment. Whole page -> get_page (Markdown, lossy; inline <span data-comment-id> tags are comment anchors — markup, not text) or get_page_json (lossless ProseMirror with block ids). Hand a huge page (with images) to an external consumer without pulling it through the model context -> stash_page (returns a short-lived anonymous URL).\n" +
   "EDIT: fix wording/typos/numbers -> edit_page_text (find/replace inside blocks, no node id needed). Change ONE block (paragraph/heading/callout/etc.) structurally -> patch_node (by attrs.id from get_outline). Add a block -> insert_node (before/after a block by attrs.id or by anchor text, or append). Remove a block -> delete_node (by attrs.id). Tables -> table_get / table_update_cell / table_insert_row / table_delete_row (address by \"#<index>\" from get_outline; table nodes have no attrs.id). Images -> insert_image (add from a web URL) / replace_image (swap an existing image). Footnotes -> insert_footnote. Bulk/structural rewrite -> update_page_json (full ProseMirror replace; prefer the granular tools above to avoid resending the whole ~100KB+ document). Complex/scripted rewrite (multiple coordinated edits, renumbering) -> docmost_transform: write a JS `(doc, ctx) => doc` transform, preview the diff with dryRun (default), then apply with dryRun:false; ctx.helpers includes commentsToFootnotes for turning inline comments into numbered footnotes.\n" +
   "PAGES: new -> create_page (Markdown). Rename (title only) -> rename_page. Move -> move_page. Delete -> delete_page (SOFT delete — the page goes to trash and is restorable; nothing is permanent). Copy/replace a page's whole content from another page (server-side, no document through the model) -> copy_page_content. Sharing -> share_page / unshare_page / list_shares; share_page makes the page PUBLICLY accessible — do it only when explicitly asked.\n" +
   "COMMENTS: create_comment is always inline and requires an EXACT selection — contiguous text from a single block, <=250 chars (fails rather than leaving an unanchored comment); reply to a thread via parentCommentId. Propose a concrete text fix for one-click human approval -> create_comment with suggestedText (the exact plain-text replacement for the selection; the selection must then be UNIQUE in the page — extend it with context if needed); prefer this over editing directly when the change is subjective or needs the author's sign-off. Manage -> list_comments, update_comment, resolve_comment (resolve/reopen, reversible — prefer over delete to close), delete_comment, check_new_comments.\n" +
@@ -186,6 +186,19 @@ registerShared(SHARED_TOOL_SPECS.getNode, async ({ pageId, nodeId }) => {
   const result = await docmostClient.getNode(pageId, nodeId);
   return jsonContent(result);
 });
+
+// Tool: search_in_page
+registerShared(
+  SHARED_TOOL_SPECS.searchInPage,
+  async ({ pageId, query, regex, caseSensitive, limit }) => {
+    const result = await docmostClient.searchInPage(pageId, query, {
+      regex,
+      caseSensitive,
+      limit,
+    });
+    return jsonContent(result);
+  },
+);
 
 // Tool: table_get
 server.registerTool(
