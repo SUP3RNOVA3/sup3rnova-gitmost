@@ -2,15 +2,28 @@ import { FastifyReply, FastifyRequest } from 'fastify';
 import { isStreamingResponse } from './metrics.constants';
 import { observeHttp } from './metrics.registry';
 
+// URL path prefixes served by @fastify/static (client build output under
+// client/dist). Their filenames are content-hashed (index-*.js, chunk-*.js),
+// so a NEW set of names is minted on every deploy — using them as the `route`
+// label would grow the label set without bound (#362). Collapse them all to one
+// bounded `static` label. (Edge latency for static is already measured by
+// Traefik's traefik_router_request_duration_*.)
+const STATIC_PATH_PREFIXES = ['/assets/', '/vad/', '/brand/', '/locales/'];
+
 /**
  * Resolve the BOUNDED route label for an HTTP response.
  *
- * HARD REQUIREMENT (#355): use the ROUTE TEMPLATE (`/pages/:id`), NEVER the raw
- * URL (`/pages/abc-123`), so label cardinality stays finite. Fastify exposes the
- * matched template on `req.routeOptions.url`. On 404s (no route matched) that is
- * missing → collapse to the literal `unknown`.
+ * HARD REQUIREMENT (#355): use the ROUTE TEMPLATE (`/pages/:id`), NEVER a raw
+ * URL (`/pages/abc-123` or `/assets/index-CAbxDtto.js`), so label cardinality
+ * stays finite. Fastify exposes the matched template on `req.routeOptions.url`,
+ * BUT @fastify/static serves each file through a route whose matched url is the
+ * raw (hashed) file path — so for static assets that value is itself unbounded.
+ * Detect static requests by their path prefix FIRST and collapse to `static`;
+ * otherwise use the route template; on a 404 (no route matched) → `unknown`.
  */
 export function resolveRouteLabel(req: FastifyRequest): string {
+  const path = (req.url ?? '').split('?', 1)[0];
+  if (STATIC_PATH_PREFIXES.some((p) => path.startsWith(p))) return 'static';
   const url = req.routeOptions?.url;
   return typeof url === 'string' && url.length > 0 ? url : 'unknown';
 }
