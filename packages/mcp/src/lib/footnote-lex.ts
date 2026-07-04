@@ -1,12 +1,14 @@
 /**
- * Shared, fence-aware line lexer for footnote markdown (MCP-internal).
+ * Shared, fence-aware line lexer for legacy footnote markdown (MCP-internal).
  *
- * Both the importer (`extractFootnotes` in collaboration.ts, which strips
- * definition lines and rebuilds a footnotes section) and the diagnostics
- * (`analyzeFootnotes` in footnote-analyze.ts) must agree EXACTLY on which lines
- * are definitions and which lines are inert (inside a code fence). Sharing one
- * lexer makes "the analyzer sees what the importer leaves" a structural property
- * instead of two hand-kept copies that can drift (#166 review).
+ * Since #293 STEP 5 the markdown -> ProseMirror IMPORT path lives in the shared
+ * `@docmost/prosemirror-markdown` package (inline `^[body]` footnotes), so this
+ * lexer no longer backs an mcp importer. It now backs ONLY the import-time
+ * diagnostics (`analyzeFootnotes` in footnote-analyze.ts), which still scan the
+ * raw markdown for legacy reference-style `[^id]:` definition lines and surface
+ * advisory warnings (duplicate/orphan definitions) about content that is now
+ * inert on import. Fence-awareness (a `[^id]:` line inside a ``` / ~~~ block is
+ * NOT a definition) is the property the analyzer relies on.
  *
  * NOTE: this is deliberately NOT shared with editor-ext's
  * `extractFootnoteDefinitions` — that lives in a different package and the

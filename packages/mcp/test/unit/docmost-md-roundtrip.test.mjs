@@ -210,13 +210,17 @@ test("drawio round-trips through export and import", () => {
     ],
   };
 
+  // #293 canon #8: the media family (image/video/audio/drawio/excalidraw)
+  // serializes to the markdown image form `![alt](src)` plus a trailing
+  // discriminator comment `<!--drawio {json}-->` carrying the non-src attrs.
   const body = convertProseMirrorToMarkdown(doc);
-  assert.match(body, /data-type="drawio"/);
-  assert.match(body, /data-src="https:\/\/example\/diagram\.xml"/);
+  assert.match(body, /!\[\]\(https:\/\/example\/diagram\.xml\)/);
+  assert.match(body, /<!--drawio \{"attachmentId":"att-7"\}-->/);
 
   return markdownToProseMirror(body).then((rebuilt) => {
     const diagram = find(rebuilt, "drawio");
     assert.ok(diagram, "expected a drawio node after import");
     assert.equal(diagram.attrs.src, "https://example/diagram.xml");
+    assert.equal(diagram.attrs.attachmentId, "att-7");
   });
 });

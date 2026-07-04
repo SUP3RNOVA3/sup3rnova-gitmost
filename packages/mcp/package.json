@@ -32,6 +32,7 @@
   "author": "Moritz Krause",
   "license": "MIT",
   "dependencies": {
+    "@docmost/prosemirror-markdown": "workspace:*",
     "@fellow/prosemirror-recreate-transform": "^1.2.3",
     "@hocuspocus/provider": "^3.4.4",
     "@hocuspocus/transformer": "^3.4.4",

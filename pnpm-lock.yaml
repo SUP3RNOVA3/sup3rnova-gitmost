@@ -953,6 +953,9 @@ importers:
 
   packages/mcp:
     dependencies:
+      '@docmost/prosemirror-markdown':
+        specifier: workspace:*
+        version: link:../prosemirror-markdown
       '@fellow/prosemirror-recreate-transform':
         specifier: ^1.2.3
         version: 1.2.3

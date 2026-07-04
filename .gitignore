@@ -14,6 +14,11 @@ packages/git-sync/build/
 # never committed, so src/ and prod can never silently diverge).
 packages/prosemirror-markdown/build/
 
+# mcp compiled output (built in CI/Docker via `pnpm build`, never committed, so
+# src/ and prod can never silently diverge). Matches the git-sync/prosemirror-
+# markdown convention; the package is private and rebuilt at deploy.
+packages/mcp/build/
+
 # Logs
 logs
 *.log

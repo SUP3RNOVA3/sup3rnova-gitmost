@@ -1,5 +1,5 @@
 /**
- * Footnote diagnostics for imported Markdown (issue #166).
+ * Legacy footnote diagnostics for imported Markdown (issue #166).
  *
  * A PURE, fence-aware text scan (independent of the Markdown->ProseMirror
  * conversion path, so it reports the same problems for `create_page`,
@@ -7,11 +7,18 @@
  * importer still creates the page; this only surfaces footnote problems to the
  * caller so an agent can fix its own markup instead of shipping broken footnotes.
  *
+ * SCOPE after #293 STEP 5: the canonical import form is now inline `^[body]`
+ * footnotes (handled by `@docmost/prosemirror-markdown`), where these problems
+ * cannot arise. This scan therefore targets the LEGACY reference-style
+ * (`[^id]` / `[^id]:`) markup, which is now inert on import (left as literal
+ * text). The warnings remain useful as an advisory nudge when an agent still
+ * authors the old syntax, but they no longer describe what the importer builds.
+ *
  * Detected problems:
  *  - danglingReferences: a `[^id]` reference with no `[^id]:` definition.
  *  - emptyDefinitions:   a `[^id]:` whose (kept) text is empty/whitespace.
  *  - duplicateDefinitions: an id defined by two or more `[^id]:` lines (only the
- *    first is kept on import — first-wins; see extractFootnotes).
+ *    first would have been kept under the old first-wins import).
  *  - referencesInTables: a `[^id]` marker found in a GFM table row (heuristic:
  *    the line, trimmed, starts with `|`) — footnotes in table cells often do not
  *    render as expected.

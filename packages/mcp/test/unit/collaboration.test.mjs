@@ -127,36 +127,54 @@ test("markdownToProseMirror: an aligned GFM table maps header alignment", async 
 });
 
 // Comment-body data-loss guard (#228 review #4): markdownToProseMirror is reused
-// for COMMENT bodies (createComment/updateComment), so it must NOT canonicalize —
-// a comment may legitimately carry a standalone footnote definition with no
-// matching reference, and canonicalization would drop the whole list (the text
-// would vanish). The page-write variant DOES canonicalize.
-test("markdownToProseMirror (comment path) PRESERVES a reference-less footnote definition", async () => {
+// for COMMENT bodies (createComment/updateComment), so it must NOT canonicalize.
+// Under the #293 canon, footnotes are INLINE (`^[body]`), so a comment can no
+// longer carry a reference-less definition to be dropped — but the comment path
+// must still (a) leave a legacy reference-style `[^id]:` line as harmless literal
+// TEXT (never silently deleted) and (b) preserve an inline footnote it does
+// contain (no canonicalization stripping it). The page-write variant canonicalizes.
+test("markdownToProseMirror (comment path) keeps a legacy `[^id]:` line as literal text", async () => {
+  // A reference-style `[^1]:` line is not canonical footnote syntax anymore, so it
+  // is not parsed into a footnote node — but its TEXT must survive verbatim (no
+  // data loss on the comment write path).
   const md = "A comment.\n\n[^1]: a standalone footnote definition";
   const doc = await markdownToProseMirror(md);
-  const defs = findAll(doc, "footnoteDefinition");
-  assert.equal(defs.length, 1, "the footnote definition must be preserved");
+  assert.equal(
+    findAll(doc, "footnoteDefinition").length,
+    0,
+    "reference-style line is not a footnote node",
+  );
   assert.match(
     JSON.stringify(doc),
     /a standalone footnote definition/,
-    "the definition text must survive the comment write path",
+    "the text must survive the comment write path",
   );
 });
 
-test("markdownToProseMirrorCanonical (page path) DROPS a reference-less footnote definition", async () => {
-  // Same input through the PAGE variant: with no reference, the canonical doc has
-  // no footnotesList (this is the page-side behavior the comment path must avoid).
-  const md = "A page.\n\n[^1]: a standalone footnote definition";
-  const doc = await markdownToProseMirrorCanonical(md);
-  assert.equal(findAll(doc, "footnotesList").length, 0);
-  assert.equal(findAll(doc, "footnoteDefinition").length, 0);
+test("markdownToProseMirror (comment path) PRESERVES an inline footnote (no canonicalization)", async () => {
+  // An inline `^[body]` footnote in a comment imports to a real footnote node and
+  // is NOT dropped: the comment path must never canonicalize away content.
+  const md = "A comment.\n\n^[an inline footnote]";
+  const doc = await markdownToProseMirror(md);
+  assert.equal(findAll(doc, "footnoteDefinition").length, 1);
+  assert.equal(findAll(doc, "footnotesList").length, 1);
+  assert.match(JSON.stringify(doc), /an inline footnote/);
 });
 
-test("markdownToProseMirrorCanonical still canonicalizes a real page footnote (order)", async () => {
-  // Page path must STILL canonicalize: refs b,a -> definitions reorder to b,a.
-  const md = "See[^b] then[^a].\n\n[^a]: alpha\n[^b]: bravo";
+test("markdownToProseMirrorCanonical (page path) yields a single reference-ordered list", async () => {
+  // Page path produces the canonical footnote topology: one trailing
+  // `footnotesList`, definitions in FIRST-REFERENCE order, ids assigned
+  // sequentially. Inline `^[body]` footnotes carry the body at the reference
+  // point, so the bottom list is inherently reference-ordered.
+  const md = "See^[bravo] then^[alpha].";
   const doc = await markdownToProseMirrorCanonical(md);
-  const defs = findAll(doc, "footnoteDefinition").map((d) => d.attrs.id);
-  assert.deepEqual(defs, ["b", "a"]);
+  const defs = findAll(doc, "footnoteDefinition");
+  assert.deepEqual(
+    defs.map((d) => d.attrs.id),
+    ["fn-1", "fn-2"],
+  );
   assert.equal(findAll(doc, "footnotesList").length, 1);
+  // Bodies stay in reference order (bravo referenced before alpha).
+  assert.match(JSON.stringify(defs[0]), /bravo/);
+  assert.match(JSON.stringify(defs[1]), /alpha/);
 });

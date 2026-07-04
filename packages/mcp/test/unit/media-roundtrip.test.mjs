@@ -25,19 +25,15 @@ const findAll = (node, type, acc = []) => {
 };
 
 // ---------------------------------------------------------------------------
-// DATA-LOSS: atom block nodes with no converter case serialize to "" and the
-// whole block disappears from markdown export.
-//
-// markdown-converter.ts has a `default` branch (~line 601) that renders a node
-// as `nodeContent.map(processNode).join("")`. For a leaf/atom node (no
-// content) that yields "" — so the node (and ALL its attributes) is dropped.
-// `htmlEmbed` and `pageBreak` are both block atoms in docmost-schema.ts with no
-// case in the converter, so they vanish on markdown export.
-//
-// These tests assert the CURRENT (buggy) behavior and name it, so that when a
-// converter case is added the failing assertion flags the test for an update.
+// #293 canon: atom block nodes with no NATIVE markdown syntax are preserved via
+// dedicated converter forms (they used to serialize to "" and vanish — the old
+// mcp converter's data-loss gap, now fixed by consuming the shared package):
+//   - htmlEmbed  -> a raw `<div data-type="htmlEmbed" data-source=… data-height=…>`
+//                   block (source base64-encoded so arbitrary HTML is inert);
+//   - pageBreak  -> a standalone `<!--pagebreak-->` machinery comment (#5).
+// Both survive markdown export AND a full PM -> markdown -> PM round-trip.
 // ---------------------------------------------------------------------------
-test("DATA-LOSS: an htmlEmbed block is silently dropped from markdown export (no converter case)", () => {
+test("htmlEmbed block survives markdown export (source + height preserved)", () => {
   const input = doc(
     para(text("before")),
     { type: "htmlEmbed", attrs: { source: "<b>hi</b>", height: 200 } },
@@ -45,32 +41,31 @@ test("DATA-LOSS: an htmlEmbed block is silently dropped from markdown export (no
   );
   const md = convertProseMirrorToMarkdown(input);
 
-  // BUG: the htmlEmbed block, including its `source` and `height` attrs, is
-  // gone — only the surrounding paragraphs survive. If a future fix adds an
-  // htmlEmbed case, update this test to assert the block (or a placeholder)
-  // survives instead.
-  assert.equal(md, "before\n\n\n\nafter", "htmlEmbed currently disappears");
-  assert.ok(!md.includes("<b>hi</b>"), "the embed source is NOT preserved (data-loss)");
+  assert.match(md, /data-type="htmlEmbed"/);
+  assert.match(md, /data-height="200"/);
+  // The raw source is base64-encoded in data-source (not emitted verbatim), so
+  // the surrounding markdown cannot be corrupted by hostile embed HTML.
+  assert.match(md, /data-source="[^"]+"/);
+  assert.ok(md.includes("before") && md.includes("after"));
 });
 
-test("DATA-LOSS: an htmlEmbed does NOT round-trip (PM -> markdown -> PM loses the node)", async () => {
+test("htmlEmbed round-trips PM -> markdown -> PM (node + source recovered)", async () => {
   const input = doc(
     para(text("x")),
     { type: "htmlEmbed", attrs: { source: "<i>raw</i>", height: 120 } },
   );
   const out = await markdownToProseMirror(convertProseMirrorToMarkdown(input));
-  assert.equal(
-    findAll(out, "htmlEmbed").length,
-    0,
-    "htmlEmbed is lost across a markdown round-trip (known data-loss gap)",
-  );
+  const embeds = findAll(out, "htmlEmbed");
+  assert.equal(embeds.length, 1, "htmlEmbed survives the markdown round-trip");
+  assert.equal(embeds[0].attrs.source, "<i>raw</i>", "source recovered intact");
 });
 
-test("DATA-LOSS: a pageBreak block is silently dropped from markdown export (no converter case)", () => {
+test("pageBreak block survives markdown export and round-trips", async () => {
   const input = doc(para(text("a")), { type: "pageBreak" }, para(text("b")));
   const md = convertProseMirrorToMarkdown(input);
-  // BUG: pageBreak (a block atom with no converter case) disappears.
-  assert.equal(md, "a\n\n\n\nb", "pageBreak currently disappears");
+  assert.match(md, /<!--pagebreak-->/);
+  const out = await markdownToProseMirror(md);
+  assert.equal(findAll(out, "pageBreak").length, 1);
 });
 
 // ---------------------------------------------------------------------------
