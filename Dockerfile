@@ -5,6 +5,13 @@ RUN npm install -g pnpm@10.4.0
 
 FROM base AS builder
 
+# re2 (packages/mcp) always compiles from source under pnpm (the prebuilt-binary
+# download cannot identify the GitHub repo), so node-gyp needs python3/make/g++.
+# This stage is discarded, so the toolchain can stay installed.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY . .
@@ -57,9 +64,16 @@ COPY --from=builder /app/patches /app/patches
 
 RUN chown -R node:node /app
 
-USER node
+# Toolchain is needed transiently to compile re2 during the prod install; install
+# and purge it in one layer to keep the final image slim. The install itself runs
+# as the node user via su to keep node_modules ownership without a costly chown layer.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && su node -c "pnpm install --frozen-lockfile --prod" \
+  && apt-get purge -y --auto-remove python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
 
-RUN pnpm install --frozen-lockfile --prod
+USER node
 
 RUN mkdir -p /app/data/storage
 
