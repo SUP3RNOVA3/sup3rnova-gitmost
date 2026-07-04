@@ -118,4 +118,29 @@ describe("StreamingPlainText", () => {
       "хвост",
     ]);
   });
+
+  // SECURITY INVARIANT — the load-bearing property of the streaming path: the
+  // reasoning text is raw, untrusted model output rendered WITHOUT a sanitizer
+  // (no marked/DOMPurify, no innerHTML). PlainChunk emits it as a React text
+  // node, which escapes it, so HTML in the model output is inert. This test
+  // pins that the path is a TEXT sink, not an HTML sink: a future change to
+  // `dangerouslySetInnerHTML` (reintroducing XSS) MUST fail here.
+  //
+  // The existing tests assert via textContent, which strips tags and so cannot
+  // distinguish an escaped literal from injected DOM. This one asserts on the
+  // parsed DOM directly: if the markup were injected as HTML, the <img>/<b>
+  // would become real elements and querySelector would find them.
+  it("renders HTML-like reasoning as an escaped literal, never as injected DOM", () => {
+    const text = "<img src=x onerror=alert(1)>\n\n<b>hi</b>";
+    const { container } = render(<StreamingPlainText text={text} />);
+    // No DOM elements were created from the payload — it was NOT parsed as HTML.
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector("b")).toBeNull();
+    // The raw markup survived verbatim as text (proving it is escaped, not
+    // interpreted). textContent alone can't prove this, but combined with the
+    // querySelector assertions above it does: the literals are present AND no
+    // elements exist.
+    expect(container.textContent).toContain("<b>hi</b>");
+    expect(container.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
 });
