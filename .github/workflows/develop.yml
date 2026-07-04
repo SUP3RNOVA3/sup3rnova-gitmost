@@ -18,13 +18,48 @@ env:
   IMAGE: ghcr.io/vvzvlad/gitmost
 
 jobs:
-  # Run the reusable test suite first so a failing test blocks the image build
-  # (the e2e jobs below gate the build as well).
+  # Run the reusable test suite. Together with the e2e jobs below it gates the
+  # publish job (the image push), not the build itself — build runs in parallel.
   test:
     uses: ./.github/workflows/test.yml
 
+  # Runs in parallel with the test/e2e jobs and only warms the buildx cache
+  # (GHA cache, scope develop-amd64). No push happens here — the publish job
+  # below is the only one that pushes the image.
   build:
-    needs: [test, e2e-server, e2e-mcp]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve version
+        id: version
+        run: echo "value=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      - name: Build develop image (warm cache, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.value }}
+            AI_AGENT_ROLES_CATALOG_URL=https://raw.githubusercontent.com/vvzvlad/gitmost/develop/agent-roles-catalog
+          push: false
+          cache-from: type=gha,scope=develop-amd64
+          cache-to: type=gha,scope=develop-amd64,mode=max,ignore-error=true
+
+  # The gate: rebuilds from the cache the build job just wrote (near-instant on
+  # a cache hit; worst case — cache eviction — a full rebuild, which matches the
+  # old sequential timing) and pushes :develop only when unit tests AND both
+  # e2e suites AND the build are green.
+  publish:
+    needs: [test, e2e-server, e2e-mcp, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -58,10 +93,10 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:develop
           cache-from: type=gha,scope=develop-amd64
-          cache-to: type=gha,scope=develop-amd64,mode=max,ignore-error=true
 
-  # e2e jobs gate the build: the :develop image is built and pushed only when
-  # unit tests AND both e2e suites pass (build.needs lists all three).
+  # e2e jobs gate the publish (image push), not the build: the :develop image
+  # is pushed only when unit tests AND both e2e suites pass (publish.needs
+  # lists them all).
   e2e-server:
     runs-on: ubuntu-latest
     # Hard cap: the full-AppModule e2e leaks open handles and hung jest to the 6h max.
@@ -122,7 +157,7 @@ jobs:
       - name: Run server e2e
         run: pnpm --filter ./apps/server test:e2e
 
-  # Gates the build too — see the comment above e2e-server.
+  # Gates the publish too — see the comment above e2e-server.
   e2e-mcp:
     runs-on: ubuntu-latest
     timeout-minutes: 20
