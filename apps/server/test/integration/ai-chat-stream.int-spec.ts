@@ -146,6 +146,9 @@ describe('AiChatService.stream [integration]', () => {
       {} as any, // aiAgentRoleRepo (role is pre-resolved + passed in)
       {} as any, // pageRepo (only used when body.openPage is set)
       {} as any, // pageAccess (idem)
+      // environment (#332): keep deferred tool loading OFF for this lifecycle
+      // harness so the toolset/behavior is exactly as before.
+      { isAiChatDeferredToolsEnabled: () => false } as any,
     );
   }
 

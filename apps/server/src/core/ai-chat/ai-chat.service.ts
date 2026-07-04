@@ -30,7 +30,15 @@ import {
 } from '@docmost/db/types/entity.types';
 import { AiChatToolsService } from './tools/ai-chat-tools.service';
 import { McpClientsService } from './external-mcp/mcp-clients.service';
+import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { buildSystemPrompt } from './ai-chat.prompt';
+import {
+  CORE_TOOL_KEYS,
+  CORE_TOOL_SET,
+  LOAD_TOOLS_NAME,
+  makeLoadToolsTool,
+  buildExternalToolCatalog,
+} from './tools/tool-tiers';
 import { computePageChange } from './page-change/page-change.util';
 import { roleModelOverride } from './roles/role-model-config';
 import {
@@ -54,22 +62,50 @@ const FINAL_STEP_INSTRUCTION =
   'language. If the information is incomplete, say so explicitly: summarize ' +
   'what you found, what is still missing, and give your best partial conclusion.';
 
-// Pure, unit-testable: decide per-step overrides. Returns undefined for normal
-// steps; on the final allowed step forces a text-only synthesis answer.
+// Pure, unit-testable: decide per-step overrides. Two responsibilities:
+//   1. Final-step lockdown (always): on the final allowed step force a text-only
+//      synthesis answer (toolChoice 'none' + FINAL_STEP_INSTRUCTION). This WINS —
+//      it takes precedence over the deferred-tool narrowing below.
+//   2. Deferred tool visibility (#332): when `deferredEnabled` and NOT the final
+//      step, expose only the CORE tools + loadTools + whatever loadTools has
+//      activated so far this turn (`activatedTools`), via `activeTools`. Deferred
+//      tools stay in the <tool_catalog> until the model loads them.
+// When `deferredEnabled` is false the behavior is unchanged: undefined on normal
+// steps (all tools active), lockdown on the final step.
+//
 // `system` is the in-scope system prompt; we CONCATENATE so the original
 // persona/context is preserved — a bare `system` override would REPLACE the
-// whole system prompt for the step.
+// whole system prompt for the step. `activatedTools` is PER-TURN mutable state
+// owned by the streaming loop (a closure Set grown by loadTools); it is passed
+// in (not module-global, not persisted) so this stays a pure function of its
+// arguments.
 //
 // NOTE: at AI SDK v7 the per-step `system` field is renamed to `instructions`.
 // On v6 (`^6.0.134`) `system` is the correct field — adjust when bumping.
 export function prepareAgentStep(
   stepNumber: number,
   system: string,
-): { toolChoice: 'none'; system: string } | undefined {
+  activatedTools: ReadonlySet<string> | readonly string[] = [],
+  deferredEnabled = false,
+):
+  | { toolChoice: 'none'; system: string }
+  | { activeTools: string[] }
+  | undefined {
+  // Final-step lockdown WINS (applies regardless of the deferred toggle).
   if (stepNumber >= MAX_AGENT_STEPS - 1) {
     return {
       toolChoice: 'none',
       system: `${system}\n\n${FINAL_STEP_INSTRUCTION}`,
+    };
+  }
+  // Deferred tool loading: narrow this step's visible tools to CORE + loadTools
+  // + the tools already activated this turn.
+  if (deferredEnabled) {
+    const activated = Array.isArray(activatedTools)
+      ? activatedTools
+      : [...activatedTools];
+    return {
+      activeTools: [...CORE_TOOL_KEYS, LOAD_TOOLS_NAME, ...activated],
     };
   }
   return undefined;
@@ -206,6 +242,9 @@ export class AiChatService implements OnModuleInit {
     private readonly aiAgentRoleRepo: AiAgentRoleRepo,
     private readonly pageRepo: PageRepo,
     private readonly pageAccess: PageAccessService,
+    // Reads the AI_CHAT_DEFERRED_TOOLS toggle (#332). Injected last so existing
+    // positional constructor callers (tests) only append one stub.
+    private readonly environment: EnvironmentService,
   ) {}
 
   /**
@@ -625,9 +664,25 @@ export class AiChatService implements OnModuleInit {
     // Build the system prompt + Docmost toolset. If either throws after the
     // external MCP lease was taken above, release the lease before rethrowing so
     // the leased transports are not leaked (#185 review).
+    // Deferred tool loading toggle (#332). When ON, the model sees a compact
+    // <tool_catalog> and only CORE tools + loadTools are active each step; other
+    // tools (fat/rare in-app tools + ALL external MCP tools) load on demand. When
+    // OFF, every tool is active and nothing below changes.
+    const deferredEnabled = this.environment.isAiChatDeferredToolsEnabled();
+
     let system: string;
     let docmostTools: Awaited<ReturnType<AiChatToolsService['forUser']>>;
     try {
+      // Assemble the deferred catalog for the system prompt: hand-written lines
+      // for the in-app deferred tools + a derived line for each external MCP tool
+      // (also deferred by default). Only built when the feature is enabled.
+      const toolCatalog = deferredEnabled
+        ? [
+            ...(await this.tools.getInAppDeferredCatalog()),
+            ...buildExternalToolCatalog(external.tools),
+          ]
+        : [];
+
       system = buildSystemPrompt({
         workspace,
         adminPrompt: resolved?.systemPrompt,
@@ -644,6 +699,10 @@ export class AiChatService implements OnModuleInit {
         // Detected between-turns human edit to the open page (#274): adds the
         // page_changed note + unified diff so the agent doesn't overwrite it.
         pageChanged,
+        // Deferred tool loading (#332): renders the <tool_catalog> block (only
+        // when enabled + non-empty) so the model can activate deferred tools.
+        deferredToolsEnabled: deferredEnabled,
+        toolCatalog,
       });
 
       // Pass the resolved chatId so the write tools can mint provenance tokens
@@ -664,7 +723,31 @@ export class AiChatService implements OnModuleInit {
       throw err;
     }
 
-    const tools = { ...external.tools, ...docmostTools };
+    // Base toolset: external MCP tools + Docmost in-app tools (Docmost wins on a
+    // name clash — external are namespaced, so no clash is expected).
+    const baseTools = { ...external.tools, ...docmostTools };
+
+    // Deferred tool loading state (#332), scoped to THIS streaming loop:
+    //  - `activatedTools` is per-TURN mutable state — a fresh closure Set created
+    //    per streamText call, NOT module-global and NOT persisted, so a new turn
+    //    starts cold. loadTools.execute adds to it; prepareAgentStep reads it to
+    //    widen `activeTools` on the NEXT step.
+    //  - `validDeferredNames` = every tool that is NOT core (the in-app deferred
+    //    tools + ALL external MCP tools), computed from the ACTUAL toolset so an
+    //    external tool is loadable by its namespaced name. loadTools rejects any
+    //    name outside this set.
+    const activatedTools = new Set<string>();
+    const validDeferredNames = new Set<string>(
+      Object.keys(baseTools).filter((k) => !CORE_TOOL_SET.has(k)),
+    );
+    // Add the loadTools meta-tool ONLY when the feature is enabled; when off the
+    // toolset and behavior are exactly as before.
+    const tools = deferredEnabled
+      ? {
+          ...baseTools,
+          [LOAD_TOOLS_NAME]: makeLoadToolsTool(activatedTools, validDeferredNames),
+        }
+      : baseTools;
 
     // Accumulate the turn's streamed output so a provider error / disconnect can
     // persist the PARTIAL answer the user already saw — the SDK's onError/onAbort
@@ -799,7 +882,8 @@ export class AiChatService implements OnModuleInit {
         // ends with no assistant text (an empty turn). prepareAgentStep forbids
         // further tool calls and appends a synthesis instruction on that step,
         // concatenated onto the original `system` so the persona is preserved.
-        prepareStep: ({ stepNumber }) => prepareAgentStep(stepNumber, system),
+        prepareStep: ({ stepNumber }) =>
+          prepareAgentStep(stepNumber, system, activatedTools, deferredEnabled),
         abortSignal: signal,
         onChunk: ({ chunk }) => {
           // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Any model

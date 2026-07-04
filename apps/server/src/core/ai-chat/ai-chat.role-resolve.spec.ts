@@ -53,6 +53,7 @@ describe('AiChatService.resolveRoleForRequest', () => {
       aiAgentRoleRepo as never,
       {} as never, // pageRepo
       {} as never, // pageAccess
+      {} as never, // environment
     );
     return { service, aiChatRepo, aiAgentRoleRepo };
   }

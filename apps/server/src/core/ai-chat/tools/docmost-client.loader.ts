@@ -241,6 +241,11 @@ export interface SharedToolSpec {
   mcpName: string;
   inAppKey: string;
   description: string;
+  // Deferred-tool metadata (#332). Optional in this mirror so an older/stale
+  // @docmost/mcp build (pre-#332) still type-checks; the in-app catalog builder
+  // reads them defensively. The external /mcp server ignores both fields.
+  tier?: 'core' | 'deferred';
+  catalogLine?: string;
   // Loose `z` on purpose: the registry is zod-agnostic so the server can pass
   // its own zod (v4) and the MCP package its own (v3) into the same builder.
   buildShape?: (z: any) => Record<string, unknown>;

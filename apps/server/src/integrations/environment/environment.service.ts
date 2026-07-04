@@ -261,6 +261,21 @@ export class EnvironmentService {
     return disable === 'true';
   }
 
+  /**
+   * Deferred tool loading for the in-app AI chat (#332). When enabled, the agent
+   * sees a compact <tool_catalog> and only CORE tools + the loadTools meta-tool
+   * are active each step; deferred tools (the fat/rare ones + all external MCP
+   * tools) load on demand. Defaults to ENABLED — the issue treats deferred
+   * loading as the new behavior; set AI_CHAT_DEFERRED_TOOLS=false to restore the
+   * old "all tools always active" behavior.
+   */
+  isAiChatDeferredToolsEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('AI_CHAT_DEFERRED_TOOLS', 'true')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
   getPostHogHost(): string {
     return this.configService.get<string>('POSTHOG_HOST');
   }

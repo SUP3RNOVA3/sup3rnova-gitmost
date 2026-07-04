@@ -17,6 +17,10 @@ import { resolveCurrentPageResult } from './current-page.util';
 import { parseNodeArg } from './parse-node-arg';
 import { modelFriendlyInput } from './model-friendly-input';
 import { SandboxStore } from '../../../integrations/sandbox/sandbox.store';
+import {
+  buildInAppDeferredCatalog,
+  type ToolCatalogEntry,
+} from './tool-tiers';
 
 /**
  * Per-user, per-request adapter that exposes Docmost READ operations to the
@@ -121,6 +125,18 @@ export class AiChatToolsService {
       aiChatId,
     );
     return client.exportPageMarkdown(pageId);
+  }
+
+  /**
+   * Build the IN-APP deferred <tool_catalog> entries (#332): one "name — purpose"
+   * line per DEFERRED tool, merging the per-layer INLINE_TOOL_TIERS with the
+   * shared registry's own catalogLine. Loads @docmost/mcp for the shared specs
+   * (memoized). Core tools are always active and are NOT listed here. External
+   * MCP tools are catalogued separately by the caller (they are runtime-scoped).
+   */
+  async getInAppDeferredCatalog(): Promise<ToolCatalogEntry[]> {
+    const { sharedToolSpecs } = await loadDocmostMcp();
+    return buildInAppDeferredCatalog(sharedToolSpecs);
   }
 
   async forUser(
