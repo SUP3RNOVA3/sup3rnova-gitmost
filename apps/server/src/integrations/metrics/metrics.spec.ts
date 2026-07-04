@@ -33,6 +33,7 @@ describe('resolveRouteLabel (histogram route label)', () => {
     '/vad/silero_vad_v5.onnx',
     '/brand/logo.svg',
     '/locales/en.json',
+    '/icons/app-icon-192x192.png',
   ])('collapses hashed/static asset %p to "static" (#362 cardinality)', (url) => {
     // @fastify/static serves each file through a route whose matched url is the
     // raw (hashed) file path, so routeOptions.url is itself unbounded here.
@@ -61,6 +62,23 @@ describe('resolveRouteLabel (histogram route label)', () => {
       routeOptions: { url: '/api/pages/:id' },
     } as unknown as FastifyRequest;
     expect(resolveRouteLabel(req)).toBe('/api/pages/:id');
+  });
+
+  it.each([
+    // The TRAILING SLASH on the prefix is the anti-false-collapse guard: a path
+    // that is the prefix WITHOUT its slash, or merely shares the prefix as a
+    // substring of a longer segment, must NOT collapse. These would collapse
+    // under a buggy `includes('/assets/')` / slashless-prefix impl.
+    '/assets',
+    '/assetsx/foo.js',
+    '/iconset/x.png',
+  ])('does NOT collapse the prefix-boundary case %p', (url) => {
+    const req = {
+      url,
+      routeOptions: { url: '/some/:route' },
+    } as unknown as FastifyRequest;
+    expect(resolveRouteLabel(req)).not.toBe('static');
+    expect(resolveRouteLabel(req)).toBe('/some/:route');
   });
 });
 

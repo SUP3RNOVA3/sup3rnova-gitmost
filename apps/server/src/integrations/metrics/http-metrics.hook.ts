@@ -3,12 +3,20 @@ import { isStreamingResponse } from './metrics.constants';
 import { observeHttp } from './metrics.registry';
 
 // URL path prefixes served by @fastify/static (client build output under
-// client/dist). Their filenames are content-hashed (index-*.js, chunk-*.js),
-// so a NEW set of names is minted on every deploy — using them as the `route`
-// label would grow the label set without bound (#362). Collapse them all to one
-// bounded `static` label. (Edge latency for static is already measured by
-// Traefik's traefik_router_request_duration_*.)
-const STATIC_PATH_PREFIXES = ['/assets/', '/vad/', '/brand/', '/locales/'];
+// client/dist). `/assets/` holds the content-hashed bundle (index-*.js,
+// chunk-*.js) — a NEW set of names every deploy, i.e. an UNBOUNDED label set
+// (#362); the others (/vad/, /brand/, /locales/, /icons/ — copied verbatim from
+// public/) have stable names, so they are merely repetitive per-file labels
+// rather than unbounded. Either way none of these belong in the API-route
+// histogram: collapse them all to one bounded `static` label. (Edge latency for
+// static is already measured by Traefik's traefik_router_request_duration_*.)
+const STATIC_PATH_PREFIXES = [
+  '/assets/',
+  '/vad/',
+  '/brand/',
+  '/locales/',
+  '/icons/',
+];
 
 /**
  * Resolve the BOUNDED route label for an HTTP response.
