@@ -169,6 +169,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The server no longer runs out of heap during long autonomous agent runs.** A
+  new pnpm patch on `ai@6.0.134` stops the SDK from building a cumulative
+  snapshot of the ENTIRE turn text on every streamed text-delta when no output
+  strategy was requested (our server never requests one). Unpatched, those
+  O(n²) `partialOutput` snapshots piled up in a never-consumed internal
+  `tee()` branch of the stream result — a ~20-step, ~28k-chunk agent run
+  retained ~1.7 GB and OOM'd the 2 GB JS heap. Streaming granularity is
+  unchanged; the patch must be re-created if `ai` is ever bumped. (#184)
 - **Internal links in exported Markdown no longer lose their visible text.** A
   link whose target page name had no file extension (e.g. a bare title) was
   collapsed to empty text during export, producing an unclickable, label-less
