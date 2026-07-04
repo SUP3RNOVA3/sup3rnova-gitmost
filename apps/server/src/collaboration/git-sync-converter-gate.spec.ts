@@ -464,23 +464,28 @@ describe('git-sync converter §13.1 idempotency gate (editor-ext schema)', () =>
 });
 
 // ---------------------------------------------------------------------------
-// Image layout attrs — width/height now PRESERVED by canon #4, align is a
-// RESIDUAL divergence (isolated so it does NOT silently weaken the gate).
+// Image layout attrs preserved by canon #4 (width/height/align all round-trip).
 //
 // The `image` NODE round-trips through editor-ext fine. Plain markdown `![](src)`
 // has no way to express layout attrs, so the canonical converter (#293/#326
 // canon decision #4) appends a machine comment `<!--img {...}-->` carrying the
-// non-default attrs, and re-parses it on import — the same trailing-comment
-// pattern used for media/textAlign. This closes the former width/height loss.
+// NON-DEFAULT attrs, and re-parses it on import — the same trailing-comment
+// pattern used for media/textAlign.
 //
-// RESIDUAL GAP (must be fixed in the converter PACKAGE on develop, fixtures-first
-// — never on this branch, which no longer owns a converter copy): canon #4
-// currently serializes only `width`/`height` into `<!--img {...}-->`, NOT
-// `align`. So an image `align` is still dropped across the round trip. Locked
-// below as the exact current shape; when the package learns to carry `align`,
-// this assertion flips to `toBe('center')`.
+// About `align` — DO NOT repeat an earlier false diagnosis: align is NOT lost.
+// `center` is the schema default, so the emitter omits it (only left/right go
+// into the comment) and the importer restores it via the image `align` default
+// ("center"). `canonNormalized.align` reads `undefined` here ONLY because
+// `canonicalizeContent` normalizes the "center" default away SYMMETRICALLY (from
+// both the original and the round trip), so docsCanonicallyEqual is unaffected —
+// this is canonical-form normalization, not a divergence. Verified empirically:
+// left/right survive the raw round trip; center is restored on import then
+// canon-stripped on both sides. The real round-trip instability in this family
+// was the empty-string-vs-absent class (image.alt `absent -> ""`), fixed
+// parse-side in the converter PACKAGE on develop (PR #350). This branch absorbs
+// that fix via the next develop merge; nothing to flip here for align.
 // ---------------------------------------------------------------------------
-describe('git-sync converter §13.1 image width/height preserved (align: residual divergence)', () => {
+describe('git-sync converter §13.1 image layout attrs round-trip (align via schema default)', () => {
   const imageDoc = doc({
     type: 'image',
     attrs: {
@@ -491,12 +496,12 @@ describe('git-sync converter §13.1 image width/height preserved (align: residua
     },
   });
 
-  it('preserves width/height via the canon `<!--img {...}-->` comment; align still drops', async () => {
+  it('preserves width/height via the canon `<!--img {...}-->` comment; center align is the default', async () => {
     const { md, canonNormalized } = await runGate(imageDoc);
 
     // Canon #4: bare `![](src)` plus a trailing `<!--img {...}-->` comment that
-    // carries the non-default layout attrs (currently width/height only), so the
-    // dimensions survive the round trip instead of collapsing to bare `![](src)`.
+    // carries the non-default layout attrs. `center` is the default, so it is
+    // correctly OMITTED from the comment (only width/height appear here).
     expect(md.trim()).toBe(
       '![](https://example.com/pic.png) <!--img {"width":"640","height":"480"}-->',
     );
@@ -509,9 +514,9 @@ describe('git-sync converter §13.1 image width/height preserved (align: residua
     expect(imgAttrs.src).toBe('https://example.com/pic.png');
     expect(String(imgAttrs.width)).toBe('640');
     expect(String(imgAttrs.height)).toBe('480');
-    // RESIDUAL GAP: canon #4 does not (yet) carry `align` in `<!--img {...}-->`,
-    // so the original `align: 'center'` is lost. Fix belongs in the converter
-    // package on develop (fixtures-first); flip to toBe('center') once landed.
+    // `align` is NOT lost — see the block comment above: `center` is the schema
+    // default, restored on import then normalized away symmetrically by
+    // canonicalize, so it reads `undefined` on the CANONICAL form (not a loss).
     expect(imgAttrs.align).toBeUndefined();
   });
 });
