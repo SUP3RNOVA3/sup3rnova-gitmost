@@ -10,6 +10,10 @@ node_modules/
 # so src/ and prod can never silently diverge).
 packages/git-sync/build/
 
+# prosemirror-markdown compiled output (built in CI/Docker via `pnpm build`,
+# never committed, so src/ and prod can never silently diverge).
+packages/prosemirror-markdown/build/
+
 # Logs
 logs
 *.log
