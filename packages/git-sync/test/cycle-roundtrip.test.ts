@@ -8,7 +8,7 @@ import { runCycle } from "../src/engine/cycle";
 import type { CycleFs } from "../src/engine/cycle";
 import { VaultGit } from "../src/engine/git";
 import type { Settings } from "../src/engine/settings";
-import { serializeDocmostMarkdownBody } from "../src/lib/index";
+import { serializeDocmostMarkdownBody } from "@docmost/prosemirror-markdown";
 
 const execFileAsync = promisify(execFile);
 

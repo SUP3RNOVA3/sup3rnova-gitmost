@@ -8,6 +8,10 @@
  */
 
 // Pure converter (markdown <-> ProseMirror, file envelope, canonicalization).
+// Re-exported from the standalone `@docmost/prosemirror-markdown` package,
+// which is the single source of truth for the converter core; git-sync keeps
+// only the engine (vault/git/orchestrator) and re-surfaces the converter for
+// in-process consumers of the git-sync barrel.
 export {
   serializeDocmostMarkdown,
   serializeDocmostMarkdownBody,
@@ -16,8 +20,8 @@ export {
   markdownToProseMirror,
   canonicalizeContent,
   docsCanonicallyEqual,
-} from "./lib/index.js";
-export type { DocmostMdMeta } from "./lib/index.js";
+} from "@docmost/prosemirror-markdown";
+export type { DocmostMdMeta } from "@docmost/prosemirror-markdown";
 
 // Pure engine (no IO): reconcile planner, vault layout, sanitize, stabilize,
 // loop-guard body hash.
@@ -123,4 +127,4 @@ export {
 } from "./engine/path-guard.js";
 export type { PathGuardIo, VaultPathUnsafeReason } from "./engine/path-guard.js";
 
-export { parsePageFile, serializePageFile } from "./lib/page-file.js";
+export { parsePageFile, serializePageFile } from "@docmost/prosemirror-markdown";

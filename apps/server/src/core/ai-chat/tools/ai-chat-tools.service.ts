@@ -659,13 +659,21 @@ export class AiChatToolsService {
 
       listComments: tool({
         description:
-          'List ALL comments on a page in one call, including RESOLVED ' +
-          'threads — filter by resolvedAt when you need only open ones. ' +
-          'Content is returned as Markdown.',
+          'List comments on a page in one call. By DEFAULT only ACTIVE ' +
+          'threads are returned; resolved threads (a resolved top-level ' +
+          'comment and all its replies) are hidden and their count reported ' +
+          'as `resolvedThreadsHidden` so you can re-query with ' +
+          '`includeResolved: true` to see everything. Returns ' +
+          '`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page.'),
+          includeResolved: z
+            .boolean()
+            .optional()
+            .describe('default only active threads; true — include resolved'),
         }),
-        execute: async ({ pageId }) => await client.listComments(pageId),
+        execute: async ({ pageId, includeResolved }) =>
+          await client.listComments(pageId, includeResolved),
       }),
 
       getComment: tool({

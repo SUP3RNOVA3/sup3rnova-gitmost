@@ -253,22 +253,23 @@ test("insertInlineFootnote: anchor in body BEFORE a nested list still inserts", 
   assert.equal(findAll(r.doc, "footnotesList").length, 1);
 });
 
-test("markdown import (page path): out-of-order definitions render as a reference-ordered list", async () => {
-  // References appear b, a, c in the body; definitions are written in a, b, c
-  // order (the import order). The PAGE import path (markdownToProseMirrorCanonical)
-  // canonicalizes so the bottom list follows REFERENCE order — numbers read 1, 2,
-  // 3 down the list. (The non-canonicalizing markdownToProseMirror, used for
-  // comment bodies, would keep the import order; see collaboration.test.mjs.)
-  const md = [
-    "See[^b] then[^a] then[^c].",
-    "",
-    "[^a]: alpha",
-    "[^b]: bravo",
-    "[^c]: charlie",
-  ].join("\n");
+test("markdown import (page path): inline footnotes render as a reference-ordered list", async () => {
+  // Inline `^[body]` footnotes carry their body at the reference point, so the
+  // PAGE import path (markdownToProseMirrorCanonical) materializes the bottom
+  // list in REFERENCE order — numbers read 1, 2, 3 down the list — with ids
+  // assigned sequentially (fn-1, fn-2, fn-3).
+  const md = "See^[bravo] then^[alpha] then^[charlie].";
   const json = await markdownToProseMirrorCanonical(md);
-  assert.deepEqual(defIds(json), ["b", "a", "c"]);
+  assert.deepEqual(defIds(json), ["fn-1", "fn-2", "fn-3"]);
   assert.equal(findAll(json, "footnotesList").length, 1);
+  // Bodies materialize in reference order (bravo, alpha, charlie).
+  const defsJson = JSON.stringify(findAll(json, "footnoteDefinition"));
+  assert.ok(
+    defsJson.indexOf("bravo") <
+      defsJson.indexOf("alpha") &&
+      defsJson.indexOf("alpha") < defsJson.indexOf("charlie"),
+    "definitions follow reference order",
+  );
 });
 
 test("generateFootnoteId: valid uuidv7 shape (version 7, variant 8..b) and unique", () => {

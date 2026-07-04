@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { applyPushActions, LAST_PUSHED_REF } from '../src/engine/push';
 import { bodyHash } from '../src/engine/loop-guard';
 import type { ApplyPushDeps, PushActions } from '../src/engine/push';
-import { parsePageFile, serializePageFile } from '../src/lib/page-file';
+import { parsePageFile, serializePageFile } from '@docmost/prosemirror-markdown';
 
 // The Docmost space this vault mirrors (native files carry no spaceId; the run
 // supplies it). A CREATE targets this space.

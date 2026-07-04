@@ -4,11 +4,20 @@
 data
 # compiled output
 /dist
-node_modules/
+node_modules
 
 # git-sync compiled output (built in CI/Docker via `pnpm build`, never committed,
 # so src/ and prod can never silently diverge).
 packages/git-sync/build/
+
+# prosemirror-markdown compiled output (built in CI/Docker via `pnpm build`,
+# never committed, so src/ and prod can never silently diverge).
+packages/prosemirror-markdown/build/
+
+# mcp compiled output (built in CI/Docker via `pnpm build`, never committed, so
+# src/ and prod can never silently diverge). Matches the git-sync/prosemirror-
+# markdown convention; the package is private and rebuilt at deploy.
+packages/mcp/build/
 
 # Logs
 logs

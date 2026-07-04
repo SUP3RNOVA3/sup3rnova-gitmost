@@ -38,6 +38,14 @@ COPY --from=builder /app/packages/editor-ext/dist /app/packages/editor-ext/dist
 COPY --from=builder /app/packages/editor-ext/package.json /app/packages/editor-ext/package.json
 COPY --from=builder /app/packages/mcp/build /app/packages/mcp/build
 COPY --from=builder /app/packages/mcp/package.json /app/packages/mcp/package.json
+# mcp now depends on @docmost/prosemirror-markdown (workspace:*) and eager-imports
+# it at runtime (the in-app ai-chat DocmostClient loads build/index.js -> lib/
+# markdown-converter.js). Ship the built package + its manifest, or the prod
+# install resolves a broken workspace symlink and every ai-chat tool dies with
+# ERR_MODULE_NOT_FOUND (#293/#326 step 5). (git-sync has no runtime consumer yet;
+# revisit at step 6 when #119 lands.)
+COPY --from=builder /app/packages/prosemirror-markdown/build /app/packages/prosemirror-markdown/build
+COPY --from=builder /app/packages/prosemirror-markdown/package.json /app/packages/prosemirror-markdown/package.json
 
 # Copy root package files
 COPY --from=builder /app/package.json /app/package.json

@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { getSchema } from "@tiptap/core";
 
-import { markdownToProseMirror } from "../src/lib/markdown-to-prosemirror";
-import { docmostExtensions } from "../src/lib/docmost-schema";
+import { markdownToProseMirror } from "@docmost/prosemirror-markdown";
+import { docmostExtensions } from "@docmost/prosemirror-markdown";
 
 // REGRESSION LOCK for the stripEmptyParagraphs schema-validity guard.
 //

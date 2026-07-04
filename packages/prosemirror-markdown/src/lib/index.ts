@@ -1,0 +1,46 @@
+/**
+ * Public surface of the pure converter (`lib/`). This barrel re-exports the
+ * PURE, IO-free pieces the sync engine needs: the self-contained markdown
+ * (de)serializers, the lossless ProseMirror <-> Markdown converter, the
+ * markdown -> ProseMirror import path, and semantic canonicalization for the
+ * round-trip idempotency check (SPEC §11).
+ *
+ * There is no REST client, websocket/collab write-path, auth-utils or page-lock
+ * here — the gitmost server writes natively.
+ */
+export {
+  serializeDocmostMarkdown,
+  parseDocmostMarkdown,
+  serializeDocmostMarkdownBody,
+} from "./markdown-document.js";
+export type { DocmostMdMeta } from "./markdown-document.js";
+
+export { convertProseMirrorToMarkdown } from "./markdown-converter.js";
+export type { ConvertProseMirrorToMarkdownOptions } from "./markdown-converter.js";
+
+export { markdownToProseMirror } from "./markdown-to-prosemirror.js";
+
+// The Docmost tiptap schema mirror. Exposed so consumers (and the sync
+// engine's schema-validity regression tests) can build the exact ProseMirror
+// schema the converter targets.
+export { docmostExtensions } from "./docmost-schema.js";
+
+// Schema-adjacent sanitizers used by consumers (mcp) so the single canonical,
+// alias-aware / allowlist implementations live ONLY here (no drifting copies).
+export { clampCalloutType, sanitizeCssColor } from "./docmost-schema.js";
+
+// Attached-comment convention (#293 canon #9/#4/#8): the reusable primitives
+// the serializer/parser use to encode attrs that have no native markdown syntax
+// as trailing `<!--name {json}-->` comments.
+export {
+  attachedCommentFor,
+  standaloneCommentFor,
+  parseAttachedComment,
+} from "./attached-comment.js";
+export type { AttachedComment } from "./attached-comment.js";
+
+export {
+  canonicalizeContent,
+  docsCanonicallyEqual,
+} from "./canonicalize.js";
+export { parsePageFile, serializePageFile } from "./page-file.js";

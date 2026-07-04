@@ -902,6 +902,9 @@ importers:
 
   packages/git-sync:
     dependencies:
+      '@docmost/prosemirror-markdown':
+        specifier: workspace:*
+        version: link:../prosemirror-markdown
       '@tiptap/core':
         specifier: 3.20.4
         version: 3.20.4(@tiptap/pm@3.20.4)
@@ -966,6 +969,9 @@ importers:
 
   packages/mcp:
     dependencies:
+      '@docmost/prosemirror-markdown':
+        specifier: workspace:*
+        version: link:../prosemirror-markdown
       '@fellow/prosemirror-recreate-transform':
         specifier: ^1.2.3
         version: 1.2.3
@@ -1048,6 +1054,67 @@ importers:
       typescript:
         specifier: ^5.0.0
         version: 5.9.3
+
+  packages/prosemirror-markdown:
+    dependencies:
+      '@tiptap/core':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/pm@3.20.4)
+      '@tiptap/extension-highlight':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))
+      '@tiptap/extension-image':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))
+      '@tiptap/extension-subscript':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4)
+      '@tiptap/extension-superscript':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4)
+      '@tiptap/extension-task-item':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/extension-list@3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4))
+      '@tiptap/extension-task-list':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/extension-list@3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4))
+      '@tiptap/html':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))(@tiptap/pm@3.20.4)(happy-dom@20.8.9)
+      '@tiptap/pm':
+        specifier: 3.20.4
+        version: 3.20.4
+      '@tiptap/starter-kit':
+        specifier: 3.20.4
+        version: 3.20.4
+      jsdom:
+        specifier: 25.0.0
+        version: 25.0.0
+      marked:
+        specifier: 17.0.5
+        version: 17.0.5
+      zod:
+        specifier: 4.3.6
+        version: 4.3.6
+    devDependencies:
+      '@docmost/editor-ext':
+        specifier: workspace:*
+        version: link:../editor-ext
+      '@types/jsdom':
+        specifier: ^21.1.7
+        version: 21.1.7
+      '@types/node':
+        specifier: ^20.0.0
+        version: 20.19.43
+      fast-check:
+        specifier: ^4.8.0
+        version: 4.8.0
+      typescript:
+        specifier: ^5.0.0
+        version: 5.9.3
+      vitest:
+        specifier: 4.1.6
+        version: 4.1.6(@opentelemetry/api@1.9.0)(@types/node@20.19.43)(@vitest/coverage-v8@4.1.6)(happy-dom@20.8.9)(jsdom@25.0.0)(vite@8.0.5(@types/node@20.19.43)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))
 
 packages:
 
@@ -11619,7 +11686,7 @@ snapshots:
 
   '@babel/code-frame@7.29.0':
     dependencies:
-      '@babel/helper-validator-identifier': 7.28.5
+      '@babel/helper-validator-identifier': 7.29.7
       js-tokens: 4.0.0
       picocolors: 1.1.1
 
@@ -16086,7 +16153,7 @@ snapshots:
       obug: 2.1.1
       std-env: 4.1.0
       tinyrainbow: 3.1.0
-      vitest: 4.1.6(@opentelemetry/api@1.9.0)(@types/node@22.19.1)(@vitest/coverage-v8@4.1.6)(happy-dom@20.8.9)(jsdom@25.0.0)(vite@8.0.5(@types/node@22.19.1)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))
+      vitest: 4.1.6(@opentelemetry/api@1.9.0)(@types/node@25.5.0)(@vitest/coverage-v8@4.1.6)(happy-dom@20.8.9)(jsdom@27.4.0(@noble/hashes@2.0.1))(vite@8.0.5(@types/node@25.5.0)(esbuild@0.28.0)(jiti@2.4.2)(less@4.2.0)(sugarss@5.0.1(postcss@8.5.14))(terser@5.39.0)(tsx@4.21.0)(yaml@2.8.3))
 
   '@vitest/expect@4.1.6':
     dependencies:
