@@ -659,6 +659,35 @@ export interface AiChatMessages {
   deletedAt: Timestamp | null;
 }
 
+// The agent RUN as a first-class server-side lifecycle object (#184 phase 1).
+// Mirrors migration 20260627T130000-ai-chat-runs.ts. A run is created when an
+// agent turn starts and survives the browser disconnecting; the DB is the source
+// of truth a later client reconnects to. `assistantMessageId` links to the #183
+// projection row (the assistant message this run materializes).
+export interface AiChatRuns {
+  id: Generated<string>;
+  chatId: string;
+  workspaceId: string;
+  // SET NULL on user deletion (the run history outlives its author); also NULL
+  // for a future non-human trigger (cron/api).
+  createdBy: string | null;
+  // The assistant message this run materializes; SET NULL if it is pruned.
+  assistantMessageId: string | null;
+  // 'user' | 'autostart' | 'schedule' | 'api' | 'continue' (only 'user' is
+  // produced in phase 1; the rest are reserved for the deferred autonomy triggers).
+  trigger: Generated<string>;
+  // 'pending' | 'running' | 'succeeded' | 'failed' | 'aborted'.
+  status: Generated<string>;
+  error: string | null;
+  stepCount: Generated<number>;
+  // Set when an EXPLICIT user stop is requested (distinct from a disconnect).
+  stopRequestedAt: Timestamp | null;
+  startedAt: Timestamp | null;
+  finishedAt: Timestamp | null;
+  createdAt: Generated<Timestamp>;
+  updatedAt: Generated<Timestamp>;
+}
+
 // Per-(chat,page) snapshot of the open page's Markdown at the END of the agent's
 // previous turn (#274). Mirrors migration 20260702T120000-ai-chat-page-snapshot.ts.
 // The next turn diffs the CURRENT Markdown against `contentMd` to surface edits a
@@ -695,6 +724,7 @@ export interface DB {
   aiAgentRoles: AiAgentRoles;
   aiChats: AiChats;
   aiChatMessages: AiChatMessages;
+  aiChatRuns: AiChatRuns;
   aiChatPageSnapshots: AiChatPageSnapshots;
   apiKeys: ApiKeys;
   attachments: Attachments;

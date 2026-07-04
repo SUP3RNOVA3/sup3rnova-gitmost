@@ -200,6 +200,38 @@ export interface IAiChatMessageRow {
   createdAt: string;
 }
 
+/**
+ * A persisted agent-run row (#184), mirroring the `ai_chat_runs` fields the
+ * client reads from `POST /ai-chat/run`. Only `status` is load-bearing for the
+ * reconnect-and-live-update UX (it drives the poll cadence); the rest are carried
+ * for display/diagnostics. The DB is the source of truth, so this resolves for an
+ * in-flight run (the browser dropped, the run kept going) and a finished one.
+ */
+export interface IAiChatRun {
+  id: string;
+  chatId: string;
+  // 'pending' | 'running' | 'succeeded' | 'failed' | 'aborted'. The first two are
+  // ACTIVE (keep polling); the rest are TERMINAL (stop polling).
+  status: "pending" | "running" | "succeeded" | "failed" | "aborted" | string;
+  error?: string | null;
+  stepCount?: number;
+  assistantMessageId?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/**
+ * Response of `POST /ai-chat/run` (#184): the latest run of a chat and the
+ * assistant message it materializes (the partial/final output, projected from the
+ * persisted rows). Both are `null` when the chat has never had a run.
+ */
+export interface IAiChatRunResponse {
+  run: IAiChatRun | null;
+  message: IAiChatMessageRow | null;
+}
+
 export interface IAiChatListParams extends QueryParams {}
 
 export interface IAiChatMessagesParams {

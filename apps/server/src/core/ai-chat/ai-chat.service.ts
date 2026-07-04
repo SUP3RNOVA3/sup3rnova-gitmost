@@ -1,4 +1,5 @@
 import {
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -39,6 +40,7 @@ import {
   makeLoadToolsTool,
   buildExternalToolCatalog,
 } from './tools/tool-tiers';
+import { RunAlreadyActiveError } from './ai-chat-run.service';
 import { computePageChange } from './page-change/page-change.util';
 import { roleModelOverride } from './roles/role-model-config';
 import {
@@ -196,6 +198,31 @@ export interface AiChatStreamBody {
   messages?: UIMessage[];
 }
 
+/**
+ * Optional run-lifecycle hooks (#184 phase 1). When supplied, the turn is wrapped
+ * in a first-class server-side RUN: `begin` is called once the chat id is known
+ * and returns the run's AbortSignal (decoupled from the HTTP socket — a browser
+ * disconnect no longer governs the abort), and the lifecycle callbacks persist
+ * the run's progress and terminal status. Absent (the default) => the legacy
+ * socket-bound behavior is unchanged.
+ */
+export interface AiChatRunHooks {
+  // Called once the chat id is resolved; returns the run handle whose `signal`
+  // drives the agent loop's abort. Returning null disables run tracking (the
+  // turn falls back to the passed-in socket signal).
+  begin(chatId: string): Promise<{ runId: string; signal: AbortSignal } | null>;
+  onAssistantSeeded?(
+    runId: string,
+    assistantMessageId: string,
+  ): Promise<void> | void;
+  onStep?(runId: string, stepCount: number): void;
+  onSettled?(
+    runId: string,
+    status: 'completed' | 'error' | 'aborted',
+    error?: string,
+  ): Promise<void> | void;
+}
+
 export interface AiChatStreamArgs {
   user: User;
   workspace: Workspace;
@@ -203,6 +230,10 @@ export interface AiChatStreamArgs {
   body: AiChatStreamBody;
   res: FastifyReply;
   signal: AbortSignal;
+  // Run-lifecycle hooks (#184). When present the turn becomes a detached,
+  // durable RUN whose abort is governed by the run (explicit stop), not the
+  // socket; when absent the turn stays socket-bound (legacy behavior).
+  runHooks?: AiChatRunHooks;
   // Resolved by the controller BEFORE res.hijack(), so an unconfigured provider
   // (AiNotConfiguredException -> 503) surfaces as clean JSON before streaming.
   // For a role with a model override this already carries the override-resolved
@@ -487,6 +518,7 @@ export class AiChatService implements OnModuleInit {
     signal,
     model,
     role,
+    runHooks,
   }: AiChatStreamArgs): Promise<void> {
     // Resolve / create the chat. A new chat is created when no valid chatId is
     // supplied or the supplied one does not belong to this workspace.
@@ -531,607 +563,690 @@ export class AiChatService implements OnModuleInit {
       isNewChat = true;
     }
 
-    // Extract the incoming user turn (the last user message from useChat).
-    const incoming = lastUserMessage(body.messages);
-    const incomingText = uiMessageText(incoming);
-
-    // Persist the user message before contacting the model.
-    await this.aiChatMessageRepo.insert({
-      chatId,
-      workspaceId: workspace.id,
-      userId: user.id,
-      role: 'user',
-      content: incomingText,
-      // jsonb column: UIMessage parts are JSON-serializable at runtime but not
-      // structurally `JsonValue`, so cast through unknown.
-      metadata: (incoming?.parts ? { parts: incoming.parts } : null) as never,
-    });
-
-    // Rebuild the conversation from persisted history (not the client payload),
-    // so the model always sees the authoritative server-side transcript. Load
-    // the FULL history in chronological order (oldest -> newest, incl. the user
-    // message just inserted above) so NO turns are dropped — there is no
-    // recent-tail window anymore. `findAllByChat` keeps a 5000-row memory-safety
-    // backstop (on overflow it keeps the NEWEST rows and logs a warning); that
-    // is a safety net far above any realistic chat, not a conversational limit.
-    const history = await this.aiChatMessageRepo.findAllByChat(
-      chatId,
-      workspace.id,
-    );
-    const uiMessages = history.map(rowToUiMessage);
-    // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
-    const messages = await convertToModelMessages(uiMessages);
-
-    // Interrupt-resume detection (#198): the client "send now" flag is only a
-    // hint — confirm it against the persisted history (the preceding assistant
-    // turn must really be aborted/streaming) so a spoofed flag cannot inject the
-    // interrupt note onto an ordinary turn. The partial output the model needs is
-    // already in `messages` (the aborted assistant row replays via findRecent).
-    const interrupted = isInterruptResume(history, body.interrupted);
-
-    // Per-turn page-change detection (#274): if the open page was hand-edited by
-    // the user since the agent's last turn ended, compute the unified diff so the
-    // system prompt can warn the agent its copy is stale (else it overwrites those
-    // edits). Best-effort (null on the fast path / first turn / any fault) — never
-    // blocks the turn. Snapshot is (re)written at turn end in onFinish below.
-    const pageChanged = await this.detectPageChange(
-      chatId,
-      openPageContext,
-      workspace,
-      user,
-      sessionId,
-    );
-
-    // The model is resolved by the controller before hijack (clean 503 path).
-    // Here we only need the admin-configured system prompt.
-    const resolved = await this.aiSettings.resolve(workspace.id);
-
-    // Build the external MCP toolset FIRST so the system prompt can carry each
-    // connected server's admin-authored guidance (#180). Merge in admin-
-    // configured external MCP tools (web search, etc.; §6.8). A down/slow
-    // external server never crashes the turn — toolsFor skips it and records the
-    // outcome. The returned client handles MUST be closed in the streamText
-    // lifecycle (onFinish/onError/onAbort) — leaking them is a bug. Docmost
-    // tools take precedence on a name clash (external are namespaced, so a clash
-    // is not expected; the spread order makes intent explicit).
-    let external: Awaited<ReturnType<McpClientsService['toolsFor']>> = {
-      tools: {},
-      clients: [],
-      outcomes: [],
-      instructions: [],
-    };
-    try {
-      external = await this.mcpClients.toolsFor(workspace.id);
-    } catch (err) {
-      // Building the external toolset must never break the turn; proceed with
-      // Docmost-only tools. Never log URLs/headers — short message only.
-      this.logger.warn(
-        `External MCP toolset unavailable: ${
-          err instanceof Error ? err.message : 'unknown error'
-        }`,
-      );
-    }
-
-    // Close every external client EXACTLY ONCE across the turn's terminal
-    // callbacks (onFinish/onError/onAbort all fire at most once collectively,
-    // but guard anyway). DEFINED HERE — before the prompt/toolset are built — so
-    // that if buildSystemPrompt or forUser throws AFTER the external lease was
-    // taken (toolsFor above), the lease is still released. Otherwise its refCount
-    // stays >= 1 forever and the external undici sockets leak until restart
-    // (#180 reorder moved toolsFor ahead of these; #185 review). Close errors are
-    // swallowed so they never break the response.
-    let clientsClosed = false;
-    const closeExternalClients = async (): Promise<void> => {
-      if (clientsClosed) return;
-      clientsClosed = true;
-      await Promise.all(
-        external.clients.map((c) =>
-          c.close().catch((closeErr) => {
-            this.logger.warn(
-              `Failed to close external MCP client: ${
-                closeErr instanceof Error ? closeErr.message : 'unknown error'
-              }`,
-            );
-          }),
-        ),
-      );
-    };
-
-    // Turn-end snapshot of the open page (#274), run EXACTLY ONCE across the
-    // terminal callbacks. This MUST run on onError/onAbort too, not only on the
-    // successful onFinish: the write tools commit page edits to the DB
-    // synchronously during a step, so an agent edit followed by an abort/error
-    // (client disconnect, stop(), provider failure) still persists and bumps
-    // page.updatedAt. If the snapshot did not advance on those paths, the NEXT
-    // turn would diff the agent's OWN committed edit against the stale previous
-    // snapshot and mis-report it as a user edit — breaking the "own edits excluded
-    // by construction" guarantee. Best-effort (snapshotOpenPage swallows + logs);
-    // skipped when no page is open.
-    let snapshotWritten = false;
-    const snapshotTurnEnd = async (): Promise<void> => {
-      if (snapshotWritten) return;
-      snapshotWritten = true;
-      if (!openPageContext) return;
-      await this.snapshotOpenPage(
-        chatId,
-        openPageContext.id,
-        workspace,
-        user,
-        sessionId,
-      );
-    };
-
-    // Build the system prompt + Docmost toolset. If either throws after the
-    // external MCP lease was taken above, release the lease before rethrowing so
-    // the leased transports are not leaked (#185 review).
-    // Deferred tool loading toggle (#332). When ON, the model sees a compact
-    // <tool_catalog> and only CORE tools + loadTools are active each step; other
-    // tools (fat/rare in-app tools + ALL external MCP tools) load on demand. When
-    // OFF, every tool is active and nothing below changes.
-    const deferredEnabled = this.environment.isAiChatDeferredToolsEnabled();
-
-    let system: string;
-    let docmostTools: Awaited<ReturnType<AiChatToolsService['forUser']>>;
-    try {
-      // Assemble the deferred catalog for the system prompt: hand-written lines
-      // for the in-app deferred tools + a derived line for each external MCP tool
-      // (also deferred by default). Only built when the feature is enabled.
-      const toolCatalog = deferredEnabled
-        ? [
-            ...(await this.tools.getInAppDeferredCatalog()),
-            ...buildExternalToolCatalog(external.tools),
-          ]
-        : [];
-
-      system = buildSystemPrompt({
-        workspace,
-        adminPrompt: resolved?.systemPrompt,
-        // The role (pre-resolved by the controller) REPLACES the persona layer;
-        // the safety framework is still appended by buildSystemPrompt.
-        roleInstructions: role?.instructions,
-        // Server-validated open page (authoritative title), not the client value.
-        openedPage: openPageContext,
-        // Guidance only for servers that connected and yielded ≥1 callable tool.
-        mcpInstructions: external.instructions,
-        // History-confirmed interrupt-resume flag (#198): adds the interrupt note
-        // so the model treats the partial answer above as cut off, not finished.
-        interrupted,
-        // Detected between-turns human edit to the open page (#274): adds the
-        // page_changed note + unified diff so the agent doesn't overwrite it.
-        pageChanged,
-        // Deferred tool loading (#332): renders the <tool_catalog> block (only
-        // when enabled + non-empty) so the model can activate deferred tools.
-        deferredToolsEnabled: deferredEnabled,
-        toolCatalog,
-      });
-
-      // Pass the resolved chatId so the write tools can mint provenance tokens
-      // (access + collab) carrying { actor:'agent', aiChatId: chatId }, making
-      // agent REST/collab writes attributable and non-spoofable (§6.5/§6.6).
-      docmostTools = await this.tools.forUser(
-        user,
-        sessionId,
-        workspace.id,
-        chatId,
-        // Same server-validated open page used by the system prompt above;
-        // exposed to the model via getCurrentPage so page identity (and the
-        // AUTHORITATIVE title) survives prompt mangling / client title spoofing.
-        openPageContext,
-      );
-    } catch (err) {
-      await closeExternalClients();
-      throw err;
-    }
-
-    // Base toolset: external MCP tools + Docmost in-app tools (Docmost wins on a
-    // name clash — external are namespaced, so no clash is expected).
-    const baseTools = { ...external.tools, ...docmostTools };
-
-    // Deferred tool loading state (#332), scoped to THIS streaming loop:
-    //  - `activatedTools` is per-TURN mutable state — a fresh closure Set created
-    //    per streamText call, NOT module-global and NOT persisted, so a new turn
-    //    starts cold. loadTools.execute adds to it; prepareAgentStep reads it to
-    //    widen `activeTools` on the NEXT step.
-    //  - `validDeferredNames` = every tool that is NOT core (the in-app deferred
-    //    tools + ALL external MCP tools), computed from the ACTUAL toolset so an
-    //    external tool is loadable by its namespaced name. loadTools rejects any
-    //    name outside this set.
-    const activatedTools = new Set<string>();
-    const validDeferredNames = new Set<string>(
-      Object.keys(baseTools).filter((k) => !CORE_TOOL_SET.has(k)),
-    );
-    // Add the loadTools meta-tool ONLY when the feature is enabled; when off the
-    // toolset and behavior are exactly as before.
-    const tools = deferredEnabled
-      ? {
-          ...baseTools,
-          [LOAD_TOOLS_NAME]: makeLoadToolsTool(activatedTools, validDeferredNames),
+    // Start the durable RUN now that the chat id is known (#184 phase 1). The
+    // returned `runId` + `signal` make the turn a first-class server-side object
+    // whose abort is governed by the run (an explicit user stop), NOT by the HTTP
+    // socket — so a browser disconnect no longer ends the turn. With no runHooks
+    // (the default / flag off) the turn stays socket-bound via `signal` and
+    // `runId` is undefined, leaving the legacy path byte-for-byte unchanged.
+    let runId: string | undefined;
+    let effectiveSignal = signal;
+    if (runHooks) {
+      try {
+        const handle = await runHooks.begin(chatId);
+        if (handle) {
+          runId = handle.runId;
+          effectiveSignal = handle.signal;
         }
-      : baseTools;
+      } catch (err) {
+        // RACE BACKSTOP: the run-row INSERT lost the chat's single active slot
+        // (the partial unique index rejected it). This is the AUTHORITATIVE
+        // concurrency gate — the controller's pre-check is only a fast-path, and a
+        // request that slipped past it must NOT proceed. Reject the turn with a
+        // 409 NOW, BEFORE any AI/provider call: no tokens are spent and no
+        // untracked turn streams. (Matches the controller's pre-check 409.)
+        if (err instanceof RunAlreadyActiveError) {
+          throw new ConflictException({
+            message: 'An agent run is already in progress for this chat',
+            code: 'A_RUN_ALREADY_ACTIVE',
+          });
+        }
+        // Any OTHER run-start failure must not break the turn — fall back to the
+        // socket signal (legacy behavior) and stream anyway.
+        this.logger.error(
+          `Failed to begin agent run (chat ${chatId}); streaming without run tracking`,
+          err as Error,
+        );
+      }
+    }
 
-    // Accumulate the turn's streamed output so a provider error / disconnect can
-    // persist the PARTIAL answer the user already saw — the SDK's onError/onAbort
-    // callbacks don't hand us the in-progress text. `capturedSteps` holds finished
-    // steps (tool calls + their text); `inProgressText` holds the text streamed in
-    // the CURRENT, not-yet-finished step, reset whenever a step finishes.
-    const capturedSteps: StepLike[] = [];
-    let inProgressText = '';
-
-    // Step-granular durability (#183): create the assistant row UPFRONT in the
-    // 'streaming' state (before any token), then UPDATE it as each step finishes
-    // and finalize it once on the terminal callback. If the process dies
-    // mid-turn the row survives with every finished step already persisted; the
-    // startup sweep (sweepStreaming) later flips a dangling 'streaming' row to
-    // 'aborted'. The DB is now the single source of truth for the turn — the
-    // socket is never required for the write path. A failed upfront insert is
-    // logged and leaves assistantId undefined; the per-step/terminal updates then
-    // no-op (guarded below) so the turn still streams to the user.
-    let assistantId: string | undefined;
     try {
-      const seed = flushAssistant([], '', 'streaming', { pageChanged });
-      const seeded = await this.aiChatMessageRepo.insert({
+      // Extract the incoming user turn (the last user message from useChat).
+      const incoming = lastUserMessage(body.messages);
+      const incomingText = uiMessageText(incoming);
+
+      // Persist the user message before contacting the model.
+      await this.aiChatMessageRepo.insert({
         chatId,
         workspaceId: workspace.id,
         userId: user.id,
-        role: 'assistant',
-        content: seed.content,
-        // jsonb columns: cast through never (same as the user insert above).
-        toolCalls: (seed.toolCalls ?? null) as never,
-        metadata: seed.metadata as never,
-        status: seed.status,
+        role: 'user',
+        content: incomingText,
+        // jsonb column: UIMessage parts are JSON-serializable at runtime but not
+        // structurally `JsonValue`, so cast through unknown.
+        metadata: (incoming?.parts ? { parts: incoming.parts } : null) as never,
       });
-      assistantId = seeded?.id;
-    } catch (err) {
-      this.logger.error(
-        `Failed to insert upfront assistant row (chat ${chatId}, workspace ${workspace.id})`,
-        err as Error,
-      );
-    }
 
-    // Per-step (non-terminal) update: persist the finished steps the moment a
-    // step ends. Tolerant — a failed update is logged and swallowed so it never
-    // throws into the stream. Keeps status 'streaming'.
-    const updateStreaming = async (): Promise<void> => {
-      if (!assistantId) return;
-      // Cheap short-circuit once the turn is finalized (see `finalized` below).
-      // The AUTHORITATIVE guard is `onlyIfStreaming` on the UPDATE: a late
-      // fire-and-forget step update could still be in flight on another pool
-      // connection when finalize runs, so the SQL `WHERE status='streaming'`
-      // (not this flag) is what prevents it clobbering the terminal row.
-      if (finalized) return;
+      // Rebuild the conversation from persisted history (not the client payload),
+      // so the model always sees the authoritative server-side transcript. Load
+      // the FULL history in chronological order (oldest -> newest, incl. the user
+      // message just inserted above) so NO turns are dropped — there is no
+      // recent-tail window anymore. `findAllByChat` keeps a 5000-row memory-safety
+      // backstop (on overflow it keeps the NEWEST rows and logs a warning); that
+      // is a safety net far above any realistic chat, not a conversational limit.
+      const history = await this.aiChatMessageRepo.findAllByChat(
+        chatId,
+        workspace.id,
+      );
+      const uiMessages = history.map(rowToUiMessage);
+      // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
+      const messages = await convertToModelMessages(uiMessages);
+
+      // Interrupt-resume detection (#198): the client "send now" flag is only a
+      // hint — confirm it against the persisted history (the preceding assistant
+      // turn must really be aborted/streaming) so a spoofed flag cannot inject the
+      // interrupt note onto an ordinary turn. The partial output the model needs is
+      // already in `messages` (the aborted assistant row replays via findRecent).
+      const interrupted = isInterruptResume(history, body.interrupted);
+
+      // Per-turn page-change detection (#274): if the open page was hand-edited by
+      // the user since the agent's last turn ended, compute the unified diff so the
+      // system prompt can warn the agent its copy is stale (else it overwrites those
+      // edits). Best-effort (null on the fast path / first turn / any fault) — never
+      // blocks the turn. Snapshot is (re)written at turn end in onFinish below.
+      const pageChanged = await this.detectPageChange(
+        chatId,
+        openPageContext,
+        workspace,
+        user,
+        sessionId,
+      );
+
+      // The model is resolved by the controller before hijack (clean 503 path).
+      // Here we only need the admin-configured system prompt.
+      const resolved = await this.aiSettings.resolve(workspace.id);
+
+      // Build the external MCP toolset FIRST so the system prompt can carry each
+      // connected server's admin-authored guidance (#180). Merge in admin-
+      // configured external MCP tools (web search, etc.; §6.8). A down/slow
+      // external server never crashes the turn — toolsFor skips it and records the
+      // outcome. The returned client handles MUST be closed in the streamText
+      // lifecycle (onFinish/onError/onAbort) — leaking them is a bug. Docmost
+      // tools take precedence on a name clash (external are namespaced, so a clash
+      // is not expected; the spread order makes intent explicit).
+      let external: Awaited<ReturnType<McpClientsService['toolsFor']>> = {
+        tools: {},
+        clients: [],
+        outcomes: [],
+        instructions: [],
+      };
       try {
-        await this.aiChatMessageRepo.update(
-          assistantId,
-          workspace.id,
-          flushAssistant(capturedSteps, '', 'streaming', { pageChanged }),
-          { onlyIfStreaming: true },
-        );
+        external = await this.mcpClients.toolsFor(workspace.id);
       } catch (err) {
+        // Building the external toolset must never break the turn; proceed with
+        // Docmost-only tools. Never log URLs/headers — short message only.
         this.logger.warn(
-          `Failed to update streaming assistant row: ${
+          `External MCP toolset unavailable: ${
             err instanceof Error ? err.message : 'unknown error'
           }`,
         );
       }
-    };
 
-    // Serialize the per-step updates (#183 review): onStepFinish fires them
-    // without await, so two could otherwise commit out of order on different pool
-    // connections (step N landing after N+1). Chaining each onto the previous
-    // keeps the persisted row monotonic with step order; each link short-circuits
-    // on `finalized`, so a tail of late updates is cheap.
-    let stepUpdateChain: Promise<void> = Promise.resolve();
+      // Close every external client EXACTLY ONCE across the turn's terminal
+      // callbacks (onFinish/onError/onAbort all fire at most once collectively,
+      // but guard anyway). DEFINED HERE — before the prompt/toolset are built — so
+      // that if buildSystemPrompt or forUser throws AFTER the external lease was
+      // taken (toolsFor above), the lease is still released. Otherwise its refCount
+      // stays >= 1 forever and the external undici sockets leak until restart
+      // (#180 reorder moved toolsFor ahead of these; #185 review). Close errors are
+      // swallowed so they never break the response.
+      let clientsClosed = false;
+      const closeExternalClients = async (): Promise<void> => {
+        if (clientsClosed) return;
+        clientsClosed = true;
+        await Promise.all(
+          external.clients.map((c) =>
+            c.close().catch((closeErr) => {
+              this.logger.warn(
+                `Failed to close external MCP client: ${
+                  closeErr instanceof Error ? closeErr.message : 'unknown error'
+                }`,
+              );
+            }),
+          ),
+        );
+      };
 
-    // Terminal finalize: write the completed/error/aborted row exactly once
-    // across the (mutually-exclusive, at-most-once) onFinish/onError/onAbort
-    // callbacks — mirroring the pre-#183 persist-at-most-once guard for the
-    // TERMINAL status (the row may be updated many times with 'streaming' before
-    // this fires once).
-    let finalized = false;
-    const finalizeAssistant = async (
-      flushed: AssistantFlush,
-    ): Promise<void> => {
-      if (finalized) return;
-      finalized = true;
-      const plan = planFinalizeAssistant(assistantId);
+      // Turn-end snapshot of the open page (#274), run EXACTLY ONCE across the
+      // terminal callbacks. This MUST run on onError/onAbort too, not only on the
+      // successful onFinish: the write tools commit page edits to the DB
+      // synchronously during a step, so an agent edit followed by an abort/error
+      // (client disconnect, stop(), provider failure) still persists and bumps
+      // page.updatedAt. If the snapshot did not advance on those paths, the NEXT
+      // turn would diff the agent's OWN committed edit against the stale previous
+      // snapshot and mis-report it as a user edit — breaking the "own edits excluded
+      // by construction" guarantee. Best-effort (snapshotOpenPage swallows + logs);
+      // skipped when no page is open.
+      let snapshotWritten = false;
+      const snapshotTurnEnd = async (): Promise<void> => {
+        if (snapshotWritten) return;
+        snapshotWritten = true;
+        if (!openPageContext) return;
+        await this.snapshotOpenPage(
+          chatId,
+          openPageContext.id,
+          workspace,
+          user,
+          sessionId,
+        );
+      };
+
+      // Build the system prompt + Docmost toolset. If either throws after the
+      // external MCP lease was taken above, release the lease before rethrowing so
+      // the leased transports are not leaked (#185 review).
+      // Deferred tool loading toggle (#332). When ON, the model sees a compact
+      // <tool_catalog> and only CORE tools + loadTools are active each step; other
+      // tools (fat/rare in-app tools + ALL external MCP tools) load on demand. When
+      // OFF, every tool is active and nothing below changes.
+      const deferredEnabled = this.environment.isAiChatDeferredToolsEnabled();
+
+      let system: string;
+      let docmostTools: Awaited<ReturnType<AiChatToolsService['forUser']>>;
       try {
-        // Shared dispatch (see applyFinalize): UPDATE the upfront row, or — when
-        // the upfront insert failed (kind 'insert') — INSERT the terminal row as
-        // the only safety against losing the turn entirely.
-        await applyFinalize(
-          this.aiChatMessageRepo,
-          plan,
-          { chatId, workspaceId: workspace.id, userId: user.id },
-          flushed,
+        // Assemble the deferred catalog for the system prompt: hand-written lines
+        // for the in-app deferred tools + a derived line for each external MCP tool
+        // (also deferred by default). Only built when the feature is enabled.
+        const toolCatalog = deferredEnabled
+          ? [
+              ...(await this.tools.getInAppDeferredCatalog()),
+              ...buildExternalToolCatalog(external.tools),
+            ]
+          : [];
+
+        system = buildSystemPrompt({
+          workspace,
+          adminPrompt: resolved?.systemPrompt,
+          // The role (pre-resolved by the controller) REPLACES the persona layer;
+          // the safety framework is still appended by buildSystemPrompt.
+          roleInstructions: role?.instructions,
+          // Server-validated open page (authoritative title), not the client value.
+          openedPage: openPageContext,
+          // Guidance only for servers that connected and yielded ≥1 callable tool.
+          mcpInstructions: external.instructions,
+          // History-confirmed interrupt-resume flag (#198): adds the interrupt note
+          // so the model treats the partial answer above as cut off, not finished.
+          interrupted,
+          // Detected between-turns human edit to the open page (#274): adds the
+          // page_changed note + unified diff so the agent doesn't overwrite it.
+          pageChanged,
+          // Deferred tool loading (#332): renders the <tool_catalog> block (only
+          // when enabled + non-empty) so the model can activate deferred tools.
+          deferredToolsEnabled: deferredEnabled,
+          toolCatalog,
+        });
+
+        // Pass the resolved chatId so the write tools can mint provenance tokens
+        // (access + collab) carrying { actor:'agent', aiChatId: chatId }, making
+        // agent REST/collab writes attributable and non-spoofable (§6.5/§6.6).
+        docmostTools = await this.tools.forUser(
+          user,
+          sessionId,
+          workspace.id,
+          chatId,
+          // Same server-validated open page used by the system prompt above;
+          // exposed to the model via getCurrentPage so page identity (and the
+          // AUTHORITATIVE title) survives prompt mangling / client title spoofing.
+          openPageContext,
         );
       } catch (err) {
+        await closeExternalClients();
+        throw err;
+      }
+
+      // Base toolset: external MCP tools + Docmost in-app tools (Docmost wins on a
+      // name clash — external are namespaced, so no clash is expected).
+      const baseTools = { ...external.tools, ...docmostTools };
+
+      // Deferred tool loading state (#332), scoped to THIS streaming loop:
+      //  - `activatedTools` is per-TURN mutable state — a fresh closure Set created
+      //    per streamText call, NOT module-global and NOT persisted, so a new turn
+      //    starts cold. loadTools.execute adds to it; prepareAgentStep reads it to
+      //    widen `activeTools` on the NEXT step.
+      //  - `validDeferredNames` = every tool that is NOT core (the in-app deferred
+      //    tools + ALL external MCP tools), computed from the ACTUAL toolset so an
+      //    external tool is loadable by its namespaced name. loadTools rejects any
+      //    name outside this set.
+      const activatedTools = new Set<string>();
+      const validDeferredNames = new Set<string>(
+        Object.keys(baseTools).filter((k) => !CORE_TOOL_SET.has(k)),
+      );
+      // Add the loadTools meta-tool ONLY when the feature is enabled; when off the
+      // toolset and behavior are exactly as before.
+      const tools = deferredEnabled
+        ? {
+            ...baseTools,
+            [LOAD_TOOLS_NAME]: makeLoadToolsTool(activatedTools, validDeferredNames),
+          }
+        : baseTools;
+
+      // Accumulate the turn's streamed output so a provider error / disconnect can
+      // persist the PARTIAL answer the user already saw — the SDK's onError/onAbort
+      // callbacks don't hand us the in-progress text. `capturedSteps` holds finished
+      // steps (tool calls + their text); `inProgressText` holds the text streamed in
+      // the CURRENT, not-yet-finished step, reset whenever a step finishes.
+      const capturedSteps: StepLike[] = [];
+      let inProgressText = '';
+
+      // Step-granular durability (#183): create the assistant row UPFRONT in the
+      // 'streaming' state (before any token), then UPDATE it as each step finishes
+      // and finalize it once on the terminal callback. If the process dies
+      // mid-turn the row survives with every finished step already persisted; the
+      // startup sweep (sweepStreaming) later flips a dangling 'streaming' row to
+      // 'aborted'. The DB is now the single source of truth for the turn — the
+      // socket is never required for the write path. A failed upfront insert is
+      // logged and leaves assistantId undefined; the per-step/terminal updates then
+      // no-op (guarded below) so the turn still streams to the user.
+      let assistantId: string | undefined;
+      try {
+        const seed = flushAssistant([], '', 'streaming', { pageChanged });
+        const seeded = await this.aiChatMessageRepo.insert({
+          chatId,
+          workspaceId: workspace.id,
+          userId: user.id,
+          role: 'assistant',
+          content: seed.content,
+          // jsonb columns: cast through never (same as the user insert above).
+          toolCalls: (seed.toolCalls ?? null) as never,
+          metadata: seed.metadata as never,
+          status: seed.status,
+        });
+        assistantId = seeded?.id;
+      } catch (err) {
         this.logger.error(
-          `Failed to finalize assistant message (kind=${plan.kind})`,
+          `Failed to insert upfront assistant row (chat ${chatId}, workspace ${workspace.id})`,
           err as Error,
         );
       }
-    };
 
-    // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Measure
-    // first-chunk latency, the model-silent gap right before a disconnect, and
-    // how many SSE heartbeats were written, so a Safari drop can be classified
-    // (idle-gap vs hard wall-clock cap vs slow first chunk).
-    const streamStartedAt = Date.now();
-    let firstModelChunkAt: number | undefined;
-    let lastModelChunkAt = streamStartedAt;
-    let heartbeatsSent = 0;
-
-    // NOTE: streamText is synchronous in v6 — do NOT await it. A synchronous
-    // failure here (or in pipe below) would skip the terminal callbacks, so the
-    // catch releases the leased external clients to avoid a connection leak.
-    let result: ReturnType<typeof streamText>;
-    try {
-      result = streamText({
-        model,
-        system,
-        messages,
-        tools,
-        // No maxOutputTokens cap on the agent: tool-call arguments (e.g. a full
-        // page body for the write tools) are emitted as OUTPUT tokens, so a fixed
-        // cap would truncate complex tool calls mid-argument. Let the model use its
-        // natural per-step budget. (Cost/credit limits are an account concern, not
-        // something to enforce by silently breaking the agent.)
-        stopWhen: stepCountIs(MAX_AGENT_STEPS),
-        // Forced finalization: reserve the LAST allowed step for a text-only
-        // answer. Without this, a turn that spends all its steps on tool calls
-        // ends with no assistant text (an empty turn). prepareAgentStep forbids
-        // further tool calls and appends a synthesis instruction on that step,
-        // concatenated onto the original `system` so the persona is preserved.
-        prepareStep: ({ stepNumber }) =>
-          prepareAgentStep(stepNumber, system, activatedTools, deferredEnabled),
-        abortSignal: signal,
-        onChunk: ({ chunk }) => {
-          // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Any model
-          // output chunk means the stream is actively emitting bytes; track first
-          // + most-recent activity timestamps.
-          const now = Date.now();
-          firstModelChunkAt ??= now;
-          lastModelChunkAt = now;
-          // 'text-delta' is the assistant's prose; tool-call args are separate chunk
-          // types — so this mirrors exactly what streams to the client.
-          if (chunk.type === 'text-delta') inProgressText += chunk.text;
-        },
-        onStepFinish: (step) => {
-          // The finished step's full text is now in `step.text`; fold it in and reset
-          // the in-progress accumulator for the next step.
-          capturedSteps.push(step as StepLike);
-          inProgressText = '';
-          // Step-granular durability (#183): persist this finished step (its text +
-          // tool calls + tool RESULTS) the moment it ends, so a process death after
-          // this point still recovers the step. Not awaited here (never block the
-          // stream), but SERIALIZED via stepUpdateChain so the writes commit in
-          // step order; updateStreaming is error-tolerant (logs + swallows).
-          stepUpdateChain = stepUpdateChain.then(() => updateStreaming());
-        },
-        onFinish: async ({ text, finishReason, totalUsage, usage, steps }) => {
-          // DIAGNOSTIC (Safari stream-drop investigation) — temporary: success
-          // baseline for Safari comparison.
-          const diagNow = Date.now();
-          this.logger.log(
-            `AI chat stream DIAGNOSTIC (finish): elapsed=${diagNow - streamStartedAt}ms ` +
-              `firstChunkLatency=${firstModelChunkAt ? firstModelChunkAt - streamStartedAt : 'none'}ms ` +
-              `heartbeatsSent=${heartbeatsSent} steps=${steps.length}`,
+      // Link the assistant message (the #183 projection) to its run (#184), so a
+      // reconnecting client can resolve the run's output. Best-effort.
+      if (runId && assistantId) {
+        try {
+          await runHooks?.onAssistantSeeded?.(runId, assistantId);
+        } catch (err) {
+          this.logger.warn(
+            `Failed to link assistant row to run ${runId}: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
           );
-          // Finalize the assistant row (#183): the upfront 'streaming' row is
-          // UPDATEd to 'completed' with the turn's final text, cumulative usage and
-          // full UIMessage parts. We pass the SDK `steps` (which carry the final
-          // step's text) as the captured steps so metadata.parts matches the
-          // pre-#183 onFinish record exactly; `inProgressText` is '' here (the last
-          // step already finished). Final-step usage (usage.input+output) ≈ the
-          // conversation's CURRENT context size, distinct from totalUsage.
-          //
-          // COLUMN-SEMANTICS NOTE (#183): `content` is built by flushAssistant as
-          // the CONCATENATION of every step's text (stepsText), whereas pre-#183
-          // it stored only the FINAL step's text. This is a deliberate, harmless
-          // change: the UI and the Markdown export render from `metadata.parts`
-          // (per-step text + tool parts), not from `content`; `content` is the
-          // plain-text projection (full-text search / fallback). A multi-step
-          // turn's `content` therefore now holds all steps' prose, not just the
-          // last block.
-          await finalizeAssistant(
-            flushAssistant(steps as StepLike[], '', 'completed', {
-              finishReason: finishReason as string,
-              usage: totalUsage as StreamUsage,
-              contextTokens:
-                (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0) ||
-                undefined,
-              // Max context window for the chat header badge denominator;
-              // resolved from the admin-configured provider settings (in
-              // closure scope here). Omitted/0 = no limit.
-              maxContextTokens: resolved?.chatContextWindow,
-              pageChanged,
-            }),
+        }
+      }
+
+      // Per-step (non-terminal) update: persist the finished steps the moment a
+      // step ends. Tolerant — a failed update is logged and swallowed so it never
+      // throws into the stream. Keeps status 'streaming'.
+      const updateStreaming = async (): Promise<void> => {
+        if (!assistantId) return;
+        // Cheap short-circuit once the turn is finalized (see `finalized` below).
+        // The AUTHORITATIVE guard is `onlyIfStreaming` on the UPDATE: a late
+        // fire-and-forget step update could still be in flight on another pool
+        // connection when finalize runs, so the SQL `WHERE status='streaming'`
+        // (not this flag) is what prevents it clobbering the terminal row.
+        if (finalized) return;
+        try {
+          await this.aiChatMessageRepo.update(
+            assistantId,
+            workspace.id,
+            flushAssistant(capturedSteps, '', 'streaming', { pageChanged }),
+            { onlyIfStreaming: true },
           );
-          // Lifecycle: release the external MCP clients leased for this turn.
-          await closeExternalClients();
+        } catch (err) {
+          this.logger.warn(
+            `Failed to update streaming assistant row: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          );
+        }
+      };
 
-          // Turn end (#274): snapshot the open page's current Markdown (after all
-          // of the agent's edits this turn) so the NEXT turn can diff against it
-          // and detect edits a human made in between. Self-clearing — the agent's
-          // own edits are baked in — and this also SEEDS the snapshot on the first
-          // turn. Runs once across every terminal path (see snapshotTurnEnd).
-          await snapshotTurnEnd();
+      // Serialize the per-step updates (#183 review): onStepFinish fires them
+      // without await, so two could otherwise commit out of order on different pool
+      // connections (step N landing after N+1). Chaining each onto the previous
+      // keeps the persisted row monotonic with step order; each link short-circuits
+      // on `finalized`, so a tail of late updates is cheap.
+      let stepUpdateChain: Promise<void> = Promise.resolve();
 
-          // Generate the chat title for a freshly created chat AFTER the stream's
-          // provider call has completed — NOT concurrently with it. The z.ai coding
-          // endpoint stalls one of two concurrent requests to the same plan, which
-          // black-holed the chat stream (~300s headers timeout) when title
-          // generation raced it. Running it here (solo, fire-and-forget) avoids the
-          // race; never block the turn on it, swallow any error.
-          if (isNewChat && incomingText) {
-            void this.generateTitle(chatId, workspace.id, incomingText).catch(
-              (err) => {
-                this.logger.warn(
-                  `Title generation failed: ${(err as Error)?.message ?? err}`,
-                );
-              },
+      // Terminal finalize: write the completed/error/aborted row exactly once
+      // across the (mutually-exclusive, at-most-once) onFinish/onError/onAbort
+      // callbacks — mirroring the pre-#183 persist-at-most-once guard for the
+      // TERMINAL status (the row may be updated many times with 'streaming' before
+      // this fires once).
+      let finalized = false;
+      const finalizeAssistant = async (
+        flushed: AssistantFlush,
+      ): Promise<void> => {
+        if (finalized) return;
+        finalized = true;
+        const plan = planFinalizeAssistant(assistantId);
+        try {
+          // Shared dispatch (see applyFinalize): UPDATE the upfront row, or — when
+          // the upfront insert failed (kind 'insert') — INSERT the terminal row as
+          // the only safety against losing the turn entirely.
+          await applyFinalize(
+            this.aiChatMessageRepo,
+            plan,
+            { chatId, workspaceId: workspace.id, userId: user.id },
+            flushed,
+          );
+        } catch (err) {
+          this.logger.error(
+            `Failed to finalize assistant message (kind=${plan.kind})`,
+            err as Error,
+          );
+        }
+      };
+
+      // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Measure
+      // first-chunk latency, the model-silent gap right before a disconnect, and
+      // how many SSE heartbeats were written, so a Safari drop can be classified
+      // (idle-gap vs hard wall-clock cap vs slow first chunk).
+      const streamStartedAt = Date.now();
+      let firstModelChunkAt: number | undefined;
+      let lastModelChunkAt = streamStartedAt;
+      let heartbeatsSent = 0;
+
+      // NOTE: streamText is synchronous in v6 — do NOT await it. A synchronous
+      // failure here (or in pipe below) would skip the terminal callbacks, so the
+      // catch releases the leased external clients to avoid a connection leak.
+      let result: ReturnType<typeof streamText>;
+      try {
+        result = streamText({
+          model,
+          system,
+          messages,
+          tools,
+          // No maxOutputTokens cap on the agent: tool-call arguments (e.g. a full
+          // page body for the write tools) are emitted as OUTPUT tokens, so a fixed
+          // cap would truncate complex tool calls mid-argument. Let the model use its
+          // natural per-step budget. (Cost/credit limits are an account concern, not
+          // something to enforce by silently breaking the agent.)
+          stopWhen: stepCountIs(MAX_AGENT_STEPS),
+          // Forced finalization: reserve the LAST allowed step for a text-only
+          // answer. Without this, a turn that spends all its steps on tool calls
+          // ends with no assistant text (an empty turn). prepareAgentStep forbids
+          // further tool calls and appends a synthesis instruction on that step,
+          // concatenated onto the original `system` so the persona is preserved.
+          prepareStep: ({ stepNumber }) =>
+            prepareAgentStep(stepNumber, system, activatedTools, deferredEnabled),
+          // #184: the RUN's signal (explicit-stop) when a run wraps this turn, else
+          // the socket-bound signal (legacy). A browser disconnect aborts only in
+          // the legacy path.
+          abortSignal: effectiveSignal,
+          onChunk: ({ chunk }) => {
+            // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Any model
+            // output chunk means the stream is actively emitting bytes; track first
+            // + most-recent activity timestamps.
+            const now = Date.now();
+            firstModelChunkAt ??= now;
+            lastModelChunkAt = now;
+            // 'text-delta' is the assistant's prose; tool-call args are separate chunk
+            // types — so this mirrors exactly what streams to the client.
+            if (chunk.type === 'text-delta') inProgressText += chunk.text;
+          },
+          onStepFinish: (step) => {
+            // The finished step's full text is now in `step.text`; fold it in and reset
+            // the in-progress accumulator for the next step.
+            capturedSteps.push(step as StepLike);
+            inProgressText = '';
+            // Step-granular durability (#183): persist this finished step (its text +
+            // tool calls + tool RESULTS) the moment it ends, so a process death after
+            // this point still recovers the step. Not awaited here (never block the
+            // stream), but SERIALIZED via stepUpdateChain so the writes commit in
+            // step order; updateStreaming is error-tolerant (logs + swallows).
+            stepUpdateChain = stepUpdateChain.then(() => updateStreaming());
+            // #184: persist the run's progress (finished-step count). Fire-and-
+            // forget; the hook swallows its own errors.
+            if (runId) runHooks?.onStep?.(runId, capturedSteps.length);
+          },
+          onFinish: async ({ text, finishReason, totalUsage, usage, steps }) => {
+            // DIAGNOSTIC (Safari stream-drop investigation) — temporary: success
+            // baseline for Safari comparison.
+            const diagNow = Date.now();
+            this.logger.log(
+              `AI chat stream DIAGNOSTIC (finish): elapsed=${diagNow - streamStartedAt}ms ` +
+                `firstChunkLatency=${firstModelChunkAt ? firstModelChunkAt - streamStartedAt : 'none'}ms ` +
+                `heartbeatsSent=${heartbeatsSent} steps=${steps.length}`,
             );
-          }
-        },
-        onError: async ({ error }) => {
-          // NestJS Logger.error(message, stack?, context?): pass the real message
-          // (with statusCode when present) + the stack string, not the Error
-          // object, so the actual provider cause is clearly logged. Reuse the
-          // shared formatter so provider error formatting stays unified.
-          const e = error as { stack?: string };
-          const errorText = describeProviderError(error, String(error));
-          this.logger.error(`AI chat stream error: ${errorText}`, e?.stack);
-          // DIAGNOSTIC (Safari stream-drop investigation) — temporary: timing of
-          // an error-terminated stream.
-          const diagNow = Date.now();
-          this.logger.warn(
-            `AI chat stream DIAGNOSTIC (error): elapsed=${diagNow - streamStartedAt}ms ` +
-              `firstChunkLatency=${firstModelChunkAt ? firstModelChunkAt - streamStartedAt : 'none'}ms ` +
-              `silentGapBeforeDrop=${diagNow - lastModelChunkAt}ms heartbeatsSent=${heartbeatsSent}`,
-          );
-          // Finalize the PARTIAL answer streamed before the failure (text + any
-          // finished tool steps) WITH the error in metadata, so the turn shows what
-          // the user already saw plus the cause — not just a bare error. Status
-          // 'error' (#183).
-          await finalizeAssistant(
-            flushAssistant(capturedSteps, inProgressText, 'error', {
-              error: errorText,
-              pageChanged,
-            }),
-          );
-          await closeExternalClients();
-          // Advance the page snapshot even on failure (#274): an agent edit that
-          // committed before the error must be baked into the snapshot, or the
-          // next turn would mis-report it as a user edit.
-          await snapshotTurnEnd();
-        },
-        onAbort: async ({ steps }) => {
-          const partialChars =
-            capturedSteps.reduce((n, s) => n + (s.text?.length ?? 0), 0) +
-            inProgressText.length;
-          // Unlike onError/onFinish, this terminal path otherwise writes nothing, so
-          // an aborted turn (client disconnect / proxy drop / stop()) would be
-          // invisible in the logs. Log it (warn) so the abort is traceable.
-          this.logger.warn(
-            `AI chat stream aborted (chat ${chatId}) after ${steps.length} ` +
-              `step(s), ${partialChars} chars partial text; persisting partial turn.`,
-          );
-          // DIAGNOSTIC (Safari stream-drop investigation) — temporary: THE key
-          // line — classifies the Safari drop.
-          const diagNow = Date.now();
-          this.logger.warn(
-            `AI chat stream DIAGNOSTIC (abort/disconnect): elapsed=${diagNow - streamStartedAt}ms ` +
-              `firstChunkLatency=${firstModelChunkAt ? firstModelChunkAt - streamStartedAt : 'none'}ms ` +
-              `silentGapBeforeDrop=${diagNow - lastModelChunkAt}ms heartbeatsSent=${heartbeatsSent} ` +
-              `steps=${steps.length}`,
-          );
-          await finalizeAssistant(
-            flushAssistant(capturedSteps, inProgressText, 'aborted', {
-              pageChanged,
-            }),
-          );
-          await closeExternalClients();
-          // Advance the page snapshot even on abort (#274): an agent edit that
-          // committed before the client disconnect / stop() must be baked into the
-          // snapshot, or the next turn would mis-report it as a user edit.
-          await snapshotTurnEnd();
-        },
-      });
+            // Finalize the assistant row (#183): the upfront 'streaming' row is
+            // UPDATEd to 'completed' with the turn's final text, cumulative usage and
+            // full UIMessage parts. We pass the SDK `steps` (which carry the final
+            // step's text) as the captured steps so metadata.parts matches the
+            // pre-#183 onFinish record exactly; `inProgressText` is '' here (the last
+            // step already finished). Final-step usage (usage.input+output) ≈ the
+            // conversation's CURRENT context size, distinct from totalUsage.
+            //
+            // COLUMN-SEMANTICS NOTE (#183): `content` is built by flushAssistant as
+            // the CONCATENATION of every step's text (stepsText), whereas pre-#183
+            // it stored only the FINAL step's text. This is a deliberate, harmless
+            // change: the UI and the Markdown export render from `metadata.parts`
+            // (per-step text + tool parts), not from `content`; `content` is the
+            // plain-text projection (full-text search / fallback). A multi-step
+            // turn's `content` therefore now holds all steps' prose, not just the
+            // last block.
+            await finalizeAssistant(
+              flushAssistant(steps as StepLike[], '', 'completed', {
+                finishReason: finishReason as string,
+                usage: totalUsage as StreamUsage,
+                contextTokens:
+                  (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0) ||
+                  undefined,
+                // Max context window for the chat header badge denominator;
+                // resolved from the admin-configured provider settings (in
+                // closure scope here). Omitted/0 = no limit.
+                maxContextTokens: resolved?.chatContextWindow,
+                pageChanged,
+              }),
+            );
+            // #184: settle the RUN as succeeded (best-effort, after the projection
+            // is finalized above).
+            if (runId) await runHooks?.onSettled?.(runId, 'completed');
+            // Lifecycle: release the external MCP clients leased for this turn.
+            await closeExternalClients();
 
-      // Drain the stream independently of the client socket so the turn always
-      // runs to completion (or to its abort) and the terminal callbacks
-      // (onFinish/onError/onAbort) fire — releasing the per-turn object graph
-      // (history, the per-request toolset closures, captured steps, SDK buffers)
-      // and closing leased MCP clients. WITHOUT this, a client disconnect leaves
-      // the pipe's dead socket as the only reader; backpressure stalls the stream,
-      // the callbacks never run, and every dropped turn stays rooted in memory —
-      // the heap-OOM leak. consumeStream removes that backpressure (AI SDK v6
-      // "Handling client disconnects"). NOT awaited (fire-and-forget); the stream
-      // errors are already logged by the streamText `onError` callback above, so
-      // swallow here to avoid an unhandledRejection.
-      void result.consumeStream({ onError: () => undefined });
+            // Turn end (#274): snapshot the open page's current Markdown (after all
+            // of the agent's edits this turn) so the NEXT turn can diff against it
+            // and detect edits a human made in between. Self-clearing — the agent's
+            // own edits are baked in — and this also SEEDS the snapshot on the first
+            // turn. Runs once across every terminal path (see snapshotTurnEnd).
+            await snapshotTurnEnd();
 
-      // Stream the UI-message protocol straight to the hijacked Node response.
-      // Without onError the AI SDK masks the cause ('An error occurred.') and the
-      // UI shows a generic failure. Surface the real provider message instead.
-      // AI SDK error messages / 4xx bodies never contain the API key, so this is
-      // safe; we never dump the resolved config/apiKey.
-      //
-      // SSE buffering / proxy note: pipeUIMessageStreamToResponse writes the
-      // headers immediately (res.writeHead) and each chunk incrementally, and the
-      // SDK's default UI_MESSAGE_STREAM_HEADERS already include
-      // `x-accel-buffering: no` (disables nginx response buffering) plus
-      // `content-type: text/event-stream` and `cache-control: no-cache`. We pass
-      // `headers` explicitly anyway so the intent is visible here and survives any
-      // future change to the SDK defaults (prepareHeaders only fills a header when
-      // absent, so this never clobbers the SDK's content-type). DEPLOYMENT: the
-      // reverse proxy in front of this server MUST NOT buffer this route, or the
-      // whole response is released at once and nothing streams. nginx honours the
-      // `x-accel-buffering: no` header we send (and additionally set
-      // `proxy_buffering off; proxy_cache off;` for /api/ai-chat/stream); traefik
-      // does not buffer responses by default.
-      // Scrub the SDK's hop-by-hop Connection header before it writes the head (Safari/HTTP2).
-      stripStreamingHopByHopHeaders(res.raw);
-      // Running sum of per-step usage (v6 `finish-step.usage` is per-step). Sent
-      // as the cumulative authoritative usage so the client never jumps DOWN.
-      let cumulativeStepUsage: ChatStreamUsage | undefined;
-      result.pipeUIMessageStreamToResponse(res.raw, {
-        headers: { 'X-Accel-Buffering': 'no' },
-        // Surface the authoritative chatId on the streamed assistant UI message so
-        // the client adopts the REAL id of the row we created, instead of guessing
-        // the newest chat in its list. `messageMetadata` is invoked by the AI SDK
-        // on the `start`, `finish-step` and `finish` stream parts (ai@6 — note the
-        // `finish-step` trigger relies on it being delivered as its own
-        // message-metadata chunk); we attach `chatId` on the `start` part so it
-        // reaches the client (as message.metadata.chatId) at the very first chunk —
-        // before any second tab can race a newer chat into the list. This fixes the
-        // two-tab "adoption race" (#137).
+            // Generate the chat title for a freshly created chat AFTER the stream's
+            // provider call has completed — NOT concurrently with it. The z.ai coding
+            // endpoint stalls one of two concurrent requests to the same plan, which
+            // black-holed the chat stream (~300s headers timeout) when title
+            // generation raced it. Running it here (solo, fire-and-forget) avoids the
+            // race; never block the turn on it, swallow any error.
+            if (isNewChat && incomingText) {
+              void this.generateTitle(chatId, workspace.id, incomingText).catch(
+                (err) => {
+                  this.logger.warn(
+                    `Title generation failed: ${(err as Error)?.message ?? err}`,
+                  );
+                },
+              );
+            }
+          },
+          onError: async ({ error }) => {
+            // NestJS Logger.error(message, stack?, context?): pass the real message
+            // (with statusCode when present) + the stack string, not the Error
+            // object, so the actual provider cause is clearly logged. Reuse the
+            // shared formatter so provider error formatting stays unified.
+            const e = error as { stack?: string };
+            const errorText = describeProviderError(error, String(error));
+            this.logger.error(`AI chat stream error: ${errorText}`, e?.stack);
+            // DIAGNOSTIC (Safari stream-drop investigation) — temporary: timing of
+            // an error-terminated stream.
+            const diagNow = Date.now();
+            this.logger.warn(
+              `AI chat stream DIAGNOSTIC (error): elapsed=${diagNow - streamStartedAt}ms ` +
+                `firstChunkLatency=${firstModelChunkAt ? firstModelChunkAt - streamStartedAt : 'none'}ms ` +
+                `silentGapBeforeDrop=${diagNow - lastModelChunkAt}ms heartbeatsSent=${heartbeatsSent}`,
+            );
+            // Finalize the PARTIAL answer streamed before the failure (text + any
+            // finished tool steps) WITH the error in metadata, so the turn shows what
+            // the user already saw plus the cause — not just a bare error. Status
+            // 'error' (#183).
+            await finalizeAssistant(
+              flushAssistant(capturedSteps, inProgressText, 'error', {
+                error: errorText,
+                pageChanged,
+              }),
+            );
+            // #184: settle the RUN as failed, carrying the provider/transport cause.
+            if (runId) await runHooks?.onSettled?.(runId, 'error', errorText);
+            await closeExternalClients();
+            // Advance the page snapshot even on failure (#274): an agent edit that
+            // committed before the error must be baked into the snapshot, or the
+            // next turn would mis-report it as a user edit.
+            await snapshotTurnEnd();
+          },
+          onAbort: async ({ steps }) => {
+            const partialChars =
+              capturedSteps.reduce((n, s) => n + (s.text?.length ?? 0), 0) +
+              inProgressText.length;
+            // Unlike onError/onFinish, this terminal path otherwise writes nothing, so
+            // an aborted turn (client disconnect / proxy drop / stop()) would be
+            // invisible in the logs. Log it (warn) so the abort is traceable.
+            this.logger.warn(
+              `AI chat stream aborted (chat ${chatId}) after ${steps.length} ` +
+                `step(s), ${partialChars} chars partial text; persisting partial turn.`,
+            );
+            // DIAGNOSTIC (Safari stream-drop investigation) — temporary: THE key
+            // line — classifies the Safari drop.
+            const diagNow = Date.now();
+            this.logger.warn(
+              `AI chat stream DIAGNOSTIC (abort/disconnect): elapsed=${diagNow - streamStartedAt}ms ` +
+                `firstChunkLatency=${firstModelChunkAt ? firstModelChunkAt - streamStartedAt : 'none'}ms ` +
+                `silentGapBeforeDrop=${diagNow - lastModelChunkAt}ms heartbeatsSent=${heartbeatsSent} ` +
+                `steps=${steps.length}`,
+            );
+            await finalizeAssistant(
+              flushAssistant(capturedSteps, inProgressText, 'aborted', {
+                pageChanged,
+              }),
+            );
+            // #184: settle the RUN as aborted (an explicit user stop reached the
+            // run's signal; a disconnect does not abort a run-wrapped turn).
+            if (runId) await runHooks?.onSettled?.(runId, 'aborted');
+            await closeExternalClients();
+            // Advance the page snapshot even on abort (#274): an agent edit that
+            // committed before the client disconnect / stop() must be baked into the
+            // snapshot, or the next turn would mis-report it as a user edit.
+            await snapshotTurnEnd();
+          },
+        });
+
+        // Drain the stream independently of the client socket so the turn always
+        // runs to completion (or to its abort) and the terminal callbacks
+        // (onFinish/onError/onAbort) fire — releasing the per-turn object graph
+        // (history, the per-request toolset closures, captured steps, SDK buffers)
+        // and closing leased MCP clients. WITHOUT this, a client disconnect leaves
+        // the pipe's dead socket as the only reader; backpressure stalls the stream,
+        // the callbacks never run, and every dropped turn stays rooted in memory —
+        // the heap-OOM leak. consumeStream removes that backpressure (AI SDK v6
+        // "Handling client disconnects"). NOT awaited (fire-and-forget); the stream
+        // errors are already logged by the streamText `onError` callback above, so
+        // swallow here to avoid an unhandledRejection.
+        void result.consumeStream({ onError: () => undefined });
+
+        // Stream the UI-message protocol straight to the hijacked Node response.
+        // Without onError the AI SDK masks the cause ('An error occurred.') and the
+        // UI shows a generic failure. Surface the real provider message instead.
+        // AI SDK error messages / 4xx bodies never contain the API key, so this is
+        // safe; we never dump the resolved config/apiKey.
         //
-        // `finish-step.usage` is PER-STEP (not cumulative) in v6, and the client
-        // merges each metadata.usage by replacement — so on a multi-step agent turn
-        // (up to MAX_AGENT_STEPS) the naive per-step value would make the live
-        // counter jump DOWN at each boundary. We keep a running sum here and send
-        // the CUMULATIVE usage, which converges to `finish.totalUsage` (#151).
-        messageMetadata: ({ part }) => {
-          const p = part as StreamMetadataPart;
-          if (p.type === 'finish-step') {
-            cumulativeStepUsage = accumulateStepUsage(
-              cumulativeStepUsage,
-              normalizeStreamUsage(p.usage),
-            );
-          }
-          return chatStreamMetadata(p, chatId, cumulativeStepUsage);
-        },
-        // Stream reasoning (thinking) parts to the client so the live counter can
-        // estimate reasoning tokens from streamed text. v6 default is already
-        // true; set explicitly so the intent survives any future SDK default
-        // change. Providers that don't emit reasoning text still surface the
-        // count via the authoritative `usage.reasoningTokens` on finish-step.
-        sendReasoning: true,
-        onError: (error: unknown) => {
-          // Reuse the shared formatter so provider error formatting stays
-          // unified between the log line and the streamed error message.
-          return describeProviderError(error, 'AI stream error');
-        },
-      });
+        // SSE buffering / proxy note: pipeUIMessageStreamToResponse writes the
+        // headers immediately (res.writeHead) and each chunk incrementally, and the
+        // SDK's default UI_MESSAGE_STREAM_HEADERS already include
+        // `x-accel-buffering: no` (disables nginx response buffering) plus
+        // `content-type: text/event-stream` and `cache-control: no-cache`. We pass
+        // `headers` explicitly anyway so the intent is visible here and survives any
+        // future change to the SDK defaults (prepareHeaders only fills a header when
+        // absent, so this never clobbers the SDK's content-type). DEPLOYMENT: the
+        // reverse proxy in front of this server MUST NOT buffer this route, or the
+        // whole response is released at once and nothing streams. nginx honours the
+        // `x-accel-buffering: no` header we send (and additionally set
+        // `proxy_buffering off; proxy_cache off;` for /api/ai-chat/stream); traefik
+        // does not buffer responses by default.
+        // Scrub the SDK's hop-by-hop Connection header before it writes the head (Safari/HTTP2).
+        stripStreamingHopByHopHeaders(res.raw);
+        // Running sum of per-step usage (v6 `finish-step.usage` is per-step). Sent
+        // as the cumulative authoritative usage so the client never jumps DOWN.
+        let cumulativeStepUsage: ChatStreamUsage | undefined;
+        result.pipeUIMessageStreamToResponse(res.raw, {
+          headers: { 'X-Accel-Buffering': 'no' },
+          // Surface the authoritative chatId on the streamed assistant UI message so
+          // the client adopts the REAL id of the row we created, instead of guessing
+          // the newest chat in its list. `messageMetadata` is invoked by the AI SDK
+          // on the `start`, `finish-step` and `finish` stream parts (ai@6 — note the
+          // `finish-step` trigger relies on it being delivered as its own
+          // message-metadata chunk); we attach `chatId` on the `start` part so it
+          // reaches the client (as message.metadata.chatId) at the very first chunk —
+          // before any second tab can race a newer chat into the list. This fixes the
+          // two-tab "adoption race" (#137).
+          //
+          // `finish-step.usage` is PER-STEP (not cumulative) in v6, and the client
+          // merges each metadata.usage by replacement — so on a multi-step agent turn
+          // (up to MAX_AGENT_STEPS) the naive per-step value would make the live
+          // counter jump DOWN at each boundary. We keep a running sum here and send
+          // the CUMULATIVE usage, which converges to `finish.totalUsage` (#151).
+          messageMetadata: ({ part }) => {
+            const p = part as StreamMetadataPart;
+            if (p.type === 'finish-step') {
+              cumulativeStepUsage = accumulateStepUsage(
+                cumulativeStepUsage,
+                normalizeStreamUsage(p.usage),
+              );
+            }
+            return chatStreamMetadata(p, chatId, cumulativeStepUsage, runId);
+          },
+          // Stream reasoning (thinking) parts to the client so the live counter can
+          // estimate reasoning tokens from streamed text. v6 default is already
+          // true; set explicitly so the intent survives any future SDK default
+          // change. Providers that don't emit reasoning text still surface the
+          // count via the authoritative `usage.reasoningTokens` on finish-step.
+          sendReasoning: true,
+          onError: (error: unknown) => {
+            // Reuse the shared formatter so provider error formatting stays
+            // unified between the log line and the streamed error message.
+            return describeProviderError(error, 'AI stream error');
+          },
+        });
 
-      // Force the status line + headers onto the socket NOW (before the model's
-      // first token), so the proxy sees the response start immediately even if the
-      // provider's first chunk is delayed. writeToServerResponse already called
-      // writeHead synchronously above; flushHeaders is a belt-and-braces no-op once
-      // headers are sent, and is guarded for response-likes that lack it.
-      res.raw.flushHeaders?.();
-      // Heartbeat: keep the SSE stream progressing during silent tool/think gaps (Safari/proxy idle timeout).
-      // DIAGNOSTIC (Safari stream-drop investigation) — temporary: count beats so a disconnect log can show
-      // how many pings were written before Safari dropped.
-      startSseHeartbeat(res.raw, 15_000, () => {
-        heartbeatsSent += 1;
-      });
+        // Force the status line + headers onto the socket NOW (before the model's
+        // first token), so the proxy sees the response start immediately even if the
+        // provider's first chunk is delayed. writeToServerResponse already called
+        // writeHead synchronously above; flushHeaders is a belt-and-braces no-op once
+        // headers are sent, and is guarded for response-likes that lack it.
+        res.raw.flushHeaders?.();
+        // Heartbeat: keep the SSE stream progressing during silent tool/think gaps (Safari/proxy idle timeout).
+        // DIAGNOSTIC (Safari stream-drop investigation) — temporary: count beats so a disconnect log can show
+        // how many pings were written before Safari dropped.
+        startSseHeartbeat(res.raw, 15_000, () => {
+          heartbeatsSent += 1;
+        });
+      } catch (err) {
+        // Synchronous failure before/while wiring the stream: the terminal
+        // callbacks will not run, so release the leased external clients here and
+        // re-throw for the controller to surface on the socket.
+        await closeExternalClients();
+        throw err;
+      }
     } catch (err) {
-      // Synchronous failure before/while wiring the stream: the terminal
-      // callbacks will not run, so release the leased external clients here and
-      // re-throw for the controller to surface on the socket.
-      await closeExternalClients();
+      // #184 safety net (see the opening comment): settle the run on ANY failure
+      // before streamText's callbacks own the lifecycle, so the run row never
+      // stays 'running' forever (which would 409 every later turn in this chat).
+      // finalizeRun (onSettled) is idempotent — a settle here and a settle from a
+      // streamText callback collapse to a single terminal write.
+      if (runId) {
+        await runHooks?.onSettled?.(
+          runId,
+          'error',
+          err instanceof Error
+            ? err.message
+            : 'Agent run failed before streaming started',
+        );
+      }
       throw err;
     }
   }
@@ -1144,7 +1259,10 @@ export class AiChatService implements OnModuleInit {
    * permission). The content is truncated to keep the prompt cheap and within
    * context limits. Throws AiNotConfiguredException (503) if AI is unconfigured.
    */
-  async generatePageTitle(workspaceId: string, content: string): Promise<string> {
+  async generatePageTitle(
+    workspaceId: string,
+    content: string,
+  ): Promise<string> {
     const model = await this.ai.getChatModel(workspaceId);
     const { text } = await generateText({
       model,
@@ -1267,8 +1385,12 @@ export function chatStreamMetadata(
   part: StreamMetadataPart,
   chatId: string,
   cumulativeStepUsage?: ChatStreamUsage,
-): { chatId: string } | { usage: ChatStreamUsage } | undefined {
-  if (part.type === 'start') return { chatId };
+  // #184: the active run's id, attached alongside `chatId` on the `start` part so
+  // the client learns the run it can reconnect to / stop. Omitted when the turn
+  // is not run-wrapped (legacy path).
+  runId?: string,
+): { chatId: string; runId?: string } | { usage: ChatStreamUsage } | undefined {
+  if (part.type === 'start') return runId ? { chatId, runId } : { chatId };
   if (part.type === 'finish-step') {
     return cumulativeStepUsage ? { usage: cumulativeStepUsage } : undefined;
   }

@@ -121,6 +121,23 @@ export class AiChatMessageRepo {
     return rows.reverse();
   }
 
+  /** Fetch a single message by id + workspace (e.g. a run's projection row for
+   *  the #184 reconnect read). Returns undefined when nothing matches. */
+  async findById(
+    id: string,
+    workspaceId: string,
+    trx?: KyselyTransaction,
+  ): Promise<AiChatMessage | undefined> {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .selectFrom('aiChatMessages')
+      .select(this.baseFields)
+      .where('id', '=', id)
+      .where('workspaceId', '=', workspaceId)
+      .where('deletedAt', 'is', null)
+      .executeTakeFirst();
+  }
+
   async insert(
     insertable: InsertableAiChatMessage,
     trx?: KyselyTransaction,

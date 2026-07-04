@@ -24,6 +24,7 @@ import {
 } from "@/features/ai-chat/utils/role-launch.ts";
 import { describeChatError } from "@/features/ai-chat/utils/error-message.ts";
 import { extractServerChatId } from "@/features/ai-chat/utils/adopt-chat-id.ts";
+import { mergeObservedMessage } from "@/features/ai-chat/utils/run-polling.ts";
 import {
   dequeue,
   enqueueMessage,
@@ -86,6 +87,29 @@ interface ChatThreadProps {
    *  Copy/export button available mid-stream). Distinct from onTurnFinished,
    *  which fires only at the terminal outcome. */
   onServerChatId?: (serverChatId?: string) => void;
+  /** #184 reconnect-and-live-follow. When THIS tab reopened a chat whose agent
+   *  run is still going (it is a PASSIVE OBSERVER — it did not start the run here),
+   *  the parent polls the reconnect endpoint and feeds the run's incrementally-
+   *  persisted assistant message here; we merge it into the live list so new
+   *  steps/tool-calls appear as they are persisted. Null when there is nothing to
+   *  observe (no run, feature off, or this tab IS the streamer). The merge is
+   *  ADDITIONALLY guarded by our own `isStreaming`, so a stale value can never
+   *  fight the local stream when we are the streamer. */
+  observedRow?: IAiChatMessageRow | null;
+  /** Report this tab's live streaming status up to the parent, so it can stop
+   *  polling the run while WE are the active streamer (the SSE owns the view) and
+   *  resume once we go idle. Called from an effect on every transition. */
+  onStreamingChange?: (streaming: boolean) => void;
+  /** #184: whether detached/autonomous agent runs are enabled for this workspace.
+   *  When true the Stop button must additionally hit the AUTHORITATIVE server stop
+   *  (via onServerStop) — aborting only the local SSE is just a client disconnect,
+   *  which the server deliberately ignores, so the detached run would keep going. */
+  autonomousRunsEnabled?: boolean;
+  /** #184: request the server-side stop of this chat's active run (the parent owns
+   *  the endpoint call + the "stopping" latch that keeps observer-polling from
+   *  immediately re-streaming the stopping run's output). Called with the resolved
+   *  chat id when the user presses Stop in autonomous mode. */
+  onServerStop?: (chatId: string) => void;
 }
 
 /**
@@ -131,6 +155,10 @@ export default function ChatThread({
   assistantName,
   onTurnFinished,
   onServerChatId,
+  observedRow,
+  onStreamingChange,
+  autonomousRunsEnabled,
+  onServerStop,
 }: ChatThreadProps) {
   const { t } = useTranslation();
 
@@ -216,6 +244,16 @@ export default function ChatThread({
   const flushOnAbortRef = useRef(false);
   const interruptNextSendRef = useRef(false);
 
+  // #234 F5: the user pressed Stop while streaming a BRAND-NEW chat whose server
+  // chat id has not been adopted yet (the `start` chunk carrying it hadn't landed
+  // when Stop was pressed). A local SSE abort alone does NOT stop the DETACHED
+  // autonomous run — it keeps burning tokens and WRITING TO PAGES — so we cannot
+  // just no-op. We latch the stop as PENDING and fire the authoritative server
+  // stop the moment onServerChatId adopts the id (below). Read-and-cleared there;
+  // also defused on every new turn start so it can never fire against a later,
+  // unrelated turn's run.
+  const stopPendingRef = useRef(false);
+
   // FIFO dequeue + send the next queued message (no-op when the queue is empty).
   // Returns whether a message was actually sent, so callers can tell an empty
   // dequeue (nothing to flush) from a real send.
@@ -274,7 +312,7 @@ export default function ChatThread({
     [],
   );
 
-  const { messages, sendMessage, status, stop, error } = useChat({
+  const { messages, sendMessage, status, stop, error, setMessages } = useChat({
     // Stable per-mount key. Existing chats use their real id; new chats use a
     // generated client id (never `undefined`) so the store is NOT re-created on
     // every render mid-stream (see `chatStoreId` above).
@@ -365,7 +403,14 @@ export default function ChatThread({
       return;
     lastForwardedChatIdRef.current = serverChatId;
     onServerChatId(serverChatId);
-  }, [messages, onServerChatId]);
+    // #234 F5: if Stop was pressed before the id was known, the authoritative
+    // server stop was deferred to this adoption point — fire it now with the
+    // just-adopted id. One-shot (read-and-clear) so it can't fire twice.
+    if (stopPendingRef.current) {
+      stopPendingRef.current = false;
+      onServerStop?.(serverChatId);
+    }
+  }, [messages, onServerChatId, onServerStop]);
 
   // Live "turn was interrupted" marker for the CURRENT session. The red error
   // banner (driven by `error`) covers the error case; this covers an aborted
@@ -377,6 +422,27 @@ export default function ChatThread({
   );
 
   const isStreaming = status === "submitted" || status === "streaming";
+
+  // #184: report our live streaming status up so the parent stops polling the run
+  // while WE are the streamer (the SSE owns the view) and resumes once we go idle.
+  // Effect (not render) so it never updates parent state during our own render;
+  // fires on mount with `false`, which also re-syncs the parent after a chat
+  // switch remounts this thread (a fresh mount is idle until the user sends).
+  useEffect(() => {
+    onStreamingChange?.(isStreaming);
+  }, [isStreaming, onStreamingChange]);
+
+  // #184 passive-observer merge: when the parent feeds a polled run message (we
+  // reopened a chat whose run is still going and did NOT start it here), merge it
+  // into the live list so new steps/tool-calls appear as they are persisted. Hard-
+  // gated by `!isStreaming`: if THIS tab is actually the streamer, the local SSE
+  // owns the view and a stale observedRow must never overwrite it. `observedRow`
+  // is a stable per-poll object, so this runs once per poll, not per render.
+  useEffect(() => {
+    if (isStreaming || !observedRow) return;
+    const observed = rowToUiMessage(observedRow);
+    setMessages((prev) => mergeObservedMessage(prev, observed));
+  }, [observedRow, isStreaming, setMessages]);
 
   // "Send now" on a queued message: interrupt the current turn and immediately
   // send THIS message, keeping the agent's partial output. Other queued messages
@@ -409,6 +475,40 @@ export default function ChatThread({
     [setQueue, stop],
   );
 
+  // Stop the current turn. ALWAYS abort the local SSE (`stop()`) so the composer
+  // returns to idle immediately. In AUTONOMOUS mode the turn is a DETACHED run:
+  // aborting the local SSE is only a client disconnect, which the server ignores,
+  // so the run would keep executing — we ADDITIONALLY request the authoritative
+  // server-side stop (the parent owns that call + the "stopping" latch that keeps
+  // observer-polling from re-streaming the stopping run's output). The chat id is
+  // read live from chatIdRef (adopted early at the stream's `start` chunk); if it
+  // is not known yet — a brand-new chat in the first moment of its first turn —
+  // only the local abort happens (there is no server-side run handle to stop yet).
+  const handleStop = useCallback(() => {
+    stop();
+    if (!autonomousRunsEnabled) return;
+    if (chatIdRef.current) {
+      onServerStop?.(chatIdRef.current);
+    } else {
+      // #234 F5: no chat id yet (brand-new chat in the first moment of its first
+      // turn, before the `start` chunk adopted the id). Latch the stop as pending;
+      // the onServerChatId adoption effect fires the deferred server stop as soon
+      // as the id appears, so the detached run is still authoritatively stopped
+      // instead of left running by a silent local-only abort.
+      //
+      // KNOWN LIMITATION (#234 F5 review): `stop()` above has already aborted the
+      // local SSE reader. In the rare sub-window where Stop is pressed while still
+      // `submitted` (request sent, not one chunk read yet), that abort can cancel
+      // the reader BEFORE the `start` chunk is applied to `messages`, so the
+      // adoption effect never runs and this pending stop never fires. The detached
+      // run then keeps going for that turn. This is not a regression (the pre-fix
+      // behavior sent no server stop at all); closing it fully would require
+      // deferring the local abort until adoption, which is riskier and out of scope
+      // for this fix. Documented so a future change can address the abort-ordering.
+      stopPendingRef.current = true;
+    }
+  }, [stop, autonomousRunsEnabled, onServerStop]);
+
   // Clear the stopped marker as soon as a new turn begins streaming, and drop any
   // stale "Send now" interrupt flags. On the legit interrupt path both refs are
   // already consumed synchronously (onFinish + prepareSendMessagesRequest) before
@@ -420,6 +520,11 @@ export default function ChatThread({
       setStopNotice(null);
       flushOnAbortRef.current = false;
       interruptNextSendRef.current = false;
+      // #234 F5: a new turn is starting — drop any pending deferred-stop from a
+      // previous turn that never adopted an id, so it can never fire against this
+      // (or a later) unrelated turn's run. A deferred stop for the CURRENT turn is
+      // set AFTER this effect (on the Stop click), so this does not clobber it.
+      stopPendingRef.current = false;
     }
   }, [isStreaming]);
 
@@ -539,7 +644,7 @@ export default function ChatThread({
         <ChatInput
           onSend={(text) => sendMessage({ text })}
           onQueue={enqueue}
-          onStop={stop}
+          onStop={handleStop}
           isStreaming={isStreaming}
         />
       </Stack>

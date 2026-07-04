@@ -43,6 +43,30 @@ export class BoundChatDto {
   pageId: string;
 }
 
+/**
+ * Reconnect to the latest run of a chat (#184): fetch its persisted lifecycle
+ * state (and the assistant message it projects) for an in-flight or finished run.
+ */
+export class GetRunDto {
+  @IsString()
+  chatId: string;
+}
+
+/**
+ * Explicitly STOP an agent run (#184): the user pressed Stop — distinct from a
+ * browser disconnect, which never stops a run. Either the run id (preferred, from
+ * the streamed start metadata) or the chat id (stop whatever run is active on it).
+ */
+export class StopRunDto {
+  @IsOptional()
+  @IsString()
+  runId?: string;
+
+  @IsOptional()
+  @IsString()
+  chatId?: string;
+}
+
 /** Export a chat to Markdown (#183). `lang` localizes the few fixed
  *  role/tool-action labels; defaults to English server-side. */
 export class ExportChatDto {

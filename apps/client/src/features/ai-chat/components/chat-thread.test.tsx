@@ -11,6 +11,7 @@ const h = vi.hoisted(() => ({
     onFinish: null as null | ((arg: Record<string, unknown>) => void),
     sendMessage: vi.fn(),
     stop: vi.fn(),
+    setMessages: vi.fn(),
     transport: null as null | {
       prepareSendMessagesRequest: (arg: {
         messages: unknown[];
@@ -30,6 +31,8 @@ vi.mock("@ai-sdk/react", () => ({
       status: h.state.status,
       stop: h.state.stop,
       error: null,
+      // #184: ChatThread reads setMessages to merge a polled observer run.
+      setMessages: h.state.setMessages,
     };
   },
 }));
@@ -226,5 +229,58 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
       const { onTurnFinished } = finishWith(flags);
       expect(onTurnFinished).toHaveBeenCalled();
     }
+  });
+});
+
+// #184 passive-observer merge: when reconnecting to a still-running run, the
+// parent feeds the polled run message via `observedRow`; ChatThread merges it via
+// setMessages — but ONLY when this tab is NOT itself streaming (the streamer's
+// SSE owns the view, so a stale observedRow must never overwrite it).
+describe("ChatThread — observer run merge (#184)", () => {
+  beforeEach(() => {
+    h.state.onFinish = null;
+    h.state.setMessages.mockReset();
+  });
+
+  const observedRow = {
+    id: "a-run",
+    role: "assistant",
+    content: "step 1\nstep 2",
+    metadata: {
+      parts: [{ type: "text", text: "step 1\nstep 2" }],
+    },
+    createdAt: "2026-01-01T00:00:00Z",
+  } as const;
+
+  function renderObserver(status: string) {
+    h.state.status = status;
+    render(
+      <MantineProvider>
+        <ChatThread
+          chatId="c1"
+          initialRows={[]}
+          onTurnFinished={vi.fn()}
+          observedRow={observedRow as never}
+        />
+      </MantineProvider>,
+    );
+  }
+
+  it("merges the polled run message when this tab is a passive observer", () => {
+    renderObserver("ready");
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    // The updater replaces/append the observed assistant row by id.
+    const updater = h.state.setMessages.mock.calls[0][0] as (
+      prev: { id: string; parts: { text: string }[] }[],
+    ) => { id: string; parts: { text: string }[] }[];
+    const merged = updater([{ id: "u1", parts: [{ text: "hi" }] }]);
+    expect(merged).toHaveLength(2);
+    expect(merged[1].id).toBe("a-run");
+    expect(merged[1].parts[0].text).toBe("step 1\nstep 2");
+  });
+
+  it("does NOT merge while THIS tab is the streamer (no double-render)", () => {
+    renderObserver("streaming");
+    expect(h.state.setMessages).not.toHaveBeenCalled();
   });
 });

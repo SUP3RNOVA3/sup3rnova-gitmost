@@ -526,6 +526,20 @@ export class WorkspaceService {
         );
       }
 
+      if (typeof updateWorkspaceDto.autonomousRuns !== 'undefined') {
+        const prev = settingsBefore?.ai?.autonomousRuns ?? false;
+        if (prev !== updateWorkspaceDto.autonomousRuns) {
+          before.autonomousRuns = prev;
+          after.autonomousRuns = updateWorkspaceDto.autonomousRuns;
+        }
+        await this.workspaceRepo.updateAiSettings(
+          workspaceId,
+          'autonomousRuns',
+          updateWorkspaceDto.autonomousRuns,
+          trx,
+        );
+      }
+
       if (typeof updateWorkspaceDto.htmlEmbed !== 'undefined') {
         const prev = settingsBefore?.htmlEmbed ?? false;
         if (prev !== updateWorkspaceDto.htmlEmbed) {
@@ -579,6 +593,7 @@ export class WorkspaceService {
       delete updateWorkspaceDto.aiChat;
       delete updateWorkspaceDto.aiDictation;
       delete updateWorkspaceDto.aiDictationStreaming;
+      delete updateWorkspaceDto.autonomousRuns;
       delete updateWorkspaceDto.htmlEmbed;
       delete updateWorkspaceDto.trackerHead;
       delete updateWorkspaceDto.aiPublicShareAssistant;
