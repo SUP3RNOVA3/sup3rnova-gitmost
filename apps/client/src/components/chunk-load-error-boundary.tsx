@@ -9,7 +9,7 @@ const RELOAD_FLAG = "chunk-reload-attempted";
 // replaces the hashed chunks, a tab left open on the old index.html requests a
 // chunk URL that now 404s, and React.lazy rejects. Browsers / Vite surface these
 // with a ChunkLoadError name or one of these messages.
-function isChunkLoadError(error: unknown): boolean {
+export function isChunkLoadError(error: unknown): boolean {
   if (!error) return false;
   const name = (error as { name?: string }).name ?? "";
   const message = (error as { message?: string }).message ?? "";
