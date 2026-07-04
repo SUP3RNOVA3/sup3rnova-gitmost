@@ -14,6 +14,7 @@ import { ModalsProvider } from "@mantine/modals";
 import { Notifications } from "@mantine/notifications";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { HelmetProvider } from "react-helmet-async";
+import { ChunkLoadErrorBoundary } from "@/components/chunk-load-error-boundary.tsx";
 import "./i18n";
 import {
   getPostHogHost,
@@ -48,7 +49,12 @@ function renderApp(app: ReactNode) {
         <ModalsProvider>
           <QueryClientProvider client={queryClient}>
             <Notifications position="bottom-center" limit={3} zIndex={10000} />
-            <HelmetProvider>{app}</HelmetProvider>
+            <HelmetProvider>
+              {/* Root boundary above every lazy route's Suspense: a stale-chunk
+                  404 after a deploy is caught and recovered here instead of
+                  blanking the whole app. */}
+              <ChunkLoadErrorBoundary>{app}</ChunkLoadErrorBoundary>
+            </HelmetProvider>
           </QueryClientProvider>
         </ModalsProvider>
       </MantineProvider>
@@ -56,12 +62,18 @@ function renderApp(app: ReactNode) {
   );
 }
 
-async function bootstrap() {
+async function initAnalytics() {
   // posthog-js (and its React provider) is only pulled in for cloud deployments
   // with analytics enabled, so self-hosted builds never download it. The gate is
   // kept identical to the previous eager code so cloud analytics behavior is
   // unchanged; the import is simply deferred behind it.
-  if (isCloud() && isPostHogEnabled) {
+  //
+  // Crucially this runs AFTER the immediate first render below, so first paint is
+  // never gated on the analytics chunk. Any failure (network, stale 404, or an
+  // ad-blocker blocking a chunk named "posthog") is swallowed so the user keeps a
+  // working app without analytics instead of a permanently blank page.
+  if (!(isCloud() && isPostHogEnabled)) return;
+  try {
     const { default: posthog } = await import("posthog-js");
     const { PostHogProvider } = await import("posthog-js/react");
     posthog.init(getPostHogKey(), {
@@ -70,14 +82,20 @@ async function bootstrap() {
       disable_session_recording: true,
       capture_pageleave: false,
     });
+    // Re-render with the provider now that analytics is ready. React reconciles
+    // the same root, attaching the PostHog context above the (already painted)
+    // app so the whole cloud tree is wrapped in PostHogProvider as before.
     renderApp(
       <PostHogProvider client={posthog}>
         <App />
       </PostHogProvider>,
     );
-  } else {
-    renderApp(<App />);
+  } catch {
+    // Analytics failed to load — degrade gracefully; the app already rendered.
   }
 }
 
-void bootstrap();
+// Paint immediately for everyone (self-hosted stays exactly as instant as before,
+// cloud no longer blocks on the analytics import). Analytics is attached after.
+renderApp(<App />);
+void initAnalytics();

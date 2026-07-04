@@ -19,7 +19,9 @@ export default function Layout() {
     const ric =
       typeof window !== "undefined" && (window as any).requestIdleCallback;
     const warm = () => {
-      void import("@/pages/page/page");
+      // Best-effort prefetch: a failed warm-up (offline, stale 404) is harmless
+      // and must not surface as an unhandledrejection.
+      void import("@/pages/page/page").catch(() => {});
     };
     if (ric) {
       const id = ric(warm);
