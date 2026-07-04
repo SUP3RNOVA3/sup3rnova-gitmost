@@ -3,6 +3,17 @@ import {
   attachedCommentFor,
   standaloneCommentFor,
 } from "./attached-comment.js";
+import {
+  attachmentToHtml,
+  audioToHtml,
+  diagramToHtml,
+  embedToHtml,
+  pageEmbedToHtml,
+  pdfToHtml,
+  transclusionReferenceToHtml,
+  videoToHtml,
+  youtubeToHtml,
+} from "./media-html.js";
 
 /**
  * Hard cap on processNode recursion depth (see the depth guard below).
@@ -61,6 +72,24 @@ export function convertProseMirrorToMarkdown(content: any): string {
       .replace(/\s/g, (c: string) => (c === " " ? "%20" : encodeURIComponent(c)))
       .replace(/\(/g, "%28")
       .replace(/\)/g, "%29");
+
+  // Backslash-escape every character a markdown link's `[text]` label would
+  // otherwise INTERPRET, so a link-form media node's visible text (a filename or
+  // provider carried in `attrs.name`/`attrs.provider`) round-trips byte-exact
+  // (#293 canon #8 link-form). Escaping only `[ ] \` is NOT enough: the label is
+  // parsed as inline content, so emphasis (`* _`), code (`` ` ``), strikethrough
+  // (`~`), autolinks/raw-HTML (`<`), HTML entities (`&`), and image markers (`!`)
+  // would all be consumed and lost when the importer reads `a.textContent` back
+  // (e.g. `report *v2*.pdf` -> `report v2.pdf`). CommonMark treats a backslash
+  // before ANY ASCII punctuation as that literal char, so escaping this active
+  // set is always lossless on re-parse; the old `<div data-attachment-name>`
+  // form carried arbitrary strings via escapeAttr, so anything less is a
+  // data-loss regression on the git-sync data path. `( )` are escaped too: even
+  // with `[ ]` escaped, an unescaped `](x)` sequence inside the label (e.g. a
+  // name like `![shot](x).pdf`) forms a false nested-link destination and
+  // fragments the parse — escaping the parens removes that ambiguity entirely.
+  const escapeLinkText = (value: unknown): string =>
+    String(value ?? "").replace(/[\\`*_~[\]<&!()]/g, (c: string) => `\\${c}`);
 
   // Recursion depth guard. processNode is mutually recursive (directly and via
   // processListItem/processTaskItem/blockToHtml), and a pathologically nested
@@ -410,48 +439,44 @@ export function convertProseMirrorToMarkdown(content: any): string {
       }
 
       case "video": {
-        // Emit the schema-matching <video> element so generateJSON rebuilds the
-        // node with its attrs intact. The schema's parseHTML reads src/aria-label
-        // from the standard attributes and the remaining attrs from data-*.
+        // #293 canon #8 (image-form): a top-level video serializes as
+        // `![](src)<!--video {…}-->`. The bare `![](src)` is ALWAYS followed by
+        // the `video` discriminator comment — a bare image with NO comment is an
+        // `image`, never sniffed by URL — so the comment is REQUIRED even when
+        // there are no extra attrs (emitted name-only as `<!--video-->`). src
+        // lives in the markdown target; every OTHER non-default attr rides in the
+        // comment JSON (stable key order, numerics stringified for byte-stability
+        // exactly like canon #4). align default "center" is omitted. The schema
+        // `<div><video>` form is still emitted on the raw-HTML path (blockToHtml)
+        // via videoToHtml, since comment nodes are dropped inside columns/cells.
         const attrs = node.attrs || {};
-        const parts: string[] = [`src="${escapeAttr(attrs.src ?? "")}"`];
-        if (attrs.alt) parts.push(`aria-label="${escapeAttr(attrs.alt)}"`);
-        if (attrs.attachmentId)
-          parts.push(
-            `data-attachment-id="${escapeAttr(attrs.attachmentId)}"`,
-          );
-        if (attrs.width != null)
-          parts.push(`width="${escapeAttr(attrs.width)}"`);
-        if (attrs.height != null)
-          parts.push(`height="${escapeAttr(attrs.height)}"`);
-        if (attrs.size != null)
-          parts.push(`data-size="${escapeAttr(attrs.size)}"`);
-        if (attrs.align)
-          parts.push(`data-align="${escapeAttr(attrs.align)}"`);
+        const src = encodeMdUrl(attrs.src);
+        const json: Record<string, unknown> = {};
+        if (attrs.alt) json.alt = attrs.alt;
+        if (attrs.attachmentId) json.attachmentId = attrs.attachmentId;
+        if (attrs.width != null) json.width = String(attrs.width);
+        if (attrs.height != null) json.height = String(attrs.height);
+        if (attrs.size != null) json.size = String(attrs.size);
+        if (attrs.align != null && attrs.align !== "center")
+          json.align = attrs.align;
         if (attrs.aspectRatio != null)
-          parts.push(`data-aspect-ratio="${escapeAttr(attrs.aspectRatio)}"`);
-        // Wrap in a block <div> so marked treats it as a block (a bare <video>
-        // is inline-level HTML and marked wraps it in <p>, leaving a spurious
-        // empty paragraph beside the hoisted block atom). The wrapper has no
-        // data-type, so the schema parser ignores it and just hoists the video.
-        return `<div><video ${parts.join(" ")}></video></div>`;
+          json.aspectRatio = String(attrs.aspectRatio);
+        return `![](${src})${standaloneCommentFor("video", json)}`;
       }
 
       case "youtube": {
-        // Emit the schema-matching div[data-type="youtube"]; the schema reads
-        // src from data-src and width/height/align from data-* attributes.
+        // #293 canon #8 (image-form): `![](url)<!--youtube {…}-->`. Same rules as
+        // video — src in the target, other non-default attrs (width/height/align,
+        // align!=center) in the ALWAYS-emitted discriminator comment. The
+        // div[data-type="youtube"] form stays on the raw-HTML path (youtubeToHtml).
         const attrs = node.attrs || {};
-        const parts: string[] = [
-          `data-type="youtube"`,
-          `data-src="${escapeAttr(attrs.src ?? "")}"`,
-        ];
-        if (attrs.width != null)
-          parts.push(`data-width="${escapeAttr(attrs.width)}"`);
-        if (attrs.height != null)
-          parts.push(`data-height="${escapeAttr(attrs.height)}"`);
-        if (attrs.align)
-          parts.push(`data-align="${escapeAttr(attrs.align)}"`);
-        return `<div ${parts.join(" ")}></div>`;
+        const src = encodeMdUrl(attrs.src);
+        const json: Record<string, unknown> = {};
+        if (attrs.width != null) json.width = String(attrs.width);
+        if (attrs.height != null) json.height = String(attrs.height);
+        if (attrs.align != null && attrs.align !== "center")
+          json.align = attrs.align;
+        return `![](${src})${standaloneCommentFor("youtube", json)}`;
       }
 
       case "table": {
@@ -595,115 +620,91 @@ export function convertProseMirrorToMarkdown(content: any): string {
       }
 
       case "attachment": {
-        // BUG FIX: the old code read node.attrs.fileName / node.attrs.src, but
-        // the schema stores name/url (plus mime/size/attachmentId). Emit the
-        // schema-matching div[data-type="attachment"] with data-attachment-*
-        // attrs so the node round-trips instead of degrading to a markdown link.
+        // #293 canon #8 (link-form): `[filename](src)<!--attachment {…}-->`. The
+        // schema's `url` is the markdown target; the VISIBLE text is the filename
+        // (`attrs.name`, escaped so `[`/`]` cannot break the label). Every OTHER
+        // non-default attr (mime/size/attachmentId) rides in the ALWAYS-emitted
+        // discriminator comment — a bare `[text](src)` with no comment is a plain
+        // link, never an attachment. The div[data-type="attachment"] form stays
+        // on the raw-HTML path (attachmentToHtml) for columns/cells.
         const attrs = node.attrs || {};
-        const parts: string[] = [
-          `data-type="attachment"`,
-          `data-attachment-url="${escapeAttr(attrs.url ?? "")}"`,
-        ];
-        if (attrs.name)
-          parts.push(`data-attachment-name="${escapeAttr(attrs.name)}"`);
-        if (attrs.mime)
-          parts.push(`data-attachment-mime="${escapeAttr(attrs.mime)}"`);
-        if (attrs.size != null)
-          parts.push(`data-attachment-size="${escapeAttr(attrs.size)}"`);
-        if (attrs.attachmentId)
-          parts.push(
-            `data-attachment-id="${escapeAttr(attrs.attachmentId)}"`,
-          );
-        return `<div ${parts.join(" ")}></div>`;
+        const src = encodeMdUrl(attrs.url);
+        const text = escapeLinkText(attrs.name ?? "");
+        const json: Record<string, unknown> = {};
+        if (attrs.mime) json.mime = attrs.mime;
+        if (attrs.size != null) json.size = String(attrs.size);
+        if (attrs.attachmentId) json.attachmentId = attrs.attachmentId;
+        return `[${text}](${src})${standaloneCommentFor("attachment", json)}`;
       }
 
       case "drawio":
       case "excalidraw": {
-        // Emit the schema-matching div[data-type=...] carrying the diagram's
-        // attrs as data-* (the schema's diagramAttributes reads src/title/alt/
-        // width/height/size/aspectRatio/align/attachmentId from data-*), so the
-        // diagram round-trips instead of degrading to a lossy placeholder.
+        // #293 canon #8 (image-form): `![](src)<!--drawio|excalidraw {…}-->`. src
+        // in the target; title/alt/width/height/size/aspectRatio/align(!=center)/
+        // attachmentId in the ALWAYS-emitted discriminator comment (the NAME
+        // selects drawio vs excalidraw). The div[data-type=…] form stays on the
+        // raw-HTML path (diagramToHtml).
         const attrs = node.attrs || {};
-        const parts: string[] = [
-          `data-type="${type}"`,
-          `data-src="${escapeAttr(attrs.src ?? "")}"`,
-        ];
-        if (attrs.title != null)
-          parts.push(`data-title="${escapeAttr(attrs.title)}"`);
-        if (attrs.alt != null) parts.push(`data-alt="${escapeAttr(attrs.alt)}"`);
-        if (attrs.width != null)
-          parts.push(`data-width="${escapeAttr(attrs.width)}"`);
-        if (attrs.height != null)
-          parts.push(`data-height="${escapeAttr(attrs.height)}"`);
-        if (attrs.size != null)
-          parts.push(`data-size="${escapeAttr(attrs.size)}"`);
+        const src = encodeMdUrl(attrs.src);
+        const json: Record<string, unknown> = {};
+        if (attrs.title != null) json.title = attrs.title;
+        if (attrs.alt != null) json.alt = attrs.alt;
+        if (attrs.width != null) json.width = String(attrs.width);
+        if (attrs.height != null) json.height = String(attrs.height);
+        if (attrs.size != null) json.size = String(attrs.size);
         if (attrs.aspectRatio != null)
-          parts.push(`data-aspect-ratio="${escapeAttr(attrs.aspectRatio)}"`);
-        if (attrs.align)
-          parts.push(`data-align="${escapeAttr(attrs.align)}"`);
-        if (attrs.attachmentId)
-          parts.push(
-            `data-attachment-id="${escapeAttr(attrs.attachmentId)}"`,
-          );
-        return `<div ${parts.join(" ")}></div>`;
+          json.aspectRatio = String(attrs.aspectRatio);
+        if (attrs.align != null && attrs.align !== "center")
+          json.align = attrs.align;
+        if (attrs.attachmentId) json.attachmentId = attrs.attachmentId;
+        return `![](${src})${standaloneCommentFor(type, json)}`;
       }
 
       case "embed": {
-        // Emit the schema-matching div[data-type="embed"]; the schema reads
-        // src/provider/align/width/height from data-* attributes so the node
-        // (and its provider iframe info) survives the round-trip.
+        // #293 canon #8 (link-form): `[provider](src)<!--embed {…}-->`. src in
+        // the target; the VISIBLE text is the provider (`attrs.provider`). align/
+        // width/height ride in the discriminator comment only when non-default
+        // (align "center", width 800, height 600 are the schema defaults). The
+        // div[data-type="embed"] form stays on the raw-HTML path (embedToHtml).
         const attrs = node.attrs || {};
-        const parts: string[] = [
-          `data-type="embed"`,
-          `data-src="${escapeAttr(attrs.src ?? "")}"`,
-          `data-provider="${escapeAttr(attrs.provider ?? "")}"`,
-        ];
-        if (attrs.align)
-          parts.push(`data-align="${escapeAttr(attrs.align)}"`);
-        if (attrs.width != null)
-          parts.push(`data-width="${escapeAttr(attrs.width)}"`);
-        if (attrs.height != null)
-          parts.push(`data-height="${escapeAttr(attrs.height)}"`);
-        return `<div ${parts.join(" ")}></div>`;
+        const src = encodeMdUrl(attrs.src);
+        const text = escapeLinkText(attrs.provider ?? "");
+        const json: Record<string, unknown> = {};
+        if (attrs.align != null && attrs.align !== "center")
+          json.align = attrs.align;
+        if (attrs.width != null && attrs.width !== 800)
+          json.width = String(attrs.width);
+        if (attrs.height != null && attrs.height !== 600)
+          json.height = String(attrs.height);
+        return `[${text}](${src})${standaloneCommentFor("embed", json)}`;
       }
 
       case "audio": {
-        // Emit the schema-matching <audio> element (was emitting nothing). The
-        // schema reads src from src and attachmentId/size from data-*.
+        // #293 canon #8 (image-form): `![](src)<!--audio {…}-->`. src in the
+        // target; attachmentId/size in the ALWAYS-emitted discriminator comment.
+        // The <div><audio> form stays on the raw-HTML path (audioToHtml).
         const attrs = node.attrs || {};
-        const parts: string[] = [`src="${escapeAttr(attrs.src ?? "")}"`];
-        if (attrs.attachmentId)
-          parts.push(
-            `data-attachment-id="${escapeAttr(attrs.attachmentId)}"`,
-          );
-        if (attrs.size != null)
-          parts.push(`data-size="${escapeAttr(attrs.size)}"`);
-        // Wrap in a block <div> for the same reason as video: a bare <audio> is
-        // inline-level HTML that marked would wrap in <p>.
-        return `<div><audio ${parts.join(" ")}></audio></div>`;
+        const src = encodeMdUrl(attrs.src);
+        const json: Record<string, unknown> = {};
+        if (attrs.attachmentId) json.attachmentId = attrs.attachmentId;
+        if (attrs.size != null) json.size = String(attrs.size);
+        return `![](${src})${standaloneCommentFor("audio", json)}`;
       }
 
       case "pdf": {
-        // Emit the schema-matching div[data-type="pdf"] (was emitting nothing).
-        // The schema reads src/width/height from standard attrs and name/
-        // attachmentId/size from data-*.
+        // #293 canon #8 (link-form): `[filename](src)<!--pdf {…}-->`. src in the
+        // target; the VISIBLE text is the filename (`attrs.name`). attachmentId/
+        // size/width/height ride in the ALWAYS-emitted discriminator comment. The
+        // div[data-type="pdf"] form stays on the raw-HTML path (pdfToHtml).
         const attrs = node.attrs || {};
-        const parts: string[] = [
-          `data-type="pdf"`,
-          `src="${escapeAttr(attrs.src ?? "")}"`,
-        ];
-        if (attrs.name) parts.push(`data-name="${escapeAttr(attrs.name)}"`);
-        if (attrs.attachmentId)
-          parts.push(
-            `data-attachment-id="${escapeAttr(attrs.attachmentId)}"`,
-          );
-        if (attrs.size != null)
-          parts.push(`data-size="${escapeAttr(attrs.size)}"`);
-        if (attrs.width != null)
-          parts.push(`width="${escapeAttr(attrs.width)}"`);
-        if (attrs.height != null)
-          parts.push(`height="${escapeAttr(attrs.height)}"`);
-        return `<div ${parts.join(" ")}></div>`;
+        const src = encodeMdUrl(attrs.src);
+        const text = escapeLinkText(attrs.name ?? "");
+        const json: Record<string, unknown> = {};
+        if (attrs.attachmentId) json.attachmentId = attrs.attachmentId;
+        if (attrs.size != null) json.size = String(attrs.size);
+        if (attrs.width != null) json.width = String(attrs.width);
+        if (attrs.height != null) json.height = String(attrs.height);
+        return `[${text}](${src})${standaloneCommentFor("pdf", json)}`;
       }
 
       case "columns": {
@@ -802,26 +803,29 @@ export function convertProseMirrorToMarkdown(content: any): string {
       }
 
       case "pageEmbed": {
-        // Whole-page live embed; the schema reads data-source-page-id.
+        // #293 canon #8 (standalone): a whole-page live embed serializes as a
+        // lone discriminator comment on its own line — `<!--pageembed-->` or
+        // `<!--pageembed {"sourcePageId":…}-->`. Readable markdown, invisible in
+        // renderers, re-materialized on import. The div[data-type="pageEmbed"]
+        // form stays on the raw-HTML path (pageEmbedToHtml) for columns/cells.
         const attrs = node.attrs || {};
-        const parts: string[] = [`data-type="pageEmbed"`];
-        if (attrs.sourcePageId)
-          parts.push(`data-source-page-id="${escapeAttr(attrs.sourcePageId)}"`);
-        return `<div ${parts.join(" ")}></div>`;
+        const json: Record<string, unknown> = {};
+        if (attrs.sourcePageId) json.sourcePageId = attrs.sourcePageId;
+        return standaloneCommentFor("pageembed", json);
       }
 
       case "transclusionReference": {
-        // Live reference to a transcluded block/page. Block atom; the schema
-        // reads data-source-page-id and data-transclusion-id.
+        // #293 canon #8 (standalone): a live block/page reference serializes as a
+        // lone `<!--transclusion {…}-->` comment carrying sourcePageId +
+        // transclusionId (the data-loss-critical id links). The
+        // div[data-type="transclusionReference"] form stays on the raw-HTML path
+        // (transclusionReferenceToHtml). (transclusionSource is unchanged — it has
+        // block children and keeps recursing through processNode.)
         const attrs = node.attrs || {};
-        const parts: string[] = [`data-type="transclusionReference"`];
-        if (attrs.sourcePageId)
-          parts.push(`data-source-page-id="${escapeAttr(attrs.sourcePageId)}"`);
-        if (attrs.transclusionId)
-          parts.push(
-            `data-transclusion-id="${escapeAttr(attrs.transclusionId)}"`,
-          );
-        return `<div ${parts.join(" ")}></div>`;
+        const json: Record<string, unknown> = {};
+        if (attrs.sourcePageId) json.sourcePageId = attrs.sourcePageId;
+        if (attrs.transclusionId) json.transclusionId = attrs.transclusionId;
+        return standaloneCommentFor("transclusion", json);
       }
 
       case "transclusionSource": {
@@ -1067,25 +1071,41 @@ export function convertProseMirrorToMarkdown(content: any): string {
         const recursive = block.attrs?.recursive ? ` data-recursive="true"` : "";
         return `<div data-type="subpages"${recursive}></div>`;
       }
-      // columns/column, math, media, embed, attachment, mention, etc. already
+      // #293 canon #8: the media/discriminator family now serializes at TOP LEVEL
+      // (processNode) as md-target + `<!--name-->` comment. A comment node is
+      // DROPPED by the DOM parse stage that reads a raw-HTML block back, so inside
+      // a column/cell the comment form would silently vanish (data loss). Give
+      // each an EXPLICIT schema-HTML case here (via the shared media-html builders
+      // — the SAME output processNode used to emit, and the same the importer
+      // rebuilds) instead of delegating to processNode's md+comment form.
+      case "video":
+        return videoToHtml(block.attrs || {});
+      case "audio":
+        return audioToHtml(block.attrs || {});
+      case "pdf":
+        return pdfToHtml(block.attrs || {});
+      case "youtube":
+        return youtubeToHtml(block.attrs || {});
+      case "embed":
+        return embedToHtml(block.attrs || {});
+      case "attachment":
+        return attachmentToHtml(block.attrs || {});
+      case "drawio":
+      case "excalidraw":
+        return diagramToHtml(block.type, block.attrs || {});
+      case "pageEmbed":
+        return pageEmbedToHtml(block.attrs || {});
+      case "transclusionReference":
+        return transclusionReferenceToHtml(block.attrs || {});
+      // columns/column, math, htmlEmbed, footnotes, transclusionSource already
       // emit schema-matching HTML from processNode.
       case "columns":
       case "column":
       case "mathBlock":
-      case "video":
-      case "audio":
-      case "pdf":
-      case "youtube":
-      case "embed":
-      case "attachment":
-      case "drawio":
-      case "excalidraw":
       case "htmlEmbed":
       case "footnotesList":
       case "footnoteDefinition":
-      case "pageEmbed":
       case "transclusionSource":
-      case "transclusionReference":
         return processNode(block);
       default:
         // Any still-unhandled block type: NEVER fall back to markdown inside a

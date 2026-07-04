@@ -430,33 +430,31 @@ describe('convertProseMirrorToMarkdown', () => {
       );
     });
 
-    it('attachment emits div with schema data-attachment-* attrs', () => {
+    it('attachment emits link-form [name](url) + discriminator comment (#293 #8)', () => {
       const out = convertProseMirrorToMarkdown(
         doc({
           type: 'attachment',
           attrs: { url: '/files/x.zip', name: 'x.zip', mime: 'application/zip', size: 99 },
         }),
       );
+      // #293 canon #8: url is the markdown target, name is the visible link text,
+      // and every other attr rides in the ALWAYS-emitted `attachment` comment.
       expect(out).toBe(
-        '<div data-type="attachment" data-attachment-url="/files/x.zip" ' +
-          'data-attachment-name="x.zip" data-attachment-mime="application/zip" ' +
-          'data-attachment-size="99"></div>',
+        '[x.zip](/files/x.zip)<!--attachment {"mime":"application/zip","size":"99"}-->',
       );
     });
 
-    it('video emits a <div>-wrapped <video> with schema attrs', () => {
+    it('video emits image-form ![](src) + discriminator comment (#293 #8)', () => {
       const out = convertProseMirrorToMarkdown(
         doc({
           type: 'video',
           attrs: { src: '/v.mp4', alt: 'clip', width: 640 },
         }),
       );
-      expect(out).toBe(
-        '<div><video src="/v.mp4" aria-label="clip" width="640"></video></div>',
-      );
+      expect(out).toBe('![](/v.mp4)<!--video {"alt":"clip","width":"640"}-->');
     });
 
-    it('youtube emits a div[data-type="youtube"] with data-src', () => {
+    it('youtube emits image-form ![](src) + discriminator comment (#293 #8)', () => {
       const out = convertProseMirrorToMarkdown(
         doc({
           type: 'youtube',
@@ -464,8 +462,7 @@ describe('convertProseMirrorToMarkdown', () => {
         }),
       );
       expect(out).toBe(
-        '<div data-type="youtube" data-src="https://youtu.be/abc" ' +
-          'data-width="560" data-height="315"></div>',
+        '![](https://youtu.be/abc)<!--youtube {"width":"560","height":"315"}-->',
       );
     });
   });

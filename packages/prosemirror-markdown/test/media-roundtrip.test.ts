@@ -52,9 +52,9 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
-    expect(md1).toBe(
-      '<div><audio src="/a.mp3" data-attachment-id="att-7" data-size="9001"></audio></div>',
-    );
+    // #293 canon #8 image-form: `![](src)` + the ALWAYS-emitted `audio`
+    // discriminator carrying the other attrs as JSON (numerics stringified).
+    expect(md1).toBe('![](/a.mp3)<!--audio {"attachmentId":"att-7","size":"9001"}-->');
     // Byte-stable: a second export reproduces the first exactly.
     expect(md2).toBe(md1);
 
@@ -87,8 +87,10 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
+    // #293 canon #8 image-form: align="center" (the schema default) is OMITTED,
+    // so the whole optional set except align rides in the `video` comment JSON.
     expect(md1).toBe(
-      '<div><video src="/v.mp4" aria-label="clip" data-attachment-id="att-1" width="640" height="480" data-size="1234" data-align="center" data-aspect-ratio="1.777"></video></div>',
+      '![](/v.mp4)<!--video {"alt":"clip","attachmentId":"att-1","width":"640","height":"480","size":"1234","aspectRatio":"1.777"}-->',
     );
     expect(md2).toBe(md1);
 
@@ -108,19 +110,26 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
   });
 
   // 3. minimal video (only src) --------------------------------------------
-  it('minimal video (src only): NOT byte-stable (gains data-align="center") but canonically equal', async () => {
+  it('minimal video (src only): the discriminator is STILL emitted; byte-stable; round-trips to VIDEO not image', async () => {
     const doc = mkDoc([{ type: 'video', attrs: { src: '/v.mp4' } }]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
-    expect(md1).toBe('<div><video src="/v.mp4"></video></div>');
-    // video.align has a non-null schema default 'center' that materializes on
-    // import; the converter only emits data-align when set, so export #2 grows
-    // by data-align="center" exactly once (the documented one-time asymmetry).
-    expect(md2).toBe('<div><video src="/v.mp4" data-align="center"></video></div>');
-    expect(md2).not.toBe(md1);
+    // #293 canon #8: the comment is the type discriminator, so it is emitted even
+    // with no extra attrs (name-only). Without it a bare `![](src)` would be read
+    // as an `image`. align="center" default is omitted, so the form is byte-stable
+    // (unlike the old div-form, which gained data-align="center" on import).
+    expect(md1).toBe('![](/v.mp4)<!--video-->');
+    expect(md2).toBe(md1);
 
-    // align:'center' is normalized away via KNOWN_DEFAULTS.video, so despite the
-    // byte growth the documents ARE canonically equal.
+    // Critically: it round-trips to a VIDEO node, NOT an image.
+    const video = findFirst(doc2, 'video');
+    expect(video).not.toBeNull();
+    expect(video.type).toBe('video');
+    expect(findFirst(doc2, 'image')).toBeNull();
+    expect(video.attrs.src).toBe('/v.mp4');
+
+    // align:'center' is normalized away via KNOWN_DEFAULTS.video, so the
+    // documents ARE canonically equal.
     expect(docsCanonicallyEqual(doc, doc2)).toBe(true);
   });
 
@@ -131,9 +140,9 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
-    expect(md1).toBe(
-      '<div data-type="pdf" src="/d.pdf" data-name="d.pdf" data-attachment-id="att-9"></div>',
-    );
+    // #293 canon #8 link-form: `[name](src)` + the `pdf` discriminator; the id
+    // link (attachmentId) is data-loss-critical and rides in the comment JSON.
+    expect(md1).toBe('[d.pdf](/d.pdf)<!--pdf {"attachmentId":"att-9"}-->');
     expect(md2).toBe(md1);
 
     const pdf = findFirst(doc2, 'pdf');
@@ -163,8 +172,10 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
+    // #293 canon #8 link-form: url is the target, name the visible text, and
+    // mime/size/attachmentId ride in the `attachment` discriminator comment.
     expect(md1).toBe(
-      '<div data-type="attachment" data-attachment-url="/f.zip" data-attachment-name="f.zip" data-attachment-mime="application/zip" data-attachment-size="512" data-attachment-id="att-3"></div>',
+      '[f.zip](/f.zip)<!--attachment {"mime":"application/zip","size":"512","attachmentId":"att-3"}-->',
     );
     expect(md2).toBe(md1);
 
@@ -197,8 +208,10 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
+    // #293 canon #8 link-form: provider is the visible text; the non-default
+    // align/width/height (defaults center/800/600) ride in the comment JSON.
     expect(md1).toBe(
-      '<div data-type="embed" data-src="https://x.com/e" data-provider="iframe" data-align="left" data-width="600" data-height="400"></div>',
+      '[iframe](https://x.com/e)<!--embed {"align":"left","width":"600","height":"400"}-->',
     );
     expect(md2).toBe(md1);
 
@@ -213,29 +226,27 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
   });
 
   // 7. minimal embed (only src+provider) -----------------------------------
-  it('minimal embed (src+provider): NOT byte-stable; defaults width/height materialize as NUMBERS 800/600', async () => {
+  it('minimal embed (src+provider): discriminator still emitted; byte-stable; defaults materialize as NUMBERS 800/600', async () => {
     const doc = mkDoc([
       { type: 'embed', attrs: { src: 'https://x.com/e', provider: 'iframe' } },
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
-    expect(md1).toBe(
-      '<div data-type="embed" data-src="https://x.com/e" data-provider="iframe"></div>',
-    );
-    // embed has non-null schema defaults align='center', width=800, height=600
-    // that the converter never emits on export #1 but materialize on import, so
-    // export #2 grows by three data-* attrs (a one-time divergence).
-    expect(md2).toBe(
-      '<div data-type="embed" data-src="https://x.com/e" data-provider="iframe" data-align="center" data-width="800" data-height="600"></div>',
-    );
-    expect(md2).not.toBe(md1);
+    // #293 canon #8: align/width/height are all at their schema defaults
+    // (center/800/600), so the discriminator is name-only. Unlike the old
+    // div-form (which grew three data-* attrs on import), the md-form OMITS the
+    // defaults on BOTH exports, so it is byte-stable from export #1.
+    expect(md1).toBe('[iframe](https://x.com/e)<!--embed-->');
+    expect(md2).toBe(md1);
 
     const embed = findFirst(doc2, 'embed');
     expect(embed).not.toBeNull();
+    expect(embed.type).toBe('embed');
+    // Round-trips to EMBED, not a plain link.
+    expect(embed.attrs.provider).toBe('iframe');
     expect(embed.attrs.align).toBe('center');
-    // NOTE: these come from the addAttributes default (NOT parseHTML), so on the
-    // FIRST import they are the NUMBERS 800/600, not strings — parseHTML only
-    // runs when the attribute is actually present on the imported element.
+    // NOTE: these come from the addAttributes default (NOT parseHTML), so they
+    // are the NUMBERS 800/600 — parseHTML only runs when the attribute is present.
     expect(embed.attrs.width).toBe(800);
     expect(embed.attrs.height).toBe(600);
   });
@@ -255,8 +266,10 @@ describe('media atom round-trip (audio/video/pdf/attachment/embed/youtube)', () 
     ]);
     const { md1, md2, doc2 } = await roundTrip(doc);
 
+    // #293 canon #8 image-form: width/height/align(right) ride in the `youtube`
+    // discriminator comment (align "right" is non-default so it is kept).
     expect(md1).toBe(
-      '<div data-type="youtube" data-src="https://youtu.be/abc" data-width="560" data-height="315" data-align="right"></div>',
+      '![](https://youtu.be/abc)<!--youtube {"width":"560","height":"315","align":"right"}-->',
     );
     expect(md2).toBe(md1);
 

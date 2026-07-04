@@ -12,6 +12,17 @@ import { JSDOM } from "jsdom";
 import { marked } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
 import { parseAttachedComment } from "./attached-comment.js";
+import {
+  attachmentToHtml,
+  audioToHtml,
+  diagramToHtml,
+  embedToHtml,
+  pageEmbedToHtml,
+  pdfToHtml,
+  transclusionReferenceToHtml,
+  videoToHtml,
+  youtubeToHtml,
+} from "./media-html.js";
 
 // Setup DOM environment for Tiptap HTML parsing in Node.js
 const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>");
@@ -346,14 +357,24 @@ function bridgeTaskLists(html: string): string {
  *     child of `<body>`. These are replaced with the schema-matching block div
  *     (`<div data-type="pageBreak">` / `<div data-type="subpages" [data-recursive]>`)
  *     that the schema's parseHTML rebuilds into the atom.
+ *   - MEDIA DISCRIMINATOR comments (#8): the comment NAME selects the node type.
+ *     IMAGE-FORM (`youtube`/`video`/`audio`/`drawio`/`excalidraw`) binds to the
+ *     preceding `<img>` (`![](src)<!--name …-->`); LINK-FORM (`pdf`/`attachment`/
+ *     `embed`) binds to the preceding `<a>` (`[text](src)<!--name …-->`);
+ *     STANDALONE (`pageembed`/`transclusion`) is a lone comment line. Each is
+ *     re-expressed as the SAME schema HTML the serializer's raw-HTML path emits
+ *     (media-html.ts) — the img's `src`/the anchor's `href`+text plus the decoded
+ *     comment attrs — then swapped in for the `<img>`/`<a>`/comment. A bare
+ *     `![](url)`/`[text](src)` with NO following discriminator stays an `image`/
+ *     plain link (never sniffed by URL).
  *
  * Position determines legality: an `attrs` comment is honored only in attached
- * position, a `subpages`/`pagebreak` comment only in standalone position; a
- * comment in the wrong position is left INERT (generateJSON drops it). Fail-open
- * everywhere: a malformed comment (null from parseAttachedComment), an unknown
- * name, a wrong-position comment, or an unknown/empty attr value is ignored.
- * Future decisions (#4/#8) extend the per-name handling here without changing
- * the parse primitive.
+ * position, `subpages`/`pagebreak`/`pageembed`/`transclusion` only in standalone
+ * position, an image-form comment only next to an `<img>` and a link-form comment
+ * only next to an `<a>`; a comment in the wrong position/next to the wrong element
+ * is left INERT (generateJSON drops it). Fail-open everywhere: a malformed comment
+ * (null from parseAttachedComment), an unknown name, a wrong-position comment, or
+ * an unknown/empty attr value is ignored.
  */
 function applyCommentDirectives(html: string): string {
   // Cheap early-out: no comments at all -> nothing to intercept.
@@ -376,6 +397,43 @@ function applyCommentDirectives(html: string): string {
   // return `document.body.innerHTML`. Because the parser only puts LEADING
   // comments at document level, prepending them to body preserves global order.
   const leadingDivs: any[] = [];
+
+  // #293 canon #8 discriminator NAME -> node form. The comment NAME alone selects
+  // the node type; a bare `![](url)`/`[text](src)` with NO following comment is an
+  // `image`/plain link (never sniffed). These are materialized below by rebuilding
+  // the SAME schema HTML the serializer's raw-HTML path emits (media-html.ts), so
+  // serialize and parse cannot drift.
+  const IMAGE_FORM_NAMES = new Set([
+    "youtube",
+    "video",
+    "audio",
+    "drawio",
+    "excalidraw",
+  ]);
+  const LINK_FORM_NAMES = new Set(["pdf", "attachment", "embed"]);
+
+  // Parse a schema-HTML string (from a media-html builder) into its top-level
+  // element so it can be swapped in for the <img>/<a>/comment it replaces.
+  const buildElement = (htmlStr: string): any => {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = htmlStr;
+    return tmp.firstElementChild;
+  };
+
+  // Build the image-form schema HTML for a given discriminator name, using the
+  // <img>'s src as the node src plus the decoded comment attrs.
+  const imageFormHtml = (name: string, attrs: Record<string, any>): string => {
+    switch (name) {
+      case "video":
+        return videoToHtml(attrs);
+      case "audio":
+        return audioToHtml(attrs);
+      case "youtube":
+        return youtubeToHtml(attrs);
+      default: // drawio | excalidraw
+        return diagramToHtml(name as "drawio" | "excalidraw", attrs);
+    }
+  };
 
   for (const comment of comments) {
     const parsed = parseAttachedComment(comment.data);
@@ -410,6 +468,86 @@ function applyCommentDirectives(html: string): string {
         comment.remove();
         leadingDivs.push(div);
       }
+      continue;
+    }
+
+    if (parsed.name === "pageembed" || parsed.name === "transclusion") {
+      // #293 canon #8 STANDALONE media. Like subpages/pagebreak: a lone comment
+      // line placed under <body> or at document level (leading). An attached-
+      // position comment (inside a <p>/<hN> with a sibling) is INERT. We rebuild
+      // the schema div the raw-HTML path emits (media-html.ts) from the decoded
+      // attrs so serialize/parse stay in sync.
+      const standalone = tag === "" || tag === "body" || tag === "html";
+      if (!standalone) continue; // wrong position -> inert
+      const el = buildElement(
+        parsed.name === "pageembed"
+          ? pageEmbedToHtml({ sourcePageId: parsed.attrs.sourcePageId })
+          : transclusionReferenceToHtml({
+              sourcePageId: parsed.attrs.sourcePageId,
+              transclusionId: parsed.attrs.transclusionId,
+            }),
+      );
+      if (!el) continue; // defensive: builder always yields an element
+      if (tag === "body") {
+        comment.replaceWith(el);
+      } else {
+        comment.remove();
+        leadingDivs.push(el);
+      }
+      continue;
+    }
+
+    if (IMAGE_FORM_NAMES.has(parsed.name)) {
+      // #293 canon #8 IMAGE-FORM media (youtube/video/audio/drawio/excalidraw).
+      // `![](src)<!--name {…}-->` renders as `<p><img …><!--name …--></p>`, so
+      // the target is the comment's previous element sibling and it MUST be an
+      // <img>. We rebuild the schema element from the img's src + decoded attrs
+      // and swap it in for the <img>. No adjacent <img> -> INERT.
+      const prev = comment.previousElementSibling as any;
+      const target =
+        prev && String(prev.tagName || "").toLowerCase() === "img"
+          ? prev
+          : null;
+      if (!target) continue; // no adjacent <img> -> inert
+      const attrs = { ...parsed.attrs, src: target.getAttribute("src") || "" };
+      const el = buildElement(imageFormHtml(parsed.name, attrs));
+      if (!el) continue;
+      target.replaceWith(el);
+      comment.remove();
+      continue;
+    }
+
+    if (LINK_FORM_NAMES.has(parsed.name)) {
+      // #293 canon #8 LINK-FORM media (pdf/attachment/embed).
+      // `[text](src)<!--name {…}-->` renders as `<p><a href="src">text</a>
+      // <!--name …--></p>`, so the target is the previous element sibling and it
+      // MUST be an <a>. src = a.href; the visible text is the filename/provider.
+      // Not an <a> -> INERT.
+      const prev = comment.previousElementSibling as any;
+      const target =
+        prev && String(prev.tagName || "").toLowerCase() === "a" ? prev : null;
+      if (!target) continue; // no adjacent <a> -> inert
+      const src = target.getAttribute("href") || "";
+      const text = target.textContent || "";
+      let htmlStr: string;
+      if (parsed.name === "pdf") {
+        // pdf: src standard attr, filename in data-name (null when empty).
+        htmlStr = pdfToHtml({ ...parsed.attrs, src, name: text || null });
+      } else if (parsed.name === "attachment") {
+        // attachment: the schema field is `url`, filename in data-attachment-name.
+        htmlStr = attachmentToHtml({
+          ...parsed.attrs,
+          url: src,
+          name: text || null,
+        });
+      } else {
+        // embed: the visible text is the provider (schema default "").
+        htmlStr = embedToHtml({ ...parsed.attrs, src, provider: text });
+      }
+      const el = buildElement(htmlStr);
+      if (!el) continue;
+      target.replaceWith(el);
+      comment.remove();
       continue;
     }
 

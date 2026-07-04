@@ -32,15 +32,16 @@ describe('diagram round-trip (docmost-schema diagramAttributes)', () => {
     const doc2 = await markdownToProseMirror(md1);
     const md2 = convertProseMirrorToMarkdown(doc2);
 
-    // Exact serialized form: numbers render as bare data-* values; attribute
-    // order follows the converter's emit order (src, then width/height/size/
-    // aspect-ratio/align, then attachment-id).
+    // #293 canon #8 (image-form): src is the markdown target; every OTHER
+    // non-default attr rides in the ALWAYS-emitted `drawio` discriminator comment
+    // (numerics stringified, stable key order width/height/size/aspectRatio then
+    // attachmentId). align="center" is the schema default, so it is OMITTED.
     expect(md1).toBe(
-      '<div data-type="drawio" data-src="/d.drawio" data-width="640" data-height="480" data-size="1234" data-aspect-ratio="1.777" data-align="center" data-attachment-id="att-1"></div>',
+      '![](/d.drawio)<!--drawio {"width":"640","height":"480","size":"1234","aspectRatio":"1.777","attachmentId":"att-1"}-->',
     );
 
-    // A second export reproduces the first byte-for-byte (drawio align default
-    // is already "center", so nothing new materializes on import).
+    // A second export reproduces the first byte-for-byte: align="center"
+    // re-materializes as the schema default on import and is omitted again.
     expect(md2).toBe(md1);
 
     // Re-import coerces every numeric attr to a STRING because parseHTML reads
@@ -64,10 +65,10 @@ describe('diagram round-trip (docmost-schema diagramAttributes)', () => {
   });
 
   // SPEC case 2: minimal excalidraw atom with ONLY string attrs (no align, no
-  // numeric attrs). Locks the one-time export divergence (align='center'
-  // default materializes only on import) plus escapeAttr of title/alt through
-  // the data-title/data-alt path.
-  it('excalidraw materializes align default only on import and escapes title/alt', async () => {
+  // numeric attrs). #293 canon #8 image-form: title/alt ride in the comment JSON
+  // (JSON-encoded, NOT HTML-escaped) and align='center' is omitted as the
+  // schema default — so the one-time divergence the OLD div-form had is GONE.
+  it('excalidraw round-trips title/alt via the discriminator comment (byte-stable, align default omitted)', async () => {
     const input = doc({
       type: 'excalidraw',
       attrs: {
@@ -81,21 +82,18 @@ describe('diagram round-trip (docmost-schema diagramAttributes)', () => {
     const doc2 = await markdownToProseMirror(md1);
     const md2 = convertProseMirrorToMarkdown(doc2);
 
-    // First export: no align emitted (the input doc carries no align), and the
-    // " in title becomes &quot;, the & in alt becomes &amp; via escapeAttr.
+    // #293 canon #8: src in the target; title/alt in the ALWAYS-emitted
+    // `excalidraw` comment as compact JSON (the " in title is JSON-escaped as \",
+    // the & in alt stays literal — JSON, not HTML). No align emitted (default).
     expect(md1).toBe(
-      '<div data-type="excalidraw" data-src="/e.excalidraw" data-title="My &quot;Diagram&quot;" data-alt="a&amp;b"></div>',
+      '![](/e.excalidraw)<!--excalidraw {"title":"My \\"Diagram\\"","alt":"a&b"}-->',
     );
 
-    // Second export: align='center' has now materialized (the schema's
-    // diagramAttributes default), so md2 gains a data-align="center" suffix and
-    // is NOT byte-equal to md1. This one-time divergence is the diagram quirk.
-    expect(md2).toBe(
-      '<div data-type="excalidraw" data-src="/e.excalidraw" data-title="My &quot;Diagram&quot;" data-alt="a&amp;b" data-align="center"></div>',
-    );
-    expect(md2).not.toBe(md1);
+    // Byte-stable: align='center' re-materializes as the schema default on import
+    // and is omitted again on export #2, so md2 === md1 (no diagram quirk now).
+    expect(md2).toBe(md1);
 
-    // Re-import decodes the escaped entities back to the original characters.
+    // Re-import decodes the JSON payload back to the original characters.
     const attrs2 = doc2.content[0].attrs;
     expect(attrs2.title).toBe('My "Diagram"');
     expect(attrs2.alt).toBe('a&b');

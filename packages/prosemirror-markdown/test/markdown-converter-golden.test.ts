@@ -51,43 +51,49 @@ describe('columns / column (raw-HTML layout wrapper)', () => {
   });
 });
 
-describe('embed / audio / pdf (previously emitted nothing — invisible regression)', () => {
-  it('embed emits div[data-type="embed"] with src/provider', () => {
+describe('embed / audio / pdf top-level md-form + discriminator (#293 #8)', () => {
+  it('embed emits link-form [provider](src) + bare discriminator (defaults omitted)', () => {
+    // provider is the visible link text; align/width/height are all at their
+    // schema defaults (center/800/600), so the comment is name-only.
     expect(c({ type: 'embed', attrs: { src: 'https://x.com/e', provider: 'iframe' } })).toBe(
-      '<div data-type="embed" data-src="https://x.com/e" data-provider="iframe"></div>',
+      '[iframe](https://x.com/e)<!--embed-->',
     );
   });
 
-  it('audio emits a div-wrapped <audio> with src', () => {
-    expect(c({ type: 'audio', attrs: { src: '/a.mp3' } })).toBe(
-      '<div><audio src="/a.mp3"></audio></div>',
-    );
+  it('audio emits image-form ![](src) + bare discriminator', () => {
+    expect(c({ type: 'audio', attrs: { src: '/a.mp3' } })).toBe('![](/a.mp3)<!--audio-->');
   });
 
-  it('pdf emits div[data-type="pdf"] with src and name', () => {
+  it('pdf emits link-form [name](src) + bare discriminator', () => {
     expect(c({ type: 'pdf', attrs: { src: '/d.pdf', name: 'd.pdf' } })).toBe(
-      '<div data-type="pdf" src="/d.pdf" data-name="d.pdf"></div>',
+      '[d.pdf](/d.pdf)<!--pdf-->',
     );
   });
 });
 
-describe('drawio / excalidraw data-align asymmetry (SPEC §11)', () => {
-  it('drawio: data-align is ABSENT when align is unset', () => {
+describe('drawio / excalidraw align emission in the discriminator comment (#293 #8)', () => {
+  it('drawio: NO align key when align is unset (bare discriminator)', () => {
     const out = c({ type: 'drawio', attrs: { src: '/d.drawio' } });
-    expect(out).toBe('<div data-type="drawio" data-src="/d.drawio"></div>');
-    expect(out).not.toContain('data-align');
+    expect(out).toBe('![](/d.drawio)<!--drawio-->');
+    expect(out).not.toContain('align');
   });
 
-  it('drawio: data-align is PRESENT for a non-default align', () => {
+  it('drawio: an "align" key IS present for a non-default align', () => {
     expect(c({ type: 'drawio', attrs: { src: '/d.drawio', align: 'right' } })).toBe(
-      '<div data-type="drawio" data-src="/d.drawio" data-align="right"></div>',
+      '![](/d.drawio)<!--drawio {"align":"right"}-->',
     );
   });
 
-  it('excalidraw: data-align is ABSENT when align is unset', () => {
+  it('drawio: the default align "center" is OMITTED (byte-stable image-form parity)', () => {
+    const out = c({ type: 'drawio', attrs: { src: '/d.drawio', align: 'center' } });
+    expect(out).toBe('![](/d.drawio)<!--drawio-->');
+    expect(out).not.toContain('align');
+  });
+
+  it('excalidraw: NO align key when align is unset (bare discriminator)', () => {
     const out = c({ type: 'excalidraw', attrs: { src: '/e.excalidraw' } });
-    expect(out).toBe('<div data-type="excalidraw" data-src="/e.excalidraw"></div>');
-    expect(out).not.toContain('data-align');
+    expect(out).toBe('![](/e.excalidraw)<!--excalidraw-->');
+    expect(out).not.toContain('align');
   });
 });
 
@@ -247,7 +253,10 @@ describe('empty / single-column tables', () => {
 // orderedList and a hardBreak inside a column.
 // ---------------------------------------------------------------------------
 describe('media / attachment / container full-attribute golden coverage', () => {
-  it('video: emits all optional attrs in source order (alt->aria-label, attachmentId/size/align/aspectRatio->data-*)', () => {
+  it('video: emits all optional attrs in the comment JSON in stable order (align center omitted)', () => {
+    // #293 canon #8 image-form: src in the target, all OTHER non-default attrs in
+    // the comment JSON (stable order alt/attachmentId/width/height/size/
+    // aspectRatio; align="center" is the default and is omitted).
     expect(
       c({
         type: 'video',
@@ -263,50 +272,49 @@ describe('media / attachment / container full-attribute golden coverage', () => 
         },
       }),
     ).toBe(
-      '<div><video src="/v.mp4" aria-label="clip" data-attachment-id="att-1" width="640" height="480" data-size="1234" data-align="center" data-aspect-ratio="1.777"></video></div>',
+      '![](/v.mp4)<!--video {"alt":"clip","attachmentId":"att-1","width":"640","height":"480","size":"1234","aspectRatio":"1.777"}-->',
     );
   });
 
-  it('video: with only src, every optional guard takes its false branch (src-only <video>, no data-type on wrapper)', () => {
-    expect(c({ type: 'video', attrs: { src: '/v.mp4' } })).toBe(
-      '<div><video src="/v.mp4"></video></div>',
-    );
+  it('video: with only src, the discriminator is still emitted name-only (bare ![](src)<!--video-->)', () => {
+    expect(c({ type: 'video', attrs: { src: '/v.mp4' } })).toBe('![](/v.mp4)<!--video-->');
   });
 
-  it('youtube + embed: each emits its full optional attr set in source order', () => {
-    // (a) youtube: width/height/align all present -> data-* in order.
+  it('youtube + embed: each emits its full optional attr set in the discriminator comment', () => {
+    // (a) youtube (image-form): width/height/align(right) in the comment JSON.
     expect(
       c({
         type: 'youtube',
         attrs: { src: 'https://youtu.be/abc', width: 560, height: 315, align: 'right' },
       }),
     ).toBe(
-      '<div data-type="youtube" data-src="https://youtu.be/abc" data-width="560" data-height="315" data-align="right"></div>',
+      '![](https://youtu.be/abc)<!--youtube {"width":"560","height":"315","align":"right"}-->',
     );
-    // (b) embed: align/width/height optional branches after src+provider.
+    // (b) embed (link-form): provider is the visible text; a non-default align/
+    // width/height (left/600/400 — the defaults are center/800/600) ride in JSON.
     expect(
       c({
         type: 'embed',
         attrs: { src: 'https://x.com/e', provider: 'iframe', align: 'left', width: 600, height: 400 },
       }),
     ).toBe(
-      '<div data-type="embed" data-src="https://x.com/e" data-provider="iframe" data-align="left" data-width="600" data-height="400"></div>',
+      '[iframe](https://x.com/e)<!--embed {"align":"left","width":"600","height":"400"}-->',
     );
   });
 
-  it('audio: emits data-attachment-id then data-size after src when both are set', () => {
+  it('audio: emits attachmentId then size in the comment JSON when both are set', () => {
     expect(c({ type: 'audio', attrs: { src: '/a.mp3', attachmentId: 'att-7', size: 9001 } })).toBe(
-      '<div><audio src="/a.mp3" data-attachment-id="att-7" data-size="9001"></audio></div>',
+      '![](/a.mp3)<!--audio {"attachmentId":"att-7","size":"9001"}-->',
     );
   });
 
-  it('audio: with attachmentId but no size, data-size is suppressed (size != null false branch)', () => {
+  it('audio: with attachmentId but no size, the size key is suppressed (size != null false branch)', () => {
     expect(c({ type: 'audio', attrs: { src: '/a.mp3', attachmentId: 'att-7' } })).toBe(
-      '<div><audio src="/a.mp3" data-attachment-id="att-7"></audio></div>',
+      '![](/a.mp3)<!--audio {"attachmentId":"att-7"}-->',
     );
   });
 
-  it('pdf: emits the full optional attr set in order (data-name, data-attachment-id, data-size, width, height)', () => {
+  it('pdf: emits the full optional attr set in the comment JSON (attachmentId, size, width, height)', () => {
     expect(
       c({
         type: 'pdf',
@@ -320,11 +328,11 @@ describe('media / attachment / container full-attribute golden coverage', () => 
         },
       }),
     ).toBe(
-      '<div data-type="pdf" src="/d.pdf" data-name="d.pdf" data-attachment-id="att-9" data-size="2048" width="800" height="600"></div>',
+      '[d.pdf](/d.pdf)<!--pdf {"attachmentId":"att-9","size":"2048","width":"800","height":"600"}-->',
     );
   });
 
-  it('attachment: emits data-attachment-name/mime/size/id in order after the always-present url', () => {
+  it('attachment: emits mime/size/attachmentId in the comment JSON after the [name](url) target', () => {
     expect(
       c({
         type: 'attachment',
@@ -337,13 +345,14 @@ describe('media / attachment / container full-attribute golden coverage', () => 
         },
       }),
     ).toBe(
-      '<div data-type="attachment" data-attachment-url="/f.zip" data-attachment-name="f.zip" data-attachment-mime="application/zip" data-attachment-size="512" data-attachment-id="att-3"></div>',
+      '[f.zip](/f.zip)<!--attachment {"mime":"application/zip","size":"512","attachmentId":"att-3"}-->',
     );
   });
 
-  it('attachment: with only a url, no spurious data-attachment-name/mime/size/id appear (all guards false)', () => {
+  it('attachment: with only a url, the link text is empty and the discriminator is name-only', () => {
+    // name is null -> empty visible text `[]`; no mime/size/id -> bare comment.
     expect(c({ type: 'attachment', attrs: { url: '/f.zip' } })).toBe(
-      '<div data-type="attachment" data-attachment-url="/f.zip"></div>',
+      '[](/f.zip)<!--attachment-->',
     );
   });
 
