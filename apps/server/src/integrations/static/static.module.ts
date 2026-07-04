@@ -50,6 +50,10 @@ export class StaticModule implements OnModuleInit {
           : undefined,
         POSTHOG_HOST: this.environmentService.getPostHogHost(),
         POSTHOG_KEY: this.environmentService.getPostHogKey(),
+        // #355 — mirrors the server-side CLIENT_TELEMETRY_ENABLED gate so the
+        // client only collects/sends vitals when the operator opts in.
+        CLIENT_TELEMETRY_ENABLED:
+          this.environmentService.isClientTelemetryEnabled(),
       };
 
       const windowScriptContent = `<script>window.CONFIG=${JSON.stringify(configString)};</script>`;

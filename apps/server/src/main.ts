@@ -16,6 +16,9 @@ import { EnvironmentService } from './integrations/environment/environment.servi
 import { SANDBOX_API_PATH } from './integrations/sandbox/sandbox.constants';
 import { resolveFrameHeader } from './common/helpers';
 import { resolveTrustProxy } from './integrations/environment/trust-proxy.util';
+import { isMetricsEnabled } from './integrations/metrics/metrics.registry';
+import { recordHttpResponse } from './integrations/metrics/http-metrics.hook';
+import { startMetricsServer } from './integrations/metrics/metrics.server';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
@@ -91,6 +94,19 @@ async function bootstrap() {
       done();
     });
 
+  // #355 — HTTP request-duration histogram. Registered ONLY when METRICS_PORT is
+  // set (otherwise no collector runs at all). Uses the bounded route template
+  // label and excludes SSE/streaming responses (see recordHttpResponse).
+  if (isMetricsEnabled()) {
+    app
+      .getHttpAdapter()
+      .getInstance()
+      .addHook('onResponse', (req, reply, done) => {
+        recordHttpResponse(req, reply);
+        done();
+      });
+  }
+
   app
     .getHttpAdapter()
     .getInstance()
@@ -127,6 +143,9 @@ async function bootstrap() {
         '/api/workspace/create',
         '/api/workspace/joined',
         '/api/workspace/find-by-email',
+        // Public client perf-telemetry sink: browsers post it without a
+        // resolved workspace host, so the workspace-resolution gate must not 404 it.
+        '/api/telemetry/vitals',
         // Anonymous in-RAM blob sandbox: a remote consumer fetches blobs by an
         // unguessable UUID without any workspace host context, so the
         // workspace-resolution gate must not apply.
@@ -175,6 +194,11 @@ async function bootstrap() {
       `Listening on http://127.0.0.1:${port} / ${process.env.APP_URL}`,
     );
   });
+
+  // #355 — Prometheus scrape endpoint on a SEPARATE port (METRICS_PORT),
+  // started after the app is up. No default port: a no-op when METRICS_PORT is
+  // unset. Closed on shutdown by MetricsServerLifecycle (MetricsModule).
+  startMetricsServer();
 }
 
 bootstrap();

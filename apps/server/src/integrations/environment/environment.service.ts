@@ -227,6 +227,22 @@ export class EnvironmentService {
     return compactTree === 'true';
   }
 
+  /**
+   * Operator toggle for the public client-telemetry sink (#355). DEFAULT OFF:
+   * the unauthenticated POST /api/telemetry/vitals endpoint + client vitals
+   * collection are only wired when this is explicitly true. Kept SEPARATE from
+   * METRICS_PORT (the server Prometheus half) because Grafana reads the
+   * `client_metrics` table directly, independent of the scrape port — and
+   * because `client_metrics` has no app-side retention, so an operator must opt
+   * in and run an external pruner.
+   */
+  isClientTelemetryEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('CLIENT_TELEMETRY_ENABLED', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
   getStripePublishableKey(): string {
     return this.configService.get<string>('STRIPE_PUBLISHABLE_KEY');
   }

@@ -156,6 +156,18 @@ export interface Billing {
   workspaceId: string;
 }
 
+export interface ClientMetrics {
+  id: Generated<Int8>;
+  createdAt: Generated<Timestamp>;
+  name: string;
+  value: number;
+  rating: string | null;
+  route: string | null;
+  attr: string | null;
+  docSize: number | null;
+  workspaceId: string | null;
+}
+
 export interface Comments {
   aiChatId: string | null;
   content: Json | null;
@@ -691,6 +703,7 @@ export interface DB {
   authProviders: AuthProviders;
   backlinks: Backlinks;
   billing: Billing;
+  clientMetrics: ClientMetrics;
   comments: Comments;
   favorites: Favorites;
   fileTasks: FileTasks;
