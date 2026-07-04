@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { runPush, LAST_PUSHED_REF, DOCMOST_BRANCH } from '../src/engine/push';
 import type { PushDeps } from '../src/engine/push';
 import type { Settings } from '../src/engine/settings';
-import { serializePageFile } from '../src/lib/page-file';
+import { serializePageFile } from '@docmost/prosemirror-markdown';
 
 /** A native page file: `gitmost_id` frontmatter + clean body (title = filename). */
 function fileFor(pageId: string, body = 'body'): string {

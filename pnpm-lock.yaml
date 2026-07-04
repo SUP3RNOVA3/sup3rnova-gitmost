@@ -889,6 +889,9 @@ importers:
 
   packages/git-sync:
     dependencies:
+      '@docmost/prosemirror-markdown':
+        specifier: workspace:*
+        version: link:../prosemirror-markdown
       '@tiptap/core':
         specifier: 3.20.4
         version: 3.20.4(@tiptap/pm@3.20.4)

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readExisting } from '../src/engine/pull';
-import { serializePageFile } from '../src/lib/page-file';
+import { serializePageFile } from '@docmost/prosemirror-markdown';
 
 // R-Pull-1 (test-strategy report §5): `readExisting` now takes injectable IO
 // (`listTracked` / `readFile`), so its parsing + skip rules are unit-testable

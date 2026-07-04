@@ -6,7 +6,7 @@ import type {
   MetaSide,
   RenameMoveAction,
 } from '../src/engine/push.js';
-import type { DocmostMdMeta } from '../src/lib/index.js';
+import type { DocmostMdMeta } from '@docmost/prosemirror-markdown';
 
 // RED-TEAM finding #4 (two facets):
 //   (a) buildVaultLayout disambiguation is ORDER-DEPENDENT: which of two

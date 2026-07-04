@@ -2,8 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { stabilizePageFile, type PageMeta } from '../src/engine/stabilize.js';
 // markdownToProseMirror lives in collaboration.ts; importing it mutates the
 // global DOM via jsdom at module load time (required for @tiptap/html under Node).
-import { markdownToProseMirror } from '../src/lib/markdown-to-prosemirror.js';
-import { parseDocmostMarkdown } from '../src/lib/markdown-document.js';
+import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
+import { parseDocmostMarkdown } from '@docmost/prosemirror-markdown';
 
 // stabilize.ts (SPEC §11 normalize-on-write) was 0% covered (only the gated e2e
 // touched it). stabilizePageFile is import-testable: build a small ProseMirror

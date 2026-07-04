@@ -31,7 +31,7 @@
  */
 import { dirname } from "node:path";
 import { sep } from "node:path";
-import { parsePageFile, serializePageFile } from "../lib/page-file.js";
+import { parsePageFile, serializePageFile } from "@docmost/prosemirror-markdown";
 import type { GitSyncClient } from "./client.types.js";
 import { buildVaultLayout, type PageNode } from "./layout.js";
 import {

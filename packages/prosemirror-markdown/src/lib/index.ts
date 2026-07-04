@@ -19,6 +19,11 @@ export { convertProseMirrorToMarkdown } from "./markdown-converter.js";
 
 export { markdownToProseMirror } from "./markdown-to-prosemirror.js";
 
+// The Docmost tiptap schema mirror. Exposed so consumers (and the sync
+// engine's schema-validity regression tests) can build the exact ProseMirror
+// schema the converter targets.
+export { docmostExtensions } from "./docmost-schema.js";
+
 export {
   canonicalizeContent,
   docsCanonicallyEqual,

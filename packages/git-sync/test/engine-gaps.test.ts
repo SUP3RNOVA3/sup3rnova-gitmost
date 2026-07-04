@@ -8,7 +8,7 @@ import { firstDivergence } from './roundtrip-helpers';
 import { applyPullActions } from '../src/engine/pull';
 import type { PullActions, ApplyPullActionsDeps } from '../src/engine/pull';
 import type { DeletionDecision } from '../src/engine/reconcile';
-import { serializePageFile, parsePageFile } from '../src/lib/page-file';
+import { serializePageFile, parsePageFile } from '@docmost/prosemirror-markdown';
 
 // Engine-layer coverage gaps flagged by the PR #119 reviewers (test-strategy
 // report, Module 2 `src/engine`). Each block targets a specific under-covered
