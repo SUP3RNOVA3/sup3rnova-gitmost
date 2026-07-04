@@ -581,6 +581,9 @@ export class PageRepo {
     const query = this.db
       .selectFrom('pages')
       .select(this.baseFields)
+      // NOTE: `content` IS needed here — the trash UI reads page.content to render
+      // the deleted-page preview modal (trash.tsx handlePageClick ->
+      // TrashPageContentModal pageContent). Do NOT drop it (see #348 review F3).
       .select('content')
       .select((eb) => this.withSpace(eb))
       .select((eb) => this.withDeletedBy(eb))

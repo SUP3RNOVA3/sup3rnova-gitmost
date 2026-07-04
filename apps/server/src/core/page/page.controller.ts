@@ -446,7 +446,11 @@ export class PageController {
       );
     }
 
-    return this.pageService.getRecentPages(user.id, pagination);
+    return this.pageService.getRecentPages(
+      user.id,
+      pagination,
+      user.workspaceId,
+    );
   }
 
   @HttpCode(HttpStatus.OK)
@@ -469,7 +473,13 @@ export class PageController {
       }
     }
 
-    return this.pageService.getCreatedByPages(targetUserId, user.id, pagination, dto.spaceId);
+    return this.pageService.getCreatedByPages(
+      targetUserId,
+      user.id,
+      pagination,
+      dto.spaceId,
+      user.workspaceId,
+    );
   }
 
   @HttpCode(HttpStatus.OK)

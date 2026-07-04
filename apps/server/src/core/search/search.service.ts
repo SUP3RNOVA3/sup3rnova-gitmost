@@ -155,6 +155,8 @@ export class SearchService {
           pageIds,
           userId: opts.userId,
           spaceId: searchParams.spaceId,
+          // #348 — enables the workspace-level short-circuit when not space-scoped.
+          workspaceId: opts.workspaceId,
         });
       const accessibleSet = new Set(accessibleIds);
       results = results.filter((r: any) => accessibleSet.has(r.id));
@@ -266,6 +268,8 @@ export class SearchService {
           await this.pagePermissionRepo.filterAccessiblePageIds({
             pageIds,
             userId,
+            // #348 — workspace-level short-circuit for the suggest path.
+            workspaceId,
           });
         const accessibleSet = new Set(accessibleIds);
         pages = pages.filter((p) => accessibleSet.has(p.id));

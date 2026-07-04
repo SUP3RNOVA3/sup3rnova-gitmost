@@ -15,7 +15,9 @@ describe('WorkspaceRepo.updateSetting (jsonb merge) [integration]', () => {
   beforeAll(() => {
     db = getTestDb();
     // Repos are plain classes taking @InjectKysely() db — instantiate directly.
-    repo = new WorkspaceRepo(db as any);
+    // 2nd arg is CACHE_MANAGER (used only to bust the #348 workspace cache); a
+    // stub is fine here since bustWorkspaceCache is best-effort (try/catch).
+    repo = new WorkspaceRepo(db as any, {} as any);
   });
 
   afterAll(async () => {

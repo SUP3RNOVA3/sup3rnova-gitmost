@@ -51,7 +51,17 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       throw new UnauthorizedException();
     }
 
-    const workspace = await this.workspaceRepo.findById(payload.workspaceId);
+    // #348 — reuse the workspace DomainMiddleware already loaded for this request
+    // instead of re-querying it. `validate()` above has confirmed
+    // `req.raw.workspaceId === payload.workspaceId` (or that it is unset), and the
+    // middleware sets `req.raw.workspace` alongside `req.raw.workspaceId` from the
+    // same row, so when the ids match the cached row is the exact one this query
+    // would return. Fall back to the query if the middleware did not populate it
+    // (e.g. a code path that bypasses DomainMiddleware).
+    const workspace =
+      req.raw.workspace && req.raw.workspaceId === payload.workspaceId
+        ? req.raw.workspace
+        : await this.workspaceRepo.findById(payload.workspaceId);
 
     if (!workspace) {
       throw new UnauthorizedException();
