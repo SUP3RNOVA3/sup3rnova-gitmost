@@ -117,6 +117,122 @@ export function convertProseMirrorToMarkdown(content: any): string {
   const escapeProseMath = (value: string): string =>
     value.replace(inlineMathGlobalRe(), (_m, inner) => `\\$${inner}\\$`);
 
+  // #293 canon #2 inline footnotes. PRE-SCAN the whole tree once: map every
+  // footnote DEFINITION by its id (first-wins) and collect every REFERENCED id.
+  // The canonical markdown form inlines a note's body AT its reference point as
+  // `^[body]`, so the serializer needs the body keyed by id when it reaches a
+  // `footnoteReference`, and needs to know which definitions are orphaned (no
+  // ref) so their bodies are not silently dropped (appended at the doc end).
+  const footnoteDefs = new Map<string, any>();
+  const referencedFootnoteIds = new Set<string>();
+  // ITERATIVE walk (explicit stack, not recursion): a pathologically deep
+  // document must not overflow the call stack here — the same reason processNode
+  // has its depth guard. This scan is unbounded but stack-safe.
+  const scanStack: any[] = [content];
+  while (scanStack.length) {
+    const n = scanStack.pop();
+    if (!n || typeof n !== "object") continue;
+    if (
+      n.type === "footnoteDefinition" &&
+      n.attrs?.id &&
+      !footnoteDefs.has(n.attrs.id)
+    ) {
+      footnoteDefs.set(n.attrs.id, n);
+    }
+    if (n.type === "footnoteReference" && n.attrs?.id) {
+      referencedFootnoteIds.add(n.attrs.id);
+    }
+    if (Array.isArray(n.content)) {
+      for (const child of n.content) scanStack.push(child);
+    }
+  }
+
+  // Balance `[`/`]` in a rendered footnote body so the whole thing stays a
+  // parseable `^[…]` capture (the importer's tokenizer counts brackets from `^[`
+  // to the matching `]`). A markdown link's `[text](url)` is already balanced
+  // and is left intact; only a STRAY unmatched `]` (or `[`) — e.g. a literal
+  // bracket in prose — is backslash-escaped so it cannot open/close the footnote
+  // early. Already backslash-escaped pairs are passed through untouched.
+  const balanceBrackets = (s: string): string => {
+    const out: string[] = [];
+    const openIndices: number[] = []; // positions in `out` of unmatched `[`
+    let i = 0;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === "\\" && i + 1 < s.length) {
+        out.push(c + s[i + 1]); // keep an existing escaped pair verbatim
+        i += 2;
+        continue;
+      }
+      if (c === "[") {
+        openIndices.push(out.length);
+        out.push("[");
+        i++;
+        continue;
+      }
+      if (c === "]") {
+        if (openIndices.length > 0) {
+          openIndices.pop();
+          out.push("]");
+        } else {
+          out.push("\\]"); // stray close -> escape
+        }
+        i++;
+        continue;
+      }
+      out.push(c);
+      i++;
+    }
+    for (const idx of openIndices) out[idx] = "\\["; // stray opens -> escape
+    return out.join("");
+  };
+
+  // While TRUE, `case "text"` DOUBLES every RAW user backslash (`\` -> `\\`) in a
+  // text run BEFORE the intentional markdown/balance escapes are layered on (see
+  // the text case). This is the F2 fix: a body ending in `\` (Windows path,
+  // LaTeX, regex) must survive `^[…]`. Without it a trailing `\` serialized to
+  // `^[…\]`, whose `\]` the import tokenizer reads as an ESCAPED `]`, so the
+  // balance never closed and the whole footnote degraded to literal prose (and
+  // the `\` was lost). Doubling raw backslashes makes `parseInline` restore each
+  // (`\\`->`\`) on import while the serializer's OWN single escapes (`\[` `\]`
+  // `\=` `\$`, the `\n` paragraph separator) stay intact. It is a closure flag
+  // (per-conversion, not module state), so concurrent conversions never share it.
+  let inFootnoteBody = false;
+
+  // Render a footnote DEFINITION's `paragraph+` body to INLINE markdown suitable
+  // to sit inside `^[…]`. Each paragraph is rendered inline (so links/marks in
+  // the note round-trip) with raw backslashes doubled (via inFootnoteBody) and
+  // its brackets balanced; paragraphs are then joined with the literal two-char
+  // separator `\n`. Because raw backslashes are already doubled, a real
+  // backslash-n in the text is `\\n` and never mistaken for the separator (the
+  // only unescaped `\n` is the join inserted here). Footnotes are inline (single
+  // line) in markdown, so an embedded hard break collapses to a space.
+  const renderFootnoteBody = (def: any): string => {
+    const paras = (def?.content || []).filter(
+      (p: any) => p?.type === "paragraph",
+    );
+    // A definition with no paragraph still yields one (empty) segment so an
+    // empty note serializes as `^[]` and round-trips.
+    const segments = (paras.length ? paras : [{ content: [] }]).map(
+      (p: any) => {
+        const prev = inFootnoteBody;
+        inFootnoteBody = true;
+        let s: string;
+        try {
+          s = renderInlineChildren(p.content || []);
+        } finally {
+          inFootnoteBody = prev;
+        }
+        // Collapse any real newline (e.g. a hard break) so `^[…]` stays on one
+        // logical line for the inline tokenizer.
+        s = s.replace(/\r?\n/g, " ");
+        s = balanceBrackets(s);
+        return s;
+      },
+    );
+    return segments.join("\\n");
+  };
+
   // Recursion depth guard. processNode is mutually recursive (directly and via
   // processListItem/processTaskItem/blockToHtml), and a pathologically nested
   // document (e.g. tens of thousands of nested blockquotes) would otherwise
@@ -194,8 +310,28 @@ export function convertProseMirrorToMarkdown(content: any): string {
     const nodeContent = node.content || [];
 
     switch (type) {
-      case "doc":
-        return nodeContent.map(processNode).join("\n\n");
+      case "doc": {
+        // #293 canon #2: the `footnotesList` is NOT emitted in markdown — every
+        // note body is inlined at its `^[…]` reference. Skip the list entirely
+        // (emitting "" would inject a phantom blank gap via the "\n\n" join),
+        // then append any ORPHAN definition (one no reference points at) as its
+        // own `^[body]` line so its body is never silently lost.
+        // F3 (accepted, intentional): on re-import that orphan `^[body]` line
+        // becomes a reference + definition (an orphan def gains a ref). This is
+        // lossless (the body survives) and byte-stable (it re-exports identically),
+        // so it is deliberately not treated as data loss.
+        const parts: string[] = [];
+        for (const child of nodeContent) {
+          if (child?.type === "footnotesList") continue;
+          parts.push(processNode(child));
+        }
+        for (const [id, def] of footnoteDefs) {
+          if (!referencedFootnoteIds.has(id)) {
+            parts.push(`^[${renderFootnoteBody(def)}]`);
+          }
+        }
+        return parts.join("\n\n");
+      }
 
       case "paragraph": {
         const text = renderInlineChildren(nodeContent);
@@ -251,6 +387,17 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // A highlight run's own `==` delimiters are appended AFTER this in the
         // marks loop, so they are never escaped; only the run's inner text is.
         if (!(node.marks || []).some((m: any) => m.type === "code")) {
+          // #293 canon #2 (F2): inside a footnote body, DOUBLE every RAW user
+          // backslash FIRST, so it survives `^[…]` (the import tokenizer treats
+          // `\<char>` as an escape when balancing brackets, and `parseInline`
+          // decodes escapes). Doing it before the intentional escapes below keeps
+          // the serializer's own single escapes (`\=` `\$` `^\[`, and the `\[`/
+          // `\]` balanceBrackets adds) single; only genuine user backslashes are
+          // doubled. Skipped for code runs (a code span's content is NOT decoded
+          // by parseInline, so its backslashes must stay verbatim).
+          if (inFootnoteBody) {
+            textContent = textContent.replace(/\\/g, "\\\\");
+          }
           textContent = textContent.replace(/==/g, "\\=\\=");
           // #293 canon #6: escape a would-be inline-math `$…$` span so it stays
           // literal text on re-import (currency `$5` is left clean — see
@@ -258,6 +405,16 @@ export function convertProseMirrorToMarkdown(content: any): string {
           // above; an inline `code` run returns verbatim below, matching the
           // codeBlock path (a `$…$` inside code must stay code, never math).
           textContent = escapeProseMath(textContent);
+          // #293 canon #2: `^[` opens a LIVE inline-footnote span on import
+          // (`^[text]` -> a footnote reference). A LITERAL `^[` in prose text
+          // would therefore materialize a phantom footnote on the next import, so
+          // backslash-escape the bracket (`^[` -> `^\[`); marked's escape
+          // tokenizer decodes `\[` back to `[`, so a literal `^[…]` round-trips
+          // as text and never opens a footnote. Only the OPENING `^[` needs
+          // breaking (the tokenizer requires it), so this is a minimal, idempotent
+          // escape. A real footnoteReference node emits `^[body]` from its own
+          // case, never through here.
+          textContent = textContent.replace(/\^\[/g, "^\\[");
         }
         // Apply marks (bold, italic, code, etc.)
         if (node.marks) {
@@ -854,26 +1011,29 @@ export function convertProseMirrorToMarkdown(content: any): string {
       }
 
       case "footnoteReference": {
-        // Inline atom marker. The schema reads its id from data-id on a
-        // sup[data-footnote-ref]; the visible number is derived, not stored.
-        const attrs = node.attrs || {};
-        const idAttr = attrs.id ? ` data-id="${escapeAttr(attrs.id)}"` : "";
-        return `<sup data-footnote-ref${idAttr}></sup>`;
+        // #293 canon #2: on the top-level/inline markdown path a footnote is
+        // written AT its reference as `^[body]` (Pandoc/Obsidian inline
+        // footnote). Look the body up by id in the pre-scanned definitions map
+        // and render it inline. An ORPHAN reference (no matching definition) has
+        // no body anywhere, so it emits `^[]` — a footnote with an empty body,
+        // the lossless choice (the id was already derived, never authored). The
+        // separate `<section data-footnotes>` list is NOT emitted (see the
+        // footnotesList/doc cases); the raw-HTML path carries the body on the
+        // <sup> instead (inlineToHtml).
+        const def = footnoteDefs.get(node.attrs?.id);
+        return `^[${def ? renderFootnoteBody(def) : ""}]`;
       }
 
-      case "footnotesList": {
-        // Bottom container of footnote definitions (section[data-footnotes]).
-        const inner = nodeContent.map((n: any) => blockToHtml(n)).join("");
-        return `<section data-footnotes>${inner}</section>`;
-      }
+      case "footnotesList":
+        // Bodies are inlined at their references (`^[…]`), so the bottom list
+        // emits NOTHING in markdown. The doc case skips it outright to avoid a
+        // phantom blank line; this case guards any non-doc-level occurrence.
+        return "";
 
-      case "footnoteDefinition": {
-        // One footnote note keyed by id (div[data-footnote-def]).
-        const attrs = node.attrs || {};
-        const idAttr = attrs.id ? ` data-id="${escapeAttr(attrs.id)}"` : "";
-        const inner = nodeContent.map((n: any) => blockToHtml(n)).join("");
-        return `<div data-footnote-def${idAttr}>${inner}</div>`;
-      }
+      case "footnoteDefinition":
+        // Reached only via a footnotesList (handled above) — never rendered on
+        // its own on the markdown path; its body rides at the reference.
+        return "";
 
       case "pageEmbed": {
         // #293 canon #8 (standalone): a whole-page live embed serializes as a
@@ -951,9 +1111,22 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // NOT re-parse markdown, so inline math MUST stay the schema-HTML `<span>`
         // form here — a `$…$` fence would land as literal text on re-import.
         if (n.type === "mathInline") return mathInlineHtml(n.attrs?.text || "");
+        if (n.type === "footnoteReference") {
+          // #293 canon #2 raw-HTML path (columns/spanned cells): marked does NOT
+          // re-parse `^[…]` inside raw HTML, so the note text rides ON the <sup>
+          // in a `data-fn-text` attribute (encoded exactly like the `^[…]`
+          // inner). NO id is emitted here (F1): the importer's footnote post-pass
+          // assigns ids by dedup-ing on the EXACT body text, so a column footnote
+          // and an inline `^[…]` with the same body merge to one definition and
+          // DIFFERENT bodies can never collide. The post-pass reads data-fn-text,
+          // sets data-id, builds the doc-level definition, and strips the attr.
+          const def = footnoteDefs.get(n.attrs?.id);
+          const body = def ? renderFootnoteBody(def) : "";
+          return `<sup data-footnote-ref data-fn-text="${escapeAttr(body)}"></sup>`;
+        }
         if (n.type !== "text") {
-          // Other inline atoms (mention, status, footnoteRef) already emit
-          // schema HTML from processNode.
+          // Other inline atoms (mention, status) already emit schema HTML from
+          // processNode.
           return processNode(n);
         }
         let t = escapeHtmlText(n.text || "");
@@ -1205,13 +1378,28 @@ export function convertProseMirrorToMarkdown(content: any): string {
       // rebuilds) instead of delegating to processNode's fence form.
       case "mathBlock":
         return mathBlockHtml(block.attrs?.text || "");
-      // columns/column, htmlEmbed, footnotes, transclusionSource already emit
+      // #293 canon #2: on the markdown path a footnotesList emits nothing (the
+      // note body rides at each `^[…]` reference). But a raw-HTML container
+      // drops comment/markdown reconstruction, so KEEP the schema-matching
+      // <section>/<div> HTML here so a footnotesList that ever lands inside a
+      // column/cell still round-trips via the schema's parseHTML instead of
+      // vanishing. (Normally the list is doc-level and never nests here.)
+      case "footnotesList": {
+        const inner = (block.content || []).map(blockToHtml).join("");
+        return `<section data-footnotes>${inner}</section>`;
+      }
+      case "footnoteDefinition": {
+        const idAttr = block.attrs?.id
+          ? ` data-id="${escapeAttr(block.attrs.id)}"`
+          : "";
+        const inner = (block.content || []).map(blockToHtml).join("");
+        return `<div data-footnote-def${idAttr}>${inner}</div>`;
+      }
+      // columns/column, htmlEmbed, transclusionSource already emit
       // schema-matching HTML from processNode.
       case "columns":
       case "column":
       case "htmlEmbed":
-      case "footnotesList":
-      case "footnoteDefinition":
       case "transclusionSource":
         return processNode(block);
       default:

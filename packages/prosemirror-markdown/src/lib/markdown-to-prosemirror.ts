@@ -13,6 +13,7 @@ import { Marked } from "marked";
 import type { TokenizerExtension, RendererExtension } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
 import { parseAttachedComment } from "./attached-comment.js";
+import { splitFootnoteParagraphs } from "./footnote.js";
 import {
   decodeInlineMathLatex,
   escapeMathAttr,
@@ -148,12 +149,100 @@ const mathBlockExtension: TokenizerExtension & RendererExtension = {
   },
 };
 
+/**
+ * #293 canon #2: Pandoc/Obsidian inline footnotes — `^[note body]`.
+ *
+ * The single canonical markdown form carries the note body AT the reference
+ * point. The crux is the tokenizer: it BALANCES `[`/`]` (respecting
+ * backslash-escaped brackets) from the opening `^[` to its MATCHING `]`, so a
+ * body that itself contains a `[link](url)` is captured whole — a lazy
+ * `^\[([^\]]+)\]` would cut at the first inner `]` and fragment the parse.
+ *
+ * The renderer emits the schema's `<sup data-footnote-ref>` marker carrying the
+ * (still-encoded) body in a `data-fn-text` attribute and NO id. A later
+ * post-`marked` pass (assembleFootnotes) collects those sups, dedups by the EXACT
+ * body text, ASSIGNS sequential ids (fn-1, fn-2, … in first-seen order), and
+ * builds one doc-level `<div data-footnote-def>` per unique body inside a single
+ * `<section data-footnotes>`. Assigning ids from the exact text (rather than a
+ * hash) makes collisions between DIFFERENT bodies impossible (F1) while staying
+ * race-free — all ids are assigned inside that one call from the local DOM, no
+ * module state — and byte-stable (ids are never written to markdown; `^[body]`
+ * carries only text, so identical bodies still merge).
+ *
+ * Fail-open: an unbalanced `^[` with no matching `]` returns undefined from the
+ * tokenizer and stays literal text (no crash). `^[]` is a footnote with an empty
+ * body. The reference form `[^id]` / `[^id]: def` is NOT parsed (no `^[`), so it
+ * stays literal (an accepted hand-authoring gap; no backward compat). Registered
+ * on the SAME dedicated instance as the highlight/math extensions.
+ */
+const footnoteInlineExtension: TokenizerExtension & RendererExtension = {
+  name: "footnoteInline",
+  level: "inline",
+  start(src: string) {
+    const i = src.indexOf("^[");
+    return i < 0 ? undefined : i;
+  },
+  tokenizer(src: string) {
+    if (!src.startsWith("^[")) return undefined;
+    // Balance-scan from just after `^[` to the matching `]`. A backslash escapes
+    // the next character (so `\[` / `\]` do not affect the depth), matching the
+    // serializer's balanceBrackets.
+    let depth = 1;
+    let i = 2;
+    while (i < src.length) {
+      const c = src[i];
+      if (c === "\\" && i + 1 < src.length) {
+        i += 2;
+        continue;
+      }
+      if (c === "[") {
+        depth++;
+        i++;
+        continue;
+      }
+      if (c === "]") {
+        depth--;
+        if (depth === 0) break;
+        i++;
+        continue;
+      }
+      i++;
+    }
+    if (depth !== 0) return undefined; // unbalanced -> literal text (fail-open)
+    const inner = src.slice(2, i); // content between `^[` and the matching `]`
+    return {
+      type: "footnoteInline",
+      raw: src.slice(0, i + 1), // includes the closing `]`
+      text: inner,
+    } as any;
+  },
+  renderer(token: any) {
+    // No id here (F1): assembleFootnotes assigns ids by dedup-ing the exact body.
+    return `<sup data-footnote-ref data-fn-text="${escapeFootnoteAttr(token.text)}"></sup>`;
+  },
+};
+
+/**
+ * Escape a value placed in a double-quoted HTML attribute (footnote id /
+ * body). Only `&` and `"` are special in that context; escaping them keeps the
+ * attribute well-formed and is idempotent (jsdom decodes them back).
+ */
+function escapeFootnoteAttr(value: string): string {
+  return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+}
+
 // Dedicated marked instance: default (GFM) options plus the `==` highlight
-// inline extension and the `$…$` / `$$…$$` math extensions (#293 canon #6).
-// Constructed once at module load so the extensions are registered exactly once
-// and never mutate the global `marked` singleton.
+// inline extension, the `$…$` / `$$…$$` math extensions (#293 canon #6), and the
+// `^[…]` inline-footnote extension (#293 canon #2). Constructed once at module
+// load so the extensions are registered exactly once and never mutate the global
+// `marked` singleton.
 const markedInstance = new Marked().use({
-  extensions: [highlightMarkExtension, mathInlineExtension, mathBlockExtension],
+  extensions: [
+    highlightMarkExtension,
+    mathInlineExtension,
+    mathBlockExtension,
+    footnoteInlineExtension,
+  ],
 });
 
 // Setup DOM environment for Tiptap HTML parsing in Node.js
@@ -739,6 +828,134 @@ function applyCommentDirectives(html: string): string {
 }
 
 /**
+ * #293 canon #2: assemble the doc-level footnote list from the `<sup>` markers.
+ *
+ * The `^[…]` inline extension (and the raw-HTML column path) leave every
+ * footnote reference as `<sup data-footnote-ref data-fn-text>`, carrying the
+ * (encoded) note body ON the marker but NO id. This post-`marked` pass — a
+ * sibling of applyCommentDirectives, run before generateJSON — turns those into
+ * the schema's three-node model:
+ *
+ *   - collect every `<sup data-footnote-ref>` that carries a `data-fn-text`;
+ *   - DEDUP by the EXACT body text (first-seen order) and assign SEQUENTIAL ids
+ *     `fn-1`, `fn-2`, …; set `data-id` on each sup (matched by its body). This is
+ *     the F1 fix: distinct bodies get distinct ids, so DIFFERENT notes can never
+ *     merge (a hash-derived id could collide and silently drop one body), while
+ *     identical bodies still key to the same entry and MERGE (identical `^[text]`
+ *     merge; a column footnote and an inline one with the same body collapse to
+ *     one def);
+ *   - build one `<div data-footnote-def data-id>` per unique body — the decoded
+ *     `data-fn-text` split on the literal `\n` separator into `<p>`s, each parsed
+ *     as INLINE markdown so links/marks in the note round-trip;
+ *   - append those defs into a single doc-level `<section data-footnotes>` at the
+ *     END of `<body>` — reusing an existing one if the HTML already has a
+ *     footnotes section (F4: never emit a duplicate `<section>`);
+ *   - STRIP `data-fn-text` from every sup, leaving `<sup data-footnote-ref
+ *     data-id>` for the schema's FootnoteReference parseHTML.
+ *
+ * NESTED footnotes (N1): a body can itself contain a `^[…]` (Pandoc/Obsidian
+ * allow it, and the schema's `footnoteDefinition` body is `paragraph+` → inline →
+ * footnoteReference), so `parseInline` of a def body SPAWNS a new inner
+ * `<sup data-fn-text>` INSIDE the just-built definition. A single scan would
+ * leave that inner sup unassigned (dangling `footnoteReference{id:null}`, inner
+ * body lost). So the pass runs to a FIXED POINT: after each round it RE-SCANS for
+ * any `sup[data-footnote-ref][data-fn-text]` still lacking a `data-id` and
+ * processes those too, reusing the SAME exact-body dedup map so an inner body
+ * identical to another still merges. A large round cap bounds pathological input
+ * (fail-open: leftover sups stay inert rather than looping forever).
+ *
+ * Race-free by construction: ids are assigned inside this one call from the local
+ * DOM, so concurrent conversions share no mutable state. Fail-open: a sup without
+ * `data-fn-text` (e.g. a legacy `<sup data-footnote-ref data-id>` from the old
+ * `<section>` HTML form) is left untouched.
+ */
+// Hard cap on fixed-point rounds. Each round peels ONE nesting level, so this is
+// far above any realistic footnote nesting; it exists only so an adversarial
+// input can never spin unbounded. On hitting it we stop (leftover deeply-nested
+// sups stay inert) rather than hang.
+const MAX_FOOTNOTE_ROUNDS = 10000;
+
+function assembleFootnotes(html: string): string {
+  // Cheap early-out: nothing carries a footnote body -> nothing to assemble.
+  if (!html.includes("data-fn-text")) return html;
+  const dom = new JSDOM(html);
+  const document = dom.window.document;
+  if (document.querySelector("sup[data-footnote-ref][data-fn-text]") == null) {
+    return html;
+  }
+
+  // F4: reuse an existing footnotes section if the HTML already has one (e.g. a
+  // legacy `<section data-footnotes>` from the old HTML form, or a footnotesList
+  // that landed inside a column via the raw-HTML path) so we never emit a
+  // duplicate. Otherwise create one at the END of <body>.
+  let section = document.querySelector("section[data-footnotes]");
+  if (!section) {
+    section = document.createElement("section");
+    section.setAttribute("data-footnotes", "");
+    // Attach it NOW (at the end of body), BEFORE the fixed-point loop: each def
+    // is appended into this section, and a def body's `parseInline` may spawn a
+    // nested `<sup data-fn-text>`. The re-scan below uses `document.query…`,
+    // which only sees ATTACHED nodes — so the section must live in the document
+    // for those inner sups to be found (N1). A detached section would hide them.
+    document.body.appendChild(section);
+  }
+
+  // N2: seed the sequential id counter PAST the highest `fn-<N>` id already
+  // present ANYWHERE in the document (a reused legacy section's defs, or existing
+  // refs), so a generated id can never collide with a pre-existing one and
+  // produce two defs sharing an id (ambiguous ref↔def).
+  let counter = 0;
+  for (const el of Array.from(document.querySelectorAll("[data-id]"))) {
+    const m = /^fn-(\d+)$/.exec(el.getAttribute("data-id") || "");
+    if (m) counter = Math.max(counter, parseInt(m[1], 10));
+  }
+
+  // Dedup by the EXACT body text (first-seen order) -> sequential id. Keyed on
+  // the string itself, so two DIFFERENT bodies can NEVER share an id (F1). The
+  // map persists ACROSS rounds so a nested inner body that equals an outer/other
+  // body merges to the same def (N1).
+  const idByBody = new Map<string, string>(); // exact body -> assigned id
+
+  for (let round = 0; round < MAX_FOOTNOTE_ROUNDS; round++) {
+    const pending = Array.from(
+      document.querySelectorAll("sup[data-footnote-ref][data-fn-text]"),
+    );
+    if (pending.length === 0) break;
+    for (const sup of pending) {
+      const body = sup.getAttribute("data-fn-text") || "";
+      let id = idByBody.get(body);
+      const isNew = id === undefined;
+      if (id === undefined) {
+        id = `fn-${++counter}`;
+        idByBody.set(body, id);
+      }
+      // Pin the id on the sup so the reference matches its definition, and strip
+      // the transient body attribute so it never re-matches / reaches generateJSON.
+      sup.setAttribute("data-id", id);
+      sup.removeAttribute("data-fn-text");
+      if (!isNew) continue; // this body already has its definition
+      // Build the definition. `parseInline` may inject a NEW inner
+      // `<sup data-fn-text>` into this def body — that is caught on the next
+      // round's re-scan (the fixed-point loop).
+      const def = document.createElement("div");
+      def.setAttribute("data-footnote-def", "");
+      def.setAttribute("data-id", id);
+      // Split the encoded body into paragraph markdown strings, then parse each
+      // inline so links/marks survive. An empty body yields one empty paragraph
+      // (the schema's footnoteDefinition requires `paragraph+`).
+      for (const paraMd of splitFootnoteParagraphs(body)) {
+        const p = document.createElement("p");
+        p.innerHTML = markedInstance.parseInline(paraMd) as string;
+        def.appendChild(p);
+      }
+      section.appendChild(def);
+    }
+  }
+
+  return document.body.innerHTML;
+}
+
+/**
  * Recursively strip content-less paragraph nodes from a generated doc.
  *
  * A block-level atom whose markdown form is INLINE (e.g. the block `image`'s
@@ -786,7 +1003,11 @@ export async function markdownToProseMirror(
   // subpages/pageBreak) while the comment nodes still exist, before generateJSON
   // drops them.
   const withAttrs = applyCommentDirectives(html);
-  const bridged = bridgeTaskLists(withAttrs);
+  // #293 canon #2: assemble the doc-level footnote list from the `<sup
+  // data-fn-text>` markers (from `^[…]` or the raw-HTML column form) before
+  // generateJSON, so references + definitions materialize into the schema model.
+  const withFootnotes = assembleFootnotes(withAttrs);
+  const bridged = bridgeTaskLists(withFootnotes);
   const doc = generateJSON(bridged, docmostExtensions);
   return stripEmptyParagraphs(doc);
 }
