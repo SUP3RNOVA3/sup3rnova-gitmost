@@ -108,10 +108,12 @@ describe("CommentListItem — suggested edit (#315)", () => {
     });
 
   it("renders the было→стало diff and an Apply button when canEdit and not applied/resolved", () => {
-    renderItem(suggestion(), true);
-    // Old text appears both as the selection quote and as the struck diff row.
+    const { container } = renderItem(suggestion(), true);
+    // Old text appears as the selection quote (a single unsplit Text node).
     expect(screen.getAllByText("old wording here").length).toBeGreaterThan(0);
-    expect(screen.getByText("new wording here")).toBeDefined();
+    // The new line is now rendered as per-fragment spans (intraline diff, #331),
+    // so it is no longer a single text node — assert the concatenated content.
+    expect(container.textContent).toContain("new wording here");
     // Apply button is present.
     expect(screen.getByRole("button", { name: "Apply" })).toBeDefined();
     // No Applied badge yet.
@@ -119,9 +121,9 @@ describe("CommentListItem — suggested edit (#315)", () => {
   });
 
   it("hides the Apply button when canEdit is false", () => {
-    renderItem(suggestion(), false);
-    // Diff still renders...
-    expect(screen.getByText("new wording here")).toBeDefined();
+    const { container } = renderItem(suggestion(), false);
+    // Diff still renders (as per-fragment spans, #331)...
+    expect(container.textContent).toContain("new wording here");
     // ...but no Apply button.
     expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
   });

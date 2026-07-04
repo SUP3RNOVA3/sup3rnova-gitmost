@@ -47,6 +47,7 @@ import {
   deleteTableRow,
   updateTableCell,
 } from "./lib/node-ops.js";
+import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
 import {
   applyTextEdits,
@@ -1097,6 +1098,29 @@ export class DocmostClient {
       type: hit.type,
       node: hit.node,
     };
+  }
+
+  /**
+   * Find every occurrence of `query` on a page IN MEMORY, over the plain text of
+   * each text container (reusing the same `getPageRaw` fetch as the other read
+   * tools) — no server search endpoint, no whole-document round-trip through the
+   * model. Returns `{ total, truncated, matches }`; each match carries a ref for
+   * get_node/patch_node (the `#<index>` form resolves with get_node but NOT
+   * patch_node — see SearchMatch.nodeId), plus the top-level block index and a
+   * short context window used to build a unique text `selection` for
+   * create_comment (create_comment has no nodeId param). The pure engine
+   * (`searchInDoc`) owns the traversal, glue, the RE2 ReDoS-safe regex engine
+   * and the empty-query / invalid-or-unsupported-regex errors.
+   */
+  async searchInPage(pageId: string, query: string, opts: SearchOptions = {}) {
+    await this.ensureAuthenticated();
+    const data = await this.getPageRaw(pageId);
+    const result = searchInDoc(
+      data.content ?? { type: "doc", content: [] },
+      query,
+      opts,
+    );
+    return { pageId, query, ...result };
   }
 
   /**

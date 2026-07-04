@@ -1,6 +1,6 @@
 import { Group, Text, Box, Badge, Button } from "@mantine/core";
 import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import classes from "./comment.module.css";
 import { useAtom, useAtomValue } from "jotai";
 import { useTimeAgo } from "@/hooks/use-time-ago";
@@ -17,7 +17,10 @@ import {
   useUpdateCommentMutation,
 } from "@/features/comment/queries/comment-query";
 import { IComment } from "@/features/comment/types/comment.types";
-import { canShowApply } from "@/features/comment/utils/suggestion";
+import {
+  canShowApply,
+  computeSuggestionDiff,
+} from "@/features/comment/utils/suggestion";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useTranslation } from "react-i18next";
@@ -53,6 +56,18 @@ function CommentListItem({
   const applySuggestionMutation = useApplySuggestionMutation();
   const [currentUser] = useAtom(currentUserAtom);
   const createdAtAgo = useTimeAgo(comment.createdAt);
+
+  // Intraline "before -> after" diff (#331) for a suggested edit: only the
+  // fragments that actually changed get emphasised inside the red/green block,
+  // instead of striking through / greening the whole line. Memoised on the
+  // (selection, suggestedText) pair so it recomputes only when they change.
+  const suggestionDiff = useMemo(
+    () =>
+      comment.suggestedText != null
+        ? computeSuggestionDiff(comment.selection ?? "", comment.suggestedText)
+        : null,
+    [comment.selection, comment.suggestedText],
+  );
 
   useEffect(() => {
     setContent(comment.content);
@@ -236,12 +251,28 @@ function CommentListItem({
         {!comment.parentCommentId && comment.suggestedText && (
           <Box className={classes.suggestionBlock}>
             {comment.selection && (
+              // Old line: read as removed as a whole (line-through/red); only the
+              // changed fragments carry the extra intraline emphasis.
               <Text size="xs" className={classes.suggestionOld}>
-                {comment.selection}
+                {suggestionDiff?.old.map((segment, index) => (
+                  <span
+                    key={index}
+                    className={segment.changed ? classes.suggestionChanged : undefined}
+                  >
+                    {segment.text}
+                  </span>
+                ))}
               </Text>
             )}
             <Text size="xs" className={classes.suggestionNew}>
-              {comment.suggestedText}
+              {suggestionDiff?.new.map((segment, index) => (
+                <span
+                  key={index}
+                  className={segment.changed ? classes.suggestionChanged : undefined}
+                >
+                  {segment.text}
+                </span>
+              ))}
             </Text>
 
             {comment.suggestionAppliedAt ? (

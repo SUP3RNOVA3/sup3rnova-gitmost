@@ -132,6 +132,62 @@ export async function createUser(
   return { id: row.id as string };
 }
 
+// The default group every workspace has; `groupUserRepo.addUserToDefaultGroup`
+// (invoked by acceptInvitation) looks it up by `isDefault = true`, so a
+// workspace under test must have exactly one for the accept path to complete.
+export async function createDefaultGroup(
+  db: Kysely<any>,
+  workspaceId: string,
+  overrides: { name?: string } = {},
+): Promise<{ id: string }> {
+  const id = randomUUID();
+  const suffix = shortId(id);
+  const row = await db
+    .insertInto('groups')
+    .values({
+      id,
+      // name is unique per workspace + NOT NULL.
+      name: overrides.name ?? `group-${suffix}`,
+      isDefault: true,
+      workspaceId,
+    })
+    .returning(['id'])
+    .executeTakeFirstOrThrow();
+  return { id: row.id as string };
+}
+
+// A pending workspace invitation. `role`/`token` are NOT NULL; `groupIds` is a
+// nullable uuid[] and `invitedById` a nullable FK to users. Returns the fields a
+// spec needs to drive acceptInvitation (id + token + the invited email).
+export async function createInvitation(
+  db: Kysely<any>,
+  args: {
+    workspaceId: string;
+    email: string;
+    invitedById?: string | null;
+    role?: string;
+    token?: string;
+    groupIds?: string[] | null;
+  },
+): Promise<{ id: string; token: string; email: string }> {
+  const id = randomUUID();
+  const token = args.token ?? `tok-${shortId(id)}`;
+  const row = await db
+    .insertInto('workspaceInvitations')
+    .values({
+      id,
+      email: args.email,
+      role: args.role ?? 'member',
+      token,
+      groupIds: (args.groupIds ?? null) as any,
+      invitedById: args.invitedById ?? null,
+      workspaceId: args.workspaceId,
+    })
+    .returning(['id'])
+    .executeTakeFirstOrThrow();
+  return { id: row.id as string, token, email: args.email };
+}
+
 export async function createSpace(
   db: Kysely<any>,
   workspaceId: string,
