@@ -60,6 +60,14 @@ export default defineConfig(({ mode }) => {
       // precompressed copy (see @fastify/static preCompressed in static.module.ts).
       compression({
         algorithms: ["brotliCompress", "gzip"],
+        // vite-plugin-compression2's default `include` only covers text-ish
+        // bundle output (js/mjs/json/css/html/svg/…). Extend it with the large
+        // VAD binaries copied from public/vad (.wasm ~26MB, .onnx ~2.3MB) so
+        // they are brotli/gzip'd once at build time and served via
+        // @fastify/static preCompressed — otherwise @fastify/compress would
+        // re-brotli them on EVERY request. The default types are repeated here
+        // because setting `include` replaces (does not extend) the default.
+        include: /\.(html|xml|css|json|js|mjs|svg|yaml|yml|toml|wasm|onnx)$/,
         // index.html is rewritten at server boot (window.CONFIG injection); a
         // precompressed copy would go stale — NEVER precompress it.
         exclude: [/index\.html$/],

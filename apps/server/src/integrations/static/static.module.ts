@@ -5,6 +5,46 @@ import * as fs from 'node:fs';
 import fastifyStatic from '@fastify/static';
 import { EnvironmentService } from '../environment/environment.service';
 
+/**
+ * Resolve the response headers for a statically served client asset.
+ *
+ * Extracted from the @fastify/static `setHeaders` callback so the cache
+ * classification stays a pure, unit-testable function (see
+ * static.module.spec.ts).
+ *
+ * `Vary: Accept-Encoding` is emitted for every static response because
+ * @fastify/static negotiates a precompressed .br/.gz neighbour by the client's
+ * Accept-Encoding but does NOT set Vary itself. Without it a shared/proxy cache
+ * keyed on the URL alone could store the brotli variant and later serve it to a
+ * client that only sent `Accept-Encoding: identity`/gzip → an undecodable body.
+ * This matters most for the immutable /assets/ files, which proxies may keep
+ * for a year.
+ */
+export function resolveStaticAssetHeaders(
+  filePath: string,
+): Record<string, string> {
+  const headers: Record<string, string> = { vary: 'Accept-Encoding' };
+
+  // Content-hashed files under /assets/ never change for a given URL, so they
+  // can be cached forever and skip revalidation entirely.
+  if (filePath.includes('/assets/')) {
+    headers['cache-control'] = 'public, max-age=31536000, immutable';
+    return headers;
+  }
+
+  // index.html is rewritten at boot (window.CONFIG injection) and on every
+  // deploy — it must be revalidated on every load.
+  if (filePath.endsWith('index.html')) {
+    headers['cache-control'] = 'no-cache, no-store, must-revalidate';
+    return headers;
+  }
+
+  // Everything else (locales, vad, icons, manifest) is NOT content-hashed and
+  // changes between deploys, so it keeps @fastify/static's default
+  // etag/last-modified revalidation — do NOT mark it immutable.
+  return headers;
+}
+
 @Module({})
 export class StaticModule implements OnModuleInit {
   constructor(
@@ -76,27 +116,11 @@ export class StaticModule implements OnModuleInit {
         // (see vite-plugin-compression2 in apps/client/vite.config.ts).
         preCompressed: true,
         setHeaders: (res, filePath) => {
-          // Content-hashed files under /assets/ never change for a given URL,
-          // so they can be cached forever and skip revalidation entirely.
-          if (filePath.includes('/assets/')) {
-            res.setHeader(
-              'cache-control',
-              'public, max-age=31536000, immutable',
-            );
-            return;
+          for (const [name, value] of Object.entries(
+            resolveStaticAssetHeaders(filePath),
+          )) {
+            res.setHeader(name, value);
           }
-          // index.html is rewritten at boot (window.CONFIG injection) and on
-          // every deploy — it must be revalidated on every load.
-          if (filePath.endsWith('index.html')) {
-            res.setHeader(
-              'cache-control',
-              'no-cache, no-store, must-revalidate',
-            );
-            return;
-          }
-          // Everything else (locales, vad, icons, manifest) is NOT content-hashed
-          // and changes between deploys, so it keeps @fastify/static's default
-          // etag/last-modified revalidation — do NOT mark it immutable.
         },
       });
 
