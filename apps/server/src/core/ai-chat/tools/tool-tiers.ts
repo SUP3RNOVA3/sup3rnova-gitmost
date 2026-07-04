@@ -108,22 +108,13 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'core',
     catalogLine: "listPages — list recent pages, or a space's full page tree.",
   },
-  listComments: {
-    tier: 'core',
-    catalogLine: 'listComments — list all comments on a page (including resolved).',
-  },
+  // NOTE: createComment, listComments and resolveComment moved to
+  // @docmost/mcp's SHARED_TOOL_SPECS (#294); they carry their own tier +
+  // catalogLine there. getComment stays inline (MCP-only shape divergence is
+  // n/a — it simply has no shared spec).
   getComment: {
     tier: 'core',
     catalogLine: 'getComment — fetch a single comment by id.',
-  },
-  createComment: {
-    tier: 'core',
-    catalogLine:
-      'createComment — add an inline comment (optionally with a suggested edit).',
-  },
-  resolveComment: {
-    tier: 'core',
-    catalogLine: 'resolveComment — resolve or reopen a comment thread.',
   },
 
   // --- deferred inline ---
@@ -157,11 +148,8 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'deferred',
     catalogLine: 'getTable — read a table as a matrix of cell texts and cell ids.',
   },
-  checkNewComments: {
-    tier: 'deferred',
-    catalogLine:
-      'checkNewComments — find comments in a space created after a timestamp.',
-  },
+  // NOTE: checkNewComments moved to @docmost/mcp's SHARED_TOOL_SPECS (#294);
+  // it carries its own deferred tier + catalogLine there.
   getPageHistory: {
     tier: 'deferred',
     catalogLine:

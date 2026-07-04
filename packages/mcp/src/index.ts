@@ -721,26 +721,8 @@ server.registerTool(
 // --- Comment tools (ported from upstream PR #3 by Max Nikitin) ---
 
 // Tool: list_comments
-server.registerTool(
-  "list_comments",
-  {
-    description:
-      "List comments on a page in one call (pagination is handled " +
-      "internally). By DEFAULT only ACTIVE threads are returned; resolved " +
-      "threads (a resolved top-level comment and all its replies) are hidden " +
-      "and their count reported as `resolvedThreadsHidden` so you can re-query " +
-      "with `includeResolved: true` to see everything. Returns " +
-      "`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.",
-    inputSchema: {
-      pageId: z.string().describe("ID of the page"),
-      includeResolved: z
-        .boolean()
-        .optional()
-        .describe(
-          "default only active threads; true — include resolved",
-        ),
-    },
-  },
+registerShared(
+  SHARED_TOOL_SPECS.listComments,
   async ({ pageId, includeResolved }) => {
     const comments = await docmostClient.listComments(pageId, includeResolved);
     return jsonContent(comments);
@@ -748,55 +730,11 @@ server.registerTool(
 );
 
 // Tool: create_comment
-// INTENTIONAL per-transport divergence (not shared): the in-app copy tunes the
-// guidance for the in-app agent (e.g. "retry with a corrected EXACT selection"
-// and "Reversible via the comment UI"); this transport keeps its own wording.
-server.registerTool(
-  "create_comment",
-  {
-    description:
-      "Create a new comment on a page. The comment is ALWAYS inline and is " +
-      "anchored to (highlights) its `selection` text — there are no page-level " +
-      "comments. Content is provided as Markdown and automatically converted. " +
-      "A top-level comment REQUIRES an exact `selection`; if the selection " +
-      "cannot be found in the page the call fails (no orphan comment is left). " +
-      "Replies (parentCommentId set) inherit the parent's anchor and take no " +
-      "selection. You may also attach a `suggestedText` proposing a replacement " +
-      "for the `selection`; a human applies (or rejects) it from the UI. When " +
-      "`suggestedText` is set the `selection` MUST occur exactly once in the " +
-      "page — expand it with surrounding context if it is ambiguous.",
-    inputSchema: {
-      pageId: z.string().describe("ID of the page to comment on"),
-      content: z.string().min(1).describe("Comment content in Markdown format"),
-      selection: z
-        .string()
-        .min(1)
-        // Enforce the documented 250-char cap to match the description above.
-        .max(250)
-        .optional()
-        .describe(
-          "EXACT contiguous text from a single paragraph/block to anchor the " +
-            "comment on (<=250 chars). Required for a top-level comment; omit " +
-            "only when replying via parentCommentId.",
-        ),
-      parentCommentId: z
-        .string()
-        .optional()
-        .describe("Parent comment ID to create a reply (max 2 nesting levels)"),
-      suggestedText: z
-        .string()
-        .min(1)
-        .max(2000)
-        .optional()
-        .describe(
-          "Optional proposed replacement (PLAIN TEXT) for the `selection`, " +
-            "applied by a human via the UI (never auto-applied). REQUIRES a " +
-            "`selection`; NOT allowed on a reply. When set, the `selection` must " +
-            "be UNIQUE in the page — expand it with surrounding context (still " +
-            "<=250 chars) if it occurs more than once, or the call is refused.",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's own guards (require a selection for a top-level
+// comment; reject suggestedText on a reply / without a selection).
+registerShared(
+  SHARED_TOOL_SPECS.createComment,
   async ({ pageId, content, selection, parentCommentId, suggestedText }) => {
     if (!parentCommentId && (!selection || !selection.trim())) {
       throw new Error(
@@ -872,28 +810,9 @@ server.registerTool(
 );
 
 // Tool: resolve_comment
-server.registerTool(
-  "resolve_comment",
-  {
-    description:
-      "Resolve (close) or reopen a comment thread. Only top-level comments can " +
-      "be resolved — the server rejects resolving a reply. Reversible: pass " +
-      "resolved=false to reopen. Resolving keeps the thread and its replies " +
-      "(unlike delete_comment, which permanently removes them).",
-    inputSchema: {
-      commentId: z
-        .string()
-        .min(1)
-        .describe("ID of the top-level comment thread to resolve or reopen"),
-      resolved: z
-        .boolean()
-        .optional()
-        .default(true)
-        .describe(
-          "true (default) marks the thread resolved/closed; false reopens it",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.resolveComment,
   async ({ commentId, resolved }) => {
     const result = await docmostClient.resolveComment(commentId, resolved);
     return jsonContent(result);
@@ -901,30 +820,10 @@ server.registerTool(
 );
 
 // Tool: check_new_comments
-server.registerTool(
-  "check_new_comments",
-  {
-    description:
-      "Check for new comments across pages in a space since a given timestamp. " +
-      "Optionally scope to a page subtree (folder). Returns only comments " +
-      "created after the specified time.",
-    inputSchema: {
-      spaceId: z.string().describe("Space ID to check for new comments"),
-      since: z
-        .string()
-        .min(1)
-        .describe(
-          "ISO 8601 timestamp — only return comments created after this time (e.g. '2026-03-10T00:00:00Z')",
-        ),
-      parentPageId: z
-        .string()
-        .optional()
-        .describe(
-          "Optional root page ID to scope the check to a subtree (folder). " +
-            "Only pages under this parent will be checked.",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's own guard rejecting an unparseable `since` timestamp.
+registerShared(
+  SHARED_TOOL_SPECS.checkNewComments,
   async ({ spaceId, since, parentPageId }) => {
     // Reject an unparseable timestamp up front: otherwise the comparison
     // against NaN silently treats every comment as "not new" and the tool

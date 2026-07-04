@@ -509,4 +509,175 @@ export const SHARED_TOOL_SPECS = {
       pageId: z.string().min(1),
     }),
   },
+
+  // --- comment tools (unified from the per-layer inline definitions, #294) ---
+  //
+  // create_comment and resolve_comment previously carried a "per-transport
+  // divergence" note in BOTH layers; #294 unifies their schema + description
+  // here. Only the four tools that genuinely exist in BOTH layers live in the
+  // registry: create/list/resolve comment and check_new_comments.
+  //
+  // update_comment and delete_comment are intentionally NOT here: they exist
+  // ONLY on the standalone MCP server. The in-app agent deliberately exposes no
+  // hard comment edit/delete tool (comment edits are irreversible / not
+  // version-tracked; see the guardrail tests in ai-chat-tools.service.spec.ts),
+  // so there is nothing to unify — they stay inline in index.ts.
+
+  createComment: {
+    mcpName: 'create_comment',
+    inAppKey: 'createComment',
+    // CANONICAL: the in-app copy (the more-maintained one). It keeps the same
+    // rules as the MCP copy — inline-only, top-level requires a `selection`, no
+    // page-level comments, replies inherit the anchor, suggestedText must be
+    // unique — and adds the "retry with a corrected EXACT selection" and reply-
+    // to-reply-rejected guidance the MCP copy lacked. Execute-side validation
+    // (reject suggestedText on a reply, require a selection) stays per-layer.
+    description:
+      'Add an INLINE comment to a page, or reply to an existing top-level ' +
+      'comment (one level only — the backend rejects replies to replies). ' +
+      'The comment is anchored inline to the given exact `selection` text ' +
+      '(which gets highlighted); page-level comments are NOT supported. A ' +
+      'new top-level comment REQUIRES a `selection`. Replies inherit the ' +
+      "parent's anchor and take no selection. If the call fails with a " +
+      '"selection not found" error, retry with a corrected EXACT selection ' +
+      'copied verbatim from a single paragraph/block. You may also attach a ' +
+      '`suggestedText` proposing a replacement for the `selection` (a human ' +
+      'applies it from the UI); when set, the `selection` must occur exactly ' +
+      'once in the page. Reversible via the comment UI.',
+    tier: 'core',
+    catalogLine:
+      'createComment — add an inline comment (optionally with a suggested edit).',
+    // Reconciled schema: the field set is identical across both layers; the
+    // only constraint drift is `content`, which the MCP copy pinned to
+    // .min(1) while the in-app copy left unbounded — the stricter MCP form is
+    // kept (an empty comment body is never valid).
+    buildShape: (z) => ({
+      pageId: z.string().describe('The id of the page to comment on.'),
+      content: z.string().min(1).describe('The comment body as Markdown.'),
+      selection: z
+        .string()
+        .min(1)
+        .max(250)
+        .optional()
+        .describe(
+          'EXACT contiguous text from a SINGLE paragraph/block to anchor ' +
+            '(highlight) the comment on (<=250 chars, avoid spanning across ' +
+            'formatting boundaries). Required for a new top-level comment; ' +
+            'omit only when replying via parentCommentId.',
+        ),
+      parentCommentId: z
+        .string()
+        .optional()
+        .describe(
+          'Optional id of a TOP-LEVEL comment to reply to (one level ' +
+            'of replies only).',
+        ),
+      suggestedText: z
+        .string()
+        .min(1)
+        .max(2000)
+        .optional()
+        .describe(
+          'Optional proposed replacement (PLAIN TEXT) for the `selection`, ' +
+            'applied by a human via the UI (never auto-applied). REQUIRES a ' +
+            '`selection`; NOT allowed on a reply. When set, the `selection` ' +
+            'must be UNIQUE in the page — expand it with surrounding context ' +
+            '(still <=250 chars) if it occurs more than once, or the call is ' +
+            'refused.',
+        ),
+    }),
+  },
+
+  listComments: {
+    mcpName: 'list_comments',
+    inAppKey: 'listComments',
+    // CANONICAL: the two copies are near-identical; the MCP copy is the
+    // superset (it keeps the "(pagination is handled internally)" note the
+    // in-app copy dropped), so it is used verbatim.
+    description:
+      'List comments on a page in one call (pagination is handled ' +
+      'internally). By DEFAULT only ACTIVE threads are returned; resolved ' +
+      'threads (a resolved top-level comment and all its replies) are hidden ' +
+      'and their count reported as `resolvedThreadsHidden` so you can re-query ' +
+      'with `includeResolved: true` to see everything. Returns ' +
+      '`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.',
+    tier: 'core',
+    catalogLine:
+      'listComments — list all comments on a page (including resolved).',
+    buildShape: (z) => ({
+      pageId: z.string().describe('ID of the page'),
+      includeResolved: z
+        .boolean()
+        .optional()
+        .describe('default only active threads; true — include resolved'),
+    }),
+  },
+
+  resolveComment: {
+    mcpName: 'resolve_comment',
+    inAppKey: 'resolveComment',
+    // CANONICAL: the MCP copy's richer wording, minus its snake_case reference
+    // to `delete_comment` (a sibling tool that does NOT exist in the in-app
+    // layer) — rephrased transport-neutrally per the registry convention.
+    description:
+      'Resolve (close) or reopen a top-level comment thread (reversible — ' +
+      'pass resolved=false to reopen). Only top-level comments can be ' +
+      'resolved; the server rejects resolving a reply. Resolving keeps the ' +
+      'thread and its replies intact (it is not a deletion).',
+    tier: 'core',
+    catalogLine: 'resolveComment — resolve or reopen a comment thread.',
+    // Reconciled schema: `resolved` drifted — the MCP copy made it optional
+    // with .default(true) (resolve is the common case, documented), the in-app
+    // copy made it required. The MCP form is kept (a strict superset: it never
+    // rejects a previously-valid input and adds a sensible default), and
+    // commentId keeps the MCP copy's stricter .min(1).
+    buildShape: (z) => ({
+      commentId: z
+        .string()
+        .min(1)
+        .describe('ID of the top-level comment thread to resolve or reopen'),
+      resolved: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          'true (default) marks the thread resolved/closed; false reopens it',
+        ),
+    }),
+  },
+
+  checkNewComments: {
+    mcpName: 'check_new_comments',
+    inAppKey: 'checkNewComments',
+    // CANONICAL: the MCP copy (the more detailed of the two). The MCP layer's
+    // execute-side guard that rejects an unparseable `since` timestamp stays in
+    // its execute body (per-layer logic), not in the shared schema.
+    description:
+      'Check for new comments across pages in a space since a given ' +
+      'timestamp. Optionally scope to a page subtree (folder). Returns only ' +
+      'comments created after the specified time.',
+    tier: 'deferred',
+    catalogLine:
+      'checkNewComments — find comments in a space created after a timestamp.',
+    // Reconciled schema: `since` keeps the MCP copy's stricter .min(1) (the
+    // in-app copy left it unbounded); field descriptions use the MCP copy's
+    // more detailed wording (it carries an example timestamp).
+    buildShape: (z) => ({
+      spaceId: z.string().describe('Space ID to check for new comments'),
+      since: z
+        .string()
+        .min(1)
+        .describe(
+          "ISO 8601 timestamp — only return comments created after this time " +
+            "(e.g. '2026-03-10T00:00:00Z')",
+        ),
+      parentPageId: z
+        .string()
+        .optional()
+        .describe(
+          'Optional root page ID to scope the check to a subtree (folder). ' +
+            'Only pages under this parent will be checked.',
+        ),
+    }),
+  },
 } satisfies Record<string, SharedToolSpec>;

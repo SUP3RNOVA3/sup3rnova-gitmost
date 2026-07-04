@@ -455,59 +455,13 @@ export class AiChatToolsService {
         },
       }),
 
-      // INTENTIONAL per-transport divergence (not shared): the description is
-      // tuned for the in-app agent (e.g. "retry with a corrected EXACT selection"
-      // and "Reversible via the comment UI"); the standalone MCP `create_comment`
-      // keeps its own wording. Kept per-layer.
-      createComment: tool({
-        description:
-          'Add an INLINE comment to a page, or reply to an existing top-level ' +
-          'comment (one level only — the backend rejects replies to replies). ' +
-          'The comment is anchored inline to the given exact `selection` text ' +
-          '(which gets highlighted); page-level comments are NOT supported. A ' +
-          "new top-level comment REQUIRES a `selection`. Replies inherit the " +
-          "parent's anchor and take no selection. If the call fails with a " +
-          '"selection not found" error, retry with a corrected EXACT selection ' +
-          'copied verbatim from a single paragraph/block. You may also attach a ' +
-          '`suggestedText` proposing a replacement for the `selection` (a human ' +
-          'applies it from the UI); when set, the `selection` must occur exactly ' +
-          'once in the page. Reversible via the comment UI.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to comment on.'),
-          content: z.string().describe('The comment body as Markdown.'),
-          selection: z
-            .string()
-            .min(1)
-            .max(250)
-            .optional()
-            .describe(
-              'EXACT contiguous text from a SINGLE paragraph/block to anchor ' +
-                '(highlight) the comment on (<=250 chars, avoid spanning across ' +
-                'formatting boundaries). Required for a new top-level comment; ' +
-                'omit only when replying via parentCommentId.',
-            ),
-          parentCommentId: z
-            .string()
-            .optional()
-            .describe(
-              'Optional id of a TOP-LEVEL comment to reply to (one level ' +
-                'of replies only).',
-            ),
-          suggestedText: z
-            .string()
-            .min(1)
-            .max(2000)
-            .optional()
-            .describe(
-              'Optional proposed replacement (PLAIN TEXT) for the `selection`, ' +
-                'applied by a human via the UI (never auto-applied). REQUIRES a ' +
-                '`selection`; NOT allowed on a reply. When set, the `selection` ' +
-                'must be UNIQUE in the page — expand it with surrounding context ' +
-                '(still <=250 chars) if it occurs more than once, or the call is ' +
-                'refused.',
-            ),
-        }),
-        execute: async ({
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // This layer keeps only its own execute-side guards (require a selection
+      // for a top-level comment; reject suggestedText on a reply / without a
+      // selection) — the schema+description are shared.
+      createComment: sharedTool(
+        sharedToolSpecs.createComment,
+        async ({
           pageId,
           content,
           selection,
@@ -548,26 +502,17 @@ export class AiChatToolsService {
           const data = (result?.data ?? {}) as { id?: string };
           return { commentId: data.id, pageId };
         },
-      }),
+      ),
 
-      resolveComment: tool({
-        description:
-          'Resolve or reopen a top-level comment thread (reversible — toggle ' +
-          'the resolved flag). Only top-level comments can be resolved.',
-        inputSchema: modelFriendlyInput({
-          commentId: z
-            .string()
-            .describe('The id of the top-level comment to resolve/reopen.'),
-          resolved: z
-            .boolean()
-            .describe('true to resolve the thread, false to reopen it.'),
-        }),
-        execute: async ({ commentId, resolved }) => {
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      resolveComment: sharedTool(
+        sharedToolSpecs.resolveComment,
+        async ({ commentId, resolved }) => {
           // resolveComment(commentId, resolved) -> { success, commentId, resolved }.
           await client.resolveComment(commentId, resolved);
           return { commentId, resolved };
         },
-      }),
+      ),
 
       // --- READ tools (added) ---
 
@@ -673,24 +618,12 @@ export class AiChatToolsService {
           await client.getTable(pageId, tableRef),
       }),
 
-      listComments: tool({
-        description:
-          'List comments on a page in one call. By DEFAULT only ACTIVE ' +
-          'threads are returned; resolved threads (a resolved top-level ' +
-          'comment and all its replies) are hidden and their count reported ' +
-          'as `resolvedThreadsHidden` so you can re-query with ' +
-          '`includeResolved: true` to see everything. Returns ' +
-          '`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          includeResolved: z
-            .boolean()
-            .optional()
-            .describe('default only active threads; true — include resolved'),
-        }),
-        execute: async ({ pageId, includeResolved }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      listComments: sharedTool(
+        sharedToolSpecs.listComments,
+        async ({ pageId, includeResolved }) =>
           await client.listComments(pageId, includeResolved),
-      }),
+      ),
 
       getComment: tool({
         description: 'Fetch a single comment by id (content as Markdown).',
@@ -700,26 +633,12 @@ export class AiChatToolsService {
         execute: async ({ commentId }) => await client.getComment(commentId),
       }),
 
-      checkNewComments: tool({
-        description:
-          'Find new comments across a space (optionally scoped to a subtree) ' +
-          'created after a given timestamp.',
-        inputSchema: modelFriendlyInput({
-          spaceId: z.string().describe('The id of the space to scan.'),
-          since: z
-            .string()
-            .describe('An ISO-8601 timestamp; only comments created after it.'),
-          parentPageId: z
-            .string()
-            .optional()
-            .describe(
-              'Optional page id to scope the scan to that page and its ' +
-                'descendants.',
-            ),
-        }),
-        execute: async ({ spaceId, since, parentPageId }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      checkNewComments: sharedTool(
+        sharedToolSpecs.checkNewComments,
+        async ({ spaceId, since, parentPageId }) =>
           await client.checkNewComments(spaceId, since, parentPageId),
-      }),
+      ),
 
       listShares: sharedTool(
         sharedToolSpecs.listShares,
