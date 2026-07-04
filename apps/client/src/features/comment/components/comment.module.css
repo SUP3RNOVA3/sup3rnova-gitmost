@@ -55,7 +55,7 @@
 
 /* Intraline diff (#331): the fragment that actually changed within the
    red "before" / green "after" block. It inherits the surrounding red/green
-   framing and adds a stronger tint plus an underline so the eye lands on the
+   framing and adds a stronger tint plus bold weight so the eye lands on the
    changed letters/words (git/GitHub-style) rather than the whole line. The
    container's line-through (old) / green (new) still marks the full line. */
 .suggestionChanged {
