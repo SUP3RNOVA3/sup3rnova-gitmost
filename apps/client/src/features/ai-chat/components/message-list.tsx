@@ -196,7 +196,7 @@ export default function MessageList({
   return (
     <ScrollArea className={classes.messages} viewportRef={viewportRef} scrollbarSize={6} type="scroll">
       <Stack gap={0} pr="xs">
-        {messages.map((message) => (
+        {messages.map((message, index) => (
           // `signature` is snapshotted HERE (parent render) into an immutable
           // string and handed to MessageItem as its memo key. It must NOT be
           // recomputed inside MessageItem's arePropsEqual: the AI SDK mutates the
@@ -210,6 +210,13 @@ export default function MessageList({
             showCitations={showCitations}
             neutralizeInternalLinks={neutralizeInternalLinks}
             assistantName={assistantName}
+            // Turn-level liveness, gated to the TAIL row: only the tail message
+            // can belong to the in-flight turn, so a reasoning part stranded at
+            // `state:"streaming"` in an EARLIER message (its turn ended without
+            // `reasoning-end`) stays finalized and doesn't flip back to plain
+            // text (and re-parse) whenever a later turn streams — see
+            // message-item.tsx.
+            turnStreaming={isStreaming && index === messages.length - 1}
           />
         ))}
         {typing && (

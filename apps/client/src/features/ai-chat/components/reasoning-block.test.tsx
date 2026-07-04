@@ -28,7 +28,11 @@ import { renderChatMarkdown } from "@/features/ai-chat/utils/markdown.ts";
 
 // matchMedia (read by MantineProvider) is stubbed globally in vitest.setup.ts.
 
-function renderBlock(props: { text: string; tokens?: number }) {
+function renderBlock(props: {
+  text: string;
+  tokens?: number;
+  streaming?: boolean;
+}) {
   return render(
     <MantineProvider>
       <ReasoningBlock {...props} />
@@ -82,6 +86,56 @@ describe("ReasoningBlock", () => {
     expect(renderSpy).not.toHaveBeenCalled();
     // Expanding parses the current text exactly once (a user-initiated click).
     fireEvent.click(screen.getByRole("button"));
+    expect(renderSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not parse while expanded and STREAMING; shows chunked plain text", () => {
+    const renderSpy = vi.mocked(renderChatMarkdown);
+    renderSpy.mockClear();
+    renderBlock({
+      text: "первый абзац размышлений\n\nвторой абзац растёт",
+      tokens: 5,
+      streaming: true,
+    });
+    fireEvent.click(screen.getByRole("button"));
+    // Expanded + still streaming: NO markdown parse and NO innerHTML swaps per
+    // delta — the body is chunked plain text (only the tail chunk updates).
+    // This is the O(n²) hole #302 left open (Safari whole-tab freeze).
+    expect(renderSpy).not.toHaveBeenCalled();
+    // Both paragraph chunks' raw text is present in the body.
+    expect(screen.getByText(/первый абзац размышлений/)).toBeDefined();
+    expect(screen.getByText(/второй абзац растёт/)).toBeDefined();
+  });
+
+  it("parses exactly once when streaming flips to done while expanded", () => {
+    const renderSpy = vi.mocked(renderChatMarkdown);
+    renderSpy.mockClear();
+    const { rerender } = renderBlock({
+      text: "**bold** reasoning",
+      tokens: 5,
+      streaming: true,
+    });
+    fireEvent.click(screen.getByRole("button"));
+    expect(renderSpy).not.toHaveBeenCalled();
+
+    // Finalization: the part's state flips streaming→done, the parent
+    // re-renders the row (the flip changes the message signature), and the
+    // block does its ONE markdown parse of the now-stable text.
+    rerender(
+      <MantineProvider>
+        <ReasoningBlock text="**bold** reasoning" tokens={5} streaming={false} />
+      </MantineProvider>,
+    );
+    expect(renderSpy).toHaveBeenCalledTimes(1);
+    // The parsed html branch rendered (the mock wraps the input in <p>…</p>).
+    expect(screen.getByText(/reasoning/)).toBeDefined();
+
+    // Further re-renders with unchanged props do not re-parse.
+    rerender(
+      <MantineProvider>
+        <ReasoningBlock text="**bold** reasoning" tokens={5} streaming={false} />
+      </MantineProvider>,
+    );
     expect(renderSpy).toHaveBeenCalledTimes(1);
   });
 });

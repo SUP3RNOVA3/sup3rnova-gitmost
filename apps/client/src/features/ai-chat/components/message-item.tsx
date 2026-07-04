@@ -52,6 +52,20 @@ interface MessageItemProps {
    * absent; the public share passes the configured identity (agent role) name.
    */
   assistantName?: string;
+  /**
+   * Whether the WHOLE turn is still streaming (MessageList's `isStreaming`).
+   * A reasoning part may be left `state: "streaming"` forever when the turn
+   * ends without a `reasoning-end` chunk (manual Stop during the thinking
+   * phase, or a provider that never emits it) — the AI SDK finalizes reasoning
+   * state ONLY on `reasoning-end`, not on `finish-step`/`finish`. So part-level
+   * state alone cannot prove liveness; the reasoning part is treated as live
+   * only while the whole turn is still streaming. Defaults to false.
+   *
+   * The parent passes it as "turn is live AND this is the tail row", so a
+   * stranded part in an EARLIER row never re-activates when a later turn
+   * streams.
+   */
+  turnStreaming?: boolean;
 }
 
 /**
@@ -105,6 +119,7 @@ function MessageItem({
   showCitations = true,
   neutralizeInternalLinks = false,
   assistantName,
+  turnStreaming = false,
 }: MessageItemProps) {
   // `signature` is intentionally not read in the body — it exists solely as the
   // memo key (see arePropsEqual). The render reads `message` directly.
@@ -155,8 +170,23 @@ function MessageItem({
           const text = (part as { text?: string }).text ?? "";
           if (!text.trim() && !(reasoningTokens && reasoningTokens > 0))
             return null;
+          // Absent state (persisted rows) and "done" both mean finalized.
+          // `messageSignature` already includes each part's `state`, so the
+          // streaming→done flip changes the row signature and re-renders this
+          // row — which is what lets ReasoningBlock switch from chunked plain
+          // text to its one-time markdown parse (see reasoning-block.tsx).
+          // ALSO require the turn to be live: a part stranded at
+          // `state:"streaming"` after the turn ended (no `reasoning-end` — see
+          // the `turnStreaming` prop doc) must still finalize and parse.
+          const streaming =
+            turnStreaming && (part as { state?: string }).state === "streaming";
           return (
-            <ReasoningBlock key={index} text={text} tokens={reasoningTokens} />
+            <ReasoningBlock
+              key={index}
+              text={text}
+              tokens={reasoningTokens}
+              streaming={streaming}
+            />
           );
         }
 
@@ -245,7 +275,11 @@ export function arePropsEqual(
     prev.signature === next.signature &&
     prev.showCitations === next.showCitations &&
     prev.neutralizeInternalLinks === next.neutralizeInternalLinks &&
-    prev.assistantName === next.assistantName
+    prev.assistantName === next.assistantName &&
+    // The turn-end flip re-renders every row once (cheap, terminal event) —
+    // that is what converts a stranded `state:"streaming"` reasoning part to
+    // its one-time markdown parse (see the `turnStreaming` prop doc).
+    prev.turnStreaming === next.turnStreaming
   );
 }
 
