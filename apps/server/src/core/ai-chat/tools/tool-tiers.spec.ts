@@ -13,6 +13,12 @@ import {
 // SHARED_TOOL_SPECS contract spec) so the tier metadata is checked against
 // exactly what @docmost/mcp ships.
 import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs';
+// For the live-toolset partition test (F3): the REAL adapter, so the catalog is
+// checked against the tools AiChatToolsService.forUser() actually builds — not a
+// static list that could drift from it.
+import { AiChatToolsService } from './ai-chat-tools.service';
+import * as loader from './docmost-client.loader';
+import type { DocmostClientLike } from './docmost-client.loader';
 
 /**
  * #332 deferred tool loading — tier metadata, catalog assembly, and the
@@ -68,12 +74,91 @@ describe('buildInAppDeferredCatalog (#332)', () => {
     expect(names).not.toContain('editPageText'); // shared core
   });
 
-  it('lists all 28 deferred tools (16 inline + 12 shared)', () => {
-    expect(catalog).toHaveLength(28);
-    // Each entry is a "name — purpose" line.
+  it('renders every entry as a "name — purpose" line', () => {
+    // Non-empty catalog (the length is pinned structurally by the live-toolset
+    // partition test below, not by a magic constant that rots on every new tool).
+    expect(catalog.length).toBeGreaterThan(0);
     for (const entry of catalog) {
       expect(entry.catalogLine).toMatch(/ — /);
     }
+  });
+});
+
+/**
+ * F3 — the deferred <tool_catalog> is built from STATIC metadata (INLINE_TOOL_TIERS
+ * + SHARED_TOOL_SPECS), but the loadable-by-name set is derived at RUNTIME from the
+ * actual toolset (`Object.keys(baseTools)` in ai-chat.service.ts). Those two must
+ * agree or a tool becomes loadable-but-invisible (agent thinks it doesn't exist) or
+ * catalogued-but-phantom. INLINE_TOOL_TIERS is a plain hand-maintained Record with
+ * no compile-time link to the tools AiChatToolsService.forUser() builds, so nothing
+ * else catches that drift. This test uses forUser()'s LIVE keys as the source of
+ * truth (mirroring ai-chat-tools.service.spec.ts's loader mock) and asserts a
+ * two-way partition against buildInAppDeferredCatalog — replacing the old magic
+ * toHaveLength(28), so a tool added to forUser() without a catalog line (or a
+ * catalog line without a real tool) fails the suite instead of silently vanishing.
+ */
+describe('deferred catalog ↔ live forUser() toolset partition (#332, F3)', () => {
+  let toolKeys: string[];
+  const catalogNames = buildInAppDeferredCatalog(SHARED_TOOL_SPECS as never).map(
+    (e) => e.name,
+  );
+
+  beforeAll(async () => {
+    // Intercept the ESM loader so forUser() builds against the TS-source shared
+    // specs (no @docmost/mcp build) and never touches the network.
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue({
+      DocmostClient: function () {
+        return {} as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor,
+      sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+    });
+    const service = new AiChatToolsService(
+      {
+        generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+        generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+      } as never,
+      {} as never, // aiService — not exercised while merely BUILDING the tools
+      {} as never, // pageEmbeddingRepo
+      {} as never, // spaceMemberRepo
+      {} as never, // pagePermissionRepo
+      // sandboxStore: forUser() eagerly calls asSink() to wire the stash tool.
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+    );
+    const tools = await service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+    toolKeys = Object.keys(tools);
+  });
+
+  afterAll(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('exposes a non-trivial toolset (sanity: the mock actually built tools)', () => {
+    expect(toolKeys.length).toBeGreaterThan(20);
+  });
+
+  it('every non-core live tool is present in the catalog (no capability silently hidden)', () => {
+    // forUser() does not itself add loadTools (ai-chat.service does), but guard
+    // anyway. Every remaining non-core key MUST have a catalog line.
+    const catalogSet = new Set(catalogNames);
+    const missing = toolKeys.filter(
+      (k) => !CORE_TOOL_SET.has(k) && k !== LOAD_TOOLS_NAME && !catalogSet.has(k),
+    );
+    expect(missing).toEqual([]);
+  });
+
+  it('every catalog entry corresponds to a real, non-core live tool (no phantom)', () => {
+    const liveSet = new Set(toolKeys);
+    const phantom = catalogNames.filter(
+      (n) => !liveSet.has(n) || CORE_TOOL_SET.has(n),
+    );
+    expect(phantom).toEqual([]);
   });
 });
 
