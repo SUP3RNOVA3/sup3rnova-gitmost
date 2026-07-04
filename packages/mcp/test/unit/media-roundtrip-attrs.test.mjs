@@ -55,8 +55,10 @@ test("round-trip: drawio diagram survives with src, title, dimensions, align, at
     },
     "drawio",
   );
-  // The converter must emit the schema-matching div[data-type="drawio"].
-  assert.match(md, /data-type="drawio"/);
+  // #293 canon #8: the media family serializes to the markdown image form plus a
+  // trailing discriminator comment carrying the non-src attrs.
+  assert.match(md, /^!\[\]\(\/api\/files\/d\.drawio\)/);
+  assert.match(md, /<!--drawio \{.*"attachmentId":"dz1".*\}-->/);
   assert.equal(found.length, 1, "drawio node must survive the round-trip");
   const a = found[0].attrs;
   assert.equal(a.src, "/api/files/d.drawio");
@@ -123,13 +125,19 @@ test("round-trip: pdf preserves width/height (standard attrs) plus name", async 
 });
 
 // ---------------------------------------------------------------------------
-// Escaping: a src containing a double quote must survive the attribute-quoted
-// HTML emission (escapeAttr) and re-parse to the exact original value, with no
-// node loss and no HTML injection.
+// Escaping: a src containing a double quote must survive the markdown image form
+// with no node loss and no injection. In the `![](src)` link the URL is
+// normalized (a raw `"` percent-encodes to `%22`) on import — a semantically
+// equivalent, IDEMPOTENT normalization (it does not drift on further round
+// trips), not data loss.
 // ---------------------------------------------------------------------------
-test("round-trip: a src containing a double quote is escaped and recovered intact", async () => {
+test("round-trip: a src containing a double quote is normalized (idempotent) and survives", async () => {
   const tricky = 'https://e.com/x?a="b"&c=1';
+  const normalized = "https://e.com/x?a=%22b%22&c=1";
   const { found } = await roundtrip({ type: "youtube", attrs: { src: tricky } }, "youtube");
   assert.equal(found.length, 1, "node must survive a quote-bearing src");
-  assert.equal(found[0].attrs.src, tricky, "the exact src is recovered");
+  assert.equal(found[0].attrs.src, normalized, "the quote is percent-encoded in the URL");
+  // Idempotent: a second round trip from the normalized node is byte-stable.
+  const again = await roundtrip({ type: "youtube", attrs: { src: normalized } }, "youtube");
+  assert.equal(again.found[0].attrs.src, normalized);
 });

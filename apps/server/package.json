@@ -23,7 +23,7 @@
     "migration:reset": "tsx src/database/migrate.ts down-to NO_MIGRATIONS",
     "migration:codegen": "kysely-codegen --dialect=postgres --camel-case --env-file=../../.env --out-file=./src/database/types/db.d.ts",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
-    "pretest": "pnpm --filter @docmost/editor-ext build && pnpm --filter @docmost/git-sync build && pnpm --filter @docmost/mcp build",
+    "pretest": "pnpm --filter @docmost/editor-ext build && pnpm --filter @docmost/prosemirror-markdown build && pnpm --filter @docmost/git-sync build && pnpm --filter @docmost/mcp build",
     "test": "jest",
     "test:int": "jest --config test/jest-integration.json",
     "test:watch": "jest --watch",
@@ -215,6 +215,7 @@
       "^src/(.*)$": "<rootDir>/$1",
       "^@docmost/git-sync$": "<rootDir>/../../../packages/git-sync/src/index.ts",
       "^@docmost/git-sync/(.*)$": "<rootDir>/../../../packages/git-sync/src/$1",
+      "^@docmost/prosemirror-markdown$": "<rootDir>/../../../packages/prosemirror-markdown/src/index.ts",
       "^(\\.{1,2}/.*)\\.js$": "$1"
     }
   }

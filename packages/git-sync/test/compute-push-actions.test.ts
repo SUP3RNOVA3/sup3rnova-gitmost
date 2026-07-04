@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { computePushActions } from '../src/engine/push';
 import type { DiffEntry, MetaSide } from '../src/engine/push';
-import type { DocmostMdMeta } from '../src/lib/index';
+import type { DocmostMdMeta } from '@docmost/prosemirror-markdown';
 
 // FS→Docmost push, FIRST increment (SPEC §6). `computePushActions` is the PURE
 // half: it classifies each `git diff --name-status` row into a Docmost action by

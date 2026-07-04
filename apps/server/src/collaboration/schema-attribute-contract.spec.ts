@@ -1,10 +1,11 @@
 import { getSchema } from '@tiptap/core';
 import { Schema } from '@tiptap/pm/model';
 import { tiptapExtensions } from './collaboration.util';
-// The vendored git-sync mirror's extension set. Imported via the subpath the
-// server jest config maps to the package SOURCE (moduleNameMapper
-// `^@docmost/git-sync/(.*)$`), so this reads the real mirror, not a build.
-import { docmostExtensions as gitSyncExtensions } from '@docmost/git-sync/lib/docmost-schema';
+// The canonical converter mirror's extension set. The schema mirror now lives in
+// the single `@docmost/prosemirror-markdown` package (#293); the server jest
+// config maps it to the package SOURCE (moduleNameMapper
+// `^@docmost/prosemirror-markdown$`), so this reads the real mirror, not a build.
+import { docmostExtensions as gitSyncExtensions } from '@docmost/prosemirror-markdown';
 
 /**
  * ATTRIBUTE-LEVEL SCHEMA CONTRACT (review #293, variant A).

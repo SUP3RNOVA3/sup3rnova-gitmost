@@ -8,8 +8,9 @@ import {
 // predated and must now preserve losslessly:
 //   - the `spoiler` inline mark (issue #259), emitted as raw inline HTML
 //     `<span data-spoiler="true">…</span>` (Markdown has no native syntax);
-//   - the image `caption` attribute (issue #221), emitted as `data-caption`
-//     on the raw <img> (Markdown `![](src)` cannot carry it).
+//   - the image `caption` attribute (issue #221). A top-level image now emits
+//     it in an attached `<!--img {…}-->` comment (#293 canon #4); a raw <img>
+//     with `data-caption` in incoming Markdown still parses it back too.
 // We exercise the real export -> import -> export cycle: a PM doc must survive
 // PM -> MD -> PM unchanged, and the raw-HTML forms in incoming Markdown must
 // parse back to the mark/attribute.
@@ -99,8 +100,9 @@ describe("image caption round-trip (#221)", () => {
     });
 
     const md1 = convertProseMirrorToMarkdown(source);
-    // A captioned image takes the raw <img> form so data-caption can ride along.
-    expect(md1).toContain('data-caption="A grey cat"');
+    // #293 canon #4: a top-level captioned image now serializes as the clean
+    // `![alt](src)` plus an attached `<!--img {…}-->` comment carrying caption.
+    expect(md1).toBe('![cat](/files/a.png) <!--img {"caption":"A grey cat"}-->');
 
     const doc2 = await markdownToProseMirror(md1);
     const img = findImage(doc2);

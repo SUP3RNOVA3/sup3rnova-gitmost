@@ -8,7 +8,7 @@ import { runPush, LAST_PUSHED_REF } from '../src/engine/push';
 import type { PushDeps } from '../src/engine/push';
 import { VaultGit } from '../src/engine/git';
 import type { Settings } from '../src/engine/settings';
-import { serializeDocmostMarkdownBody } from '../src/lib/index';
+import { serializeDocmostMarkdownBody } from '@docmost/prosemirror-markdown';
 
 const execFileAsync = promisify(execFile);
 

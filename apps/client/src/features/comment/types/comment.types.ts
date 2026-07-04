@@ -60,6 +60,15 @@ export interface IResolveComment {
   resolved: boolean;
 }
 
+// Result of applying or dismissing an ephemeral suggested edit (#329). The
+// server hard-deletes the comment (`deleted`) unless the thread has replies, in
+// which case it is resolved (`resolved`). The returned comment fields carry the
+// resolved-branch state; `outcome` tells the client which optimistic action to
+// take (drop the comment vs. move it to the resolved tab).
+export type ISuggestionOutcome = IComment & {
+  outcome?: "deleted" | "resolved";
+};
+
 export interface ICommentParams extends QueryParams {
   pageId: string;
 }

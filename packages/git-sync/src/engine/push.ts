@@ -26,8 +26,11 @@
  * the gitmost server drives the engine in-process (there is no standalone CLI
  * entry point).
  */
-import { type DocmostMdMeta } from "../lib/index.js";
-import { parsePageFile, serializePageFile } from "../lib/page-file.js";
+import {
+  type DocmostMdMeta,
+  parsePageFile,
+  serializePageFile,
+} from "@docmost/prosemirror-markdown";
 import type { GitSyncClient } from "./client.types.js";
 import type { DiffEntry } from "./git.js";
 import { VaultGit, DEFAULT_BRANCH } from "./git.js";

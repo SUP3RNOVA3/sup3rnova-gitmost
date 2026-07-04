@@ -36,29 +36,30 @@ async function roundTrip(node: any): Promise<{ md1: string; doc2: any; md2: stri
 // existing documented `it.fails` bugs in markdown-roundtrip.property.test.ts).
 // ---------------------------------------------------------------------------
 describe('pageBreak data loss (no converter case — SPEC §11 divergence)', () => {
-  it('exports a pageBreak node to the schema-matching block div', () => {
-    // FIXED: a standalone pageBreak now emits the block-level HTML div so the
-    // node survives instead of being erased to "".
+  it('exports a pageBreak node to the standalone comment (#293 #5)', () => {
+    // #293 canon #5: a standalone pageBreak now serializes as the readable,
+    // renderer-invisible comment `<!--pagebreak-->` (re-materialized on import),
+    // instead of the earlier raw <div> block.
     expect(convertProseMirrorToMarkdown(doc({ type: 'pageBreak' }))).toBe(
-      '<div data-type="pageBreak"></div>',
+      '<!--pagebreak-->',
     );
   });
 
   it('keeps a pageBreak sitting BETWEEN two paragraphs on export', () => {
-    // FIXED: with surrounding content the divider is emitted as its own block
+    // With surrounding content the divider is emitted as its own comment line
     // between the two paragraphs (joined by the doc "\n\n"), no longer dropped.
     const out = convertProseMirrorToMarkdown(
       doc(para(text('before')), { type: 'pageBreak' }, para(text('after'))),
     );
     expect(out).toBe(
-      'before\n\n<div data-type="pageBreak"></div>\n\nafter',
+      'before\n\n<!--pagebreak-->\n\nafter',
     );
-    expect(out).toContain('pageBreak');
+    expect(out).toContain('<!--pagebreak-->');
   });
 
   // FIXED: a pageBreak node now survives an export -> import -> export cycle
-  // because the FIRST export emits the schema-matching block div, which marked
-  // passes through and generateJSON rebuilds into a pageBreak node again.
+  // because the FIRST export emits the standalone comment, which the importer
+  // materializes back into a pageBreak node again.
   it('a pageBreak node round-trips (export -> import yields a pageBreak)', async () => {
     const { md1, doc2 } = await roundTrip({ type: 'pageBreak' });
     expect(md1).not.toBe('');
@@ -68,18 +69,18 @@ describe('pageBreak data loss (no converter case — SPEC §11 divergence)', () 
 });
 
 // ---------------------------------------------------------------------------
-// 2. subpages round-trip (`case "subpages"` emits the schema-matching div).
+// 2. subpages round-trip (#293 #5 standalone comment).
 //
 // It used to emit the literal `{{SUBPAGES}}`, which has no markdown/HTML meaning,
 // so on re-import the subpages BLOCK came back as a plain PARAGRAPH carrying the
 // literal string (the embed rendered as visible "{{SUBPAGES}}" text on the page
-// after a sync — data loss). It now emits `<div data-type="subpages">` like the
-// other embed nodes, so the schema's parseHTML rebuilds the subpages node.
+// after a sync — data loss). Per canon #5 it now emits the standalone comment
+// `<!--subpages-->`, which the importer materializes back into a subpages node.
 // ---------------------------------------------------------------------------
-describe('subpages round-trip (schema-matching div)', () => {
-  it('emits the subpages div and re-imports as a subpages node (no literal leak)', async () => {
+describe('subpages round-trip (standalone comment #293 #5)', () => {
+  it('emits the subpages comment and re-imports as a subpages node (no literal leak)', async () => {
     const { md1, doc2 } = await roundTrip({ type: 'subpages' });
-    expect(md1).toBe('<div data-type="subpages"></div>');
+    expect(md1).toBe('<!--subpages-->');
 
     const collect = (n: any): string[] => [
       n.type,
@@ -477,22 +478,24 @@ describe('converter gap coverage — documented round-trip data loss (specs 12�
     expect(docsCanonicallyEqual(d, doc2)).toBe(false);
   });
 
-  // 14. The image emitter drops the title attribute (silently lost on round-trip).
-  it('an image title attribute is dropped on export and lost on re-import', async () => {
+  // 14. #293 canon #4: the image title now round-trips via the attached
+  //     `<!--img {…}-->` comment (previously silently dropped).
+  it('an image title attribute round-trips via the attached img-comment', async () => {
     const d = doc({
       type: 'image',
       attrs: { src: '/i.png', alt: 'a', title: 't"q' },
     });
     const md1 = convertProseMirrorToMarkdown(d);
-    expect(md1).toBe('![a](/i.png)'); // no title, no quotes
+    // The quote in the title is JSON-escaped inside the comment payload.
+    expect(md1).toBe('![a](/i.png) <!--img {"title":"t\\"q"}-->');
 
     const doc2 = await markdownToProseMirror(md1);
     const img = (doc2.content || []).find((n: any) => n.type === 'image');
     expect(img).toBeTruthy();
-    expect(img.attrs?.title).toBeNull(); // the original 't"q' was dropped
+    expect(img.attrs?.title).toBe('t"q'); // restored byte-exact
     expect(img.attrs?.src).toBe('/i.png');
     expect(img.attrs?.alt).toBe('a');
-    expect(docsCanonicallyEqual(d, doc2)).toBe(false);
+    expect(docsCanonicallyEqual(d, doc2)).toBe(true);
   });
 });
 
@@ -506,8 +509,10 @@ describe('converter gap coverage — raw-HTML container round-trips (specs 15–
         attrs: { src: '/i.png', alt: 'cap', width: 320, align: 'center' },
       }),
     );
+    // #293 canon #4: image align default is unified to "center", so a center
+    // image inside a column no longer emits a redundant align="center".
     expect(md1).toBe(
-      '<div data-type="columns" data-layout="two"><div data-type="column"><img src="/i.png" alt="cap" width="320" align="center"></div></div>',
+      '<div data-type="columns" data-layout="two"><div data-type="column"><img src="/i.png" alt="cap" width="320"></div></div>',
     );
     expect(md2).toBe(md1);
     expect(colChildOf(doc2)?.type).toBe('image');
@@ -786,11 +791,11 @@ describe('converter gap coverage — raw-HTML container round-trips (specs 15–
 });
 
 // ===========================================================================
-// 30. heading.textAlign round-trip (A1). The paragraph case already exports a
-// non-default alignment as a styled `<p style="text-align:…">` that re-parses
-// losslessly; headings used to emit only the bare `## text` form, silently
-// DROPPING textAlign on export. The heading case is now symmetric: an aligned
-// heading exports as `<hN style="text-align:…">` and re-parses back to a heading
+// 30. heading.textAlign round-trip (A1). Bare `## text` markdown carries no
+// alignment, so an aligned heading used to silently DROP textAlign on export.
+// Per #293 canon #9 an aligned heading now keeps the readable `## text` form and
+// ATTACHES a trailing `<!--attrs {"textAlign":…}-->` comment (replacing the old
+// `<hN style="text-align:…">` HTML form). It re-parses back to a heading
 // carrying BOTH the level and the textAlign, so the round-trip is lossless; an
 // UNaligned heading still emits the bare `## text` markdown form (no churn).
 // ===========================================================================
@@ -801,21 +806,22 @@ const alignedHeading = (level: number, align: string, ...inline: any[]) => ({
 });
 
 describe('heading.textAlign round-trip (A1)', () => {
-  it('an aligned heading exports as <hN style="text-align:…"> (not bare ##)', () => {
+  it('an aligned heading keeps "## text" and attaches a <!--attrs--> comment (#293 #9)', () => {
     expect(convertProseMirrorToMarkdown(doc(alignedHeading(2, 'center', text('Title'))))).toBe(
-      '<h2 style="text-align:center">Title</h2>',
+      '## Title <!--attrs {"textAlign":"center"}-->',
     );
   });
 
   it('survives export -> import -> export losslessly (level AND textAlign preserved)', async () => {
     const input = alignedHeading(2, 'center', text('Title'));
     const { md1, doc2, md2 } = await roundTrip(input);
-    // Export direction: a styled <hN>, injection-safe via escapeAttr.
-    expect(md1).toBe('<h2 style="text-align:center">Title</h2>');
+    // Export direction: `## Title` plus the attached alignment comment (#293 #9).
+    expect(md1).toBe('## Title <!--attrs {"textAlign":"center"}-->');
     // Import direction: re-parses to a heading node with the level AND textAlign
-    // (the raw <hN style> HTML block flows through marked -> generateJSON, where
-    // the heading parse rule matches and the textAlign global attr reads the
-    // style back). Byte-stable second export closes the loop.
+    // (marked keeps the comment inside the <h2>; applyAttachedComments re-expresses
+    // it as an inline style before generateJSON, where the heading parse rule
+    // matches and the textAlign global attr reads it back). Byte-stable second
+    // export closes the loop.
     const h = doc2.content[0];
     expect(h.type).toBe('heading');
     expect(h.attrs.level).toBe(2);

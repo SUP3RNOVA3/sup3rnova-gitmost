@@ -5,7 +5,7 @@ import type {
   MetaSide,
   RenameMoveAction,
 } from '../src/engine/push';
-import type { DocmostMdMeta } from '../src/lib/index';
+import type { DocmostMdMeta } from '@docmost/prosemirror-markdown';
 
 // FS→Docmost push #3 (SPEC §5/§6/§16). `classifyRenameMoves` is the PURE half of
 // the move/rename apply: it resolves each `{pageId, oldPath, newPath}` into the

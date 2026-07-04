@@ -39,12 +39,18 @@ COPY --from=builder /app/packages/editor-ext/dist /app/packages/editor-ext/dist
 COPY --from=builder /app/packages/editor-ext/package.json /app/packages/editor-ext/package.json
 COPY --from=builder /app/packages/mcp/build /app/packages/mcp/build
 COPY --from=builder /app/packages/mcp/package.json /app/packages/mcp/package.json
+# @docmost/prosemirror-markdown is the shared converter (#293/#326). Both mcp and
+# git-sync depend on it (workspace:*) and load it at runtime, so the built package +
+# its manifest must be shipped or the prod install resolves a broken workspace
+# symlink and every consumer dies with ERR_MODULE_NOT_FOUND.
+COPY --from=builder /app/packages/prosemirror-markdown/build /app/packages/prosemirror-markdown/build
+COPY --from=builder /app/packages/prosemirror-markdown/package.json /app/packages/prosemirror-markdown/package.json
 # git-sync: the server loads @docmost/git-sync at runtime via the loader
 # (git-sync.loader.ts), which deliberately does NOT `require()` it — the package is
 # ESM-only, so the loader uses `require.resolve` + a dynamic `import()`. Without
 # these copied build artifacts that resolve/import fails and the server crashes on
 # first use. Built fresh by the builder's `pnpm build` (nx builds the package's tsc
-# `build` target).
+# `build` target). This branch (#119) is where git-sync gains its runtime consumer.
 COPY --from=builder /app/packages/git-sync/build /app/packages/git-sync/build
 COPY --from=builder /app/packages/git-sync/package.json /app/packages/git-sync/package.json
 

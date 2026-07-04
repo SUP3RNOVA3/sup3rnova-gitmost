@@ -70,7 +70,7 @@ test("hardBreak -> trailing two-spaces+newline", () => {
   assert.equal(convertProseMirrorToMarkdown(input), "line1  \nline2");
 });
 
-test("table cell with two block children joined by a space (and a pipe escaped)", () => {
+test("table cell with two block children falls back to a raw HTML table", () => {
   const input = doc({
     type: "table",
     content: [
@@ -86,11 +86,12 @@ test("table cell with two block children joined by a space (and a pipe escaped)"
     ],
   });
 
-  // Single-column header row + separator. The cell joins its two paragraphs
-  // with a space ("a|b c") then escapes the pipe -> "a\|b c".
+  // A pipe-table cell cannot represent two block children, so the canonical
+  // converter emits the whole table as raw HTML (lossless) rather than lossily
+  // flattening the paragraphs into one cell.
   assert.equal(
     convertProseMirrorToMarkdown(input),
-    "| a\\|b c |\n| --- |",
+    "<table><tbody><tr><td><p>a|b</p><p>c</p></td></tr></tbody></table>",
   );
 });
 
@@ -108,20 +109,20 @@ test("code block trailing newline trimmed", () => {
   );
 });
 
-test("textAlign value: delimiting double-quote escaped (attribute-safe, idempotent; < > left literal/inert)", () => {
+test("textAlign is carried in a trailing attached-comment directive (JSON-encoded, safe)", () => {
   const input = doc({
     type: "paragraph",
     attrs: { textAlign: 'right"><b' },
     content: [text("body")],
   });
 
-  // Attribute values escape only & and " so the value cannot break out of the
-  // quoted attribute. < and > are left literal: parse5/jsdom does NOT decode
-  // &lt;/&gt; inside attribute values, so escaping them would corrupt the value
-  // and accumulate on every round-trip. The literal < > are inert inside quotes.
+  // #293 canon #9: paragraph textAlign has no native markdown syntax, so it is
+  // attached as a trailing `<!--attrs {json}-->` comment on the block. The value
+  // is JSON-encoded, so a hostile value (`"`, `<`, `>`) is carried verbatim and
+  // inert — it cannot break out of the comment.
   assert.equal(
     convertProseMirrorToMarkdown(input),
-    '<div align="right&quot;><b">body</div>',
+    'body <!--attrs {"textAlign":"right\\"><b"}-->',
   );
 });
 
@@ -150,10 +151,10 @@ test("empty task item still emits its marker", () => {
   assert.equal(convertProseMirrorToMarkdown(input), "- [ ]\n- [x]");
 });
 
-// Image captions (issue #221). An image WITHOUT a caption stays the lossy-free
-// `![alt](src)`; WITH a caption it is emitted as a raw <img data-caption>
-// wrapped in a block <div> (symmetric to video) so the round-trip md -> html ->
-// json restores the caption via the image extension's parseHTML.
+// Image captions (issue #221 / #293 canon #8). An image WITHOUT a caption stays
+// the plain `![alt](src)`; WITH a caption (or any other non-src attr) the extra
+// attrs ride in a trailing `<!--img {json}-->` discriminator comment on the
+// markdown image form, so the round-trip md -> json restores them.
 test("image without a caption emits plain ![alt](src)", () => {
   const input = doc({
     type: "image",
@@ -162,24 +163,24 @@ test("image without a caption emits plain ![alt](src)", () => {
   assert.equal(convertProseMirrorToMarkdown(input), "![cat](/files/a.png)");
 });
 
-test("image with a caption emits a raw <img data-caption> in a block div", () => {
+test("image with a caption emits ![alt](src) plus an <!--img--> directive", () => {
   const input = doc({
     type: "image",
     attrs: { src: "/files/a.png", alt: "cat", caption: "A grey cat" },
   });
   assert.equal(
     convertProseMirrorToMarkdown(input),
-    '<div><img src="/files/a.png" alt="cat" data-caption="A grey cat"></div>',
+    '![cat](/files/a.png) <!--img {"caption":"A grey cat"}-->',
   );
 });
 
-test("image caption escapes & and \" in the data-caption attribute", () => {
+test("image caption is JSON-encoded in the <!--img--> directive (& and \" safe)", () => {
   const input = doc({
     type: "image",
     attrs: { src: "/files/a.png", caption: 'Tom & "Jerry"' },
   });
   assert.equal(
     convertProseMirrorToMarkdown(input),
-    '<div><img src="/files/a.png" data-caption="Tom &amp; &quot;Jerry&quot;"></div>',
+    '![](/files/a.png) <!--img {"caption":"Tom & \\"Jerry\\""}-->',
   );
 });

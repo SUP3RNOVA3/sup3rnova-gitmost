@@ -8,7 +8,7 @@ import {
 import type { PushDeps } from '../src/engine/push';
 import type { Settings } from '../src/engine/settings';
 import { runCycle, type RunCycleDeps } from '../src/engine/cycle';
-import { serializePageFile } from '../src/lib/page-file';
+import { serializePageFile } from '@docmost/prosemirror-markdown';
 
 // Red-team confirmations for PR #119 (git-sync). Each test asserts the DESIRED
 // behavior, so it FAILS today iff the bug is real.

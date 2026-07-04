@@ -6,10 +6,14 @@ data
 /dist
 /node_modules
 # workspace package node_modules (pnpm symlinks — never commit; they bake
-# machine-local store paths) and the git-sync compiled output (built in CI/Docker
-# via `pnpm build`, never committed, so src/ and prod can never silently diverge).
+# machine-local store paths).
 packages/*/node_modules/
+
+# Compiled package output: build/ is gitignored for every workspace package
+# (built in CI/Docker via `pnpm build`, never committed, so src/ and prod can
+# never silently diverge). Private packages are rebuilt at deploy.
 packages/git-sync/build/
+packages/prosemirror-markdown/build/
 packages/mcp/build/
 
 # Logs

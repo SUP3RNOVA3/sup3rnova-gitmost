@@ -15,6 +15,7 @@ import { CreateCommentDto } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
 import { ResolveCommentDto } from './dto/resolve-comment.dto';
 import { ApplySuggestionDto } from './dto/apply-suggestion.dto';
+import { DismissSuggestionDto } from './dto/dismiss-suggestion.dto';
 import { PageIdDto, CommentIdDto } from './dto/comments.input';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
@@ -232,6 +233,59 @@ export class CommentController {
     // for an already-applied suggestion, and lets ConflictException (409, with
     // currentText in the payload) propagate untouched.
     return this.commentService.applySuggestion(comment, user, provenance);
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('dismiss-suggestion')
+  async dismissSuggestion(
+    @Body() dto: DismissSuggestionDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+    @AuthProvenance() provenance: AuthProvenanceData,
+  ) {
+    const comment = await this.commentRepo.findById(dto.commentId, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
+    if (!comment) {
+      throw new NotFoundException('Comment not found');
+    }
+
+    const page = await this.pageRepo.findById(comment.pageId);
+    if (!page || page.deletedAt) {
+      throw new NotFoundException('Page not found');
+    }
+
+    // Authorize BEFORE revealing any structural detail (metadata-disclosure
+    // hygiene, mirroring apply-suggestion). Dismissing a suggestion does NOT
+    // change the page text — it only removes/resolves the comment — so the
+    // page-level gate is comment access (canComment), NOT edit access. A viewer
+    // allowed to comment but not edit can still dismiss their own suggestion.
+    // The structural 400s (top-level / has-a-suggested-edit / not applied /
+    // not resolved) are re-checked by the service below.
+    await this.pageAccessService.validateCanComment(page, user, workspace.id);
+
+    // AUTHZ (#338): a childless dismiss IRREVERSIBLY hard-deletes the comment,
+    // so — beyond canComment — restrict it to the comment owner OR a space
+    // admin, exactly like POST /comments/delete. canComment alone is not enough:
+    // it would let any bystander commenter erase another user's suggestion for
+    // good. (apply-suggestion deliberately stays on canEdit: accepting an edit
+    // is the editor's semantics, not the suggestion author's.)
+    const isOwner = comment.creatorId === user.id;
+    if (!isOwner) {
+      const ability = await this.spaceAbility.createForUser(
+        user,
+        comment.spaceId,
+      );
+      // Space admin can dismiss any suggestion.
+      if (ability.cannot(SpaceCaslAction.Manage, SpaceCaslSubject.Settings)) {
+        throw new ForbiddenException(
+          'You can only dismiss your own suggestions',
+        );
+      }
+    }
+
+    return this.commentService.dismissSuggestion(comment, user, provenance);
   }
 
   @HttpCode(HttpStatus.OK)

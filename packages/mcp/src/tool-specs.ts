@@ -13,6 +13,11 @@
 // diverge on purpose (security guardrails, tuned UX, "Reversible" framing on
 // some write tools, different limits, hybrid-RRF search, etc.) stay defined
 // per-layer and are NOT represented here.
+//
+// MAINTENANCE RULE: adding, renaming, or removing a spec here (or an inline
+// registerTool in index.ts) REQUIRES updating SERVER_INSTRUCTIONS in
+// packages/mcp/src/index.ts — the intent-routing guide MCP clients receive on
+// initialize. Enforced by test/unit/server-instructions.test.mjs.
 
 // Loose on purpose — see the comment above. The two zod majors expose different
 // static type surfaces, so typing this precisely would couple the registry to
@@ -105,14 +110,68 @@ export const SHARED_TOOL_SPECS = {
     }),
   },
 
+  // --- in-page occurrence search (client-side, over ProseMirror plain text) ---
+
+  searchInPage: {
+    mcpName: 'search_in_page',
+    inAppKey: 'searchInPage',
+    description:
+      'Find every occurrence of a string (or regex) INSIDE one page and get ' +
+      'WHERE each is — instead of pulling blocks one-by-one with get_node. ' +
+      'Searches the plain text of each text block/cell (marks glued, so a match ' +
+      'survives bold/italic/link splits; comment anchors do not interfere). ' +
+      'Returns { total, truncated, matches:[{ nodeId, blockIndex, type, before, ' +
+      'match, after }] }: `nodeId` is the block id (or "#<index>" for ' +
+      'table/cell content) — pass it to get_node/patch_node (the "#<index>" ' +
+      'form resolves with get_node but NOT patch_node, which only accepts a real ' +
+      'block id). To anchor a comment, do NOT pass nodeId to create_comment (it ' +
+      'has no nodeId param); build a UNIQUE text selection from before+match+' +
+      'after and pass it as create_comment\'s `selection`. `blockIndex` is the ' +
+      'get_outline index; `before`/`after` give ~40 chars of context to build ' +
+      'that unique selection. `total` counts all ' +
+      'hits and `truncated` is true when more than `limit` were found (nothing ' +
+      'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
+      'set regex:true for an RE2 regular expression (linear-time, ReDoS-safe: ' +
+      'char classes, word boundaries, anchors and quantifiers work; lookaround ' +
+      '(?=…)/(?<=…) and backreferences \\1 are NOT supported) and ' +
+      'caseSensitive:true to match case. Ideal for systematic ' +
+      'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
+      'invalid regex or an empty query returns a clear error to fix.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('ID of the page to search'),
+      query: z
+        .string()
+        .min(1)
+        .describe('The text to find (a literal substring, or a regex when regex:true)'),
+      regex: z
+        .boolean()
+        .optional()
+        .describe(
+          'Treat query as an RE2 regular expression — linear-time, ReDoS-safe; ' +
+            'no lookaround or backreferences (default false).',
+        ),
+      caseSensitive: z
+        .boolean()
+        .optional()
+        .describe('Case-sensitive matching (default false).'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(200)
+        .optional()
+        .describe('Max matches to RETURN (default 50, max 200); total is always reported.'),
+    }),
+  },
+
   // --- node delete ---
 
   deleteNode: {
     mcpName: 'delete_node',
     inAppKey: 'deleteNode',
     description:
-      'Remove a single block by its attrs.id (from the page-JSON view) WITHOUT ' +
-      'resending the whole document.',
+      'Remove a single block by its attrs.id (from the page outline or ' +
+      'page-JSON view) WITHOUT resending the whole document.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
       nodeId: z.string().min(1),
@@ -134,7 +193,8 @@ export const SHARED_TOOL_SPECS = {
     description:
       'Replace a single content block identified by its attrs.id with a new ' +
       'ProseMirror node, WITHOUT resending the whole document; the replacement ' +
-      'keeps the same node id. Get the block id from the page-JSON view, then ' +
+      'keeps the same node id. Get the block id from the page outline (cheap) ' +
+      'or the page-JSON view, then ' +
       'pass a ProseMirror node to put in its place. Example node: a paragraph ' +
       '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
       'heading {"type":"heading","attrs":{"level":2},"content":' +
@@ -169,7 +229,8 @@ export const SHARED_TOOL_SPECS = {
       'Insert a block before/after another block (by attrs.id or anchor text) ' +
       'or append it at the end (top level). For before/after you MUST provide ' +
       'EXACTLY ONE of anchorNodeId or anchorText. Get anchor block ids from the ' +
-      'page-JSON view. Avoids resending the whole document. Can also insert ' +
+      'page outline or the page-JSON view. Avoids resending the whole document. ' +
+      'Can also insert ' +
       'table structure: to add a tableRow, pass a tableRow node with position ' +
       'before/after and anchor INSIDE the target table — anchorNodeId of any ' +
       'block/cell in it, or anchorText matching the table; to add a ' +

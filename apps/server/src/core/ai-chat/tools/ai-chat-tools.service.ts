@@ -303,7 +303,9 @@ export class AiChatToolsService {
       getPage: tool({
         description:
           'Fetch a single page as Markdown by its page id. Returns the page ' +
-          'title and its Markdown content.',
+          'title and its Markdown content. Inline <span data-comment-id> tags ' +
+          'in the markdown are comment highlight anchors (also present for ' +
+          'RESOLVED threads) — treat them as markup, not page text.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id (or slugId) of the page.'),
         }),
@@ -628,6 +630,16 @@ export class AiChatToolsService {
         async ({ pageId, nodeId }) => await client.getNode(pageId, nodeId),
       ),
 
+      searchInPage: sharedTool(
+        sharedToolSpecs.searchInPage,
+        async ({ pageId, query, regex, caseSensitive, limit }) =>
+          await client.searchInPage(pageId, query, {
+            regex,
+            caseSensitive,
+            limit,
+          }),
+      ),
+
       getTable: tool({
         description:
           'Read a table as a matrix of cell texts (plus a parallel cellIds ' +
@@ -647,11 +659,21 @@ export class AiChatToolsService {
 
       listComments: tool({
         description:
-          'List all comments on a page (content as Markdown).',
+          'List comments on a page in one call. By DEFAULT only ACTIVE ' +
+          'threads are returned; resolved threads (a resolved top-level ' +
+          'comment and all its replies) are hidden and their count reported ' +
+          'as `resolvedThreadsHidden` so you can re-query with ' +
+          '`includeResolved: true` to see everything. Returns ' +
+          '`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page.'),
+          includeResolved: z
+            .boolean()
+            .optional()
+            .describe('default only active threads; true — include resolved'),
         }),
-        execute: async ({ pageId }) => await client.listComments(pageId),
+        execute: async ({ pageId, includeResolved }) =>
+          await client.listComments(pageId, includeResolved),
       }),
 
       getComment: tool({

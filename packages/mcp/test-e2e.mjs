@@ -462,7 +462,7 @@ async function main() {
     check("create_comment: markdown round-trip", c1.data.content.includes("**комментарий**"), c1.data.content);
     const reply = await client.createComment(pageId, "Ответ на комментарий.", "page", undefined, c1.data.id);
     check("create_comment: reply has parent", reply.data.parentCommentId === c1.data.id);
-    const list = await client.listComments(pageId);
+    const list = (await client.listComments(pageId)).items;
     check("list_comments: both visible", list.length === 2, `count=${list.length}`);
     await client.updateComment(c1.data.id, "Обновлённый текст комментария.");
     const got = await client.getComment(c1.data.id);
@@ -472,17 +472,19 @@ async function main() {
     // resolve_comment: close the top-level thread, verify resolvedAt surfaces, then reopen
     const resolvedRes = await client.resolveComment(c1.data.id, true);
     check("resolve_comment: marks resolved", resolvedRes.success === true && resolvedRes.resolved === true);
-    const listResolved = await client.listComments(pageId);
+    // c1 is now resolved; the default feed hides resolved threads, so pass
+    // includeResolved:true to still see it and assert its resolvedAt (#328).
+    const listResolved = (await client.listComments(pageId, true)).items;
     const c1Resolved = listResolved.find((c) => c.id === c1.data.id);
     check("resolve_comment: resolvedAt set in list", !!c1Resolved?.resolvedAt, `resolvedAt=${c1Resolved?.resolvedAt}`);
     const reopenedRes = await client.resolveComment(c1.data.id, false);
     check("resolve_comment: reopen succeeds", reopenedRes.resolved === false);
-    const listReopened = await client.listComments(pageId);
+    const listReopened = (await client.listComments(pageId)).items;
     const c1Reopened = listReopened.find((c) => c.id === c1.data.id);
     check("resolve_comment: resolvedAt cleared on reopen", !c1Reopened?.resolvedAt, `resolvedAt=${c1Reopened?.resolvedAt}`);
     await client.deleteComment(reply.data.id);
     await client.deleteComment(c1.data.id);
-    const listAfter = await client.listComments(pageId);
+    const listAfter = (await client.listComments(pageId)).items;
     check("delete_comment: comments removed", listAfter.length === 0, `count=${listAfter.length}`);
   } finally {
     if (pageId) {

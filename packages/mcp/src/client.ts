@@ -47,6 +47,7 @@ import {
   deleteTableRow,
   updateTableCell,
 } from "./lib/node-ops.js";
+import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
 import {
   applyTextEdits,
@@ -807,8 +808,14 @@ export class DocmostClient {
     await this.ensureAuthenticated();
     const resultData = await this.getPageRaw(pageId);
 
+    // Agent read: hide resolved-comment anchors so the agent sees only active
+    // discussions. Active anchors are kept. (The lossless export_page_markdown
+    // round-trip deliberately does NOT pass this flag — resolved anchors there
+    // must be preserved.)
     let content = resultData.content
-      ? convertProseMirrorToMarkdown(resultData.content)
+      ? convertProseMirrorToMarkdown(resultData.content, {
+          dropResolvedCommentAnchors: true,
+        })
       : "";
 
     // Always fetch subpages to provide context to the agent
@@ -1091,6 +1098,29 @@ export class DocmostClient {
       type: hit.type,
       node: hit.node,
     };
+  }
+
+  /**
+   * Find every occurrence of `query` on a page IN MEMORY, over the plain text of
+   * each text container (reusing the same `getPageRaw` fetch as the other read
+   * tools) — no server search endpoint, no whole-document round-trip through the
+   * model. Returns `{ total, truncated, matches }`; each match carries a ref for
+   * get_node/patch_node (the `#<index>` form resolves with get_node but NOT
+   * patch_node — see SearchMatch.nodeId), plus the top-level block index and a
+   * short context window used to build a unique text `selection` for
+   * create_comment (create_comment has no nodeId param). The pure engine
+   * (`searchInDoc`) owns the traversal, glue, the RE2 ReDoS-safe regex engine
+   * and the empty-query / invalid-or-unsupported-regex errors.
+   */
+  async searchInPage(pageId: string, query: string, opts: SearchOptions = {}) {
+    await this.ensureAuthenticated();
+    const data = await this.getPageRaw(pageId);
+    const result = searchInDoc(
+      data.content ?? { type: "doc", content: [] },
+      query,
+      opts,
+    );
+    return { pageId, query, ...result };
   }
 
   /**
@@ -1774,7 +1804,10 @@ export class DocmostClient {
     const body = page.content ? convertProseMirrorToMarkdown(page.content) : "";
     let comments: any[] = [];
     try {
-      comments = await this.listComments(pageId);
+      // Lossless export: include RESOLVED threads so the export -> import
+      // round-trip preserves every comment. This is exactly why the active-only
+      // filter is an opt-in (default false) on listComments.
+      comments = (await this.listComments(pageId, true)).items;
     } catch (e) {
       // A comments fetch failure must not lose the body; export with [] and let
       // the caller see the (empty) comments block. Log under DEBUG only.
@@ -2343,8 +2376,21 @@ export class DocmostClient {
     }
   }
 
-  /** List all comments on a page (cursor-paginated), content as markdown. */
-  async listComments(pageId: string) {
+  /**
+   * List comments on a page (cursor-paginated), content as markdown.
+   *
+   * DEFAULT (`includeResolved = false`) hides RESOLVED THREADS WHOLESALE so the
+   * agent sees only active discussions: a top-level comment with `resolvedAt`
+   * set AND every reply under it (a reply of a closed thread is part of the
+   * closed thread) are dropped from `items`. `resolvedThreadsHidden` reports how
+   * many resolved top-level threads were hidden so the agent can re-query with
+   * `includeResolved: true` to see everything. Active threads always stay.
+   *
+   * Returns `{ items, resolvedThreadsHidden }` (NOT a bare array) — callers that
+   * need the full feed (lossless export, transformPage, checkNewComments) pass
+   * `includeResolved: true` and read `.items`.
+   */
+  async listComments(pageId: string, includeResolved = false) {
     await this.ensureAuthenticated();
     let allComments: any[] = [];
     let cursor: string | null = null;
@@ -2360,7 +2406,7 @@ export class DocmostClient {
       cursor = data.meta?.nextCursor || null;
     } while (cursor);
 
-    return allComments.map((comment: any) => {
+    const mapped = allComments.map((comment: any) => {
       const markdown = comment.content
         ? convertProseMirrorToMarkdown(
             this.parseCommentContent(comment.content),
@@ -2368,6 +2414,31 @@ export class DocmostClient {
         : "";
       return filterComment(comment, markdown);
     });
+
+    if (includeResolved) {
+      return { items: mapped, resolvedThreadsHidden: 0 };
+    }
+
+    // Ids of RESOLVED top-level threads (a top-level comment has no
+    // parentCommentId). A whole thread is hidden when its root is resolved.
+    const resolvedRootIds = new Set(
+      mapped
+        .filter((c) => !c.parentCommentId && c.resolvedAt != null)
+        .map((c) => c.id),
+    );
+
+    const items = mapped.filter((c) => {
+      // Hide the resolved root itself and every reply anchored to it. A reply's
+      // own resolvedAt is irrelevant — its membership follows the parent thread.
+      // ASSUMPTION: Docmost's comment model is FLAT — a reply's parentCommentId
+      // always points at the thread ROOT (no reply-of-reply nesting), so a single
+      // level of parent lookup covers a whole thread. If nested replies are ever
+      // introduced, a deep reply of a resolved thread would need a root-walk here.
+      if (!c.parentCommentId) return !resolvedRootIds.has(c.id);
+      return !resolvedRootIds.has(c.parentCommentId);
+    });
+
+    return { items, resolvedThreadsHidden: resolvedRootIds.size };
   }
 
   async getComment(commentId: string) {
@@ -2742,7 +2813,9 @@ export class DocmostClient {
     const results: any[] = [];
     for (const page of pagesInScope) {
       try {
-        const comments = await this.listComments(page.id);
+        // Full feed (incl. resolved): a "new comments since" scan reports all
+        // recent activity; the active-only filter is scoped to list_comments.
+        const comments = (await this.listComments(page.id, true)).items;
         const newComments = comments.filter(
           (c: any) => new Date(c.createdAt) > sinceDate,
         );
@@ -3488,7 +3561,9 @@ export class DocmostClient {
     const deleteComments = opts.deleteComments ?? false;
 
     await this.ensureAuthenticated();
-    const comments = await this.listComments(pageId);
+    // Full feed (incl. resolved): a page transform (e.g. comments -> footnotes)
+    // must operate on every comment, so it opts into the unfiltered feed.
+    const comments = (await this.listComments(pageId, true)).items;
 
     // ctx handed to the sandbox. consume() records ids; helpers are the pure
     // transform primitives. log is captured from console.log inside the sandbox.

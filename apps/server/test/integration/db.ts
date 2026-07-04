@@ -132,6 +132,62 @@ export async function createUser(
   return { id: row.id as string };
 }
 
+// The default group every workspace has; `groupUserRepo.addUserToDefaultGroup`
+// (invoked by acceptInvitation) looks it up by `isDefault = true`, so a
+// workspace under test must have exactly one for the accept path to complete.
+export async function createDefaultGroup(
+  db: Kysely<any>,
+  workspaceId: string,
+  overrides: { name?: string } = {},
+): Promise<{ id: string }> {
+  const id = randomUUID();
+  const suffix = shortId(id);
+  const row = await db
+    .insertInto('groups')
+    .values({
+      id,
+      // name is unique per workspace + NOT NULL.
+      name: overrides.name ?? `group-${suffix}`,
+      isDefault: true,
+      workspaceId,
+    })
+    .returning(['id'])
+    .executeTakeFirstOrThrow();
+  return { id: row.id as string };
+}
+
+// A pending workspace invitation. `role`/`token` are NOT NULL; `groupIds` is a
+// nullable uuid[] and `invitedById` a nullable FK to users. Returns the fields a
+// spec needs to drive acceptInvitation (id + token + the invited email).
+export async function createInvitation(
+  db: Kysely<any>,
+  args: {
+    workspaceId: string;
+    email: string;
+    invitedById?: string | null;
+    role?: string;
+    token?: string;
+    groupIds?: string[] | null;
+  },
+): Promise<{ id: string; token: string; email: string }> {
+  const id = randomUUID();
+  const token = args.token ?? `tok-${shortId(id)}`;
+  const row = await db
+    .insertInto('workspaceInvitations')
+    .values({
+      id,
+      email: args.email,
+      role: args.role ?? 'member',
+      token,
+      groupIds: (args.groupIds ?? null) as any,
+      invitedById: args.invitedById ?? null,
+      workspaceId: args.workspaceId,
+    })
+    .returning(['id'])
+    .executeTakeFirstOrThrow();
+  return { id: row.id as string, token, email: args.email };
+}
+
 export async function createSpace(
   db: Kysely<any>,
   workspaceId: string,
@@ -168,6 +224,40 @@ export async function createPage(
       title: args.title ?? `page-${suffix}`,
       spaceId: args.spaceId,
       workspaceId: args.workspaceId,
+    })
+    .returning(['id'])
+    .executeTakeFirstOrThrow();
+  return { id: row.id as string };
+}
+
+export async function createComment(
+  db: Kysely<any>,
+  args: {
+    workspaceId: string;
+    spaceId: string;
+    pageId: string;
+    creatorId?: string | null;
+    parentCommentId?: string | null;
+    content?: unknown;
+    selection?: string | null;
+    suggestedText?: string | null;
+    type?: string | null;
+  },
+): Promise<{ id: string }> {
+  const id = randomUUID();
+  const row = await db
+    .insertInto('comments')
+    .values({
+      id,
+      workspaceId: args.workspaceId,
+      spaceId: args.spaceId,
+      pageId: args.pageId,
+      creatorId: args.creatorId ?? null,
+      parentCommentId: args.parentCommentId ?? null,
+      content: (args.content ?? null) as any,
+      selection: args.selection ?? null,
+      suggestedText: args.suggestedText ?? null,
+      type: args.type ?? 'page',
     })
     .returning(['id'])
     .executeTakeFirstOrThrow();

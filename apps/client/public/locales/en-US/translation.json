@@ -1390,5 +1390,8 @@
   "Applied": "Applied",
   "Suggestion applied": "Suggestion applied",
   "Failed to apply suggestion": "Failed to apply suggestion",
-  "The commented text changed since this suggestion was made; it was not applied.": "The commented text changed since this suggestion was made; it was not applied."
+  "The commented text changed since this suggestion was made; it was not applied.": "The commented text changed since this suggestion was made; it was not applied.",
+  "Dismiss": "Dismiss",
+  "Suggestion dismissed": "Suggestion dismissed",
+  "Failed to dismiss suggestion": "Failed to dismiss suggestion"
 }

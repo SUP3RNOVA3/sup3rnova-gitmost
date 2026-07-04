@@ -12,13 +12,13 @@ bundles:
       - en
     roles:
       - slug: structural-editor
-        version: 3
-      - slug: line-editor
-        version: 3
-      - slug: fact-checker
         version: 4
+      - slug: line-editor
+        version: 4
+      - slug: fact-checker
+        version: 6
       - slug: proofreader
-        version: 5
+        version: 8
       - slug: narrator
         version: 2
   - id: research

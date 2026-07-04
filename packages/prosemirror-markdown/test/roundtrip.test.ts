@@ -60,10 +60,8 @@ describe('math round-trip (mathBlock + mathInline)', () => {
     const source = { type: 'mathBlock', attrs: { text: 'a^2+b^2' } };
     const { md1, doc2, md2 } = await roundTrip(source);
 
-    // One-way emit: LaTeX rides in the `text` HTML attribute, data-katex flag set.
-    expect(md1).toBe(
-      '<div data-type="mathBlock" data-katex="true" text="a^2+b^2"></div>',
-    );
+    // #293 canon #6: block math emits a `$$` fence on its own lines.
+    expect(md1).toBe('$$\na^2+b^2\n$$');
     // Byte-stable: the second export reproduces the first exactly.
     expect(md2).toBe(md1);
 
@@ -81,9 +79,8 @@ describe('math round-trip (mathBlock + mathInline)', () => {
     const source = para({ type: 'mathInline', attrs: { text: 'x_i' } });
     const { md1, doc2, md2 } = await roundTrip(source);
 
-    expect(md1).toBe(
-      '<span data-type="mathInline" data-katex="true" text="x_i"></span>',
-    );
+    // #293 canon #6: inline math emits the Obsidian-native `$LaTeX$` form.
+    expect(md1).toBe('$x_i$');
     expect(md2).toBe(md1);
 
     // The re-imported paragraph's child is a mathInline with the LaTeX recovered.
