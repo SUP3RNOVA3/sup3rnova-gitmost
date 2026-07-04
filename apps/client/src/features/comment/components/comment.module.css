@@ -53,6 +53,21 @@
     margin-top: 4px;
 }
 
+/* Intraline diff (#331): the fragment that actually changed within the
+   red "before" / green "after" block. It inherits the surrounding red/green
+   framing and adds a stronger tint plus an underline so the eye lands on the
+   changed letters/words (git/GitHub-style) rather than the whole line. The
+   container's line-through (old) / green (new) still marks the full line. */
+.suggestionChanged {
+    /* Stronger tint of the surrounding red/green so the changed fragment pops
+       within the block. `currentColor` follows the parent's red (old) or green
+       (new) text colour. No `text-decoration` here on purpose: the old block's
+       inherited line-through must survive on the changed letters too. */
+    background: color-mix(in srgb, currentColor 22%, transparent);
+    border-radius: 2px;
+    font-weight: 700;
+}
+
 .commentEditor {
 
     &[data-editable][data-surface="muted"] .ProseMirror:not(.focused) {
