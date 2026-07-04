@@ -19,6 +19,16 @@ export class MigrationService {
         path,
         migrationFolder: path.join(__dirname, '..', 'migrations'),
       }),
+      // A long-lived branch can add a migration whose timestamped filename sorts
+      // BEFORE migrations already applied in prod (e.g. #234's 20260627 landing
+      // after 20260704 was live). With the default (ordered) setting the startup
+      // migrator then sees "corrupted migrations" — the applied set is no longer a
+      // prefix of the sorted list — throws, and the app crash-loops on boot
+      // (incident #361: 502s for ~11 min). allowUnorderedMigrations runs any
+      // not-yet-applied migration regardless of filename order, so a back-dated
+      // migration is applied instead of bricking startup. A CI order-gate still
+      // discourages back-dating; this is the runtime safety net.
+      allowUnorderedMigrations: true,
     });
 
     const { error, results } = await migrator.migrateToLatest();
