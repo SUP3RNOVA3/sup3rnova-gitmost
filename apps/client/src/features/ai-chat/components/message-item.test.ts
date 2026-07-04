@@ -65,6 +65,25 @@ describe("arePropsEqual", () => {
     expect(arePropsEqual(props(m), props(m))).toBe(true);
   });
 
+  // REGRESSION (stranded reasoning part): a reasoning part is left at
+  // `state:"streaming"` forever when the turn ends without `reasoning-end`
+  // (manual Stop during thinking). The signature is EQUAL across that turn-end
+  // flip (nothing in the message changed), so the comparator must ALSO compare
+  // `turnStreaming` — otherwise the memo swallows the flip and ReasoningBlock
+  // never switches from chunked plain text to its one-time markdown parse.
+  it("returns false when turnStreaming differs despite an equal signature", () => {
+    const m = msg([
+      { type: "reasoning", text: "thinking", state: "streaming" },
+      { type: "text", text: "answer" },
+    ]);
+    expect(
+      arePropsEqual(
+        props(m, { turnStreaming: true }),
+        props(m, { turnStreaming: false }),
+      ),
+    ).toBe(false);
+  });
+
   it("returns true for the same content in a different message object", () => {
     const a = msg([{ type: "text", text: "answer" }]);
     const b = msg([{ type: "text", text: "answer" }]);
