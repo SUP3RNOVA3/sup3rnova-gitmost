@@ -2,7 +2,7 @@ import { NodeViewProps, NodeViewWrapper } from "@tiptap/react";
 import { ActionIcon, Anchor, Text } from "@mantine/core";
 import { IconFileDescription } from "@tabler/icons-react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import { useSharePageQuery } from "@/features/share/queries/share-query.ts";
 import {
   buildPageUrl,
@@ -36,7 +36,7 @@ export function MentionContent({ attrs }: { attrs: MentionAttrs }) {
     data: page,
     isLoading,
     isError,
-  } = usePageQuery({ pageId: isPageMention && !isShareRoute ? slugId : null });
+  } = usePageMetaQuery({ pageId: isPageMention && !isShareRoute ? slugId : null });
 
   const { data: sharedPage } = useSharePageQuery({
     pageId: isPageMention && isShareRoute ? slugId : undefined,

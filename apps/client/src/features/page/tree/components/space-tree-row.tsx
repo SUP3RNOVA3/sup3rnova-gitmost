@@ -1,6 +1,6 @@
 import { useRef } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useAtom } from "jotai";
+import { useAtom, useSetAtom } from "jotai";
 import { useTranslation } from "react-i18next";
 import { ActionIcon, rem, Tooltip } from "@mantine/core";
 import {
@@ -51,7 +51,11 @@ export function SpaceTreeRow({
   const { t } = useTranslation();
   const { spaceSlug } = useParams();
   const updatePageMutation = useUpdatePageMutation();
-  const [, setTreeData] = useAtom(treeDataAtom);
+  // Setter-only: subscribing to the whole treeDataAtom (via useAtom) re-rendered
+  // every virtualized row on any tree event, bypassing the DocTreeRow memo. This
+  // row never reads the tree value, only writes it, so useSetAtom avoids the
+  // value subscription.
+  const setTreeData = useSetAtom(treeDataAtom);
   const emit = useQueryEmit();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [mobileSidebarOpened] = useAtom(mobileSidebarAtom);

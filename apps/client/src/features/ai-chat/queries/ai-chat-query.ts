@@ -53,8 +53,12 @@ export const AI_CHAT_MESSAGES_RQ_KEY = (chatId: string) => [
   chatId,
 ];
 
-/** Paginated list of the current user's chats (auto-loads further pages). */
-export function useAiChatsQuery() {
+/**
+ * Paginated list of the current user's chats (auto-loads further pages).
+ * `enabled` (default true) lets the AI chat window skip fetching while it is
+ * closed — the list is only needed once the window is open.
+ */
+export function useAiChatsQuery(enabled: boolean = true) {
   const query = useInfiniteQuery({
     queryKey: AI_CHATS_RQ_KEY,
     queryFn: ({ pageParam }) => getAiChats({ cursor: pageParam, limit: 50 }),
@@ -63,6 +67,7 @@ export function useAiChatsQuery() {
       lastPage.meta.hasNextPage
         ? (lastPage.meta.nextCursor ?? undefined)
         : undefined,
+    enabled,
   });
 
   const data = useMemo<IPagination<IAiChat> | undefined>(() => {
@@ -93,6 +98,9 @@ export function useAiChatMessagesQuery(
   // follow the detached run to settle. The callback form lives in AiChatWindow;
   // threaded here verbatim so this query owns the polling. Undefined => no poll.
   refetchInterval?: number | false | (() => number | false),
+  // #344: gate the query so a backgrounded/hidden window stops issuing refetches
+  // and duplicating work. Defaults to enabled to preserve existing call-sites.
+  enabled: boolean = true,
 ) {
   const query = useInfiniteQuery({
     queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatId ?? ""),
@@ -103,7 +111,7 @@ export function useAiChatMessagesQuery(
       lastPage.meta.hasNextPage
         ? (lastPage.meta.nextCursor ?? undefined)
         : undefined,
-    enabled: !!chatId,
+    enabled: !!chatId && enabled,
     refetchInterval,
   });
 

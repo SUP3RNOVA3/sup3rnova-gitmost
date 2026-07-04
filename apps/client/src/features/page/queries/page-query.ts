@@ -51,6 +51,10 @@ export function usePageQuery(
     queryFn: () => getPageById(pageInput),
     enabled: !!pageInput.pageId,
     staleTime: 5 * 60 * 1000,
+    // Keep the previously-loaded page visible while navigating to a new one
+    // instead of flashing a blank/skeleton frame (the new page's content
+    // streams in when ready). isLoading stays true only for the very first load.
+    placeholderData: keepPreviousData,
   });
 
   useEffect(() => {
@@ -60,6 +64,61 @@ export function usePageQuery(
       } else {
         queryClient.setQueryData(["pages", query.data.id], query.data);
       }
+    }
+  }, [query.data]);
+
+  return query;
+}
+
+/**
+ * A page view that omits the large, frequently-changing `content` field. Every
+ * other field is preserved, so consumers that read only metadata (title, icon,
+ * permissions, id, creator, timestamps, …) keep working unchanged.
+ */
+export type IPageMeta = Omit<IPage, "content">;
+
+function selectPageMeta(page: IPage): IPageMeta {
+  // Drop `content`; react-query's structural sharing (replaceEqualDeep) then
+  // returns the SAME reference whenever the remaining fields are unchanged, so a
+  // pure content churn (typing / debouncedUpdateContent, collab `page.updated`)
+  // no longer changes this slice's identity and its ~13 subscribers don't
+  // re-render on every keystroke wave.
+  const { content: _content, ...meta } = page;
+  return meta as IPageMeta;
+}
+
+/**
+ * Metadata-only variant of {@link usePageQuery}. Shares the SAME query cache
+ * entry (`["pages", pageId]`, full object incl. content), but this hook returns
+ * a stable content-less slice so peripheral subscribers stop re-rendering on
+ * every content update. Use it anywhere the full `content` is not read.
+ */
+export function usePageMetaQuery(
+  pageInput: Partial<IPageInput>,
+): UseQueryResult<IPageMeta, Error> {
+  const query = useQuery({
+    queryKey: ["pages", pageInput.pageId],
+    queryFn: () => getPageById(pageInput),
+    enabled: !!pageInput.pageId,
+    staleTime: 5 * 60 * 1000,
+    select: selectPageMeta,
+    // Match usePageQuery: keep the previous page's metadata visible while
+    // navigating so the periphery (header, breadcrumb, …) doesn't flash blank.
+    placeholderData: keepPreviousData,
+  });
+
+  // Mirror usePageQuery's cross-key alias write so a page fetched by one
+  // identifier is also cached under the other. The cache stores the FULL page
+  // (select only narrows what THIS hook returns), so read the full object back
+  // from the cache and alias THAT — never the content-less slice.
+  useEffect(() => {
+    if (!query.data) return;
+    const full = queryClient.getQueryData<IPage>(["pages", pageInput.pageId]);
+    if (!full) return;
+    if (isValidUuid(pageInput.pageId)) {
+      queryClient.setQueryData(["pages", full.slugId], full);
+    } else {
+      queryClient.setQueryData(["pages", full.id], full);
     }
   }, [query.data]);
 
@@ -351,6 +410,10 @@ export function useRecentChangesQuery(spaceId?: string) {
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.meta.hasNextPage ? lastPage.meta.nextCursor : undefined,
+    // KEEP refetchOnMount:true (against the global default false): recent-changes
+    // is invalidated only while a mounted observer exists, and the widget isn't
+    // always mounted — an event that lands while it's unmounted marks it stale but
+    // the global refetchOnMount:false would not re-fetch on remount → stale list.
     refetchOnMount: true,
   });
 }
@@ -367,6 +430,9 @@ export function useCreatedByQuery(params?: {
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.meta.hasNextPage ? lastPage.meta.nextCursor : undefined,
+    // KEEP refetchOnMount:true: the "created-by" key is never invalidated (no
+    // socket/mutation path), so the mount refetch is its ONLY freshness mechanism
+    // — without it the list shows stale cache on navigation.
     refetchOnMount: true,
   });
 }
@@ -380,8 +446,12 @@ export function useDeletedPagesQuery(
     queryFn: () => getDeletedPages(spaceId, params),
     enabled: !!spaceId,
     placeholderData: keepPreviousData,
-    refetchOnMount: true,
     staleTime: 0,
+    // KEEP refetchOnMount:true: the "trash-list" key is never invalidated (no
+    // socket/mutation path), so opening the trash after deleting/restoring a page
+    // must refetch on mount — the global refetchOnMount:false would show a stale
+    // trash missing the just-deleted page until a hard reload.
+    refetchOnMount: true,
   });
 }
 
@@ -516,7 +586,35 @@ export function invalidateOnUpdatePage(
   title: string,
   icon: string,
 ) {
-  invalidatePageTree();
+  // Scoped page-tree refresh (was a blanket `invalidatePageTree()`): this is the
+  // FIELD-only update path (title/icon — no structural change), and the sidebar
+  // tree is already updated pointwise (applyUpdateOne / optimistic setData) plus
+  // via the sidebar-pages cache below. Invalidating ALL ["page-tree"] queries
+  // here refetched every open recursive subpages-embed block on each
+  // rename/icon-change — pure duplicate work. Instead patch just the affected
+  // node IN PLACE in every cached embed subtree: same visible result, no network
+  // churn, no full embed-tree rebuild. Structural events (create/move/delete)
+  // keep the blanket invalidate in their own helpers.
+  const pageTreeMatches = queryClient.getQueriesData<IPage[]>({
+    queryKey: ["page-tree"],
+  });
+  pageTreeMatches.forEach(([key, items]) => {
+    if (!items || !items.some((p) => p.id === id)) return;
+    queryClient.setQueryData<IPage[]>(key, (old) =>
+      old?.map((p) =>
+        p.id === id
+          ? {
+              ...p,
+              // Guard undefined so a title-only event can't wipe the icon (and
+              // vice versa) in the embed cache.
+              ...(title !== undefined ? { title } : {}),
+              ...(icon !== undefined ? { icon } : {}),
+            }
+          : p,
+      ),
+    );
+  });
+
   let queryKey: QueryKey = null;
   if (parentPageId === null) {
     queryKey = ["root-sidebar-pages", spaceId];

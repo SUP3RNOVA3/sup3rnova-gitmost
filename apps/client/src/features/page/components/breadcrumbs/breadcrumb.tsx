@@ -1,7 +1,9 @@
 import { useAtomValue } from "jotai";
+import { selectAtom } from "jotai/utils";
 import { treeDataAtom } from "@/features/page/tree/atoms/tree-data-atom.ts";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { computeBreadcrumbState } from "./breadcrumb.utils";
+import { findBreadcrumbPath } from "@/features/page/tree/utils";
 import {
   Button,
   Anchor,
@@ -18,7 +20,7 @@ import { SpaceTreeNode } from "@/features/page/tree/types.ts";
 import { IPage } from "@/features/page/types/page.types.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import {
-  usePageQuery,
+  usePageMetaQuery,
   usePageBreadcrumbsQuery,
 } from "@/features/page/queries/page-query.ts";
 import { extractPageSlugId } from "@/lib";
@@ -32,39 +34,84 @@ function getTitle(name: string, icon: string) {
   return name;
 }
 
+/**
+ * Equality over a breadcrumb chain by the only fields the breadcrumb renders
+ * (id, slugId, name, icon). Lets the selectAtom below hand back the SAME
+ * reference when an unrelated tree mutation leaves THIS page's ancestor chain
+ * visually unchanged, so the breadcrumb no longer re-renders on every tree
+ * event (it previously subscribed to the whole treeDataAtom).
+ */
+function breadcrumbPathEqual(
+  a: SpaceTreeNode[] | null,
+  b: SpaceTreeNode[] | null,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (
+      a[i].id !== b[i].id ||
+      a[i].slugId !== b[i].slugId ||
+      a[i].name !== b[i].name ||
+      a[i].icon !== b[i].icon
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export default function Breadcrumb() {
   const { t } = useTranslation();
-  const treeData = useAtomValue(treeDataAtom);
   const [breadcrumbNodes, setBreadcrumbNodes] = useState<
     SpaceTreeNode[] | null
   >(null);
   const { pageSlug, spaceSlug } = useParams();
-  const { data: currentPage } = usePageQuery({
+  const { data: currentPage } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
+  const currentPageId = currentPage?.id;
   // The page's own ancestor chain, fetched independently of the lazily-built
   // sidebar tree so a deep page doesn't render a blank breadcrumb for seconds
   // while the tree backfills (#218).
-  const { data: ancestors } = usePageBreadcrumbsQuery(currentPage?.id);
+  const { data: ancestors } = usePageBreadcrumbsQuery(currentPageId);
   const isMobile = useMediaQuery("(max-width: 48em)");
+
+  // Narrowed subscription: instead of subscribing to the whole treeDataAtom and
+  // recomputing on every tree event, derive ONLY the current page's ancestor
+  // chain. The custom equality returns the previous reference when that chain is
+  // visually unchanged, so an unrelated tree mutation no longer re-renders this
+  // component. Mirrors computeBreadcrumbState's tree-hit branch
+  // (findBreadcrumbPath); the tree-miss/ancestors fallback is applied below.
+  const treePathAtom = useMemo(
+    () =>
+      selectAtom(
+        treeDataAtom,
+        (tree): SpaceTreeNode[] | null =>
+          currentPageId ? findBreadcrumbPath(tree, currentPageId) : null,
+        breadcrumbPathEqual,
+      ),
+    [currentPageId],
+  );
+  const treePath = useAtomValue(treePathAtom);
 
   useEffect(() => {
     if (!currentPage) return;
 
     // Selection/mapping + stale-clearing live in a pure, unit-tested helper
-    // (#218). It resolves the correct chain when possible and, on a transient
-    // miss, clears a chain left over from a previously-viewed page instead of
-    // showing the wrong trail — while keeping a chain already resolved for THIS
-    // page to avoid a blank flash.
+    // (#218). The tree-hit chain (treePath) always wins when present; otherwise
+    // fall back to the page's own ancestors and the stale-clearing logic — this
+    // reproduces computeBreadcrumbState(fullTree, ancestors, …) exactly, since
+    // its tree-hit branch is precisely findBreadcrumbPath(fullTree, pageId).
     setBreadcrumbNodes((previous) =>
+      treePath ??
       computeBreadcrumbState(
-        treeData,
+        null,
         ancestors as IPage[] | undefined,
         currentPage.id,
         previous,
       ),
     );
-  }, [currentPage?.id, treeData, ancestors]);
+  }, [currentPage?.id, treePath, ancestors]);
 
   const HiddenNodesTooltipContent = () =>
     breadcrumbNodes?.slice(1, -1).map((node) => (

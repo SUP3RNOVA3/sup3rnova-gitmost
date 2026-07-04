@@ -35,6 +35,7 @@ vi.mock("@/features/page/queries/page-query.ts", () => ({
     isFetching: false,
   }),
   usePageQuery: () => ({ data: undefined }),
+  usePageMetaQuery: () => ({ data: undefined }),
   fetchAllAncestorChildren: (...args: unknown[]) =>
     fetchAllAncestorChildrenMock(...args),
 }));

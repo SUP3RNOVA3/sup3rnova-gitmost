@@ -67,14 +67,20 @@ export default function GlobalAppShell({
   );
 
   useEffect(() => {
-    //https://codesandbox.io/p/sandbox/kz9de
+    // Attach the global mousemove/mouseup only WHILE resizing (started on the
+    // handle's mousedown via startResizing → isResizing=true) and detach on
+    // mouseup (stopResizing → isResizing=false). Previously these listeners were
+    // attached for the whole app lifetime, so every mouse move over the app ran
+    // the resize handler.
+    // https://codesandbox.io/p/sandbox/kz9de
+    if (!isResizing) return;
     window.addEventListener("mousemove", resize);
     window.addEventListener("mouseup", stopResizing);
     return () => {
       window.removeEventListener("mousemove", resize);
       window.removeEventListener("mouseup", stopResizing);
     };
-  }, [resize, stopResizing]);
+  }, [isResizing, resize, stopResizing]);
 
   const location = useLocation();
   const isSettingsRoute = location.pathname.startsWith("/settings");

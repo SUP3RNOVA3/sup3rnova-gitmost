@@ -1,4 +1,4 @@
-import { useAtom } from "jotai";
+import { useSetAtom, useStore } from "jotai";
 import { useTranslation } from "react-i18next";
 import { useParams } from "react-router-dom";
 import { ActionIcon, Menu, rem } from "@mantine/core";
@@ -52,7 +52,11 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
   const clipboard = useClipboard({ timeout: 500 });
   const { spaceSlug } = useParams();
   const { handleDelete } = useTreeMutation(node.spaceId);
-  const [data, setData] = useAtom(treeDataAtom);
+  // Setter-only: the tree value is read only imperatively inside the duplicate
+  // handler (via `store` below), never at render, so useSetAtom avoids
+  // re-rendering every row's NodeMenu on any tree event.
+  const setData = useSetAtom(treeDataAtom);
+  const store = useStore();
   const emit = useQueryEmit();
   const [exportOpened, { open: openExportModal, close: closeExportModal }] =
     useDisclosure(false);
@@ -125,8 +129,8 @@ export function NodeMenu({ node, canEdit }: NodeMenuProps) {
     try {
       const duplicatedPage = await duplicatePage({ pageId: node.id });
 
-      // figure out parent + insertion index
-      const siblings = treeModel.siblingsOf(data, node.id);
+      // figure out parent + insertion index (read the live tree imperatively)
+      const siblings = treeModel.siblingsOf(store.get(treeDataAtom), node.id);
       const parentId = siblings?.parentId ?? null;
       const currentIndex = siblings?.index ?? 0;
       const newIndex = currentIndex + 1;
