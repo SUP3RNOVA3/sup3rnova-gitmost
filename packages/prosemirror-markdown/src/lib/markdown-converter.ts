@@ -213,6 +213,20 @@ export function convertProseMirrorToMarkdown(content: any): string {
 
       case "text":
         let textContent = node.text || "";
+        // #293 canon #7: `==` is now a LIVE inline highlight syntax on import (a
+        // marked inline extension turns `==text==` into a color-less highlight
+        // mark). A LITERAL `==` in a text run would therefore be misparsed as a
+        // highlight on the next import, so backslash-escape each `=` of a `==`
+        // pair; marked's escape tokenizer decodes `\=` back to a literal `=`, so
+        // a literal `==` round-trips as text (never materializes a phantom mark).
+        // This runs for BOTH unmarked text and marked non-code runs, but NOT for
+        // an inline code span (a run carrying the `code` mark returns a backtick
+        // span below with `==` verbatim, matching `` `a == b` `` staying code).
+        // A highlight run's own `==` delimiters are appended AFTER this in the
+        // marks loop, so they are never escaped; only the run's inner text is.
+        if (!(node.marks || []).some((m: any) => m.type === "code")) {
+          textContent = textContent.replace(/==/g, "\\=\\=");
+        }
         // Apply marks (bold, italic, code, etc.)
         if (node.marks) {
           // The schema's `code` mark declares `excludes: "_"` — it excludes every
@@ -286,14 +300,19 @@ export function convertProseMirrorToMarkdown(content: any): string {
                 textContent = `<sup>${textContent}</sup>`;
                 break;
               case "highlight": {
-                // Preserve a null/empty color as a plain highlight (a bare
-                // <mark> with no background-color); only emit the style when a
-                // color is actually set, so a plain highlight is not forced to
-                // yellow on export.
+                // #293 canon #7: a highlight WITHOUT a color serializes as the
+                // Obsidian/GFM `==text==` syntax (the importer's marked inline
+                // `==` extension parses it back to a color-less highlight mark).
+                // A highlight WITH a color keeps the `<mark style="background-
+                // color: …">` HTML form (the condition is deterministic on the
+                // `color` attr), so a colored highlight is not flattened. The
+                // inner textContent already had any literal `==` backslash-
+                // escaped above, so a highlight over text containing `==` still
+                // round-trips.
                 const color = mark.attrs?.color;
                 textContent = color
                   ? `<mark style="background-color: ${escapeAttr(color)}">${textContent}</mark>`
-                  : `<mark>${textContent}</mark>`;
+                  : `==${textContent}==`;
                 break;
               }
               case "textStyle":
@@ -332,8 +351,17 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // re-adds exactly one trailing "\n" on import, so trimming only one
         // here would let the text grow by "\n" on each round-trip. Removing
         // every trailing newline makes repeated cycles stable.
+        //
+        // Read the child text RAW (schema codeBlock is `content: "text*"`), NOT
+        // through processNode: code-fence content is literal and markdown escapes
+        // do not apply inside a fence. In particular the canon #7 `==` -> `\=\=`
+        // escape (in `case "text"`) must NOT reach code — marked leaves `\=`
+        // verbatim inside a fence, so routing code through `case "text"` would
+        // permanently stamp backslashes into any `==` (a `==` comparison is
+        // extremely common in source), corrupting the block on the git-sync data
+        // path.
         const code = nodeContent
-          .map(processNode)
+          .map((child: any) => (typeof child?.text === "string" ? child.text : ""))
           .join("")
           .replace(/\n+$/, "");
         // CommonMark: an inner ``` run inside the code would prematurely close

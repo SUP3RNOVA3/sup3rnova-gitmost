@@ -9,7 +9,8 @@
  */
 import { generateJSON } from "@tiptap/html";
 import { JSDOM } from "jsdom";
-import { marked } from "marked";
+import { Marked } from "marked";
+import type { TokenizerExtension, RendererExtension } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
 import { parseAttachedComment } from "./attached-comment.js";
 import {
@@ -23,6 +24,67 @@ import {
   videoToHtml,
   youtubeToHtml,
 } from "./media-html.js";
+
+/**
+ * #293 canon #7: `==text==` (Obsidian/GFM highlight) inline syntax.
+ *
+ * `==` is NOT standard markdown, so we teach the parser to turn `==text==` into
+ * `<mark>text</mark>`, which the schema's Highlight extension parses back into a
+ * color-less `highlight` mark (see docmost-schema.ts). This mirrors the
+ * serializer's no-color highlight form, so a plain highlight round-trips.
+ *
+ * This is an INLINE extension (mid-line, must respect token precedence so it
+ * never fires inside an inline code span). The tokenizer requires a non-empty,
+ * non-space-leading inner and re-tokenizes that inner via `this.lexer.inline-
+ * Tokens`, so nested marks (bold/italic/links inside a highlight) round-trip.
+ * The renderer re-parses the inner tokens and wraps them in `<mark>`.
+ *
+ * It is registered on a DEDICATED `Marked` instance owned by this module
+ * (below), NOT the global `marked` singleton, so the `==` behavior cannot leak
+ * into unrelated callers that import `marked` elsewhere in the monorepo.
+ */
+interface HighlightMarkToken {
+  type: "highlightMark";
+  raw: string;
+  text: string;
+  tokens: any[];
+}
+
+const highlightMarkExtension: TokenizerExtension & RendererExtension = {
+  name: "highlightMark",
+  level: "inline",
+  // Point marked at the next `==` so the tokenizer is invoked at that offset.
+  start(src: string) {
+    const i = src.indexOf("==");
+    return i < 0 ? undefined : i;
+  },
+  tokenizer(src: string) {
+    // Require a non-empty, non-space-leading inner and a closing `==`. The lazy
+    // `+?` matches the SHORTEST inner, so `==a== ==b==` yields two marks. `====`
+    // (empty) and `==x` (unbalanced) do not match and stay literal text.
+    const match = /^==(?=\S)([\s\S]+?)==/.exec(src);
+    if (!match) return undefined;
+    const token: HighlightMarkToken = {
+      type: "highlightMark",
+      raw: match[0],
+      text: match[1],
+      tokens: [],
+    };
+    // Re-tokenize the inner so marks nested inside the highlight round-trip.
+    token.tokens = this.lexer.inlineTokens(match[1]);
+    return token as any;
+  },
+  renderer(token: any) {
+    return `<mark>${this.parser.parseInline(token.tokens)}</mark>`;
+  },
+};
+
+// Dedicated marked instance: default (GFM) options plus the `==` highlight
+// inline extension. Constructed once at module load so the extension is
+// registered exactly once and never mutates the global `marked` singleton.
+const markedInstance = new Marked().use({
+  extensions: [highlightMarkExtension],
+});
 
 // Setup DOM environment for Tiptap HTML parsing in Node.js
 const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>");
@@ -162,7 +224,7 @@ async function preprocessCallouts(markdown: string): Promise<string> {
           // Found the matching closing fence: render the body (recursively, so
           // nested callouts are handled) and emit the callout div.
           const inner = await transform(bodyLines);
-          const renderedInner = await marked.parse(inner);
+          const renderedInner = await markedInstance.parse(inner);
           out.push(
             `\n<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>\n`,
           );
@@ -191,7 +253,7 @@ async function preprocessCallouts(markdown: string): Promise<string> {
           bodyLines.push(lines[j].replace(/^>\s?/, ""));
         }
         const inner = await transform(bodyLines);
-        const renderedInner = await marked.parse(inner);
+        const renderedInner = await markedInstance.parse(inner);
         out.push(
           `\n<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>\n`,
         );
@@ -649,7 +711,7 @@ export async function markdownToProseMirror(
   markdownContent: string,
 ): Promise<any> {
   const withCallouts = await preprocessCallouts(markdownContent);
-  const html = await marked.parse(withCallouts);
+  const html = await markedInstance.parse(withCallouts);
   // Materialize comment directives (#293 #9 attached textAlign; #5 standalone
   // subpages/pageBreak) while the comment nodes still exist, before generateJSON
   // drops them.

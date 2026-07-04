@@ -103,7 +103,9 @@ describe('inline-mark matrix (underline/sub/sup/highlight±color/textStyle/comme
       [[{ type: 'underline' }], '<u>m</u>'],
       [[{ type: 'subscript' }], '<sub>m</sub>'],
       [[{ type: 'superscript' }], '<sup>m</sup>'],
-      [[{ type: 'highlight' }], '<mark>m</mark>'],
+      // #293 canon #7: a no-color highlight now serializes as `==m==` (Obsidian
+      // syntax); only a COLORED highlight keeps the `<mark style=…>` HTML form.
+      [[{ type: 'highlight' }], '==m=='],
       [
         [{ type: 'highlight', attrs: { color: '#ff0000' } }],
         '<mark style="background-color: #ff0000">m</mark>',
