@@ -118,56 +118,19 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
 // transport exposes a `tree:true` mode that returns the full nested hierarchy;
 // the in-app copy keeps the same tree option but is worded for the in-app agent.
 // Kept per-layer so each side can tune its own guidance.
-server.registerTool(
-  "list_pages",
-  {
-    description:
-      "List most recent pages in a space ordered by updatedAt (descending). " +
-      "Returns a bounded list (default 50, max 100) — use search for lookups " +
-      "in large spaces. Pass tree:true (with spaceId) to instead get the " +
-      "space's full page hierarchy as a nested tree.",
-    inputSchema: {
-      spaceId: z.string().optional(),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(100)
-        .optional()
-        .describe("Max pages to return (default 50, max 100)"),
-      tree: z
-        .boolean()
-        .optional()
-        .describe(
-          "When true, return the space's full page hierarchy as a nested tree (each node has a children array) instead of the recent-by-updatedAt flat list. Requires spaceId; ignores limit.",
-        ),
-    },
-  },
-  async ({ spaceId, limit, tree }) => {
-    const result = await docmostClient.listPages(spaceId, limit ?? 50, tree ?? false);
-    return jsonContent(result);
-  },
-);
+// Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294). This
+// transport keeps applying its own defaults (limit=50, tree=false) in execute.
+registerShared(SHARED_TOOL_SPECS.listPages, async ({ spaceId, limit, tree }) => {
+  const result = await docmostClient.listPages(spaceId, limit ?? 50, tree ?? false);
+  return jsonContent(result);
+});
 
 // Tool: get_page
-server.registerTool(
-  "get_page",
-  {
-    description:
-      "Get page details with content converted to Markdown. The conversion is " +
-      "LOSSY (block ids, exact table/callout structure are approximated); for a " +
-      "lossless representation use get_page_json. Inline <span data-comment-id> " +
-      "tags in the markdown are comment highlight anchors (also present for " +
-      "RESOLVED threads) — treat them as markup, not page text.",
-    inputSchema: {
-      pageId: z.string().min(1),
-    },
-  },
-  async ({ pageId }) => {
-    const page = await docmostClient.getPage(pageId);
-    return jsonContent(page);
-  },
-);
+// Schema + description now live in the shared registry (#294).
+registerShared(SHARED_TOOL_SPECS.getPage, async ({ pageId }) => {
+  const page = await docmostClient.getPage(pageId);
+  return jsonContent(page);
+});
 
 // Tool: get_page_json
 registerShared(SHARED_TOOL_SPECS.getPageJson, async ({ pageId }) => {
@@ -270,22 +233,9 @@ registerShared(
 );
 
 // Tool: create_page
-server.registerTool(
-  "create_page",
-  {
-    description:
-      "Create a new page from Markdown in a space. Pass parentPageId to nest " +
-      "it under a parent; omit it to create at the space root.",
-    inputSchema: {
-      title: z.string().min(1).describe("Title of the page"),
-      content: z.string().min(1).describe("Markdown content"),
-      spaceId: z.string().min(1),
-      parentPageId: z
-        .string()
-        .optional()
-        .describe("Optional parent page ID to nest under"),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.createPage,
   async ({ title, content, spaceId, parentPageId }) => {
     const result = await docmostClient.createPage(
       title,
@@ -298,32 +248,11 @@ server.registerTool(
 );
 
 // Tool: update_page_json
-server.registerTool(
-  "update_page_json",
-  {
-    description:
-      "Replace a page's content with a raw ProseMirror JSON document " +
-      "(lossless write: preserves the block ids, callouts, tables and " +
-      "attributes you pass in). Typical flow: get_page_json -> modify the " +
-      "JSON -> update_page_json. Keep existing node ids intact so heading " +
-      "anchors and history stay stable. Minimal full-doc example: " +
-      '{"type":"doc","content":[{"type":"paragraph","content":' +
-      '[{"type":"text","text":"Hi"}]}]}. `content` may be a JSON object or a ' +
-      "JSON string (both accepted), and is OPTIONAL: omit it to update only " +
-      "the title (though prefer rename_page for a title-only change). " +
-      "Supplying neither content nor title is an error.",
-    inputSchema: {
-      pageId: z.string().min(1).describe("ID of the page to update"),
-      content: z
-        .any()
-        .optional()
-        .describe(
-          'ProseMirror document {"type":"doc","content":[...]} (JSON object or ' +
-            "JSON string). Omit to rename only.",
-        ),
-      title: z.string().optional().describe("Optional new title"),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's content normalization (parse a JSON-string content,
+// pass undefined/null through for a title-only/no-op update).
+registerShared(
+  SHARED_TOOL_SPECS.updatePageJson,
   async ({ pageId, content, title }) => {
     // Only parse/validate the document when it was actually supplied; when it
     // is omitted, pass it straight through so the client performs a title-only
@@ -341,26 +270,11 @@ server.registerTool(
 );
 
 // Tool: export_page_markdown
-server.registerTool(
-  "export_page_markdown",
-  {
-    description:
-      "Export a page to a single self-contained, lossless Docmost-flavoured " +
-      "Markdown file (custom extensions): YAML-free meta header, body with " +
-      "inline comment anchors and diagrams, and a trailing comments-thread " +
-      "block. Designed for a download -> edit body -> import_page_markdown " +
-      "round-trip that preserves everything, including comment highlights. " +
-      "Comment THREADS are preserved in the file but are not re-pushed to the " +
-      "server on import.",
-    inputSchema: {
-      pageId: z.string().min(1),
-    },
-  },
-  async ({ pageId }) => {
-    const md = await docmostClient.exportPageMarkdown(pageId);
-    return { content: [{ type: "text" as const, text: md }] };
-  },
-);
+// Schema + description now live in the shared registry (#294).
+registerShared(SHARED_TOOL_SPECS.exportPageMarkdown, async ({ pageId }) => {
+  const md = await docmostClient.exportPageMarkdown(pageId);
+  return { content: [{ type: "text" as const, text: md }] };
+});
 
 // Tool: import_page_markdown
 registerShared(
@@ -384,22 +298,11 @@ registerShared(
 );
 
 // Tool: rename_page
-server.registerTool(
-  "rename_page",
-  {
-    description:
-      "Rename a page (change its title only) without touching or resending " +
-      "its content.",
-    inputSchema: {
-      pageId: z.string().min(1).describe("ID of the page to rename"),
-      title: z.string().min(1).describe("New title"),
-    },
-  },
-  async ({ pageId, title }) => {
-    const result = await docmostClient.renamePage(pageId, title);
-    return jsonContent(result);
-  },
-);
+// Schema + description now live in the shared registry (#294).
+registerShared(SHARED_TOOL_SPECS.renamePage, async ({ pageId, title }) => {
+  const result = await docmostClient.renamePage(pageId, title);
+  return jsonContent(result);
+});
 
 // Tool: edit_page_text
 registerShared(SHARED_TOOL_SPECS.editPageText, async ({ pageId, edits }) => {
@@ -603,29 +506,11 @@ registerShared(SHARED_TOOL_SPECS.listShares, async () => {
 });
 
 // Tool: move_page
-server.registerTool(
-  "move_page",
-  {
-    description:
-      "Move a page under a new parent (nesting) or to the space root.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      parentPageId: z
-        .string()
-        .nullable()
-        .optional()
-        .describe(
-          "Target parent page ID. Pass 'null' or empty string to move to root.",
-        ),
-      position: z
-        .string()
-        .min(5)
-        .optional()
-        .describe(
-          "fractional-index position key; min 5 chars; omit to append at the end.",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's cycle guard, its 'null'/'' -> null string coercion, and
+// its positive-confirmation check on the move response.
+registerShared(
+  SHARED_TOOL_SPECS.movePage,
   async ({ pageId, parentPageId, position }) => {
     const finalParentId =
       parentPageId === "" || parentPageId === "null" ? null : parentPageId;
@@ -660,25 +545,16 @@ server.registerTool(
 );
 
 // Tool: delete_page
-server.registerTool(
-  "delete_page",
-  {
-    description:
-      "Delete a single page by ID. SOFT delete only: the page is moved to " +
-      "trash and can be restored; nothing is permanently deleted.",
-    inputSchema: {
-      pageId: z.string().min(1),
-    },
-  },
-  async ({ pageId }) => {
-    await docmostClient.deletePage(pageId);
-    return {
-      content: [
-        { type: "text" as const, text: `Successfully deleted page ${pageId}` },
-      ],
-    };
-  },
-);
+// Schema + description now live in the shared registry (#294). The shared schema
+// exposes ONLY pageId, so no permanent/force-delete flag can reach the client.
+registerShared(SHARED_TOOL_SPECS.deletePage, async ({ pageId }) => {
+  await docmostClient.deletePage(pageId);
+  return {
+    content: [
+      { type: "text" as const, text: `Successfully deleted page ${pageId}` },
+    ],
+  };
+});
 
 // --- Comment tools (ported from upstream PR #3 by Max Nikitin) ---
 

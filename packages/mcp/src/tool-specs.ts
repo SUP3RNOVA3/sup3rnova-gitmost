@@ -510,6 +510,211 @@ export const SHARED_TOOL_SPECS = {
     }),
   },
 
+  // --- page tools (unified from the per-layer inline definitions, #294) ---
+  //
+  // Descriptions merge both layers (the MCP copy's richer structural notes + the
+  // in-app copy's "Reversible via history/trash" framing where it added one).
+  // Field constraints keep the MCP copy's stricter .min(1) EXCEPT where the
+  // in-app layer deliberately allowed a looser value (documented per field).
+
+  getPage: {
+    mcpName: 'get_page',
+    inAppKey: 'getPage',
+    description:
+      'Fetch a single page as Markdown by its id. Returns the page title and ' +
+      'its Markdown content. The Markdown conversion is LOSSY (block ids, exact ' +
+      'table/callout structure are approximated); for a lossless representation ' +
+      'use get_page_json. Inline <span data-comment-id> tags in the markdown ' +
+      'are comment highlight anchors (also present for RESOLVED threads) — ' +
+      'treat them as markup, not page text.',
+    tier: 'core',
+    catalogLine: 'getPage — fetch a page as Markdown by its id.',
+    // Reconciled: MCP's stricter .min(1) kept; in-app's more-informative
+    // "(or slugId)" describe kept.
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id (or slugId) of the page.'),
+    }),
+  },
+
+  listPages: {
+    mcpName: 'list_pages',
+    inAppKey: 'listPages',
+    description:
+      'List the most recent pages (ordered by updatedAt, descending), ' +
+      'optionally scoped to a single space. Returns a bounded list (default ' +
+      '50, max 100) — use search for lookups in large spaces. Pass tree:true ' +
+      "(with spaceId) to instead get the space's full page hierarchy as a " +
+      'nested tree.',
+    tier: 'core',
+    catalogLine: "listPages — list recent pages, or a space's full page tree.",
+    buildShape: (z) => ({
+      spaceId: z
+        .string()
+        .optional()
+        .describe('Optional space id to scope the listing to.'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe('Maximum number of pages (default 50, max 100).'),
+      tree: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, return the space's full page hierarchy as a nested tree " +
+            '(children arrays) instead of the recent-by-updatedAt flat list. ' +
+            'Requires spaceId; ignores limit.',
+        ),
+    }),
+  },
+
+  createPage: {
+    mcpName: 'create_page',
+    inAppKey: 'createPage',
+    description:
+      'Create a new page with a Markdown body in a space, optionally under a ' +
+      'parent page (omit parentPageId to create at the space root). Returns ' +
+      'the new page id and title. Reversible: a page can be moved to trash ' +
+      'later.',
+    tier: 'deferred',
+    catalogLine: 'createPage — create a new page with a Markdown body in a space.',
+    // Reconciled schema DRIFT: the MCP copy pinned `content` to .min(1) while
+    // the in-app copy left it unbounded and DOCUMENTS an empty body as valid
+    // ("may be empty") — creating an empty page to fill in later is a real use
+    // case. The looser (no-min) form is kept, so create_page now also accepts an
+    // empty body (harmless — it creates an empty page) and no previously-valid
+    // in-app input is ever rejected. `title`/`spaceId` keep the MCP .min(1)
+    // (an empty title or space is never valid).
+    buildShape: (z) => ({
+      title: z.string().min(1).describe('The title of the new page.'),
+      content: z.string().describe('The page body as Markdown (may be empty).'),
+      spaceId: z.string().min(1).describe('The id of the space to create the page in.'),
+      parentPageId: z
+        .string()
+        .optional()
+        .describe('Optional parent page id to nest the new page under.'),
+    }),
+  },
+
+  movePage: {
+    mcpName: 'move_page',
+    inAppKey: 'movePage',
+    description:
+      'Move a page under a new parent page, or to the space root when no ' +
+      'parent is given. Reversible: move it back at any time.',
+    tier: 'deferred',
+    catalogLine: 'movePage — move a page under a new parent or to the space root.',
+    // Reconciled schema DRIFT: the MCP copy exposed a `position` field
+    // (fractional-index ordering) that the in-app copy lacked. Unified by
+    // KEEPING position (the in-app client already accepts an optional position
+    // arg, so the in-app execute now forwards it) — it is optional, so no
+    // previously-valid in-app call is rejected. `parentPageId` is `.nullable()`
+    // on both, so a real JSON null moves to root on either transport; the MCP
+    // execute additionally coerces the strings 'null'/'' to null as a robustness
+    // fallback (kept in its execute body, not in the shared schema).
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to move.'),
+      parentPageId: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          'Target parent page id. Null or omitted moves the page to the space ' +
+            'root.',
+        ),
+      position: z
+        .string()
+        .min(5)
+        .optional()
+        .describe(
+          'Optional fractional-index position key (min 5 chars); omit to ' +
+            'append at the end.',
+        ),
+    }),
+  },
+
+  renamePage: {
+    mcpName: 'rename_page',
+    inAppKey: 'renamePage',
+    description:
+      'Rename a page (change its title only; the body is untouched, never ' +
+      'resent). Reversible: rename back at any time.',
+    tier: 'deferred',
+    catalogLine: "renamePage — change a page's title only (body untouched).",
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to rename.'),
+      title: z.string().min(1).describe('The new title.'),
+    }),
+  },
+
+  deletePage: {
+    mcpName: 'delete_page',
+    inAppKey: 'deletePage',
+    description:
+      'Move a page to the trash — SOFT delete only: the page can be restored ' +
+      'from trash and nothing is ever permanently deleted.',
+    tier: 'deferred',
+    catalogLine: 'deletePage — move a page to trash (soft delete, reversible).',
+    // GUARDRAIL preserved (§14 H4): the schema exposes ONLY pageId, so a
+    // permanentlyDelete/forceDelete flag can never reach the client through this
+    // tool (asserted by ai-chat-tools.service.spec.ts).
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to move to trash.'),
+    }),
+  },
+
+  updatePageJson: {
+    mcpName: 'update_page_json',
+    inAppKey: 'updatePageJson',
+    description:
+      "Replace a page's content with a raw ProseMirror JSON document (lossless " +
+      'write: preserves the block ids, callouts, tables and attributes you pass ' +
+      'in). Typical flow: get_page_json -> modify the JSON -> update_page_json. ' +
+      'Keep existing node ids intact so heading anchors and history stay ' +
+      'stable. Minimal full-doc example: {"type":"doc","content":[{"type":' +
+      '"paragraph","content":[{"type":"text","text":"Hi"}]}]}. `content` may be ' +
+      'a JSON object or a JSON string (both accepted), and is OPTIONAL: omit it ' +
+      'to update only the title (though prefer rename_page for a title-only ' +
+      'change). Supplying neither content nor title is an error. Reversible: ' +
+      'the previous version is kept in page history.',
+    tier: 'deferred',
+    catalogLine:
+      "updatePageJson — overwrite a page's body with a full ProseMirror document.",
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('ID of the page to update'),
+      content: z
+        .any()
+        .optional()
+        .describe(
+          'ProseMirror document {"type":"doc","content":[...]} (JSON object or ' +
+            'JSON string). Omit to update only the title.',
+        ),
+      title: z.string().optional().describe('Optional new title'),
+    }),
+  },
+
+  exportPageMarkdown: {
+    mcpName: 'export_page_markdown',
+    inAppKey: 'exportPageMarkdown',
+    // CANONICAL: the MCP copy (a strict superset of the terse in-app wording).
+    description:
+      'Export a page to a single self-contained, lossless Docmost-flavoured ' +
+      'Markdown file (custom extensions): YAML-free meta header, body with ' +
+      'inline comment anchors and diagrams, and a trailing comments-thread ' +
+      'block. Designed for a download -> edit body -> import_page_markdown ' +
+      'round-trip that preserves everything, including comment highlights. ' +
+      'Comment THREADS are preserved in the file but are not re-pushed to the ' +
+      'server on import.',
+    tier: 'deferred',
+    catalogLine:
+      'exportPageMarkdown — export a page to self-contained Markdown (body + comments).',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to export.'),
+    }),
+  },
+
   // --- comment tools (unified from the per-layer inline definitions, #294) ---
   //
   // create_comment and resolve_comment previously carried a "per-transport

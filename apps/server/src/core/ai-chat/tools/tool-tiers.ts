@@ -100,14 +100,8 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'core',
     catalogLine: 'getCurrentPage — the page the user is currently viewing.',
   },
-  getPage: {
-    tier: 'core',
-    catalogLine: 'getPage — fetch a page as Markdown by its id.',
-  },
-  listPages: {
-    tier: 'core',
-    catalogLine: "listPages — list recent pages, or a space's full page tree.",
-  },
+  // NOTE: getPage and listPages moved to @docmost/mcp's SHARED_TOOL_SPECS
+  // (#294); they carry their own tier ('core') + catalogLine there.
   // NOTE: createComment, listComments and resolveComment moved to
   // @docmost/mcp's SHARED_TOOL_SPECS (#294); they carry their own tier +
   // catalogLine there. getComment stays inline (MCP-only shape divergence is
@@ -118,26 +112,13 @@ export const INLINE_TOOL_TIERS: Record<
   },
 
   // --- deferred inline ---
-  createPage: {
-    tier: 'deferred',
-    catalogLine: 'createPage — create a new page with a Markdown body in a space.',
-  },
+  // NOTE: createPage, renamePage, movePage, deletePage, updatePageJson and
+  // exportPageMarkdown moved to @docmost/mcp's SHARED_TOOL_SPECS (#294); they
+  // carry their own deferred tier + catalogLine there.
   updatePageContent: {
     tier: 'deferred',
     catalogLine:
       "updatePageContent — replace a page's body (and optionally title) with new Markdown.",
-  },
-  renamePage: {
-    tier: 'deferred',
-    catalogLine: "renamePage — change a page's title only (body untouched).",
-  },
-  movePage: {
-    tier: 'deferred',
-    catalogLine: 'movePage — move a page under a new parent or to the space root.',
-  },
-  deletePage: {
-    tier: 'deferred',
-    catalogLine: 'deletePage — move a page to trash (soft delete, reversible).',
   },
   listSidebarPages: {
     tier: 'deferred',
@@ -158,16 +139,6 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'deferred',
     catalogLine:
       'getPageHistory — fetch one page-history version with its ProseMirror content.',
-  },
-  exportPageMarkdown: {
-    tier: 'deferred',
-    catalogLine:
-      'exportPageMarkdown — export a page to self-contained Markdown (body + comments).',
-  },
-  updatePageJson: {
-    tier: 'deferred',
-    catalogLine:
-      "updatePageJson — overwrite a page's body with a full ProseMirror document.",
   },
   sharePage: {
     tier: 'deferred',
