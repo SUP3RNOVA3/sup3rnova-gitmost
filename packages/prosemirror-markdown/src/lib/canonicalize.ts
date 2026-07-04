@@ -45,9 +45,11 @@
  *       converter coercing numeric `width`/`height` to strings, which is outside
  *       canonicalize's scope.
  *
- * NOTE: `image` has NO non-null align default — its `align` defaults to `null`
- * (docmost-schema.ts L174), so it is already handled by the null-drop rule and
- * is intentionally NOT listed here.
+ * NOTE: `image` align now defaults to `"center"` — unified with editor-ext
+ * (#293 canon #4). It is listed below so a canonical image drops `align` when
+ * it equals "center" (absent ≡ default), exactly like the diagram/media nodes.
+ * A null align is likewise dropped by the null-drop rule and re-imports as the
+ * "center" default, so bare `![](src)` images stay canonically clean.
  */
 const KNOWN_DEFAULTS: Record<string, Record<string, unknown>> = {
   // mark types
@@ -61,6 +63,9 @@ const KNOWN_DEFAULTS: Record<string, Record<string, unknown>> = {
   // node types
   orderedList: {
     start: 1,
+  },
+  image: {
+    align: "center",
   },
   drawio: {
     align: "center",

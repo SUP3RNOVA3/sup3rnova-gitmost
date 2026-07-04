@@ -478,22 +478,24 @@ describe('converter gap coverage — documented round-trip data loss (specs 12�
     expect(docsCanonicallyEqual(d, doc2)).toBe(false);
   });
 
-  // 14. The image emitter drops the title attribute (silently lost on round-trip).
-  it('an image title attribute is dropped on export and lost on re-import', async () => {
+  // 14. #293 canon #4: the image title now round-trips via the attached
+  //     `<!--img {…}-->` comment (previously silently dropped).
+  it('an image title attribute round-trips via the attached img-comment', async () => {
     const d = doc({
       type: 'image',
       attrs: { src: '/i.png', alt: 'a', title: 't"q' },
     });
     const md1 = convertProseMirrorToMarkdown(d);
-    expect(md1).toBe('![a](/i.png)'); // no title, no quotes
+    // The quote in the title is JSON-escaped inside the comment payload.
+    expect(md1).toBe('![a](/i.png) <!--img {"title":"t\\"q"}-->');
 
     const doc2 = await markdownToProseMirror(md1);
     const img = (doc2.content || []).find((n: any) => n.type === 'image');
     expect(img).toBeTruthy();
-    expect(img.attrs?.title).toBeNull(); // the original 't"q' was dropped
+    expect(img.attrs?.title).toBe('t"q'); // restored byte-exact
     expect(img.attrs?.src).toBe('/i.png');
     expect(img.attrs?.alt).toBe('a');
-    expect(docsCanonicallyEqual(d, doc2)).toBe(false);
+    expect(docsCanonicallyEqual(d, doc2)).toBe(true);
   });
 });
 
@@ -507,8 +509,10 @@ describe('converter gap coverage — raw-HTML container round-trips (specs 15–
         attrs: { src: '/i.png', alt: 'cap', width: 320, align: 'center' },
       }),
     );
+    // #293 canon #4: image align default is unified to "center", so a center
+    // image inside a column no longer emits a redundant align="center".
     expect(md1).toBe(
-      '<div data-type="columns" data-layout="two"><div data-type="column"><img src="/i.png" alt="cap" width="320" align="center"></div></div>',
+      '<div data-type="columns" data-layout="two"><div data-type="column"><img src="/i.png" alt="cap" width="320"></div></div>',
     );
     expect(md2).toBe(md1);
     expect(colChildOf(doc2)?.type).toBe('image');

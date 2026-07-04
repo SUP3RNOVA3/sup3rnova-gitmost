@@ -256,7 +256,22 @@ const DocmostAttributes = Extension.create({
       {
         types: ["image"],
         attributes: {
-          align: { default: null },
+          // #293 canon #4: the image `align` default is unified to "center"
+          // (matching editor-ext, the source of real user documents) so an
+          // editor-authored image — which is always align="center" — serializes
+          // as the clean `![](src)` form with NO attached comment, and only a
+          // genuinely non-default alignment (left/right) emits an `<!--img-->`
+          // comment. The DOM attribute name stays `align` (imageToHtml already
+          // round-trips it as align="…"); only the DEFAULT value changed from
+          // null to "center". parseHTML reads the `align` attribute so a bare
+          // <img> with no align falls back to "center", and <img align="left">
+          // reads "left".
+          align: {
+            default: "center",
+            parseHTML: (el: HTMLElement) => el.getAttribute("align") || "center",
+            renderHTML: (attrs: Record<string, any>) =>
+              attrs.align && attrs.align !== "center" ? { align: attrs.align } : {},
+          },
           // imageToHtml emits these Docmost-specific image attrs as data-*; map
           // them back explicitly so a top-level image (or one inside a column)
           // round-trips them. Without a parseHTML the default reads the bare

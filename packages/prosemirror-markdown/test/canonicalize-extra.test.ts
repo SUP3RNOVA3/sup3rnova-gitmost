@@ -6,7 +6,8 @@ import { canonicalizeContent, docsCanonicallyEqual } from 'docmost-client';
 
 // ---------------------------------------------------------------------------
 // Gaps NOT covered by canonicalize.test.ts (test-strategy report §2 diff):
-//   - the *.align family (drawio/excalidraw/video/youtube/embed): a "center"
+//   - the *.align family (drawio/excalidraw/video/youtube/embed AND image, whose
+//     align default is unified to "center" per #293 canon #4): a "center"
 //     default is dropped, a non-default value is kept;
 //   - comment.resolved: TRUE is PRESERVED (only resolved:false is normalized);
 //   - link.target / link.rel NON-default values are kept;
@@ -39,21 +40,27 @@ describe('canonicalizeContent — *.align default family', () => {
     });
   }
 
-  it('image align is NOT in KNOWN_DEFAULTS: a non-null align survives, null is dropped', () => {
-    // image.align defaults to null, so it is handled by the null-drop rule and
-    // a real value ("left") must be kept (no spurious default match).
+  it('image align default is now "center" (#293 canon #4): center/null dropped, left kept', () => {
+    // A real non-default value ("left") must be kept.
     const kept = canonicalizeContent({
       type: 'image',
       attrs: { id: 'i-1', src: '/a.png', align: 'left' },
     });
     expect(kept.attrs).toEqual({ src: '/a.png', align: 'left' });
-    // An image with align:"center" must KEEP it (center is NOT a default for
-    // image, only for the diagram/media family) — guards against over-matching.
+    // #293 canon #4 unified the image align default to "center" (matching
+    // editor-ext), so a center image now DROPS align exactly like the diagram/
+    // media family — bare `![](src)` images stay canonically clean.
     const center = canonicalizeContent({
       type: 'image',
       attrs: { id: 'i-2', src: '/b.png', align: 'center' },
     });
-    expect(center.attrs).toEqual({ src: '/b.png', align: 'center' });
+    expect(center.attrs).toEqual({ src: '/b.png' });
+    // A null align is likewise dropped (null-drop rule) and re-imports as center.
+    const nullAlign = canonicalizeContent({
+      type: 'image',
+      attrs: { id: 'i-3', src: '/c.png', align: null },
+    });
+    expect(nullAlign.attrs).toEqual({ src: '/c.png' });
   });
 });
 

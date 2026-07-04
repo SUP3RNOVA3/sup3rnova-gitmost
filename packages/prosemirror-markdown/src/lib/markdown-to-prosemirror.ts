@@ -335,6 +335,12 @@ function bridgeTaskLists(html: string): string {
  *     (same rendered line as visible content). The only handled key is
  *     `textAlign`, re-expressed as an inline `text-align` style on the parent,
  *     which the docmost-schema textAlign global attribute reads back.
+ *   - ATTACHED image comments (#4 `img`): a comment bound to an `<img>` (its
+ *     previous element sibling), e.g. `![](src) <!--img {"align":"left"}-->`
+ *     rendered as `<p><img> <!--img …--></p>`. Each decoded key is written as
+ *     the DOM attribute the image schema's parseHTML reads back (align/width/
+ *     height/data-size/data-aspect-ratio/data-attachment-id/data-caption/title).
+ *     An `img` comment with no adjacent <img> is INERT.
  *   - STANDALONE machinery comments (#5 `subpages`/`pagebreak`): a lone comment
  *     line, which `marked` renders as an HTML block so jsdom makes it a DIRECT
  *     child of `<body>`. These are replaced with the schema-matching block div
@@ -404,6 +410,38 @@ function applyCommentDirectives(html: string): string {
         comment.remove();
         leadingDivs.push(div);
       }
+      continue;
+    }
+
+    if (parsed.name === "img") {
+      // #293 canon #4 ATTACHED image attrs. `![](src) <!--img {…}-->` renders
+      // as `<p><img …> <!--img …--></p>`, so the comment's target is the nearest
+      // preceding <img> — its previousElementSibling. An `img` comment with no
+      // adjacent <img> (e.g. a standalone `<!--img-->` at body level, or one
+      // whose previous sibling is not an image) is INERT.
+      const prev = comment.previousElementSibling as any;
+      const target =
+        prev && String(prev.tagName || "").toLowerCase() === "img"
+          ? prev
+          : null;
+      if (!target) continue; // no adjacent <img> -> inert
+      // Re-express each decoded key as the DOM attribute the schema's image
+      // parseHTML reads back (docmost-schema.ts image attrs). Unknown keys are
+      // ignored (fail-open); a bad JSON body already returned null above.
+      const a = parsed.attrs;
+      if (typeof a.align === "string" && a.align)
+        target.setAttribute("align", a.align);
+      if (a.width != null) target.setAttribute("width", String(a.width));
+      if (a.height != null) target.setAttribute("height", String(a.height));
+      if (a.size != null) target.setAttribute("data-size", String(a.size));
+      if (a.aspectRatio != null)
+        target.setAttribute("data-aspect-ratio", String(a.aspectRatio));
+      if (a.attachmentId != null)
+        target.setAttribute("data-attachment-id", String(a.attachmentId));
+      if (a.caption != null)
+        target.setAttribute("data-caption", String(a.caption));
+      if (a.title != null) target.setAttribute("title", String(a.title));
+      comment.remove();
       continue;
     }
 

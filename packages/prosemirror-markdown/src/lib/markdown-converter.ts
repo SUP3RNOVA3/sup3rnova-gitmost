@@ -364,38 +364,49 @@ export function convertProseMirrorToMarkdown(content: any): string {
 
       case "image": {
         const imgAttrs = node.attrs || {};
-        // A top-level image with layout/identity attrs beyond src/alt cannot be
-        // expressed by markdown `![](src)` — width/height/align/size/
-        // attachmentId/aspectRatio would be silently dropped on export and lost
-        // on re-import. Emit the SAME schema-matching <img> used inside columns
-        // (imageToHtml) so those attrs survive the round-trip. A bare image
-        // (only src/alt, optionally a title — which has no schema attr) keeps
-        // the lighter markdown form so existing image round-trip tests hold.
-        const hasLayoutAttrs =
-          imgAttrs.width != null ||
-          imgAttrs.height != null ||
-          imgAttrs.align ||
-          imgAttrs.size != null ||
-          imgAttrs.attachmentId ||
-          imgAttrs.aspectRatio != null ||
-          // A caption (issue #221) cannot be expressed by markdown `![](src)`,
-          // so route a captioned image through imageToHtml's raw <img> form
-          // (data-caption) — the same lossless form used for the other
-          // Docmost-specific image attrs.
-          imgAttrs.caption;
-        if (hasLayoutAttrs) {
-          return imageToHtml(node);
-        }
+        // #293 canon #4: a top-level image ALWAYS serializes as `![alt](src)`.
+        // Non-default layout/identity attrs (which markdown `![](src)` cannot
+        // express — width/height/align/size/attachmentId/aspectRatio/caption/
+        // title) are carried in an attached `<!--img {…}-->` comment on the SAME
+        // line, materialized back onto the <img> by markdown-to-prosemirror's
+        // applyCommentDirectives before generateJSON drops the comment.
         const imgAlt = imgAttrs.alt || "";
         // Neutralize characters that could break out of the markdown image
         // URL: spaces/newlines and parentheses would terminate the (...) target
         // and let a stored src inject following markdown/HTML. Percent-encode
         // them so the URL stays a single inert token.
         const imgSrc = encodeMdUrl(imgAttrs.src);
-        // A bare image (only src/alt, optionally a title) has no caption, so the
-        // lighter markdown form is lossless here; captioned images took the
-        // imageToHtml branch above.
-        return `![${imgAlt}](${imgSrc})`;
+        const base = `![${imgAlt}](${imgSrc})`;
+        // Build the img-comment JSON from the NON-DEFAULT attrs only, in a
+        // STABLE key order so the output is deterministic. An attr equal to its
+        // schema default is NOT emitted (predicate over the canonicalized attrs).
+        const json: Record<string, unknown> = {};
+        // Numeric sizing attrs are coerced to string in the payload: the import
+        // side (applyCommentDirectives) writes them as DOM attributes and the
+        // schema's parseHTML reads them back as strings, so a numeric value would
+        // otherwise round-trip as `420 -> "420"` and produce a one-time spurious
+        // git diff. Emitting the string form up front keeps the round-trip
+        // byte-stable whether the source attr was a number or a string (mirrors
+        // the legacy imageToHtml, which stringified via `width="…"`).
+        if (imgAttrs.width != null) json.width = String(imgAttrs.width);
+        if (imgAttrs.height != null) json.height = String(imgAttrs.height);
+        // align default is unified to "center" (#293 canon #4): treat BOTH null
+        // and "center" as the default and omit them, so a bare/center image stays
+        // clean `![](src)` and only left/right emits `"align"`.
+        if (imgAttrs.align != null && imgAttrs.align !== "center")
+          json.align = imgAttrs.align;
+        if (imgAttrs.size != null) json.size = String(imgAttrs.size);
+        if (imgAttrs.aspectRatio != null)
+          json.aspectRatio = String(imgAttrs.aspectRatio);
+        if (imgAttrs.attachmentId) json.attachmentId = imgAttrs.attachmentId;
+        if (imgAttrs.caption) json.caption = imgAttrs.caption;
+        if (imgAttrs.title) json.title = imgAttrs.title;
+        // No non-default attrs -> bare image, no trailing space, no comment.
+        if (Object.keys(json).length === 0) return base;
+        // attachedCommentFor defuses any `--` in a value (e.g. a caption that
+        // contains the comment-closing `-->`) so the payload can never close the
+        // HTML comment early; JSON.parse on the import side restores it verbatim.
+        return `${base} ${attachedCommentFor("img", json)}`;
       }
 
       case "video": {
@@ -905,7 +916,11 @@ export function convertProseMirrorToMarkdown(content: any): string {
     if (attrs.title) parts.push(`title="${escapeAttr(attrs.title)}"`);
     if (attrs.width != null) parts.push(`width="${escapeAttr(attrs.width)}"`);
     if (attrs.height != null) parts.push(`height="${escapeAttr(attrs.height)}"`);
-    if (attrs.align) parts.push(`align="${escapeAttr(attrs.align)}"`);
+    // #293 canon #4: image align default is unified to "center", so a center
+    // (or unset) image no longer emits a redundant align="center" here — only a
+    // genuinely non-default alignment (left/right) is written.
+    if (attrs.align && attrs.align !== "center")
+      parts.push(`align="${escapeAttr(attrs.align)}"`);
     if (attrs.size != null) parts.push(`data-size="${escapeAttr(attrs.size)}"`);
     if (attrs.attachmentId)
       parts.push(`data-attachment-id="${escapeAttr(attrs.attachmentId)}"`);
