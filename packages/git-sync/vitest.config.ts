@@ -18,6 +18,25 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
+    // Coverage gate (issue #324). The v8 provider is used deliberately: the
+    // istanbul provider instruments sources by rewriting their AST, which broke
+    // on the ESM `@docmost/editor-ext` barrel import; v8 collects native
+    // coverage from the runtime and never re-parses ESM, so it sidesteps that.
+    // Thresholds are calibrated a few points BELOW the level measured on
+    // develop so the gate passes today but fails on a real regression. Numbers
+    // reflect the files actually exercised by the suite (`all: false`).
+    coverage: {
+      enabled: true,
+      provider: 'v8',
+      reporter: ['text-summary', 'text'],
+      all: false,
+      thresholds: {
+        statements: 88,
+        branches: 75,
+        functions: 72,
+        lines: 88,
+      },
+    },
     // Runtime suites. The `.test.ts` glob deliberately EXCLUDES the type-only
     // contract file (`*.test-d.ts`), which is enforced by the typecheck pass
     // below instead — so the 35 runtime suites are never typechecked.

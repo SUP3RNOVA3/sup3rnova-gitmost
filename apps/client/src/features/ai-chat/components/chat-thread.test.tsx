@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 
 // Shared, hoisted mock state so the @ai-sdk/react and "ai" module mocks (hoisted
@@ -138,5 +138,93 @@ describe("ChatThread — send now (#198)", () => {
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
     const prep = h.state.transport!.prepareSendMessagesRequest;
     expect(prep({ messages: [], body: {} }).body.interrupted).toBe(false);
+  });
+});
+
+// The turn-end decision lives in the `onFinish` handler: given the terminal
+// outcome of a turn (`isAbort` / `isDisconnect` / `isError`, or none = clean),
+// it decides whether to CONTINUE (flush the next queued message) or END (leave
+// the queue intact for the user), and which stop notice — if any — to show.
+// `sendNow` is exercised above; these tests pin down the plain outcomes.
+describe("ChatThread — turn-end decision (onFinish)", () => {
+  beforeEach(() => {
+    h.state.status = "streaming";
+    h.state.onFinish = null;
+    h.state.sendMessage.mockClear();
+    h.state.stop.mockClear();
+    h.state.transport = null;
+  });
+
+  // Drive a fresh onFinish with the given terminal flags after queueing a
+  // message, and report both what the parent was told and whether the queue was
+  // flushed (a resend to the sendMessage spy).
+  function finishWith(flags: {
+    isAbort?: boolean;
+    isDisconnect?: boolean;
+    isError?: boolean;
+  }) {
+    // Tear down any prior render so the loop-driven "every outcome" case does
+    // not leave duplicate queue buttons in the DOM.
+    cleanup();
+    h.state.sendMessage.mockClear();
+    const { onTurnFinished } = renderThread();
+    // Populate the queue while the turn is streaming.
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+        ...flags,
+      });
+    });
+    return { onTurnFinished };
+  }
+
+  it("CONTINUES — flushes the next queued message on a clean finish", () => {
+    finishWith({});
+    // Clean finish (no terminal flag): the queued message is auto-sent.
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+    // A clean finish shows no stop notice.
+    expect(screen.queryByText("Response stopped.")).toBeNull();
+  });
+
+  it("ENDS — keeps the queue intact on a user abort and shows the stopped notice", () => {
+    finishWith({ isAbort: true });
+    // A plain Stop (not the sendNow interrupt path) must NOT auto-resend: the
+    // queue is preserved for the user to decide.
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    expect(screen.getByText("Response stopped.")).toBeTruthy();
+  });
+
+  it("ENDS — keeps the queue intact on a disconnect and shows the connection-lost notice", () => {
+    finishWith({ isDisconnect: true });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("Connection lost — the answer was interrupted."),
+    ).toBeTruthy();
+  });
+
+  it("ENDS — keeps the queue intact on a stream error (no auto-retry, no stopped notice)", () => {
+    finishWith({ isError: true });
+    // Blindly retrying after a failure would be wrong; the queue is left alone.
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    // isError clears the neutral notice (the error banner covers this case).
+    expect(screen.queryByText("Response stopped.")).toBeNull();
+  });
+
+  it("notifies the parent on EVERY terminal outcome", () => {
+    // The chat-list refresh / new-chat id adoption must run on success and on
+    // every failure path alike.
+    for (const flags of [
+      {},
+      { isAbort: true },
+      { isDisconnect: true },
+      { isError: true },
+    ]) {
+      const { onTurnFinished } = finishWith(flags);
+      expect(onTurnFinished).toHaveBeenCalled();
+    }
   });
 });
