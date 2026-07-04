@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#119)
 - **Place several images side by side in a row.** A new "Inline (side by
   side)" alignment mode in the image bubble menu renders consecutive inline
-  images as a row that wraps onto the next line on narrow screens. Unlike the
-  float modes, text does not wrap around inline images. The mode round-trips
+  images as a row that wraps onto the next line on narrow screens. The row is
+  centered horizontally by default in modern browsers (CSS `:has()`), falling
+  back to start-aligned rows in browsers without support. Unlike the float
+  modes, text does not wrap around inline images. The mode round-trips
   losslessly through markdown as `data-align`, like the other alignment
   values.
 
@@ -98,6 +100,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the `||text||` input rule; the rendered span blurs until clicked to reveal.
   The mark is preserved losslessly through Markdown export/import (as a raw
   `<span data-spoiler="true">…</span>`) and on public shares. (#259)
+- **Dock the AI chat window into the side menu.** The floating chat window can
+  be pinned to the sidebar — drag it onto the navbar (a drop-zone highlight
+  shows where it lands) or use the new "Dock to sidebar" header button; while
+  docked it fills the sidebar area and follows its live size. "Undock" (or
+  dragging it back out) restores the floating window, a collapsed/absent
+  sidebar falls back to floating, and the docked state survives a reload.
+  (#276, #282)
+- **Hovering commented text shows the comment thread in a tooltip.** Pointing
+  at a highlighted comment mark pops a small card with the author and plain
+  text of the root comment and its replies, so a thread can be skimmed without
+  opening the side panel. The card appears after a short delay (no flicker on a
+  passing glance), skips resolved and text-less threads, and dismisses on
+  scroll or click — clicking a mark still opens the comments panel. (#268,
+  #271)
+- **"Move to trash" button in the temporary-note banner.** Besides "Make
+  permanent", the banner on an open temporary note now also offers to trash the
+  note immediately instead of waiting out its lifetime. It reuses the regular
+  soft-delete path, so the "Page moved to trash" undo toast is the safety net —
+  no confirmation dialog. (#273, #277)
+- **Code-block controls float as an overlay instead of taking a row above the
+  code.** The language selector and copy button now sit in the block's top-right
+  corner, and the selector stays invisible until the block is hovered or the
+  selector is focused, so reading code is chrome-free. In read-only views only
+  the copy button renders. (#275, #278)
+- **The AI agent is told about your page edits between turns.** The server
+  snapshots the open page's Markdown at the end of every agent turn and, on the
+  next turn, injects a unified diff of what changed in between, so the agent
+  knows its earlier copy of the page is stale and builds on the user's edits
+  instead of reverting or overwriting them. The diff is whitespace-normalized
+  (pure formatting churn injects nothing) and size-capped, with a hint to
+  re-read the full page via `getPage` when truncated. (#274, #281)
+- **Stress-accent button (U+0301) in the bubble menu.** Select a vowel and
+  toggle a combining acute accent over it — a Russian-style stress mark. The
+  accent is stored as plain text (no custom mark), so it survives Markdown/HTML
+  export, full-text search and public shares unchanged; the toggle is a single
+  undo step and re-clicking removes the accent. (#270, #280)
+- **Reading position survives a reload.** The editor remembers how far you
+  scrolled in each page (per tab, in `sessionStorage`) and restores that
+  position after an F5 or reopening the document, waiting for the collaborative
+  content to finish laying out first. A URL `#hash` anchor still wins — restore
+  is a no-op then. (#266, #267)
+- **The slash menu finds commands typed in the wrong keyboard layout.** A query
+  typed with the wrong layout active (e.g. `/сщву` for `/code`, or `/cyjcrf`
+  for the Cyrillic «сноска» → Footnote) is additionally remapped ЙЦУКЕН↔QWERTY
+  by physical key position and matched against the commands; genuine Cyrillic
+  search terms keep priority over remapped candidates, and short wrong-layout
+  prefixes match by command title. (#283, #285, #287)
 
 ### Changed
 
@@ -163,6 +212,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   emits a single-use "intentional clear" signal that lets exactly that one empty
   write through the guard, so genuinely emptying a page is persisted while
   accidental empties are blocked. (#248, #251)
+- **Ctrl+Z works again right after using a table menu.** Closing a table
+  row/column menu (grip or chevron) left focus on the menu's portaled target
+  outside the editor, so undo keystrokes went nowhere until you clicked back
+  into a cell. The editor is now refocused after the menu closes — unless you
+  deliberately moved focus to another input or editable (e.g. the page title).
+  (#269, #279)
+- **The AI reindex progress counter no longer freezes at 0.** Right after
+  "Reindex now" the client could read the stale pre-reindex snapshot of an
+  already-indexed workspace (`reindexing=false`, all pages counted) as
+  "finished" and stop polling on the very first tick, leaving the counter
+  frozen until a manual reload. Polling now keeps going until it has actually
+  observed the active run. (#262, #264)
+- **An MCP edit can no longer be silently lost to a duplicate collab document.**
+  When the agent addressed a page by its short slugId, the MCP opened a
+  collaboration document named after that slugId while the web editor always
+  uses the page's canonical UUID — two independent live documents for one page,
+  whose debounced stores clobbered each other. The MCP now resolves every page
+  id to the canonical UUID before opening the collab doc (a UUID input
+  short-circuits locally; a slugId is resolved once and cached). (#260, #265)
 
 ### Security
 

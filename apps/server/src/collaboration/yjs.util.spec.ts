@@ -10,6 +10,7 @@ import {
   setYjsMark,
   removeYjsMarkByAttribute,
   updateYjsMarkAttribute,
+  replaceYjsMarkedText,
   type YjsSelection,
 } from './yjs.util';
 
@@ -273,6 +274,259 @@ describe('updateYjsMarkAttribute', () => {
       { resolved: true },
     );
 
+    expect(text.toDelta()).toEqual(before);
+  });
+});
+
+describe('replaceYjsMarkedText', () => {
+  // Build a single-paragraph XmlText from runs. Insert the whole string as
+  // plain text FIRST, then format only the marked ranges — otherwise text
+  // inserted right after a marked run inherits its comment mark (Yjs carries
+  // formatting from the left insertion boundary).
+  function buildRuns(
+    runs: Array<{
+      text: string;
+      comment?: { commentId: string; resolved: boolean };
+    }>,
+  ): { fragment: Y.XmlFragment; text: Y.XmlText } {
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment('default');
+    const para = new Y.XmlElement('paragraph');
+    fragment.insert(0, [para]);
+    const text = new Y.XmlText();
+    para.insert(0, [text]);
+    text.insert(0, runs.map((r) => r.text).join(''));
+    let offset = 0;
+    for (const run of runs) {
+      if (run.comment) {
+        text.format(offset, run.text.length, { comment: run.comment });
+      }
+      offset += run.text.length;
+    }
+    return { fragment, text };
+  }
+
+  // Two paragraphs, each with its own XmlText, both marked with the same
+  // commentId — mirrors a suggestion anchor that got split across blocks.
+  function buildTwoParagraphs(
+    a: { text: string; comment?: { commentId: string; resolved: boolean } },
+    b: { text: string; comment?: { commentId: string; resolved: boolean } },
+  ): { fragment: Y.XmlFragment; textA: Y.XmlText; textB: Y.XmlText } {
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment('default');
+    const build = (seg: typeof a) => {
+      const para = new Y.XmlElement('paragraph');
+      const text = new Y.XmlText();
+      para.insert(0, [text]);
+      text.insert(0, seg.text);
+      if (seg.comment) {
+        text.format(0, seg.text.length, { comment: seg.comment });
+      }
+      return { para, text };
+    };
+    const pa = build(a);
+    const pb = build(b);
+    fragment.insert(0, [pa.para, pb.para]);
+    return { fragment, textA: pa.text, textB: pb.text };
+  }
+
+  it('happy path: replaces marked text with newText and keeps the comment mark', () => {
+    const { fragment, text } = buildRuns([
+      { text: 'Hello ' },
+      { text: 'world', comment: { commentId: 'c1', resolved: false } },
+      { text: '!' },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'world', 'planet');
+
+    expect(result).toEqual({ applied: true, currentText: 'planet' });
+    // New text carries the SAME comment mark; surrounding text is untouched.
+    expect(text.toDelta()).toEqual([
+      { insert: 'Hello ' },
+      {
+        insert: 'planet',
+        attributes: { comment: { commentId: 'c1', resolved: false } },
+      },
+      { insert: '!' },
+    ]);
+  });
+
+  it('matches by commentId even when the mark is resolved', () => {
+    const { fragment, text } = buildWithComments([
+      { text: 'foo', comment: { commentId: 'c9', resolved: true } },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c9', 'foo', 'bar');
+
+    expect(result).toEqual({ applied: true, currentText: 'bar' });
+    expect(text.toDelta()).toEqual([
+      {
+        insert: 'bar',
+        attributes: { comment: { commentId: 'c9', resolved: true } },
+      },
+    ]);
+  });
+
+  it('changed text: marked text differs from expected → no-op, doc unchanged', () => {
+    const { fragment, text } = buildWithComments([
+      { text: 'abc', comment: { commentId: 'c1', resolved: false } },
+    ]);
+    const before = text.toDelta();
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'expected', 'new');
+
+    expect(result).toEqual({ applied: false, currentText: 'abc' });
+    expect(text.toDelta()).toEqual(before);
+  });
+
+  // F1 regression: the marked doc text is TYPOGRAPHIC (smart quotes / em-dash)
+  // and expectedText equals that raw typographic text — as it now does, because
+  // the MCP client stores the RAW anchored substring (getAnchoredText) rather
+  // than the agent's ASCII input. The strict `joinedText !== expectedText`
+  // compare must therefore MATCH and the suggestion apply (not a spurious 409).
+  it('typographic marked text applies when expectedText is the raw typographic text', () => {
+    const marked = '“hello”—world';
+    const { fragment, text } = buildRuns([
+      { text: 'say ' },
+      { text: marked, comment: { commentId: 'c1', resolved: false } },
+      { text: '!' },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', marked, 'bye');
+
+    expect(result).toEqual({ applied: true, currentText: 'bye' });
+    expect(text.toDelta()).toEqual([
+      { insert: 'say ' },
+      {
+        insert: 'bye',
+        attributes: { comment: { commentId: 'c1', resolved: false } },
+      },
+      { insert: '!' },
+    ]);
+  });
+
+  it('anchor deleted: no mark with that commentId → { applied: false, currentText: null }', () => {
+    const { fragment, text } = buildWithComments([
+      { text: 'abc', comment: { commentId: 'c1', resolved: false } },
+    ]);
+    const before = text.toDelta();
+
+    const result = replaceYjsMarkedText(fragment, 'missing', 'abc', 'new');
+
+    expect(result).toEqual({ applied: false, currentText: null });
+    expect(text.toDelta()).toEqual(before);
+  });
+
+  it('paragraph split: same commentId in two XmlText nodes → no-op, doc unchanged', () => {
+    const { fragment, textA, textB } = buildTwoParagraphs(
+      { text: 'Hello ', comment: { commentId: 'c1', resolved: false } },
+      { text: 'world', comment: { commentId: 'c1', resolved: false } },
+    );
+    const beforeA = textA.toDelta();
+    const beforeB = textB.toDelta();
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'Hello world', 'new');
+
+    expect(result).toEqual({ applied: false, currentText: 'Hello world' });
+    expect(textA.toDelta()).toEqual(beforeA);
+    expect(textB.toDelta()).toEqual(beforeB);
+  });
+
+  it('interleaved unmarked text: marked run not contiguous → no-op, doc unchanged', () => {
+    const { fragment, text } = buildRuns([
+      { text: 'abc', comment: { commentId: 'c1', resolved: false } },
+      { text: 'X' },
+      { text: 'def', comment: { commentId: 'c1', resolved: false } },
+    ]);
+    const before = text.toDelta();
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'abcdef', 'new');
+
+    // Joined marked text ("abcdef") is returned, but the run is not contiguous.
+    expect(result).toEqual({ applied: false, currentText: 'abcdef' });
+    expect(text.toDelta()).toEqual(before);
+  });
+
+  it('preserves surrounding text and merges adjacent marked segments on apply', () => {
+    // The marked run itself is split into two adjacent delta segments; they must
+    // be treated as one contiguous run and replaced as a whole.
+    const { fragment, text } = buildRuns([
+      { text: 'pre ' },
+      { text: 'ab', comment: { commentId: 'c1', resolved: false } },
+      { text: 'cd', comment: { commentId: 'c1', resolved: false } },
+      { text: ' post' },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'abcd', 'Z');
+
+    expect(result).toEqual({ applied: true, currentText: 'Z' });
+    expect(text.toDelta()).toEqual([
+      { insert: 'pre ' },
+      {
+        insert: 'Z',
+        attributes: { comment: { commentId: 'c1', resolved: false } },
+      },
+      { insert: ' post' },
+    ]);
+  });
+
+  it('embed before the marked run: offset accounts for the embed unit → replaces the right text, embed intact', () => {
+    // "AB", then a Yjs embed (1 index unit), then marked "world". Before the
+    // fix the embed was skipped WITHOUT advancing offset, so the computed start
+    // for "world" was too low by 1 → delete/insert would have hit the embed/text
+    // instead of "world", mangling the embed. With the fix offset is correct.
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment('default');
+    const para = new Y.XmlElement('paragraph');
+    fragment.insert(0, [para]);
+    const text = new Y.XmlText();
+    para.insert(0, [text]);
+    text.insert(0, 'AB');
+    text.insertEmbed(2, { image: { src: 'x' } });
+    text.insert(3, 'world');
+    text.format(3, 'world'.length, {
+      comment: { commentId: 'c1', resolved: false },
+    });
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'world', 'planet');
+
+    expect(result).toEqual({ applied: true, currentText: 'planet' });
+    // "AB" untouched, embed still present and intact, "world" → "planet"
+    // carrying the SAME comment mark.
+    expect(text.toDelta()).toEqual([
+      { insert: 'AB' },
+      { insert: { image: { src: 'x' } } },
+      {
+        insert: 'planet',
+        attributes: { comment: { commentId: 'c1', resolved: false } },
+      },
+    ]);
+  });
+
+  it('embed inside the marked run: embed splits the run → non-contiguous → no-op, doc unchanged', () => {
+    // marked "abc", an embed, marked "def" — same commentId. The embed occupies
+    // one index unit between the two marked segments, so they are not contiguous
+    // → the guard rejects it and nothing is mutated (embed intact).
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment('default');
+    const para = new Y.XmlElement('paragraph');
+    fragment.insert(0, [para]);
+    const text = new Y.XmlText();
+    para.insert(0, [text]);
+    text.insert(0, 'abc');
+    text.insertEmbed(3, { image: { src: 'y' } });
+    text.insert(4, 'def');
+    text.format(0, 'abc'.length, {
+      comment: { commentId: 'c1', resolved: false },
+    });
+    text.format(4, 'def'.length, {
+      comment: { commentId: 'c1', resolved: false },
+    });
+    const before = text.toDelta();
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'abcdef', 'new');
+
+    expect(result).toEqual({ applied: false, currentText: 'abcdef' });
     expect(text.toDelta()).toEqual(before);
   });
 });

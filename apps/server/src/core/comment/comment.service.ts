@@ -1,7 +1,10 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
+  Inject,
   Injectable,
+  InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -26,6 +29,11 @@ import {
   AuthProvenanceData,
   agentSourceFields,
 } from '../../common/decorators/auth-provenance.decorator';
+import { AuditEvent, AuditResource } from '../../common/events/audit-events';
+import {
+  AUDIT_SERVICE,
+  IAuditService,
+} from '../../integrations/audit/audit.service';
 
 @Injectable()
 export class CommentService {
@@ -40,6 +48,7 @@ export class CommentService {
     private generalQueue: Queue,
     @InjectQueue(QueueName.NOTIFICATION_QUEUE)
     private notificationQueue: Queue,
+    @Inject(AUDIT_SERVICE) private auditService: IAuditService,
   ) {}
 
   async findById(commentId: string) {
@@ -78,15 +87,58 @@ export class CommentService {
       }
     }
 
+    // Do NOT lossily truncate at 250: for a suggestion the client sends the RAW
+    // anchored document substring (the exact text under the comment mark) as the
+    // selection, which can be LONGER than the agent's <=250-char typed input
+    // (normalization collapses whitespace/typographic runs, so the raw span can
+    // exceed the normalized selection). Truncating it shorter than the mark span
+    // would break the apply-time equality check and make the suggestion
+    // un-appliable. Keep a generous 2000-char safety bound (matching
+    // suggestedText) so a legitimate anchored substring is never cut.
+    const selection = createCommentDto?.selection?.substring(0, 2000) ?? null;
+
+    // A suggested edit rewrites the exact text under an inline comment mark, so
+    // it is only meaningful on a top-level inline comment that carries a
+    // selection, and only if the suggestion actually changes that text.
+    let suggestedText: string | null = null;
+    if (
+      createCommentDto.suggestedText !== undefined &&
+      createCommentDto.suggestedText !== null
+    ) {
+      if (createCommentDto.parentCommentId) {
+        throw new BadRequestException(
+          'A suggested edit can only be attached to a top-level comment, not a reply',
+        );
+      }
+      if (!selection || selection.trim().length === 0) {
+        throw new BadRequestException(
+          'A suggested edit requires an inline comment with a non-empty text selection',
+        );
+      }
+      const trimmed = createCommentDto.suggestedText.trim();
+      if (trimmed.length === 0) {
+        throw new BadRequestException('A suggested edit cannot be empty');
+      }
+      // A no-op suggestion (identical to the selection) is meaningless and would
+      // make "apply" indistinguishable from "already applied".
+      if (trimmed === selection.trim()) {
+        throw new BadRequestException(
+          'A suggested edit must differ from the selected text',
+        );
+      }
+      suggestedText = trimmed;
+    }
+
     const inserted = await this.commentRepo.insertComment({
       pageId: page.id,
       content: commentContent,
-      selection: createCommentDto?.selection?.substring(0, 250) ?? null,
+      selection,
       type: createCommentDto.type ?? 'page',
       parentCommentId: createCommentDto?.parentCommentId,
       creatorId: user.id,
       workspaceId: workspaceId,
       spaceId: page.spaceId,
+      suggestedText,
       // Agent-edit provenance: the user stays creatorId; this only annotates the
       // source. Normal user requests leave the column default ('user').
       ...agentSourceFields(provenance, 'createdSource', 'aiChatId'),
@@ -207,17 +259,27 @@ export class CommentService {
       false,
     );
 
-    comment.content = commentContent;
-    comment.editedAt = editedAt;
-    comment.updatedAt = editedAt;
+    // Re-fetch the enriched comment before broadcasting, symmetric with
+    // create()/resolveComment(). updateComment() above has already persisted the
+    // new content/timestamps, so this single-row read reflects the edit AND
+    // carries the same {agent,launcher} avatar stack (via includeCreator) as the
+    // other two broadcasts. This deliberately does NOT reuse the caller's
+    // pre-loaded `comment`: relying on the controller happening to load it with
+    // includeCreator:true is exactly the fragile coupling that let the agent
+    // stack silently vanish on edit once already (#300/#304) — a future caller
+    // dropping that flag must not regress the broadcast.
+    const updatedComment = await this.commentRepo.findById(comment.id, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
 
     this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
       operation: 'commentUpdated',
       pageId: comment.pageId,
-      comment,
+      comment: updatedComment,
     });
 
-    return comment;
+    return updatedComment;
   }
 
   async resolveComment(
@@ -284,6 +346,152 @@ export class CommentService {
       operation: 'commentResolved',
       pageId: comment.pageId,
       comment: updatedComment,
+    });
+
+    return updatedComment;
+  }
+
+  /**
+   * Apply the suggested edit carried by a top-level inline comment: atomically
+   * replace the text under the comment mark in the collaborative document with
+   * the comment's suggestedText, then stamp the applied fields and auto-resolve
+   * the thread. The controller authorizes (validateCanEdit); this re-checks the
+   * comment's own state so the invariant holds regardless of caller.
+   */
+  async applySuggestion(
+    comment: Comment,
+    user: User,
+    provenance?: AuthProvenanceData,
+  ): Promise<Comment> {
+    // Structural guards.
+    if (comment.parentCommentId) {
+      throw new BadRequestException(
+        'Only a top-level comment can carry a suggested edit',
+      );
+    }
+    if (!comment.suggestedText) {
+      throw new BadRequestException('This comment has no suggested edit to apply');
+    }
+    // State guards. Order matters — the already-applied check precedes the
+    // resolved check because an applied comment is normally also resolved.
+    //
+    // Already applied → IDEMPOTENT SUCCESS (issue #315 DoD: double-click /
+    // two-user race → idempotent "already applied", NOT a 409). The suggestion
+    // is already in the document, so do NOT call the collab gateway again.
+    // finalizeAppliedSuggestion re-fetches/broadcasts the same success shape as
+    // the applied branch and, when the thread is still open (the rare "applied
+    // but not resolved" crash window), self-heals it via resolveComment.
+    if (comment.suggestionAppliedAt) {
+      return this.finalizeAppliedSuggestion(comment, user, provenance);
+    }
+    // Not-yet-applied on a resolved thread → reject. The client hides the apply
+    // button once a thread is resolved; this is the defensive server check.
+    if (comment.resolvedAt) {
+      throw new BadRequestException(
+        'Cannot apply a suggested edit on a resolved comment thread',
+      );
+    }
+
+    // Derive the document name the same way create()/resolveComment() do for
+    // the comment marks: `page.${pageId}`.
+    const documentName = `page.${comment.pageId}`;
+
+    let verdict: { applied: boolean; currentText: string | null } | undefined;
+    try {
+      verdict = await this.collaborationGateway.handleYjsEvent(
+        'applyCommentSuggestion',
+        documentName,
+        {
+          commentId: comment.id,
+          expectedText: comment.selection,
+          newText: comment.suggestedText,
+          user,
+        },
+      );
+    } catch (error) {
+      // A throwing gateway (or the phase-3 fallback failing) is a hard error —
+      // never silently succeed, the document may or may not have changed.
+      this.logger.error(
+        `Failed to apply suggested edit for comment ${comment.id}`,
+        error,
+      );
+      throw new InternalServerErrorException('Failed to apply the suggested edit');
+    }
+
+    if (!verdict) {
+      // Should not happen given the phase-3 fallback; treat as a hard error
+      // rather than assuming success.
+      throw new InternalServerErrorException('Failed to apply the suggested edit');
+    }
+
+    if (verdict.applied === true) {
+      return this.finalizeAppliedSuggestion(comment, user, provenance);
+    }
+
+    // Idempotent branch: the mutation didn't run now, but the text under the
+    // mark is ALREADY the suggested text (double-click, two-user race, or a
+    // crash between the doc mutation and the DB write). Reconcile the DB /
+    // resolved state and report success — do NOT 409.
+    if (
+      verdict.applied === false &&
+      verdict.currentText === comment.suggestedText
+    ) {
+      return this.finalizeAppliedSuggestion(comment, user, provenance);
+    }
+
+    // The commented text changed since the suggestion was made. Surface the
+    // current text so the client can tell the user what it is now.
+    throw new ConflictException({
+      message:
+        'The commented text changed since this suggestion was made; it was not applied.',
+      currentText: verdict.currentText,
+    });
+  }
+
+  /**
+   * Persist the applied stamps (idempotently), auto-resolve the thread and
+   * broadcast + audit the applied suggestion. Shared by the applied and the
+   * idempotent "already-applied" branches of applySuggestion.
+   */
+  private async finalizeAppliedSuggestion(
+    comment: Comment,
+    user: User,
+    provenance?: AuthProvenanceData,
+  ): Promise<Comment> {
+    if (!comment.suggestionAppliedAt) {
+      await this.commentRepo.updateComment(
+        {
+          suggestionAppliedAt: new Date(),
+          suggestionAppliedById: user.id,
+        },
+        comment.id,
+      );
+    }
+
+    // Auto-resolve the thread. resolveComment handles the resolve mark, its ws
+    // broadcast and the resolve notification. The guard above guarantees the
+    // thread was open when we entered, but stay defensive on re-entry.
+    if (!comment.resolvedAt) {
+      await this.resolveComment(comment, true, user, provenance);
+    }
+
+    const updatedComment = await this.commentRepo.findById(comment.id, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
+
+    this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
+      operation: 'commentUpdated',
+      pageId: comment.pageId,
+      comment: updatedComment,
+    });
+
+    this.auditService.log({
+      event: AuditEvent.COMMENT_SUGGESTION_APPLIED,
+      resourceType: AuditResource.COMMENT,
+      resourceId: comment.id,
+      spaceId: comment.spaceId,
+      metadata: { pageId: comment.pageId },
     });
 
     return updatedComment;

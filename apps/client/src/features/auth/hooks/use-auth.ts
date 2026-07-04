@@ -23,6 +23,7 @@ import { acceptInvitation } from "@/features/workspace/services/workspace-servic
 import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
 import { RESET } from "jotai/utils";
 import { useTranslation } from "react-i18next";
+import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
 
 export default function useAuth() {
   const { t } = useTranslation();
@@ -122,6 +123,11 @@ export default function useAuth() {
 
   const handleLogout = async () => {
     setCurrentUser(RESET);
+    // Purge the persisted sidebar tree caches (they contain page titles) so the
+    // cached page titles aren't left readable in localStorage on a shared
+    // machine. (Only the tree caches are swept; other localStorage entries
+    // remain.)
+    clearPersistedTreeCaches();
     await logout();
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
   };

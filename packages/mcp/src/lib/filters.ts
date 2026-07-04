@@ -75,6 +75,11 @@ export function filterComment(comment: any, markdownContent?: string) {
     editedAt: comment.editedAt || null,
     resolvedAt: comment.resolvedAt || null,
     resolvedById: comment.resolvedById || null,
+    // Suggestion state: the proposed replacement text (if any) and, once a human
+    // applies it via the UI, when and by whom.
+    suggestedText: comment.suggestedText || null,
+    suggestionAppliedAt: comment.suggestionAppliedAt || null,
+    suggestionAppliedById: comment.suggestionAppliedById || null,
   };
 }
 

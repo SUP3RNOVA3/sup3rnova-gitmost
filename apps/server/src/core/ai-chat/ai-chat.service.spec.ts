@@ -356,6 +356,32 @@ describe('flushAssistant', () => {
     expect(flushed.toolCalls).not.toBeNull();
     expect(flushed.metadata.error).toBe('boom');
   });
+
+  // #274 observability: the page-change diff the agent saw this turn is persisted
+  // to metadata.pageChanged when a non-empty diff was injected, and omitted when
+  // the diff is empty/whitespace or the arg is not supplied.
+  it('persists metadata.pageChanged when a non-empty diff was injected', () => {
+    const f = flushAssistant([], '', 'completed', {
+      pageChanged: { title: 'Doc', diff: '@@ -1 +1 @@\n-old\n+new' },
+    });
+    expect(f.metadata.pageChanged).toEqual({
+      title: 'Doc',
+      diff: '@@ -1 +1 @@\n-old\n+new',
+    });
+  });
+
+  it('omits metadata.pageChanged for an empty/whitespace diff or a missing arg', () => {
+    const whitespace = flushAssistant([], '', 'completed', {
+      pageChanged: { title: 'Doc', diff: '   \n  ' },
+    });
+    expect('pageChanged' in whitespace.metadata).toBe(false);
+
+    const nullArg = flushAssistant([], '', 'completed', { pageChanged: null });
+    expect('pageChanged' in nullArg.metadata).toBe(false);
+
+    const omitted = flushAssistant([], '', 'streaming');
+    expect('pageChanged' in omitted.metadata).toBe(false);
+  });
 });
 
 /**

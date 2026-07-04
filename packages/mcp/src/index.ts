@@ -38,7 +38,7 @@ const VERSION = packageJson.version;
 // Editing guide surfaced to MCP clients in the initialize result so they can
 // pick the right tool by intent and avoid resending whole documents.
 const SERVER_INSTRUCTIONS =
-  "Docmost editing guide — choose the tool by intent: fix wording/typos/numbers (text inside blocks) -> edit_page_text (no node id needed). Change ONE block (paragraph/heading/callout/table cell/etc.) structurally -> patch_node (address by attrs.id from get_page_json). Add a block -> insert_node (before/after a block by attrs.id or by anchor text, or append). Remove a block -> delete_node (by attrs.id). Images -> insert_image (add an image from a web URL) / replace_image (swap an existing image for one from a web URL). New page -> create_page (Markdown). Bulk/structural rewrite or nodes without an id -> update_page_json (full ProseMirror replace; prefer the granular tools above to avoid resending the whole ~100KB+ document). Copy/replace a page's whole content from another page (server-side, no document through the model) -> copy_page_content. Rename a page (title only) -> rename_page. Read -> get_page (Markdown, lossy) or get_page_json (lossless ProseMirror with block ids). Comments -> create_comment (always inline; requires an EXACT selection — the contiguous text to anchor/highlight on; fails rather than leaving an unanchored comment), list_comments, update_comment, resolve_comment (resolve/reopen a thread, reversible — prefer over delete to close), delete_comment, check_new_comments. Tip: read block ids via get_page_json, then use patch_node/insert_node/delete_node so you never resend the full document. " +
+  "Docmost editing guide — choose the tool by intent: fix wording/typos/numbers (text inside blocks) -> edit_page_text (no node id needed). Change ONE block (paragraph/heading/callout/table cell/etc.) structurally -> patch_node (address by attrs.id from get_page_json). Add a block -> insert_node (before/after a block by attrs.id or by anchor text, or append). Remove a block -> delete_node (by attrs.id). Images -> insert_image (add an image from a web URL) / replace_image (swap an existing image for one from a web URL). New page -> create_page (Markdown). Bulk/structural rewrite or nodes without an id -> update_page_json (full ProseMirror replace; prefer the granular tools above to avoid resending the whole ~100KB+ document). Copy/replace a page's whole content from another page (server-side, no document through the model) -> copy_page_content. Rename a page (title only) -> rename_page. Read -> get_page (Markdown, lossy) or get_page_json (lossless ProseMirror with block ids). Comments -> create_comment (always inline; requires an EXACT selection — the contiguous text to anchor/highlight on; fails rather than leaving an unanchored comment), list_comments, update_comment, resolve_comment (resolve/reopen a thread, reversible — prefer over delete to close), delete_comment, check_new_comments. Propose a concrete text fix for one-click human approval -> create_comment with suggestedText (the exact plain-text replacement for the selection; the selection must then be UNIQUE in the page — extend it with context if needed); prefer this over editing directly when the change is subjective or needs the author's sign-off. Tip: read block ids via get_page_json, then use patch_node/insert_node/delete_node so you never resend the full document. " +
   "Complex/scripted rewrite (multiple coordinated edits, footnotes, renumbering) -> docmost_transform: write a JS `(doc, ctx) => doc` transform, preview the diff with dryRun (default), then apply with dryRun:false; ctx.helpers includes commentsToFootnotes for turning inline comments into numbered footnotes. " +
   "Review what changed -> diff_page_versions (compare a historyId to current, or two history versions). See a page's saved versions -> list_page_history. Undo a bad edit -> restore_page_version (writes a past version back as current; itself revertible). " +
   "Lossless markdown round-trip (download, edit, re-upload, incl. comment anchors) -> export_page_markdown / import_page_markdown.";
@@ -105,6 +105,10 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   });
 
 // Tool: list_pages
+// INTENTIONAL per-transport divergence (not in the shared registry): this
+// transport exposes a `tree:true` mode that returns the full nested hierarchy;
+// the in-app copy keeps the same tree option but is worded for the in-app agent.
+// Kept per-layer so each side can tune its own guidance.
 server.registerTool(
   "list_pages",
   {
@@ -195,6 +199,10 @@ server.registerTool(
 );
 
 // Tool: table_insert_row
+// NOT in the shared registry: this transport names the table argument `table`,
+// while the in-app tool names it `tableRef` (ai-chat-tools.service.ts). Sharing
+// one buildShape would rename a public MCP parameter, so the table row/cell
+// tools stay per-transport by design.
 server.registerTool(
   "table_insert_row",
   {
@@ -222,6 +230,8 @@ server.registerTool(
 );
 
 // Tool: table_delete_row
+// NOT shared — same `table` (here) vs `tableRef` (in-app) parameter-name
+// divergence as table_insert_row.
 server.registerTool(
   "table_delete_row",
   {
@@ -243,6 +253,8 @@ server.registerTool(
 );
 
 // Tool: table_update_cell
+// NOT shared — same `table` (here) vs `tableRef` (in-app) parameter-name
+// divergence as table_insert_row.
 server.registerTool(
   "table_update_cell",
   {
@@ -445,32 +457,11 @@ server.registerTool(
   },
 );
 
-// Tool: patch_node
-server.registerTool(
-  "patch_node",
-  {
-    description:
-      "Replaces a single block identified by its attrs.id WITHOUT resending the " +
-      "whole document. Get the block id from get_page_json, then pass a " +
-      "ProseMirror node to put in its place. Example node: a paragraph " +
-      '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
-      'heading {"type":"heading","attrs":{"level":2},"content":' +
-      '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
-      '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
-      "JSON object or a JSON string (both accepted). Cheaper and safer than " +
-      "update_page_json for one-block structural edits.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      nodeId: z.string().min(1),
-      node: z
-        .any()
-        .describe(
-          "ProseMirror node to put in place of the node with this id, e.g. " +
-            '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
-            "JSON object or JSON string both accepted.",
-        ),
-    },
-  },
+// Tool: patch_node — schema + description from the shared registry (identical
+// across both transports). The execute body keeps its own parseNodeArg
+// normalization (the model sometimes serializes `node` as a JSON string).
+registerShared(
+  SHARED_TOOL_SPECS.patchNode,
   async ({ pageId, nodeId, node }) => {
     const parsedNode = parseNodeArg(node);
     const result = await docmostClient.patchNode(pageId, nodeId, parsedNode);
@@ -478,42 +469,10 @@ server.registerTool(
   },
 );
 
-// Tool: insert_node
-server.registerTool(
-  "insert_node",
-  {
-    description:
-      "Insert a block before/after another block (by attrs.id or anchor text) " +
-      "or append at the end. Get anchor block ids from get_page_json. Avoids " +
-      "resending the whole document. Can also insert table structure: to add a " +
-      "tableRow, pass a tableRow node with position before/after and anchor " +
-      "INSIDE the target table — anchorNodeId of any block/cell in it, or " +
-      "anchorText matching the table; to add a tableCell/tableHeader, use " +
-      "anchorNodeId of a block inside the target row (anchorText only resolves " +
-      "top-level blocks, so it cannot target a row). `anchorText` is matched " +
-      "against the block's literal rendered plain text (no markdown); " +
-      "markdown/emoji are tolerated as a fallback; prefer plain text or " +
-      "anchorNodeId. Note: append is top-level " +
-      "only and rejects structural table nodes. Example node: a paragraph " +
-      '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
-      'heading {"type":"heading","attrs":{"level":2},"content":' +
-      '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
-      '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
-      "JSON object or a JSON string (both accepted).",
-    inputSchema: {
-      pageId: z.string().min(1),
-      node: z
-        .any()
-        .describe(
-          "ProseMirror node to insert, e.g. " +
-            '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
-            "JSON object or JSON string both accepted.",
-        ),
-      position: z.enum(["before", "after", "append"]),
-      anchorNodeId: z.string().optional(),
-      anchorText: z.string().optional(),
-    },
-  },
+// Tool: insert_node — schema + description from the shared registry. As with
+// patch_node, the execute body retains parseNodeArg on the incoming node.
+registerShared(
+  SHARED_TOOL_SPECS.insertNode,
   async ({ pageId, node, position, anchorNodeId, anchorText }) => {
     const parsedNode = parseNodeArg(node);
     const result = await docmostClient.insertNode(pageId, parsedNode, {
@@ -619,6 +578,10 @@ server.registerTool(
 );
 
 // Tool: share_page
+// INTENTIONAL per-transport divergence (not shared): the in-app copy adds a
+// security-confirmation framing ("only share when the user explicitly asked,
+// since this exposes the page to anyone with the link") tuned for the in-app
+// agent; this transport keeps the plain public-URL wording.
 server.registerTool(
   "share_page",
   {
@@ -746,6 +709,9 @@ server.registerTool(
 );
 
 // Tool: create_comment
+// INTENTIONAL per-transport divergence (not shared): the in-app copy tunes the
+// guidance for the in-app agent (e.g. "retry with a corrected EXACT selection"
+// and "Reversible via the comment UI"); this transport keeps its own wording.
 server.registerTool(
   "create_comment",
   {
@@ -756,7 +722,10 @@ server.registerTool(
       "A top-level comment REQUIRES an exact `selection`; if the selection " +
       "cannot be found in the page the call fails (no orphan comment is left). " +
       "Replies (parentCommentId set) inherit the parent's anchor and take no " +
-      "selection.",
+      "selection. You may also attach a `suggestedText` proposing a replacement " +
+      "for the `selection`; a human applies (or rejects) it from the UI. When " +
+      "`suggestedText` is set the `selection` MUST occur exactly once in the " +
+      "page — expand it with surrounding context if it is ambiguous.",
     inputSchema: {
       pageId: z.string().describe("ID of the page to comment on"),
       content: z.string().min(1).describe("Comment content in Markdown format"),
@@ -775,13 +744,37 @@ server.registerTool(
         .string()
         .optional()
         .describe("Parent comment ID to create a reply (max 2 nesting levels)"),
+      suggestedText: z
+        .string()
+        .min(1)
+        .max(2000)
+        .optional()
+        .describe(
+          "Optional proposed replacement (PLAIN TEXT) for the `selection`, " +
+            "applied by a human via the UI (never auto-applied). REQUIRES a " +
+            "`selection`; NOT allowed on a reply. When set, the `selection` must " +
+            "be UNIQUE in the page — expand it with surrounding context (still " +
+            "<=250 chars) if it occurs more than once, or the call is refused.",
+        ),
     },
   },
-  async ({ pageId, content, selection, parentCommentId }) => {
+  async ({ pageId, content, selection, parentCommentId, suggestedText }) => {
     if (!parentCommentId && (!selection || !selection.trim())) {
       throw new Error(
         "create_comment: a 'selection' (exact text to anchor on) is required for a top-level comment; omit it only when replying via parentCommentId.",
       );
+    }
+    if (suggestedText !== undefined) {
+      if (parentCommentId) {
+        throw new Error(
+          "create_comment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
+        );
+      }
+      if (!selection || !selection.trim()) {
+        throw new Error(
+          "create_comment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
+        );
+      }
     }
     const result = await docmostClient.createComment(
       pageId,
@@ -789,6 +782,7 @@ server.registerTool(
       "inline",
       selection,
       parentCommentId,
+      suggestedText,
     );
     return jsonContent(result);
   },
@@ -911,6 +905,10 @@ server.registerTool(
 );
 
 // Tool: search
+// INTENTIONAL per-transport divergence (not shared): the in-app `searchPages`
+// runs a semantic + keyword hybrid (RRF) with in-process access control and a
+// different schema (limit 1-20); this transport is a plain REST full-text search
+// (limit up to 100). Different behaviour AND schema, so kept per-layer.
 server.registerTool(
   "search",
   {
@@ -937,6 +935,10 @@ server.registerTool(
 );
 
 // Tool: docmost_transform
+// INTENTIONAL per-transport divergence (not shared): the in-app `transformPage`
+// deliberately omits the `deleteComments` schema field (comment-deletion
+// guardrail) and carries a much shorter description; this transport exposes the
+// full helper catalogue. Different schema, so kept per-layer.
 server.registerTool(
   "docmost_transform",
   {

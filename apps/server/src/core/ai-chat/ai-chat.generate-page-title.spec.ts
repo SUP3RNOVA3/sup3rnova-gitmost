@@ -60,6 +60,7 @@ describe('AiChatController.generatePageTitle', () => {
       {} as never,
       {} as never,
       {} as never,
+      {} as never,
     );
     return { controller, aiChatService };
   }

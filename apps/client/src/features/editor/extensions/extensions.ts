@@ -6,7 +6,7 @@ import { TaskList, TaskItem } from "@tiptap/extension-list";
 import { Placeholder, CharacterCount, UndoRedo } from "@tiptap/extensions";
 import { Superscript } from "@tiptap/extension-superscript";
 import SubScript from "@tiptap/extension-subscript";
-import { Typography } from "@tiptap/extension-typography";
+import { CustomTypography } from "./custom-typography";
 import { TextStyle } from "@tiptap/extension-text-style";
 import { Color } from "@tiptap/extension-color";
 import { Youtube } from "@tiptap/extension-youtube";
@@ -245,7 +245,9 @@ export const mainExtensions = [
       return ReactMarkViewRenderer(SpoilerView);
     },
   }),
-  Typography,
+  // Typography with an undo guard: does not re-apply a substitution the user
+  // just undid (e.g. Ctrl+Z on "1/2" -> "½" followed by another space).
+  CustomTypography,
   TrailingNode,
   GlobalDragHandle.configure({
     customNodes: ["transclusionSource", "transclusionReference", "pageEmbed"],

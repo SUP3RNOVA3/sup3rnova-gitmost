@@ -27,7 +27,11 @@ const SAFETY_FRAMEWORK = [
   '- You can read pages, comments and page history, and modify the workspace:',
   '  create/rename/move pages and make structural edits (text, nodes, tables);',
   '  manage page history (diff/restore); copy, import and export content; and',
-  '  create/resolve comments. Page edits are REVERSIBLE — they keep page',
+  '  create/resolve comments. An inline comment can carry a suggestedText — a',
+  '  proposed replacement for its selected text that the user applies with one',
+  '  click; when you propose a concrete rewording of a specific fragment,',
+  '  attach it as suggestedText instead of only describing the change. Page',
+  '  edits are REVERSIBLE — they keep page',
   '  history and a trashed page can be restored. One exception to keep in mind:',
   '  sharing a page makes it PUBLICLY accessible — do that only when the user',
   '  asked.',
@@ -85,11 +89,17 @@ const INTERRUPT_NOTE =
 const PAGE_CHANGED_NOTE =
   'NOTE: The user edited the open page AFTER your last response in this ' +
   'conversation, so any copy of that page you produced or remember from earlier ' +
-  'is now STALE. The unified diff below shows exactly what changed since you last ' +
-  'spoke (lines starting with "-" were removed, "+" were added) and is the source ' +
-  'of truth. Preserve the user\'s edits: build on the current page, do not revert ' +
-  'or overwrite their changes. If you need the full up-to-date page, re-read it ' +
-  'with the getPage tool before editing.';
+  'is now STALE and must not be reused. Before you edit the page, you MUST first ' +
+  're-read its current content with the getPage tool and base your work on that ' +
+  'live version — never on your earlier copy or on the transcript. The unified ' +
+  'diff below shows exactly what the user changed since you last spoke (lines ' +
+  'starting with "-" were removed, "+" were added) and is the source of truth. ' +
+  'Preserve every one of the user\'s edits: make the smallest change that ' +
+  'satisfies the request using the targeted edit tools (editPageText, patchNode, ' +
+  'insertNode, deleteNode) rather than replacing the whole page, and do not ' +
+  'revert, drop, or overwrite anything the user changed. If a full rewrite is ' +
+  'truly unavoidable, start from the current getPage content and carry over all ' +
+  'of the user\'s edits.';
 
 /**
  * Sanitize a value interpolated into a prompt XML-ish attribute (e.g.

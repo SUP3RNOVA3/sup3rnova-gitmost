@@ -449,7 +449,9 @@ export function applyAlignment(container: HTMLElement, align: string) {
     // the next line when the viewport is narrow. The right/bottom padding
     // provides the gap between images in a row and between wrapped rows;
     // vertical-align: top keeps rows of different-height images aligned by
-    // their top edge.
+    // their top edge. Horizontal centering of the whole row is handled by the
+    // client stylesheet (media.css) via a :has() rule on the parent block
+    // container, since the row has no wrapper element of its own.
     container.style.display = "inline-block";
     container.style.verticalAlign = "top";
     container.style.padding = "0 10px 10px 0";

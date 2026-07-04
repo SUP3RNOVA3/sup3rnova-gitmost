@@ -210,18 +210,25 @@ describe("HistoryItem git-sync provenance badge", () => {
     expect(setHistoryModalOpen).not.toHaveBeenCalled();
   });
 
-  // Sanity contrast: the agent badge (the copy-paste source) IS interactive when
-  // it carries an aiChatId — proving the not-clickable assertion above is real.
-  it("contrast: the AI-agent badge is a deep-link button when it has an aiChatId", () => {
+  // Sanity contrast: the agent provenance IS interactive when it carries an
+  // aiChatId — proving the not-clickable assertion above is real. The old text
+  // `AiAgentBadge` was superseded by `AgentAvatarStack` (#300), which becomes a
+  // role=button deep-link (and fires the ai-chat atoms) when an aiChatId is present.
+  it("contrast: the agent stack is a deep-link button when it has an aiChatId", () => {
     renderItem(
       makeItem({
         lastUpdatedSource: "agent",
+        agent: { name: "Zeta" },
         lastUpdatedAiChatId: "chat-1",
       }),
     );
-    const agentBadge = screen.getByText("AI-agent");
-    const root = agentBadge.closest("[role='button']");
+    // The agent glyph lives inside the clickable stack; walk up to its role=button.
+    const root = screen.getByTestId("agent-glyph").closest("[role='button']");
     expect(root).not.toBeNull();
-    within(root as HTMLElement).getByText("AI-agent");
+    (root as HTMLElement).dispatchEvent(
+      new MouseEvent("click", { bubbles: true }),
+    );
+    expect(setActiveChatId).toHaveBeenCalledWith("chat-1");
+    expect(setAiChatWindowOpen).toHaveBeenCalled();
   });
 });

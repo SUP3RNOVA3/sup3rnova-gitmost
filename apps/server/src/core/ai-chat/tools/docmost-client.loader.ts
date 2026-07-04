@@ -178,6 +178,7 @@ export interface DocmostClientLike {
     type?: 'page' | 'inline',
     selection?: string,
     parentCommentId?: string,
+    suggestedText?: string,
   ): Promise<{ data: Record<string, unknown>; success: boolean }>;
   resolveComment(
     commentId: string,

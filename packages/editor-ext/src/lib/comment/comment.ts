@@ -172,27 +172,28 @@ export const Comment = Mark.create<ICommentOptions, ICommentStorage>({
     const commentId = HTMLAttributes?.["data-comment-id"] || null;
     const resolved = HTMLAttributes?.["data-resolved"] || false;
 
-    // Prefer the static array (DOMOutputSpec) form whenever we are NOT in a real
-    // interactive browser. Guarding only on `document`/`window` is insufficient
-    // on the server: `generateHTML()` runs under a DOM shim (happy-dom/jsdom) that
-    // DEFINES both globals, so the imperative `document.createElement` branch ran
-    // server-side and its live node + addEventListener crashed the shim's
-    // DOMSerializer ("Cannot read properties of undefined (reading 'length')"),
-    // turning every Export / copy-as-markdown of a page with an inline comment
-    // into an HTTP 500 (QA GS-EXPORT-500). A real browser has a non-empty
-    // navigator.userAgent; the SSR shims do not — route the server to the safe
-    // static form while keeping the clickable node in the actual editor.
-    const isInteractiveBrowser =
-      typeof window !== "undefined" &&
-      typeof document !== "undefined" &&
-      typeof navigator !== "undefined" &&
-      typeof navigator.userAgent === "string" &&
-      // Real browsers ALL carry "Mozilla" in the UA string (historical); the
-      // server-side DOM shim used by generateHTML() does not (e.g. "Node.js/22").
-      // This keeps the interactive click node ONLY in a true browser and routes
-      // the server to the crash-free static form.
-      navigator.userAgent.includes("Mozilla");
-    if (!isInteractiveBrowser) {
+    // The in-process MCP module injects a jsdom `global.document` into the Node
+    // server, so `typeof document === "undefined"` is not enough to detect SSR.
+    // On any Node runtime always return a plain, serializable spec array; the
+    // interactive live-DOM branch below is browser-only. This stops server-side
+    // HTML/Markdown export (happy-dom DOMSerializer) from appending a foreign
+    // jsdom node into a happy-dom tree.
+    // Safe in the browser: Vite substitutes only `process.env` (a member
+    // expression), NOT the bare `process` object, so `typeof process` is
+    // "undefined" in the client bundle → isNodeRuntime is false → the interactive
+    // live-DOM branch below still runs and comment marks stay clickable in the
+    // editor. This browser-safety is load-bearing and NOT covered by a test
+    // (client vitest runs under jsdom→node, where isNodeRuntime is true). Do NOT
+    // add a `process` polyfill (e.g. vite-plugin-node-polyfills) without
+    // revisiting this guard, or comment interactivity dies silently.
+    const isNodeRuntime =
+      typeof process !== "undefined" && !!process.versions?.node;
+
+    if (
+      typeof window === "undefined" ||
+      typeof document === "undefined" ||
+      isNodeRuntime
+    ) {
       return [
         "span",
         mergeAttributes(this.options.HTMLAttributes, HTMLAttributes, {

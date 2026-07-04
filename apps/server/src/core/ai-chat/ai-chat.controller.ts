@@ -24,6 +24,7 @@ import { AiChat, User, Workspace } from '@docmost/db/types/entity.types';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
+import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { UserThrottlerGuard } from '../../integrations/throttle/user-throttler.guard';
 import { AI_CHAT_THROTTLER } from '../../integrations/throttle/throttler-names';
 import { FileInterceptor } from '../../common/interceptors/file.interceptor';
@@ -55,6 +56,7 @@ export class AiChatController {
     private readonly aiChatRepo: AiChatRepo,
     private readonly aiChatMessageRepo: AiChatMessageRepo,
     private readonly aiTranscription: AiTranscriptionService,
+    private readonly pageRepo: PageRepo,
   ) {}
 
   /** List the requesting user's chats in this workspace (paginated). */
@@ -71,9 +73,15 @@ export class AiChatController {
   /**
    * Resolve the chat bound to a document for the requesting user: the most-recent
    * non-deleted chat created on that page (ai_chats.page_id). Returns
-   * { chatId: null } when the page has no owned chat (-> a fresh chat). No page
-   * access check needed: only the caller's OWN chats are matched, so a foreign
-   * pageId reveals nothing.
+   * { chatId: null } when the page has no owned chat (-> a fresh chat).
+   *
+   * `dto.pageId` carries EITHER a page slugId (10-char nanoid, sent by the client
+   * off a slug URL) OR a page uuid, so it must be resolved to a real page uuid
+   * before it touches the uuid ai_chats.page_id column — passing a slugId straight
+   * through triggered a Postgres 22P02 "invalid input syntax for type uuid" 500
+   * (#312). PageRepo.findById accepts both forms. The workspace guard rejects an
+   * unknown or cross-workspace page (-> { chatId: null }) so a foreign id cannot
+   * probe another workspace's chats. Only the caller's OWN chats are then matched.
    */
   @HttpCode(HttpStatus.OK)
   @Post('bound-chat')
@@ -82,10 +90,14 @@ export class AiChatController {
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
   ): Promise<{ chatId: string | null }> {
+    const page = await this.pageRepo.findById(dto.pageId); // accepts slugId OR uuid
+    if (!page || page.workspaceId !== workspace.id) {
+      return { chatId: null }; // unknown or foreign-workspace page — no binding, no leak
+    }
     const chat = await this.aiChatRepo.findLatestByPage(
       user.id,
       workspace.id,
-      dto.pageId,
+      page.id, // the real uuid, never the incoming slugId
     );
     return { chatId: chat?.id ?? null };
   }

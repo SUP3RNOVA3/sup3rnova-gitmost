@@ -72,7 +72,10 @@ git log -1 --format='Author: %an <%ae>%nCommitter: %cn <%ce>'
 
 ### 4. Push and PR to develop
 
-PRs always target `develop`. The `claude_code` password lives in the macOS
+PRs always target `develop`. Two different mechanisms are involved: **pushing
+commits is git-native** (the Gitea MCP cannot push local git history, so the
+branch is still pushed with `git push`), while **the PR itself is opened through
+the Gitea MCP** (see below). The `claude_code` password lives in the macOS
 keychain as a **generic password** under service `gitea-claude-code` (do not
 duplicate it as an internet-password for `gitea.vvzvlad.xyz` — that creates a
 conflict with the owner's account in the git credential helper):
@@ -94,18 +97,24 @@ git remote set-url gitea "$ORIG_URL"
 unset AGENT_PASS SAFE_PASS
 ```
 
-The PR is created via the Gitea REST API (Basic Auth as `claude_code`):
+The PR is opened through the **Gitea MCP** (server `gitea`), not `curl`/`tea` —
+the MCP authenticates in-process, so no keychain lookup or Basic-Auth is needed.
+Call `pull_request_write` with:
 
-```bash
-curl -s -X POST \
-  -u "claude_code:$(security find-generic-password -s gitea-claude-code -w)" \
-  -H "Content-Type: application/json" \
-  -d @pr_body.json \
-  "https://gitea.vvzvlad.xyz/api/v1/repos/vvzvlad/gitmost/pulls"
-```
+- `method: "create"`
+- `owner: "vvzvlad"`, `repo: "gitmost"`
+- `base: "develop"`, `head: "<branch>"`
+- `title`, `body` — in the body: what was done, what is out of scope,
+  verification results (tsc/lint/tests).
 
-`base: develop`, `head: <branch>`. In the PR body: what was done, what is out
-of scope, verification results (tsc/lint/tests).
+Manage and read PRs through the same server: `list_pull_requests`,
+`pull_request_read` (`get`, `get_diff`, `get_files`, `get_status`),
+`pull_request_review_write`.
+
+**Identity note:** the MCP acts under its **own** configured Gitea token (verify
+with `get_me`), a different account from the `claude_code` used for git
+commits/pushes in §3. Only the forge API calls (PR / issue / review) go through
+the MCP account; the commits themselves stay authored as `claude_code`.
 
 > If push fails with `User permission denied for writing`, then `claude_code`
 > lacks collaborator rights on the repo. Ask the owner to add them (once, via
@@ -152,23 +161,25 @@ below.
 | Agent user (Gitea/git) | `claude_code` |
 | Agent email | `claude_code@vvzvlad.xyz` |
 | Keychain password | `security find-generic-password -s gitea-claude-code -w` |
-| PR API | `https://gitea.vvzvlad.xyz/api/v1/repos/vvzvlad/gitmost/pulls` (here `gitmost` is the repo's real slug on the server) |
+| Forge API (PR / issue / review / reads) | **Gitea MCP** — server `gitea` (`pull_request_write`, `issue_write`, `list_pull_requests`, `pull_request_read`, `label_read`, …). Authenticated in-process; acts under its own token — check with `get_me`. Repo slug on the server is `gitmost`. |
 | Base branch | `develop` |
 | `origin` | GitHub mirror `vvzvlad/gitmost` — **do not push**, updated by the owner's CI |
 | `upstream` | The original Docmost — **never push** |
 
-## Creating issues (Gitea `tea` CLI)
+## Creating issues (Gitea MCP)
 
-Issues are filed with the official Gitea CLI `tea`, already logged in as
-`claude_code` (`tea logins list` shows the `gitea` login as default):
+File issues through the **Gitea MCP** (server `gitea`), not a CLI — call
+`issue_write` with:
 
-```bash
-tea issues create --repo vvzvlad/gitmost --labels feature \
-  --title '<title>' --description "$(cat body.md)"
-```
+- `method: "create"`
+- `owner: "vvzvlad"`, `repo: "gitmost"`
+- `title`, `body`
+- `labels` — an array of label **IDs** (numbers), *not* names. Resolve a name
+  such as `feature` to its id first with `label_read` (`method: "list"`), then
+  pass e.g. `labels: [<id>]`.
 
-> Gotcha (tea 0.14.1): the issue body flag is `--description`/`-d`, **not**
-> `--body` — passing `--body` fails with `flag provided but not defined: -body`.
+Read issues with `list_issues`, `issue_read`, or `search_issues`. The MCP is
+authenticated in-process, so no `tea`/`curl` and no keychain lookup are needed.
 
 ---
 

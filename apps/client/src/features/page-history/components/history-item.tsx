@@ -1,7 +1,7 @@
 import { Text, Group, UnstyledButton, Avatar, Tooltip } from "@mantine/core";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
-import { AiAgentBadge } from "@/components/ui/ai-agent-badge.tsx";
 import { GitSyncBadge } from "@/components/ui/git-sync-badge.tsx";
+import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
 import { formattedDate } from "@/lib/time";
 import classes from "./css/history.module.css";
 import clsx from "clsx";
@@ -101,12 +101,13 @@ const HistoryItem = memo(function HistoryItem({
           </>
         )}
 
-        {isAgentEdit && (
-          <AiAgentBadge
-            authorName={historyItem.lastUpdatedBy?.name}
+        {isAgentEdit && historyItem.agent && (
+          <AgentAvatarStack
+            agent={historyItem.agent}
+            launcher={historyItem.launcher}
             aiChatId={historyItem.lastUpdatedAiChatId}
-            // The history row owns the modal: close it when the badge deep-links
-            // into the chat (the badge no longer reaches into page-history).
+            // The history row owns the modal: close it when the stack deep-links
+            // into the chat (the stack no longer reaches into page-history).
             onActivate={() => setHistoryModalOpen(false)}
           />
         )}

@@ -27,11 +27,12 @@ import {
   collabExtensions,
   mainExtensions,
 } from "@/features/editor/extensions/extensions";
-import { useAtom, useAtomValue } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
   currentPageEditModeAtom,
+  dictationAvailabilityAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
@@ -78,7 +79,8 @@ import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
-import { useScrollPosition } from "./hooks/use-scroll-position";
+import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
+import { useSwapHeightReservation } from "./hooks/use-swap-height-reservation";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
@@ -87,6 +89,7 @@ import { PageEmbedAncestryProvider } from "@/features/editor/components/page-emb
 import PageEmbedPicker from "@/features/editor/components/page-embed/page-embed-picker";
 import { useTranslation } from "react-i18next";
 import {
+  computeDictationAvailability,
   isBodyEditable,
   isCollabSynced,
 } from "@/features/editor/editor-sync-state";
@@ -138,12 +141,12 @@ export default function PageEditor({
   const { pageSlug } = useParams();
   const slugId = extractPageSlugId(pageSlug);
   const currentPageEditMode = useAtomValue(currentPageEditModeAtom);
+  const setDictationAvailability = useSetAtom(dictationAvailabilityAtom);
   const canScroll = useCallback(
     () => Boolean(isComponentMounted.current && editorRef.current),
     [isComponentMounted],
   );
   const { handleScrollTo } = useEditorScroll({ canScroll });
-  const { restoreScrollPosition } = useScrollPosition(pageId);
   // Providers only created once per pageId
   const providersRef = useRef<{
     local: IndexeddbPersistence;
@@ -450,6 +453,22 @@ export default function PageEditor({
   const hasConnectedOnceRef = useRef(false);
   const [showStatic, setShowStatic] = useState(true);
 
+  // Reserved height held across the static -> live editor swap. The live editor
+  // lays out its content over a few frames, so replacing the (full-height) static
+  // copy with it momentarily shrinks the document; the browser then clamps window
+  // scroll to the top, which yanked the reader off their restored reading position
+  // (and threw their scroll to 0 if they were scrolling at that moment). Pinning a
+  // min-height on the swap wrapper keeps the document tall through the swap so the
+  // scroll position simply survives. `null` = no reservation active.
+  const swapWrapperRef = useRef<HTMLDivElement | null>(null);
+  // Reserve/release wiring lives in the hook so its capture trigger and release
+  // guard/cap are directly unit-testable. Capture stays synchronous at the swap
+  // point (see the collab-sync effect below); the hook only owns the release.
+  const { reservedHeight, captureReservation } = useSwapHeightReservation(
+    showStatic,
+    menuContainerRef,
+  );
+
   useEffect(() => {
     const timeout = setTimeout(() => {
       if (yjsConnectionStatus === WebSocketStatus.Connecting || !isSynced) {
@@ -472,25 +491,55 @@ export default function PageEditor({
     );
   }, [currentPageEditMode, editor, editable, showStatic]);
 
+  // Publish whether dictation can start and, if not, the cause-specific reason
+  // the mic button surfaces. Recomputed on the same signals that drive body
+  // editability so the tooltip never lies about the current state.
+  useEffect(() => {
+    setDictationAvailability(
+      computeDictationAvailability({
+        editable,
+        inEditMode: currentPageEditMode === PageEditMode.Edit,
+        showStatic,
+        isDisconnected: yjsConnectionStatus === WebSocketStatus.Disconnected,
+      }),
+    );
+  }, [
+    editable,
+    currentPageEditMode,
+    showStatic,
+    yjsConnectionStatus,
+    setDictationAvailability,
+  ]);
+
   useEffect(() => {
     if (
       !hasConnectedOnceRef.current &&
       isCollabSynced(yjsConnectionStatus, isSynced)
     ) {
       hasConnectedOnceRef.current = true;
+      // Capture the current (static, full-height) content height BEFORE the swap
+      // so the wrapper can reserve it while the live editor lays out — otherwise
+      // the transient shrink clamps window scroll to the top.
+      captureReservation(swapWrapperRef.current?.offsetHeight ?? null);
       setShowStatic(false);
     }
   }, [yjsConnectionStatus, isSynced]);
 
-  // Restore the saved reading position once the live content is laid out.
-  useEffect(() => {
-    if (!showStatic && editor) restoreScrollPosition();
-  }, [showStatic, editor, restoreScrollPosition]);
+  // Restore the reader's scroll position across the static -> live editor swap.
+  // The wiring (early pre-paint restore + post-swap re-assert) lives in the hook
+  // so its triggers/guard are directly unit-testable.
+  useScrollRestoreOnSwap(pageId, editor, showStatic);
 
   return (
     <TransclusionLookupProvider>
       <PageEmbedLookupProvider>
         <PageEmbedAncestryProvider hostPageId={pageId}>
+      <div
+        ref={swapWrapperRef}
+        style={
+          reservedHeight != null ? { minHeight: reservedHeight } : undefined
+        }
+      >
       {showStatic ? (
         <div style={{ position: "relative" }}>
           {/* Surface the pre-sync read-only window so edits typed before the
@@ -578,6 +627,7 @@ export default function PageEditor({
           ></div>
         </div>
       )}
+      </div>
         </PageEmbedAncestryProvider>
       </PageEmbedLookupProvider>
     </TransclusionLookupProvider>

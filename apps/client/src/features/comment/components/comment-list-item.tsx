@@ -1,5 +1,5 @@
-import { Group, Text, Box } from "@mantine/core";
-import { AiAgentBadge } from "@/components/ui/ai-agent-badge.tsx";
+import { Group, Text, Box, Badge, Button } from "@mantine/core";
+import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
 import React, { useEffect, useRef, useState } from "react";
 import classes from "./comment.module.css";
 import { useAtom, useAtomValue } from "jotai";
@@ -11,11 +11,13 @@ import CommentMenu from "@/features/comment/components/comment-menu";
 import ResolveComment from "@/features/comment/components/resolve-comment";
 import { useHover } from "@mantine/hooks";
 import {
+  useApplySuggestionMutation,
   useDeleteCommentMutation,
   useResolveCommentMutation,
   useUpdateCommentMutation,
 } from "@/features/comment/queries/comment-query";
 import { IComment } from "@/features/comment/types/comment.types";
+import { canShowApply } from "@/features/comment/utils/suggestion";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useTranslation } from "react-i18next";
@@ -24,6 +26,10 @@ interface CommentListItemProps {
   comment: IComment;
   pageId: string;
   canComment: boolean;
+  // Real page-edit permission (page.permissions.canEdit) — gates the suggestion
+  // "Apply" button. Distinct from `canComment`, which may be looser (viewers
+  // allowed to comment cannot apply edits).
+  canEdit?: boolean;
   userSpaceRole?: string;
 }
 
@@ -31,6 +37,7 @@ function CommentListItem({
   comment,
   pageId,
   canComment,
+  canEdit,
   userSpaceRole,
 }: CommentListItemProps) {
   const { t } = useTranslation();
@@ -43,6 +50,7 @@ function CommentListItem({
   const updateCommentMutation = useUpdateCommentMutation();
   const deleteCommentMutation = useDeleteCommentMutation(comment.pageId);
   const resolveCommentMutation = useResolveCommentMutation();
+  const applySuggestionMutation = useApplySuggestionMutation();
   const [currentUser] = useAtom(currentUserAtom);
   const createdAtAgo = useTimeAgo(comment.createdAt);
 
@@ -95,6 +103,18 @@ function CommentListItem({
     }
   }
 
+  async function handleApplySuggestion() {
+    try {
+      await applySuggestionMutation.mutateAsync({
+        commentId: comment.id,
+        pageId: comment.pageId,
+      });
+    } catch (error) {
+      // Errors surface via the mutation's onError notification (incl. 409).
+      console.error("Failed to apply suggestion:", error);
+    }
+  }
+
   function handleCommentClick(comment: IComment) {
     const el = document.querySelector(
       `.comment-mark[data-comment-id="${comment.id}"]`,
@@ -119,24 +139,44 @@ function CommentListItem({
   return (
     <Box ref={ref} pb={6}>
       <Group gap="xs">
-        <CustomAvatar
-          size="sm"
-          avatarUrl={comment.creator.avatarUrl}
-          name={comment.creator.name}
-        />
+        {comment.createdSource === "agent" && comment.agent ? (
+          <AgentAvatarStack
+            agent={comment.agent}
+            launcher={comment.launcher}
+            aiChatId={comment.aiChatId}
+            showName={false}
+          />
+        ) : (
+          <CustomAvatar
+            size="sm"
+            avatarUrl={comment.creator.avatarUrl}
+            name={comment.creator.name}
+          />
+        )}
 
         <div style={{ flex: 1 }}>
           <Group justify="space-between" wrap="nowrap">
             <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-              <Text size="xs" fw={500} lineClamp={1} lh={1.2}>
-                {comment.creator.name}
-              </Text>
-
-              {comment.createdSource === "agent" && (
-                <AiAgentBadge
-                  authorName={comment.creator?.name}
-                  aiChatId={comment.aiChatId}
-                />
+              {comment.createdSource === "agent" && comment.agent ? (
+                <>
+                  <Text size="xs" fw={600} lineClamp={1} lh={1.2}>
+                    {comment.agent.name}
+                  </Text>
+                  {comment.launcher && (
+                    <>
+                      <Text size="xs" c="dimmed" fw={400} aria-hidden>
+                        ·
+                      </Text>
+                      <Text size="xs" c="dimmed" fw={400} lineClamp={1} lh={1.2}>
+                        {comment.launcher.name}
+                      </Text>
+                    </>
+                  )}
+                </>
+              ) : (
+                <Text size="xs" fw={500} lineClamp={1} lh={1.2}>
+                  {comment.creator.name}
+                </Text>
               )}
             </Group>
 
@@ -188,6 +228,47 @@ function CommentListItem({
             aria-label={t("Jump to comment selection")}
           >
             <Text size="xs">{comment?.selection}</Text>
+          </Box>
+        )}
+
+        {/* Suggested-edit (#315): "было → стало" diff for a top-level comment
+            carrying a suggestion. Old text struck-through/red, new text green. */}
+        {!comment.parentCommentId && comment.suggestedText && (
+          <Box className={classes.suggestionBlock}>
+            {comment.selection && (
+              <Text size="xs" className={classes.suggestionOld}>
+                {comment.selection}
+              </Text>
+            )}
+            <Text size="xs" className={classes.suggestionNew}>
+              {comment.suggestedText}
+            </Text>
+
+            {comment.suggestionAppliedAt ? (
+              <Badge
+                size="sm"
+                color="green"
+                variant="light"
+                mt={6}
+                aria-label={t("Applied")}
+              >
+                {t("Applied")}
+              </Badge>
+            ) : (
+              canShowApply(comment, canEdit) && (
+                <Button
+                  size="compact-xs"
+                  variant="light"
+                  color="green"
+                  mt={6}
+                  onClick={handleApplySuggestion}
+                  loading={applySuggestionMutation.isPending}
+                  disabled={applySuggestionMutation.isPending}
+                >
+                  {t("Apply")}
+                </Button>
+              )
+            )}
           </Box>
         )}
 

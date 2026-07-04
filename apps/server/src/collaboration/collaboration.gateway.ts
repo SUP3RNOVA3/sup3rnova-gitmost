@@ -147,8 +147,41 @@ export class CollaborationGateway {
     eventName: TName,
     documentName: string,
     payload: Parameters<CollabEventHandlers[TName]>[1],
-  ) {
-    return this.redisSync?.handleEvent(eventName, documentName, payload);
+  ): ReturnType<CollabEventHandlers[TName]> {
+    if (this.redisSync) {
+      // Normal path: the Redis bridge routes the event to the instance that owns
+      // the document (local or another worker) and carries the handler's return
+      // value back to us (customEventComplete + replyId).
+      return this.redisSync.handleEvent(
+        eventName,
+        documentName,
+        payload,
+      ) as ReturnType<CollabEventHandlers[TName]>;
+    }
+
+    // COLLAB_DISABLE_REDIS: there is no cross-process bridge, so a single local
+    // hocuspocus instance owns every document. Invoke the handler directly
+    // against it instead of returning undefined — otherwise doc-mutation events
+    // (setCommentMark / resolveCommentMark / applyCommentSuggestion) would
+    // silently no-op and, for suggestions, the caller could never learn the
+    // verdict. openDirectConnection loads the doc via the persistence extension
+    // if it is not already in memory.
+    if (this.hocuspocus) {
+      const handlers = this.collabEventsService.getHandlers(this.hocuspocus);
+      const handler = handlers[eventName] as (
+        documentName: string,
+        payload: unknown,
+      ) => ReturnType<CollabEventHandlers[TName]>;
+      return handler(documentName, payload);
+    }
+
+    // Collaboration was never initialized (no live instance). Fail loudly rather
+    // than silently dropping a mutation; phase 4's caller maps this to a 5xx.
+    throw new Error(
+      `Cannot handle collaboration event "${String(
+        eventName,
+      )}": requires a live collaboration instance`,
+    );
   }
 
   openDirectConnection(documentName: string, context?: any) {

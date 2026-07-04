@@ -164,8 +164,8 @@
     /* NOTE: `white-space: pre-wrap` is intentionally NOT set here. On the
        rendered markdown <div> it would turn the newlines between block tags
        (</li>\n<li>, </p>\n<ol>) into visible blank lines/indents on top of the
-       margins. The plain-text fallback <Text> that needs pre-wrap sets it
-       inline itself (see reasoning-block.tsx). */
+       margins. The streaming plain-text path that needs pre-wrap sets it
+       per chunk instead, in PlainChunk (see streaming-plain-text.tsx). */
 }
 
 .reasoningText p {

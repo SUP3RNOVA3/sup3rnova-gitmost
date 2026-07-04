@@ -6,6 +6,8 @@ import {
   findAnchorInBlock,
   canAnchorInDoc,
   applyAnchorInDoc,
+  countAnchorMatches,
+  getAnchoredText,
 } from "../../build/lib/comment-anchor.js";
 
 const COMMENT_ID = "cmt-123";
@@ -207,4 +209,102 @@ test("anchoring works inside a nested block (e.g. list item) via DFS recursion",
   const marked = para.filter((p) => commentMark(p));
   assert.equal(marked.length, 1);
   assert.equal(marked[0].text, "target");
+});
+
+// ---------------------------------------------------------------------------
+// countAnchorMatches — the uniqueness gate for suggestions. Counts every
+// non-overlapping occurrence across the whole document (0 / 1 / N).
+// ---------------------------------------------------------------------------
+test("countAnchorMatches returns 0 when the selection is absent", () => {
+  const doc = paragraphDoc([{ type: "text", text: "hello world" }]);
+  assert.equal(countAnchorMatches(doc, "missing"), 0);
+});
+
+test("countAnchorMatches returns 1 for a unique selection", () => {
+  const doc = paragraphDoc([{ type: "text", text: "Hello brave world" }]);
+  assert.equal(countAnchorMatches(doc, "brave"), 1);
+});
+
+test("countAnchorMatches counts multiple occurrences within one block", () => {
+  const doc = paragraphDoc([{ type: "text", text: "ab ab ab" }]);
+  assert.equal(countAnchorMatches(doc, "ab"), 3);
+});
+
+test("countAnchorMatches sums occurrences across separate blocks", () => {
+  const doc = {
+    type: "doc",
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "first target here" }] },
+      { type: "paragraph", content: [{ type: "text", text: "second target here" }] },
+    ],
+  };
+  assert.equal(countAnchorMatches(doc, "target"), 2);
+});
+
+test("countAnchorMatches counts a match spanning adjacent text nodes as one", () => {
+  const doc = paragraphDoc([
+    { type: "text", text: "запуска ", marks: [{ type: "italic" }] },
+    { type: "text", text: "перед блоком", marks: [{ type: "italic" }] },
+  ]);
+  assert.equal(countAnchorMatches(doc, "запуска перед"), 1);
+});
+
+test("countAnchorMatches counts matches inside nested (recursed) blocks", () => {
+  const doc = {
+    type: "doc",
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "outer target" }] },
+      {
+        type: "bulletList",
+        content: [
+          {
+            type: "listItem",
+            content: [
+              { type: "paragraph", content: [{ type: "text", text: "nested target" }] },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  assert.equal(countAnchorMatches(doc, "target"), 2);
+});
+
+test("countAnchorMatches applies the same normalization as anchoring", () => {
+  // Smart quotes in the doc match ASCII quotes in the selection.
+  const doc = paragraphDoc([{ type: "text", text: "say “hi” now" }]);
+  assert.equal(countAnchorMatches(doc, '"hi"'), 1);
+});
+
+// -----------------------------------------------------------------------------
+// getAnchoredText: returns the RAW document substring the mark would cover (the
+// doc's original typographic characters), not the normalized ASCII selection.
+// This is what makes a suggestion's stored selection equal the apply-time
+// expectedText, so the strict equality in replaceYjsMarkedText holds.
+// -----------------------------------------------------------------------------
+test("getAnchoredText returns the RAW (typographic) doc substring for an ASCII selection", () => {
+  // Doc holds smart quotes; agent selection is the ASCII form.
+  const doc = paragraphDoc([{ type: "text", text: "he said “hello” loudly" }]);
+  assert.equal(getAnchoredText(doc, '"hello"'), "“hello”");
+});
+
+test("getAnchoredText undoes whitespace/dash normalization to the raw span", () => {
+  // Em-dash + nbsp in the doc; ASCII hyphen + single space in the selection.
+  const doc = paragraphDoc([{ type: "text", text: "a—b c" }]);
+  // selection "a-b c" (ascii dash) matches, raw substring keeps the em-dash+nbsp.
+  assert.equal(getAnchoredText(doc, "a-b c"), "a—b c");
+});
+
+test("getAnchoredText spans consecutive text nodes and returns their raw slices", () => {
+  const doc = paragraphDoc([
+    { type: "text", text: "Hello " },
+    { type: "text", text: "“brave”", marks: [{ type: "bold" }] },
+    { type: "text", text: " world" },
+  ]);
+  assert.equal(getAnchoredText(doc, '"brave" wor'), "“brave” wor");
+});
+
+test("getAnchoredText returns null when the selection does not anchor", () => {
+  const doc = paragraphDoc([{ type: "text", text: "hello world" }]);
+  assert.equal(getAnchoredText(doc, "not present"), null);
 });

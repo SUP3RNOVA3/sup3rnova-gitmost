@@ -1,3 +1,8 @@
+import type {
+  AgentInfo,
+  LauncherInfo,
+} from "@/components/ui/agent-avatar-stack.tsx";
+
 interface IPageHistoryUser {
   id: string;
   name: string;
@@ -24,4 +29,9 @@ export interface IPageHistory {
   // (when present) deep-links to the chat that produced the edit.
   lastUpdatedSource?: string;
   lastUpdatedAiChatId?: string | null;
+  // Server-normalized "agent avatar stack" provenance (#300), present only when
+  // lastUpdatedSource === "agent": `agent` is the front identity, `launcher` the
+  // human behind it (null for an external MCP agent).
+  agent?: AgentInfo | null;
+  launcher?: LauncherInfo | null;
 }

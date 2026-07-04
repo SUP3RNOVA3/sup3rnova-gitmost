@@ -134,6 +134,137 @@ export function removeYjsMarkByAttribute(
 }
 
 /**
+ * A single marked delta segment collected during the walk, together with the
+ * Y.XmlText node that owns it, the segment's start offset within that node,
+ * and the full `comment` mark attributes object (needed to re-attach the mark
+ * to the replacement text).
+ */
+type MarkedSegment = {
+  node: Y.XmlText;
+  offset: number;
+  length: number;
+  text: string;
+  markAttrs: Record<string, any>;
+};
+
+/**
+ * Atomically check-and-replace the text currently under a comment mark.
+ *
+ * Walks the fragment collecting every delta segment whose `comment` mark has the
+ * given commentId. The replacement is applied ONLY if the marked run is intact:
+ * it lives in a single Y.XmlText node, is contiguous (no unmarked text spliced
+ * into the middle), and its joined text still equals `expectedText`. On success
+ * the run is deleted and `newText` is inserted at the same offset carrying the
+ * SAME comment attributes, so the comment thread stays anchored to the new text.
+ *
+ * This mutates the passed fragment/text directly and does NOT open its own Y
+ * transaction — the caller is expected to wrap the call in connection.transact()
+ * so the delete+insert are atomic (mirrors updateYjsMarkAttribute's direct
+ * mutation style).
+ *
+ * @returns `{ applied: true, currentText: newText }` on replacement, otherwise
+ * `{ applied: false, currentText }` where currentText is the text currently
+ * under the mark (or null when the mark/anchor no longer exists).
+ */
+export function replaceYjsMarkedText(
+  fragment: Y.XmlFragment,
+  commentId: string,
+  expectedText: string,
+  newText: string,
+): { applied: boolean; currentText: string | null } {
+  // 1. Collect every marked segment in document order.
+  const segments: MarkedSegment[] = [];
+
+  const processItem = (item: any) => {
+    if (item instanceof Y.XmlText) {
+      const deltas = item.toDelta();
+      let offset = 0;
+
+      for (const delta of deltas) {
+        const insert = delta.insert;
+        // Non-string inserts (embeds) carry no text length we can splice on.
+        if (typeof insert !== 'string') {
+          // A Yjs embed occupies one unit in the index space used by delete/
+          // insert/format — advance offset so a marked segment after an embed
+          // gets the right position (and an embed inside a marked run creates a
+          // gap → the contiguity guard rejects it as a changed anchor).
+          offset += 1;
+          continue;
+        }
+        const length = insert.length;
+        const attributes = delta.attributes ?? {};
+        const markAttr = attributes['comment'];
+
+        if (markAttr && markAttr.commentId === commentId) {
+          segments.push({
+            node: item,
+            offset,
+            length,
+            text: insert,
+            markAttrs: markAttr,
+          });
+        }
+        offset += length;
+      }
+    } else if (item instanceof Y.XmlElement) {
+      for (let i = 0; i < item.length; i++) {
+        processItem(item.get(i));
+      }
+    }
+  };
+
+  for (let i = 0; i < fragment.length; i++) {
+    processItem(fragment.get(i));
+  }
+
+  const joinedText = segments.map((s) => s.text).join('');
+
+  // 2a. No segments — the mark/anchor was deleted.
+  if (segments.length === 0) {
+    return { applied: false, currentText: null };
+  }
+
+  // 2b. Segments span more than one Y.XmlText node (paragraph split by Enter,
+  // or the mark bled across blocks) — treat as changed.
+  const node = segments[0].node;
+  const sameNode = segments.every((s) => s.node === node);
+  if (!sameNode) {
+    return { applied: false, currentText: joinedText };
+  }
+
+  // 2c. Non-contiguous within the single node: unmarked text is spliced between
+  // the first and last marked segment. Since collected segments are in document
+  // order, contiguity holds iff each segment starts where the previous ended.
+  let contiguous = true;
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i].offset !== segments[i - 1].offset + segments[i - 1].length) {
+      contiguous = false;
+      break;
+    }
+  }
+  if (!contiguous) {
+    return { applied: false, currentText: joinedText };
+  }
+
+  // 2d. The text under the mark changed.
+  if (joinedText !== expectedText) {
+    return { applied: false, currentText: joinedText };
+  }
+
+  // 3. All guards passed: delete the marked run and re-insert newText with the
+  // same comment attributes at the same offset. Atomic within the caller's
+  // transaction.
+  const start = segments[0].offset;
+  const len = segments.reduce((sum, s) => sum + s.length, 0);
+  const markAttrs = segments[0].markAttrs;
+
+  node.delete(start, len);
+  node.insert(start, newText, { comment: markAttrs });
+
+  return { applied: true, currentText: newText };
+}
+
+/**
  * Updates a mark's attributes for all text that has the specified attribute value.
  * Useful for resolving/unresolving comments by commentId.
  */
