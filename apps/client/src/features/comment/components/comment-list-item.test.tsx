@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { IComment } from "@/features/comment/types/comment.types";
 
@@ -9,10 +9,11 @@ import { IComment } from "@/features/comment/types/comment.types";
 // component renders in isolation. We only assert the AI-badge rendering branch.
 const applyMutateAsync = vi.fn();
 const dismissMutateAsync = vi.fn();
+const updateMutateAsync = vi.fn();
 vi.mock("@/features/comment/queries/comment-query", () => ({
   useDeleteCommentMutation: () => ({ mutateAsync: vi.fn() }),
   useResolveCommentMutation: () => ({ mutateAsync: vi.fn() }),
-  useUpdateCommentMutation: () => ({ mutateAsync: vi.fn() }),
+  useUpdateCommentMutation: () => ({ mutateAsync: updateMutateAsync }),
   useApplySuggestionMutation: () => ({
     mutateAsync: applyMutateAsync,
     isPending: false,
@@ -23,10 +24,42 @@ vi.mock("@/features/comment/queries/comment-query", () => ({
   }),
 }));
 
+// The document the mocked editor emits via onUpdate when the edit form is open.
+// Duplicated inside the mock factory (below) to keep the factory self-contained.
+const EDITED_DOC = {
+  type: "doc",
+  content: [
+    { type: "paragraph", content: [{ type: "text", text: "edited via editor" }] },
+  ],
+};
+
 // CommentEditor pulls in the full TipTap editor stack; replace it with a stub.
-vi.mock("@/features/comment/components/comment-editor", () => ({
-  default: () => <div data-testid="comment-editor" />,
-}));
+// In edit mode the stub exposes buttons that fire the real onUpdate/onSave props
+// so the edit->save/cancel flow can be driven without a live editor.
+vi.mock("@/features/comment/components/comment-editor", () => {
+  const doc = {
+    type: "doc",
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "edited via editor" }] },
+    ],
+  };
+  return {
+    default: ({ onUpdate, onSave }: any) => (
+      <div data-testid="comment-editor">
+        <button
+          type="button"
+          data-testid="editor-emit-update"
+          onClick={() => onUpdate?.(doc)}
+        />
+        <button
+          type="button"
+          data-testid="editor-emit-save"
+          onClick={() => onSave?.()}
+        />
+      </div>
+    ),
+  };
+});
 
 // CommentContentView (used for the read-only body) imports the mention view,
 // which pulls page-query -> main.tsx (createRoot). Stub the queries so the item
@@ -294,6 +327,113 @@ describe("canShowDismiss predicate", () => {
   });
   it("false for a reply comment", () => {
     expect(canShowDismiss(c({ parentCommentId: "p" }), true, true)).toBe(false);
+  });
+});
+
+describe("CommentListItem — edit -> save/cancel flow (#340 F3)", () => {
+  const body = (t: string) =>
+    JSON.stringify({
+      type: "doc",
+      content: [{ type: "paragraph", content: [{ type: "text", text: t }] }],
+    });
+
+  // The edit menu item is gated on the viewer owning the comment
+  // (currentUser.id === creatorId). currentUserAtom is atomWithStorage-backed,
+  // so seed localStorage to make the viewer the owner (creatorId "user-1").
+  beforeEach(() => {
+    updateMutateAsync.mockClear();
+    localStorage.setItem(
+      "currentUser",
+      JSON.stringify({ user: { id: "user-1", name: "Owner" } }),
+    );
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  async function openEditor() {
+    // Open the comment menu, then click "Edit comment" to toggle into edit mode.
+    fireEvent.click(screen.getByLabelText("Comment menu"));
+    fireEvent.click(await screen.findByText("Edit comment"));
+    // Edit form (mocked editor + actions) is now mounted.
+    await screen.findByTestId("comment-editor");
+  }
+
+  it("saves the edited content and, on cache update, shows the new body", async () => {
+    const { rerender } = renderItem(
+      baseComment({ content: body("original body") }),
+    );
+    // Static body first.
+    expect(screen.getByText("original body")).toBeDefined();
+
+    await openEditor();
+
+    // Editor emits an update (populates editContentRef), then Save is clicked.
+    fireEvent.click(screen.getByTestId("editor-emit-update"));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    // mutateAsync is called with the stringified edited doc.
+    expect(updateMutateAsync).toHaveBeenCalledWith({
+      commentId: "c-1",
+      content: JSON.stringify(EDITED_DOC),
+    });
+
+    // On success the form closes (isEditing -> false); the static body renders
+    // from the comment.content prop again.
+    await waitFor(() =>
+      expect(screen.queryByTestId("comment-editor")).toBeNull(),
+    );
+
+    // Simulate the cache invalidation swapping in a new comment object with the
+    // updated content — the static body reflects it.
+    rerender(
+      <MantineProvider>
+        <CommentListItem
+          comment={baseComment({ content: body("updated body after save") })}
+          pageId="page-1"
+          canComment={true}
+          canEdit={true}
+        />
+      </MantineProvider>,
+    );
+    expect(screen.getByText("updated body after save")).toBeDefined();
+    expect(screen.queryByText("original body")).toBeNull();
+  });
+
+  it("cancel restores the static body and does not call the update mutation", async () => {
+    renderItem(baseComment({ content: body("original body") }));
+    await openEditor();
+
+    // Type something (editContentRef set), then cancel.
+    fireEvent.click(screen.getByTestId("editor-emit-update"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // Editor unmounts, static body restored, no save happened.
+    await waitFor(() =>
+      expect(screen.queryByTestId("comment-editor")).toBeNull(),
+    );
+    expect(screen.getByText("original body")).toBeDefined();
+    expect(updateMutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("saving without editing sends the existing content (editContentRef cleared after cancel)", async () => {
+    renderItem(baseComment({ content: body("original body") }));
+
+    // Cancel path clears editContentRef...
+    await openEditor();
+    fireEvent.click(screen.getByTestId("editor-emit-update"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() =>
+      expect(screen.queryByTestId("comment-editor")).toBeNull(),
+    );
+
+    // ...so re-opening and saving WITHOUT an update falls back to comment.content.
+    await openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    expect(updateMutateAsync).toHaveBeenCalledWith({
+      commentId: "c-1",
+      content: JSON.stringify(body("original body")),
+    });
   });
 });
 

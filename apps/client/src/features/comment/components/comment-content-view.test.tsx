@@ -72,6 +72,15 @@ describe("CommentContentView", () => {
     expect(container.querySelector("s")?.textContent).toBe("st");
   });
 
+  it("renders the underline mark as <u> (not the editor fallback)", () => {
+    const { container } = renderView(
+      doc([para([text("un", [{ type: "underline" }])])]),
+    );
+    expect(container.querySelector("u")?.textContent).toBe("un");
+    // Underline is a supported mark, so no degrade to the editor fallback.
+    expect(screen.queryByTestId("comment-editor-fallback")).toBeNull();
+  });
+
   it("renders the code mark as <code>", () => {
     const { container } = renderView(
       doc([para([text("co", [{ type: "code" }])])]),

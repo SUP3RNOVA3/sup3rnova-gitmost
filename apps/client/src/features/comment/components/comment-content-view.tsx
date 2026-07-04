@@ -62,6 +62,11 @@ function renderMarks(
         return <em key={key}>{acc}</em>;
       case "strike":
         return <s key={key}>{acc}</s>;
+      case "underline":
+        // StarterKit enables the Underline extension by default (Mod-u) and
+        // CommentEditor does not disable it, so real comments can carry this
+        // mark. Render it here rather than degrading the whole comment.
+        return <u key={key}>{acc}</u>;
       case "code":
         return <code key={key}>{acc}</code>;
       case "link": {

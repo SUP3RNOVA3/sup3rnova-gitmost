@@ -35,6 +35,24 @@ interface CommentListWithTabsProps {
   onClose?: () => void;
 }
 
+// Index replies by their parent id once (O(n)), instead of an O(n^2) filter per
+// thread. Replies whose parent is not in `items` are still grouped under their
+// parentCommentId (they simply won't be reached by the top-level walk).
+// Exported for unit testing.
+export function buildChildrenByParent(
+  items: IComment[] | undefined,
+): Map<string, IComment[]> {
+  const m = new Map<string, IComment[]>();
+  for (const c of items ?? []) {
+    if (c.parentCommentId) {
+      const arr = m.get(c.parentCommentId);
+      if (arr) arr.push(c);
+      else m.set(c.parentCommentId, [c]);
+    }
+  }
+  return m;
+}
+
 function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const { t } = useTranslation();
   const { pageSlug } = useParams();
@@ -79,17 +97,10 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   // Index replies by their parent once, instead of an O(n^2) filter per thread.
   // The map ref changes on any comments update, so MemoizedChildComments re-runs
   // (cheap) and re-looks-up, while memoized CommentListItems skip unchanged items.
-  const childrenByParent = useMemo(() => {
-    const m = new Map<string, IComment[]>();
-    for (const c of comments?.items ?? []) {
-      if (c.parentCommentId) {
-        const arr = m.get(c.parentCommentId);
-        if (arr) arr.push(c);
-        else m.set(c.parentCommentId, [c]);
-      }
-    }
-    return m;
-  }, [comments?.items]);
+  const childrenByParent = useMemo(
+    () => buildChildrenByParent(comments?.items),
+    [comments?.items],
+  );
 
   const [isPageCommentLoading, setIsPageCommentLoading] = useState(false);
 
@@ -217,8 +228,10 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
       <Tabs
         defaultValue="open"
         variant="default"
-        // Do not mount the inactive tab: the Resolved list (hundreds of items)
-        // stays unmounted while the Open tab is shown, and vice versa.
+        // Default to not mounting an inactive tab (the heavy Resolved list stays
+        // unmounted while Open is shown). The Open panel overrides this with its
+        // own keepMounted (below) so an in-progress reply/edit draft survives an
+        // Open -> Resolved -> Open switch.
         keepMounted={false}
         style={{
           flex: "1 1 auto",
@@ -278,7 +291,10 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
           type="scroll"
         >
           <div style={{ paddingBottom: "8px" }}>
-            <Tabs.Panel value="open" pt="xs">
+            {/* keepMounted keeps the Open panel alive even while Resolved is
+                active, so a lazily-mounted reply editor's draft (and an
+                in-progress edit) is not discarded on tab switch. */}
+            <Tabs.Panel value="open" pt="xs" keepMounted>
               {activeComments.length === 0 ? (
                 <Center py="xl">
                   <Stack align="center" gap="xs">
@@ -368,7 +384,7 @@ const ChildComments = ({
 
 const MemoizedChildComments = memo(ChildComments);
 
-const CommentEditorWithActions = ({
+export const CommentEditorWithActions = ({
   commentId,
   onSave,
   placeholder = undefined,
