@@ -249,6 +249,13 @@ describe('#293 #8 LINK-FORM: pdf', () => {
       'tag <x> & y.pdf',
       'amp &amp; here.pdf',
       '![shot](x).pdf',
+      // Canon inline-extension triggers (F5): math `$`, highlight `==`, footnote
+      // `^[` — a filename carrying these must not become a math/highlight/footnote
+      // node on import.
+      'data $A$.csv',
+      'q3 ==final==.pdf',
+      '5$ and 10$.pdf',
+      'note ^[x].pdf',
     ]) {
       const { md1, md2, doc2 } = await roundTrip(mkDoc([{ type: 'pdf', attrs: { src: '/x', name } }]));
       expect(md2).toBe(md1); // byte-stable, no churn

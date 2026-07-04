@@ -78,23 +78,26 @@ export function convertProseMirrorToMarkdown(content: any): string {
       .replace(/\(/g, "%28")
       .replace(/\)/g, "%29");
 
-  // Backslash-escape every character a markdown link's `[text]` label would
-  // otherwise INTERPRET, so a link-form media node's visible text (a filename or
-  // provider carried in `attrs.name`/`attrs.provider`) round-trips byte-exact
-  // (#293 canon #8 link-form). Escaping only `[ ] \` is NOT enough: the label is
-  // parsed as inline content, so emphasis (`* _`), code (`` ` ``), strikethrough
-  // (`~`), autolinks/raw-HTML (`<`), HTML entities (`&`), and image markers (`!`)
-  // would all be consumed and lost when the importer reads `a.textContent` back
-  // (e.g. `report *v2*.pdf` -> `report v2.pdf`). CommonMark treats a backslash
-  // before ANY ASCII punctuation as that literal char, so escaping this active
-  // set is always lossless on re-parse; the old `<div data-attachment-name>`
-  // form carried arbitrary strings via escapeAttr, so anything less is a
-  // data-loss regression on the git-sync data path. `( )` are escaped too: even
-  // with `[ ]` escaped, an unescaped `](x)` sequence inside the label (e.g. a
-  // name like `![shot](x).pdf`) forms a false nested-link destination and
-  // fragments the parse — escaping the parens removes that ambiguity entirely.
+  // Backslash-escape every character that would be INTERPRETED inside a markdown
+  // label re-parsed as inline content — used for a link-form media node's visible
+  // text (`attrs.name`/`attrs.provider`, #293 canon #8) AND for an image `![alt]`
+  // (canon #4) — so the value round-trips byte-exact. Two overlapping trigger
+  // sets must be escaped:
+  //   1. Stock CommonMark inline: emphasis (`* _`), code (`` ` ``), strikethrough
+  //      (`~`), autolinks/raw-HTML (`<`), HTML entities (`&`), image markers (`!`),
+  //      brackets (`[ ]`), and `( )` — even with `[ ]` escaped, an unescaped
+  //      `](x)` forms a false nested-link destination and fragments the parse.
+  //   2. The Docmost inline EXTENSIONS this package registers on its marked
+  //      instance: highlight `==x==` (canon #7), math `$x$` (canon #6), and
+  //      footnote `^[x]` (canon #2). Their triggers `= $ ^` are NOT CommonMark
+  //      punctuation the stock lexer would treat specially, but the extension
+  //      tokenizers fire on them — so an alt/name like `x $A$ y`, `use ==b==`, or
+  //      `^[fn]` would be silently turned into a math/highlight/footnote node on
+  //      import unless the trigger is escaped. `\= \$ \^` decode back to literals
+  //      (all ASCII punctuation) and, being escape tokens, stop the extension
+  //      tokenizer from matching — verified lossless round-trip.
   const escapeLinkText = (value: unknown): string =>
-    String(value ?? "").replace(/[\\`*_~[\]<&!()]/g, (c: string) => `\\${c}`);
+    String(value ?? "").replace(/[\\`*_~[\]<&!()=$^]/g, (c: string) => `\\${c}`);
 
   // #293 canon #6: the schema-HTML forms for math. These are the LOSSLESS forms
   // the raw-HTML path (columns/cells) and the mathInline fallback emit, and the

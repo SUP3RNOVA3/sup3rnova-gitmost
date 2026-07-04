@@ -62,7 +62,13 @@ describe('#293 canon #4 — image serialization + attached img-comment', () => {
     // import; without escaping, a bracket/emphasis in a realistic description
     // would make the image node VANISH or collapse emphasis. Assert the image
     // survives with the exact alt AND the markdown is byte-stable on re-export.
-    for (const alt of ['a]b[c', 'Figure [1]', 'the *new* logo', 'x_y_z', 'see ![img', 'a & b']) {
+    for (const alt of [
+      'a]b[c', 'Figure [1]', 'the *new* logo', 'x_y_z', 'see ![img', 'a & b',
+      // Canon inline-extension triggers this same package introduces (F5): math
+      // `$`, highlight `==`, footnote `^[` — an unescaped one turns the alt into
+      // a math/highlight/footnote node on import.
+      'x $A$ y', '5$ and 10$', 'use ==bold==', '^[fn]', 'cost $5 == price',
+    ]) {
       const md1 = convertProseMirrorToMarkdown(image({ alt }));
       const back = await markdownToProseMirror(md1);
       const img = findImage(back);
