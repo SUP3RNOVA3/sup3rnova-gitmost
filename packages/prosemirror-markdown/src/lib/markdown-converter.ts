@@ -599,7 +599,12 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // title) are carried in an attached `<!--img {…}-->` comment on the SAME
         // line, materialized back onto the <img> by markdown-to-prosemirror's
         // applyCommentDirectives before generateJSON drops the comment.
-        const imgAlt = imgAttrs.alt || "";
+        // Escape the alt text: it sits in the `![alt]` label, which the importer
+        // re-parses as CommonMark inline content, so a markdown-active char in a
+        // realistic description ("Figure [1]", "the *new* logo") would break the
+        // round-trip — the image node vanishes / emphasis collapses. Same reason
+        // the link-form media (attachment/pdf/embed) escape their visible text.
+        const imgAlt = escapeLinkText(imgAttrs.alt ?? "");
         // Neutralize characters that could break out of the markdown image
         // URL: spaces/newlines and parentheses would terminate the (...) target
         // and let a stored src inject following markdown/HTML. Percent-encode

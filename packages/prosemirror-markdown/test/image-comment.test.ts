@@ -57,6 +57,21 @@ describe('#293 canon #4 — image serialization + attached img-comment', () => {
     expect(img.attrs.alt).toBe('схема');
   });
 
+  it('alt with markdown-ACTIVE punctuation is escaped and round-trips byte-stable (F1)', async () => {
+    // The alt sits in the `![alt]` label, re-parsed as CommonMark inline on
+    // import; without escaping, a bracket/emphasis in a realistic description
+    // would make the image node VANISH or collapse emphasis. Assert the image
+    // survives with the exact alt AND the markdown is byte-stable on re-export.
+    for (const alt of ['a]b[c', 'Figure [1]', 'the *new* logo', 'x_y_z', 'see ![img', 'a & b']) {
+      const md1 = convertProseMirrorToMarkdown(image({ alt }));
+      const back = await markdownToProseMirror(md1);
+      const img = findImage(back);
+      expect(img).toBeTruthy(); // image node did NOT vanish
+      expect(img.attrs.alt).toBe(alt); // exact alt preserved
+      expect(convertProseMirrorToMarkdown(back)).toBe(md1); // byte-stable
+    }
+  });
+
   it('align "center" (the default) emits a bare image, NO comment, round-trips to center', async () => {
     const { md, img } = await roundTrip(image({ align: 'center' }));
     expect(md).toBe('![](/i.png)');
