@@ -22,6 +22,7 @@ describe('AiChatService.onModuleInit (startup sweep)', () => {
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo
       {} as never, // pageAccess
+      {} as never, // environment
     );
     return { service, aiChatMessageRepo };
   }

@@ -23,7 +23,6 @@ import CommentActions from "@/features/comment/components/comment-actions";
 import { useFocusWithin } from "@mantine/hooks";
 import { IComment } from "@/features/comment/types/comment.types.ts";
 import { usePageQuery } from "@/features/page/queries/page-query.ts";
-import { IPagination } from "@/lib/types.ts";
 import { extractPageSlugId } from "@/lib";
 import { useTranslation } from "react-i18next";
 import { useGetSpaceBySlugQuery } from "@/features/space/queries/space-query.ts";
@@ -36,6 +35,24 @@ interface CommentListWithTabsProps {
   onClose?: () => void;
 }
 
+// Index replies by their parent id once (O(n)), instead of an O(n^2) filter per
+// thread. Replies whose parent is not in `items` are still grouped under their
+// parentCommentId (they simply won't be reached by the top-level walk).
+// Exported for unit testing.
+export function buildChildrenByParent(
+  items: IComment[] | undefined,
+): Map<string, IComment[]> {
+  const m = new Map<string, IComment[]>();
+  for (const c of items ?? []) {
+    if (c.parentCommentId) {
+      const arr = m.get(c.parentCommentId);
+      if (arr) arr.push(c);
+      else m.set(c.parentCommentId, [c]);
+    }
+  }
+  return m;
+}
+
 function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const { t } = useTranslation();
   const { pageSlug } = useParams();
@@ -46,7 +63,9 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
     isError,
   } = useCommentsQuery({ pageId: page?.id });
   const createCommentMutation = useCreateCommentMutation();
-  const [isLoading, setIsLoading] = useState(false);
+  // mutateAsync is a stable reference across renders; depend on it (not the
+  // mutation object) so the reply/comment callbacks stay stable.
+  const createCommentAsync = createCommentMutation.mutateAsync;
   const { data: space } = useGetSpaceBySlugQuery(page?.space?.slug);
 
   const canEdit = page?.permissions?.canEdit ?? false;
@@ -75,13 +94,21 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
     return { activeComments: active, resolvedComments: resolved };
   }, [comments]);
 
+  // Index replies by their parent once, instead of an O(n^2) filter per thread.
+  // The map ref changes on any comments update, so MemoizedChildComments re-runs
+  // (cheap) and re-looks-up, while memoized CommentListItems skip unchanged items.
+  const childrenByParent = useMemo(
+    () => buildChildrenByParent(comments?.items),
+    [comments?.items],
+  );
+
   const [isPageCommentLoading, setIsPageCommentLoading] = useState(false);
 
   const handleAddPageComment = useCallback(
     async (_commentId: string, content: string) => {
       try {
         setIsPageCommentLoading(true);
-        const createdComment = await createCommentMutation.mutateAsync({
+        const createdComment = await createCommentAsync({
           pageId: page?.id,
           content: JSON.stringify(content),
         });
@@ -100,27 +127,26 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
         setIsPageCommentLoading(false);
       }
     },
-    [createCommentMutation, page?.id],
+    [createCommentAsync, page?.id],
   );
 
   const handleAddReply = useCallback(
     async (commentId: string, content: string) => {
+      // Pending state lives inside CommentEditorWithActions so sending a reply
+      // does not churn renderComments and re-render the whole list.
       try {
-        setIsLoading(true);
         const commentData = {
           pageId: page?.id,
           parentCommentId: commentId,
           content: JSON.stringify(content),
         };
 
-        await createCommentMutation.mutateAsync(commentData);
+        await createCommentAsync(commentData);
       } catch (error) {
         console.error("Failed to post comment:", error);
-      } finally {
-        setIsLoading(false);
       }
     },
-    [createCommentMutation, page?.id],
+    [createCommentAsync, page?.id],
   );
 
   const renderComments = useCallback(
@@ -143,7 +169,7 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
             userSpaceRole={space?.membership?.role}
           />
           <MemoizedChildComments
-            comments={comments}
+            childrenByParent={childrenByParent}
             parentId={comment.id}
             pageId={page?.id}
             canComment={canComment}
@@ -158,16 +184,15 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
             <CommentEditorWithActions
               commentId={comment.id}
               onSave={handleAddReply}
-              isLoading={isLoading}
             />
           </>
         )}
       </Paper>
     ),
     [
-      comments,
+      childrenByParent,
       handleAddReply,
-      isLoading,
+      page?.id,
       space?.membership?.role,
       canComment,
       canEdit,
@@ -203,6 +228,11 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
       <Tabs
         defaultValue="open"
         variant="default"
+        // Default to not mounting an inactive tab (the heavy Resolved list stays
+        // unmounted while Open is shown). The Open panel overrides this with its
+        // own keepMounted (below) so an in-progress reply/edit draft survives an
+        // Open -> Resolved -> Open switch.
+        keepMounted={false}
         style={{
           flex: "1 1 auto",
           display: "flex",
@@ -261,7 +291,10 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
           type="scroll"
         >
           <div style={{ paddingBottom: "8px" }}>
-            <Tabs.Panel value="open" pt="xs">
+            {/* keepMounted keeps the Open panel alive even while Resolved is
+                active, so a lazily-mounted reply editor's draft (and an
+                in-progress edit) is not discarded on tab switch. */}
+            <Tabs.Panel value="open" pt="xs" keepMounted>
               {activeComments.length === 0 ? (
                 <Center py="xl">
                   <Stack align="center" gap="xs">
@@ -307,7 +340,7 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
 }
 
 interface ChildCommentsProps {
-  comments: IPagination<IComment>;
+  childrenByParent: Map<string, IComment[]>;
   parentId: string;
   pageId: string;
   canComment: boolean;
@@ -315,24 +348,18 @@ interface ChildCommentsProps {
   userSpaceRole?: string;
 }
 const ChildComments = ({
-  comments,
+  childrenByParent,
   parentId,
   pageId,
   canComment,
   canEdit,
   userSpaceRole,
 }: ChildCommentsProps) => {
-  const getChildComments = useCallback(
-    (parentId: string) =>
-      comments.items.filter(
-        (comment: IComment) => comment.parentCommentId === parentId,
-      ),
-    [comments.items],
-  );
+  const children = childrenByParent.get(parentId) ?? [];
 
   return (
     <div>
-      {getChildComments(parentId).map((childComment) => (
+      {children.map((childComment) => (
         <div key={childComment.id}>
           <CommentListItem
             comment={childComment}
@@ -342,7 +369,7 @@ const ChildComments = ({
             userSpaceRole={userSpaceRole}
           />
           <MemoizedChildComments
-            comments={comments}
+            childrenByParent={childrenByParent}
             parentId={childComment.id}
             pageId={pageId}
             canComment={canComment}
@@ -357,21 +384,60 @@ const ChildComments = ({
 
 const MemoizedChildComments = memo(ChildComments);
 
-const CommentEditorWithActions = ({
+export const CommentEditorWithActions = ({
   commentId,
   onSave,
-  isLoading,
   placeholder = undefined,
 }) => {
+  const { t } = useTranslation();
+  // Lazily mount the TipTap reply editor: until the user interacts with the
+  // stub, no editor instance is created for this thread. Once mounted it stays
+  // mounted so the draft is preserved.
+  const [mounted, setMounted] = useState(false);
   const [content, setContent] = useState("");
+  const [isSending, setIsSending] = useState(false);
   const { ref, focused } = useFocusWithin();
   const commentEditorRef = useRef(null);
 
-  const handleSave = useCallback(() => {
-    onSave(commentId, content);
-    setContent("");
-    commentEditorRef.current?.clearContent();
+  const activate = useCallback(() => setMounted(true), []);
+
+  const handleSave = useCallback(async () => {
+    try {
+      setIsSending(true);
+      await onSave(commentId, content);
+      setContent("");
+      commentEditorRef.current?.clearContent();
+    } finally {
+      setIsSending(false);
+    }
   }, [commentId, content, onSave]);
+
+  if (!mounted) {
+    return (
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={activate}
+        onFocus={activate}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            activate();
+          }
+        }}
+        style={{
+          padding: "6px",
+          fontSize: "var(--mantine-font-size-sm)",
+          lineHeight: 1.4,
+          color: "var(--mantine-color-placeholder)",
+          cursor: "text",
+          borderRadius: "var(--mantine-radius-sm)",
+        }}
+      >
+        {placeholder || t("Reply...")}
+      </div>
+    );
+  }
 
   return (
     <div ref={ref}>
@@ -381,8 +447,9 @@ const CommentEditorWithActions = ({
         onSave={handleSave}
         editable={true}
         placeholder={placeholder}
+        autofocus={true}
       />
-      {focused && <CommentActions onSave={handleSave} isLoading={isLoading} />}
+      {focused && <CommentActions onSave={handleSave} isLoading={isSending} />}
     </div>
   );
 };

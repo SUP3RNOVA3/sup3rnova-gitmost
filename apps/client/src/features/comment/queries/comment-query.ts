@@ -53,7 +53,10 @@ export function useCommentsQuery(params: ICommentParams) {
 
   return {
     data,
-    isLoading: query.isLoading || query.hasNextPage,
+    // Paint the first page as soon as it arrives instead of blocking until every
+    // page has loaded; the background effect above keeps streaming the rest
+    // (tab counts grow as pages arrive).
+    isLoading: query.isLoading,
     isError: query.isError,
   };
 }

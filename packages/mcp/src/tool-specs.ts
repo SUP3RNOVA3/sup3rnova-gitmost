@@ -32,6 +32,22 @@ export interface SharedToolSpec {
   /** Single canonical model-facing description used by both layers. */
   description: string;
   /**
+   * Deferred-tool tier for the IN-APP agent (#332). 'core' tools are always
+   * active; 'deferred' tools are hidden behind the <tool_catalog> and loaded on
+   * demand via the loadTools meta-tool. This is an IN-APP concern only: the
+   * standalone /mcp server ignores this field and registers every tool normally
+   * (registerShared in index.ts reads mcpName/description/buildShape only).
+   */
+  tier: 'core' | 'deferred';
+  /**
+   * Hand-written one-liner "name — purpose" shown in the in-app agent's
+   * <tool_catalog> for a DEFERRED tool (#332). Deliberately NOT derived from the
+   * description's first sentence — a concise, accurate purpose line. Present on
+   * every spec (core tools too) for uniformity; only deferred ones are rendered.
+   * Inert for the external /mcp server.
+   */
+  catalogLine: string;
+  /**
    * Builds the tool's input schema as a plain object of zod fields (a
    * ZodRawShape). Called with the consumer's own zod namespace. Omitted for
    * no-argument tools (the MCP side then registers with no inputSchema and the
@@ -47,6 +63,8 @@ export const SHARED_TOOL_SPECS = {
     mcpName: 'get_workspace',
     inAppKey: 'getWorkspace',
     description: 'Fetch metadata about the current workspace (name, settings).',
+    tier: 'core',
+    catalogLine: 'getWorkspace — fetch current workspace metadata (name, settings).',
   },
 
   listSpaces: {
@@ -55,6 +73,8 @@ export const SHARED_TOOL_SPECS = {
     description:
       'List the spaces the current user can access. Returns the array of ' +
       'spaces (id, name, slug, ...).',
+    tier: 'core',
+    catalogLine: 'listSpaces — list the spaces the user can access (id, name, slug).',
   },
 
   listShares: {
@@ -62,6 +82,8 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'listShares',
     description:
       'List all public shares in the workspace with page titles and public URLs.',
+    tier: 'deferred',
+    catalogLine: 'listShares — list all public shares in the workspace with their URLs.',
   },
 
   // --- single-pageId read tools ---
@@ -74,6 +96,9 @@ export const SHARED_TOOL_SPECS = {
       'includes block ids, callouts, tables, link/image attributes) plus the ' +
       'slugId used in URLs. Use the block ids it returns to make precise ' +
       'structural edits or surgical text edits without resending the page.',
+    tier: 'deferred',
+    catalogLine:
+      "getPageJson — get a page's raw ProseMirror JSON (lossless, with block ids).",
     buildShape: (z) => ({
       pageId: z.string().min(1),
     }),
@@ -88,6 +113,9 @@ export const SHARED_TOOL_SPECS = {
       'count) WITHOUT the full document body. Use it to locate sections/tables ' +
       'and grab block ids cheaply before fetching, patching or inserting ' +
       'individual blocks.',
+    tier: 'core',
+    catalogLine:
+      "getOutline — compact outline of a page's top-level blocks with their ids.",
     buildShape: (z) => ({
       pageId: z.string().min(1),
     }),
@@ -104,6 +132,9 @@ export const SHARED_TOOL_SPECS = {
       'outline or page-JSON view (works for headings/paragraphs/callouts/images), OR ' +
       '`#<index>` to fetch a top-level block by its outline index — use the ' +
       '`#<index>` form for tables/rows/cells, which carry no id.',
+    tier: 'core',
+    catalogLine:
+      "getNode — fetch one block's ProseMirror subtree by block id or #index.",
     buildShape: (z) => ({
       pageId: z.string().min(1),
       nodeId: z.string().min(1),
@@ -137,6 +168,9 @@ export const SHARED_TOOL_SPECS = {
       'caseSensitive:true to match case. Ideal for systematic ' +
       'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
       'invalid regex or an empty query returns a clear error to fix.',
+    tier: 'core',
+    catalogLine:
+      'searchInPage — find every occurrence of a string/regex inside one page, with locations.',
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('ID of the page to search'),
       query: z
@@ -172,6 +206,8 @@ export const SHARED_TOOL_SPECS = {
     description:
       'Remove a single block by its attrs.id (from the page outline or ' +
       'page-JSON view) WITHOUT resending the whole document.',
+    tier: 'deferred',
+    catalogLine: 'deleteNode — remove a single content block by its block id.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
       nodeId: z.string().min(1),
@@ -203,6 +239,9 @@ export const SHARED_TOOL_SPECS = {
       'JSON object or a JSON string (both accepted). Cheaper and safer than ' +
       'replacing the whole document for one-block structural edits. Reversible: ' +
       'the previous version is kept in page history.',
+    tier: 'deferred',
+    catalogLine:
+      'patchNode — replace one block with a new ProseMirror node, keeping its id.',
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('ID of the page containing the block'),
       nodeId: z
@@ -245,6 +284,9 @@ export const SHARED_TOOL_SPECS = {
       '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
       '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
       'JSON object or a JSON string (both accepted). Reversible via page history.',
+    tier: 'deferred',
+    catalogLine:
+      'insertNode — insert a block before/after an anchor, or append at the end.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
       node: z
@@ -278,6 +320,8 @@ export const SHARED_TOOL_SPECS = {
     mcpName: 'unshare_page',
     inAppKey: 'unsharePage',
     description: 'Remove the public share of a page (revokes the public URL).',
+    tier: 'deferred',
+    catalogLine: "unsharePage — revoke a page's public share (removes the public URL).",
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('ID of the page to unshare'),
     }),
@@ -295,6 +339,9 @@ export const SHARED_TOOL_SPECS = {
       "`from`/`to` each accept a historyId, or null/'current' for the page's " +
       'current content (defaults: from=current, to=current — pass a historyId ' +
       'from the page-history list to compare against the live page).',
+    tier: 'deferred',
+    catalogLine:
+      'diffPageVersions — diff two page versions and return the change set + summary.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
       from: z
@@ -315,6 +362,9 @@ export const SHARED_TOOL_SPECS = {
       "List a page's saved versions (Docmost auto-snapshots on every save), " +
       'newest first, cursor-paginated. Returns { items, nextCursor }; each ' +
       "item's id is the historyId to pass to the page diff or restore tools.",
+    tier: 'deferred',
+    catalogLine:
+      "listPageHistory — list a page's saved versions (newest first, paginated).",
     buildShape: (z) => ({
       pageId: z.string().min(1),
       cursor: z
@@ -332,6 +382,9 @@ export const SHARED_TOOL_SPECS = {
       'as the page\'s current content (Docmost has no restore endpoint, so ' +
       'this creates a NEW history snapshot — the restore is itself revertible). ' +
       'Get the historyId from the page-history list.',
+    tier: 'deferred',
+    catalogLine:
+      'restorePageVersion — restore a page to a saved history version (revertible).',
     buildShape: (z) => ({
       historyId: z.string().min(1),
     }),
@@ -349,6 +402,9 @@ export const SHARED_TOOL_SPECS = {
       'thread records are NOT created/updated/deleted on the server by this ' +
       'tool — only the page body + inline comment marks are written; manage ' +
       'comment threads via the comment tools/UI.',
+    tier: 'deferred',
+    catalogLine:
+      "importPageMarkdown — replace a page's content from exported Docmost Markdown.",
     buildShape: (z) => ({
       pageId: z.string().min(1),
       markdown: z.string().min(1),
@@ -365,6 +421,9 @@ export const SHARED_TOOL_SPECS = {
       'entirely server-side — the document is NOT sent through the model. The ' +
       'target keeps its own title and slug; only its body is replaced. Ideal ' +
       "for 'make page A's content equal to B' or 'replace A with B but keep A's URL'.",
+    tier: 'deferred',
+    catalogLine:
+      "copyPageContent — replace one page's body with a copy of another page's body.",
     buildShape: (z) => ({
       sourcePageId: z.string().min(1).describe('Page to copy content FROM'),
       targetPageId: z
@@ -402,6 +461,9 @@ export const SHARED_TOOL_SPECS = {
       'page JSON and use a structural node patch/update to set its marks. ' +
       'Examples: edits:[{find:"teh",replace:"the"}]; edits:[{find:"Hello ' +
       'world",replace:"Hello there"}] (crosses a bold boundary).',
+    tier: 'core',
+    catalogLine:
+      "editPageText — surgical find/replace of plain text in a page, preserving ids/marks.",
     buildShape: (z) => ({
       pageId: z.string().describe('ID of the page to edit'),
       edits: z
@@ -440,6 +502,9 @@ export const SHARED_TOOL_SPECS = {
       'server instance that created it: in a multi-replica deployment without ' +
       'sticky sessions a blob stored on one instance is not retrievable via the ' +
       'sandbox URL on another (it 404s like an expired one).',
+    tier: 'deferred',
+    catalogLine:
+      'stashPage — serialize a whole page to a short anonymous URL without loading its body.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
     }),

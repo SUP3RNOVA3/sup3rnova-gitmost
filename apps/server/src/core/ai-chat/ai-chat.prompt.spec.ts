@@ -1,4 +1,8 @@
-import { buildSystemPrompt, buildMcpToolingBlock } from './ai-chat.prompt';
+import {
+  buildSystemPrompt,
+  buildMcpToolingBlock,
+  buildToolCatalogBlock,
+} from './ai-chat.prompt';
 import { Workspace } from '@docmost/db/types/entity.types';
 
 /**
@@ -394,5 +398,64 @@ describe('buildSystemPrompt page-changed note (#274)', () => {
     // Only the builder's real opening delimiter remains.
     const opens = prompt.split('<page_changed ').length - 1;
     expect(opens).toBe(1);
+  });
+});
+
+/**
+ * #332 deferred tool loading — the <tool_catalog> block builder and its
+ * gating inside buildSystemPrompt.
+ */
+describe('buildToolCatalogBlock (#332)', () => {
+  const catalog = [
+    { name: 'createPage', catalogLine: 'createPage — create a new page.' },
+    { name: 'transformPage', catalogLine: 'transformPage — run a JS transform.' },
+  ];
+
+  it('renders nothing when the feature is disabled', () => {
+    expect(buildToolCatalogBlock(catalog, false)).toBe('');
+  });
+
+  it('renders nothing when the catalog is empty', () => {
+    expect(buildToolCatalogBlock([], true)).toBe('');
+    expect(buildToolCatalogBlock(undefined, true)).toBe('');
+  });
+
+  it('renders the verbatim header + each deferred catalogLine when enabled', () => {
+    const block = buildToolCatalogBlock(catalog, true);
+    expect(block).toContain('<tool_catalog note="deferred tools;');
+    expect(block).toContain('NEVER tell the user you lack a capability');
+    expect(block).toContain('Deferred tools (name — purpose):');
+    expect(block).toContain('- createPage — create a new page.');
+    expect(block).toContain('- transformPage — run a JS transform.');
+    expect(block).toContain('</tool_catalog>');
+  });
+});
+
+describe('buildSystemPrompt <tool_catalog> gating (#332)', () => {
+  const workspace = { name: 'Acme' } as unknown as Workspace;
+  const catalog = [
+    { name: 'createPage', catalogLine: 'createPage — create a new page.' },
+  ];
+
+  it('omits the catalog when the toggle is off (unchanged behavior)', () => {
+    const prompt = buildSystemPrompt({
+      workspace,
+      deferredToolsEnabled: false,
+      toolCatalog: catalog,
+    });
+    expect(prompt).not.toContain('<tool_catalog');
+    expect(prompt).not.toContain('createPage — create a new page.');
+  });
+
+  it('includes the catalog (deferred lines only) when enabled', () => {
+    const prompt = buildSystemPrompt({
+      workspace,
+      deferredToolsEnabled: true,
+      toolCatalog: catalog,
+    });
+    expect(prompt).toContain('<tool_catalog');
+    expect(prompt).toContain('createPage — create a new page.');
+    // A core tool line is never in the catalog (the caller passes deferred only).
+    expect(prompt).not.toContain('searchPages —');
   });
 });

@@ -1,10 +1,11 @@
 import { Group, Text, Box, Badge, Button } from "@mantine/core";
 import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import classes from "./comment.module.css";
 import { useAtom, useAtomValue } from "jotai";
 import { useTimeAgo } from "@/hooks/use-time-ago";
 import CommentEditor from "@/features/comment/components/comment-editor";
+import CommentContentView from "@/features/comment/components/comment-content-view";
 import { pageEditorAtom } from "@/features/editor/atoms/editor-atoms";
 import CommentActions from "@/features/comment/components/comment-actions";
 import CommentMenu from "@/features/comment/components/comment-menu";
@@ -50,7 +51,6 @@ function CommentListItem({
   const [isEditing, setIsEditing] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const editor = useAtomValue(pageEditorAtom);
-  const [content, setContent] = useState<string>(comment.content);
   const editContentRef = useRef<any>(null);
   const updateCommentMutation = useUpdateCommentMutation();
   const deleteCommentMutation = useDeleteCommentMutation(comment.pageId);
@@ -78,22 +78,16 @@ function CommentListItem({
   const isOwnerOrAdmin =
     currentUser?.user?.id === comment.creatorId || userSpaceRole === "admin";
 
-  useEffect(() => {
-    setContent(comment.content);
-  }, [comment]);
 
   async function handleUpdateComment() {
     try {
       setIsLoading(true);
       const commentToUpdate = {
         commentId: comment.id,
-        content: JSON.stringify(editContentRef.current ?? content),
+        content: JSON.stringify(editContentRef.current ?? comment.content),
       };
       await updateCommentMutation.mutateAsync(commentToUpdate);
-      if (editContentRef.current) {
-        setContent(editContentRef.current);
-        editContentRef.current = null;
-      }
+      editContentRef.current = null;
       setIsEditing(false);
     } catch (error) {
       console.error("Failed to update comment:", error);
@@ -350,11 +344,11 @@ function CommentListItem({
         )}
 
         {!isEditing ? (
-          <CommentEditor defaultContent={content} editable={false} />
+          <CommentContentView content={comment.content} />
         ) : (
           <>
             <CommentEditor
-              defaultContent={content}
+              defaultContent={comment.content}
               editable={true}
               onUpdate={(newContent: any) => { editContentRef.current = newContent; }}
               onSave={handleUpdateComment}
@@ -374,4 +368,6 @@ function CommentListItem({
   );
 }
 
-export default CommentListItem;
+// Memoized so a resolve/apply/reply cache update (which only replaces the touched
+// comment's object identity) re-renders that one thread, not all ~356 items.
+export default React.memo(CommentListItem);
