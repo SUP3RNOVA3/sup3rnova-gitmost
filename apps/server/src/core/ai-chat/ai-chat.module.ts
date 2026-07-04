@@ -3,6 +3,7 @@ import { AiModule } from '../../integrations/ai/ai.module';
 import { TokenModule } from '../auth/token.module';
 import { AiChatController } from './ai-chat.controller';
 import { AiChatService } from './ai-chat.service';
+import { AiChatRunService } from './ai-chat-run.service';
 import { AiTranscriptionService } from './ai-transcription.service';
 import { AiChatToolsService } from './tools/ai-chat-tools.service';
 import { EmbeddingModule } from './embedding/embedding.module';
@@ -42,6 +43,7 @@ import { PublicShareChatToolsService } from './tools/public-share-chat-tools.ser
   controllers: [AiChatController, PublicShareChatController],
   providers: [
     AiChatService,
+    AiChatRunService,
     AiTranscriptionService,
     AiChatToolsService,
     PublicShareChatService,

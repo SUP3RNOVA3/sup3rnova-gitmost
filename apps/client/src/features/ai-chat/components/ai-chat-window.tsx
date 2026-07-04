@@ -19,7 +19,7 @@ import {
   IconPlus,
   IconX,
 } from "@tabler/icons-react";
-import { useAtom, useSetAtom } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { useLocation, useMatch } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
@@ -41,13 +41,24 @@ import { extractPageSlugId } from "@/lib";
 import {
   AI_CHATS_RQ_KEY,
   AI_CHAT_MESSAGES_RQ_KEY,
+  AI_CHAT_RUN_RQ_KEY,
   useAiChatMessagesQuery,
+  useAiChatRunQuery,
   useAiChatsQuery,
   useAiRolesQuery,
 } from "@/features/ai-chat/queries/ai-chat-query.ts";
+import {
+  shouldClearLatchOnQueryError,
+  shouldClearStoppingLatch,
+  shouldObserveRun,
+} from "@/features/ai-chat/utils/run-polling.ts";
+import { workspaceAtom } from "@/features/user/atoms/current-user-atom";
 import ConversationList from "@/features/ai-chat/components/conversation-list.tsx";
 import ChatThread from "@/features/ai-chat/components/chat-thread.tsx";
-import { exportAiChat } from "@/features/ai-chat/services/ai-chat-service.ts";
+import {
+  exportAiChat,
+  stopRun,
+} from "@/features/ai-chat/services/ai-chat-service.ts";
 import { useChatSession } from "@/features/ai-chat/hooks/use-chat-session.ts";
 import {
   shouldCollapseOnOutsidePointer,
@@ -233,6 +244,147 @@ export default function AiChatWindow() {
 
   const { data: messageRows, isLoading: messagesLoading } =
     useAiChatMessagesQuery(activeChatId ?? undefined);
+
+  // #184 reconnect-and-live-follow. Whether detached agent runs are enabled for
+  // this workspace. The reconnect endpoint itself is NOT flag-gated server-side
+  // (it is only owner-gated and returns `{ run: null }` when the chat has no
+  // run); but when the feature is off no runs are ever created, so polling it
+  // would always come back empty — we gate it off here to avoid pointless polls.
+  const workspace = useAtomValue(workspaceAtom);
+  const autonomousRunsEnabled =
+    workspace?.settings?.ai?.autonomousRuns === true;
+
+  // Whether THIS tab is the one actively streaming the open chat's run locally
+  // (it started the run here and holds the SSE). Reported up from ChatThread. We
+  // are the STREAMER while true and a passive OBSERVER while false — the basis of
+  // the observer-vs-streamer detection. Reset to false by the fresh ChatThread's
+  // mount effect on every chat switch.
+  const [localStreaming, setLocalStreaming] = useState(false);
+  const onStreamingChange = useCallback((streaming: boolean) => {
+    setLocalStreaming(streaming);
+  }, []);
+
+  // #184 Stop wiring. While a detached run is being stopped we SUPPRESS the
+  // observer merge so the stopping run's still-persisting output does not
+  // re-stream back into view between the moment the user pressed Stop and the run
+  // actually settling as 'aborted' server-side. Polling itself keeps running (so
+  // the terminal transition is still detected) — only the visual merge is gated.
+  // Cleared when the run is observed terminal (below) or the chat is switched.
+  const [stoppingRun, setStoppingRun] = useState(false);
+  // Reset the stopping latch whenever the open chat changes: it is scoped to the
+  // run of the previously-open chat.
+  useEffect(() => {
+    setStoppingRun(false);
+  }, [activeChatId]);
+
+  // Authoritative stop of the open chat's detached run (the Stop button in
+  // autonomous mode). Latch "stopping" first (suppresses the re-stream flash),
+  // then request the server stop — the ONLY thing that ends a detached run; a mere
+  // local SSE abort is a client disconnect the server ignores. On failure we
+  // release the latch so the observer resumes (better to show the live run than to
+  // freeze the view) and surface the error.
+  const handleServerStop = useCallback(
+    (chatId: string): void => {
+      setStoppingRun(true);
+      // #234 F4: drop the PREVIOUS turn's run from the cache so `run` becomes null
+      // until the CURRENT turn's run is fetched fresh. Without this, once the local
+      // stream aborts (localStreaming -> false) the run query re-enables and
+      // react-query SYNCHRONOUSLY returns the still-cached prior terminal run; the
+      // terminal effect would then clear the stopping latch against that STALE run
+      // before the current turn's (still-running, detached, growing) run is ever
+      // observed — re-opening the observer merge and flashing the growing output
+      // over the frozen row. With the cache cleared the terminal effect's
+      // `if (!run) return` holds the latch until the current run itself is observed
+      // terminal (see shouldClearStoppingLatch).
+      queryClient.removeQueries({ queryKey: AI_CHAT_RUN_RQ_KEY(chatId) });
+      void stopRun(chatId).catch(() => {
+        setStoppingRun(false);
+        notifications.show({
+          message: t("Failed to stop the run"),
+          color: "red",
+        });
+      });
+    },
+    [t, queryClient],
+  );
+
+  // Poll the latest run of the open chat ONLY when we are a passive observer:
+  // feature on, a chat is open, and we are NOT the local streamer (the streamer
+  // already has the live SSE — polling/merging too would double-render). The
+  // query's own status-keyed refetchInterval stops once the run is terminal.
+  const { data: runData, isError: runQueryFailed } = useAiChatRunQuery(
+    activeChatId ?? undefined,
+    autonomousRunsEnabled && !localStreaming,
+  );
+  const run = runData?.run ?? null;
+
+  // Safety net (#234 F4 review): after handleServerStop clears the run cache,
+  // `run` is null until the current turn's run is fetched fresh, and the terminal
+  // effect below holds the latch via `if (!run) return`. If that refetch instead
+  // ERRORS PERMANENTLY (the GET-run keeps failing) while we are no longer the
+  // streamer, the run stays null, its status-keyed refetchInterval is off, and
+  // nothing would ever observe a terminal run — freezing the view with the
+  // observer merge suppressed. Release the latch on that error so the live view
+  // resumes rather than stays stuck (the local stopRun may already have succeeded
+  // independently).
+  //
+  // #234 F7: this must NOT fire on a TRANSIENT error while `run` is still an
+  // ACTIVE held run. In TanStack Query v5 (retry:false) the query's `data` is
+  // RETAINED on error, so `runQueryFailed` can be true while `run` is still
+  // pending/running — releasing then would re-open the observer merge and flash
+  // the growing detached run over the frozen row (the very flash F4 prevents). The
+  // decision is the pure, unit-tested `shouldClearLatchOnQueryError`, which gates
+  // on the run NOT being active: it cures only the genuine permanent-null-freeze
+  // (`run === null`) and never releases against an active run.
+  useEffect(() => {
+    if (
+      shouldClearLatchOnQueryError({
+        stoppingRun,
+        isLocalStreaming: localStreaming,
+        runQueryFailed,
+        run,
+      })
+    )
+      setStoppingRun(false);
+  }, [stoppingRun, localStreaming, runQueryFailed, run]);
+  // The run's incrementally-persisted assistant message to merge into the thread,
+  // but only while we are an observer (never when we are the streamer — guards
+  // against a stale poll fighting the live stream). Includes a terminal run so the
+  // final persisted output is shown on reopen.
+  const observedRow =
+    shouldObserveRun(run, localStreaming) && !stoppingRun
+      ? (runData?.message ?? null)
+      : null;
+
+  // When the observed run reaches a terminal status, do a final messages refetch
+  // so the persisted final state (token/context badge, export source) is shown,
+  // then the query's refetchInterval has already stopped polling. Deduped per run
+  // id so it fires exactly once per run, not on every subsequent poll-less render.
+  const finalizedRunIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!run || !activeChatId) return;
+    if (run.status === "pending" || run.status === "running") {
+      // Active again (a new run) — re-arm so its terminal transition fires once.
+      finalizedRunIdRef.current = null;
+      return;
+    }
+    // Terminal: a stop we requested has landed (or the run finished on its own),
+    // so release the stopping latch — the observer merge can now show the final
+    // persisted (aborted/finished) output without any live re-stream. The decision
+    // is the pure, unit-tested `shouldClearStoppingLatch` (run-polling.ts): release
+    // ONLY when we requested a stop, this tab is no longer the streamer, AND the
+    // CURRENT run is terminal. The #234 F4 cache removal in handleServerStop makes
+    // `run` null (this branch's `if (!run) return` above holds) until the current
+    // turn's run is fetched fresh, so the latch can never clear against a stale
+    // cached run.
+    if (shouldClearStoppingLatch({ stoppingRun, run, isLocalStreaming: localStreaming }))
+      setStoppingRun(false);
+    if (finalizedRunIdRef.current === run.id) return;
+    finalizedRunIdRef.current = run.id;
+    queryClient.invalidateQueries({
+      queryKey: AI_CHAT_MESSAGES_RQ_KEY(activeChatId),
+    });
+  }, [run, activeChatId, queryClient, stoppingRun, localStreaming]);
 
   // The page the user is currently viewing. AiChatWindow lives in a pathless
   // parent layout route, so useParams() can't see :pageSlug. Match the full
@@ -882,6 +1034,18 @@ export default function AiChatWindow() {
               assistantName={currentRole?.name}
               onTurnFinished={onTurnFinished}
               onServerChatId={onServerChatId}
+              // #184: live-follow a still-running run when we reopened the chat as
+              // a passive observer; null when there is nothing to observe or this
+              // tab is the streamer. onStreamingChange lets the window stop polling
+              // while we are the streamer.
+              observedRow={observedRow}
+              onStreamingChange={onStreamingChange}
+              // #184: in autonomous mode the Stop button must hit the authoritative
+              // server stop (a local SSE abort is a client disconnect the server
+              // ignores). onServerStop also arms the "stopping" latch above so the
+              // stopped run's output does not re-stream via the observer merge.
+              autonomousRunsEnabled={autonomousRunsEnabled}
+              onServerStop={handleServerStop}
             />
           )}
         </div>

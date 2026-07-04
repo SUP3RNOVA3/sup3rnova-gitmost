@@ -57,6 +57,7 @@ describe('AiChatController.generatePageTitle', () => {
     const aiChatService = { generatePageTitle: generate };
     const controller = new AiChatController(
       aiChatService as never,
+      {} as never, // aiChatRunService
       {} as never,
       {} as never,
       {} as never,

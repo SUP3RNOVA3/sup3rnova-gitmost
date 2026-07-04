@@ -72,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   append/prepend fragments, nor to COMMENT bodies — a comment may legitimately
   contain a standalone footnote definition, which canonicalization would drop.
   (#228)
+- **Detached, autonomous agent runs that survive a browser disconnect.** When the
+  new `settings.ai.autonomousRuns` workspace flag is on (off by default), an
+  AI-chat turn becomes a first-class, server-side RUN tracked in a new
+  `ai_chat_runs` table instead of a socket-bound stream: closing the tab or
+  losing the connection no longer aborts the turn — it keeps executing and
+  persisting server-side, and only an explicit Stop ends it. A client can
+  reconnect and live-follow (or stop) an in-flight run via `POST /ai-chat/run`
+  (resolve the latest run + its assistant message for a chat) and
+  `POST /ai-chat/stop` (stop by `runId` or `chatId`). A partial unique index
+  enforces one active run per chat, and a startup sweep settles any run left
+  dangling by a restart. Phase 1 is single-instance-only (cross-instance Stop is
+  not yet reliable); the server warns at startup on a horizontally-scaled
+  deployment. (#184)
 - **Out-of-band page transfer via an in-RAM blob sandbox (`stash_page`).** A
   new MCP tool serializes a whole page (its full ProseMirror JSON, with every
   internal image/file mirrored) into an ephemeral in-RAM blob and returns only

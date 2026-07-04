@@ -3,6 +3,7 @@ import {
   AiAgentRoles,
   AiChats,
   AiChatMessages,
+  AiChatRuns,
   AiChatPageSnapshots,
   Attachments,
   Comments,
@@ -56,10 +57,12 @@ export type UpdatableAiChat = Updateable<Omit<AiChats, 'id'>>;
 // full-text search. It is omitted from the public type so it never leaks
 // into HTTP responses or the chat history fed to the language model.
 export type AiChatMessage = Omit<Selectable<AiChatMessages>, 'tsv'>;
-export type InsertableAiChatMessage = Omit<
-  Insertable<AiChatMessages>,
-  'tsv'
->;
+export type InsertableAiChatMessage = Omit<Insertable<AiChatMessages>, 'tsv'>;
+
+// AI Chat Run (#184 phase 1): the agent run as a first-class lifecycle object,
+// detached from the HTTP request / browser window.
+export type AiChatRun = Selectable<AiChatRuns>;
+export type InsertableAiChatRun = Insertable<AiChatRuns>;
 
 // AI Chat Page Snapshot (#274): per-(chat,page) Markdown snapshot taken at the
 // end of the agent's previous turn, diffed against the current page next turn to
@@ -214,11 +217,14 @@ export type UpdatableFavorite = Updateable<Omit<Favorites, 'id'>>;
 // Page Transclusion
 export type PageTransclusion = Selectable<PageTransclusions>;
 export type InsertablePageTransclusion = Insertable<PageTransclusions>;
-export type UpdatablePageTransclusion = Updateable<Omit<PageTransclusions, 'id'>>;
+export type UpdatablePageTransclusion = Updateable<
+  Omit<PageTransclusions, 'id'>
+>;
 
 // Page Transclusion Reference
 export type PageTransclusionReference = Selectable<PageTransclusionReferences>;
-export type InsertablePageTransclusionReference = Insertable<PageTransclusionReferences>;
+export type InsertablePageTransclusionReference =
+  Insertable<PageTransclusionReferences>;
 export type UpdatablePageTransclusionReference = Updateable<
   Omit<PageTransclusionReferences, 'id'>
 >;
@@ -288,7 +294,9 @@ export type UpdatablePagePermission = Updateable<Omit<_PagePermissions, 'id'>>;
 // Page Verification
 export type PageVerification = Selectable<_PageVerifications>;
 export type InsertablePageVerification = Insertable<_PageVerifications>;
-export type UpdatablePageVerification = Updateable<Omit<_PageVerifications, 'id'>>;
+export type UpdatablePageVerification = Updateable<
+  Omit<_PageVerifications, 'id'>
+>;
 
 // Page Verifier
 export type PageVerifier = Selectable<_PageVerifiers>;

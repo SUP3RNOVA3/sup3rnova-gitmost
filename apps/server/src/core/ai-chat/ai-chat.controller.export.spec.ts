@@ -53,6 +53,7 @@ describe('AiChatController.export', () => {
     };
     const controller = new AiChatController(
       {} as never,
+      {} as never, // aiChatRunService
       aiChatRepo as never,
       aiChatMessageRepo as never,
       {} as never,

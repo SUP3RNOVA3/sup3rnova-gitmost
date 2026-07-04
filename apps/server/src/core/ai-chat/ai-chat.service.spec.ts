@@ -453,6 +453,12 @@ describe('chatStreamMetadata', () => {
     });
   });
 
+  it('attaches the runId on the start part when a run wraps the turn (#184)', () => {
+    expect(
+      chatStreamMetadata({ type: 'start' }, 'chat-1', undefined, 'run-1'),
+    ).toEqual({ chatId: 'chat-1', runId: 'run-1' });
+  });
+
   it('returns the CUMULATIVE step usage passed in for the finish-step part', () => {
     // finish-step usage is per-step in v6; the caller accumulates and passes the
     // running sum, which this just wraps.

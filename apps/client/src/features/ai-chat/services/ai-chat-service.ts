@@ -5,6 +5,7 @@ import {
   IAiChatListParams,
   IAiChatMessageRow,
   IAiChatMessagesParams,
+  IAiChatRunResponse,
   IAiRole,
   IAiRoleCatalog,
   IAiRoleCatalogBundle,
@@ -39,6 +40,38 @@ export async function getAiChatMessages(
     "/ai-chat/messages",
     params,
   );
+  return req.data;
+}
+
+/**
+ * Reconnect to the latest agent run of a chat (#184). Returns the run's
+ * persisted lifecycle state and the assistant message it materializes (the
+ * partial output while the run is in-flight, the final output once it finished).
+ * The DB is the source of truth, so this works for an in-flight run (the browser
+ * dropped, the run kept going) and a finished one alike; `{ run: null }` when the
+ * chat has never had a run. Owner-gated server-side (the requesting user must own
+ * the chat); it is NOT flag-gated — when the feature is off the chat simply has no
+ * runs, so the endpoint returns `{ run: null }`.
+ */
+export async function getAiChatRun(
+  chatId: string,
+): Promise<IAiChatRunResponse> {
+  const req = await api.post<IAiChatRunResponse>("/ai-chat/run", { chatId });
+  return req.data;
+}
+
+/**
+ * Explicitly STOP the active agent run of a chat (#184). This is the ONLY thing
+ * that ends a DETACHED run — a mere browser disconnect (aborting the local SSE)
+ * is deliberately ignored server-side, so the client must call this to actually
+ * stop an autonomous run. Targeted by `chatId` (the server resolves whatever run
+ * is active on it); owner-gated server-side. Returns `{ stopped }` — false when
+ * there was nothing active to stop.
+ */
+export async function stopRun(
+  chatId: string,
+): Promise<{ stopped: boolean }> {
+  const req = await api.post<{ stopped: boolean }>("/ai-chat/stop", { chatId });
   return req.data;
 }
 

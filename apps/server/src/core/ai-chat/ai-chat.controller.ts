@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   ForbiddenException,
   HttpCode,
@@ -20,7 +21,13 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
 import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
-import { AiChat, User, Workspace } from '@docmost/db/types/entity.types';
+import {
+  AiChat,
+  AiChatMessage,
+  AiChatRun,
+  User,
+  Workspace,
+} from '@docmost/db/types/entity.types';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
@@ -28,7 +35,12 @@ import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { UserThrottlerGuard } from '../../integrations/throttle/user-throttler.guard';
 import { AI_CHAT_THROTTLER } from '../../integrations/throttle/throttler-names';
 import { FileInterceptor } from '../../common/interceptors/file.interceptor';
-import { AiChatService, AiChatStreamBody } from './ai-chat.service';
+import {
+  AiChatRunHooks,
+  AiChatService,
+  AiChatStreamBody,
+} from './ai-chat.service';
+import { AiChatRunService } from './ai-chat-run.service';
 import { AiTranscriptionService } from './ai-transcription.service';
 import {
   BoundChatDto,
@@ -36,7 +48,9 @@ import {
   ExportChatDto,
   GeneratePageTitleDto,
   GetChatMessagesDto,
+  GetRunDto,
   RenameChatDto,
+  StopRunDto,
 } from './dto/ai-chat.dto';
 import { describeProviderError } from '../../integrations/ai/ai-error.util';
 import { buildChatMarkdown } from './chat-markdown.util';
@@ -53,6 +67,7 @@ export class AiChatController {
 
   constructor(
     private readonly aiChatService: AiChatService,
+    private readonly aiChatRunService: AiChatRunService,
     private readonly aiChatRepo: AiChatRepo,
     private readonly aiChatMessageRepo: AiChatMessageRepo,
     private readonly aiTranscription: AiTranscriptionService,
@@ -149,6 +164,75 @@ export class AiChatController {
     return { markdown };
   }
 
+  /**
+   * Reconnect to the latest run of a chat (#184 phase 1). Returns the run's
+   * persisted lifecycle state ({ status, error, stepCount, timings, ... }) plus
+   * the assistant message it projects (the partial/final output) — the DB is the
+   * source of truth, so this works for an in-flight run (the browser dropped, the
+   * run kept going) and a finished one alike. Owner-gated via assertOwnedChat.
+   * `{ run: null }` when the chat has never had a run.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('run')
+  async getRun(
+    @Body() dto: GetRunDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ run: AiChatRun | null; message: AiChatMessage | null }> {
+    await this.assertOwnedChat(dto.chatId, user, workspace);
+    const run = await this.aiChatRunService.getLatestForChat(
+      dto.chatId,
+      workspace.id,
+    );
+    if (!run) return { run: null, message: null };
+    const message = run.assistantMessageId
+      ? await this.aiChatMessageRepo.findById(
+          run.assistantMessageId,
+          workspace.id,
+        )
+      : undefined;
+    return { run, message: message ?? null };
+  }
+
+  /**
+   * Explicitly STOP an agent run (#184 phase 1) — the user pressed Stop. This is
+   * the ONLY thing that ends a detached run; a browser disconnect deliberately
+   * does not. Target by `runId` (from the streamed start metadata) or by `chatId`
+   * (stop whatever run is active on it). Owner-gated. Returns
+   * `{ stopped }` — false when there was nothing active to stop.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('stop')
+  async stopRun(
+    @Body() dto: StopRunDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ stopped: boolean }> {
+    let runId = dto.runId;
+    if (!runId && !dto.chatId) {
+      throw new BadRequestException('runId or chatId is required');
+    }
+    if (runId) {
+      // Resolve the run to its chat and owner-gate via that chat.
+      const run = await this.aiChatRunService.getRun(runId, workspace.id);
+      if (!run) return { stopped: false };
+      await this.assertOwnedChat(run.chatId, user, workspace);
+    } else {
+      await this.assertOwnedChat(dto.chatId!, user, workspace);
+      const active = await this.aiChatRunService.getActiveForChat(
+        dto.chatId!,
+        workspace.id,
+      );
+      if (!active) return { stopped: false };
+      runId = active.id;
+    }
+    const stopped = await this.aiChatRunService.requestStop(
+      runId,
+      workspace.id,
+    );
+    return { stopped };
+  }
+
   /** Rename a chat. */
   @HttpCode(HttpStatus.OK)
   @Post('rename')
@@ -200,10 +284,19 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<void> {
     // A7 gate: the workspace must have AI chat explicitly enabled.
-    const settings = (workspace.settings ?? {}) as { ai?: { chat?: boolean } };
+    const settings = (workspace.settings ?? {}) as {
+      ai?: { chat?: boolean; autonomousRuns?: boolean };
+    };
     if (settings.ai?.chat !== true) {
       throw new ForbiddenException('AI chat is disabled');
     }
+
+    // #184 phase 1 flag: when ON, the turn becomes a detached, durable RUN — its
+    // lifecycle is tracked in ai_chat_runs, a browser disconnect no longer aborts
+    // it, and only an explicit /ai-chat/stop ends it. When OFF (the default) the
+    // turn is socket-bound exactly as before, so existing deployments are
+    // unaffected.
+    const autonomousRuns = settings.ai?.autonomousRuns === true;
 
     const sessionId = (req.raw as { sessionId?: string }).sessionId;
     if (!sessionId) {
@@ -228,6 +321,58 @@ export class AiChatController {
     // HttpException) instead of breaking mid-stream.
     const model = await this.aiChatService.getChatModel(workspace.id, role);
 
+    // #184: one active run per chat. For an EXISTING chat reject a concurrent
+    // start with a clean 409 BEFORE hijack (the common double-submit / second-tab
+    // case), so the user gets JSON, not a mid-stream error. A brand-new chat
+    // (no chatId) cannot have a prior run, and the DB partial unique index is the
+    // backstop against any race that slips past this check.
+    if (autonomousRuns && body.chatId) {
+      const active = await this.aiChatRunService.getActiveForChat(
+        body.chatId,
+        workspace.id,
+      );
+      if (active) {
+        throw new ConflictException({
+          message: 'An agent run is already in progress for this chat',
+          code: 'A_RUN_ALREADY_ACTIVE',
+        });
+      }
+    }
+
+    // Run-lifecycle hooks (#184), only when the flag is on. They wrap the turn in
+    // a durable run whose abort is governed by the run (explicit stop), persist
+    // its progress, and settle its terminal status — see AiChatRunService.
+    const runHooks: AiChatRunHooks | undefined = autonomousRuns
+      ? {
+          begin: (chatId) =>
+            this.aiChatRunService.beginRun({
+              chatId,
+              workspaceId: workspace.id,
+              userId: user.id,
+              trigger: 'user',
+            }),
+          onAssistantSeeded: (runId, messageId) =>
+            this.aiChatRunService.linkAssistantMessage(
+              runId,
+              workspace.id,
+              messageId,
+            ),
+          onStep: (runId, stepCount) =>
+            void this.aiChatRunService.recordStep(
+              runId,
+              workspace.id,
+              stepCount,
+            ),
+          onSettled: (runId, status, error) =>
+            this.aiChatRunService.finalizeRun(
+              runId,
+              workspace.id,
+              status,
+              error,
+            ),
+        }
+      : undefined;
+
     // Abort the agent loop when the client disconnects. `close` also fires on
     // normal completion, so only abort when the response has not finished
     // writing (a genuine disconnect). `once` fires at most once and self-removes;
@@ -242,17 +387,43 @@ export class AiChatController {
       // A genuine disconnect leaves the response unfinished (unlike a normal
       // completion, which also fires `close`). Such a drop — e.g. a reverse
       // proxy cutting the SSE mid-answer — is otherwise invisible server-side,
-      // so log it here before aborting the agent loop.
+      // so log it here.
       if (!res.raw.writableEnded) {
-        this.logger.warn(
-          `AI chat stream: client disconnected before completion; aborting turn ` +
-            `(elapsed=${Date.now() - reqStartedAt}ms since request received)`,
-        );
-        controller.abort();
+        if (autonomousRuns) {
+          // #184: the turn is a DETACHED run. A disconnect must NOT abort it —
+          // the run keeps executing and persisting server-side; the client
+          // reconnects via /ai-chat/run (or re-stops via /ai-chat/stop). Log only.
+          this.logger.log(
+            `AI chat stream: client disconnected; run continues server-side ` +
+              `(elapsed=${Date.now() - reqStartedAt}ms since request received)`,
+          );
+        } else {
+          this.logger.warn(
+            `AI chat stream: client disconnected before completion; aborting turn ` +
+              `(elapsed=${Date.now() - reqStartedAt}ms since request received)`,
+          );
+          controller.abort();
+        }
       }
     };
     req.raw.once('close', onClose);
     res.raw.once('finish', () => req.raw.off('close', onClose));
+
+    // #184: in detached mode the turn is NOT aborted on disconnect, so the SDK's
+    // pipe keeps writing to a socket the client may have dropped — for the rest of
+    // the (continuing) run. A write to the dead socket can emit an 'error' on the
+    // raw response; without a listener that surfaces as an unhandled error event.
+    // Swallow it (the run continues server-side regardless). Legacy mode aborts on
+    // disconnect, so it does not need this and keeps its exact prior behavior.
+    if (autonomousRuns) {
+      res.raw.on('error', (err) => {
+        this.logger.debug(
+          `AI chat detached stream: post-disconnect socket error swallowed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }
 
     // Commit to streaming: hijack so Fastify stops managing the response and
     // the AI SDK can write the UI-message stream directly to the Node socket.
@@ -268,15 +439,32 @@ export class AiChatController {
         signal: controller.signal,
         model,
         role,
+        // #184: present only when the flag is on; wraps the turn in a durable run.
+        runHooks,
       });
     } catch (err) {
-      // Any failure AFTER hijack can no longer send a clean JSON error, so emit
-      // a minimal error on the raw socket if nothing has been written yet.
-      this.logger.error('AI chat stream failed', err as Error);
+      // Any failure AFTER hijack can no longer go through Nest's exception
+      // filter, so emit the error on the raw socket if nothing has been written
+      // yet. The lost-the-race 409 (RunAlreadyActiveError -> ConflictException)
+      // is raised by stream() BEFORE it writes a byte, so headers are still
+      // unsent here: honor the HttpException's real status + body (a clean 409),
+      // not a blanket 500. Everything else stays a 500.
+      const isHttp = err instanceof HttpException;
+      if (!isHttp) {
+        this.logger.error('AI chat stream failed', err as Error);
+      }
       if (!res.raw.headersSent) {
-        res.raw.statusCode = 500;
+        const status = isHttp ? err.getStatus() : 500;
+        const payload = isHttp
+          ? err.getResponse()
+          : { error: 'Internal server error' };
+        res.raw.statusCode = status;
         res.raw.setHeader('Content-Type', 'application/json');
-        res.raw.end(JSON.stringify({ error: 'Internal server error' }));
+        res.raw.end(
+          JSON.stringify(
+            typeof payload === 'string' ? { message: payload } : payload,
+          ),
+        );
       } else if (!res.raw.writableEnded) {
         res.raw.end();
       }

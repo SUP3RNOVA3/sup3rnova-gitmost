@@ -25,6 +25,7 @@ describe('AiChatController.boundChat', () => {
     };
     const controller = new AiChatController(
       {} as never,
+      {} as never, // aiChatRunService
       aiChatRepo as never,
       {} as never,
       {} as never,
