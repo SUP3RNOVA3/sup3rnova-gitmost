@@ -23,7 +23,7 @@ import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 describe('CommentService — applySuggestion', () => {
   const UPDATED = { id: 'c-1', __updated: true } as any;
 
-  function makeService(verdict: unknown, hasChildren = false) {
+  function makeService(verdict: unknown, hasChildren = false, deletedRows = 1) {
     const commentRepo: any = {
       // Both the applied-stamp re-read and resolveComment's re-read go through
       // findById; return a recognizable enriched row.
@@ -31,6 +31,9 @@ describe('CommentService — applySuggestion', () => {
       updateComment: jest.fn(async () => undefined),
       hasChildren: jest.fn(async () => hasChildren),
       deleteComment: jest.fn(async () => undefined),
+      // #338 F1: the childless ephemeral delete is atomic-conditional and
+      // returns the number of rows removed (1 = deleted, 0 = a reply raced in).
+      deleteCommentIfChildless: jest.fn(async () => deletedRows),
     };
     const pageRepo: any = {};
     const wsService: any = { emitCommentEvent: jest.fn() };
@@ -101,9 +104,9 @@ describe('CommentService — applySuggestion', () => {
       }),
     );
 
-    // Ephemeral: the redundant comment is hard-deleted and its inline anchor
-    // mark removed via the deleteCommentMark collab event.
-    expect(commentRepo.deleteComment).toHaveBeenCalledWith('c-1');
+    // Ephemeral: the redundant comment is hard-deleted (atomic-conditional) and
+    // its inline anchor mark removed via the deleteCommentMark collab event.
+    expect(commentRepo.deleteCommentIfChildless).toHaveBeenCalledWith('c-1');
     expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
       'deleteCommentMark',
       'page.page-1',
@@ -136,7 +139,7 @@ describe('CommentService — applySuggestion', () => {
 
     const result = await service.applySuggestion(suggestionComment(), user());
 
-    expect(commentRepo.deleteComment).toHaveBeenCalledWith('c-1');
+    expect(commentRepo.deleteCommentIfChildless).toHaveBeenCalledWith('c-1');
     expect(auditService.log).toHaveBeenCalledTimes(1);
     expect(result.outcome).toBe('deleted');
   });
@@ -247,8 +250,37 @@ describe('CommentService — applySuggestion', () => {
       expect.anything(),
       expect.anything(),
     );
-    expect(commentRepo.deleteComment).toHaveBeenCalledWith('c-1');
+    expect(commentRepo.deleteCommentIfChildless).toHaveBeenCalledWith('c-1');
     expect(result.outcome).toBe('deleted');
+  });
+
+  it('applied=true, no replies at read time but a reply races in (conditional delete → 0 rows) → resolves instead, no hard-delete, outcome=resolved (#338 F1)', async () => {
+    // The suggested text is already applied to the document, but between the
+    // hasChildren read and the atomic delete a reply landed. The parent must NOT
+    // be hard-deleted (cascade would destroy the reply); resolve the thread.
+    const { service, commentRepo, wsService, collaborationGateway } =
+      makeService({ applied: true, currentText: 'new text' }, false, 0);
+
+    const result = await service.applySuggestion(suggestionComment(), user());
+
+    expect(commentRepo.deleteCommentIfChildless).toHaveBeenCalledWith('c-1');
+    // No deletion broadcast — the row + the racing reply survive.
+    expect(wsService.emitCommentEvent).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ operation: 'commentDeleted' }),
+    );
+    // Fell back to resolving.
+    const resolvePatch = commentRepo.updateComment.mock.calls
+      .map((c: any[]) => c[0])
+      .find((p: any) => 'resolvedAt' in p);
+    expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
+    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
+      'resolveCommentMark',
+      'page.page-1',
+      expect.objectContaining({ commentId: 'c-1', resolved: true }),
+    );
+    expect(result.outcome).toBe('resolved');
   });
 
   it('rejects a comment with no suggestedText', async () => {

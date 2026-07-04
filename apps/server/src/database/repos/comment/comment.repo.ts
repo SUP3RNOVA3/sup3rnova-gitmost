@@ -139,6 +139,37 @@ export class CommentRepo {
     await this.db.deleteFrom('comments').where('id', '=', commentId).execute();
   }
 
+  /**
+   * Atomic conditional delete for an ephemeral suggestion (#338 / #329 F1):
+   * delete the row ONLY if it is still childless, in a single statement, and
+   * return the number of rows removed (0 or 1). This closes a race: dismiss/apply
+   * read `hasChildren`, then remove the anchor mark (a collab round-trip of
+   * tens-to-hundreds of ms), then delete. `comments.parent_comment_id` is
+   * ON DELETE CASCADE, so if a reply lands in that window an unconditional delete
+   * would cascade-delete the just-added reply forever. The `NOT EXISTS` re-checks
+   * childlessness at delete time inside the same statement, so an interleaved
+   * reply makes this delete 0 rows and the caller can fall back to resolving the
+   * thread instead of destroying the discussion.
+   */
+  async deleteCommentIfChildless(commentId: string): Promise<number> {
+    const result = await this.db
+      .deleteFrom('comments')
+      .where('id', '=', commentId)
+      .where((eb) =>
+        eb.not(
+          eb.exists(
+            eb
+              .selectFrom('comments as child')
+              .select('child.id')
+              .whereRef('child.parentCommentId', '=', 'comments.id'),
+          ),
+        ),
+      )
+      .executeTakeFirst();
+
+    return Number(result?.numDeletedRows ?? 0n);
+  }
+
   async hasChildren(commentId: string): Promise<boolean> {
     const result = await this.db
       .selectFrom('comments')

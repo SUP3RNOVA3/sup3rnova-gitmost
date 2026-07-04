@@ -516,8 +516,10 @@ export class CommentService {
       return { ...updatedComment, outcome: 'resolved' };
     }
 
-    // Ephemeral: no replies → the suggestion vanishes entirely.
-    await this.deleteEphemeralSuggestion(comment, user);
+    // Ephemeral: no replies → the suggestion vanishes entirely. The atomic
+    // conditional delete may still fall back to a resolve if a reply raced in
+    // (see deleteEphemeralSuggestion), so the outcome is whatever it settled on.
+    const settled = await this.deleteEphemeralSuggestion(comment, user, provenance);
     this.auditService.log({
       event: AuditEvent.COMMENT_SUGGESTION_DISMISSED,
       resourceType: AuditResource.COMMENT,
@@ -525,7 +527,7 @@ export class CommentService {
       spaceId: comment.spaceId,
       metadata: { pageId: comment.pageId },
     });
-    return { ...comment, outcome: 'deleted' };
+    return settled;
   }
 
   /**
@@ -592,7 +594,9 @@ export class CommentService {
     // the comment is redundant. Hard-delete it and strip its inline anchor. We
     // deliberately do NOT write the applied stamps first (the row is about to be
     // deleted); the audit event still records that the suggestion was applied.
-    await this.deleteEphemeralSuggestion(comment, user);
+    // The delete is atomic-conditional: if a reply raced in after the
+    // hasChildren read, it falls back to resolving instead (outcome 'resolved').
+    const settled = await this.deleteEphemeralSuggestion(comment, user, provenance);
 
     this.auditService.log({
       event: AuditEvent.COMMENT_SUGGESTION_APPLIED,
@@ -602,13 +606,13 @@ export class CommentService {
       metadata: { pageId: comment.pageId },
     });
 
-    return { ...comment, outcome: 'deleted' };
+    return settled;
   }
 
   /**
-   * Hard-delete an ephemeral suggestion comment and remove its inline `comment`
-   * anchor mark from the collaborative document, then broadcast the deletion.
-   * Shared by the apply/dismiss no-replies branches (#329).
+   * Settle an ephemeral suggestion whose thread looked childless: remove its
+   * inline `comment` anchor mark, then ATOMICALLY hard-delete the row only if it
+   * is still childless. Shared by the apply/dismiss no-replies branches (#329).
    *
    * ORDER MATTERS: the anchor mark is removed FIRST and FATALLY (mirrors
    * applySuggestion, which mutates the doc before writing the DB). The row
@@ -618,19 +622,51 @@ export class CommentService {
    * anchor pointing at a comment that no longer exists (the exact data-integrity
    * bug #329 targets). Let the exception propagate (→ 5xx); the operation is
    * then repeatable with row + mark still consistent.
+   *
+   * RACE (#338 F1): the caller read `hasChildren` BEFORE the (slow) mark
+   * removal, so a reply can land in that window. `comments.parent_comment_id` is
+   * ON DELETE CASCADE, so an unconditional delete here would cascade-destroy the
+   * just-added reply forever. Instead we use `deleteCommentIfChildless`, which
+   * re-checks childlessness inside the delete statement. If it removes the row
+   * (outcome 'deleted') we broadcast the deletion as before. If it removes 0
+   * rows (a reply interleaved) we do NOT hard-delete — we resolve the thread
+   * instead (outcome 'resolved'), preserving the discussion and the new reply.
+   * The anchor mark is already gone by then, an accepted degradation: the thread
+   * lands in the resolved tab without its inline highlight — far better than
+   * losing a reply.
    */
   private async deleteEphemeralSuggestion(
     comment: Comment,
     user: User,
-  ): Promise<void> {
+    provenance?: AuthProvenanceData,
+  ): Promise<Comment & { outcome: SuggestionOutcome }> {
     await this.deleteCommentMark(comment, user);
-    await this.commentRepo.deleteComment(comment.id);
 
-    this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
-      operation: 'commentDeleted',
-      pageId: comment.pageId,
-      commentId: comment.id,
-    });
+    const deletedRows = await this.commentRepo.deleteCommentIfChildless(
+      comment.id,
+    );
+
+    if (deletedRows > 0) {
+      this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
+        operation: 'commentDeleted',
+        pageId: comment.pageId,
+        commentId: comment.id,
+      });
+      return { ...comment, outcome: 'deleted' };
+    }
+
+    // A reply interleaved between the hasChildren read and this delete, so the
+    // conditional delete matched nothing. Preserve the discussion + the new
+    // reply by resolving the thread instead of hard-deleting it. resolveComment
+    // handles the resolve patch, its ws broadcast and the resolve notification;
+    // its collab call is best-effort, so the already-stripped mark is fine.
+    const resolvedComment = await this.resolveComment(
+      comment,
+      true,
+      user,
+      provenance,
+    );
+    return { ...resolvedComment, outcome: 'resolved' };
   }
 
   /**

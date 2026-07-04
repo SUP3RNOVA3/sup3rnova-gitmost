@@ -127,7 +127,9 @@ describe('CommentController apply-suggestion authz', () => {
  * the delete/resolve + mark removal). These tests pin that boundary.
  */
 describe('CommentController dismiss-suggestion authz', () => {
-  function makeController() {
+  // isAdmin=false → ability.cannot(Manage, Settings) returns true (i.e. the user
+  // is NOT a space admin). Flip to true to model a space admin.
+  function makeController(isAdmin = false) {
     const commentService = {
       dismissSuggestion: jest.fn(async () => ({
         id: 'c-1',
@@ -136,7 +138,11 @@ describe('CommentController dismiss-suggestion authz', () => {
     };
     const commentRepo = { findById: jest.fn() };
     const pageRepo = { findById: jest.fn() };
-    const spaceAbility = {} as any;
+    const spaceAbility = {
+      createForUser: jest.fn(async () => ({
+        cannot: jest.fn(() => !isAdmin),
+      })),
+    } as any;
     const pageAccessService = {
       validateCanComment: jest.fn(async () => undefined),
       validateCanEdit: jest.fn(async () => undefined),
@@ -159,6 +165,7 @@ describe('CommentController dismiss-suggestion authz', () => {
       commentRepo,
       pageRepo,
       pageAccessService,
+      spaceAbility,
     };
   }
 
@@ -166,10 +173,12 @@ describe('CommentController dismiss-suggestion authz', () => {
   const workspace: any = { id: 'ws-1' };
   const provenance: any = undefined;
   const dto: any = { commentId: 'c-1' };
+  // Owned by the acting user (u-1) unless a test overrides creatorId.
   const comment = {
     id: 'c-1',
     pageId: 'p-1',
     spaceId: 'sp-1',
+    creatorId: 'u-1',
     suggestedText: 'new text',
     selection: 'old text',
   };
@@ -257,5 +266,59 @@ describe('CommentController dismiss-suggestion authz', () => {
     await expect(
       controller.dismissSuggestion(dto, user, workspace, provenance),
     ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  // --- #338 owner-or-space-admin gate (mirrors POST /comments/delete) --------
+  // A childless dismiss irreversibly hard-deletes the comment, so canComment is
+  // not enough: only the comment owner or a space admin may dismiss.
+
+  it('owner dismisses their own suggestion → allowed, no admin check needed', async () => {
+    const { controller, commentRepo, pageRepo, commentService, spaceAbility } =
+      makeController(false);
+    // comment.creatorId === user.id (owner).
+    commentRepo.findById.mockResolvedValue(comment);
+    pageRepo.findById.mockResolvedValue(page);
+
+    await controller.dismissSuggestion(dto, user, workspace, provenance);
+
+    // Owner short-circuits the admin lookup.
+    expect(spaceAbility.createForUser).not.toHaveBeenCalled();
+    expect(commentService.dismissSuggestion).toHaveBeenCalledWith(
+      comment,
+      user,
+      provenance,
+    );
+  });
+
+  it('non-owner non-admin → Forbidden AND the service is never called', async () => {
+    const { controller, commentRepo, pageRepo, commentService, spaceAbility } =
+      makeController(false); // NOT a space admin
+    commentRepo.findById.mockResolvedValue({
+      ...comment,
+      creatorId: 'someone-else',
+    });
+    pageRepo.findById.mockResolvedValue(page);
+
+    await expect(
+      controller.dismissSuggestion(dto, user, workspace, provenance),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+
+    expect(spaceAbility.createForUser).toHaveBeenCalledWith(user, comment.spaceId);
+    expect(commentService.dismissSuggestion).not.toHaveBeenCalled();
+  });
+
+  it('non-owner space admin → allowed to dismiss another user’s suggestion', async () => {
+    const { controller, commentRepo, pageRepo, commentService, spaceAbility } =
+      makeController(true); // space admin
+    commentRepo.findById.mockResolvedValue({
+      ...comment,
+      creatorId: 'someone-else',
+    });
+    pageRepo.findById.mockResolvedValue(page);
+
+    await controller.dismissSuggestion(dto, user, workspace, provenance);
+
+    expect(spaceAbility.createForUser).toHaveBeenCalledWith(user, comment.spaceId);
+    expect(commentService.dismissSuggestion).toHaveBeenCalled();
   });
 });

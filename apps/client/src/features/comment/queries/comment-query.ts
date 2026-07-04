@@ -253,14 +253,19 @@ export function useApplySuggestionMutation() {
     },
     onError: (err: any, variables) => {
       const status = err?.response?.status;
-      // Idempotent races (double-click, or apply↔dismiss): after #329 an applied
+      // Idempotent race (double-click, or apply↔dismiss): after #329 an applied
       // reply-less suggestion is hard-deleted, so a second/racing apply hits 404
-      // (already gone) or 400 (already resolved) BEFORE the server's applied
-      // idempotent branch. Drop it from the cache and report success — the user's
-      // intent is already satisfied — rather than a scary error (mirrors dismiss;
-      // restores the #315 apply idempotency the ephemeral delete would otherwise
-      // break).
-      if (status === 404 || status === 400) {
+      // (already gone). ONLY 404 is a real success-noop — drop it from the cache
+      // and report success, the user's intent is already satisfied (restores the
+      // #315 apply idempotency the ephemeral delete would otherwise break).
+      //
+      // 400 is NOT success (#338 F2): apply's only 400 is "Cannot apply … on a
+      // resolved comment thread" — the thread was resolved (often WITH a live
+      // discussion) but the edit was NOT applied. Treating it as "Suggestion
+      // applied" is a false success that also drops a live thread from the cache.
+      // The #315 idempotent repeat does NOT produce 400 (childless → 404;
+      // with-replies → 200), so we never lose idempotency by excluding it here.
+      if (status === 404) {
         const cache = queryClient.getQueryData(RQ_KEY(variables.pageId)) as
           | InfiniteData<IPagination<IComment>>
           | undefined;
@@ -271,6 +276,20 @@ export function useApplySuggestionMutation() {
           );
         }
         notifications.show({ message: t("Suggestion applied") });
+        return;
+      }
+      // 400 => the thread was resolved and the edit could not be applied. Show a
+      // real error and KEEP the comment in the cache (it is still alive). Prefer
+      // the server's specific message when it carries one.
+      if (status === 400) {
+        const serverMsg = err?.response?.data?.message;
+        notifications.show({
+          message:
+            typeof serverMsg === "string" && serverMsg.length > 0
+              ? serverMsg
+              : t("Failed to apply suggestion"),
+          color: "red",
+        });
         return;
       }
       // 409 => the commented text changed since the suggestion was made. Surface
@@ -321,12 +340,15 @@ export function useDismissSuggestionMutation() {
       notifications.show({ message: t("Suggestion dismissed") });
     },
     onError: (err: any, variables) => {
-      // Idempotent races (double-click, or apply↔dismiss): the comment is already
-      // gone (404) or already resolved (400). Drop it from the cache and report
-      // success rather than a scary error — the user's intent (make it disappear)
-      // is satisfied either way.
+      // Idempotent race (double-click, or apply↔dismiss): the comment is already
+      // gone (404). ONLY 404 is a real success-noop — drop it from the cache and
+      // report success, the user's intent (make it disappear) is satisfied.
+      //
+      // 400 is NOT success (#338 F2): it means the thread is still ALIVE (already
+      // resolved, or a reply raced in), so treating it as "dismissed" would drop
+      // a live thread from the cache. Show a real error and keep the comment.
       const status = err?.response?.status;
-      if (status === 404 || status === 400) {
+      if (status === 404) {
         const cache = queryClient.getQueryData(RQ_KEY(variables.pageId)) as
           | InfiniteData<IPagination<IComment>>
           | undefined;

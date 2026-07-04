@@ -28,6 +28,7 @@ vi.mock("@/features/comment/services/comment-service", () => ({
   getPageComments: vi.fn(),
 }));
 
+import { notifications } from "@mantine/notifications";
 import {
   applySuggestion,
   dismissSuggestion,
@@ -181,6 +182,39 @@ describe("useDismissSuggestionMutation — outcome handling (#329)", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
 
     expect(items(queryClient)).toHaveLength(0);
+    // #338 F3: the idempotent race must still fire the SUCCESS toast, not just
+    // silently drop the comment.
+    expect(notifications.show).toHaveBeenCalledWith({
+      message: "Suggestion dismissed",
+    });
+  });
+
+  it("dismiss 400 (thread still alive) → NOT a success, comment kept, no green toast (#338 F2)", async () => {
+    // 400 means the thread is alive (already resolved / a reply raced in).
+    // Narrowed onError: only 404 is a success-noop; 400 must surface a real error
+    // and keep the comment in the cache.
+    vi.mocked(dismissSuggestion).mockRejectedValue({
+      response: { status: 400 },
+    });
+    const { queryClient, wrapper } = seededClient(comment());
+
+    const { result } = renderHook(() => useDismissSuggestionMutation(), {
+      wrapper,
+    });
+    await result.current
+      .mutateAsync({ commentId: "c-1", pageId: PAGE_ID })
+      .catch(() => undefined);
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // Comment NOT dropped from the cache.
+    expect(items(queryClient)).toHaveLength(1);
+    // A real (red) error, never the success message.
+    expect(notifications.show).toHaveBeenCalledWith(
+      expect.objectContaining({ color: "red" }),
+    );
+    expect(notifications.show).not.toHaveBeenCalledWith({
+      message: "Suggestion dismissed",
+    });
   });
 
   it("APPLY idempotent race (404) → treated as success, comment removed from the list", async () => {
@@ -201,5 +235,45 @@ describe("useDismissSuggestionMutation — outcome handling (#329)", () => {
     await waitFor(() => expect(result.current.isError).toBe(true));
 
     expect(items(queryClient)).toHaveLength(0);
+    // #338 F3: the idempotent race must still fire the SUCCESS toast.
+    expect(notifications.show).toHaveBeenCalledWith({
+      message: "Suggestion applied",
+    });
+  });
+
+  it("APPLY 400 (thread resolved, not applied) → NOT a success, comment kept, red error (#338 F2)", async () => {
+    // apply's only 400 is "Cannot apply … on a resolved comment thread" — the
+    // thread was resolved (often with discussion) but NOT applied. It must be a
+    // real error surfacing the server message, and must NOT drop the live thread.
+    vi.mocked(applySuggestion).mockRejectedValue({
+      response: {
+        status: 400,
+        data: {
+          message: "Cannot apply a suggested edit on a resolved comment thread",
+        },
+      },
+    });
+    const { queryClient, wrapper } = seededClient(comment());
+
+    const { result } = renderHook(() => useApplySuggestionMutation(), {
+      wrapper,
+    });
+    await result.current
+      .mutateAsync({ commentId: "c-1", pageId: PAGE_ID })
+      .catch(() => undefined);
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // The live thread is NOT dropped from the cache.
+    expect(items(queryClient)).toHaveLength(1);
+    // Surfaces the server's specific message as a red error, never a success.
+    expect(notifications.show).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: "Cannot apply a suggested edit on a resolved comment thread",
+        color: "red",
+      }),
+    );
+    expect(notifications.show).not.toHaveBeenCalledWith({
+      message: "Suggestion applied",
+    });
   });
 });
