@@ -164,7 +164,6 @@ registerShared(
 );
 
 // Tool: table_get
-// Tool: table_get
 // NOT in the shared registry: the MCP tool name `table_get` is noun-first while
 // the in-app key is `getTable` (verb-first), breaking the snake_case(inAppKey)
 // convention the shared registry enforces (shared-tool-specs.contract.spec.ts).
@@ -473,25 +472,10 @@ server.registerTool(
 );
 
 // Tool: share_page
-// INTENTIONAL per-transport divergence (not shared): the in-app copy adds a
-// security-confirmation framing ("only share when the user explicitly asked,
-// since this exposes the page to anyone with the link") tuned for the in-app
-// agent; this transport keeps the plain public-URL wording.
-server.registerTool(
-  "share_page",
-  {
-    description:
-      "Make a page publicly accessible (idempotent) and return its public " +
-      "URL. The URL format is <app>/share/<key>/p/<slugId>. This exposes the " +
-      "page content to ANYONE with the URL — do it only when explicitly asked.",
-    inputSchema: {
-      pageId: z.string().min(1).describe("ID of the page to share"),
-      searchIndexing: z
-        .boolean()
-        .optional()
-        .describe("Allow search engines to index the page (default true)"),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's own `searchIndexing ?? true` default.
+registerShared(
+  SHARED_TOOL_SPECS.sharePage,
   async ({ pageId, searchIndexing }) => {
     const result = await docmostClient.sharePage(pageId, searchIndexing ?? true);
     return jsonContent(result);

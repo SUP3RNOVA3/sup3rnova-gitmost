@@ -140,10 +140,10 @@ export const INLINE_TOOL_TIERS: Record<
     catalogLine:
       'getPageHistory — fetch one page-history version with its ProseMirror content.',
   },
-  sharePage: {
-    tier: 'deferred',
-    catalogLine: 'sharePage — make a page publicly accessible and return its URL.',
-  },
+  // NOTE: sharePage moved to @docmost/mcp's SHARED_TOOL_SPECS (#294); it carries
+  // its own deferred tier + catalogLine there. transformPage stays inline (its
+  // schema deliberately diverges — it omits the deleteComments field the MCP
+  // docmost_transform exposes, a comment-deletion guardrail).
   transformPage: {
     tier: 'deferred',
     catalogLine: "transformPage — run a sandboxed JS transform over a page's document.",

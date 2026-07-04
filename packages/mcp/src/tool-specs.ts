@@ -316,6 +316,34 @@ export const SHARED_TOOL_SPECS = {
 
   // --- share management ---
 
+  // Unified from the per-layer inline definitions (#294). Both layers already
+  // carried the "only share when explicitly asked" security framing (the
+  // "per-transport divergence" note on the old inline copies was stale), so
+  // there was no real behavioral divergence to preserve — only wording drift.
+  sharePage: {
+    mcpName: 'share_page',
+    inAppKey: 'sharePage',
+    // CANONICAL: merges the MCP copy's URL-format + idempotency detail with the
+    // in-app copy's reversibility note; keeps the security framing both had.
+    description:
+      'Make a page PUBLICLY accessible (idempotent) and return its public URL ' +
+      '(format: <app>/share/<key>/p/<slugId>). This exposes the page content ' +
+      'to ANYONE with the URL — only share when the user explicitly asked. ' +
+      'Reversible: unshare it later to revoke the public URL.',
+    tier: 'deferred',
+    catalogLine: 'sharePage — make a page publicly accessible and return its URL.',
+    // Reconciled: MCP's stricter .min(1) on pageId kept; field descriptions from
+    // the in-app copy. The MCP execute keeps its own `searchIndexing ?? true`
+    // default (a per-layer concern, not part of the shared schema).
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to share.'),
+      searchIndexing: z
+        .boolean()
+        .optional()
+        .describe('Allow public search engines to index it (default true).'),
+    }),
+  },
+
   unsharePage: {
     mcpName: 'unshare_page',
     inAppKey: 'unsharePage',

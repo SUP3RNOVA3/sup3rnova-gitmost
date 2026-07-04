@@ -717,25 +717,14 @@ export class AiChatToolsService {
           await client.importPageMarkdown(pageId, markdown),
       ),
 
-      // INTENTIONAL per-transport divergence (not shared): adds a security
-      // confirmation framing ("Only share when the user explicitly asked, since
-      // this exposes the page to anyone with the link") for the in-app agent; the
-      // standalone MCP `share_page` keeps the plain public-URL wording.
-      sharePage: tool({
-        description:
-          'Make a page PUBLICLY accessible and return its public URL. ' +
-          'Reversible via unsharePage. Only share when the user explicitly ' +
-          'asked, since this exposes the page to anyone with the link.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to share.'),
-          searchIndexing: z
-            .boolean()
-            .optional()
-            .describe('Allow public search engines to index it (default true).'),
-        }),
-        execute: async ({ pageId, searchIndexing }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // Both layers already carried the security-confirmation framing, so there
+      // was no real divergence to preserve — only wording drift.
+      sharePage: sharedTool(
+        sharedToolSpecs.sharePage,
+        async ({ pageId, searchIndexing }) =>
           await client.sharePage(pageId, searchIndexing),
-      }),
+      ),
 
       unsharePage: sharedTool(
         sharedToolSpecs.unsharePage,
