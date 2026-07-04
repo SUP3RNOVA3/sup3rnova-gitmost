@@ -41,6 +41,7 @@ import {
   HISTORY_INTERVAL,
 } from '../constants';
 import { TransclusionService } from '../../core/page/transclusion/transclusion.service';
+import { observeCollabStore } from '../../integrations/metrics/metrics.registry';
 
 /**
  * #251 — wire format of the client→server stateless message that signals a
@@ -192,6 +193,17 @@ export class PersistenceExtension implements Extension {
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
+    // #355 — time the full store (persist + post-store side effects) into
+    // collab_store_duration_seconds. No-op when METRICS_PORT is unset.
+    const startedAt = performance.now();
+    try {
+      await this.storeDocument(data);
+    } finally {
+      observeCollabStore((performance.now() - startedAt) / 1000);
+    }
+  }
+
+  private async storeDocument(data: onStoreDocumentPayload) {
     const { documentName, document, context } = data;
 
     const pageId = getPageId(documentName);

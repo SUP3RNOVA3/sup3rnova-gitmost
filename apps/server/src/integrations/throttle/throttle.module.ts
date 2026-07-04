@@ -9,6 +9,7 @@ import {
   AI_CHAT_THROTTLER,
   PAGE_TEMPLATE_THROTTLER,
   PUBLIC_SHARE_AI_THROTTLER,
+  VITALS_THROTTLER,
 } from './throttler-names';
 
 @Module({
@@ -29,6 +30,8 @@ import {
             { name: PAGE_TEMPLATE_THROTTLER, ttl: 60_000, limit: 30 },
             // Anonymous public-share assistant: ~5 req/min per IP.
             { name: PUBLIC_SHARE_AI_THROTTLER, ttl: 60_000, limit: 5 },
+            // Anonymous client perf-telemetry sink: 120 batched posts/min per IP.
+            { name: VITALS_THROTTLER, ttl: 60_000, limit: 120 },
           ],
           errorMessage: 'Too many requests',
           // Pass ioredis options (not a pre-built Redis instance) so

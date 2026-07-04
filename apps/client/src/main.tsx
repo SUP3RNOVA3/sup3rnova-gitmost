@@ -22,6 +22,7 @@ import {
   isPostHogEnabled,
 } from "@/lib/config.ts";
 import posthog from "posthog-js";
+import { initVitals } from "@/lib/telemetry/vitals";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -42,6 +43,10 @@ if (isCloud() && isPostHogEnabled) {
     capture_pageleave: false,
   });
 }
+
+// #355 — client perf-telemetry. Decides sampling ONCE (25%/session) before
+// subscribing to any observer; non-sampled sessions send nothing.
+initVitals();
 
 const container = document.getElementById("root") as HTMLElement;
 const root = (container as any).__reactRoot ??= ReactDOM.createRoot(container);

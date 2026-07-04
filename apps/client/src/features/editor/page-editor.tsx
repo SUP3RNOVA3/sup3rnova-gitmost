@@ -93,6 +93,10 @@ import {
   isBodyEditable,
   isCollabSynced,
 } from "@/features/editor/editor-sync-state";
+import {
+  measurePageOpen,
+  reportEditorTx,
+} from "@/lib/telemetry/vitals";
 
 interface PageEditorProps {
   pageId: string;
@@ -351,6 +355,34 @@ export default function PageEditor({
           editor.storage.pageId = pageId;
           handleScrollTo(editor);
           editorRef.current = editor;
+
+          // #355 — page_open_ms: this is the first editor-content render, so
+          // measure against any page-open mark set on the tree-row/link click.
+          measurePageOpen();
+
+          // #355 — editor_tx_ms: time the SYNCHRONOUS part of applying each
+          // transaction (state.apply + updateState) by wrapping the view's
+          // dispatch. Only slow syncs (>8ms) are reported (see reportEditorTx),
+          // so the common path adds just one performance.now() pair. Passive:
+          // the original dispatch still runs unchanged.
+          try {
+            const view = editor.view as unknown as {
+              dispatch: (tr: unknown) => void;
+            };
+            const originalDispatch = view.dispatch.bind(view);
+            view.dispatch = (tr: unknown) => {
+              const started = performance.now();
+              originalDispatch(tr);
+              const elapsed = performance.now() - started;
+              try {
+                reportEditorTx(elapsed, editor.state.doc.content.size);
+              } catch {
+                // never let telemetry break editing
+              }
+            };
+          } catch {
+            // if the view shape changes, skip editor_tx instrumentation
+          }
         }
       },
       onUpdate({ editor }) {

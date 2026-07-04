@@ -31,6 +31,8 @@ import { McpModule } from './integrations/mcp/mcp.module';
 import { SandboxModule } from './integrations/sandbox/sandbox.module';
 import { AiModule } from './integrations/ai/ai.module';
 import { AiChatModule } from './core/ai-chat/ai-chat.module';
+import { MetricsModule } from './integrations/metrics/metrics.module';
+import { ClientTelemetryModule } from './core/telemetry/client-telemetry.module';
 
 const enterpriseModules = [];
 try {
@@ -93,6 +95,8 @@ try {
     SandboxModule,
     AiModule,
     AiChatModule,
+    MetricsModule,
+    ClientTelemetryModule,
     ...enterpriseModules,
   ],
   controllers: [AppController],

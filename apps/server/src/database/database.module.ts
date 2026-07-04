@@ -40,6 +40,8 @@ import { PageListener } from '@docmost/db/listeners/page.listener';
 import { PostgresJSDialect } from 'kysely-postgres-js';
 import * as postgres from 'postgres';
 import { normalizePostgresUrl } from '../common/helpers';
+import { observeDbQuery } from '../integrations/metrics/metrics.registry';
+import { firstSqlToken } from '../integrations/metrics/metrics.constants';
 
 @Global()
 @Module({
@@ -67,6 +69,14 @@ import { normalizePostgresUrl } from '../common/helpers';
         }),
         plugins: [new CamelCasePlugin()],
         log: (event: LogEvent) => {
+          // #355 — db_query_duration_seconds, labelled by the leading SQL token
+          // (bounded cardinality). No-op when METRICS_PORT is unset. Runs for
+          // every query, independent of the dev-only debug logging below.
+          observeDbQuery(
+            firstSqlToken(event.query.sql),
+            event.queryDurationMillis / 1000,
+          );
+
           if (environmentService.getNodeEnv() !== 'development') return;
           const logger = new Logger(DatabaseModule.name);
           if (process.env.DEBUG_DB?.toLowerCase() === 'true') {
