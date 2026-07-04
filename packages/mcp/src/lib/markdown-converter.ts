@@ -9,4 +9,7 @@
  * many existing `./markdown-converter.js` importers (client.ts, tests) do not
  * have to move.
  */
-export { convertProseMirrorToMarkdown } from "@docmost/prosemirror-markdown";
+export {
+  convertProseMirrorToMarkdown,
+  type ConvertProseMirrorToMarkdownOptions,
+} from "@docmost/prosemirror-markdown";

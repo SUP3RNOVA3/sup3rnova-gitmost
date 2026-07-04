@@ -34,11 +34,34 @@ import {
 const MAX_NODE_DEPTH = 400;
 
 /**
+ * Options for {@link convertProseMirrorToMarkdown}.
+ */
+export interface ConvertProseMirrorToMarkdownOptions {
+  /**
+   * When true, an inline comment anchor whose Comment mark is `resolved`
+   * emits its BARE text (no `<span data-comment-id …>` wrapper), so an agent
+   * reading the page never sees resolved-comment anchors. ACTIVE (unresolved)
+   * anchors still emit their wrapper. Defaults to false — a zero-behavior
+   * change for every existing caller, including the lossless git-sync export
+   * path where resolved anchors MUST be preserved for round-tripping.
+   */
+  dropResolvedCommentAnchors?: boolean;
+}
+
+/**
  * Convert ProseMirror/TipTap JSON content to Markdown
  * Supports all Docmost-specific node types and extensions
  */
-export function convertProseMirrorToMarkdown(content: any): string {
+export function convertProseMirrorToMarkdown(
+  content: any,
+  options: ConvertProseMirrorToMarkdownOptions = {},
+): string {
   if (!content || !content.content) return "";
+
+  // Closure flag read by both `case "comment"` emitters (the top-level marks
+  // loop and the raw-HTML inlineToHtml path). Off by default; the agent-read
+  // callers (mcp getPage / in-app AI chat) pass it true.
+  const dropResolvedCommentAnchors = options.dropResolvedCommentAnchors === true;
 
   // Escape a value interpolated into an HTML double-quoted attribute value
   // (textAlign, colors, image src, math `text`, all data-* attrs, etc.). In the
@@ -508,6 +531,11 @@ export function convertProseMirrorToMarkdown(content: any): string {
                 // commentId/resolved).
                 const cid = mark.attrs?.commentId;
                 if (cid) {
+                  // Hide resolved anchors from agent reads: drop the wrapper and
+                  // keep only the bare text. Active anchors keep their wrapper.
+                  if (mark.attrs?.resolved && dropResolvedCommentAnchors) {
+                    break;
+                  }
                   const resolvedAttr = mark.attrs?.resolved
                     ? ` data-resolved="true"`
                     : "";
@@ -1177,6 +1205,11 @@ export function convertProseMirrorToMarkdown(content: any): string {
               // Inline comment anchor inside a raw-HTML container (columns /
               // spanned table cells), so commented text there also round-trips.
               if (mark.attrs?.commentId) {
+                // Hide resolved anchors from agent reads: drop the wrapper and
+                // keep only the bare text. Active anchors keep their wrapper.
+                if (mark.attrs?.resolved && dropResolvedCommentAnchors) {
+                  break;
+                }
                 const r = mark.attrs?.resolved ? ` data-resolved="true"` : "";
                 t = `<span data-comment-id="${escapeAttr(mark.attrs.commentId)}"${r}>${t}</span>`;
               }
