@@ -390,27 +390,26 @@ describe('convertProseMirrorToMarkdown', () => {
 
   // ---------------------------------------------------------------------------
   describe('math', () => {
-    it('inline math carries LaTeX in a text attr WITHOUT escaping < or >', () => {
+    it('inline math serializes as $LaTeX$ (Obsidian-native), no HTML escaping', () => {
       const out = convertProseMirrorToMarkdown(
         doc(para({ type: 'mathInline', attrs: { text: 'a < b' } })),
       );
-      // < and > must NOT be HTML-escaped (idempotency); only & and " would be.
-      expect(out).toBe(
-        '<span data-type="mathInline" data-katex="true" text="a < b"></span>',
-      );
+      // #293 canon #6: readable `$…$` form; the LaTeX is verbatim (no HTML
+      // attribute escaping of < or & in the fence form).
+      expect(out).toBe('$a < b$');
       expect(out).not.toContain('&lt;');
+      expect(out).not.toContain('<span');
     });
 
-    it('block math carries LaTeX in a text attr WITHOUT escaping < or >', () => {
+    it('block math serializes as a $$ fence on its own lines', () => {
       const out = convertProseMirrorToMarkdown(
         doc({ type: 'mathBlock', attrs: { text: 'x > y & z' } }),
       );
-      // & IS escaped (entity-significant), but < and > are NOT.
-      expect(out).toBe(
-        '<div data-type="mathBlock" data-katex="true" text="x > y &amp; z"></div>',
-      );
-      expect(out).not.toContain('&lt;');
-      expect(out).not.toContain('&gt;');
+      // #293 canon #6: `$$\n<latex>\n$$`. The LaTeX is verbatim inside the fence
+      // (plain markdown, so & is NOT entity-escaped as it would be in an attr).
+      expect(out).toBe('$$\nx > y & z\n$$');
+      expect(out).not.toContain('&amp;');
+      expect(out).not.toContain('<div');
     });
   });
 

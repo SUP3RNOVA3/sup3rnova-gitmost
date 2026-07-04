@@ -14,6 +14,11 @@ import type { TokenizerExtension, RendererExtension } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
 import { parseAttachedComment } from "./attached-comment.js";
 import {
+  decodeInlineMathLatex,
+  escapeMathAttr,
+  inlineMathAnchoredRe,
+} from "./math-inline.js";
+import {
   attachmentToHtml,
   audioToHtml,
   diagramToHtml,
@@ -79,11 +84,76 @@ const highlightMarkExtension: TokenizerExtension & RendererExtension = {
   },
 };
 
+/**
+ * #293 canon #6: Obsidian-native math — `$LaTeX$` (inline) and `$$…$$` (block).
+ *
+ * INLINE `$…$` uses the SHARED pandoc currency-safe rule (math-inline.ts), the
+ * SAME rule the serializer's prose escaper uses, so currency (`$5`,
+ * `$5 and $10`) is NEVER math and a would-be-math prose `$x$` (escaped `\$x\$`
+ * on export) stays literal. The captured inner LaTeX is decoded (`\$`→`$`) and
+ * emitted as the schema's `span[data-type="mathInline"]` carrying the LaTeX in a
+ * `text="…"` attribute (the schema's default attribute parser reads it back).
+ *
+ * BLOCK `$$…$$` matches a `$$` fence on its own line(s), capturing multi-line
+ * LaTeX up to the next `$$` line, and emits `div[data-type="mathBlock"]`.
+ *
+ * Both fail OPEN: an unbalanced `$`/`$$`, or a currency `$`, returns undefined
+ * from the tokenizer and stays literal text with no crash. Registered on the
+ * SAME dedicated instance as the highlight extension (never the global marked
+ * singleton), so the `$`/`$$` behavior cannot leak into unrelated callers.
+ */
+const mathInlineExtension: TokenizerExtension & RendererExtension = {
+  name: "mathInline",
+  level: "inline",
+  start(src: string) {
+    const i = src.indexOf("$");
+    return i < 0 ? undefined : i;
+  },
+  tokenizer(src: string) {
+    const match = inlineMathAnchoredRe().exec(src);
+    if (!match) return undefined; // currency / unbalanced -> literal
+    return {
+      type: "mathInline",
+      raw: match[0],
+      text: decodeInlineMathLatex(match[1]),
+    } as any;
+  },
+  renderer(token: any) {
+    return `<span data-type="mathInline" data-katex="true" text="${escapeMathAttr(token.text)}"></span>`;
+  },
+};
+
+const mathBlockExtension: TokenizerExtension & RendererExtension = {
+  name: "mathBlock",
+  level: "block",
+  start(src: string) {
+    const m = /(?:^|\n)\$\$/.exec(src);
+    if (!m) return undefined;
+    return m.index + (m[0].startsWith("\n") ? 1 : 0);
+  },
+  tokenizer(src: string) {
+    // A `$$` fence on its own line, then the SHORTEST run up to the next `$$`
+    // line (non-greedy, so it never swallows across an unrelated later fence).
+    // The inner may be empty (an empty mathBlock) or multi-line.
+    const match = /^\$\$[^\S\n]*\n([\s\S]*?)\n\$\$[^\S\n]*(?:\n|$)/.exec(src);
+    if (!match) return undefined; // no closing fence -> literal
+    return {
+      type: "mathBlock",
+      raw: match[0],
+      text: match[1],
+    } as any;
+  },
+  renderer(token: any) {
+    return `<div data-type="mathBlock" data-katex="true" text="${escapeMathAttr(token.text)}"></div>`;
+  },
+};
+
 // Dedicated marked instance: default (GFM) options plus the `==` highlight
-// inline extension. Constructed once at module load so the extension is
-// registered exactly once and never mutates the global `marked` singleton.
+// inline extension and the `$…$` / `$$…$$` math extensions (#293 canon #6).
+// Constructed once at module load so the extensions are registered exactly once
+// and never mutate the global `marked` singleton.
 const markedInstance = new Marked().use({
-  extensions: [highlightMarkExtension],
+  extensions: [highlightMarkExtension, mathInlineExtension, mathBlockExtension],
 });
 
 // Setup DOM environment for Tiptap HTML parsing in Node.js

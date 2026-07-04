@@ -4,6 +4,11 @@ import {
   standaloneCommentFor,
 } from "./attached-comment.js";
 import {
+  encodeInlineMathLatex,
+  inlineMathGlobalRe,
+  inlineMathSerializable,
+} from "./math-inline.js";
+import {
   attachmentToHtml,
   audioToHtml,
   diagramToHtml,
@@ -91,6 +96,27 @@ export function convertProseMirrorToMarkdown(content: any): string {
   const escapeLinkText = (value: unknown): string =>
     String(value ?? "").replace(/[\\`*_~[\]<&!()]/g, (c: string) => `\\${c}`);
 
+  // #293 canon #6: the schema-HTML forms for math. These are the LOSSLESS forms
+  // the raw-HTML path (columns/cells) and the mathInline fallback emit, and the
+  // SAME shape the importer's schema parseHTML rebuilds (span/div carrying the
+  // LaTeX in a `text="…"` attribute). Kept as small helpers so the readable
+  // `$…$`/`$$…$$` markdown forms and the raw-HTML forms cannot drift apart.
+  const mathInlineHtml = (latex: string): string =>
+    `<span data-type="mathInline" data-katex="true" text="${escapeAttr(latex)}"></span>`;
+  const mathBlockHtml = (latex: string): string =>
+    `<div data-type="mathBlock" data-katex="true" text="${escapeAttr(latex)}"></div>`;
+
+  // #293 canon #6: neutralize a would-be inline-math `$…$` span sitting in PROSE
+  // text so it re-imports as literal text (never a phantom math node). We escape
+  // ONLY the two delimiting `$` of a span the inline-math tokenizer WOULD match
+  // (shared rule, math-inline.ts), leaving the inner untouched. A currency `$`
+  // (`$5`, `$5 and $10`) has no VALID closing under the rule, so it never
+  // matches and is emitted CLEAN (no backslash churn). On re-import marked's
+  // escape tokenizer turns each `\$` back into a literal `$`, so `the set $A$`
+  // round-trips as text while `$5 and $10` stays exactly as written.
+  const escapeProseMath = (value: string): string =>
+    value.replace(inlineMathGlobalRe(), (_m, inner) => `\\$${inner}\\$`);
+
   // Recursion depth guard. processNode is mutually recursive (directly and via
   // processListItem/processTaskItem/blockToHtml), and a pathologically nested
   // document (e.g. tens of thousands of nested blockquotes) would otherwise
@@ -172,7 +198,7 @@ export function convertProseMirrorToMarkdown(content: any): string {
         return nodeContent.map(processNode).join("\n\n");
 
       case "paragraph": {
-        const text = nodeContent.map(processNode).join("");
+        const text = renderInlineChildren(nodeContent);
         const align = node.attrs?.textAlign;
         // Non-default alignment round-trips as an ATTACHED HTML comment at the
         // END of the block line (#293 canon #9):
@@ -192,7 +218,7 @@ export function convertProseMirrorToMarkdown(content: any): string {
 
       case "heading": {
         const level = node.attrs?.level || 1;
-        const headingText = nodeContent.map(processNode).join("");
+        const headingText = renderInlineChildren(nodeContent);
         const headingLine = "#".repeat(level) + " " + headingText;
         const headingAlign = node.attrs?.textAlign;
         // A non-default heading alignment attaches the same trailing comment
@@ -226,6 +252,12 @@ export function convertProseMirrorToMarkdown(content: any): string {
         // marks loop, so they are never escaped; only the run's inner text is.
         if (!(node.marks || []).some((m: any) => m.type === "code")) {
           textContent = textContent.replace(/==/g, "\\=\\=");
+          // #293 canon #6: escape a would-be inline-math `$…$` span so it stays
+          // literal text on re-import (currency `$5` is left clean — see
+          // escapeProseMath). Runs on the SAME non-code runs as the `==` escape
+          // above; an inline `code` run returns verbatim below, matching the
+          // codeBlock path (a `$…$` inside code must stay code, never math).
+          textContent = escapeProseMath(textContent);
         }
         // Apply marks (bold, italic, code, etc.)
         if (node.marks) {
@@ -598,26 +630,39 @@ export function convertProseMirrorToMarkdown(content: any): string {
       }
 
       case "detailsSummary":
-        return `<summary>${nodeContent.map(processNode).join("")}</summary>\n\n`;
+        return `<summary>${renderInlineChildren(nodeContent)}</summary>\n\n`;
 
       case "detailsContent":
         return `${nodeContent.map(processNode).join("\n")}\n`;
 
       case "mathInline": {
-        // The schema's `text` attribute has no parseHTML, so TipTap's default
-        // parser reads it from the `text` HTML attribute (NOT the element's text
-        // content). Emit span[data-type="mathInline"] carrying the LaTeX in a
-        // `text="..."` attribute so it round-trips. marked cannot parse $...$
-        // back, so the previous form was lossy.
+        // #293 canon #6: inline math serializes as Obsidian-native `$LaTeX$`
+        // (readable, re-parsed by the importer's marked inline extension). A
+        // literal `$` inside the LaTeX is escaped `\$` so it cannot close the
+        // span early (the importer decodes `\$`→`$`). When the LaTeX cannot be
+        // safely fenced (empty, whitespace-edged, multi-line, or an ambiguous
+        // backslash-before-`$`), fall back to the LOSSLESS schema-HTML `<span>`
+        // form (inlineMathSerializable). A following-sibling digit — which would
+        // also break the pandoc closing rule — is handled by renderInlineChildren
+        // (this case cannot see siblings).
         const inlineMath = node.attrs?.text || "";
-        return `<span data-type="mathInline" data-katex="true" text="${escapeAttr(inlineMath)}"></span>`;
+        if (!inlineMathSerializable(inlineMath)) {
+          return mathInlineHtml(inlineMath);
+        }
+        return `$${encodeInlineMathLatex(inlineMath)}$`;
       }
 
       case "mathBlock": {
-        // Same as mathInline: the LaTeX must ride in the `text` HTML attribute
-        // for the schema's default parser to recover it.
+        // #293 canon #6: block math serializes as a `$$` fence on its own lines
+        // (`$$\n<latex>\n$$`), so multi-line LaTeX is preserved. If the LaTeX
+        // itself contains a `$$` (which would close the fence early — essentially
+        // never valid inside a single math node), fall back to the lossless
+        // schema-HTML `<div>` form.
         const blockMath = node.attrs?.text || "";
-        return `<div data-type="mathBlock" data-katex="true" text="${escapeAttr(blockMath)}"></div>`;
+        if (blockMath.includes("$$")) {
+          return mathBlockHtml(blockMath);
+        }
+        return `$$\n${blockMath}\n$$`;
       }
 
       case "mention": {
@@ -871,6 +916,28 @@ export function convertProseMirrorToMarkdown(content: any): string {
     }
   };
 
+  // Render a run of inline children to MARKDOWN, with the #293 canon #6
+  // inline-math guard. A `mathInline` serialized as `$…$` whose FOLLOWING
+  // sibling renders starting with a DIGIT would put a digit right after the
+  // closing `$`, which the pandoc inline rule refuses to parse as math (the
+  // currency guard) — so the node would re-import as literal text (data loss).
+  // For that node ONLY we fall back to the lossless schema-HTML `<span>` form.
+  // Every other inline node is rendered exactly as processNode would, so output
+  // is unchanged whenever no math sits directly before a digit.
+  const renderInlineChildren = (nodes: any[]): string => {
+    const parts = nodes.map(processNode);
+    for (let i = 0; i < nodes.length - 1; i++) {
+      if (
+        nodes[i]?.type === "mathInline" &&
+        parts[i].startsWith("$") &&
+        /^[0-9]/.test(parts[i + 1] || "")
+      ) {
+        parts[i] = mathInlineHtml(nodes[i].attrs?.text || "");
+      }
+    }
+    return parts.join("");
+  };
+
   // Render inline content (text runs + their marks) to HTML. Used by the raw
   // HTML fallbacks (spanned tables, columns) where marked will NOT re-parse
   // markdown, so backtick/asterisk/bracket syntax would otherwise leak as
@@ -880,8 +947,13 @@ export function convertProseMirrorToMarkdown(content: any): string {
     (inlineNodes || [])
       .map((n: any) => {
         if (n.type === "hardBreak") return "<br>";
+        // #293 canon #6: on the raw-HTML path (columns/spanned cells) marked does
+        // NOT re-parse markdown, so inline math MUST stay the schema-HTML `<span>`
+        // form here — a `$…$` fence would land as literal text on re-import.
+        if (n.type === "mathInline") return mathInlineHtml(n.attrs?.text || "");
         if (n.type !== "text") {
-          // Inline atoms (mention, mathInline) already emit schema HTML.
+          // Other inline atoms (mention, status, footnoteRef) already emit
+          // schema HTML from processNode.
           return processNode(n);
         }
         let t = escapeHtmlText(n.text || "");
@@ -1125,11 +1197,18 @@ export function convertProseMirrorToMarkdown(content: any): string {
         return pageEmbedToHtml(block.attrs || {});
       case "transclusionReference":
         return transclusionReferenceToHtml(block.attrs || {});
-      // columns/column, math, htmlEmbed, footnotes, transclusionSource already
-      // emit schema-matching HTML from processNode.
+      // #293 canon #6: on the TOP-LEVEL path (processNode) mathBlock now
+      // serializes as a `$$…$$` fence, but marked does NOT re-parse markdown
+      // inside a raw-HTML block, so inside a column/cell it MUST stay the
+      // schema-HTML `<div>` form or it would land as literal `$$…$$` text on
+      // re-import. Give it an EXPLICIT case here (the same form the importer
+      // rebuilds) instead of delegating to processNode's fence form.
+      case "mathBlock":
+        return mathBlockHtml(block.attrs?.text || "");
+      // columns/column, htmlEmbed, footnotes, transclusionSource already emit
+      // schema-matching HTML from processNode.
       case "columns":
       case "column":
-      case "mathBlock":
       case "htmlEmbed":
       case "footnotesList":
       case "footnoteDefinition":

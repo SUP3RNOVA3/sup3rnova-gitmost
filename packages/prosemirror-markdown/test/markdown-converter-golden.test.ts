@@ -184,13 +184,20 @@ describe('subpages token + unknown-in-container fallback', () => {
 
 describe('escaping idempotence (SPEC §11 phantom-diff guard)', () => {
   it('escapeAttr escapes ONLY & and " in an attribute context, and is idempotent', () => {
-    // The mathBlock `text` attr goes through escapeAttr. & -> &amp;, " -> &quot;.
-    const once = c({ type: 'mathBlock', attrs: { text: 'a & "b"' } });
-    expect(once).toBe(
+    // #293 canon #6: a TOP-LEVEL mathBlock now serializes as a `$$` fence, so
+    // to exercise the schema-HTML `text` attr (which DOES go through escapeAttr)
+    // we wrap the math in a COLUMN — the raw-HTML path keeps the `<div>` form.
+    const col = (child: any) => ({
+      type: 'columns',
+      content: [{ type: 'column', content: [child] }],
+    });
+    // & -> &amp;, " -> &quot; in the attribute context.
+    const once = c(col({ type: 'mathBlock', attrs: { text: 'a & "b"' } }));
+    expect(once).toContain(
       '<div data-type="mathBlock" data-katex="true" text="a &amp; &quot;b&quot;"></div>',
     );
     // < and > are deliberately NOT escaped (would accumulate on round-trips).
-    const angled = c({ type: 'mathBlock', attrs: { text: 'a < b > c' } });
+    const angled = c(col({ type: 'mathBlock', attrs: { text: 'a < b > c' } }));
     expect(angled).toContain('text="a < b > c"');
     expect(angled).not.toContain('&lt;');
     expect(angled).not.toContain('&gt;');
