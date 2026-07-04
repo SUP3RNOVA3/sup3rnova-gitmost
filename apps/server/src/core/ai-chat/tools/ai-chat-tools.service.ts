@@ -630,6 +630,16 @@ export class AiChatToolsService {
         async ({ pageId, nodeId }) => await client.getNode(pageId, nodeId),
       ),
 
+      searchInPage: sharedTool(
+        sharedToolSpecs.searchInPage,
+        async ({ pageId, query, regex, caseSensitive, limit }) =>
+          await client.searchInPage(pageId, query, {
+            regex,
+            caseSensitive,
+            limit,
+          }),
+      ),
+
       getTable: tool({
         description:
           'Read a table as a matrix of cell texts (plus a parallel cellIds ' +

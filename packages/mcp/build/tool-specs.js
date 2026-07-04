@@ -74,6 +74,48 @@ export const SHARED_TOOL_SPECS = {
             nodeId: z.string().min(1),
         }),
     },
+    // --- in-page occurrence search (client-side, over ProseMirror plain text) ---
+    searchInPage: {
+        mcpName: 'search_in_page',
+        inAppKey: 'searchInPage',
+        description: 'Find every occurrence of a string (or regex) INSIDE one page and get ' +
+            'WHERE each is — instead of pulling blocks one-by-one with get_node. ' +
+            'Searches the plain text of each text block/cell (marks glued, so a match ' +
+            'survives bold/italic/link splits; comment anchors do not interfere). ' +
+            'Returns { total, truncated, matches:[{ nodeId, blockIndex, type, before, ' +
+            'match, after }] }: `nodeId` is the block id (or "#<index>" for ' +
+            'table/cell content) — pass it straight to get_node/patch_node or as a ' +
+            'comment anchor; `blockIndex` is the get_outline index; `before`/`after` ' +
+            'give ~40 chars of context to build a unique selection. `total` counts all ' +
+            'hits and `truncated` is true when more than `limit` were found (nothing ' +
+            'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
+            'set regex:true for a JS regular expression (char classes, word ' +
+            'boundaries) and caseSensitive:true to match case. Ideal for systematic ' +
+            'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
+            'invalid regex or an empty query returns a clear error to fix.',
+        buildShape: (z) => ({
+            pageId: z.string().min(1).describe('ID of the page to search'),
+            query: z
+                .string()
+                .min(1)
+                .describe('The text to find (a literal substring, or a regex when regex:true)'),
+            regex: z
+                .boolean()
+                .optional()
+                .describe('Treat query as a JS regular expression (default false).'),
+            caseSensitive: z
+                .boolean()
+                .optional()
+                .describe('Case-sensitive matching (default false).'),
+            limit: z
+                .number()
+                .int()
+                .min(1)
+                .max(200)
+                .optional()
+                .describe('Max matches to RETURN (default 50, max 200); total is always reported.'),
+        }),
+    },
     // --- node delete ---
     deleteNode: {
         mcpName: 'delete_node',
