@@ -635,13 +635,17 @@ const Attachment = Node.create({
       },
       name: {
         default: null,
-        parseHTML: (el: HTMLElement) => el.getAttribute("data-attachment-name"),
+        // Empty-string-vs-absent idempotency (GS-EDIT-REVERT class): "" -> default.
+        parseHTML: (el: HTMLElement) =>
+          el.getAttribute("data-attachment-name") || null,
         renderHTML: (attrs: Record<string, any>) =>
           attrs.name ? { "data-attachment-name": attrs.name } : {},
       },
       mime: {
         default: null,
-        parseHTML: (el: HTMLElement) => el.getAttribute("data-attachment-mime"),
+        // Empty-string-vs-absent idempotency (GS-EDIT-REVERT class): "" -> default.
+        parseHTML: (el: HTMLElement) =>
+          el.getAttribute("data-attachment-mime") || null,
         renderHTML: (attrs: Record<string, any>) =>
           attrs.mime ? { "data-attachment-mime": attrs.mime } : {},
       },
@@ -689,7 +693,10 @@ const Video = Node.create({
       },
       alt: {
         default: null,
-        parseHTML: (el: HTMLElement) => el.getAttribute("aria-label"),
+        // Empty-string-vs-absent idempotency: coerce "" back to the default so a
+        // stray empty `aria-label` never materializes `alt: ""` on a video stored
+        // with no alt (same GS-EDIT-REVERT class as the image `alt` fix).
+        parseHTML: (el: HTMLElement) => el.getAttribute("aria-label") || null,
         renderHTML: (attrs: Record<string, any>) =>
           attrs.alt ? { "aria-label": attrs.alt } : {},
       },
@@ -864,13 +871,15 @@ const diagramAttributes = () => ({
   },
   title: {
     default: null,
-    parseHTML: (el: HTMLElement) => el.getAttribute("data-title"),
+    // Empty-string-vs-absent idempotency (GS-EDIT-REVERT class): "" -> default.
+    parseHTML: (el: HTMLElement) => el.getAttribute("data-title") || null,
     renderHTML: (attrs: Record<string, any>) =>
       attrs.title ? { "data-title": attrs.title } : {},
   },
   alt: {
     default: null,
-    parseHTML: (el: HTMLElement) => el.getAttribute("data-alt"),
+    // Empty-string-vs-absent idempotency (GS-EDIT-REVERT class): "" -> default.
+    parseHTML: (el: HTMLElement) => el.getAttribute("data-alt") || null,
     renderHTML: (attrs: Record<string, any>) =>
       attrs.alt ? { "data-alt": attrs.alt } : {},
   },
@@ -1106,7 +1115,8 @@ const Pdf = Node.create({
       },
       name: {
         default: null,
-        parseHTML: (el: HTMLElement) => el.getAttribute("data-name"),
+        // Empty-string-vs-absent idempotency (GS-EDIT-REVERT class): "" -> default.
+        parseHTML: (el: HTMLElement) => el.getAttribute("data-name") || null,
         renderHTML: (attrs: Record<string, any>) =>
           attrs.name ? { "data-name": attrs.name } : {},
       },
@@ -1490,6 +1500,29 @@ export const docmostExtensions = [
         height: {
           ...parent.height,
           parseHTML: (el: HTMLElement) => el.getAttribute("height"),
+        },
+        // Empty-string-vs-absent idempotency (GS-EDIT-REVERT class). `marked`
+        // renders `![](src)` as `<img alt="">`, so the stock Image `alt`
+        // parseHTML (`getAttribute("alt")`) materializes `alt: ""` on an image
+        // that was stored with NO alt (attr absent). That is a false diff against
+        // the editor-stored form (a no-alt image has alt ABSENT, not ""), so a
+        // git-sync / ai-chat touch of a page with a plain image produced phantom
+        // churn. Coerce an empty string back to the attr's default (null) so the
+        // import is idempotent. A real alt survives verbatim (`|| undefined` keeps
+        // the truthy value; the default fills the empty case). `title` is coerced
+        // the same way for the whole class, even though `marked` does not
+        // currently emit `title=""` — defence in depth against any path that does.
+        // NOTE: this DIVERGES from editor-ext's literal image `alt` parseHTML
+        // (`getAttribute("alt")`, which returns "" verbatim), but CONVERGES on
+        // editor-ext's real STORED shape: an editor image inserted without alt
+        // renders with no `alt` attribute and re-parses as absent, never "".
+        alt: {
+          ...parent.alt,
+          parseHTML: (el: HTMLElement) => el.getAttribute("alt") || null,
+        },
+        title: {
+          ...parent.title,
+          parseHTML: (el: HTMLElement) => el.getAttribute("title") || null,
         },
       };
     },
