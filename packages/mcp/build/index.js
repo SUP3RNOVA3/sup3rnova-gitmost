@@ -116,7 +116,9 @@ export function createDocmostMcpServer(config) {
     server.registerTool("get_page", {
         description: "Get page details with content converted to Markdown. The conversion is " +
             "LOSSY (block ids, exact table/callout structure are approximated); for a " +
-            "lossless representation use get_page_json.",
+            "lossless representation use get_page_json. Inline <span data-comment-id> " +
+            "tags in the markdown are comment highlight anchors (also present for " +
+            "RESOLVED threads) — treat them as markup, not page text.",
         inputSchema: {
             pageId: z.string().min(1),
         },
@@ -213,7 +215,8 @@ export function createDocmostMcpServer(config) {
     });
     // Tool: create_page
     server.registerTool("create_page", {
-        description: "Create a new page with content (automatically moves it to the correct hierarchy).",
+        description: "Create a new page from Markdown in a space. Pass parentPageId to nest " +
+            "it under a parent; omit it to create at the space root.",
         inputSchema: {
             title: z.string().min(1).describe("Title of the page"),
             content: z.string().min(1).describe("Markdown content"),
@@ -435,7 +438,8 @@ export function createDocmostMcpServer(config) {
     // agent; this transport keeps the plain public-URL wording.
     server.registerTool("share_page", {
         description: "Make a page publicly accessible (idempotent) and return its public " +
-            "URL. The URL format is <app>/share/<key>/p/<slugId>.",
+            "URL. The URL format is <app>/share/<key>/p/<slugId>. This exposes the " +
+            "page content to ANYONE with the URL — do it only when explicitly asked.",
         inputSchema: {
             pageId: z.string().min(1).describe("ID of the page to share"),
             searchIndexing: z
@@ -459,7 +463,7 @@ export function createDocmostMcpServer(config) {
     });
     // Tool: move_page
     server.registerTool("move_page", {
-        description: "Move a page to a new parent (nesting) or root. Essential for organizing pages created via 'create_page'.",
+        description: "Move a page under a new parent (nesting) or to the space root.",
         inputSchema: {
             pageId: z.string().min(1),
             parentPageId: z
@@ -511,7 +515,9 @@ export function createDocmostMcpServer(config) {
     // --- Comment tools (ported from upstream PR #3 by Max Nikitin) ---
     // Tool: list_comments
     server.registerTool("list_comments", {
-        description: "List all comments on a page (paginated). Content is returned as Markdown.",
+        description: "List ALL comments on a page in one call (pagination is handled " +
+            "internally), including RESOLVED threads — filter by resolvedAt when you " +
+            "need only open ones. Content is returned as Markdown.",
         inputSchema: {
             pageId: z.string().describe("ID of the page"),
         },
@@ -662,8 +668,9 @@ export function createDocmostMcpServer(config) {
     // different schema (limit 1-20); this transport is a plain REST full-text search
     // (limit up to 100). Different behaviour AND schema, so kept per-layer.
     server.registerTool("search", {
-        description: "Search for pages and content. Results are bounded by `limit` " +
-            "(default applied by the client, max 100).",
+        description: "Full-text search for pages and content across the whole workspace. " +
+            "Results are bounded by `limit` (1-100; when omitted the server applies " +
+            "its own default).",
         inputSchema: {
             query: z.string().min(1).describe("Search query"),
             limit: z
@@ -713,7 +720,9 @@ export function createDocmostMcpServer(config) {
             "insertInlineFootnote(doc, {anchorText, text}) (author-inline footnote: " +
             "marker + dedup'd definition, list derived). Footnote convention: markers are " +
             "plain '[N]' text in the body; the notes are an orderedList under a " +
-            "heading whose text is 'Примечания переводчика'. The transform runs " +
+            "heading whose text is 'Примечания переводчика' (that is only the DEFAULT " +
+            "notesHeading — pass the notesHeading option to the helpers to use a " +
+            "heading matching the page's language). The transform runs " +
             "sandboxed (no require/process/fs/network, 5s timeout) and must return a " +
             "{type:'doc'} node.",
         inputSchema: {

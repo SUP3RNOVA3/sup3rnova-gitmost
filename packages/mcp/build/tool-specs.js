@@ -78,8 +78,8 @@ export const SHARED_TOOL_SPECS = {
     deleteNode: {
         mcpName: 'delete_node',
         inAppKey: 'deleteNode',
-        description: 'Remove a single block by its attrs.id (from the page-JSON view) WITHOUT ' +
-            'resending the whole document.',
+        description: 'Remove a single block by its attrs.id (from the page outline or ' +
+            'page-JSON view) WITHOUT resending the whole document.',
         buildShape: (z) => ({
             pageId: z.string().min(1),
             nodeId: z.string().min(1),
@@ -99,7 +99,8 @@ export const SHARED_TOOL_SPECS = {
         inAppKey: 'patchNode',
         description: 'Replace a single content block identified by its attrs.id with a new ' +
             'ProseMirror node, WITHOUT resending the whole document; the replacement ' +
-            'keeps the same node id. Get the block id from the page-JSON view, then ' +
+            'keeps the same node id. Get the block id from the page outline (cheap) ' +
+            'or the page-JSON view, then ' +
             'pass a ProseMirror node to put in its place. Example node: a paragraph ' +
             '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
             'heading {"type":"heading","attrs":{"level":2},"content":' +
@@ -128,7 +129,8 @@ export const SHARED_TOOL_SPECS = {
         description: 'Insert a block before/after another block (by attrs.id or anchor text) ' +
             'or append it at the end (top level). For before/after you MUST provide ' +
             'EXACTLY ONE of anchorNodeId or anchorText. Get anchor block ids from the ' +
-            'page-JSON view. Avoids resending the whole document. Can also insert ' +
+            'page outline or the page-JSON view. Avoids resending the whole document. ' +
+            'Can also insert ' +
             'table structure: to add a tableRow, pass a tableRow node with position ' +
             'before/after and anchor INSIDE the target table — anchorNodeId of any ' +
             'block/cell in it, or anchorText matching the table; to add a ' +

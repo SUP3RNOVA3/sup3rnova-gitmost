@@ -303,7 +303,9 @@ export class AiChatToolsService {
       getPage: tool({
         description:
           'Fetch a single page as Markdown by its page id. Returns the page ' +
-          'title and its Markdown content.',
+          'title and its Markdown content. Inline <span data-comment-id> tags ' +
+          'in the markdown are comment highlight anchors (also present for ' +
+          'RESOLVED threads) — treat them as markup, not page text.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id (or slugId) of the page.'),
         }),
@@ -647,7 +649,9 @@ export class AiChatToolsService {
 
       listComments: tool({
         description:
-          'List all comments on a page (content as Markdown).',
+          'List ALL comments on a page in one call, including RESOLVED ' +
+          'threads — filter by resolvedAt when you need only open ones. ' +
+          'Content is returned as Markdown.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page.'),
         }),
