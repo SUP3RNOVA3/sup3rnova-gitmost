@@ -52,22 +52,11 @@ export class PagePermissionRepo {
     trx?: KyselyTransaction,
   ): Promise<PageAccess> {
     const db = dbOrTx(this.db, trx);
-    const row = await db
+    return db
       .insertInto('pageAccess')
       .values(data)
       .returningAll()
       .executeTakeFirst();
-    // Bust the workspace-level "has any restricted page" cache: a 0->1 transition
-    // (the FIRST restricted page in a workspace) must take effect immediately, or
-    // the filterAccessiblePageIds short-circuit would keep treating the workspace
-    // as unrestricted for up to PERMISSION_CACHE_TTL_MS and leak the just-
-    // restricted page into whole-workspace lists (search/favorites/recent/…).
-    if (data.workspaceId) {
-      await this.cacheManager.del(
-        CacheKey.HAS_RESTRICTED_PAGES_IN_WORKSPACE(data.workspaceId),
-      );
-    }
-    return row;
   }
 
   async deletePageAccess(
@@ -931,34 +920,32 @@ export class PagePermissionRepo {
    * whole workspace carry a restriction? Lets whole-workspace access filters
    * short-circuit the recursive-ancestor CTE when nothing is restricted at all.
    *
-   * Cached with the same short PERMISSION_CACHE_TTL_MS as PAGE_CAN_EDIT: this is
-   * the workspace-wide restriction flag, so it is read on nearly every list
-   * endpoint, and the 5s TTL bounds the window in which a just-added first
-   * restriction is not yet reflected — the identical staleness contract the other
-   * permission caches already accept. No explicit bust (mirrors PAGE_CAN_EDIT).
+   * UNCACHED (like the sibling hasRestrictedPagesInSpace) — a single cheap
+   * `EXISTS(pageAccess WHERE workspaceId=?)` per call. This is an ACCESS-CONTROL
+   * gate on whole-workspace list endpoints, so it must never go stale: caching it
+   * (even 5s) reintroduced a leak the space-path never had — a concurrent
+   * whole-workspace read in the insert->commit window of the FIRST restricted page
+   * could re-populate `false` under withCache (read-then-set, no del-during-read
+   * guard) and override the insert bust, leaking that page to unauthorized users
+   * for up to the TTL (#348 review F1). An uncached EXISTS removes both the
+   * cache/DB asymmetry with hasRestrictedPagesInSpace and that race; the space
+   * path already accepts this exact per-call cost.
    */
   async hasRestrictedPagesInWorkspace(workspaceId: string): Promise<boolean> {
-    return withCache(
-      this.cacheManager,
-      CacheKey.HAS_RESTRICTED_PAGES_IN_WORKSPACE(workspaceId),
-      PERMISSION_CACHE_TTL_MS,
-      async () => {
-        const result = await this.db
-          .selectNoFrom((eb) =>
+    const result = await this.db
+      .selectNoFrom((eb) =>
+        eb
+          .exists(
             eb
-              .exists(
-                eb
-                  .selectFrom('pageAccess')
-                  .select(sql`1`.as('one'))
-                  .where('pageAccess.workspaceId', '=', workspaceId),
-              )
-              .as('exists'),
+              .selectFrom('pageAccess')
+              .select(sql`1`.as('one'))
+              .where('pageAccess.workspaceId', '=', workspaceId),
           )
-          .executeTakeFirst();
+          .as('exists'),
+      )
+      .executeTakeFirst();
 
-        return Boolean(result?.exists);
-      },
-    );
+    return Boolean(result?.exists);
   }
 
   /**

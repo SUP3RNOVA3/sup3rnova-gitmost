@@ -4,10 +4,6 @@ export const CacheKey = {
     `perm:space-roles:${userId}:${spaceId}`,
   PAGE_CAN_EDIT: (userId: string, pageId: string) =>
     `perm:can-edit:${userId}:${pageId}`,
-  // #348 — "does this workspace have ANY restricted page?" Lets whole-workspace
-  // access filters skip the recursive-ancestor CTE when nothing is restricted.
-  HAS_RESTRICTED_PAGES_IN_WORKSPACE: (workspaceId: string) =>
-    `perm:ws-has-restricted:${workspaceId}`,
   // #348 — DomainMiddleware workspace resolution. Self-hosted resolves the single
   // workspace (constant key); cloud resolves by the request subdomain (lowercased
   // to match the case-insensitive `LOWER(hostname)` lookup). Every WorkspaceRepo
