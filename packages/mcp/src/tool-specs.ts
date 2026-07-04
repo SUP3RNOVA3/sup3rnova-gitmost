@@ -13,6 +13,11 @@
 // diverge on purpose (security guardrails, tuned UX, "Reversible" framing on
 // some write tools, different limits, hybrid-RRF search, etc.) stay defined
 // per-layer and are NOT represented here.
+//
+// MAINTENANCE RULE: adding, renaming, or removing a spec here (or an inline
+// registerTool in index.ts) REQUIRES updating SERVER_INSTRUCTIONS in
+// packages/mcp/src/index.ts — the intent-routing guide MCP clients receive on
+// initialize. Enforced by test/unit/server-instructions.test.mjs.
 
 // Loose on purpose — see the comment above. The two zod majors expose different
 // static type surfaces, so typing this precisely would couple the registry to

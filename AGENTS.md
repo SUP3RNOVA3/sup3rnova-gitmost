@@ -293,6 +293,7 @@ Vite SPA. Code is organized by feature under `apps/client/src/features/*` (mirro
 - The version string shown in the UI comes from `APP_VERSION` (CI/Docker) or `git describe --tags --always` (local), resolved in `vite.config.ts` — not from `package.json`.
 - Server TS config is permissive (`noImplicitAny: false`, `strictNullChecks: false`, `no-explicit-any` lint disabled). Follow the existing relaxed style rather than tightening types broadly.
 - Dependency versions are heavily pinned via `pnpm.overrides` and `pnpm.patchedDependencies` (`scimmy`, `yjs`) in the root `package.json`. Don't bump pinned/patched deps casually; the patches and overrides exist for compatibility/security reasons.
+- **Adding/renaming/removing an MCP tool requires updating `SERVER_INSTRUCTIONS`** in `packages/mcp/src/index.ts` — the intent-routing guide MCP clients receive on initialize. This applies both to inline `server.registerTool(...)` calls in `index.ts` and to specs in `packages/mcp/src/tool-specs.ts`. Enforced by `packages/mcp/test/unit/server-instructions.test.mjs`, which fails when a registered tool is not mentioned in the guide (deliberate opt-outs go into its `EXCEPTIONS` list). Remember `packages/mcp/build/` is committed — rebuild after editing.
 
 ## CI / release
 
