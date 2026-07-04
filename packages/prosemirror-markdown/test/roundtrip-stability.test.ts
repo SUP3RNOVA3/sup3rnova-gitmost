@@ -3,6 +3,10 @@ import {
   runStabilityMatrix,
   unstableCombos,
   formatReport,
+  runConvergenceCase,
+  convergenceCasesFor,
+  convergenceOk,
+  formatConvergence,
   type NodeStabilitySpec,
 } from "./roundtrip-stability.helper.js";
 
@@ -31,8 +35,8 @@ const SPECS: NodeStabilitySpec[] = [
     type: "image",
     baseAttrs: { src: "/i.png" },
     attrMatrix: [
-      { attr: "alt", default: undefined, nonDefault: "a real alt text" },
-      { attr: "title", default: undefined, nonDefault: "a real title" },
+      { attr: "alt", default: undefined, nonDefault: "a real alt text", emptyStringClass: true },
+      { attr: "title", default: undefined, nonDefault: "a real title", emptyStringClass: true },
       { attr: "caption", default: undefined, nonDefault: "a real caption" },
       { attr: "attachmentId", default: undefined, nonDefault: "att-42" },
     ],
@@ -42,7 +46,7 @@ const SPECS: NodeStabilitySpec[] = [
     type: "video",
     baseAttrs: { src: "/v.mp4" },
     attrMatrix: [
-      { attr: "alt", default: undefined, nonDefault: "a clip" },
+      { attr: "alt", default: undefined, nonDefault: "a clip", emptyStringClass: true },
       { attr: "attachmentId", default: undefined, nonDefault: "att-1" },
     ],
   },
@@ -59,7 +63,7 @@ const SPECS: NodeStabilitySpec[] = [
     type: "pdf",
     baseAttrs: { src: "/d.pdf" },
     attrMatrix: [
-      { attr: "name", default: undefined, nonDefault: "report.pdf" },
+      { attr: "name", default: undefined, nonDefault: "report.pdf", emptyStringClass: true },
       { attr: "attachmentId", default: undefined, nonDefault: "att-3" },
     ],
   },
@@ -68,8 +72,8 @@ const SPECS: NodeStabilitySpec[] = [
     type: "attachment",
     baseAttrs: { url: "/f.zip" },
     attrMatrix: [
-      { attr: "name", default: undefined, nonDefault: "bundle.zip" },
-      { attr: "mime", default: undefined, nonDefault: "application/zip" },
+      { attr: "name", default: undefined, nonDefault: "bundle.zip", emptyStringClass: true },
+      { attr: "mime", default: undefined, nonDefault: "application/zip", emptyStringClass: true },
       { attr: "attachmentId", default: undefined, nonDefault: "att-4" },
     ],
   },
@@ -98,8 +102,8 @@ const SPECS: NodeStabilitySpec[] = [
     type: "drawio",
     baseAttrs: { src: "blob:drawio" },
     attrMatrix: [
-      { attr: "title", default: undefined, nonDefault: "flow chart" },
-      { attr: "alt", default: undefined, nonDefault: "an alt" },
+      { attr: "title", default: undefined, nonDefault: "flow chart", emptyStringClass: true },
+      { attr: "alt", default: undefined, nonDefault: "an alt", emptyStringClass: true },
       { attr: "attachmentId", default: undefined, nonDefault: "att-5" },
     ],
   },
@@ -108,8 +112,8 @@ const SPECS: NodeStabilitySpec[] = [
     type: "excalidraw",
     baseAttrs: { src: "blob:excalidraw" },
     attrMatrix: [
-      { attr: "title", default: undefined, nonDefault: "sketch" },
-      { attr: "alt", default: undefined, nonDefault: "an alt" },
+      { attr: "title", default: undefined, nonDefault: "sketch", emptyStringClass: true },
+      { attr: "alt", default: undefined, nonDefault: "an alt", emptyStringClass: true },
       { attr: "attachmentId", default: undefined, nonDefault: "att-6" },
     ],
   },
@@ -124,5 +128,37 @@ describe("round-trip stability matrix (image + media family)", () => {
       // unstable is legible.
       expect(unstable, `\n${formatReport(report)}\n`).toEqual([]);
     });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// THIRD STATE: an attr EXPLICITLY stored as a literal "" (GS-EDIT-REVERT: a user
+// typed alt/title/name/... then deleted it, so Tiptap persisted `attr: ""` — a
+// value DISTINCT from "attr was never set"). Unlike the absent case above, this
+// state is NOT first-pass byte-stable: the fix's `"" -> default` coercion is a
+// deliberate ONE-TIME normalization on the FIRST sync round-trip, stable
+// thereafter. We therefore assert a DIFFERENT contract — "converges to default
+// on pass 1, then idempotent from pass 2 on" — for every empty-string-class attr
+// across the whole node family (image/video/pdf/attachment/drawio/excalidraw).
+//
+// IMPORTANT for a future sync/QA pass: the pass-1 `"" -> null` diff is the
+// converter canon, not corruption. It appears at most once per affected node and
+// must NOT be flagged as "the converter is losing/corrupting page data".
+// ---------------------------------------------------------------------------
+describe("round-trip third state: explicit empty string converges once, then idempotent", () => {
+  for (const spec of SPECS) {
+    for (const attr of convergenceCasesFor(spec)) {
+      it(`${spec.type}.${attr}: "" normalizes to default on pass 1, byte-stable from pass 2`, async () => {
+        const r = await runConvergenceCase(spec, attr);
+        // Pass 1 must converge "" -> the schema default (the one-time diff) and
+        // pass 2 (roundtrip of pass-1 output) must be byte-stable. formatConvergence
+        // prints exactly which half failed.
+        expect(convergenceOk(r), `\n${formatConvergence(r)}\n`).toBe(true);
+        // Spell the contract out explicitly so the intent is legible in the test:
+        expect(r.convergedToDefault, `\n${formatConvergence(r)}\n`).toBe(true);
+        expect(r.firstPassValue).toEqual(r.expectedDefault);
+        expect(r.secondPassDivergence, `\n${formatConvergence(r)}\n`).toBeNull();
+      });
+    }
   }
 });

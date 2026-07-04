@@ -50,6 +50,16 @@ export interface AttrMatrixEntry {
   default: unknown;
   /** A representative NON-default value to exercise (must survive verbatim). */
   nonDefault: unknown;
+  /**
+   * Marks the attr as a member of the EMPTY-STRING class the fix targets: a
+   * string attr whose schema default is `null`/absent and whose parseHTML
+   * coerces `"" -> default` (image/drawio `alt`+`title`, video `alt` via
+   * aria-label, pdf/attachment `name`, attachment `mime`). Set true to also
+   * drive the THIRD-STATE convergence case (see runConvergenceCase) for this
+   * attr. Attrs whose default is NOT null (e.g. embed `provider`, default "")
+   * or that are not `""`-coerced (control attrs) are left unset.
+   */
+  emptyStringClass?: boolean;
 }
 
 /** A node type + the attribute matrix to sweep for it. */
@@ -278,6 +288,134 @@ export function unstableCombos(report: MatrixReport): ComboResult[] {
   return report.combos.filter(
     (c) => c.missing || c.raw.length > 0 || c.canonical !== null,
   );
+}
+
+// ---------------------------------------------------------------------------
+// THIRD STATE: an EXPLICITLY-STORED empty string on a string attr.
+//
+// The matrix above sweeps TWO states per string attr: absent/default and a
+// non-default value — and asserts FIRST-pass byte-stability for both. There is
+// a third, degenerate state the matrix does NOT cover: the attr stored as a
+// LITERAL `""`. This is DISTINCT from "the node never had the attr": a user
+// types an alt in the editor, then deletes it, and Tiptap's
+// `updateAttributes({ alt: "" })` persists a literal `alt: ""` in the stored
+// JSON. There is no absent-vs-"" distinction in the DOM once serialized, so the
+// fix's `getAttribute("alt") || null` coercion canonicalizes BOTH to the
+// default (`null`).
+//
+// Consequence — and this is CORRECT, not a bug: a doc carrying an explicit `""`
+// converges to the default on the FIRST round-trip (a ONE-TIME diff: `"" ->
+// null`), then is byte-stable from the SECOND round-trip on (idempotent). So
+// this state must be pinned with a DIFFERENT contract than the matrix's:
+//   - do NOT assert first-pass byte-stability (the first pass legitimately
+//     changes `""` -> default), and
+//   - DO assert the first pass converges to the default AND the second pass is
+//     idempotent (rt2 deep-equals rt1).
+//
+// A future sync/QA pass diffing stored pages will see this one-time `"" -> null`
+// normalization exactly once per affected node; it is the converter canon, not
+// corruption, and must not be flagged as data loss.
+// ---------------------------------------------------------------------------
+
+/** Result of the third-state ("explicit empty string") convergence probe. */
+export interface ConvergenceResult {
+  type: string;
+  attr: string;
+  /** The schema default the attr must converge to on pass 1 (null / absent). */
+  expectedDefault: unknown;
+  /** rt1's materialized value for the attr — must equal `expectedDefault`. */
+  firstPassValue: unknown;
+  /** True when the node round-tripped AND rt1 converged the attr to default. */
+  convergedToDefault: boolean;
+  /** rt1-vs-rt2 divergence; MUST be null (idempotent from pass 2 on). */
+  secondPassDivergence: { path: string; a: unknown; b: unknown } | null;
+  /** True when the node type failed to round-trip at all (structural loss). */
+  missing: boolean;
+}
+
+/** Round-trip a full PM doc through the real converter once. */
+async function roundtripDoc(doc: any): Promise<any> {
+  return markdownToProseMirror(convertProseMirrorToMarkdown(doc));
+}
+
+/**
+ * Third-state convergence probe for one string attr of the empty-string class.
+ *
+ * (a) builds a doc with the attr EXPLICITLY set to `""` (baseAttrs + `""`),
+ * (b) rt1 = roundtrip(doc); asserts rt1's attr equals the schema default — the
+ *     documented ONE-TIME `"" -> default` normalization (NOT byte-stable vs the
+ *     `""` input, so first-pass stability is deliberately NOT asserted here),
+ * (c) rt2 = roundtrip(rt1); asserts rt2 deep-equals rt1 — idempotent from the
+ *     second round-trip on.
+ *
+ * Returns a structured result (does NOT throw) so the caller can assert and
+ * print. Reusable across the whole node family: drive it for every attr flagged
+ * `emptyStringClass` on every spec (see convergenceCasesFor / the test driver).
+ */
+export async function runConvergenceCase(
+  spec: NodeStabilitySpec,
+  attr: string,
+): Promise<ConvergenceResult> {
+  const expectedDefault = schemaDefaults(spec.type)[attr];
+
+  // (a) The degenerate third state: attr persisted as a LITERAL "".
+  const authored = { ...(spec.baseAttrs ?? {}), [attr]: "" };
+  const doc = { type: "doc", content: [{ type: spec.type, attrs: authored }] };
+
+  // (b) First round-trip: "" must normalize to the default (a one-time diff).
+  const rt1 = await roundtripDoc(doc);
+  const node1 = findFirst(rt1, spec.type);
+  const firstPassValue = node1?.attrs?.[attr];
+  const convergedToDefault =
+    node1 != null && firstDivergence(firstPassValue, expectedDefault) === null;
+
+  // (c) Second round-trip: must be byte-stable (rt2 deep-equals rt1). We compare
+  // the WHOLE docs — both are converter OUTPUTS already in the same materialized
+  // form (numeric attrs are strings on both sides), so no numeric normalization
+  // is needed here, unlike the raw/canonical contours above.
+  const rt2 = node1 != null ? await roundtripDoc(rt1) : rt1;
+  const secondPassDivergence =
+    node1 != null ? firstDivergence(rt1, rt2) : null;
+
+  return {
+    type: spec.type,
+    attr,
+    expectedDefault,
+    firstPassValue,
+    convergedToDefault,
+    secondPassDivergence,
+    missing: node1 == null,
+  };
+}
+
+/** The attrs of a spec flagged as members of the empty-string class. */
+export function convergenceCasesFor(spec: NodeStabilitySpec): string[] {
+  return spec.attrMatrix
+    .filter((e) => e.emptyStringClass)
+    .map((e) => e.attr);
+}
+
+/** True when a convergence result honours the "converges once, then stable" contract. */
+export function convergenceOk(r: ConvergenceResult): boolean {
+  return !r.missing && r.convergedToDefault && r.secondPassDivergence === null;
+}
+
+/** Render a convergence result as a legible one-liner for a failed assertion. */
+export function formatConvergence(r: ConvergenceResult): string {
+  if (r.missing) return `${r.type}.${r.attr}: DID-NOT-ROUND-TRIP`;
+  const parts: string[] = [];
+  if (!r.convergedToDefault) {
+    parts.push(
+      `pass1 did NOT converge: got ${JSON.stringify(r.firstPassValue)} (expected default ${JSON.stringify(r.expectedDefault)})`,
+    );
+  }
+  if (r.secondPassDivergence) {
+    parts.push(
+      `pass2 NOT idempotent @ ${r.secondPassDivergence.path}: ${JSON.stringify(r.secondPassDivergence.a)} vs ${JSON.stringify(r.secondPassDivergence.b)}`,
+    );
+  }
+  const status = parts.length === 0 ? "converges-once-then-stable" : parts.join("; ");
+  return `${r.type}.${r.attr}: ${status}`;
 }
 
 /** Render a report as a legible multi-line string for a failed assertion. */
