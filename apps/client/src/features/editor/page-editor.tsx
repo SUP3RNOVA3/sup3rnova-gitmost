@@ -62,7 +62,7 @@ import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu-lazy";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
-import { useDebouncedCallback, useDocumentVisibility } from "@mantine/hooks";
+import { useDocumentVisibility } from "@mantine/hooks";
 import { useIdle } from "@/hooks/use-idle.ts";
 import { queryClient } from "@/main.tsx";
 import { IPage } from "@/features/page/types/page.types.ts";
@@ -79,6 +79,7 @@ import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
+import { usePageContentCache } from "./hooks/use-page-content-cache";
 import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
 import { useSwapHeightReservation } from "./hooks/use-swap-height-reservation";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
@@ -272,8 +273,13 @@ export default function PageEditor({
     }
   }, [isIdle, documentState, providersReady, resetIdle]);
 
-  // Attach here, to make sure the connection gets properly established
-  providersRef.current?.remote.attach();
+  // Attach the remote provider once it's ready (and again after a pageId swap
+  // recreates it) to make sure the connection gets properly established. This
+  // used to run in the render body — a side effect during render (#343, PART 7).
+  // `attach()` is idempotent, so re-running it on these deps is safe.
+  useEffect(() => {
+    providersRef.current?.remote.attach();
+  }, [providersReady, pageId]);
 
   const extensions = useMemo(() => {
     if (!providersReady || !providersRef.current || !currentUser?.user) {
@@ -287,6 +293,12 @@ export default function PageEditor({
       ...collabExtensions(remoteProvider, currentUser?.user),
     ];
   }, [providersReady, currentUser?.user]);
+
+  // getJSON() serialization + cache write live in the hook, off the keystroke
+  // path, and flush on unmount so the last snapshot survives navigation (#343).
+  // MUST be declared before useEditor: React runs effect cleanups in declaration
+  // order on unmount, so the flush must run before the editor is torn down.
+  const debouncedUpdateContent = usePageContentCache(editorRef, slugId);
 
   const editor = useEditor(
     {
@@ -392,11 +404,11 @@ export default function PageEditor({
           }
         }
       },
-      onUpdate({ editor }) {
-        if (editor.isEmpty) return;
-        const editorJson = editor.getJSON();
-        //update local page cache to reduce flickers
-        debouncedUpdateContent(editorJson);
+      onUpdate() {
+        // Only schedule the debounce here — the whole-doc getJSON() serialization
+        // happens INSIDE the debounced callback (see usePageContentCache), so it
+        // no longer runs synchronously on every (local or remote) keystroke.
+        debouncedUpdateContent();
       },
     },
     [pageId, editable, extensions],
@@ -441,17 +453,6 @@ export default function PageEditor({
       }
     };
   }, [editor, pageId, editorIsEditable]);
-
-  const debouncedUpdateContent = useDebouncedCallback((newContent: any) => {
-    const pageData = queryClient.getQueryData<IPage>(["pages", slugId]);
-
-    if (pageData) {
-      queryClient.setQueryData(["pages", slugId], {
-        ...pageData,
-        content: newContent,
-      });
-    }
-  }, 3000);
 
   const handleActiveCommentEvent = (event) => {
     const { commentId, resolved } = event.detail;
