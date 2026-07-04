@@ -450,7 +450,7 @@ async function main() {
     // 8. get_page markdown round-trip sanity (table separator present)
     const md = await client.getPage(pageId);
     check("get_page md: table separator emitted", md.data.content.includes("| --- |"), "");
-    check("get_page md: callout exported as :::", md.data.content.includes(":::info"));
+    check("get_page md: callout exported as Obsidian '> [!info]'", md.data.content.includes("> [!info]"));
 
     // 9. comments: create / list / reply / update / check_new / delete
     const beforeComments = new Date(Date.now() - 1000).toISOString();
