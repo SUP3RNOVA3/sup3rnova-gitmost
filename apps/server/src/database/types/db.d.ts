@@ -660,7 +660,7 @@ export interface AiChatMessages {
 }
 
 // The agent RUN as a first-class server-side lifecycle object (#184 phase 1).
-// Mirrors migration 20260627T130000-ai-chat-runs.ts. A run is created when an
+// Mirrors migration 20260704T130000-ai-chat-runs.ts. A run is created when an
 // agent turn starts and survives the browser disconnecting; the DB is the source
 // of truth a later client reconnects to. `assistantMessageId` links to the #183
 // projection row (the assistant message this run materializes).
