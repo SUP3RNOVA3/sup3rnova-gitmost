@@ -93,8 +93,10 @@ export const SHARED_TOOL_SPECS = {
             'that unique selection. `total` counts all ' +
             'hits and `truncated` is true when more than `limit` were found (nothing ' +
             'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
-            'set regex:true for a JS regular expression (char classes, word ' +
-            'boundaries) and caseSensitive:true to match case. Ideal for systematic ' +
+            'set regex:true for an RE2 regular expression (linear-time, ReDoS-safe: ' +
+            'char classes, word boundaries, anchors and quantifiers work; lookaround ' +
+            '(?=…)/(?<=…) and backreferences \\1 are NOT supported) and ' +
+            'caseSensitive:true to match case. Ideal for systematic ' +
             'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
             'invalid regex or an empty query returns a clear error to fix.',
         buildShape: (z) => ({
@@ -106,7 +108,8 @@ export const SHARED_TOOL_SPECS = {
             regex: z
                 .boolean()
                 .optional()
-                .describe('Treat query as a JS regular expression (default false).'),
+                .describe('Treat query as an RE2 regular expression — linear-time, ReDoS-safe; ' +
+                'no lookaround or backreferences (default false).'),
             caseSensitive: z
                 .boolean()
                 .optional()
