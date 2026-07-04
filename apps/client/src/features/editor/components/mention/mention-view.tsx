@@ -11,9 +11,19 @@ import {
 import { extractPageSlugId } from "@/lib";
 import classes from "./mention.module.css";
 
-export default function MentionView(props: NodeViewProps) {
-  const { node } = props;
-  const { label, entityType, entityId, slugId, anchorId } = node.attrs;
+interface MentionAttrs {
+  label?: string;
+  entityType?: string;
+  entityId?: string;
+  slugId?: string;
+  anchorId?: string;
+}
+
+// Presentational mention renderer (no NodeViewWrapper). Shared by the editor
+// NodeView (MentionView) and the static comment renderer (CommentContentView)
+// so mention click/nav/icon behavior stays identical outside of an editor.
+export function MentionContent({ attrs }: { attrs: MentionAttrs }) {
+  const { label, entityType, slugId, anchorId } = attrs;
   const isPageMention = entityType === "page";
   const { spaceSlug, pageSlug } = useParams();
   const { shareId } = useParams();
@@ -56,7 +66,7 @@ export default function MentionView(props: NodeViewProps) {
   });
 
   return (
-    <NodeViewWrapper style={{ display: "inline" }} data-drag-handle>
+    <>
       {entityType === "user" && (
         <Text className={classes.userMention} component="span">
           @{label}
@@ -139,6 +149,14 @@ export default function MentionView(props: NodeViewProps) {
           </span>
         </Anchor>
       )}
+    </>
+  );
+}
+
+export default function MentionView(props: NodeViewProps) {
+  return (
+    <NodeViewWrapper style={{ display: "inline" }} data-drag-handle>
+      <MentionContent attrs={props.node.attrs} />
     </NodeViewWrapper>
   );
 }

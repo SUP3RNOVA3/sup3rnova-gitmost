@@ -28,6 +28,16 @@ vi.mock("@/features/comment/components/comment-editor", () => ({
   default: () => <div data-testid="comment-editor" />,
 }));
 
+// CommentContentView (used for the read-only body) imports the mention view,
+// which pulls page-query -> main.tsx (createRoot). Stub the queries so the item
+// renders in isolation without the app entry side-effect.
+vi.mock("@/features/page/queries/page-query.ts", () => ({
+  usePageQuery: () => ({ data: undefined, isLoading: false, isError: false }),
+}));
+vi.mock("@/features/share/queries/share-query.ts", () => ({
+  useSharePageQuery: () => ({ data: undefined }),
+}));
+
 import CommentListItem from "./comment-list-item";
 import {
   canShowApply,
@@ -284,5 +294,27 @@ describe("canShowDismiss predicate", () => {
   });
   it("false for a reply comment", () => {
     expect(canShowDismiss(c({ parentCommentId: "p" }), true, true)).toBe(false);
+  });
+});
+
+describe("CommentListItem — read-only body renders statically", () => {
+  it("renders the comment body as static text without a TipTap editor", () => {
+    renderItem(
+      baseComment({
+        content: JSON.stringify({
+          type: "doc",
+          content: [
+            {
+              type: "paragraph",
+              content: [{ type: "text", text: "Hello static world" }],
+            },
+          ],
+        }),
+      }),
+    );
+    // Body text is present...
+    expect(screen.getByText("Hello static world")).toBeDefined();
+    // ...and it did NOT go through the (mocked) CommentEditor instance.
+    expect(screen.queryByTestId("comment-editor")).toBeNull();
   });
 });
