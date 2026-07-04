@@ -6,10 +6,16 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
-import { Throttle, ThrottlerGuard } from '@nestjs/throttler';
+import { SkipThrottle, Throttle, ThrottlerGuard } from '@nestjs/throttler';
 import { FastifyRequest } from 'fastify';
 import { Public } from '../../common/decorators/public.decorator';
-import { VITALS_THROTTLER } from '../../integrations/throttle/throttler-names';
+import {
+  AI_CHAT_THROTTLER,
+  AUTH_THROTTLER,
+  PAGE_TEMPLATE_THROTTLER,
+  PUBLIC_SHARE_AI_THROTTLER,
+  VITALS_THROTTLER,
+} from '../../integrations/throttle/throttler-names';
 import { VitalsService } from './vitals.service';
 
 /**
@@ -25,6 +31,17 @@ export class VitalsController {
 
   @Public()
   @UseGuards(ThrottlerGuard)
+  // The global ThrottlerGuard applies ALL named throttlers to every route, so
+  // every OTHER bucket must be skipped here — otherwise the strictest of them
+  // (public-share AI at 5/min) would override the intended vitals limit and cap
+  // this route at 5/min instead of 120/min. Skip them all so ONLY the VITALS
+  // bucket below applies.
+  @SkipThrottle({
+    [AUTH_THROTTLER]: true,
+    [AI_CHAT_THROTTLER]: true,
+    [PAGE_TEMPLATE_THROTTLER]: true,
+    [PUBLIC_SHARE_AI_THROTTLER]: true,
+  })
   @Throttle({ [VITALS_THROTTLER]: { limit: 120, ttl: 60_000 } })
   @Post('vitals')
   @HttpCode(200)

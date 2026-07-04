@@ -195,8 +195,9 @@ async function bootstrap() {
     );
   });
 
-  // #355 — Prometheus scrape endpoint on a SEPARATE port (METRICS_PORT, default
-  // 9464), started after the app is up. No-op when METRICS_PORT is unset.
+  // #355 — Prometheus scrape endpoint on a SEPARATE port (METRICS_PORT),
+  // started after the app is up. No default port: a no-op when METRICS_PORT is
+  // unset. Closed on shutdown by MetricsServerLifecycle (MetricsModule).
   startMetricsServer();
 }
 

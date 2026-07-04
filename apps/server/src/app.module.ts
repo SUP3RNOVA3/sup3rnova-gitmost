@@ -96,7 +96,9 @@ try {
     AiModule,
     AiChatModule,
     MetricsModule,
-    ClientTelemetryModule,
+    // Gated OFF by default: only registers the public vitals sink controller
+    // when CLIENT_TELEMETRY_ENABLED=true (maintainer decision E1=B).
+    ClientTelemetryModule.register(),
     ...enterpriseModules,
   ],
   controllers: [AppController],

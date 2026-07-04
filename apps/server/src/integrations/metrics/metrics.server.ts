@@ -3,13 +3,19 @@ import { Logger } from '@nestjs/common';
 import { getMetricsRegistry, isMetricsEnabled } from './metrics.registry';
 
 /**
- * Start the Prometheus scrape endpoint on a SEPARATE port (default 9464,
- * overridable via `METRICS_PORT`). This is a bare node:http server, NOT part of
- * the Fastify app, so `/metrics` never exists on the public :3000 listener.
+ * Start the Prometheus scrape endpoint on a SEPARATE port, taken from
+ * `METRICS_PORT`. There is NO default port: when `METRICS_PORT` is unset the
+ * whole metrics subsystem is OFF and this returns null. This is a bare node:http
+ * server, NOT part of the Fastify app, so `/metrics` never exists on the public
+ * :3000 listener.
  *
  * Returns the http.Server (so callers can close it on shutdown) or null when
- * metrics are disabled.
+ * metrics are disabled. The reference is also kept module-side so the Nest
+ * lifecycle (see MetricsModule) can close it on application shutdown without
+ * threading the handle back through the non-DI bootstrap.
  */
+let metricsServer: Server | null = null;
+
 export function startMetricsServer(): Server | null {
   if (!isMetricsEnabled()) return null;
 
@@ -52,5 +58,20 @@ export function startMetricsServer(): Server | null {
     logger.error(`Metrics server error: ${err?.message}`);
   });
 
+  metricsServer = server;
   return server;
+}
+
+/**
+ * Close the metrics scrape server if one is running. Idempotent and safe to call
+ * when metrics are disabled (no server was ever started). Wired into Nest's
+ * shutdown lifecycle so the listener is not left dangling on shutdown.
+ */
+export function closeMetricsServer(): Promise<void> {
+  const server = metricsServer;
+  metricsServer = null;
+  if (!server) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
 }

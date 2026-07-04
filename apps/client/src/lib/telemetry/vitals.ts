@@ -8,6 +8,7 @@ import {
   type LCPMetricWithAttribution,
   type TTFBMetricWithAttribution,
 } from "web-vitals/attribution";
+import { isClientTelemetryEnabled } from "@/lib/config";
 import { currentRouteTemplate } from "./route-template";
 
 /**
@@ -75,6 +76,16 @@ export function isVitalsSampled(): boolean {
   }
 }
 
+/**
+ * True only when telemetry is BOTH enabled by the operator (F1 flag) AND this
+ * session is sampled. Callers outside initVitals (e.g. the editor dispatch
+ * wrapper) use this to skip ALL instrumentation cost on disabled/non-sampled
+ * sessions — no observers, no per-transaction timing.
+ */
+export function isVitalsActive(): boolean {
+  return isClientTelemetryEnabled() && isVitalsSampled();
+}
+
 function truncateAttr(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length === 0) return undefined;
   return value.slice(0, MAX_ATTR_LENGTH);
@@ -126,7 +137,7 @@ export function reportClientMetric(
   value: number,
   extra?: { docSize?: number },
 ): void {
-  if (!isVitalsSampled()) return;
+  if (!isVitalsActive()) return;
   if (!Number.isFinite(value)) return;
   enqueue({
     name,
@@ -199,6 +210,10 @@ function attrTarget(
 export function initVitals(): void {
   if (initialised) return;
   initialised = true;
+
+  // Operator flag gate (F1, default OFF): when telemetry is disabled the sink
+  // endpoint does not even exist server-side, so install ZERO observers.
+  if (!isClientTelemetryEnabled()) return;
 
   // Sampling gate is evaluated BEFORE any observer subscription.
   if (!isVitalsSampled()) return;

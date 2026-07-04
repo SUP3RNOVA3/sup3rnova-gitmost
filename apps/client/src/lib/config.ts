@@ -47,6 +47,13 @@ export function isCompactPageTreeEnabled(): boolean {
   return castToBoolean(getConfigValue("COMPACT_PAGE_TREE", "true"));
 }
 
+// #355 — operator toggle for client perf-telemetry. DEFAULT OFF: the server
+// mirrors CLIENT_TELEMETRY_ENABLED into window.CONFIG; when off the client
+// installs no observers and sends nothing (the sink endpoint doesn't exist).
+export function isClientTelemetryEnabled(): boolean {
+  return castToBoolean(getConfigValue("CLIENT_TELEMETRY_ENABLED", "false"));
+}
+
 export function getAvatarUrl(
   avatarUrl: string,
   type: AvatarIconType = AvatarIconType.AVATAR,

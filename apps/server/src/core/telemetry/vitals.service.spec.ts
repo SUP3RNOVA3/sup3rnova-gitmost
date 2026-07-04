@@ -119,4 +119,31 @@ describe('VitalsService.buildRows', () => {
     const rows = svc.buildRows({ events: [{ name: 'LCP', value: 1 }] }, null);
     expect(rows[0].workspaceId).toBeNull();
   });
+
+  it('drops an out-of-int4-range docSize to null without losing the batch', () => {
+    const rows = svc.buildRows(
+      {
+        events: [
+          // Garbage docSize overflowing int4 must NOT reject the whole batch:
+          // the field is dropped to null and the event is kept.
+          { name: 'editor_tx_ms', value: 10, docSize: 9_999_999_999 },
+          { name: 'editor_tx_ms', value: 20, docSize: -5 },
+          { name: 'editor_tx_ms', value: 30, docSize: 4096 },
+        ],
+      },
+      WS,
+    );
+    expect(rows).toHaveLength(3);
+    expect(rows[0].docSize).toBeNull();
+    expect(rows[1].docSize).toBeNull();
+    expect(rows[2].docSize).toBe(4096);
+  });
+
+  it('keeps a docSize exactly at the int4 max', () => {
+    const rows = svc.buildRows(
+      { events: [{ name: 'editor_tx_ms', value: 1, docSize: 2147483647 }] },
+      WS,
+    );
+    expect(rows[0].docSize).toBe(2147483647);
+  });
 });

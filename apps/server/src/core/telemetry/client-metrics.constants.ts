@@ -37,6 +37,12 @@ export const MAX_ATTR_LENGTH = 120;
 // route label sanity cap (client sends a template like /s/:space/p/:slug).
 export const MAX_ROUTE_LENGTH = 200;
 
+// `client_metrics.doc_size` is a Postgres `int` (int4). A garbage/huge docSize
+// on a single event would overflow int4 and make Postgres reject the WHOLE
+// batch INSERT, losing every event in it. Values outside this range are DROPPED
+// to null (the event is still kept) so one bad field never loses the batch.
+export const DOC_SIZE_MAX = 2147483647; // 2^31 - 1 (int4 max)
+
 export interface ClientMetricRow {
   name: string;
   value: number;
@@ -87,6 +93,12 @@ export function sanitizeVitalEvent(
   } else if (typeof e.doc_size === 'number' && Number.isFinite(e.doc_size)) {
     // Accept snake_case too, in case a client sends the raw column name.
     docSize = Math.trunc(e.doc_size as number);
+  }
+  // Guard the int4 column: an out-of-range docSize would overflow int4 and make
+  // Postgres reject the whole batch INSERT. Drop the field (keep the event)
+  // rather than lose every other event in the batch.
+  if (docSize !== null && (docSize < 0 || docSize > DOC_SIZE_MAX)) {
+    docSize = null;
   }
 
   return { name, value, rating, route, attr, docSize, workspaceId };
