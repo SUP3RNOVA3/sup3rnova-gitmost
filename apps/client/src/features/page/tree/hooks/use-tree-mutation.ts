@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useAtom, useStore } from "jotai";
+import { useAtom, useSetAtom, useStore } from "jotai";
 import { notifications } from "@mantine/notifications";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
@@ -20,6 +20,7 @@ import {
 } from "@/features/page/queries/page-query.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import { getSpaceUrl } from "@/lib/config.ts";
+import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 
 export type UseTreeMutation = {
   handleMove: (sourceId: string, op: DropOp) => Promise<void>;
@@ -43,6 +44,7 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
   const removePageMutation = useRemovePageMutation();
   const movePageMutation = useMovePageMutation();
   const navigate = useNavigate();
+  const setMobileSidebar = useSetAtom(mobileSidebarAtom);
   const { spaceSlug, pageSlug } = useParams();
 
   const handleMove = useCallback(
@@ -201,8 +203,23 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
         createdPage.title,
       );
       navigate(pageUrl);
+      // On mobile the create action is triggered from inside the off-canvas
+      // sidebar drawer (space sidebar "+", tree-row "add subpage"). Navigating
+      // alone leaves that drawer open on top of the freshly created page, so the
+      // editor stays hidden behind the tree. Close it here so the new page opens
+      // in the editor — mirrors the row-click drawer-close in space-tree-row.
+      // No-op on desktop, where the mobile drawer atom is already false.
+      setMobileSidebar(false);
     },
-    [spaceId, createPageMutation, setData, store, navigate, spaceSlug],
+    [
+      spaceId,
+      createPageMutation,
+      setData,
+      store,
+      navigate,
+      spaceSlug,
+      setMobileSidebar,
+    ],
   );
 
   const handleRename = useCallback(
