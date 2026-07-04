@@ -680,4 +680,94 @@ export const SHARED_TOOL_SPECS = {
         ),
     }),
   },
+
+  // --- table tools (unified from the per-layer inline definitions, #294) ---
+  //
+  // These tools carried a "NOT shared" note in BOTH layers because of a single
+  // parameter-NAME drift: the MCP layer named the table reference `table` while
+  // the in-app layer named it `tableRef`. #294 reconciles that drift by unifying
+  // on the MCP name `table` — renaming the MCP public parameter would break
+  // external MCP clients, whereas the in-app parameter is model-facing
+  // (prompt-only) and safe to rename. The in-app execute bodies now destructure
+  // `table` instead of `tableRef` (nothing else changes). Descriptions take the
+  // MCP copy's richer wording (it documented `#<index>`, padding, header-row
+  // behavior) plus the in-app copy's "Reversible via page history" note; sibling
+  // tool references are phrased transport-neutrally.
+  //
+  // NOT here (kept inline in index.ts): table_get / getTable. Its MCP tool name
+  // is noun-first (`table_get`) while the in-app key is verb-first (`getTable`),
+  // so it breaks the snake_case(inAppKey) naming convention the registry enforces
+  // (shared-tool-specs.contract.spec.ts). Renaming the public MCP tool would
+  // break external clients, so it stays per-transport (its in-app param was still
+  // aligned to `table` for consistency with the migrated trio below).
+
+  tableInsertRow: {
+    mcpName: 'table_insert_row',
+    inAppKey: 'tableInsertRow',
+    description:
+      'Insert a row of plain-text cells into a table. `table` is `#<index>` ' +
+      'from the page outline, or a block id inside it. `cells` is the text per ' +
+      "column (padded to the table's column count; an error if more cells than " +
+      'columns). `index` is the 0-based insert position (0 inserts before the ' +
+      'header); omit to append at the end. Reversible via page history.',
+    tier: 'deferred',
+    catalogLine: 'tableInsertRow — insert a row of plain-text cells into a table.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page.'),
+      table: z
+        .string()
+        .min(1)
+        .describe('"#<index>" from the page outline, or a block id in the table.'),
+      cells: z.array(z.string()).describe('The cell texts for the row (one per column).'),
+      index: z
+        .number()
+        .int()
+        .optional()
+        .describe('0-based insert position (0 inserts before the header); omit to append.'),
+    }),
+  },
+
+  tableDeleteRow: {
+    mcpName: 'table_delete_row',
+    inAppKey: 'tableDeleteRow',
+    description:
+      'Delete the row at 0-based `index` from a table (`table` is `#<index>` ' +
+      'from the page outline, or a block id inside it). Refuses to delete the ' +
+      "table's only row; an out-of-range `index` throws. Deleting `index` 0 " +
+      'removes the header row, and the next row becomes the new header. ' +
+      'Reversible via page history.',
+    tier: 'deferred',
+    catalogLine: 'tableDeleteRow — delete a table row at a 0-based index.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page.'),
+      table: z
+        .string()
+        .min(1)
+        .describe('"#<index>" from the page outline, or a block id in the table.'),
+      index: z.number().int().describe('0-based row index to delete.'),
+    }),
+  },
+
+  tableUpdateCell: {
+    mcpName: 'table_update_cell',
+    inAppKey: 'tableUpdateCell',
+    description:
+      'Set the plain-text content of cell [row, col] (0-based) in a table ' +
+      '(`table` is `#<index>` from the page outline, or a block id inside it). ' +
+      "Replaces the cell's content with a single text paragraph; for rich " +
+      "formatting, patch the cell's paragraph id (obtained from reading the " +
+      'table) instead. Reversible via page history.',
+    tier: 'deferred',
+    catalogLine: 'tableUpdateCell — set the text of a table cell at [row, col].',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page.'),
+      table: z
+        .string()
+        .min(1)
+        .describe('"#<index>" from the page outline, or a block id in the table.'),
+      row: z.number().int().describe('0-based row index.'),
+      col: z.number().int().describe('0-based column index.'),
+      text: z.string().describe('The new cell text.'),
+    }),
+  },
 } satisfies Record<string, SharedToolSpec>;

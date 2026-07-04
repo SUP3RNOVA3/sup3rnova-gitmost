@@ -201,6 +201,11 @@ registerShared(
 );
 
 // Tool: table_get
+// Tool: table_get
+// NOT in the shared registry: the MCP tool name `table_get` is noun-first while
+// the in-app key is `getTable` (verb-first), breaking the snake_case(inAppKey)
+// convention the shared registry enforces (shared-tool-specs.contract.spec.ts).
+// Renaming the public MCP tool would break external clients, so it stays inline.
 server.registerTool(
   "table_get",
   {
@@ -223,25 +228,10 @@ server.registerTool(
 );
 
 // Tool: table_insert_row
-// NOT in the shared registry: this transport names the table argument `table`,
-// while the in-app tool names it `tableRef` (ai-chat-tools.service.ts). Sharing
-// one buildShape would rename a public MCP parameter, so the table row/cell
-// tools stay per-transport by design.
-server.registerTool(
-  "table_insert_row",
-  {
-    description:
-      "Insert a row of plain-text cells into a table. `table` = `#<index>` or " +
-      "a block id inside it. `cells` = text per column (padded to the table's " +
-      "column count; error if more cells than columns). `index` = 0-based " +
-      "insert position (0 inserts before the header); omit to append at the end.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      table: z.string().min(1),
-      cells: z.array(z.string()),
-      index: z.number().int().optional(),
-    },
-  },
+// Schema + description now live in the shared registry (#294); the `table`
+// parameter name is the canonical one (the in-app layer was unified to it).
+registerShared(
+  SHARED_TOOL_SPECS.tableInsertRow,
   async ({ pageId, table, cells, index }) => {
     const result = await docmostClient.tableInsertRow(
       pageId,
@@ -254,22 +244,9 @@ server.registerTool(
 );
 
 // Tool: table_delete_row
-// NOT shared — same `table` (here) vs `tableRef` (in-app) parameter-name
-// divergence as table_insert_row.
-server.registerTool(
-  "table_delete_row",
-  {
-    description:
-      "Delete the row at 0-based `index` from a table (`table` = `#<index>` or " +
-      "a block id inside it). Refuses to delete the table's only row. An " +
-      "out-of-range `index` throws. Deleting `index` 0 removes the header row, " +
-      "and the next row becomes the new header.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      table: z.string().min(1),
-      index: z.number().int(),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.tableDeleteRow,
   async ({ pageId, table, index }) => {
     const result = await docmostClient.tableDeleteRow(pageId, table, index);
     return jsonContent(result);
@@ -277,24 +254,9 @@ server.registerTool(
 );
 
 // Tool: table_update_cell
-// NOT shared — same `table` (here) vs `tableRef` (in-app) parameter-name
-// divergence as table_insert_row.
-server.registerTool(
-  "table_update_cell",
-  {
-    description:
-      "Set the plain-text content of cell [row,col] (0-based) in a table " +
-      "(`table` = `#<index>` or a block id inside it). Replaces the cell's " +
-      "content with a single text paragraph; for rich formatting use patch_node " +
-      "on the cell's paragraph id from table_get.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      table: z.string().min(1),
-      row: z.number().int(),
-      col: z.number().int(),
-      text: z.string(),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.tableUpdateCell,
   async ({ pageId, table, row, col, text }) => {
     const result = await docmostClient.tableUpdateCell(
       pageId,

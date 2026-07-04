@@ -148,6 +148,10 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'deferred',
     catalogLine: 'getTable — read a table as a matrix of cell texts and cell ids.',
   },
+  // NOTE: tableInsertRow, tableDeleteRow and tableUpdateCell moved to
+  // @docmost/mcp's SHARED_TOOL_SPECS (#294); they carry their own deferred tier +
+  // catalogLine there. getTable stays inline (its MCP name table_get breaks the
+  // snake_case(inAppKey) convention, so it has no shared spec).
   // NOTE: checkNewComments moved to @docmost/mcp's SHARED_TOOL_SPECS (#294);
   // it carries its own deferred tier + catalogLine there.
   getPageHistory: {
@@ -164,18 +168,6 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'deferred',
     catalogLine:
       "updatePageJson — overwrite a page's body with a full ProseMirror document.",
-  },
-  tableInsertRow: {
-    tier: 'deferred',
-    catalogLine: 'tableInsertRow — insert a row of plain-text cells into a table.',
-  },
-  tableDeleteRow: {
-    tier: 'deferred',
-    catalogLine: 'tableDeleteRow — delete a table row at a 0-based index.',
-  },
-  tableUpdateCell: {
-    tier: 'deferred',
-    catalogLine: 'tableUpdateCell — set the text of a table cell at [row, col].',
   },
   sharePage: {
     tier: 'deferred',

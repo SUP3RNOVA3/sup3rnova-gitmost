@@ -601,21 +601,26 @@ export class AiChatToolsService {
           }),
       ),
 
+      // NOT shared (kept inline): the MCP tool name `table_get` is noun-first
+      // while this key is `getTable` (verb-first), breaking the
+      // snake_case(inAppKey) convention the shared registry enforces. Its
+      // reference parameter is still named `table` (was `tableRef`) so it matches
+      // the migrated table row/cell tools below.
       getTable: tool({
         description:
           'Read a table as a matrix of cell texts (plus a parallel cellIds ' +
           'matrix so cells can be addressed for rich edits).',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page.'),
-          tableRef: z
+          table: z
             .string()
             .describe(
-              '"#<index>" from getOutline, or a block id of any node inside ' +
-                'the table.',
+              '"#<index>" from the page outline, or a block id of any node ' +
+                'inside the table.',
             ),
         }),
-        execute: async ({ pageId, tableRef }) =>
-          await client.getTable(pageId, tableRef),
+        execute: async ({ pageId, table }) =>
+          await client.getTable(pageId, table),
       }),
 
       // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
@@ -766,64 +771,27 @@ export class AiChatToolsService {
         },
       }),
 
-      // NOT in the shared registry: this layer names the table argument
-      // `tableRef`, while the standalone MCP tool names it `table` (index.ts).
-      // Sharing one buildShape would rename a model-facing parameter on one
-      // transport, so the table row/cell tools stay per-layer by design.
-      tableInsertRow: tool({
-        description:
-          'Insert a row of plain-text cells into a table. Reversible via ' +
-          'page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          tableRef: z
-            .string()
-            .describe('"#<index>" from getOutline, or a block id in the table.'),
-          cells: z.array(z.string()).describe('The cell texts for the row.'),
-          index: z
-            .number()
-            .int()
-            .optional()
-            .describe('0-based insert position (omit/out-of-range to append).'),
-        }),
-        execute: async ({ pageId, tableRef, cells, index }) =>
-          await client.tableInsertRow(pageId, tableRef, cells, index),
-      }),
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // The table reference parameter was unified to `table` (was `tableRef`).
+      tableInsertRow: sharedTool(
+        sharedToolSpecs.tableInsertRow,
+        async ({ pageId, table, cells, index }) =>
+          await client.tableInsertRow(pageId, table, cells, index),
+      ),
 
-      // NOT shared — same `tableRef` (here) vs `table` (MCP) parameter-name
-      // divergence as tableInsertRow.
-      tableDeleteRow: tool({
-        description:
-          'Delete a table row at a 0-based index. Reversible via page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          tableRef: z
-            .string()
-            .describe('"#<index>" from getOutline, or a block id in the table.'),
-          index: z.number().int().describe('0-based row index to delete.'),
-        }),
-        execute: async ({ pageId, tableRef, index }) =>
-          await client.tableDeleteRow(pageId, tableRef, index),
-      }),
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      tableDeleteRow: sharedTool(
+        sharedToolSpecs.tableDeleteRow,
+        async ({ pageId, table, index }) =>
+          await client.tableDeleteRow(pageId, table, index),
+      ),
 
-      // NOT shared — same `tableRef` (here) vs `table` (MCP) parameter-name
-      // divergence as tableInsertRow.
-      tableUpdateCell: tool({
-        description:
-          'Set the plain-text content of a table cell at [row, col] (0-based). ' +
-          'Reversible via page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          tableRef: z
-            .string()
-            .describe('"#<index>" from getOutline, or a block id in the table.'),
-          row: z.number().int().describe('0-based row index.'),
-          col: z.number().int().describe('0-based column index.'),
-          text: z.string().describe('The new cell text.'),
-        }),
-        execute: async ({ pageId, tableRef, row, col, text }) =>
-          await client.tableUpdateCell(pageId, tableRef, row, col, text),
-      }),
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      tableUpdateCell: sharedTool(
+        sharedToolSpecs.tableUpdateCell,
+        async ({ pageId, table, row, col, text }) =>
+          await client.tableUpdateCell(pageId, table, row, col, text),
+      ),
 
       copyPageContent: sharedTool(
         sharedToolSpecs.copyPageContent,
