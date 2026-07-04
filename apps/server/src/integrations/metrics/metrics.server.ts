@@ -73,5 +73,14 @@ export function closeMetricsServer(): Promise<void> {
   if (!server) return Promise.resolve();
   return new Promise((resolve) => {
     server.close(() => resolve());
+    // server.close() stops accepting NEW connections but its callback does not
+    // fire until existing keep-alive sockets drain. The scraper (VictoriaMetrics/
+    // vmagent) holds an idle HTTP keep-alive socket, so without this the callback
+    // — and thus shutdown — would hang until the scraper disconnects or the
+    // orchestrator escalates to SIGKILL on the kill-grace window. Force-close idle
+    // keep-alive sockets so close() completes immediately, and unref so this
+    // server never keeps the event loop alive on its own.
+    server.closeIdleConnections();
+    server.unref();
   });
 }

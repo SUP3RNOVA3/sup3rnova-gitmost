@@ -30,28 +30,32 @@ export const JOB_BUCKETS = [
  * the full query text would blow up label cardinality; the leading keyword is a
  * finite set. Unknown/empty queries collapse to `other`.
  */
+// The bounded set of SQL leading keywords used as db_query_duration_seconds
+// labels. Module-const so it is built ONCE, not per query (this runs on every DB
+// query when metrics are enabled).
+const KNOWN_SQL_TOKENS = new Set([
+  'select',
+  'insert',
+  'update',
+  'delete',
+  'with',
+  'begin',
+  'commit',
+  'rollback',
+  'alter',
+  'create',
+  'drop',
+  'truncate',
+  'explain',
+]);
+
 export function firstSqlToken(sql: string | undefined): string {
   if (!sql) return 'other';
   // Skip leading whitespace / comments and grab the first word.
   const match = /^[\s(]*([a-zA-Z]+)/.exec(sql);
   if (!match) return 'other';
   const token = match[1].toLowerCase();
-  const known = new Set([
-    'select',
-    'insert',
-    'update',
-    'delete',
-    'with',
-    'begin',
-    'commit',
-    'rollback',
-    'alter',
-    'create',
-    'drop',
-    'truncate',
-    'explain',
-  ]);
-  return known.has(token) ? token : 'other';
+  return KNOWN_SQL_TOKENS.has(token) ? token : 'other';
 }
 
 /**
