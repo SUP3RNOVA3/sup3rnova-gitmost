@@ -84,9 +84,13 @@ export const SHARED_TOOL_SPECS = {
             'survives bold/italic/link splits; comment anchors do not interfere). ' +
             'Returns { total, truncated, matches:[{ nodeId, blockIndex, type, before, ' +
             'match, after }] }: `nodeId` is the block id (or "#<index>" for ' +
-            'table/cell content) — pass it straight to get_node/patch_node or as a ' +
-            'comment anchor; `blockIndex` is the get_outline index; `before`/`after` ' +
-            'give ~40 chars of context to build a unique selection. `total` counts all ' +
+            'table/cell content) — pass it to get_node/patch_node (the "#<index>" ' +
+            'form resolves with get_node but NOT patch_node, which only accepts a real ' +
+            'block id). To anchor a comment, do NOT pass nodeId to create_comment (it ' +
+            'has no nodeId param); build a UNIQUE text selection from before+match+' +
+            'after and pass it as create_comment\'s `selection`. `blockIndex` is the ' +
+            'get_outline index; `before`/`after` give ~40 chars of context to build ' +
+            'that unique selection. `total` counts all ' +
             'hits and `truncated` is true when more than `limit` were found (nothing ' +
             'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
             'set regex:true for a JS regular expression (char classes, word ' +

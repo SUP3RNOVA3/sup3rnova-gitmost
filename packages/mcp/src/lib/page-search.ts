@@ -3,10 +3,20 @@
  *
  * `searchInDoc(doc, query, opts)` finds every occurrence of a literal substring
  * (default) or a regular expression across the page's TEXT CONTAINERS and
- * reports WHERE each match is — the container's ref (usable verbatim with
- * get_node/patch_node and comment anchoring), the top-level block index, and a
- * short context window around the hit. It never touches the network, the DB, or
- * the schema mirror; like `comment-anchor.ts` it is isolated-testable.
+ * reports WHERE each match is — the container's ref (for get_node/patch_node;
+ * see the SearchMatch.nodeId note for the `#<index>` caveat), the top-level
+ * block index, and a short context window around the hit. It never touches the
+ * network, the DB, or the schema mirror; like `comment-anchor.ts` it is
+ * isolated-testable.
+ *
+ * REGEX ENGINE: with `regex:true` the pattern is compiled with RE2 (Google's
+ * linear-time engine), NOT the JS `RegExp`. RE2 has no backtracking, so a
+ * catastrophic pattern (e.g. `(a+)+$`) can never wedge the shared event loop —
+ * it runs in linear time. The trade-off is that RE2 does not support the
+ * backtracking-only features lookaround (`(?=…)`, `(?<=…)`) and backreferences
+ * (`\1`); such a pattern is rejected up front with a clear tool error (see
+ * searchInDoc) rather than being run, which is the desired behaviour — a clear
+ * error the agent can fix beats a server hang.
  *
  * WHY plain text (not markdown): each container's inline text is glued into ONE
  * string via `blockPlainText`, so a match survives inline-mark boundaries
@@ -21,7 +31,12 @@
  * whole top-level block's glued text.
  */
 
+import RE2 from "re2";
+
 import { blockPlainText } from "./node-ops.js";
+
+/** An RE2 regex instance (RE2 extends `RegExp`, so it is usable as one). */
+type Re2Regex = InstanceType<typeof RE2>;
 
 /** True if `value` is a non-null plain object (and not an array). */
 function isObject(value: any): value is Record<string, any> {
@@ -54,10 +69,21 @@ export interface SearchOptions {
 /** One located occurrence. */
 export interface SearchMatch {
   /**
-   * The container's ref: its `attrs.id` when it has one, otherwise
-   * `#<topLevelIndex>` of the nearest top-level block (the same ref format
-   * get_node/patch_node and comment anchoring accept). Table-cell/list-item
-   * paragraphs that carry no id fall back to the `#<index>` form.
+   * The container's ref, for addressing the block with get_node/patch_node: its
+   * `attrs.id` when it has one, otherwise `#<topLevelIndex>` of the nearest
+   * top-level block. Table-cell/list-item paragraphs that carry no id fall back
+   * to the `#<index>` form.
+   *
+   * CAVEAT: the `#<index>` form is accepted by get_node (getNodeByRef resolves
+   * it by top-level index) but NOT by patch_node (replaceNodeById resolves only
+   * by `attrs.id`), so id-less table/cell content can be READ by this ref but
+   * not PATCHED by it.
+   *
+   * To anchor a comment, do NOT pass this ref to create_comment — it has no
+   * nodeId parameter. A top-level comment needs an exact-text `selection` that
+   * occurs once on the page (it fails if the text isn't found), so build a
+   * UNIQUE `selection` from before+match+after and pass THAT as create_comment's
+   * `selection`.
    */
   nodeId: string;
   /** The top-level block index (as in get_outline). */
@@ -86,11 +112,12 @@ const MAX_LIMIT = 200;
 // Context window on each side of a match.
 const CONTEXT = 40;
 
-// Anti-ReDoS guards. JS regex is not interruptible, so a pathological pattern
-// on a large input can wedge the event loop; we bound BOTH inputs by size (not
-// a timeout). These also bound the literal engine's work.
-const MAX_PATTERN_LENGTH = 1000; // cap the query/pattern length
-const MAX_CONTAINER_TEXT = 100_000; // cap the text scanned per container
+// Cheap sanity cap on the query/pattern length. ReDoS is handled structurally
+// by the RE2 engine (linear-time, no backtracking — see the module doc), so we
+// no longer truncate the per-container text: RE2 scans it in linear time and a
+// cap could silently drop real matches past it. This just rejects an absurdly
+// long pattern early with a clear error.
+const MAX_PATTERN_LENGTH = 1000;
 
 /** Clamp the requested limit into [1, MAX_LIMIT], defaulting when absent. */
 function resolveLimit(limit: number | undefined): number {
@@ -101,14 +128,15 @@ function resolveLimit(limit: number | undefined): number {
 /**
  * Yield the [start, length] of every occurrence of the engine in `text`, in
  * order. A literal engine uses indexOf (case-folded when requested); a regex
- * engine uses a global RegExp. Zero-length regex matches (e.g. `\b`, `a*`) are
- * SKIPPED and lastIndex is advanced, so a pattern that can match the empty
- * string cannot flood the results or spin forever.
+ * engine uses a global RE2 regex (RE2 extends `RegExp`, so `.exec` advances
+ * `lastIndex` exactly like the native engine). Zero-length regex matches (e.g.
+ * `\b`, `a*`) are SKIPPED and lastIndex is advanced, so a pattern that can match
+ * the empty string cannot flood the results or spin forever.
  */
 function* eachMatch(
   text: string,
   query: string,
-  re: RegExp | null,
+  re: Re2Regex | null,
   caseSensitive: boolean,
 ): Generator<[number, number]> {
   if (re) {
@@ -148,8 +176,9 @@ function* eachMatch(
  * dropped.
  *
  * Throws a clear, model-actionable error (never a generic failure) on: an
- * empty/whitespace-only query, an over-long pattern, or — with `regex:true` —
- * an invalid RegExp, so the agent can fix its input.
+ * empty/whitespace-only query, an over-long pattern, or — with `regex:true` — a
+ * pattern RE2 rejects (invalid syntax, or the unsupported lookaround/
+ * backreference features), so the agent can fix its input.
  */
 export function searchInDoc(
   doc: any,
@@ -171,17 +200,21 @@ export function searchInDoc(
   const caseSensitive = opts.caseSensitive === true;
   const limit = resolveLimit(opts.limit);
 
-  // Compile the regex up front so an invalid pattern is a clean tool error
-  // rather than a failure deep in the traversal.
-  let re: RegExp | null = null;
+  // Compile the pattern up front with RE2 (linear-time, ReDoS-safe) so a bad
+  // pattern is a clean tool error rather than a failure deep in the traversal —
+  // and so a catastrophic-backtracking pattern can never wedge the event loop.
+  // RE2 throws both on syntactically invalid input AND on backtracking-only
+  // features it does not implement (lookaround, backreferences); both map to the
+  // same actionable error so the agent rewrites the pattern.
+  let re: Re2Regex | null = null;
   if (opts.regex === true) {
     try {
-      re = new RegExp(query, caseSensitive ? "g" : "gi");
+      re = new RE2(query, caseSensitive ? "g" : "gi");
     } catch (e) {
       throw new Error(
-        `search_in_page: invalid regular expression: ${
+        `search_in_page: invalid or unsupported regular expression: ${
           e instanceof Error ? e.message : String(e)
-        }`,
+        } — RE2 does not support lookaround ((?=…)/(?<=…)) or backreferences (\\1); rewrite the pattern without them.`,
       );
     }
   }
@@ -198,17 +231,16 @@ export function searchInDoc(
     if (!isObject(node)) return;
 
     if (isTextContainer(node)) {
-      // Glue this container's inline text into one string (mark-safe) and cap it
-      // so a single non-interruptible regex exec can never run on an unbounded
-      // input.
-      let text = blockPlainText(node);
-      if (text.length > MAX_CONTAINER_TEXT) {
-        text = text.slice(0, MAX_CONTAINER_TEXT);
-      }
+      // Glue this container's inline text into one string (mark-safe). No length
+      // cap: RE2 scans it in linear time (no ReDoS) and the whole document is
+      // already in memory, so truncating would only risk dropping real matches
+      // in a very long container.
+      const text = blockPlainText(node);
 
-      // The container's own id addresses it verbatim in get_node/patch_node and
-      // comment anchoring; a container with no id (e.g. a table-cell paragraph)
-      // falls back to the top-level block's #<index>.
+      // The container's own id addresses it verbatim in get_node/patch_node; a
+      // container with no id (e.g. a table-cell paragraph) falls back to the
+      // top-level block's #<index> (readable via get_node, but not patchable —
+      // see the SearchMatch.nodeId note).
       const id =
         isObject(node.attrs) && typeof node.attrs.id === "string" && node.attrs.id.length > 0
           ? node.attrs.id

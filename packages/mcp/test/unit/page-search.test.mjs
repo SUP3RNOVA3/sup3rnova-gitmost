@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { searchInDoc } from "../../build/lib/page-search.js";
+import { getNodeByRef } from "../../build/lib/node-ops.js";
 
 // ---------------------------------------------------------------------------
 // Document builders. Mirror the Docmost ProseMirror shape: paragraphs/headings
@@ -181,8 +182,110 @@ test("invalid regex throws a clear tool error", () => {
   const d = doc(para("p1", text("hi")));
   assert.throws(
     () => searchInDoc(d, "(", { regex: true }),
-    /invalid regular expression/i,
+    /invalid or unsupported regular expression/i,
   );
+});
+
+test("RE2: a catastrophic-backtracking pattern completes FAST and correctly (no ReDoS)", () => {
+  // (a+)+$ against a long run of 'a' followed by a non-'a' is the classic
+  // catastrophic-backtracking case that wedges the JS RegExp engine for
+  // seconds/forever. Under RE2 (linear time) it returns effectively instantly.
+  const d = doc(para("p1", text("a".repeat(50_000) + "b")));
+  const t0 = Date.now();
+  const res = searchInDoc(d, "(a+)+$", { regex: true });
+  const elapsed = Date.now() - t0;
+  // No '$'-anchored all-'a' run exists (there's a trailing 'b'), so no match.
+  assert.equal(res.total, 0);
+  assert.equal(res.matches.length, 0);
+  // Generous ceiling: the JS engine would take orders of magnitude longer.
+  assert.ok(elapsed < 1000, `expected fast completion, took ${elapsed}ms`);
+});
+
+test("RE2: catastrophic pattern that DOES match still completes fast and finds it", () => {
+  // (a+)+b matches the whole "aaa…b"; RE2 finds it in linear time.
+  const d = doc(para("p1", text("a".repeat(20_000) + "b")));
+  const t0 = Date.now();
+  const res = searchInDoc(d, "(a+)+b", { regex: true });
+  const elapsed = Date.now() - t0;
+  assert.equal(res.total, 1);
+  assert.equal(res.matches[0].match, "a".repeat(20_000) + "b");
+  assert.ok(elapsed < 1000, `expected fast completion, took ${elapsed}ms`);
+});
+
+test("RE2: unsupported lookaround/backreference patterns yield the clear unsupported-regex error", () => {
+  const d = doc(para("p1", text("hello")));
+  // Lookahead / lookbehind / backreference are backtracking-only features RE2
+  // rejects at compile time — a clean tool error, never a hang.
+  assert.throws(
+    () => searchInDoc(d, "foo(?=bar)", { regex: true }),
+    /invalid or unsupported regular expression/i,
+  );
+  assert.throws(
+    () => searchInDoc(d, "(?<=foo)bar", { regex: true }),
+    /invalid or unsupported regular expression/i,
+  );
+  assert.throws(
+    () => searchInDoc(d, "(a)\\1", { regex: true }),
+    /invalid or unsupported regular expression/i,
+  );
+});
+
+test("F3 round-trip: every match's nodeId resolves through the REAL getNodeByRef consumer", () => {
+  // A doc mixing an attrs.id paragraph and an id-less table-cell paragraph, so
+  // both ref formats (block id and "#<index>") are exercised end-to-end.
+  const cellPara = (t) => ({ type: "paragraph", content: [text(t)] });
+  const d = doc(
+    para("intro", text("find needle here")), // attrs.id ref -> "intro"
+    {
+      type: "table",
+      content: [
+        {
+          type: "tableRow",
+          content: [
+            { type: "tableCell", content: [cellPara("cell needle")] }, // id-less -> "#1"
+          ],
+        },
+      ],
+    },
+  );
+  const res = searchInDoc(d, "needle");
+  assert.equal(res.total, 2);
+
+  // Match 0: an attrs.id ref must resolve to that exact paragraph.
+  assert.equal(res.matches[0].nodeId, "intro");
+  const byId = getNodeByRef(d, res.matches[0].nodeId);
+  assert.ok(byId, "attrs.id ref must resolve via getNodeByRef");
+  assert.equal(byId.type, "paragraph");
+  assert.equal(byId.node.attrs.id, "intro");
+
+  // Match 1: an id-less table cell falls back to the table's "#<index>", which
+  // getNodeByRef resolves to the TOP-LEVEL block (the table) by index.
+  assert.equal(res.matches[1].nodeId, "#1");
+  const byIndex = getNodeByRef(d, res.matches[1].nodeId);
+  assert.ok(byIndex, "#<index> ref must resolve via getNodeByRef");
+  assert.equal(byIndex.type, "table");
+});
+
+test("F4: before/after are pinned correctly at string edges (clamp not dropped)", () => {
+  // Match within the first CONTEXT (40) chars of a container LONGER than
+  // CONTEXT: before is only the chars that exist, never a negative-index slice.
+  const head = doc(para("p1", text("ab NEEDLE" + "x".repeat(100))));
+  const r1 = searchInDoc(head, "NEEDLE");
+  assert.equal(r1.matches.length, 1);
+  assert.equal(r1.matches[0].before, "ab ");
+  assert.equal(r1.matches[0].after.length, 40); // plenty of trailing 'x'
+
+  // Match at index 0: before is empty.
+  const atStart = doc(para("p1", text("NEEDLE tail")));
+  const r2 = searchInDoc(atStart, "NEEDLE");
+  assert.equal(r2.matches[0].before, "");
+  assert.equal(r2.matches[0].after, " tail");
+
+  // Match at the container END: after is empty.
+  const atEnd = doc(para("p1", text("lead NEEDLE")));
+  const r3 = searchInDoc(atEnd, "NEEDLE");
+  assert.equal(r3.matches[0].before, "lead ");
+  assert.equal(r3.matches[0].after, "");
 });
 
 test("empty or whitespace-only query is rejected", () => {

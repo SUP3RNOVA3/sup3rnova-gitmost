@@ -1098,11 +1098,13 @@ export class DocmostClient {
    * Find every occurrence of `query` on a page IN MEMORY, over the plain text of
    * each text container (reusing the same `getPageRaw` fetch as the other read
    * tools) — no server search endpoint, no whole-document round-trip through the
-   * model. Returns `{ total, truncated, matches }`; each match carries a ref the
-   * agent can hand straight to get_node/patch_node or a comment anchor, plus the
-   * top-level block index and a short context window to build a unique selection.
-   * The pure engine (`searchInDoc`) owns the traversal, glue, ReDoS guards and
-   * the empty-query / invalid-regex errors.
+   * model. Returns `{ total, truncated, matches }`; each match carries a ref for
+   * get_node/patch_node (the `#<index>` form resolves with get_node but NOT
+   * patch_node — see SearchMatch.nodeId), plus the top-level block index and a
+   * short context window used to build a unique text `selection` for
+   * create_comment (create_comment has no nodeId param). The pure engine
+   * (`searchInDoc`) owns the traversal, glue, the RE2 ReDoS-safe regex engine
+   * and the empty-query / invalid-or-unsupported-regex errors.
    */
   async searchInPage(pageId: string, query: string, opts: SearchOptions = {}) {
     await this.ensureAuthenticated();
