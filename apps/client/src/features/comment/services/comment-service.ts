@@ -3,6 +3,7 @@ import {
   ICommentParams,
   IComment,
   IResolveComment,
+  ISuggestionOutcome,
 } from "@/features/comment/types/comment.types";
 import { IPagination } from "@/lib/types.ts";
 
@@ -18,10 +19,21 @@ export async function resolveComment(data: IResolveComment): Promise<IComment> {
   return req.data;
 }
 
-export async function applySuggestion(commentId: string): Promise<IComment> {
+export async function applySuggestion(
+  commentId: string,
+): Promise<ISuggestionOutcome> {
   // Mirrors resolveComment: let axios reject on non-2xx so the mutation can read
   // the 409 body (`{ message, currentText }`) off err.response.data.
   const req = await api.post("/comments/apply-suggestion", { commentId });
+  return req.data.data ?? req.data;
+}
+
+export async function dismissSuggestion(
+  commentId: string,
+): Promise<ISuggestionOutcome> {
+  // Dismiss ("Не применять") a suggested edit (#329): the server hard-deletes
+  // the comment (or resolves it when it has replies) and returns the outcome.
+  const req = await api.post("/comments/dismiss-suggestion", { commentId });
   return req.data.data ?? req.data;
 }
 

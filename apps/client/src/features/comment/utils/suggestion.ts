@@ -115,3 +115,25 @@ export function computeSuggestionDiff(
 
   return { old: oldSegments, new: newSegments };
 }
+
+// Whether the suggested-edit (#329) "Не применять" (Dismiss) button should be
+// shown. Dismiss does NOT change the page text (so it needs only canComment, not
+// canEdit), BUT a childless dismiss IRREVERSIBLY hard-deletes the comment, so the
+// server gates it on comment-owner-OR-space-admin (#338 F5). The button must
+// mirror that authz or a non-owner non-admin sees a live Dismiss that always
+// 403s → red error. Hence isOwnerOrAdmin is required IN ADDITION to canComment.
+// Same not-applied/not-resolved/top-level conditions as Apply.
+export function canShowDismiss(
+  comment: IComment,
+  canComment?: boolean,
+  isOwnerOrAdmin?: boolean,
+): boolean {
+  return Boolean(
+    canComment &&
+      isOwnerOrAdmin &&
+      comment.suggestedText &&
+      !comment.suggestionAppliedAt &&
+      !comment.resolvedAt &&
+      !comment.parentCommentId,
+  );
+}

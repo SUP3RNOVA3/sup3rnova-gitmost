@@ -52,6 +52,7 @@ export const AuditEvent = {
   COMMENT_RESOLVED: 'comment.resolved',
   COMMENT_REOPENED: 'comment.reopened',
   COMMENT_SUGGESTION_APPLIED: 'comment.suggestion_applied',
+  COMMENT_SUGGESTION_DISMISSED: 'comment.suggestion_dismissed',
 
   // Page
   PAGE_CREATED: 'page.created',

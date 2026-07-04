@@ -130,3 +130,59 @@ describe('CollaborationHandler.applyCommentSuggestion', () => {
     expect(value).toBe(42);
   });
 });
+
+describe('CollaborationHandler.deleteCommentMark', () => {
+  it('strips the comment mark for the given commentId (ephemeral suggestion #329)', async () => {
+    const doc = buildDocWithComment('Hello world', 'c1');
+    const { hocuspocus, connection } = fakeHocuspocus(doc);
+    const handler = new CollaborationHandler();
+    const handlers = handler.getHandlers(hocuspocus);
+
+    await handlers.deleteCommentMark('doc-1', { commentId: 'c1', user });
+
+    // The mark is gone; the text itself stays (deleting the anchor, not the run).
+    const xmlText = (
+      doc.getXmlFragment('default').get(0) as Y.XmlElement
+    ).get(0) as Y.XmlText;
+    expect(xmlText.toDelta()).toEqual([{ insert: 'Hello world' }]);
+    expect(connection.transact).toHaveBeenCalledTimes(1);
+    expect(connection.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes the removal through removeYjsMarkByAttribute with the right args', async () => {
+    const doc = buildDocWithComment('abc', 'c9');
+    const { hocuspocus } = fakeHocuspocus(doc);
+    const spy = jest.spyOn(yjsUtil, 'removeYjsMarkByAttribute');
+    const handler = new CollaborationHandler();
+    const handlers = handler.getHandlers(hocuspocus);
+
+    await handlers.deleteCommentMark('doc-1', { commentId: 'c9', user });
+
+    expect(spy).toHaveBeenCalledWith(
+      doc.getXmlFragment('default'),
+      'comment',
+      'commentId',
+      'c9',
+    );
+    spy.mockRestore();
+  });
+
+  it('leaves a different comment\'s mark intact', async () => {
+    const doc = buildDocWithComment('keep me', 'other');
+    const { hocuspocus } = fakeHocuspocus(doc);
+    const handler = new CollaborationHandler();
+    const handlers = handler.getHandlers(hocuspocus);
+
+    await handlers.deleteCommentMark('doc-1', { commentId: 'c1', user });
+
+    const xmlText = (
+      doc.getXmlFragment('default').get(0) as Y.XmlElement
+    ).get(0) as Y.XmlText;
+    expect(xmlText.toDelta()).toEqual([
+      {
+        insert: 'keep me',
+        attributes: { comment: { commentId: 'other', resolved: false } },
+      },
+    ]);
+  });
+});

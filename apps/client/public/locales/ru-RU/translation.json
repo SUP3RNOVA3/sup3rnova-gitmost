@@ -1245,5 +1245,8 @@
   "Applied": "Применено",
   "Suggestion applied": "Предложение применено",
   "Failed to apply suggestion": "Не удалось применить предложение",
-  "The commented text changed since this suggestion was made; it was not applied.": "Прокомментированный текст изменился после создания предложения; оно не было применено."
+  "The commented text changed since this suggestion was made; it was not applied.": "Прокомментированный текст изменился после создания предложения; оно не было применено.",
+  "Dismiss": "Не применять",
+  "Suggestion dismissed": "Предложение отклонено",
+  "Failed to dismiss suggestion": "Не удалось отклонить предложение"
 }

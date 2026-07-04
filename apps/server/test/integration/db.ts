@@ -230,6 +230,40 @@ export async function createPage(
   return { id: row.id as string };
 }
 
+export async function createComment(
+  db: Kysely<any>,
+  args: {
+    workspaceId: string;
+    spaceId: string;
+    pageId: string;
+    creatorId?: string | null;
+    parentCommentId?: string | null;
+    content?: unknown;
+    selection?: string | null;
+    suggestedText?: string | null;
+    type?: string | null;
+  },
+): Promise<{ id: string }> {
+  const id = randomUUID();
+  const row = await db
+    .insertInto('comments')
+    .values({
+      id,
+      workspaceId: args.workspaceId,
+      spaceId: args.spaceId,
+      pageId: args.pageId,
+      creatorId: args.creatorId ?? null,
+      parentCommentId: args.parentCommentId ?? null,
+      content: (args.content ?? null) as any,
+      selection: args.selection ?? null,
+      suggestedText: args.suggestedText ?? null,
+      type: args.type ?? 'page',
+    })
+    .returning(['id'])
+    .executeTakeFirstOrThrow();
+  return { id: row.id as string };
+}
+
 export async function createRole(
   db: Kysely<any>,
   args: {
