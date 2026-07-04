@@ -34,9 +34,16 @@ jobs:
         run: |
           set -euo pipefail
           MIG_DIR="apps/server/src/database/migrations"
-          git fetch --no-tags --depth=1 origin "$TARGET_BRANCH"
+          # checkout above already did fetch-depth:0 (full history). Fetch the base
+          # WITHOUT --depth (a shallow graft would truncate the base history and
+          # break the merge-base when the base has moved ahead of the PR merge —
+          # exactly the long-branch-vs-moving-base case this gate guards, #361).
+          git fetch --no-tags origin "$TARGET_BRANCH"
           newest_on_target=$(git ls-tree -r --name-only "origin/${TARGET_BRANCH}" "$MIG_DIR" | sort | tail -1)
-          added=$(git diff --diff-filter=A --name-only "origin/${TARGET_BRANCH}...HEAD" -- "$MIG_DIR" || true)
+          # NO `|| true`: a diff failure (e.g. an unresolved merge-base) must fail
+          # the job CLOSED — a gate whose job is to BLOCK must never pass on error.
+          # `set -e` above already aborts on a non-zero diff exit.
+          added=$(git diff --diff-filter=A --name-only "origin/${TARGET_BRANCH}...HEAD" -- "$MIG_DIR")
           bad=0
           for f in $added; do
             if [[ "$f" < "$newest_on_target" || "$f" == "$newest_on_target" ]]; then
