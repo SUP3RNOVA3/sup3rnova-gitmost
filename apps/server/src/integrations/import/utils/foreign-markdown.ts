@@ -74,10 +74,26 @@ function escapeFootnoteBody(body: string): string {
  * We split the line on inline-code spans (paired backtick runs) and rewrite only
  * the non-code segments.
  */
+// Above this length a single line is not split into inline-code spans (see
+// below). A genuine markdown line carrying a footnote reference is never tens of
+// KB; the cap only bypasses the inline-code protection for pathological lines.
+const INLINE_SPLIT_MAX_LINE = 8192;
+
 function rewriteRefsOutsideInlineCode(
   line: string,
   replace: (text: string) => string,
 ): string {
+  // The inline-code split alternation `(`+)(?:(?!\1)[\s\S])*\1` backtracks
+  // quadratically on a long UNCLOSED backtick run (its middle can consume the
+  // rest of the line, then fail to find a closing run and retry from each
+  // position). On an untrusted import this is a request-thread ReDoS. A real
+  // footnote line is short, so for an oversized line we skip the inline-code
+  // protection entirely and leave the line UNTOUCHED (rewriting it wholesale
+  // could corrupt a `[^id]` that legitimately lives inside inline code). This is
+  // a conservative bypass: an over-8KB line simply does not get its reference
+  // footnotes inlined — acceptable for a pathological input.
+  if (line.length > INLINE_SPLIT_MAX_LINE) return line;
+
   // Alternation: an inline-code span (one or more backticks, then anything up to
   // the SAME run of backticks) OR a run of non-backtick text. Unterminated
   // backticks fall through as ordinary text (matched by the second branch on the
@@ -161,6 +177,26 @@ function convertReferenceFootnotes(markdown: string): string {
     return markdown;
   }
 
+  // ONE precompiled alternation regex over ALL definition ids, built once per
+  // document (not once per definition per line). This makes pass 2 O(total text)
+  // instead of O(text × defs): a line with no reference pays a single failed
+  // scan, and the replacer looks the matched id up in `defs`. The previous
+  // per-def loop (`for (id) line.replace(new RegExp(...))`) was quadratic in the
+  // definition count — a modest upload with thousands of defs could freeze the
+  // request thread (and thus the whole instance, since import runs synchronously
+  // on it). The ids are escaped and joined; `defs` is the id→body lookup.
+  const refRe = new RegExp(
+    '\\[\\^(' + [...defs.keys()].map(escapeRegExp).join('|') + ')\\]',
+    'g',
+  );
+  const rewriteSegment = (segment: string): string =>
+    segment.replace(refRe, (whole, id: string) => {
+      const body = defs.get(id);
+      // A ref whose id is not a real definition should not be reachable (the
+      // alternation only contains real ids), but stay defensive: leave it as-is.
+      return body === undefined ? whole : `^[${escapeFootnoteBody(body)}]`;
+    });
+
   // Pass 2: rewrite in-text references, skipping fenced code and dropped lines.
   const out: string[] = [];
   inFence = false;
@@ -185,14 +221,7 @@ function convertReferenceFootnotes(markdown: string): string {
       continue;
     }
 
-    line = rewriteRefsOutsideInlineCode(line, (segment) => {
-      let s = segment;
-      for (const [id, body] of defs) {
-        const ref = new RegExp('\\[\\^' + escapeRegExp(id) + '\\]', 'g');
-        s = s.replace(ref, `^[${escapeFootnoteBody(body)}]`);
-      }
-      return s;
-    });
+    line = rewriteRefsOutsideInlineCode(line, rewriteSegment);
     out.push(line);
   }
 
@@ -200,12 +229,25 @@ function convertReferenceFootnotes(markdown: string): string {
 }
 
 /**
+ * Strip a single leading YAML front-matter block (`---\n…\n---`). Foreign files
+ * from Obsidian / Hugo / Jekyll / Notion — and Docmost's OWN git-sync page files
+ * — open with front-matter that the canonical parser does not consume, so
+ * without this it leaks into the body (and `title: Foo` above the closing `---`
+ * renders as a setext `<h2>` that `extractTitleAndRemoveHeading` can hijack as
+ * the page title). This mirrors the strip the retired `markdownToHtml` layer did
+ * (editor-ext marked.utils.ts). It is a no-op for front-matter-free input.
+ */
+const YAML_FRONT_MATTER_RE = /^\s*---[\s\S]*?---\s*/;
+
+/**
  * Normalize a foreign markdown string into Docmost's canonical markdown surface
- * so the strict canonical parser accepts it losslessly. Currently this rewrites
- * GFM reference footnotes into inline footnotes; add further fixture-driven
- * foreign-surface cases here as they are found.
+ * so the strict canonical parser accepts it losslessly: strip a leading YAML
+ * front-matter block, then rewrite GFM reference footnotes into inline
+ * footnotes. Add further fixture-driven foreign-surface cases here as they are
+ * found.
  */
 export function normalizeForeignMarkdown(markdown: string): string {
   if (!markdown) return markdown;
-  return convertReferenceFootnotes(markdown);
+  const withoutFrontMatter = markdown.replace(YAML_FRONT_MATTER_RE, '').trimStart();
+  return convertReferenceFootnotes(withoutFrontMatter);
 }

@@ -83,6 +83,49 @@ describe('normalizeForeignMarkdown — GFM reference footnotes', () => {
     const callouts = ':::info\nHi\n:::\n\n> [!warning]\n> Careful';
     expect(normalizeForeignMarkdown(callouts)).toBe(callouts);
   });
+
+  it('strips a leading YAML front-matter block (Obsidian/Hugo/git-sync files)', () => {
+    const out = normalizeForeignMarkdown(
+      '---\ntitle: My Page\ntags: [a, b]\n---\n\n# Heading\n\nBody.',
+    );
+    expect(out).toBe('# Heading\n\nBody.');
+    // The front-matter must not leak into the body as a setext heading.
+    expect(out).not.toContain('title: My Page');
+    expect(out).not.toContain('---');
+  });
+
+  it('does not strip a horizontal rule that is not leading front-matter', () => {
+    const md = 'Intro paragraph.\n\n---\n\nAfter the rule.';
+    expect(normalizeForeignMarkdown(md)).toBe(md);
+  });
+
+  it('is linear on a document with thousands of definitions (no quadratic blowup)', () => {
+    // F2(a): the pass-2 rewrite must be O(text), not O(text × defs). Build a
+    // pathological doc (many defs + many plain text lines) and assert it
+    // completes well under a second — a quadratic implementation took ~14s.
+    const N = 4000;
+    const refs = Array.from({ length: N }, (_, i) => `line ${i} plain text`).join('\n');
+    const defs = Array.from({ length: N }, (_, i) => `[^n${i}]: def ${i}`).join('\n');
+    const doc = `start[^n0] and[^n${N - 1}] end\n\n${refs}\n\n${defs}`;
+    const t0 = Date.now();
+    const out = normalizeForeignMarkdown(doc);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(2000);
+    // Sanity: the two real references were still inlined.
+    expect(out).toContain('^[def 0]');
+    expect(out).toContain(`^[def ${N - 1}]`);
+  });
+
+  it('is bounded on a long unclosed backtick run (no inline-split ReDoS)', () => {
+    // F2(b): a huge unterminated backtick run must not cause quadratic
+    // backtracking in the inline-code split. Oversized lines skip the split
+    // entirely (left untouched), so this returns promptly.
+    const line = 'x' + '`'.repeat(200000);
+    const doc = `${line}\n\n[^1]: def`;
+    const t0 = Date.now();
+    normalizeForeignMarkdown(doc);
+    expect(Date.now() - t0).toBeLessThan(2000);
+  });
 });
 
 describe('foreign markdown import acceptance (normalizer + canonical parser)', () => {
