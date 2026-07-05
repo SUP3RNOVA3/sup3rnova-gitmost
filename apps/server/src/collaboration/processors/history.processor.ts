@@ -71,57 +71,85 @@ export class HistoryProcessor extends WorkerHost implements OnModuleDestroy {
       let contributorIds: string[] = [];
       let snapshotWritten = false;
       let lastHistoryContent: unknown;
+      // #370 F8 — the contributor set popped from Redis (destructive SPOP) must be
+      // restored if the snapshot does not durably land. The inner try/catch only
+      // covers a throw INSIDE the callback; a COMMIT failure (connection drop,
+      // serialization/deadlock abort on commit — the transient class the epic
+      // already retries) throws OUTSIDE it, rolling the snapshot back while the
+      // pop is already gone. We track the popped set here and restore it in the
+      // outer catch so a BullMQ retry re-attributes the version. addContributors
+      // is an idempotent Redis SADD, so a double-restore is harmless.
+      let poppedForRestore: string[] = [];
 
-      await executeTx(this.db, async (trx) => {
-        const lockedPage = await this.pageRepo.findById(pageId, {
-          includeContent: true,
-          withLock: true,
-          trx,
-        });
-        if (!lockedPage) return;
-
-        const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
-          pageId,
-          { includeContent: true, trx },
-        );
-        lastHistoryContent = lastHistory?.content;
-
-        if (!lastHistory && isEmptyParagraphDoc(lockedPage.content as any)) {
-          this.logger.debug(
-            `Skipping first history for page ${pageId}: empty content`,
-          );
-          return;
-        }
-
-        if (
-          lastHistory &&
-          isDeepStrictEqual(lastHistory.content, lockedPage.content)
-        ) {
-          return; // already snapshotted at this content — nothing to write
-        }
-
-        contributorIds = await this.collabHistory.popContributors(pageId);
-        try {
-          await this.watcherService.addPageWatchers(
-            contributorIds,
-            pageId,
-            lockedPage.spaceId,
-            lockedPage.workspaceId,
-          );
-
-          // #370 — every job on this queue is a trailing idle-flush autosnapshot.
-          await this.pageHistoryRepo.saveHistory(lockedPage, {
-            contributorIds,
-            kind: job.data.kind ?? 'idle',
+      try {
+        await executeTx(this.db, async (trx) => {
+          const lockedPage = await this.pageRepo.findById(pageId, {
+            includeContent: true,
+            withLock: true,
             trx,
           });
-          snapshotWritten = true;
-          this.logger.debug(`History created for page: ${pageId}`);
-        } catch (err) {
-          await this.collabHistory.addContributors(pageId, contributorIds);
-          throw err;
+          if (!lockedPage) return;
+
+          const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
+            pageId,
+            { includeContent: true, trx },
+          );
+          lastHistoryContent = lastHistory?.content;
+
+          if (!lastHistory && isEmptyParagraphDoc(lockedPage.content as any)) {
+            this.logger.debug(
+              `Skipping first history for page ${pageId}: empty content`,
+            );
+            return;
+          }
+
+          if (
+            lastHistory &&
+            isDeepStrictEqual(lastHistory.content, lockedPage.content)
+          ) {
+            return; // already snapshotted at this content — nothing to write
+          }
+
+          contributorIds = await this.collabHistory.popContributors(pageId);
+          poppedForRestore = contributorIds;
+          try {
+            // Pass `trx` so the watcher insert's FK check (FOR KEY SHARE on
+            // pages[pageId]) runs on the SAME connection that already holds the
+            // FOR UPDATE lock from findById — otherwise it takes the FK lock on a
+            // separate pool connection and self-deadlocks against our own tx.
+            await this.watcherService.addPageWatchers(
+              contributorIds,
+              pageId,
+              lockedPage.spaceId,
+              lockedPage.workspaceId,
+              trx,
+            );
+
+            // #370 — every job on this queue is a trailing idle-flush autosnapshot.
+            await this.pageHistoryRepo.saveHistory(lockedPage, {
+              contributorIds,
+              kind: job.data.kind ?? 'idle',
+              trx,
+            });
+            snapshotWritten = true;
+            this.logger.debug(`History created for page: ${pageId}`);
+          } catch (err) {
+            await this.collabHistory.addContributors(pageId, contributorIds);
+            poppedForRestore = [];
+            throw err;
+          }
+        });
+      } catch (err) {
+        // A throw here means the tx did NOT commit (callback threw, or the commit
+        // itself failed and rolled back). If we popped contributors and the inner
+        // catch did not already restore them, restore now so the retry keeps
+        // attribution. snapshotWritten is irrelevant: it is set before commit, so
+        // it can be true even when the commit rolled the snapshot back.
+        if (poppedForRestore.length) {
+          await this.collabHistory.addContributors(pageId, poppedForRestore);
         }
-      });
+        throw err;
+      }
 
       // No snapshot written (page vanished / empty-first / unchanged content) →
       // clear the contributor set for the skip cases and stop.

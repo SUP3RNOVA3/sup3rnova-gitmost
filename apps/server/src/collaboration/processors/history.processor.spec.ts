@@ -136,16 +136,26 @@ describe('HistoryProcessor.process', () => {
     await proc.process(buildJob());
 
     expect(collabHistory.popContributors).toHaveBeenCalledWith(PAGE_ID);
+    // #370 F3/F9 — the snapshot decision runs under a page-row lock. Pin the lock
+    // structurally so a refactor that drops withLock/trx (silently reintroducing
+    // the TOCTOU double-insert) turns this red. The tx stub is { __trx: true }.
+    expect(pageRepo.findById).toHaveBeenCalledWith(
+      PAGE_ID,
+      expect.objectContaining({ withLock: true, trx: { __trx: true } }),
+    );
+    // #370 F7 — addPageWatchers MUST receive the trx, or its FK-check runs on a
+    // separate connection and self-deadlocks against our FOR UPDATE. Asserting
+    // the trx arg here is exactly what would have caught that regression.
     expect(watcherService.addPageWatchers).toHaveBeenCalledWith(
       ['u1', 'u2'],
       PAGE_ID,
       SPACE_ID,
       WORKSPACE_ID,
+      { __trx: true },
     );
     expect(pageHistoryRepo.saveHistory).toHaveBeenCalledWith(
       expect.objectContaining({ id: PAGE_ID }),
-      // #370 F3 — saveHistory now runs inside the locked tx, so it carries trx.
-      expect.objectContaining({ contributorIds: ['u1', 'u2'], kind: 'idle' }),
+      { contributorIds: ['u1', 'u2'], kind: 'idle', trx: { __trx: true } },
     );
     expect(generalQueue.add).toHaveBeenCalledWith(
       QueueJob.PAGE_BACKLINKS,
@@ -195,6 +205,48 @@ describe('HistoryProcessor.process', () => {
       'u1',
       'u2',
     ]);
+  });
+
+  it('COMMIT failure (throw outside the tx callback) → contributors RESTORED', async () => {
+    // #370 F8 — a commit-time failure throws OUTSIDE the callback, so the inner
+    // try/catch does not run; the outer catch must restore the popped set (else a
+    // BullMQ retry writes an unattributed version). Use a db whose execute() runs
+    // the callback THEN throws, simulating a commit abort.
+    pageHistoryRepo.findPageLastHistory.mockResolvedValue({
+      content: { type: 'doc', content: [] },
+    });
+    const commitFail = {
+      transaction: () => ({
+        execute: async (fn: (trx: any) => Promise<any>) => {
+          await fn({ __trx: true }); // callback succeeds (saveHistory ok)
+          throw new Error('commit aborted'); // ...but the COMMIT fails
+        },
+      }),
+    };
+    const procCommitFail = new HistoryProcessor(
+      pageHistoryRepo as any,
+      pageRepo as any,
+      collabHistory as any,
+      watcherService as any,
+      commitFail as any,
+      notificationQueue as any,
+      generalQueue as any,
+    );
+    jest
+      .spyOn(procCommitFail['logger'], 'error')
+      .mockImplementation(() => undefined);
+
+    await expect(procCommitFail.process(buildJob())).rejects.toThrow(
+      'commit aborted',
+    );
+    // The inner catch did NOT run (save succeeded), so only the outer catch can
+    // restore — assert it did.
+    expect(collabHistory.addContributors).toHaveBeenCalledWith(PAGE_ID, [
+      'u1',
+      'u2',
+    ]);
+    // And the post-snapshot queue work must NOT have run (we rethrew).
+    expect(generalQueue.add).not.toHaveBeenCalled();
   });
 
   it('backlinks + notification queue failures are swallowed (history still committed)', async () => {
