@@ -214,6 +214,12 @@ Run from the repo root unless noted. The dev workflow needs **Postgres (with the
 > server, `APP_SECRET` mismatch between processes, a stale `editor-ext` white-
 > screening the client, LAN exposure. See **[docs/dev-stand.md](docs/dev-stand.md)**
 > for the step-by-step and the traps.
+>
+> **Testing the app against a stand** (browser E2E + out-of-band verification) has
+> its own non-obvious traps — the page has two ProseMirror editors (only the body is
+> collab-bound), a ~10s store debounce, and API-seeding the thing under test is a
+> silent no-test. See **[docs/how-to-test.md](docs/how-to-test.md)** before writing
+> UI tests.
 
 ```bash
 pnpm install                 # install all workspaces (uses pnpm patches; see package.json `pnpm.patchedDependencies`)
