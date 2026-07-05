@@ -1,5 +1,5 @@
 import { readFileSync } from 'fs';
-import { streamText } from 'ai';
+import { streamText, Output } from 'ai';
 import { MockLanguageModelV3, simulateReadableStream } from 'ai/test';
 
 /**
@@ -78,6 +78,38 @@ describe('ai@6.0.134 pnpm patch: no partialOutput accumulation without an output
     // cumulative snapshots are being produced (and thus none can pile up in
     // the leftover internal tee branch).
     expect(partials).toEqual([]);
+  });
+
+  it('preserves cumulative partialOutput when the caller DOES request an output strategy', async () => {
+    // PRESERVE-BRANCH GUARD: the patch only short-circuits partialOutput when
+    // `output == null`. When an output strategy IS set (here Output.text()),
+    // createOutputTransformStream must fall through to the ORIGINAL code path
+    // and keep publishing cumulative snapshots, so object/text-output consumers
+    // behave byte-identically to unpatched ai. A careless re-port that routed
+    // output-set calls into the skip branch would leave partialOutput empty and
+    // silently break those consumers — this test is the tripwire for that.
+    const result = streamText({
+      model: makeModel(),
+      prompt: 'hi',
+      experimental_output: Output.text(),
+    });
+
+    // Drain the primary stream fully and accumulate the complete output text.
+    let fullText = '';
+    for await (const delta of result.textStream) {
+      fullText += delta;
+    }
+
+    const partials: string[] = [];
+    for await (const partial of result.experimental_partialOutputStream) {
+      partials.push(partial);
+    }
+
+    // With a strategy set, partialOutput must be PRESERVED (non-empty) and
+    // cumulative: the last emitted partial equals the full accumulated text.
+    expect(partials.length).toBeGreaterThan(0);
+    expect(partials[partials.length - 1]).toBe(fullText);
+    expect(fullText).toBe('Hello, world!');
   });
 
   it('both installed dist builds (CJS and ESM) carry the patch marker', () => {
