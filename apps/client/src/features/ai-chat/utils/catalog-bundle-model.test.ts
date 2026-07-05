@@ -1,9 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  bundleCounts,
   bundlePhase,
   installedLangForRole,
   mapBundleRolesToView,
   mapCatalogRoleToView,
+  nameConflictSlugs,
+  partialOffersRename,
   type CatalogViewRole,
 } from "./catalog-bundle-model.ts";
 import type {
@@ -82,8 +85,50 @@ describe("bundlePhase", () => {
     expect(bundlePhase([viewRole("import"), viewRole("update")])).toBe("mixed");
   });
 
-  it("transient skipped roles are ignored (counted as neither) -> allInstalled", () => {
-    expect(bundlePhase([viewRole("skipped")])).toBe("allInstalled");
+  it("a skipped role with nothing installed -> mixed (NOT allInstalled)", () => {
+    // F1: a bundle whose only non-installed role was skipped has 0 installed for
+    // it, so the collapsed 'All installed · up to date' header would contradict
+    // the open 'Installed 0 · 1 skipped' plaque. It must be mixed until resolved.
+    expect(bundlePhase([viewRole("skipped")])).toBe("mixed");
+  });
+
+  it("installed + a skipped role -> mixed (partial success is not allInstalled)", () => {
+    expect(bundlePhase([viewRole("installed"), viewRole("skipped")])).toBe(
+      "mixed",
+    );
+  });
+});
+
+describe("bundleCounts", () => {
+  it("tallies each status once", () => {
+    expect(
+      bundleCounts([
+        viewRole("import"),
+        viewRole("import"),
+        viewRole("installed"),
+        viewRole("update"),
+        viewRole("skipped"),
+      ]),
+    ).toEqual({ importable: 2, installed: 1, update: 1, skipped: 1 });
+  });
+});
+
+describe("nameConflictSlugs / partialOffersRename (reason -> action)", () => {
+  it("only name-conflict skips become the transient overlay / offer rename", () => {
+    const skipped = [
+      { slug: "writer", name: "Writer", reason: "name-conflict" as const },
+      { slug: "editor", name: "Editor", reason: "already-installed" as const },
+    ];
+    expect(nameConflictSlugs(skipped)).toEqual(["writer"]);
+    expect(partialOffersRename(skipped)).toBe(true);
+  });
+
+  it("an already-installed-only skip is informational: no overlay, no rename", () => {
+    const skipped = [
+      { slug: "editor", name: "Editor", reason: "already-installed" as const },
+    ];
+    expect(nameConflictSlugs(skipped)).toEqual([]);
+    expect(partialOffersRename(skipped)).toBe(false);
   });
 });
 

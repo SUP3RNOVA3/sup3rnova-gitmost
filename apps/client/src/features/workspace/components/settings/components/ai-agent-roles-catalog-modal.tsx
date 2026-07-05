@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Accordion,
   Alert,
@@ -33,9 +33,12 @@ import {
 } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import { IAiRole } from "@/features/ai-chat/types/ai-chat.types.ts";
 import {
+  bundleCounts,
   bundlePhase,
   CatalogViewRole,
   mapBundleRolesToView,
+  nameConflictSlugs,
+  partialOffersRename,
   RoleStatus,
 } from "@/features/ai-chat/utils/catalog-bundle-model.ts";
 
@@ -290,15 +293,14 @@ export default function AiAgentRolesCatalogModal({
         slugs,
         conflict: "skip",
       });
-      // Only name conflicts get a "Rename & install"; already-installed skips
-      // are just informational (they can happen on a concurrent import race).
-      const nameConflicts = res.skippedRoles.filter(
-        (s) => s.reason === "name-conflict",
-      );
-      if (nameConflicts.length > 0) {
+      // Only name conflicts become a transient `skipped` overlay (renameable);
+      // an already-installed race has nothing to act on. Decision lives in the
+      // pure, unit-tested nameConflictSlugs helper.
+      const conflictSlugs = nameConflictSlugs(res.skippedRoles);
+      if (conflictSlugs.length > 0) {
         setSkipped((prev) => {
           const set = new Set(prev[b.id] ?? []);
-          nameConflicts.forEach((s) => set.add(s.slug));
+          conflictSlugs.forEach((slug) => set.add(slug));
           return { ...prev, [b.id]: set };
         });
       }
@@ -610,11 +612,11 @@ function BundlePanel({
 }: BundlePanelProps) {
   const { t } = useTranslation();
 
+  // Single tally pass shared by the summary and the primary action (F4).
+  const counts = bundleCounts(b.roles);
   const impCount = importableCount;
-  const upCount = b.roles.filter((r) => r.status === "update").length;
-  const installedCount = b.roles.filter(
-    (r) => r.status === "installed",
-  ).length;
+  const upCount = counts.update;
+  const installedCount = counts.installed;
   const busy = busyBundle === b.id || busyBundle === GLOBAL_SCOPE;
   const phase = bundlePhase(b.roles);
 
@@ -952,7 +954,10 @@ function ResultBanner({
   // name-conflict skip; an already-installed race is informational (re-importing
   // the same slug+language would just skip again, so no button — otherwise the
   // click self-heals into a false "installed" with nothing actually installed).
-  const nameConflict = result.skipped.find((s) => s.reason === "name-conflict");
+  const offersRename = partialOffersRename(result.skipped);
+  const nameConflict = offersRename
+    ? result.skipped.find((s) => s.reason === "name-conflict")
+    : undefined;
   const detail = nameConflict
     ? t('A role named "{{name}}" already exists in this workspace.', {
         name: nameConflict.name,

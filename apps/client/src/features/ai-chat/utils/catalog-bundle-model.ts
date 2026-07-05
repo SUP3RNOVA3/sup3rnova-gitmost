@@ -52,11 +52,9 @@ export interface CatalogViewRole {
  * the collapsed-header summary and the bundle's single primary action.
  *  - `empty`        — the bundle has no roles.
  *  - `allNew`       — everything is importable, nothing installed.
- *  - `allInstalled` — nothing to import and nothing to update.
+ *  - `allInstalled` — everything installed & up to date; nothing else pending.
  *  - `updates`      — updates available and nothing left to import.
  *  - `mixed`        — any other combination.
- * Transient `skipped` roles are ignored (they count as neither import, installed
- * nor update), so a post-import conflict does not distort the header summary.
  */
 export type BundlePhase =
   | "empty"
@@ -65,15 +63,73 @@ export type BundlePhase =
   | "updates"
   | "mixed";
 
+/** Per-status tallies for a bundle's roles (the single source of truth). */
+export interface BundleCounts {
+  importable: number;
+  installed: number;
+  update: number;
+  skipped: number;
+}
+
+/**
+ * Count a bundle's roles by status ONCE. Both `bundlePhase` and the panel derive
+ * from this, so the tally logic lives in exactly one place (no rescans / drift).
+ */
+export function bundleCounts(roles: CatalogViewRole[]): BundleCounts {
+  const counts: BundleCounts = {
+    importable: 0,
+    installed: 0,
+    update: 0,
+    skipped: 0,
+  };
+  for (const r of roles) {
+    if (r.status === "import") counts.importable += 1;
+    else if (r.status === "installed") counts.installed += 1;
+    else if (r.status === "update") counts.update += 1;
+    else if (r.status === "skipped") counts.skipped += 1;
+  }
+  return counts;
+}
+
 export function bundlePhase(roles: CatalogViewRole[]): BundlePhase {
   if (roles.length === 0) return "empty";
-  const imp = roles.filter((r) => r.status === "import").length;
-  const ups = roles.filter((r) => r.status === "update").length;
-  const installed = roles.filter((r) => r.status === "installed").length;
-  if (imp === 0 && ups === 0) return "allInstalled";
-  if (ups > 0 && imp === 0) return "updates";
-  if (imp > 0 && installed === 0 && ups === 0) return "allNew";
+  const { importable, installed, update, skipped } = bundleCounts(roles);
+  // A `skipped` role is a pending post-import conflict (0 installed for it), so a
+  // bundle that has ANY skipped role is NOT "all installed & up to date" — that
+  // would make the collapsed green "up to date" header contradict the open
+  // panel's "Installed 0 · 1 skipped" plaque. It is `mixed` until resolved.
+  if (importable === 0 && update === 0 && skipped === 0) return "allInstalled";
+  if (update > 0 && importable === 0 && skipped === 0) return "updates";
+  if (importable > 0 && installed === 0 && update === 0 && skipped === 0)
+    return "allNew";
   return "mixed";
+}
+
+/**
+ * The subset of a skip result that should be shown as a TRANSIENT `skipped`
+ * overlay in the bundle (so the row offers a re-import path). Only NAME-CONFLICT
+ * skips qualify: an `already-installed` skip (a concurrent-import race) has
+ * nothing to act on — re-importing the same slug would just skip again — so it
+ * must NOT be overlaid (else the row shows a misleading "Rename & install" that
+ * self-heals into a false "installed"). Pure so both reason branches are tested.
+ */
+export function nameConflictSlugs(
+  skipped: { slug: string; reason: "name-conflict" | "already-installed" }[],
+): string[] {
+  return skipped
+    .filter((s) => s.reason === "name-conflict")
+    .map((s) => s.slug);
+}
+
+/**
+ * Whether a partial-import result should offer the "Rename & install" action:
+ * only when at least one skip is a name conflict (renameable). An
+ * `already-installed`-only partial is informational.
+ */
+export function partialOffersRename(
+  skipped: { reason: "name-conflict" | "already-installed" }[],
+): boolean {
+  return skipped.some((s) => s.reason === "name-conflict");
 }
 
 /**
