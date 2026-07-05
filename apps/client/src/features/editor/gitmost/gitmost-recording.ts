@@ -240,23 +240,57 @@ export async function gitmostUploadFileToEditor(
   }
 }
 
+// Zero-width space (U+200B). Prepended to a transcript line that begins with a
+// markdown BLOCK trigger: it is invisible in the rendered doc but shifts the
+// trigger off column 0, so the git-sync doc->markdown->doc round-trip keeps the
+// line a plain paragraph (see GITMOST_MD_BLOCK_TRIGGER_RE).
+const GITMOST_ZWSP = "​";
+
+// A markdown BLOCK-level construct that, sitting at column 0 of a paragraph
+// line, the git-sync markdown serializer (packages/prosemirror-markdown
+// markdown-converter.ts, `case "paragraph"`) would re-parse into a NON-paragraph
+// block on the doc->markdown->doc cycle. That serializer emits paragraph text
+// verbatim with NO block-escape (the pre-existing root cause), so a leading
+// `#`/`-`/`*`/`+`/`>`, an ordered-list `N.`/`N)`, a code fence ```/~~~, a table
+// `|`, or a `> [!info]` callout opener would silently become a heading / list /
+// quote / code block / table / callout. This matches a TRIMMED line's start;
+// the transcript's own `You:` / `Speaker N:` prefix begins with a letter and
+// never matches, so prefixed lines are left byte-exact.
+const GITMOST_MD_BLOCK_TRIGGER_RE =
+  /^(#{1,6}(\s|$)|[-*+](\s|$)|>|\d+[.)](\s|$)|```|~~~|\|)/;
+
 // Append a transcript block BELOW the recording's audio node in a live editor:
 // a "Transcript" heading followed by one paragraph per non-empty transcript
 // line. The transcript is plain text, `\n`-separated, each line already
-// formatted as `You: ...` / `Speaker N: ...` by the native host — lines are
-// inserted VERBATIM as text nodes (never HTML), so there is no injection
-// surface. This is best-effort and meant to run AFTER the audio has already
-// been inserted; the caller must guard against a throw so a transcript failure
-// never fails the (already successful) recording. Returns true when a block was
-// inserted, false when there was nothing to insert (transcript undefined/empty/
-// not-a-string). A non-string value is a no-op, not an error.
+// formatted as `You: ...` / `Speaker N: ...` by the native host — line text is
+// inserted as a TEXT node (never HTML/markdown), so there is no injection or
+// mark-parsing surface. Each kept line is trimmed (drops an indent that would
+// both leak into the display and, at col 0, form a markdown block trigger) and,
+// if it still begins with a col-0 markdown block trigger, gets an invisible
+// zero-width space prepended so the git-sync round-trip cannot turn it into a
+// list/quote/heading/callout/code/table (defensive boundary against the
+// serializer's missing block-escape). This is best-effort and meant to run
+// AFTER the audio has already been inserted; the caller must guard against a
+// throw so a transcript failure never fails the (already successful) recording.
+// Returns true when a block was inserted, false when there was nothing to
+// insert (transcript undefined/empty/not-a-string). A non-string value is a
+// no-op, not an error.
 export function gitmostInsertTranscriptIntoEditor(
   editor: Editor,
   transcript: unknown,
 ): boolean {
   if (typeof transcript !== "string") return false;
-  // Keep each line's text verbatim; only drop blank (whitespace-only) lines.
-  const lines = transcript.split("\n").filter((line) => line.trim().length > 0);
+  const lines = transcript
+    .split("\n")
+    // Trim each line and drop blank (whitespace-only) ones.
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    // Neutralize a col-0 markdown block trigger with an invisible ZWSP so the
+    // git-sync round-trip keeps the line a paragraph. Host lines (`You:` /
+    // `Speaker N:`) never match and stay byte-exact.
+    .map((line) =>
+      GITMOST_MD_BLOCK_TRIGGER_RE.test(line) ? GITMOST_ZWSP + line : line,
+    );
   if (lines.length === 0) return false;
 
   const content = [
