@@ -43,7 +43,6 @@ import {
   Column,
   Status,
   addUniqueIdsToDoc,
-  htmlToMarkdown,
   TransclusionSource,
   TransclusionReference,
   FootnoteReference,
@@ -51,6 +50,7 @@ import {
   FootnoteDefinition,
   PageEmbed,
 } from '@docmost/editor-ext';
+import { convertProseMirrorToMarkdown } from '@docmost/prosemirror-markdown';
 import { generateText, getSchema, JSONContent } from '@tiptap/core';
 import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
 // @tiptap/html library works best for generating prosemirror json state but not HTML
@@ -239,6 +239,10 @@ export function prosemirrorNodeToYElement(node: any): Y.XmlElement | Y.XmlText {
 }
 
 export function jsonToMarkdown(tiptapJson: any): string {
-  const html = jsonToHtml(tiptapJson);
-  return htmlToMarkdown(html);
+  // Direct ProseMirror JSON -> Markdown via the canonical converter
+  // (`@docmost/prosemirror-markdown`) — no HTML intermediate, no second
+  // editor-ext markdown layer. Same serializer as the page/space export and the
+  // git-sync vault writer, so every server PM->MD path emits identical canonical
+  // markdown (issue #345).
+  return convertProseMirrorToMarkdown(tiptapJson);
 }
