@@ -131,5 +131,14 @@ const { Client } = require("pg");
 7. **Migrations don't auto-run in dev** — run `migration:latest` after every pull
    or branch switch.
 
+8. **Automation (Playwright): type into the BODY editor, not the title.** A page has
+   two `.ProseMirror` editors — `[aria-label='Page title']` (non-collab) and
+   `[aria-label='Page content']` (the collab body). `document.querySelector('.ProseMirror')`
+   returns the TITLE editor, so typing there never changes body content and `mod+S`
+   versions nothing. Target `[aria-label='Page content']`, confirm it's collab-bound
+   (`el.editor.extensionManager.extensions.some(e=>e.name==='collaboration')`), and
+   wait ~10-12s for the store debounce before asserting `pages.content` changed. Full
+   testing methodology + traps: **[how-to-test.md](how-to-test.md)**.
+
 See also the **Commands** and **Architecture → Two server processes** sections in
 [`AGENTS.md`](../AGENTS.md).
