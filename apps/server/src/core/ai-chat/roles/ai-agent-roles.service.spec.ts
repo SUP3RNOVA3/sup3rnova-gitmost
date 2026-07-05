@@ -610,6 +610,63 @@ describe('AiAgentRolesService guards', () => {
       expect(repo.insert.mock.calls[0][0].name).toBe('Researcher (2)');
     });
 
+    it('createdRoles lists the installed role (no renamedTo when not renamed)', async () => {
+      const { service } = makeImportService({});
+      const res = await service.importFromCatalog('ws-1', 'u1', dto());
+      expect(res.createdRoles).toEqual([
+        { slug: 'researcher', name: 'Researcher' },
+      ]);
+      expect(res.skippedRoles).toEqual([]);
+    });
+
+    it('createdRoles carries renamedTo on a rename', async () => {
+      const existing = [makeRow({ id: 'r-x', name: 'Researcher' })];
+      const { service } = makeImportService({ existing });
+      const res = await service.importFromCatalog(
+        'ws-1',
+        'u1',
+        dto({ conflict: 'rename' }),
+      );
+      expect(res.createdRoles).toEqual([
+        { slug: 'researcher', name: 'Researcher', renamedTo: 'Researcher (2)' },
+      ]);
+      expect(res.skippedRoles).toEqual([]);
+    });
+
+    it('skippedRoles: already-installed slug carries reason "already-installed"', async () => {
+      const existing = [
+        makeRow({
+          id: 'r-existing',
+          name: 'Old researcher',
+          source: { slug: 'researcher', language: 'en', version: 1 } as never,
+        }),
+      ];
+      const { service } = makeImportService({ existing });
+      const res = await service.importFromCatalog('ws-1', 'u1', dto());
+      expect(res.skippedRoles).toEqual([
+        {
+          slug: 'researcher',
+          name: 'Researcher',
+          reason: 'already-installed',
+        },
+      ]);
+      expect(res.createdRoles).toEqual([]);
+    });
+
+    it('skippedRoles: a name collision under conflict:skip carries reason "name-conflict"', async () => {
+      const existing = [makeRow({ id: 'r-x', name: 'Researcher' })];
+      const { service } = makeImportService({ existing });
+      const res = await service.importFromCatalog(
+        'ws-1',
+        'u1',
+        dto({ conflict: 'skip' }),
+      );
+      expect(res.skippedRoles).toEqual([
+        { slug: 'researcher', name: 'Researcher', reason: 'name-conflict' },
+      ]);
+      expect(res.createdRoles).toEqual([]);
+    });
+
     it('dto.slugs filters; an unknown slug becomes an error entry', async () => {
       const { service, repo } = makeImportService({
         bundleRoles: [catalogRole()],
@@ -677,6 +734,15 @@ describe('AiAgentRolesService guards', () => {
       // 'a' converged on the concurrent install (skip); 'b' imported; no errors.
       expect(res).toMatchObject({ created: 1, skipped: 1, renamed: 0 });
       expect(res.errors).toEqual([]);
+      // The per-role list records 'a' as an already-installed skip (the UI reads
+      // skippedRoles, not the counter, to render its plaque — assert the array,
+      // not just the count).
+      expect(res.skippedRoles).toContainEqual({
+        slug: 'a',
+        name: 'A',
+        reason: 'already-installed',
+      });
+      expect(res.createdRoles.map((r) => r.slug)).toEqual(['b']);
       // Both inserts were attempted (the batch did not abort on the 23505).
       expect(repo.insert).toHaveBeenCalledTimes(2);
     });
