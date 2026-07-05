@@ -1,4 +1,11 @@
-import { Text, Group, UnstyledButton, Avatar, Tooltip } from "@mantine/core";
+import {
+  Text,
+  Group,
+  UnstyledButton,
+  Avatar,
+  Tooltip,
+  Badge,
+} from "@mantine/core";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
 import { formattedDate } from "@/lib/time";
@@ -7,9 +14,29 @@ import clsx from "clsx";
 import { IPageHistory } from "@/features/page-history/types/page.types";
 import { memo, useCallback } from "react";
 import { useSetAtom } from "jotai";
+import { useTranslation } from "react-i18next";
 import { historyAtoms } from "@/features/page-history/atoms/history-atoms.ts";
 
 const MAX_VISIBLE_AVATARS = 5;
+
+/**
+ * #370 — map a snapshot's intentionality tier to its badge. `version: true`
+ * marks the intentional points (manual / agent); autosaves (boundary / idle /
+ * legacy null) are non-versions and get dimmed in the list.
+ */
+type HistoryKindMeta = { labelKey: string; color: string; version: boolean };
+export function historyKindMeta(kind?: string | null): HistoryKindMeta {
+  switch (kind) {
+    case "manual":
+      return { labelKey: "Saved", color: "blue", version: true };
+    case "agent":
+      return { labelKey: "Agent version", color: "violet", version: true };
+    case "boundary":
+      return { labelKey: "Boundary", color: "gray", version: false };
+    default: // "idle" | null | undefined (legacy autosave)
+      return { labelKey: "Autosave", color: "gray", version: false };
+  }
+}
 
 interface HistoryItemProps {
   historyItem: IPageHistory;
@@ -29,6 +56,8 @@ const HistoryItem = memo(function HistoryItem({
   isActive,
 }: HistoryItemProps) {
   const setHistoryModalOpen = useSetAtom(historyAtoms);
+  const { t } = useTranslation();
+  const kindMeta = historyKindMeta(historyItem.kind);
 
   const handleClick = useCallback(() => {
     onSelect(historyItem.id, index);
@@ -49,8 +78,20 @@ const HistoryItem = memo(function HistoryItem({
       onMouseEnter={handleMouseEnter}
       onMouseLeave={onHoverEnd}
       className={clsx(classes.history, { [classes.active]: isActive })}
+      // #370 — dim autosnapshots so intentional versions stand out.
+      style={{ opacity: kindMeta.version ? 1 : 0.55 }}
     >
-      <Text size="sm">{formattedDate(new Date(historyItem.createdAt))}</Text>
+      <Group gap={6} wrap="nowrap" justify="space-between">
+        <Text size="sm">{formattedDate(new Date(historyItem.createdAt))}</Text>
+        <Badge
+          size="xs"
+          radius="sm"
+          variant={kindMeta.version ? "filled" : "light"}
+          color={kindMeta.color}
+        >
+          {t(kindMeta.labelKey)}
+        </Badge>
+      </Group>
 
       <Group gap={6} wrap="nowrap" mt={4}>
         {hasContributors ? (

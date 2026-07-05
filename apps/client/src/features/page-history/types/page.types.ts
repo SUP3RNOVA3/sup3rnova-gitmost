@@ -24,6 +24,10 @@ export interface IPageHistory {
   updatedAt: string;
   lastUpdatedBy: IPageHistoryUser;
   contributors?: IPageHistoryUser[];
+  // #370 — intentionality tier: 'manual'/'agent' are versions (intentional
+  // points), 'idle'/'boundary' are autosnapshots; null/undefined = legacy
+  // autosave. Derived server-side, drives the history badge + "versions" filter.
+  kind?: "manual" | "agent" | "idle" | "boundary" | null;
   // Provenance markers copied off the page row when the snapshot was saved.
   // `'agent'` marks a version written by the AI agent; `lastUpdatedAiChatId`
   // (when present) deep-links to the chat that produced the edit.

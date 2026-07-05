@@ -1418,5 +1418,14 @@
   "The commented text changed since this suggestion was made; it was not applied.": "The commented text changed since this suggestion was made; it was not applied.",
   "Dismiss": "Dismiss",
   "Suggestion dismissed": "Suggestion dismissed",
-  "Failed to dismiss suggestion": "Failed to dismiss suggestion"
+  "Failed to dismiss suggestion": "Failed to dismiss suggestion",
+  "Save version": "Save version",
+  "Ctrl+S": "Ctrl+S",
+  "Version saved": "Version saved",
+  "Already saved as the latest version": "Already saved as the latest version",
+  "Agent version": "Agent version",
+  "Boundary": "Boundary",
+  "Autosave": "Autosave",
+  "Only versions": "Only versions",
+  "No saved versions yet.": "No saved versions yet."
 }

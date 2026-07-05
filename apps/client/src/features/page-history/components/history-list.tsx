@@ -9,7 +9,7 @@ import {
   historyAtoms,
 } from "@/features/page-history/atoms/history-atoms";
 import { useAtom, useSetAtom } from "jotai";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   ScrollArea,
@@ -17,6 +17,8 @@ import {
   Divider,
   Loader,
   Center,
+  Switch,
+  Text,
 } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { useHistoryRestore } from "@/features/page-history/hooks";
@@ -45,6 +47,28 @@ function HistoryList({ pageId }: Props) {
   const historyItems = useMemo(
     () => pageHistoryData?.pages.flatMap((page) => page.items) ?? [],
     [pageHistoryData],
+  );
+
+  // #370 — "only versions" filter: hide autosnapshots (idle/boundary/legacy
+  // null), keep only intentional points (manual/agent). Filtering is over the
+  // already-loaded pages; the diff/restore still targets the true previous
+  // snapshot, so items carry their index within the FULL list.
+  const [onlyVersions, setOnlyVersions] = useState(false);
+  const isVersion = useCallback(
+    (kind?: string | null) => kind === "manual" || kind === "agent",
+    [],
+  );
+  const originalIndexById = useMemo(() => {
+    const map = new Map<string, number>();
+    historyItems.forEach((item, index) => map.set(item.id, index));
+    return map;
+  }, [historyItems]);
+  const visibleItems = useMemo(
+    () =>
+      onlyVersions
+        ? historyItems.filter((item) => isVersion(item.kind))
+        : historyItems,
+    [historyItems, onlyVersions, isVersion],
   );
 
   const loadMoreRef = useRef<HTMLDivElement>(null);
@@ -128,12 +152,30 @@ function HistoryList({ pageId }: Props) {
 
   return (
     <div>
+      <Group px="xs" py={6} justify="flex-end">
+        <Switch
+          size="xs"
+          checked={onlyVersions}
+          onChange={(e) => setOnlyVersions(e.currentTarget.checked)}
+          label={t("Only versions")}
+        />
+      </Group>
+
       <ScrollArea h={620} w="100%" type="scroll" scrollbarSize={5}>
-        {historyItems.map((historyItem, index) => (
+        {onlyVersions && visibleItems.length === 0 && (
+          <Center py="md">
+            <Text size="sm" c="dimmed">
+              {t("No saved versions yet.")}
+            </Text>
+          </Center>
+        )}
+        {visibleItems.map((historyItem) => (
           <HistoryItem
             key={historyItem.id}
             historyItem={historyItem}
-            index={index}
+            // Index within the FULL list so diff/restore uses the true previous
+            // snapshot, not the previous visible one.
+            index={originalIndexById.get(historyItem.id) ?? 0}
             onSelect={handleSelect}
             onHover={handleHover}
             onHoverEnd={clearPrefetchTimeout}

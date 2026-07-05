@@ -134,7 +134,7 @@ describe('HistoryProcessor.process', () => {
     );
     expect(pageHistoryRepo.saveHistory).toHaveBeenCalledWith(
       expect.objectContaining({ id: PAGE_ID }),
-      { contributorIds: ['u1', 'u2'] },
+      { contributorIds: ['u1', 'u2'], kind: 'idle' },
     );
     expect(generalQueue.add).toHaveBeenCalledWith(
       QueueJob.PAGE_BACKLINKS,

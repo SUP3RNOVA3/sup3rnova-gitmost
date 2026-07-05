@@ -20,6 +20,10 @@ export interface IStripeSeatsSyncJob {
 
 export interface IPageHistoryJob {
   pageId: string;
+  // #370 — intentionality tier the worker stamps on the snapshot. All jobs on
+  // this queue are trailing idle-flush autosnapshots, so this is 'idle' (absent
+  // → treated as 'idle' by the processor).
+  kind?: 'idle';
 }
 
 /**

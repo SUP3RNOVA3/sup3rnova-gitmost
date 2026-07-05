@@ -40,11 +40,12 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
   let pageHistoryRepo: {
     saveHistory: jest.Mock;
     findPageLastHistory: jest.Mock;
+    updateHistoryKind: jest.Mock;
   };
   let aiQueue: { add: jest.Mock };
-  let historyQueue: { add: jest.Mock };
+  let historyQueue: { add: jest.Mock; remove: jest.Mock };
   let notificationQueue: { add: jest.Mock };
-  let collabHistory: { addContributors: jest.Mock };
+  let collabHistory: { addContributors: jest.Mock; popContributors: jest.Mock };
   let transclusionService: {
     syncPageTransclusions: jest.Mock;
     syncPageReferences: jest.Mock;
@@ -93,13 +94,22 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
     pageHistoryRepo = {
       saveHistory: jest.fn().mockImplementation(async () => {
         callOrder.push('saveHistory');
+        return { id: 'history-1' };
       }),
       findPageLastHistory: jest.fn().mockResolvedValue(null),
+      updateHistoryKind: jest.fn().mockResolvedValue(undefined),
     };
     aiQueue = { add: jest.fn().mockResolvedValue(undefined) };
-    historyQueue = { add: jest.fn().mockResolvedValue(undefined) };
+    historyQueue = {
+      add: jest.fn().mockResolvedValue(undefined),
+      // #370 — enqueuePageHistory now removes any pending idle job before re-adding.
+      remove: jest.fn().mockResolvedValue(undefined),
+    };
     notificationQueue = { add: jest.fn().mockResolvedValue(undefined) };
-    collabHistory = { addContributors: jest.fn().mockResolvedValue(undefined) };
+    collabHistory = {
+      addContributors: jest.fn().mockResolvedValue(undefined),
+      popContributors: jest.fn().mockResolvedValue([]),
+    };
     transclusionService = {
       syncPageTransclusions: jest.fn().mockResolvedValue(undefined),
       syncPageReferences: jest.fn().mockResolvedValue(undefined),
@@ -163,6 +173,50 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
     expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
     expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
     expect(pageRepo.updatePage.mock.calls[0][0].lastUpdatedSource).toBe('user');
+  });
+
+  // #370 review round-1 SUGGESTION: the boundary was GENERALIZED from a
+  // user→agent special-case to ANY lastUpdatedSource transition. These pin the
+  // generalized behaviour it was rebuilt for.
+  describe('generalized boundary — any source transition', () => {
+    // Same persisted page but with an explicit prior source.
+    const pageWithPriorSource = (prior: string | null) => ({
+      ...persistedHumanPage('NEW CONTENT'),
+      lastUpdatedSource: prior,
+    });
+
+    it('agent→user transition fires the boundary (pins the prior agent revision)', async () => {
+      const document = ydocFor(doc('NEW CONTENT'));
+      pageRepo.findById.mockResolvedValue(pageWithPriorSource('agent'));
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
+
+      await ext.onStoreDocument(buildData(document, 'user') as any);
+
+      expect(pageHistoryRepo.saveHistory).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['saveHistory', 'updatePage']);
+      expect(pageRepo.updatePage.mock.calls[0][0].lastUpdatedSource).toBe('user');
+    });
+
+    it('git→user transition fires the boundary (git-sync overwrite is a source change)', async () => {
+      const document = ydocFor(doc('NEW CONTENT'));
+      pageRepo.findById.mockResolvedValue(pageWithPriorSource('git'));
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
+
+      await ext.onStoreDocument(buildData(document, 'user') as any);
+
+      expect(pageHistoryRepo.saveHistory).toHaveBeenCalledTimes(1);
+      expect(callOrder).toEqual(['saveHistory', 'updatePage']);
+    });
+
+    it('a null prior source (first-ever edit) does NOT fire the boundary', async () => {
+      const document = ydocFor(doc('NEW CONTENT'));
+      pageRepo.findById.mockResolvedValue(pageWithPriorSource(null));
+
+      await ext.onStoreDocument(buildData(document, 'agent') as any);
+
+      expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
+      expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('idempotency: unchanged content → no updatePage, no history, no queues', async () => {
@@ -478,5 +532,126 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
     // Contributors keyed by the UUID so they match the PAGE_HISTORY job (page.id).
     expect(collabHistory.addContributors.mock.calls[0][0]).toBe(PAGE_ID);
+  });
+
+  // #370 — explicit save-version (Cmd+S / agent save tool) over the stateless
+  // seam. The tier is derived from the SIGNED connection actor, the store path
+  // is reused, and promote-not-dup avoids duplicating heavy content rows.
+  describe('save-version (#370)', () => {
+    const emitSave = (document: any, actor: 'user' | 'agent') =>
+      ext.onStateless({
+        connection: {
+          readOnly: false,
+          context: { user: { id: USER_ID, name: 'Alice' }, actor },
+        } as any,
+        documentName: `page.${PAGE_ID}`,
+        document: document as any,
+        payload: JSON.stringify({ type: 'save-version' }),
+      } as any);
+
+    // findById returns a page whose content already equals the live doc, so the
+    // store path is a no-op and we isolate the versioning decision.
+    const pageMatchingDoc = (document: any) => ({
+      ...persistedHumanPage('IGNORED'),
+      content: TiptapTransformer.fromYdoc(document, 'default'),
+    });
+
+    it('human save with no prior snapshot → writes a manual version + broadcasts', async () => {
+      const document = ydocFor(doc('VERSION ME'));
+      pageRepo.findById.mockResolvedValue(pageMatchingDoc(document));
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
+
+      await emitSave(document, 'user');
+
+      expect(pageHistoryRepo.saveHistory).toHaveBeenCalledTimes(1);
+      expect(pageHistoryRepo.saveHistory.mock.calls[0][1]).toEqual(
+        expect.objectContaining({ kind: 'manual' }),
+      );
+      // The pending idle autosnapshot is cancelled by the explicit version.
+      expect(historyQueue.remove).toHaveBeenCalledWith(PAGE_ID);
+      const msg = JSON.parse(
+        (document as any).broadcastStateless.mock.calls.at(-1)[0],
+      );
+      expect(msg).toMatchObject({
+        type: 'version.saved',
+        kind: 'manual',
+        alreadySaved: false,
+      });
+    });
+
+    it('agent save derives kind=agent from the signed actor', async () => {
+      const document = ydocFor(doc('AGENT VERSION'));
+      pageRepo.findById.mockResolvedValue(pageMatchingDoc(document));
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
+
+      await emitSave(document, 'agent');
+
+      expect(pageHistoryRepo.saveHistory.mock.calls.at(-1)[1]).toEqual(
+        expect.objectContaining({ kind: 'agent' }),
+      );
+    });
+
+    it('promote-not-dup: latest snapshot is an autosave with identical content → upgrades in place', async () => {
+      const document = ydocFor(doc('SAME'));
+      const page = pageMatchingDoc(document);
+      pageRepo.findById.mockResolvedValue(page);
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue({
+        id: 'auto-1',
+        content: page.content,
+        kind: 'idle',
+      });
+
+      await emitSave(document, 'user');
+
+      // No heavy new content row — the existing autosave is promoted to manual.
+      expect(pageHistoryRepo.updateHistoryKind).toHaveBeenCalledWith(
+        'auto-1',
+        'manual',
+        expect.anything(),
+      );
+      expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
+      const msg = JSON.parse(
+        (document as any).broadcastStateless.mock.calls.at(-1)[0],
+      );
+      expect(msg).toMatchObject({ historyId: 'auto-1', alreadySaved: false });
+    });
+
+    it('no-op when the latest snapshot is already a manual version of this content', async () => {
+      const document = ydocFor(doc('ALREADY SAVED'));
+      const page = pageMatchingDoc(document);
+      pageRepo.findById.mockResolvedValue(page);
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue({
+        id: 'ver-1',
+        content: page.content,
+        kind: 'manual',
+      });
+
+      await emitSave(document, 'user');
+
+      expect(pageHistoryRepo.updateHistoryKind).not.toHaveBeenCalled();
+      expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
+      const msg = JSON.parse(
+        (document as any).broadcastStateless.mock.calls.at(-1)[0],
+      );
+      expect(msg).toMatchObject({ alreadySaved: true, kind: 'manual' });
+    });
+
+    it('a read-only connection cannot save a version', async () => {
+      const document = ydocFor(doc('READER'));
+      pageRepo.findById.mockResolvedValue(pageMatchingDoc(document));
+
+      await ext.onStateless({
+        connection: {
+          readOnly: true,
+          context: { user: { id: USER_ID }, actor: 'user' },
+        } as any,
+        documentName: `page.${PAGE_ID}`,
+        document: document as any,
+        payload: JSON.stringify({ type: 'save-version' }),
+      } as any);
+
+      expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
+      expect(pageHistoryRepo.updateHistoryKind).not.toHaveBeenCalled();
+    });
   });
 });

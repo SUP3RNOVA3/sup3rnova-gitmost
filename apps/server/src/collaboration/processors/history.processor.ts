@@ -78,7 +78,11 @@ export class HistoryProcessor extends WorkerHost implements OnModuleDestroy {
             page.workspaceId,
           );
 
-          await this.pageHistoryRepo.saveHistory(page, { contributorIds });
+          // #370 — every job on this queue is a trailing idle-flush autosnapshot.
+          await this.pageHistoryRepo.saveHistory(page, {
+            contributorIds,
+            kind: job.data.kind ?? 'idle',
+          });
           this.logger.debug(`History created for page: ${pageId}`);
         } catch (err) {
           await this.collabHistory.addContributors(pageId, contributorIds);

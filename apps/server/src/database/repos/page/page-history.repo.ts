@@ -13,6 +13,7 @@ import { jsonArrayFrom, jsonObjectFrom } from 'kysely/helpers/postgres';
 import { ExpressionBuilder, sql } from 'kysely';
 import { DB } from '@docmost/db/types/db';
 import { resolveAgentProvenance } from '../agent-provenance';
+import { PageHistoryKind } from '../../../collaboration/constants';
 
 /**
  * Role-resolution subquery for a page-history row's bound AI chat (#300). Joins
@@ -46,6 +47,9 @@ export class PageHistoryRepo {
     'lastUpdatedById',
     'lastUpdatedSource',
     'lastUpdatedAiChatId',
+    // #370 — intentionality tier ('manual' | 'agent' | 'idle' | 'boundary');
+    // null on legacy rows (= autosave). Selected so callers can read/promote it.
+    'kind',
     'contributorIds',
     'spaceId',
     'workspaceId',
@@ -85,9 +89,15 @@ export class PageHistoryRepo {
 
   async saveHistory(
     page: Page,
-    opts?: { contributorIds?: string[]; trx?: KyselyTransaction },
-  ): Promise<void> {
-    await this.insertPageHistory(
+    opts?: {
+      contributorIds?: string[];
+      // #370 — intentionality tier for this snapshot. Omitted → null (legacy
+      // autosave semantics). Callers derive it server-side, never from a client.
+      kind?: PageHistoryKind;
+      trx?: KyselyTransaction;
+    },
+  ): Promise<PageHistory> {
+    return await this.insertPageHistory(
       {
         pageId: page.id,
         slugId: page.slugId,
@@ -99,12 +109,32 @@ export class PageHistoryRepo {
         // Copy the provenance marker off the page row, as for lastUpdatedById.
         lastUpdatedSource: page.lastUpdatedSource,
         lastUpdatedAiChatId: page.lastUpdatedAiChatId,
+        kind: opts?.kind ?? null,
         contributorIds: opts?.contributorIds,
         spaceId: page.spaceId,
         workspaceId: page.workspaceId,
       },
       opts?.trx,
     );
+  }
+
+  /**
+   * #370 — promote an existing snapshot's intentionality tier in place. Used by
+   * the manual-save "promote-not-dup" path: when the latest history row already
+   * holds the exact content being versioned, we upgrade its `kind` instead of
+   * duplicating a heavy content row.
+   */
+  async updateHistoryKind(
+    pageHistoryId: string,
+    kind: PageHistoryKind,
+    trx?: KyselyTransaction,
+  ): Promise<void> {
+    const db = dbOrTx(this.db, trx);
+    await db
+      .updateTable('pageHistory')
+      .set({ kind })
+      .where('id', '=', pageHistoryId)
+      .execute();
   }
 
   async findPageHistoryByPageId(pageId: string, pagination: PaginationOptions) {

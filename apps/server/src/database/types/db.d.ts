@@ -280,6 +280,7 @@ export interface PageHistory {
   createdAt: Generated<Timestamp>;
   icon: string | null;
   id: Generated<string>;
+  kind: string | null;
   lastUpdatedAiChatId: string | null;
   lastUpdatedById: string | null;
   lastUpdatedSource: string | null;
