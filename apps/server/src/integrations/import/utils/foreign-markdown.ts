@@ -247,13 +247,19 @@ const YAML_FRONT_MATTER_RE = /^\uFEFF?---\n[\s\S]*?\n---\n?/;
 
 /**
  * Normalize a foreign markdown string into Docmost's canonical markdown surface
- * so the strict canonical parser accepts it losslessly: strip a leading YAML
- * front-matter block, then rewrite GFM reference footnotes into inline
- * footnotes. Add further fixture-driven foreign-surface cases here as they are
- * found.
+ * so the strict canonical parser accepts it losslessly: normalize line endings,
+ * strip a leading YAML front-matter block, then rewrite GFM reference footnotes
+ * into inline footnotes. Add further fixture-driven foreign-surface cases here as
+ * they are found.
  */
 export function normalizeForeignMarkdown(markdown: string): string {
   if (!markdown) return markdown;
-  const withoutFrontMatter = markdown.replace(YAML_FRONT_MATTER_RE, '').trimStart();
+  // Normalize CRLF -> LF FIRST. The line-anchored front-matter regex requires a
+  // bare `\n` after the opening `---`, and convertReferenceFootnotes splits on
+  // `\n`; a Windows/CRLF foreign file (`---\r\n…`) would otherwise slip past the
+  // front-matter strip and leak into the body. The canonical parser
+  // (page-file.ts parsePageFile) normalizes the same way before its FRONTMATTER_RE.
+  const src = markdown.replace(/\r\n/g, '\n');
+  const withoutFrontMatter = src.replace(YAML_FRONT_MATTER_RE, '').trimStart();
   return convertReferenceFootnotes(withoutFrontMatter);
 }

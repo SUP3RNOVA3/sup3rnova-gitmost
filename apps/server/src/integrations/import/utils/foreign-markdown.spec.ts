@@ -144,6 +144,18 @@ describe('normalizeForeignMarkdown — GFM reference footnotes', () => {
     expect(out).toContain(`^[body ${N}]`);
   });
 
+  it('strips a CRLF (Windows) front-matter block, not just LF', () => {
+    // F9: the line-anchored regex needs LF after the opening `---`, so a Windows
+    // file (`---\r\n…`) would slip past the strip and leak the front-matter into
+    // the body. normalizeForeignMarkdown normalizes CRLF -> LF first.
+    const out = normalizeForeignMarkdown(
+      '---\r\ntitle: Foo\r\ntags: [a]\r\n---\r\n\r\n# Heading\r\n\r\nBody.',
+    );
+    expect(out).toBe('# Heading\n\nBody.');
+    expect(out).not.toContain('title: Foo');
+    expect(out).not.toContain('---');
+  });
+
   it('strips front-matter whose value contains a triple-dash (line-anchored)', () => {
     // F8: the block must close only on a `\n---` LINE, not the first inline
     // `---`. A value like `title: Q1 --- Q2` must not truncate the front-matter
