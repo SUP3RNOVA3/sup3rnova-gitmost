@@ -539,3 +539,115 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
     expect(result.error?.message).toContain('parameter "pageId": missing (required)');
   });
 });
+
+/**
+ * #294 F1 — the contract-parity test introspects only the ADVERTISED schema keys
+ * (buildShape), not the execute bodies. Most execs are unchanged pass-throughs,
+ * but two wirings actually CHANGED in the migration and are otherwise untested:
+ *   - movePage now forwards the newly-added optional `position` field to the
+ *     client (client.movePage(pageId, parentPageId, position));
+ *   - the table trio unified its `tableRef` param to `table` and must forward it
+ *     positionally. A field destructured under the wrong name would silently pass
+ *     `undefined` to the client (execute is `any`-cast, so tsc won't catch it).
+ */
+describe('AiChatToolsService #294 changed execute wirings', () => {
+  const calls: Record<string, unknown[][]> = {
+    movePage: [],
+    tableInsertRow: [],
+    tableDeleteRow: [],
+    tableUpdateCell: [],
+  };
+  const fakeClient: Partial<DocmostClientLike> = {
+    movePage: (...args: unknown[]) => {
+      calls.movePage.push(args);
+      return Promise.resolve({ success: true });
+    },
+    tableInsertRow: (...args: unknown[]) => {
+      calls.tableInsertRow.push(args);
+      return Promise.resolve({ ok: true });
+    },
+    tableDeleteRow: (...args: unknown[]) => {
+      calls.tableDeleteRow.push(args);
+      return Promise.resolve({ ok: true });
+    },
+    tableUpdateCell: (...args: unknown[]) => {
+      calls.tableUpdateCell.push(args);
+      return Promise.resolve({ ok: true });
+    },
+  };
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    for (const k of Object.keys(calls)) calls[k].length = 0;
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return fakeClient as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+    );
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+
+  it('movePage forwards the optional position to the client', async () => {
+    const tools = await buildTools();
+    await tools.movePage.execute(
+      { pageId: 'p1', parentPageId: 'parent1', position: 'a5' } as never,
+      {} as never,
+    );
+    expect(calls.movePage).toEqual([['p1', 'parent1', 'a5']]);
+  });
+
+  it('movePage passes undefined position and null parent when omitted (unchanged behavior)', async () => {
+    const tools = await buildTools();
+    await tools.movePage.execute({ pageId: 'p2' } as never, {} as never);
+    expect(calls.movePage).toEqual([['p2', null, undefined]]);
+  });
+
+  it('tableInsertRow forwards the unified `table` param positionally', async () => {
+    const tools = await buildTools();
+    await tools.tableInsertRow.execute(
+      { pageId: 'p1', table: '#0', cells: ['a', 'b'], index: 2 } as never,
+      {} as never,
+    );
+    expect(calls.tableInsertRow).toEqual([['p1', '#0', ['a', 'b'], 2]]);
+  });
+
+  it('tableDeleteRow forwards `table` positionally', async () => {
+    const tools = await buildTools();
+    await tools.tableDeleteRow.execute(
+      { pageId: 'p1', table: '#0', index: 1 } as never,
+      {} as never,
+    );
+    expect(calls.tableDeleteRow).toEqual([['p1', '#0', 1]]);
+  });
+
+  it('tableUpdateCell forwards `table` positionally', async () => {
+    const tools = await buildTools();
+    await tools.tableUpdateCell.execute(
+      { pageId: 'p1', table: '#0', row: 1, col: 2, text: 'x' } as never,
+      {} as never,
+    );
+    expect(calls.tableUpdateCell).toEqual([['p1', '#0', 1, 2, 'x']]);
+  });
+});

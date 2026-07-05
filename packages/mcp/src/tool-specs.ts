@@ -552,7 +552,7 @@ export const SHARED_TOOL_SPECS = {
       'Fetch a single page as Markdown by its id. Returns the page title and ' +
       'its Markdown content. The Markdown conversion is LOSSY (block ids, exact ' +
       'table/callout structure are approximated); for a lossless representation ' +
-      'use get_page_json. Inline <span data-comment-id> tags in the markdown ' +
+      'use the lossless page-JSON read tool. Inline <span data-comment-id> tags in the markdown ' +
       'are comment highlight anchors (also present for RESOLVED threads) — ' +
       'treat them as markup, not page text.',
     tier: 'core',
@@ -699,12 +699,12 @@ export const SHARED_TOOL_SPECS = {
     description:
       "Replace a page's content with a raw ProseMirror JSON document (lossless " +
       'write: preserves the block ids, callouts, tables and attributes you pass ' +
-      'in). Typical flow: get_page_json -> modify the JSON -> update_page_json. ' +
+      'in). Typical flow: read the page-JSON view -> modify the JSON -> write it back. ' +
       'Keep existing node ids intact so heading anchors and history stay ' +
       'stable. Minimal full-doc example: {"type":"doc","content":[{"type":' +
       '"paragraph","content":[{"type":"text","text":"Hi"}]}]}. `content` may be ' +
       'a JSON object or a JSON string (both accepted), and is OPTIONAL: omit it ' +
-      'to update only the title (though prefer rename_page for a title-only ' +
+      'to update only the title (though prefer the rename-page tool for a title-only ' +
       'change). Supplying neither content nor title is an error. Reversible: ' +
       'the previous version is kept in page history.',
     tier: 'deferred',
@@ -731,7 +731,7 @@ export const SHARED_TOOL_SPECS = {
       'Export a page to a single self-contained, lossless Docmost-flavoured ' +
       'Markdown file (custom extensions): YAML-free meta header, body with ' +
       'inline comment anchors and diagrams, and a trailing comments-thread ' +
-      'block. Designed for a download -> edit body -> import_page_markdown ' +
+      'block. Designed for a download -> edit body -> page-Markdown import ' +
       'round-trip that preserves everything, including comment highlights. ' +
       'Comment THREADS are preserved in the file but are not re-pushed to the ' +
       'server on import.',
