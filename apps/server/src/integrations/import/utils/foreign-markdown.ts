@@ -177,23 +177,23 @@ function convertReferenceFootnotes(markdown: string): string {
     return markdown;
   }
 
-  // ONE precompiled alternation regex over ALL definition ids, built once per
-  // document (not once per definition per line). This makes pass 2 O(total text)
-  // instead of O(text × defs): a line with no reference pays a single failed
-  // scan, and the replacer looks the matched id up in `defs`. The previous
-  // per-def loop (`for (id) line.replace(new RegExp(...))`) was quadratic in the
-  // definition count — a modest upload with thousands of defs could freeze the
-  // request thread (and thus the whole instance, since import runs synchronously
-  // on it). The ids are escaped and joined; `defs` is the id→body lookup.
-  const refRe = new RegExp(
-    '\\[\\^(' + [...defs.keys()].map(escapeRegExp).join('|') + ')\\]',
-    'g',
-  );
+  // ONE fixed, generic scanner regex — NOT one built from the definition ids.
+  // It matches ANY `[^id]` shape, and the replacer decides per match via a map
+  // lookup whether that id is a real definition (replace) or not (leave as-is).
+  // This is genuinely O(total text) with no per-document regex compilation.
+  //
+  // Do NOT rebuild this as an alternation over `[...defs.keys()]`: a giant
+  // `(id1|id2|...)` alternation over thousands of ids can blow the V8 regex
+  // compiler's stack — a fatal, UNCATCHABLE "RegExpCompiler Allocation failed"
+  // on prefix-chain ids (`a`, `aa`, `aaa`, ...) that kills the whole process
+  // (worse than the earlier per-def thread-hang). A fixed scanner has no
+  // id-dependent compilation cost and cannot blow up.
+  const refRe = /\[\^([^\]]+)\]/g;
   const rewriteSegment = (segment: string): string =>
     segment.replace(refRe, (whole, id: string) => {
       const body = defs.get(id);
-      // A ref whose id is not a real definition should not be reachable (the
-      // alternation only contains real ids), but stay defensive: leave it as-is.
+      // Only real definitions are inlined; an unknown id is left literal (same as
+      // the old per-def loop, which simply never matched it).
       return body === undefined ? whole : `^[${escapeFootnoteBody(body)}]`;
     });
 
@@ -234,10 +234,16 @@ function convertReferenceFootnotes(markdown: string): string {
  * — open with front-matter that the canonical parser does not consume, so
  * without this it leaks into the body (and `title: Foo` above the closing `---`
  * renders as a setext `<h2>` that `extractTitleAndRemoveHeading` can hijack as
- * the page title). This mirrors the strip the retired `markdownToHtml` layer did
- * (editor-ext marked.utils.ts). It is a no-op for front-matter-free input.
+ * the page title). It is a no-op for front-matter-free input.
+ *
+ * LINE-ANCHORED (the same shape the canonical parser uses in
+ * prosemirror-markdown/page-file.ts): the block opens only on `---\n` at the
+ * very start and closes only on a `\n---` line. The retired `markdownToHtml`
+ * strip closed on the FIRST `---` ANYWHERE (an unanchored close), so a value
+ * containing a triple-dash (e.g. `title: Q1 --- Q2`) truncated the front-matter
+ * and leaked the rest into the body. An optional leading BOM is tolerated.
  */
-const YAML_FRONT_MATTER_RE = /^\s*---[\s\S]*?---\s*/;
+const YAML_FRONT_MATTER_RE = /^\uFEFF?---\n[\s\S]*?\n---\n?/;
 
 /**
  * Normalize a foreign markdown string into Docmost's canonical markdown surface

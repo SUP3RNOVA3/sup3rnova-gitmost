@@ -126,6 +126,35 @@ describe('normalizeForeignMarkdown — GFM reference footnotes', () => {
     normalizeForeignMarkdown(doc);
     expect(Date.now() - t0).toBeLessThan(2000);
   });
+
+  it('does not crash or slow down on thousands of prefix-chain definition ids', () => {
+    // F7: the rewrite must use a FIXED generic scanner, not an alternation built
+    // from the ids. A `(a|aa|aaa|…)` alternation over prefix-chain ids blows the
+    // V8 regex compiler (FATAL RegExpCompiler Allocation failed — uncatchable,
+    // kills the process). A fixed scanner has no id-dependent compilation cost.
+    const N = 4000;
+    const ids = Array.from({ length: N }, (_, i) => 'a'.repeat(i + 1));
+    const defs = ids.map((id) => `[^${id}]: body ${id.length}`).join('\n');
+    const doc = `ref[^${ids[0]}] and[^${ids[N - 1]}] end\n\n${defs}`;
+    const t0 = Date.now();
+    const out = normalizeForeignMarkdown(doc);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    // Prefix disambiguation is correct: [^a] and [^aaaa...] inline their OWN body.
+    expect(out).toContain('^[body 1]');
+    expect(out).toContain(`^[body ${N}]`);
+  });
+
+  it('strips front-matter whose value contains a triple-dash (line-anchored)', () => {
+    // F8: the block must close only on a `\n---` LINE, not the first inline
+    // `---`. A value like `title: Q1 --- Q2` must not truncate the front-matter
+    // and leak the rest (author/closing ---) into the body.
+    const out = normalizeForeignMarkdown(
+      '---\ntitle: Q1 --- Q2 results\nauthor: bob\n---\n\nReal body.',
+    );
+    expect(out).toBe('Real body.');
+    expect(out).not.toContain('author: bob');
+    expect(out).not.toContain('Q2 results');
+  });
 });
 
 describe('foreign markdown import acceptance (normalizer + canonical parser)', () => {
