@@ -103,6 +103,9 @@ describe("gitmostInsertTranscriptIntoEditor", () => {
         "1. one",
         "> [!info] note",
         "```js",
+        "---", // solid thematic break -> horizontalRule (text-losing) if unneutralized
+        "***",
+        "___",
         "You: normal line",
       ].join("\n"),
     );
@@ -122,6 +125,9 @@ describe("gitmostInsertTranscriptIntoEditor", () => {
       ZWSP + "1. one",
       ZWSP + "> [!info] note",
       ZWSP + "```js",
+      ZWSP + "---",
+      ZWSP + "***",
+      ZWSP + "___",
       "You: normal line",
     ]);
 

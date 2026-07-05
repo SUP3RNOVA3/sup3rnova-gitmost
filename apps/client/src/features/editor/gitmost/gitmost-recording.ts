@@ -253,11 +253,15 @@ const GITMOST_ZWSP = "​";
 // verbatim with NO block-escape (the pre-existing root cause), so a leading
 // `#`/`-`/`*`/`+`/`>`, an ordered-list `N.`/`N)`, a code fence ```/~~~, a table
 // `|`, or a `> [!info]` callout opener would silently become a heading / list /
-// quote / code block / table / callout. This matches a TRIMMED line's start;
-// the transcript's own `You:` / `Speaker N:` prefix begins with a letter and
-// never matches, so prefixed lines are left byte-exact.
+// quote / code block / table / callout. The final alternative matches a WHOLE-
+// LINE thematic break — solid `---`/`***`/`___` or spaced `- - -`/`_ _ _` (3+ of
+// the same `-`/`*`/`_`) — which round-trips into a `horizontalRule`; because
+// that node carries NO text, an un-neutralized separator line would LOSE its
+// text entirely (worse than the list/quote case). This matches a TRIMMED line's
+// start; the transcript's own `You:` / `Speaker N:` prefix begins with a letter
+// and never matches, so prefixed lines are left byte-exact.
 const GITMOST_MD_BLOCK_TRIGGER_RE =
-  /^(#{1,6}(\s|$)|[-*+](\s|$)|>|\d+[.)](\s|$)|```|~~~|\|)/;
+  /^(?:#{1,6}(?:\s|$)|[-*+](?:\s|$)|>|\d+[.)](?:\s|$)|```|~~~|\||([-*_])(?:\s*\1){2,}\s*$)/;
 
 // Append a transcript block BELOW the recording's audio node in a live editor:
 // a "Transcript" heading followed by one paragraph per non-empty transcript

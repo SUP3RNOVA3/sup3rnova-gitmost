@@ -29,7 +29,7 @@ const ZWSP = "​"; // U+200B
 
 // MUST stay in sync with GITMOST_MD_BLOCK_TRIGGER_RE in the client bridge.
 const MD_BLOCK_TRIGGER_RE =
-  /^(#{1,6}(\s|$)|[-*+](\s|$)|>|\d+[.)](\s|$)|```|~~~|\|)/;
+  /^(?:#{1,6}(?:\s|$)|[-*+](?:\s|$)|>|\d+[.)](?:\s|$)|```|~~~|\||([-*_])(?:\s*\1){2,}\s*$)/;
 
 const doc = (...nodes: any[]) => ({ type: "doc", content: nodes });
 const para = (t: string) => ({
@@ -57,6 +57,14 @@ describe("gitmost transcript neutralization (git-sync round-trip)", () => {
     "> [!info] note",
     "```js",
     "~~~",
+    // Solid + spaced thematic breaks — these re-parse into a `horizontalRule`,
+    // which carries NO text, so a bare separator line LOSES its text entirely
+    // (round-2 finding). `_` also only forms a block via this construct.
+    "---",
+    "***",
+    "___",
+    "- - -", // spaced dash break (solid form is caught by [-*+]\s too, but this is the break)
+    "_ _ _",
   ];
 
   it("BARE trigger lines corrupt into non-paragraph blocks (root cause)", async () => {
@@ -68,6 +76,18 @@ describe("gitmost transcript neutralization (git-sync round-trip)", () => {
         allParagraphs,
         `expected "${line}" to corrupt when inserted bare`,
       ).toBe(false);
+    }
+  });
+
+  it("BARE solid thematic breaks corrupt into a text-LOSING horizontalRule", async () => {
+    // The severe case: no text node survives. Documents why neutralization
+    // matters more here than for list/quote (where the text survived).
+    for (const line of ["---", "***", "___"]) {
+      const blocks = await roundtrip(line);
+      expect(blocks.map((b) => b.type)).toContain("horizontalRule");
+      // No block carries the original text anywhere.
+      const flat = JSON.stringify(blocks);
+      expect(flat).not.toContain(line);
     }
   });
 
