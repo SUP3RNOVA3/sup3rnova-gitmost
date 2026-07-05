@@ -1,0 +1,16 @@
+{
+  "_bug": "BUG #351: a `column` whose `width` is a percentage string (e.g. \"50%\") is NOT byte-stable across export->import->export (violates P2). The `column` schema's parseHTML does `parseFloat(getAttribute('data-width'))`, which silently drops the '%' unit and returns the NUMBER 50. So the first export emits data-width=\"50%\" but the re-import stores width=50, and the second export emits data-width=\"50\": md2 !== md1, a permanent GS-EDIT-REVERT churn (every git-sync pull rewrites the column width). The editor authors column widths as percentages, so this is a real data/round-trip defect. Fix belongs in src/lib/docmost-schema.ts column.width parseHTML (preserve the unit / keep the string), which is OUT OF SCOPE for this test-only PR and must be a separate, maintainer-approved change. This flat generator therefore keeps `column.width` frozen (never generates a non-default width).",
+  "doc": {
+    "type": "doc",
+    "content": [
+      {
+        "type": "columns",
+        "attrs": { "layout": "two_equal", "widthMode": "normal" },
+        "content": [
+          { "type": "column", "attrs": { "width": "50%" }, "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "L" }] }] },
+          { "type": "column", "attrs": { "width": "50%" }, "content": [{ "type": "paragraph", "content": [{ "type": "text", "text": "R" }] }] }
+        ]
+      }
+    ]
+  }
+}
