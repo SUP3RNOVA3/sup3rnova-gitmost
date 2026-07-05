@@ -48,6 +48,27 @@ describe('normalizeForeignMarkdown — GFM reference footnotes', () => {
     expect(out).not.toContain('[^1]: def.');
   });
 
+  it('never rewrites a reference inside an INLINE-code span (backticks)', () => {
+    // The `[^1]` inside backticks is literal code and must survive verbatim;
+    // the one outside is rewritten. (Bug #1: only fenced blocks were protected.)
+    const out = normalizeForeignMarkdown(
+      'Use `arr[^1]` in code but note[^1] in prose.\n\n[^1]: def.',
+    );
+    expect(out).toBe('Use `arr[^1]` in code but note^[def.] in prose.\n');
+  });
+
+  it('escapes brackets in a body so an unbalanced ] cannot truncate the footnote', () => {
+    // A foreign definition body with a stray `]` would, unescaped, close the
+    // canonical `^[...]` early and leak the tail as text (bug #2). The body's
+    // brackets are backslash-escaped so the footnote stays whole.
+    const out = normalizeForeignMarkdown(
+      'Ref[^1] here.\n\n[^1]: see item ] and [more] later',
+    );
+    expect(out).toBe('Ref^[see item \\] and \\[more\\] later] here.\n');
+    // The tokenizer must see exactly one unescaped closing bracket (our own).
+    expect(out.match(/(?<!\\)\]/g)).toHaveLength(1);
+  });
+
   it('leaves a reference with no matching definition literal (no body to inline)', () => {
     const out = normalizeForeignMarkdown('Dangling[^x] ref.');
     expect(out).toBe('Dangling[^x] ref.');

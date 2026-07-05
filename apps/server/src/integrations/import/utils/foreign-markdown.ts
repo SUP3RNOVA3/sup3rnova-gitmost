@@ -53,6 +53,43 @@ function escapeRegExp(value: string): string {
 }
 
 /**
+ * Backslash-escape any square bracket in a footnote body before it is wrapped in
+ * `^[...]`. The canonical inline-footnote tokenizer scans the body with bracket
+ * balancing and closes on the first UNMATCHED `]`, so an unbalanced bracket in a
+ * foreign definition (e.g. `[^1]: see item ] later`) would otherwise truncate the
+ * footnote and leak the tail as literal text. Escaping every `[`/`]` makes the
+ * body an inert run of characters — the tokenizer then closes only on our own
+ * closing `]`. (A balanced `[link](url)` inside a body still round-trips because
+ * the escaped form renders the literal brackets, which is the safe reading for a
+ * footnote body; the alternative — brittle balance tracking — risks worse.)
+ */
+function escapeFootnoteBody(body: string): string {
+  return body.replace(/[[\]]/g, '\\$&');
+}
+
+/**
+ * Rewrite every `[^id]` reference on a line to its `^[body]` form, but ONLY in the
+ * text OUTSIDE inline-code spans. A `[^id]` inside backticks is literal code
+ * content and must be preserved verbatim (a footnote ref never lives inside code).
+ * We split the line on inline-code spans (paired backtick runs) and rewrite only
+ * the non-code segments.
+ */
+function rewriteRefsOutsideInlineCode(
+  line: string,
+  replace: (text: string) => string,
+): string {
+  // Alternation: an inline-code span (one or more backticks, then anything up to
+  // the SAME run of backticks) OR a run of non-backtick text. Unterminated
+  // backticks fall through as ordinary text (matched by the second branch on the
+  // leftover), so a stray backtick never swallows the rest of the line.
+  const parts = line.match(/(`+)(?:(?!\1)[\s\S])*\1|[^`]+|`+/g);
+  if (!parts) return line;
+  return parts
+    .map((seg) => (seg.startsWith('`') ? seg : replace(seg)))
+    .join('');
+}
+
+/**
  * Convert GFM reference footnotes (`[^id]` + `[^id]: def`) into canonical inline
  * footnotes (`^[def]`).
  *
@@ -62,9 +99,12 @@ function escapeRegExp(value: string): string {
  * - Each in-text reference `[^id]` for which a definition was found is replaced by
  *   `^[def]`. References with no matching definition are left literal (there is no
  *   body to inline; the parser fails them open the same way).
- * - Code fences are respected on both passes: `[^id]` inside a ``` / ~~~ block is
- *   never rewritten, and a `[^id]:` line inside a fence is never treated as a
- *   definition.
+ * - Code is respected on both passes: `[^id]` inside a fenced ``` / ~~~ block is
+ *   never rewritten and a `[^id]:` line inside a fence is never a definition; and
+ *   on the rewrite pass a `[^id]` inside an INLINE-code span (backticks) is left
+ *   literal too.
+ * - The inlined body is bracket-escaped so an unbalanced `[`/`]` in a foreign
+ *   definition cannot truncate the resulting `^[...]` footnote.
  *
  * Deduplication / reference-ordering / orphan-dropping of the resulting footnotes
  * is handled downstream by the canonical parser (`assembleFootnotes`); this pass
@@ -145,10 +185,14 @@ function convertReferenceFootnotes(markdown: string): string {
       continue;
     }
 
-    for (const [id, body] of defs) {
-      const ref = new RegExp('\\[\\^' + escapeRegExp(id) + '\\]', 'g');
-      line = line.replace(ref, `^[${body}]`);
-    }
+    line = rewriteRefsOutsideInlineCode(line, (segment) => {
+      let s = segment;
+      for (const [id, body] of defs) {
+        const ref = new RegExp('\\[\\^' + escapeRegExp(id) + '\\]', 'g');
+        s = s.replace(ref, `^[${escapeFootnoteBody(body)}]`);
+      }
+      return s;
+    });
     out.push(line);
   }
 
