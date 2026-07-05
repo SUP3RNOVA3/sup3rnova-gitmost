@@ -4,10 +4,14 @@
   "testEnvironment": "node",
   "testRegex": ".e2e-spec.ts$",
   "transform": {
+    "prosemirror-markdown/build/.+\\.js$": [
+      "babel-jest",
+      { "presets": [["@babel/preset-env", { "targets": { "node": "current" } }]] }
+    ],
     "^.+\\.(t|j)sx?$": ["ts-jest", { "tsconfig": { "allowJs": true } }]
   },
   "transformIgnorePatterns": [
-    "/node_modules/(?!(\\.pnpm/)?(nanoid|uuid|image-dimensions|marked|happy-dom|lib0|@sindresorhus[+/][a-z0-9-]+|escape-string-regexp|p-limit|yocto-queue)(@|/))"
+    "/node_modules/(?!(\\.pnpm/)?(nanoid|uuid|image-dimensions|marked|happy-dom|lib0|@sindresorhus[+/][a-z0-9-]+|escape-string-regexp|p-limit|yocto-queue|@docmost/prosemirror-markdown)(@|/))"
   ],
   "moduleNameMapper": {
     "^@docmost/db/(.*)$": "<rootDir>/../src/database/$1",

@@ -4,10 +4,14 @@
   "testRegex": ".*\\.int-spec\\.ts$",
   "testPathIgnorePatterns": ["/node_modules/"],
   "transform": {
+    "prosemirror-markdown/build/.+\\.js$": [
+      "babel-jest",
+      { "presets": [["@babel/preset-env", { "targets": { "node": "current" } }]] }
+    ],
     "^.+\\.(t|j)sx?$": "ts-jest"
   },
   "transformIgnorePatterns": [
-    "/node_modules/(?!(\\.pnpm/)?(nanoid|uuid|image-dimensions|marked|happy-dom|lib0)(@|/))"
+    "/node_modules/(?!(\\.pnpm/)?(nanoid|uuid|image-dimensions|marked|happy-dom|lib0|@docmost/prosemirror-markdown)(@|/))"
   ],
   "testEnvironment": "node",
   "testTimeout": 60000,

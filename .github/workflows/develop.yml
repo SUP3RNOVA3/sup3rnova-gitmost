@@ -151,6 +151,12 @@ jobs:
       - name: Build editor-ext
         run: pnpm --filter @docmost/editor-ext build
 
+      # @docmost/prosemirror-markdown is an ESM workspace package the server
+      # imports at runtime; its build/ is gitignored and test:e2e has no pretest
+      # hook, so build it before the e2e run (mirrors the test.yml job).
+      - name: Build prosemirror-markdown
+        run: pnpm --filter @docmost/prosemirror-markdown build
+
       - name: Run migrations
         run: pnpm --filter ./apps/server migration:latest
 
