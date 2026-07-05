@@ -65,6 +65,11 @@ export interface GitmostCreatePagePayload {
   base64: string;
   filename: string;
   mimeType: string;
+  // Optional transcript for the recording: plain text, `\n`-separated, each
+  // line already formatted as `You: ...` / `Speaker N: ...` by the native host
+  // (ready to insert, no parsing needed). Omitted (no speech / no models) ->
+  // audio only.
+  transcript?: string;
 }
 
 export interface GitmostCreatePageResult {
@@ -233,6 +238,45 @@ export async function gitmostUploadFileToEditor(
       message: err?.response?.data?.message ?? err?.message ?? "Insert failed",
     };
   }
+}
+
+// Append a transcript block BELOW the recording's audio node in a live editor:
+// a "Transcript" heading followed by one paragraph per non-empty transcript
+// line. The transcript is plain text, `\n`-separated, each line already
+// formatted as `You: ...` / `Speaker N: ...` by the native host — lines are
+// inserted VERBATIM as text nodes (never HTML), so there is no injection
+// surface. This is best-effort and meant to run AFTER the audio has already
+// been inserted; the caller must guard against a throw so a transcript failure
+// never fails the (already successful) recording. Returns true when a block was
+// inserted, false when there was nothing to insert (transcript undefined/empty/
+// not-a-string). A non-string value is a no-op, not an error.
+export function gitmostInsertTranscriptIntoEditor(
+  editor: Editor,
+  transcript: unknown,
+): boolean {
+  if (typeof transcript !== "string") return false;
+  // Keep each line's text verbatim; only drop blank (whitespace-only) lines.
+  const lines = transcript.split("\n").filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return false;
+
+  const content = [
+    {
+      type: "heading",
+      attrs: { level: 2 },
+      content: [{ type: "text", text: "Transcript" }],
+    },
+    ...lines.map((line) => ({
+      type: "paragraph",
+      content: [{ type: "text", text: line }],
+    })),
+  ];
+
+  // Append at the end of the document. On a freshly-created recording page the
+  // audio node is the last block, so the end position places the transcript
+  // directly below it.
+  const endPos = editor.state.doc.content.size;
+  editor.chain().focus().insertContentAt(endPos, content).run();
+  return true;
 }
 
 // Full insert path used by the open-page bridge (insertRecording): guard the

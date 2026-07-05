@@ -24,6 +24,7 @@ import {
   GitmostListPagesResult,
   GitmostListSpacesResult,
   gitmostDecodePayloadToFile,
+  gitmostInsertTranscriptIntoEditor,
   gitmostUploadFileToEditor,
 } from "@/features/editor/gitmost/gitmost-recording.ts";
 
@@ -281,6 +282,18 @@ export default function GitmostGlobalBridge() {
             pageId: page.id,
           };
         }
+
+        // Best-effort: append the transcript (heading + one paragraph per line)
+        // below the just-inserted audio node. The audio insert already
+        // succeeded, so a transcript failure must NOT turn this into an error —
+        // wrap it and, on any throw, log and still return ok. A missing/empty/
+        // non-string transcript is a no-op inside the helper (audio only).
+        try {
+          gitmostInsertTranscriptIntoEditor(editor, payload?.transcript);
+        } catch (err) {
+          console.error("[gitmost] transcript insert failed", err);
+        }
+
         return { ok: true, pageId: page.id };
       } catch (err: any) {
         console.error("[gitmost] createPageWithRecording failed", err);
