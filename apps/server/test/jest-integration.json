@@ -16,6 +16,7 @@
   "testEnvironment": "node",
   "testTimeout": 60000,
   "maxWorkers": 1,
+  "forceExit": true,
   "globalSetup": "<rootDir>/test/integration/global-setup.ts",
   "globalTeardown": "<rootDir>/test/integration/global-teardown.ts",
   "moduleNameMapper": {
