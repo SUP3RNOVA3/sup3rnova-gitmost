@@ -108,12 +108,25 @@ export interface IAiRoleImportPayload {
   conflict: "skip" | "rename";
 }
 
-/** Import result counts (mirrors `importFromCatalog()`). */
+/**
+ * Import result (mirrors `importFromCatalog()`). The counters (`created`,
+ * `skipped`, `renamed`) drive the summary notification; the per-role lists
+ * (`createdRoles`, `skippedRoles`) drive the redesigned catalog modal's inline
+ * result plaque — which roles were installed (and any rename) and which were
+ * skipped and why (so the plaque can name the conflicting role and offer
+ * "Rename & install").
+ */
 export interface IAiRoleImportResult {
   created: number;
   skipped: number;
   renamed: number;
   errors: { slug: string; message: string }[];
+  createdRoles: { slug: string; name: string; renamedTo?: string }[];
+  skippedRoles: {
+    slug: string;
+    name: string;
+    reason: "name-conflict" | "already-installed";
+  }[];
 }
 
 /**

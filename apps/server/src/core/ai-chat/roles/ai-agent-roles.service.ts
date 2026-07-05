@@ -305,6 +305,16 @@ export class AiAgentRolesService {
     skipped: number;
     renamed: number;
     errors: { slug: string; message: string }[];
+    // Per-role lists alongside the counters (kept for back-compat). The redesigned
+    // catalog UI needs the actual roles — which were created (and any rename) and
+    // which were skipped and why — to render an inline result plaque with the
+    // conflicting role's name and a "Rename & install" affordance.
+    createdRoles: { slug: string; name: string; renamedTo?: string }[];
+    skippedRoles: {
+      slug: string;
+      name: string;
+      reason: 'name-conflict' | 'already-installed';
+    }[];
   }> {
     const { file, versions } = await this.loadBundleById(
       dto.bundleId,
@@ -312,6 +322,13 @@ export class AiAgentRolesService {
     );
 
     const errors: { slug: string; message: string }[] = [];
+    const createdRoles: { slug: string; name: string; renamedTo?: string }[] =
+      [];
+    const skippedRoles: {
+      slug: string;
+      name: string;
+      reason: 'name-conflict' | 'already-installed';
+    }[] = [];
 
     // Resolve the selected catalog roles (honor dto.slugs; flag unknown ones).
     let selected = file.roles;
@@ -351,16 +368,27 @@ export class AiAgentRolesService {
       // Already installed from the catalog in THIS language => skip (use
       // update-from-catalog). A different language of the same slug still imports.
       const installKey = `${role.slug}:${dto.language}`;
+      const originalName = role.name.trim();
       if (installedKeys.has(installKey)) {
         skipped++;
+        skippedRoles.push({
+          slug: role.slug,
+          name: originalName,
+          reason: 'already-installed',
+        });
         continue;
       }
 
-      let name = role.name.trim();
+      let name = originalName;
       let didRename = false;
       if (takenNames.has(name.toLowerCase())) {
         if (dto.conflict === 'skip') {
           skipped++;
+          skippedRoles.push({
+            slug: role.slug,
+            name: originalName,
+            reason: 'name-conflict',
+          });
           continue;
         }
         // conflict === 'rename': find a free " (N)" suffix.
@@ -380,6 +408,11 @@ export class AiAgentRolesService {
         });
         created++;
         if (didRename) renamed++;
+        createdRoles.push({
+          slug: role.slug,
+          name: originalName,
+          ...(didRename ? { renamedTo: name } : {}),
+        });
         takenNames.add(name.toLowerCase());
         installedKeys.add(installKey);
       } catch (err) {
@@ -391,6 +424,11 @@ export class AiAgentRolesService {
         // skipped (already installed) and continue; do NOT abort or error.
         if (isSourceUniqueViolation(err)) {
           skipped++;
+          skippedRoles.push({
+            slug: role.slug,
+            name: originalName,
+            reason: 'already-installed',
+          });
           installedKeys.add(installKey);
           continue;
         }
@@ -407,7 +445,7 @@ export class AiAgentRolesService {
       }
     }
 
-    return { created, skipped, renamed, errors };
+    return { created, skipped, renamed, errors, createdRoles, skippedRoles };
   }
 
   /**

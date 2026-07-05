@@ -77,7 +77,14 @@ describe("useImportAiRolesFromCatalogMutation — success notifications", () => 
   });
 
   it("errors:[] -> only the summary notification (counts interpolated)", async () => {
-    await runMutation({ created: 3, renamed: 1, skipped: 2, errors: [] });
+    await runMutation({
+      created: 3,
+      renamed: 1,
+      skipped: 2,
+      errors: [],
+      createdRoles: [],
+      skippedRoles: [],
+    });
     expect(notificationsShowMock).toHaveBeenCalledTimes(1);
     expect(notificationsShowMock).toHaveBeenCalledWith({
       message: "Imported 3, renamed 1, skipped 2",
@@ -93,6 +100,8 @@ describe("useImportAiRolesFromCatalogMutation — success notifications", () => 
         { slug: "a", message: "name taken" },
         { slug: "b", message: "name taken" },
       ],
+      createdRoles: [{ slug: "ok", name: "Ok" }],
+      skippedRoles: [],
     });
     expect(notificationsShowMock).toHaveBeenCalledTimes(2);
     expect(notificationsShowMock).toHaveBeenNthCalledWith(1, {
