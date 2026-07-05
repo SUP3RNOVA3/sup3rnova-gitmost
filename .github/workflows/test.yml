@@ -13,6 +13,49 @@ permissions:
   contents: read
 
 jobs:
+  # Guard against a long-lived branch adding a migration whose timestamped
+  # filename sorts BEFORE migrations already applied on the target branch (and
+  # thus in prod). The Kysely startup migrator rejects that as "corrupted
+  # migrations" and crash-loops the app on boot (incident #361). This gate fails
+  # the PR so the migration is renamed to a current timestamp before merge. Only
+  # runs for pull_request events (needs a base branch to diff against).
+  migration-order:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout (full history for the base-branch diff)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Added migrations must sort after the newest on the base branch
+        env:
+          TARGET_BRANCH: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          MIG_DIR="apps/server/src/database/migrations"
+          # checkout above already did fetch-depth:0 (full history). Fetch the base
+          # WITHOUT --depth (a shallow graft would truncate the base history and
+          # break the merge-base when the base has moved ahead of the PR merge —
+          # exactly the long-branch-vs-moving-base case this gate guards, #361).
+          git fetch --no-tags origin "$TARGET_BRANCH"
+          newest_on_target=$(git ls-tree -r --name-only "origin/${TARGET_BRANCH}" "$MIG_DIR" | sort | tail -1)
+          # NO `|| true`: a diff failure (e.g. an unresolved merge-base) must fail
+          # the job CLOSED — a gate whose job is to BLOCK must never pass on error.
+          # `set -e` above already aborts on a non-zero diff exit.
+          added=$(git diff --diff-filter=A --name-only "origin/${TARGET_BRANCH}...HEAD" -- "$MIG_DIR")
+          bad=0
+          for f in $added; do
+            if [[ "$f" < "$newest_on_target" || "$f" == "$newest_on_target" ]]; then
+              echo "::error::Migration $f sorts at or before the newest on ${TARGET_BRANCH} ($newest_on_target) — rename it with a CURRENT timestamp before merge (do not change its contents). See incident #361."
+              bad=1
+            fi
+          done
+          if [ "$bad" -eq 0 ]; then
+            echo "Migration order OK (added migrations all sort after $newest_on_target)."
+          fi
+          exit $bad
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
