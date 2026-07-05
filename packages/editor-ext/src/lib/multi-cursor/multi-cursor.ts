@@ -32,12 +32,17 @@ import { findOccurrences } from "../search-and-replace/find-occurrences";
  * built here):
  *   - Alt+Click arbitrary carets and Alt+drag column selection.
  *   - Cmd/Ctrl+Alt+Up/Down "add cursor on the adjacent line".
- *   - Cursors inside tables / code-blocks / callouts — like replaceAll this
- *     operates on plain text occurrences only (schema violations are skipped
- *     per-cursor as a backstop, never applied half-way).
  *   - Simultaneous IME / composition input into multiple positions — on
  *     `compositionstart` we collapse back to a single cursor.
- *   - Cursors spanning different schema nodes.
+ *   - Cursors spanning different schema nodes in one edit.
+ *
+ * NOT out of scope, but worth stating precisely: there is NO schema-aware or
+ * structural cursor. Occurrences are found by a plain text-node walk
+ * (`findOccurrences`), so a term that appears inside a table cell, code block or
+ * callout DOES get a cursor there and IS edited — as plain text, exactly like
+ * `replaceAll`. There is no special table/code handling; the per-cursor try/catch
+ * only SKIPS a cursor whose edit would violate the schema (never applied
+ * half-way), it does not exclude those node types from matching.
  */
 
 interface MultiCursorState {

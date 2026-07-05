@@ -274,6 +274,37 @@ describe("multi-cursor: position remapping", () => {
     }
     editor.destroy();
   });
+
+  it("a REMOTE delete UNDER a cursor collapses it to a caret (not drop), leaving others intact", () => {
+    // The riskiest remap path: a collaborator deletes the very text one cursor
+    // spans. Both edges map with assoc +1 and there is no drop logic, so the
+    // deleted-over cursor CONTRACT is: it collapses to a zero-width caret at the
+    // deletion point (from === to) and STAYS in the set — it is not removed.
+    // Untouched cursors keep spanning their occurrence. Pinning this makes the
+    // collapse-not-drop choice explicit (review #372 F2).
+    const editor = makeEditor(doc("foo bar foo"));
+    editor.commands.setTextSelection(2);
+    editor.commands.selectAllOccurrences();
+    const before = cursors(editor).map((c) => ({ ...c }));
+    expect(before.length).toBe(2);
+
+    // Remote (no multi-cursor meta) delete of the FIRST "foo" range.
+    const tr = editor.state.tr.delete(before[0].from, before[0].to);
+    editor.view.dispatch(tr);
+
+    const after = cursors(editor);
+    // Still two cursors — the deleted-over one is NOT dropped.
+    expect(after.length).toBe(2);
+    // The first collapsed to a caret at the deletion point.
+    expect(after[0].from).toBe(after[0].to);
+    expect(after[0].from).toBe(before[0].from);
+    // The second still spans "foo" (shifted left by the 3 removed chars).
+    expect(after[1].from).toBe(before[1].from - 3);
+    expect(editor.state.doc.textBetween(after[1].from, after[1].to)).toBe("foo");
+    // Sanity: the document now reads " bar foo".
+    expect(paraTexts(editor.state.doc)).toEqual([" bar foo"]);
+    editor.destroy();
+  });
 });
 
 describe("multi-cursor: collapse / exit", () => {
