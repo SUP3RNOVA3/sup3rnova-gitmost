@@ -316,6 +316,34 @@ export const SHARED_TOOL_SPECS = {
 
   // --- share management ---
 
+  // Unified from the per-layer inline definitions (#294). Both layers already
+  // carried the "only share when explicitly asked" security framing (the
+  // "per-transport divergence" note on the old inline copies was stale), so
+  // there was no real behavioral divergence to preserve — only wording drift.
+  sharePage: {
+    mcpName: 'share_page',
+    inAppKey: 'sharePage',
+    // CANONICAL: merges the MCP copy's URL-format + idempotency detail with the
+    // in-app copy's reversibility note; keeps the security framing both had.
+    description:
+      'Make a page PUBLICLY accessible (idempotent) and return its public URL ' +
+      '(format: <app>/share/<key>/p/<slugId>). This exposes the page content ' +
+      'to ANYONE with the URL — only share when the user explicitly asked. ' +
+      'Reversible: unshare it later to revoke the public URL.',
+    tier: 'deferred',
+    catalogLine: 'sharePage — make a page publicly accessible and return its URL.',
+    // Reconciled: MCP's stricter .min(1) on pageId kept; field descriptions from
+    // the in-app copy. The MCP execute keeps its own `searchIndexing ?? true`
+    // default (a per-layer concern, not part of the shared schema).
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to share.'),
+      searchIndexing: z
+        .boolean()
+        .optional()
+        .describe('Allow public search engines to index it (default true).'),
+    }),
+  },
+
   unsharePage: {
     mcpName: 'unshare_page',
     inAppKey: 'unsharePage',
@@ -507,6 +535,472 @@ export const SHARED_TOOL_SPECS = {
       'stashPage — serialize a whole page to a short anonymous URL without loading its body.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
+    }),
+  },
+
+  // --- page tools (unified from the per-layer inline definitions, #294) ---
+  //
+  // Descriptions merge both layers (the MCP copy's richer structural notes + the
+  // in-app copy's "Reversible via history/trash" framing where it added one).
+  // Field constraints keep the MCP copy's stricter .min(1) EXCEPT where the
+  // in-app layer deliberately allowed a looser value (documented per field).
+
+  getPage: {
+    mcpName: 'get_page',
+    inAppKey: 'getPage',
+    description:
+      'Fetch a single page as Markdown by its id. Returns the page title and ' +
+      'its Markdown content. The Markdown conversion is LOSSY (block ids, exact ' +
+      'table/callout structure are approximated); for a lossless representation ' +
+      'use the lossless page-JSON read tool. Inline <span data-comment-id> tags in the markdown ' +
+      'are comment highlight anchors (also present for RESOLVED threads) — ' +
+      'treat them as markup, not page text.',
+    tier: 'core',
+    catalogLine: 'getPage — fetch a page as Markdown by its id.',
+    // Reconciled: MCP's stricter .min(1) kept; in-app's more-informative
+    // "(or slugId)" describe kept.
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id (or slugId) of the page.'),
+    }),
+  },
+
+  listPages: {
+    mcpName: 'list_pages',
+    inAppKey: 'listPages',
+    description:
+      'List the most recent pages (ordered by updatedAt, descending), ' +
+      'optionally scoped to a single space. Returns a bounded list (default ' +
+      '50, max 100) — use search for lookups in large spaces. Pass tree:true ' +
+      "(with spaceId) to instead get the space's full page hierarchy as a " +
+      'nested tree.',
+    tier: 'core',
+    catalogLine: "listPages — list recent pages, or a space's full page tree.",
+    buildShape: (z) => ({
+      spaceId: z
+        .string()
+        .optional()
+        .describe('Optional space id to scope the listing to.'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe('Maximum number of pages (default 50, max 100).'),
+      tree: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, return the space's full page hierarchy as a nested tree " +
+            '(children arrays) instead of the recent-by-updatedAt flat list. ' +
+            'Requires spaceId; ignores limit.',
+        ),
+    }),
+  },
+
+  createPage: {
+    mcpName: 'create_page',
+    inAppKey: 'createPage',
+    description:
+      'Create a new page with a Markdown body in a space, optionally under a ' +
+      'parent page (omit parentPageId to create at the space root). Returns ' +
+      'the new page id and title. Reversible: a page can be moved to trash ' +
+      'later.',
+    tier: 'deferred',
+    catalogLine: 'createPage — create a new page with a Markdown body in a space.',
+    // Reconciled schema DRIFT: the MCP copy pinned `content` to .min(1) while
+    // the in-app copy left it unbounded and DOCUMENTS an empty body as valid
+    // ("may be empty") — creating an empty page to fill in later is a real use
+    // case. The looser (no-min) form is kept, so create_page now also accepts an
+    // empty body (harmless — it creates an empty page) and no previously-valid
+    // in-app input is ever rejected. `title`/`spaceId` keep the MCP .min(1)
+    // (an empty title or space is never valid).
+    buildShape: (z) => ({
+      title: z.string().min(1).describe('The title of the new page.'),
+      content: z.string().describe('The page body as Markdown (may be empty).'),
+      spaceId: z.string().min(1).describe('The id of the space to create the page in.'),
+      parentPageId: z
+        .string()
+        .optional()
+        .describe('Optional parent page id to nest the new page under.'),
+    }),
+  },
+
+  movePage: {
+    mcpName: 'move_page',
+    inAppKey: 'movePage',
+    description:
+      'Move a page under a new parent page, or to the space root when no ' +
+      'parent is given. Reversible: move it back at any time.',
+    tier: 'deferred',
+    catalogLine: 'movePage — move a page under a new parent or to the space root.',
+    // Reconciled schema DRIFT: the MCP copy exposed a `position` field
+    // (fractional-index ordering) that the in-app copy lacked. Unified by
+    // KEEPING position (the in-app client already accepts an optional position
+    // arg, so the in-app execute now forwards it) — it is optional, so no
+    // previously-valid in-app call is rejected. `parentPageId` is `.nullable()`
+    // on both, so a real JSON null moves to root on either transport; the MCP
+    // execute additionally coerces the strings 'null'/'' to null as a robustness
+    // fallback (kept in its execute body, not in the shared schema).
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to move.'),
+      parentPageId: z
+        .string()
+        .nullable()
+        .optional()
+        .describe(
+          'Target parent page id. Null or omitted moves the page to the space ' +
+            'root.',
+        ),
+      position: z
+        .string()
+        .min(5)
+        .optional()
+        .describe(
+          'Optional fractional-index position key (min 5 chars); omit to ' +
+            'append at the end.',
+        ),
+    }),
+  },
+
+  renamePage: {
+    mcpName: 'rename_page',
+    inAppKey: 'renamePage',
+    description:
+      'Rename a page (change its title only; the body is untouched, never ' +
+      'resent). Reversible: rename back at any time.',
+    tier: 'deferred',
+    catalogLine: "renamePage — change a page's title only (body untouched).",
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to rename.'),
+      title: z.string().min(1).describe('The new title.'),
+    }),
+  },
+
+  deletePage: {
+    mcpName: 'delete_page',
+    inAppKey: 'deletePage',
+    description:
+      'Move a page to the trash — SOFT delete only: the page can be restored ' +
+      'from trash and nothing is ever permanently deleted.',
+    tier: 'deferred',
+    catalogLine: 'deletePage — move a page to trash (soft delete, reversible).',
+    // GUARDRAIL preserved (§14 H4): the schema exposes ONLY pageId, so a
+    // permanentlyDelete/forceDelete flag can never reach the client through this
+    // tool (asserted by ai-chat-tools.service.spec.ts).
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to move to trash.'),
+    }),
+  },
+
+  updatePageJson: {
+    mcpName: 'update_page_json',
+    inAppKey: 'updatePageJson',
+    description:
+      "Replace a page's content with a raw ProseMirror JSON document (lossless " +
+      'write: preserves the block ids, callouts, tables and attributes you pass ' +
+      'in). Typical flow: read the page-JSON view -> modify the JSON -> write it back. ' +
+      'Keep existing node ids intact so heading anchors and history stay ' +
+      'stable. Minimal full-doc example: {"type":"doc","content":[{"type":' +
+      '"paragraph","content":[{"type":"text","text":"Hi"}]}]}. `content` may be ' +
+      'a JSON object or a JSON string (both accepted), and is OPTIONAL: omit it ' +
+      'to update only the title (though prefer the rename-page tool for a title-only ' +
+      'change). Supplying neither content nor title is an error. Reversible: ' +
+      'the previous version is kept in page history.',
+    tier: 'deferred',
+    catalogLine:
+      "updatePageJson — overwrite a page's body with a full ProseMirror document.",
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('ID of the page to update'),
+      content: z
+        .any()
+        .optional()
+        .describe(
+          'ProseMirror document {"type":"doc","content":[...]} (JSON object or ' +
+            'JSON string). Omit to update only the title.',
+        ),
+      title: z.string().optional().describe('Optional new title'),
+    }),
+  },
+
+  exportPageMarkdown: {
+    mcpName: 'export_page_markdown',
+    inAppKey: 'exportPageMarkdown',
+    // CANONICAL: the MCP copy (a strict superset of the terse in-app wording).
+    description:
+      'Export a page to a single self-contained, lossless Docmost-flavoured ' +
+      'Markdown file (custom extensions): YAML-free meta header, body with ' +
+      'inline comment anchors and diagrams, and a trailing comments-thread ' +
+      'block. Designed for a download -> edit body -> page-Markdown import ' +
+      'round-trip that preserves everything, including comment highlights. ' +
+      'Comment THREADS are preserved in the file but are not re-pushed to the ' +
+      'server on import.',
+    tier: 'deferred',
+    catalogLine:
+      'exportPageMarkdown — export a page to self-contained Markdown (body + comments).',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to export.'),
+    }),
+  },
+
+  // --- comment tools (unified from the per-layer inline definitions, #294) ---
+  //
+  // create_comment and resolve_comment previously carried a "per-transport
+  // divergence" note in BOTH layers; #294 unifies their schema + description
+  // here. Only the four tools that genuinely exist in BOTH layers live in the
+  // registry: create/list/resolve comment and check_new_comments.
+  //
+  // update_comment and delete_comment are intentionally NOT here: they exist
+  // ONLY on the standalone MCP server. The in-app agent deliberately exposes no
+  // hard comment edit/delete tool (comment edits are irreversible / not
+  // version-tracked; see the guardrail tests in ai-chat-tools.service.spec.ts),
+  // so there is nothing to unify — they stay inline in index.ts.
+
+  createComment: {
+    mcpName: 'create_comment',
+    inAppKey: 'createComment',
+    // CANONICAL: the in-app copy (the more-maintained one). It keeps the same
+    // rules as the MCP copy — inline-only, top-level requires a `selection`, no
+    // page-level comments, replies inherit the anchor, suggestedText must be
+    // unique — and adds the "retry with a corrected EXACT selection" and reply-
+    // to-reply-rejected guidance the MCP copy lacked. Execute-side validation
+    // (reject suggestedText on a reply, require a selection) stays per-layer.
+    description:
+      'Add an INLINE comment to a page, or reply to an existing top-level ' +
+      'comment (one level only — the backend rejects replies to replies). ' +
+      'The comment is anchored inline to the given exact `selection` text ' +
+      '(which gets highlighted); page-level comments are NOT supported. A ' +
+      'new top-level comment REQUIRES a `selection`. Replies inherit the ' +
+      "parent's anchor and take no selection. If the call fails with a " +
+      '"selection not found" error, retry with a corrected EXACT selection ' +
+      'copied verbatim from a single paragraph/block. You may also attach a ' +
+      '`suggestedText` proposing a replacement for the `selection` (a human ' +
+      'applies it from the UI); when set, the `selection` must occur exactly ' +
+      'once in the page. Reversible via the comment UI.',
+    tier: 'core',
+    catalogLine:
+      'createComment — add an inline comment (optionally with a suggested edit).',
+    // Reconciled schema: the field set is identical across both layers; the
+    // only constraint drift is `content`, which the MCP copy pinned to
+    // .min(1) while the in-app copy left unbounded — the stricter MCP form is
+    // kept (an empty comment body is never valid).
+    buildShape: (z) => ({
+      pageId: z.string().describe('The id of the page to comment on.'),
+      content: z.string().min(1).describe('The comment body as Markdown.'),
+      selection: z
+        .string()
+        .min(1)
+        .max(250)
+        .optional()
+        .describe(
+          'EXACT contiguous text from a SINGLE paragraph/block to anchor ' +
+            '(highlight) the comment on (<=250 chars, avoid spanning across ' +
+            'formatting boundaries). Required for a new top-level comment; ' +
+            'omit only when replying via parentCommentId.',
+        ),
+      parentCommentId: z
+        .string()
+        .optional()
+        .describe(
+          'Optional id of a TOP-LEVEL comment to reply to (one level ' +
+            'of replies only).',
+        ),
+      suggestedText: z
+        .string()
+        .min(1)
+        .max(2000)
+        .optional()
+        .describe(
+          'Optional proposed replacement (PLAIN TEXT) for the `selection`, ' +
+            'applied by a human via the UI (never auto-applied). REQUIRES a ' +
+            '`selection`; NOT allowed on a reply. When set, the `selection` ' +
+            'must be UNIQUE in the page — expand it with surrounding context ' +
+            '(still <=250 chars) if it occurs more than once, or the call is ' +
+            'refused.',
+        ),
+    }),
+  },
+
+  listComments: {
+    mcpName: 'list_comments',
+    inAppKey: 'listComments',
+    // CANONICAL: the two copies are near-identical; the MCP copy is the
+    // superset (it keeps the "(pagination is handled internally)" note the
+    // in-app copy dropped), so it is used verbatim.
+    description:
+      'List comments on a page in one call (pagination is handled ' +
+      'internally). By DEFAULT only ACTIVE threads are returned; resolved ' +
+      'threads (a resolved top-level comment and all its replies) are hidden ' +
+      'and their count reported as `resolvedThreadsHidden` so you can re-query ' +
+      'with `includeResolved: true` to see everything. Returns ' +
+      '`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.',
+    tier: 'core',
+    catalogLine:
+      'listComments — list all comments on a page (including resolved).',
+    buildShape: (z) => ({
+      pageId: z.string().describe('ID of the page'),
+      includeResolved: z
+        .boolean()
+        .optional()
+        .describe('default only active threads; true — include resolved'),
+    }),
+  },
+
+  resolveComment: {
+    mcpName: 'resolve_comment',
+    inAppKey: 'resolveComment',
+    // CANONICAL: the MCP copy's richer wording, minus its snake_case reference
+    // to `delete_comment` (a sibling tool that does NOT exist in the in-app
+    // layer) — rephrased transport-neutrally per the registry convention.
+    description:
+      'Resolve (close) or reopen a top-level comment thread (reversible — ' +
+      'pass resolved=false to reopen). Only top-level comments can be ' +
+      'resolved; the server rejects resolving a reply. Resolving keeps the ' +
+      'thread and its replies intact (it is not a deletion).',
+    tier: 'core',
+    catalogLine: 'resolveComment — resolve or reopen a comment thread.',
+    // Reconciled schema: `resolved` drifted — the MCP copy made it optional
+    // with .default(true) (resolve is the common case, documented), the in-app
+    // copy made it required. The MCP form is kept (a strict superset: it never
+    // rejects a previously-valid input and adds a sensible default), and
+    // commentId keeps the MCP copy's stricter .min(1).
+    buildShape: (z) => ({
+      commentId: z
+        .string()
+        .min(1)
+        .describe('ID of the top-level comment thread to resolve or reopen'),
+      resolved: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          'true (default) marks the thread resolved/closed; false reopens it',
+        ),
+    }),
+  },
+
+  checkNewComments: {
+    mcpName: 'check_new_comments',
+    inAppKey: 'checkNewComments',
+    // CANONICAL: the MCP copy (the more detailed of the two). The MCP layer's
+    // execute-side guard that rejects an unparseable `since` timestamp stays in
+    // its execute body (per-layer logic), not in the shared schema.
+    description:
+      'Check for new comments across pages in a space since a given ' +
+      'timestamp. Optionally scope to a page subtree (folder). Returns only ' +
+      'comments created after the specified time.',
+    tier: 'deferred',
+    catalogLine:
+      'checkNewComments — find comments in a space created after a timestamp.',
+    // Reconciled schema: `since` keeps the MCP copy's stricter .min(1) (the
+    // in-app copy left it unbounded); field descriptions use the MCP copy's
+    // more detailed wording (it carries an example timestamp).
+    buildShape: (z) => ({
+      spaceId: z.string().describe('Space ID to check for new comments'),
+      since: z
+        .string()
+        .min(1)
+        .describe(
+          "ISO 8601 timestamp — only return comments created after this time " +
+            "(e.g. '2026-03-10T00:00:00Z')",
+        ),
+      parentPageId: z
+        .string()
+        .optional()
+        .describe(
+          'Optional root page ID to scope the check to a subtree (folder). ' +
+            'Only pages under this parent will be checked.',
+        ),
+    }),
+  },
+
+  // --- table tools (unified from the per-layer inline definitions, #294) ---
+  //
+  // These tools carried a "NOT shared" note in BOTH layers because of a single
+  // parameter-NAME drift: the MCP layer named the table reference `table` while
+  // the in-app layer named it `tableRef`. #294 reconciles that drift by unifying
+  // on the MCP name `table` — renaming the MCP public parameter would break
+  // external MCP clients, whereas the in-app parameter is model-facing
+  // (prompt-only) and safe to rename. The in-app execute bodies now destructure
+  // `table` instead of `tableRef` (nothing else changes). Descriptions take the
+  // MCP copy's richer wording (it documented `#<index>`, padding, header-row
+  // behavior) plus the in-app copy's "Reversible via page history" note; sibling
+  // tool references are phrased transport-neutrally.
+  //
+  // NOT here (kept inline in index.ts): table_get / getTable. Its MCP tool name
+  // is noun-first (`table_get`) while the in-app key is verb-first (`getTable`),
+  // so it breaks the snake_case(inAppKey) naming convention the registry enforces
+  // (shared-tool-specs.contract.spec.ts). Renaming the public MCP tool would
+  // break external clients, so it stays per-transport (its in-app param was still
+  // aligned to `table` for consistency with the migrated trio below).
+
+  tableInsertRow: {
+    mcpName: 'table_insert_row',
+    inAppKey: 'tableInsertRow',
+    description:
+      'Insert a row of plain-text cells into a table. `table` is `#<index>` ' +
+      'from the page outline, or a block id inside it. `cells` is the text per ' +
+      "column (padded to the table's column count; an error if more cells than " +
+      'columns). `index` is the 0-based insert position (0 inserts before the ' +
+      'header); omit to append at the end. Reversible via page history.',
+    tier: 'deferred',
+    catalogLine: 'tableInsertRow — insert a row of plain-text cells into a table.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page.'),
+      table: z
+        .string()
+        .min(1)
+        .describe('"#<index>" from the page outline, or a block id in the table.'),
+      cells: z.array(z.string()).describe('The cell texts for the row (one per column).'),
+      index: z
+        .number()
+        .int()
+        .optional()
+        .describe('0-based insert position (0 inserts before the header); omit to append.'),
+    }),
+  },
+
+  tableDeleteRow: {
+    mcpName: 'table_delete_row',
+    inAppKey: 'tableDeleteRow',
+    description:
+      'Delete the row at 0-based `index` from a table (`table` is `#<index>` ' +
+      'from the page outline, or a block id inside it). Refuses to delete the ' +
+      "table's only row; an out-of-range `index` throws. Deleting `index` 0 " +
+      'removes the header row, and the next row becomes the new header. ' +
+      'Reversible via page history.',
+    tier: 'deferred',
+    catalogLine: 'tableDeleteRow — delete a table row at a 0-based index.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page.'),
+      table: z
+        .string()
+        .min(1)
+        .describe('"#<index>" from the page outline, or a block id in the table.'),
+      index: z.number().int().describe('0-based row index to delete.'),
+    }),
+  },
+
+  tableUpdateCell: {
+    mcpName: 'table_update_cell',
+    inAppKey: 'tableUpdateCell',
+    description:
+      'Set the plain-text content of cell [row, col] (0-based) in a table ' +
+      '(`table` is `#<index>` from the page outline, or a block id inside it). ' +
+      "Replaces the cell's content with a single text paragraph; for rich " +
+      "formatting, patch the cell's paragraph id (obtained from reading the " +
+      'table) instead. Reversible via page history.',
+    tier: 'deferred',
+    catalogLine: 'tableUpdateCell — set the text of a table cell at [row, col].',
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page.'),
+      table: z
+        .string()
+        .min(1)
+        .describe('"#<index>" from the page outline, or a block id in the table.'),
+      row: z.number().int().describe('0-based row index.'),
+      col: z.number().int().describe('0-based column index.'),
+      text: z.string().describe('The new cell text.'),
     }),
   },
 } satisfies Record<string, SharedToolSpec>;

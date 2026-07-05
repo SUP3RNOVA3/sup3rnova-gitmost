@@ -316,50 +316,27 @@ export class AiChatToolsService {
         execute: async () => resolveCurrentPageResult(openedPage),
       }),
 
-      getPage: tool({
-        description:
-          'Fetch a single page as Markdown by its page id. Returns the page ' +
-          'title and its Markdown content. Inline <span data-comment-id> tags ' +
-          'in the markdown are comment highlight anchors (also present for ' +
-          'RESOLVED threads) — treat them as markup, not page text.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id (or slugId) of the page.'),
-        }),
-        execute: async ({ pageId }) => {
-          // getPage(pageId) -> { data: filterPage(page, markdown), success }.
-          const result = await client.getPage(pageId);
-          const data = (result?.data ?? {}) as {
-            title?: string;
-            content?: string;
-          };
-          return {
-            title: data.title ?? '',
-            markdown: typeof data.content === 'string' ? data.content : '',
-          };
-        },
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // The execute body keeps this layer's { title, markdown } projection.
+      getPage: sharedTool(sharedToolSpecs.getPage, async ({ pageId }) => {
+        // getPage(pageId) -> { data: filterPage(page, markdown), success }.
+        const result = await client.getPage(pageId);
+        const data = (result?.data ?? {}) as {
+          title?: string;
+          content?: string;
+        };
+        return {
+          title: data.title ?? '',
+          markdown: typeof data.content === 'string' ? data.content : '',
+        };
       }),
 
       // --- WRITE tools (all reversible — history/trash; §6.5 / D3) ---
 
-      createPage: tool({
-        description:
-          'Create a new page with a Markdown body in a space, optionally under ' +
-          'a parent page. Returns the new page id and title. Reversible: a page ' +
-          'can be moved to trash later.',
-        inputSchema: modelFriendlyInput({
-          title: z.string().describe('The title of the new page.'),
-          content: z
-            .string()
-            .describe('The page body as Markdown (may be empty).'),
-          spaceId: z
-            .string()
-            .describe('The id of the space to create the page in.'),
-          parentPageId: z
-            .string()
-            .optional()
-            .describe('Optional parent page id to nest the new page under.'),
-        }),
-        execute: async ({ title, content, spaceId, parentPageId }) => {
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      createPage: sharedTool(
+        sharedToolSpecs.createPage,
+        async ({ title, content, spaceId, parentPageId }) => {
           // createPage(title, content, spaceId, parentPageId?) ->
           // { data: filterPage(page, markdown), success }.
           const result = await client.createPage(
@@ -375,7 +352,7 @@ export class AiChatToolsService {
           };
           return { id: data.id ?? data.slugId, title: data.title ?? title };
         },
-      }),
+      ),
 
       updatePageContent: tool({
         description:
@@ -399,115 +376,46 @@ export class AiChatToolsService {
         },
       }),
 
-      renamePage: tool({
-        description:
-          "Rename a page (change its title only; the body is untouched). " +
-          'Reversible: rename back at any time.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to rename.'),
-          title: z.string().describe('The new title.'),
-        }),
-        execute: async ({ pageId, title }) => {
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      renamePage: sharedTool(
+        sharedToolSpecs.renamePage,
+        async ({ pageId, title }) => {
           // renamePage(pageId, title) -> { success, pageId, title }.
           await client.renamePage(pageId, title);
           return { pageId, title };
         },
-      }),
+      ),
 
-      movePage: tool({
-        description:
-          'Move a page under a new parent page, or to the space root when no ' +
-          'parent is given. Reversible: move it back at any time.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to move.'),
-          parentPageId: z
-            .string()
-            .nullable()
-            .optional()
-            .describe(
-              'Target parent page id. Null/omitted moves the page to the ' +
-                'space root.',
-            ),
-        }),
-        execute: async ({ pageId, parentPageId }) => {
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // The shared schema adds the optional `position` field this layer lacked
+      // before; the execute now forwards it (the client already accepted it).
+      movePage: sharedTool(
+        sharedToolSpecs.movePage,
+        async ({ pageId, parentPageId, position }) => {
           // movePage(pageId, parentPageId, position?) -> raw move response.
-          await client.movePage(pageId, parentPageId ?? null);
+          await client.movePage(pageId, parentPageId ?? null, position);
           return { pageId, parentPageId: parentPageId ?? null, moved: true };
         },
+      ),
+
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // GUARDRAIL (§14 H4) preserved: the shared schema exposes ONLY pageId, so
+      // permanentlyDelete/forceDelete are never part of the input and can never
+      // be forwarded — the agent physically cannot permanently delete a page.
+      deletePage: sharedTool(sharedToolSpecs.deletePage, async ({ pageId }) => {
+        // deletePage(pageId) hits POST /pages/delete with { pageId } only,
+        // which is the soft-delete (trash) path on the server.
+        await client.deletePage(pageId);
+        return { pageId, trashed: true };
       }),
 
-      deletePage: tool({
-        description:
-          'Move a page to the trash (SOFT delete only — fully reversible; the ' +
-          'page can be restored from trash). This NEVER permanently deletes.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to move to trash.'),
-        }),
-        // GUARDRAIL (§14 H4): the only field ever passed to the client is
-        // pageId. permanentlyDelete/forceDelete are not part of the schema and
-        // are never forwarded, so the agent physically cannot permanently
-        // delete a page through this tool.
-        execute: async ({ pageId }) => {
-          // deletePage(pageId) hits POST /pages/delete with { pageId } only,
-          // which is the soft-delete (trash) path on the server.
-          await client.deletePage(pageId);
-          return { pageId, trashed: true };
-        },
-      }),
-
-      // INTENTIONAL per-transport divergence (not shared): the description is
-      // tuned for the in-app agent (e.g. "retry with a corrected EXACT selection"
-      // and "Reversible via the comment UI"); the standalone MCP `create_comment`
-      // keeps its own wording. Kept per-layer.
-      createComment: tool({
-        description:
-          'Add an INLINE comment to a page, or reply to an existing top-level ' +
-          'comment (one level only — the backend rejects replies to replies). ' +
-          'The comment is anchored inline to the given exact `selection` text ' +
-          '(which gets highlighted); page-level comments are NOT supported. A ' +
-          "new top-level comment REQUIRES a `selection`. Replies inherit the " +
-          "parent's anchor and take no selection. If the call fails with a " +
-          '"selection not found" error, retry with a corrected EXACT selection ' +
-          'copied verbatim from a single paragraph/block. You may also attach a ' +
-          '`suggestedText` proposing a replacement for the `selection` (a human ' +
-          'applies it from the UI); when set, the `selection` must occur exactly ' +
-          'once in the page. Reversible via the comment UI.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to comment on.'),
-          content: z.string().describe('The comment body as Markdown.'),
-          selection: z
-            .string()
-            .min(1)
-            .max(250)
-            .optional()
-            .describe(
-              'EXACT contiguous text from a SINGLE paragraph/block to anchor ' +
-                '(highlight) the comment on (<=250 chars, avoid spanning across ' +
-                'formatting boundaries). Required for a new top-level comment; ' +
-                'omit only when replying via parentCommentId.',
-            ),
-          parentCommentId: z
-            .string()
-            .optional()
-            .describe(
-              'Optional id of a TOP-LEVEL comment to reply to (one level ' +
-                'of replies only).',
-            ),
-          suggestedText: z
-            .string()
-            .min(1)
-            .max(2000)
-            .optional()
-            .describe(
-              'Optional proposed replacement (PLAIN TEXT) for the `selection`, ' +
-                'applied by a human via the UI (never auto-applied). REQUIRES a ' +
-                '`selection`; NOT allowed on a reply. When set, the `selection` ' +
-                'must be UNIQUE in the page — expand it with surrounding context ' +
-                '(still <=250 chars) if it occurs more than once, or the call is ' +
-                'refused.',
-            ),
-        }),
-        execute: async ({
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // This layer keeps only its own execute-side guards (require a selection
+      // for a top-level comment; reject suggestedText on a reply / without a
+      // selection) — the schema+description are shared.
+      createComment: sharedTool(
+        sharedToolSpecs.createComment,
+        async ({
           pageId,
           content,
           selection,
@@ -548,26 +456,17 @@ export class AiChatToolsService {
           const data = (result?.data ?? {}) as { id?: string };
           return { commentId: data.id, pageId };
         },
-      }),
+      ),
 
-      resolveComment: tool({
-        description:
-          'Resolve or reopen a top-level comment thread (reversible — toggle ' +
-          'the resolved flag). Only top-level comments can be resolved.',
-        inputSchema: modelFriendlyInput({
-          commentId: z
-            .string()
-            .describe('The id of the top-level comment to resolve/reopen.'),
-          resolved: z
-            .boolean()
-            .describe('true to resolve the thread, false to reopen it.'),
-        }),
-        execute: async ({ commentId, resolved }) => {
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      resolveComment: sharedTool(
+        sharedToolSpecs.resolveComment,
+        async ({ commentId, resolved }) => {
           // resolveComment(commentId, resolved) -> { success, commentId, resolved }.
           await client.resolveComment(commentId, resolved);
           return { commentId, resolved };
         },
-      }),
+      ),
 
       // --- READ tools (added) ---
 
@@ -585,33 +484,12 @@ export class AiChatToolsService {
       // hierarchy mode but is worded for the in-app agent; the standalone MCP
       // `list_pages` carries its own wording. Kept per-layer so each side tunes
       // its own guidance.
-      listPages: tool({
-        description:
-          'List the most recent pages, optionally scoped to a single space. ' +
-          'Returns a bounded list (default 50, max 100). Pass tree:true (with ' +
-          "spaceId) to instead get the space's full page hierarchy as a nested tree.",
-        inputSchema: modelFriendlyInput({
-          spaceId: z
-            .string()
-            .optional()
-            .describe('Optional space id to scope the listing to.'),
-          limit: z
-            .number()
-            .int()
-            .min(1)
-            .max(100)
-            .optional()
-            .describe('Maximum number of pages (1-100).'),
-          tree: z
-            .boolean()
-            .optional()
-            .describe(
-              'When true, return the full page hierarchy of the given space as a nested tree (children arrays) instead of the recent-pages flat list. Requires spaceId; ignores limit.',
-            ),
-        }),
-        execute: async ({ spaceId, limit, tree }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      listPages: sharedTool(
+        sharedToolSpecs.listPages,
+        async ({ spaceId, limit, tree }) =>
           await client.listPages(spaceId, limit, tree),
-      }),
+      ),
 
       listSidebarPages: tool({
         description:
@@ -656,41 +534,34 @@ export class AiChatToolsService {
           }),
       ),
 
+      // NOT shared (kept inline): the MCP tool name `table_get` is noun-first
+      // while this key is `getTable` (verb-first), breaking the
+      // snake_case(inAppKey) convention the shared registry enforces. Its
+      // reference parameter is still named `table` (was `tableRef`) so it matches
+      // the migrated table row/cell tools below.
       getTable: tool({
         description:
           'Read a table as a matrix of cell texts (plus a parallel cellIds ' +
           'matrix so cells can be addressed for rich edits).',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page.'),
-          tableRef: z
+          table: z
             .string()
             .describe(
-              '"#<index>" from getOutline, or a block id of any node inside ' +
-                'the table.',
+              '"#<index>" from the page outline, or a block id of any node ' +
+                'inside the table.',
             ),
         }),
-        execute: async ({ pageId, tableRef }) =>
-          await client.getTable(pageId, tableRef),
+        execute: async ({ pageId, table }) =>
+          await client.getTable(pageId, table),
       }),
 
-      listComments: tool({
-        description:
-          'List comments on a page in one call. By DEFAULT only ACTIVE ' +
-          'threads are returned; resolved threads (a resolved top-level ' +
-          'comment and all its replies) are hidden and their count reported ' +
-          'as `resolvedThreadsHidden` so you can re-query with ' +
-          '`includeResolved: true` to see everything. Returns ' +
-          '`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          includeResolved: z
-            .boolean()
-            .optional()
-            .describe('default only active threads; true — include resolved'),
-        }),
-        execute: async ({ pageId, includeResolved }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      listComments: sharedTool(
+        sharedToolSpecs.listComments,
+        async ({ pageId, includeResolved }) =>
           await client.listComments(pageId, includeResolved),
-      }),
+      ),
 
       getComment: tool({
         description: 'Fetch a single comment by id (content as Markdown).',
@@ -700,26 +571,12 @@ export class AiChatToolsService {
         execute: async ({ commentId }) => await client.getComment(commentId),
       }),
 
-      checkNewComments: tool({
-        description:
-          'Find new comments across a space (optionally scoped to a subtree) ' +
-          'created after a given timestamp.',
-        inputSchema: modelFriendlyInput({
-          spaceId: z.string().describe('The id of the space to scan.'),
-          since: z
-            .string()
-            .describe('An ISO-8601 timestamp; only comments created after it.'),
-          parentPageId: z
-            .string()
-            .optional()
-            .describe(
-              'Optional page id to scope the scan to that page and its ' +
-                'descendants.',
-            ),
-        }),
-        execute: async ({ spaceId, since, parentPageId }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      checkNewComments: sharedTool(
+        sharedToolSpecs.checkNewComments,
+        async ({ spaceId, since, parentPageId }) =>
           await client.checkNewComments(spaceId, since, parentPageId),
-      }),
+      ),
 
       listShares: sharedTool(
         sharedToolSpecs.listShares,
@@ -749,19 +606,14 @@ export class AiChatToolsService {
           await client.diffPageVersions(pageId, from, to),
       ),
 
-      exportPageMarkdown: tool({
-        description:
-          'Export a page to a single self-contained Docmost-flavoured ' +
-          'Markdown file (meta + body + comment threads). Lossless round-trip ' +
-          'with importPageMarkdown.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to export.'),
-        }),
-        execute: async ({ pageId }) => {
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      exportPageMarkdown: sharedTool(
+        sharedToolSpecs.exportPageMarkdown,
+        async ({ pageId }) => {
           const markdown = await client.exportPageMarkdown(pageId);
           return { markdown };
         },
-      }),
+      ),
 
       // --- WRITE tools (added; reversible via page history/trash) ---
 
@@ -811,28 +663,12 @@ export class AiChatToolsService {
         async ({ pageId, nodeId }) => await client.deleteNode(pageId, nodeId),
       ),
 
-      updatePageJson: tool({
-        description:
-          "Replace a page's body with a full ProseMirror document — a full " +
-          'overwrite — and/or update its title. Minimal example content: ' +
-          '{"type":"doc","content":[{"type":"paragraph","content":' +
-          '[{"type":"text","text":"Hi"}]}]}. The content arg may be a JSON ' +
-          'object or a JSON string (both accepted). Omit content for a ' +
-          'title-only update. Reversible: the previous version is kept in page ' +
-          'history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to update.'),
-          content: z
-            .any()
-            .optional()
-            .describe(
-              'Full ProseMirror doc {"type":"doc","content":[...]} (JSON ' +
-                'object or JSON string); omit for a title-only update.',
-            ),
-          title: z.string().optional().describe('Optional new title.'),
-        }),
-        execute: async ({ pageId, content, title }) => {
-          // Parity with the standalone MCP server (index.ts update_page_json):
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // The execute body keeps this layer's content normalization (parity with
+      // the standalone MCP server, index.ts update_page_json).
+      updatePageJson: sharedTool(
+        sharedToolSpecs.updatePageJson,
+        async ({ pageId, content, title }) => {
           // undefined/null pass through as undefined (title-only / no-op); any
           // string is JSON.parsed (so an empty string "" throws, matching the
           // MCP server); an object is passed through unchanged.
@@ -845,66 +681,29 @@ export class AiChatToolsService {
           }
           return await client.updatePageJson(pageId, doc, title);
         },
-      }),
+      ),
 
-      // NOT in the shared registry: this layer names the table argument
-      // `tableRef`, while the standalone MCP tool names it `table` (index.ts).
-      // Sharing one buildShape would rename a model-facing parameter on one
-      // transport, so the table row/cell tools stay per-layer by design.
-      tableInsertRow: tool({
-        description:
-          'Insert a row of plain-text cells into a table. Reversible via ' +
-          'page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          tableRef: z
-            .string()
-            .describe('"#<index>" from getOutline, or a block id in the table.'),
-          cells: z.array(z.string()).describe('The cell texts for the row.'),
-          index: z
-            .number()
-            .int()
-            .optional()
-            .describe('0-based insert position (omit/out-of-range to append).'),
-        }),
-        execute: async ({ pageId, tableRef, cells, index }) =>
-          await client.tableInsertRow(pageId, tableRef, cells, index),
-      }),
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // The table reference parameter was unified to `table` (was `tableRef`).
+      tableInsertRow: sharedTool(
+        sharedToolSpecs.tableInsertRow,
+        async ({ pageId, table, cells, index }) =>
+          await client.tableInsertRow(pageId, table, cells, index),
+      ),
 
-      // NOT shared — same `tableRef` (here) vs `table` (MCP) parameter-name
-      // divergence as tableInsertRow.
-      tableDeleteRow: tool({
-        description:
-          'Delete a table row at a 0-based index. Reversible via page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          tableRef: z
-            .string()
-            .describe('"#<index>" from getOutline, or a block id in the table.'),
-          index: z.number().int().describe('0-based row index to delete.'),
-        }),
-        execute: async ({ pageId, tableRef, index }) =>
-          await client.tableDeleteRow(pageId, tableRef, index),
-      }),
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      tableDeleteRow: sharedTool(
+        sharedToolSpecs.tableDeleteRow,
+        async ({ pageId, table, index }) =>
+          await client.tableDeleteRow(pageId, table, index),
+      ),
 
-      // NOT shared — same `tableRef` (here) vs `table` (MCP) parameter-name
-      // divergence as tableInsertRow.
-      tableUpdateCell: tool({
-        description:
-          'Set the plain-text content of a table cell at [row, col] (0-based). ' +
-          'Reversible via page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page.'),
-          tableRef: z
-            .string()
-            .describe('"#<index>" from getOutline, or a block id in the table.'),
-          row: z.number().int().describe('0-based row index.'),
-          col: z.number().int().describe('0-based column index.'),
-          text: z.string().describe('The new cell text.'),
-        }),
-        execute: async ({ pageId, tableRef, row, col, text }) =>
-          await client.tableUpdateCell(pageId, tableRef, row, col, text),
-      }),
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      tableUpdateCell: sharedTool(
+        sharedToolSpecs.tableUpdateCell,
+        async ({ pageId, table, row, col, text }) =>
+          await client.tableUpdateCell(pageId, table, row, col, text),
+      ),
 
       copyPageContent: sharedTool(
         sharedToolSpecs.copyPageContent,
@@ -918,25 +717,14 @@ export class AiChatToolsService {
           await client.importPageMarkdown(pageId, markdown),
       ),
 
-      // INTENTIONAL per-transport divergence (not shared): adds a security
-      // confirmation framing ("Only share when the user explicitly asked, since
-      // this exposes the page to anyone with the link") for the in-app agent; the
-      // standalone MCP `share_page` keeps the plain public-URL wording.
-      sharePage: tool({
-        description:
-          'Make a page PUBLICLY accessible and return its public URL. ' +
-          'Reversible via unsharePage. Only share when the user explicitly ' +
-          'asked, since this exposes the page to anyone with the link.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to share.'),
-          searchIndexing: z
-            .boolean()
-            .optional()
-            .describe('Allow public search engines to index it (default true).'),
-        }),
-        execute: async ({ pageId, searchIndexing }) =>
+      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
+      // Both layers already carried the security-confirmation framing, so there
+      // was no real divergence to preserve — only wording drift.
+      sharePage: sharedTool(
+        sharedToolSpecs.sharePage,
+        async ({ pageId, searchIndexing }) =>
           await client.sharePage(pageId, searchIndexing),
-      }),
+      ),
 
       unsharePage: sharedTool(
         sharedToolSpecs.unsharePage,

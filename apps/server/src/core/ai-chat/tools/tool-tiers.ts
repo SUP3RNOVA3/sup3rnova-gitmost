@@ -100,53 +100,25 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'core',
     catalogLine: 'getCurrentPage — the page the user is currently viewing.',
   },
-  getPage: {
-    tier: 'core',
-    catalogLine: 'getPage — fetch a page as Markdown by its id.',
-  },
-  listPages: {
-    tier: 'core',
-    catalogLine: "listPages — list recent pages, or a space's full page tree.",
-  },
-  listComments: {
-    tier: 'core',
-    catalogLine: 'listComments — list all comments on a page (including resolved).',
-  },
+  // NOTE: getPage and listPages moved to @docmost/mcp's SHARED_TOOL_SPECS
+  // (#294); they carry their own tier ('core') + catalogLine there.
+  // NOTE: createComment, listComments and resolveComment moved to
+  // @docmost/mcp's SHARED_TOOL_SPECS (#294); they carry their own tier +
+  // catalogLine there. getComment stays inline (MCP-only shape divergence is
+  // n/a — it simply has no shared spec).
   getComment: {
     tier: 'core',
     catalogLine: 'getComment — fetch a single comment by id.',
   },
-  createComment: {
-    tier: 'core',
-    catalogLine:
-      'createComment — add an inline comment (optionally with a suggested edit).',
-  },
-  resolveComment: {
-    tier: 'core',
-    catalogLine: 'resolveComment — resolve or reopen a comment thread.',
-  },
 
   // --- deferred inline ---
-  createPage: {
-    tier: 'deferred',
-    catalogLine: 'createPage — create a new page with a Markdown body in a space.',
-  },
+  // NOTE: createPage, renamePage, movePage, deletePage, updatePageJson and
+  // exportPageMarkdown moved to @docmost/mcp's SHARED_TOOL_SPECS (#294); they
+  // carry their own deferred tier + catalogLine there.
   updatePageContent: {
     tier: 'deferred',
     catalogLine:
       "updatePageContent — replace a page's body (and optionally title) with new Markdown.",
-  },
-  renamePage: {
-    tier: 'deferred',
-    catalogLine: "renamePage — change a page's title only (body untouched).",
-  },
-  movePage: {
-    tier: 'deferred',
-    catalogLine: 'movePage — move a page under a new parent or to the space root.',
-  },
-  deletePage: {
-    tier: 'deferred',
-    catalogLine: 'deletePage — move a page to trash (soft delete, reversible).',
   },
   listSidebarPages: {
     tier: 'deferred',
@@ -157,42 +129,21 @@ export const INLINE_TOOL_TIERS: Record<
     tier: 'deferred',
     catalogLine: 'getTable — read a table as a matrix of cell texts and cell ids.',
   },
-  checkNewComments: {
-    tier: 'deferred',
-    catalogLine:
-      'checkNewComments — find comments in a space created after a timestamp.',
-  },
+  // NOTE: tableInsertRow, tableDeleteRow and tableUpdateCell moved to
+  // @docmost/mcp's SHARED_TOOL_SPECS (#294); they carry their own deferred tier +
+  // catalogLine there. getTable stays inline (its MCP name table_get breaks the
+  // snake_case(inAppKey) convention, so it has no shared spec).
+  // NOTE: checkNewComments moved to @docmost/mcp's SHARED_TOOL_SPECS (#294);
+  // it carries its own deferred tier + catalogLine there.
   getPageHistory: {
     tier: 'deferred',
     catalogLine:
       'getPageHistory — fetch one page-history version with its ProseMirror content.',
   },
-  exportPageMarkdown: {
-    tier: 'deferred',
-    catalogLine:
-      'exportPageMarkdown — export a page to self-contained Markdown (body + comments).',
-  },
-  updatePageJson: {
-    tier: 'deferred',
-    catalogLine:
-      "updatePageJson — overwrite a page's body with a full ProseMirror document.",
-  },
-  tableInsertRow: {
-    tier: 'deferred',
-    catalogLine: 'tableInsertRow — insert a row of plain-text cells into a table.',
-  },
-  tableDeleteRow: {
-    tier: 'deferred',
-    catalogLine: 'tableDeleteRow — delete a table row at a 0-based index.',
-  },
-  tableUpdateCell: {
-    tier: 'deferred',
-    catalogLine: 'tableUpdateCell — set the text of a table cell at [row, col].',
-  },
-  sharePage: {
-    tier: 'deferred',
-    catalogLine: 'sharePage — make a page publicly accessible and return its URL.',
-  },
+  // NOTE: sharePage moved to @docmost/mcp's SHARED_TOOL_SPECS (#294); it carries
+  // its own deferred tier + catalogLine there. transformPage stays inline (its
+  // schema deliberately diverges — it omits the deleteComments field the MCP
+  // docmost_transform exposes, a comment-deletion guardrail).
   transformPage: {
     tier: 'deferred',
     catalogLine: "transformPage — run a sandboxed JS transform over a page's document.",

@@ -118,56 +118,19 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
 // transport exposes a `tree:true` mode that returns the full nested hierarchy;
 // the in-app copy keeps the same tree option but is worded for the in-app agent.
 // Kept per-layer so each side can tune its own guidance.
-server.registerTool(
-  "list_pages",
-  {
-    description:
-      "List most recent pages in a space ordered by updatedAt (descending). " +
-      "Returns a bounded list (default 50, max 100) — use search for lookups " +
-      "in large spaces. Pass tree:true (with spaceId) to instead get the " +
-      "space's full page hierarchy as a nested tree.",
-    inputSchema: {
-      spaceId: z.string().optional(),
-      limit: z
-        .number()
-        .int()
-        .min(1)
-        .max(100)
-        .optional()
-        .describe("Max pages to return (default 50, max 100)"),
-      tree: z
-        .boolean()
-        .optional()
-        .describe(
-          "When true, return the space's full page hierarchy as a nested tree (each node has a children array) instead of the recent-by-updatedAt flat list. Requires spaceId; ignores limit.",
-        ),
-    },
-  },
-  async ({ spaceId, limit, tree }) => {
-    const result = await docmostClient.listPages(spaceId, limit ?? 50, tree ?? false);
-    return jsonContent(result);
-  },
-);
+// Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294). This
+// transport keeps applying its own defaults (limit=50, tree=false) in execute.
+registerShared(SHARED_TOOL_SPECS.listPages, async ({ spaceId, limit, tree }) => {
+  const result = await docmostClient.listPages(spaceId, limit ?? 50, tree ?? false);
+  return jsonContent(result);
+});
 
 // Tool: get_page
-server.registerTool(
-  "get_page",
-  {
-    description:
-      "Get page details with content converted to Markdown. The conversion is " +
-      "LOSSY (block ids, exact table/callout structure are approximated); for a " +
-      "lossless representation use get_page_json. Inline <span data-comment-id> " +
-      "tags in the markdown are comment highlight anchors (also present for " +
-      "RESOLVED threads) — treat them as markup, not page text.",
-    inputSchema: {
-      pageId: z.string().min(1),
-    },
-  },
-  async ({ pageId }) => {
-    const page = await docmostClient.getPage(pageId);
-    return jsonContent(page);
-  },
-);
+// Schema + description now live in the shared registry (#294).
+registerShared(SHARED_TOOL_SPECS.getPage, async ({ pageId }) => {
+  const page = await docmostClient.getPage(pageId);
+  return jsonContent(page);
+});
 
 // Tool: get_page_json
 registerShared(SHARED_TOOL_SPECS.getPageJson, async ({ pageId }) => {
@@ -201,6 +164,10 @@ registerShared(
 );
 
 // Tool: table_get
+// NOT in the shared registry: the MCP tool name `table_get` is noun-first while
+// the in-app key is `getTable` (verb-first), breaking the snake_case(inAppKey)
+// convention the shared registry enforces (shared-tool-specs.contract.spec.ts).
+// Renaming the public MCP tool would break external clients, so it stays inline.
 server.registerTool(
   "table_get",
   {
@@ -223,25 +190,10 @@ server.registerTool(
 );
 
 // Tool: table_insert_row
-// NOT in the shared registry: this transport names the table argument `table`,
-// while the in-app tool names it `tableRef` (ai-chat-tools.service.ts). Sharing
-// one buildShape would rename a public MCP parameter, so the table row/cell
-// tools stay per-transport by design.
-server.registerTool(
-  "table_insert_row",
-  {
-    description:
-      "Insert a row of plain-text cells into a table. `table` = `#<index>` or " +
-      "a block id inside it. `cells` = text per column (padded to the table's " +
-      "column count; error if more cells than columns). `index` = 0-based " +
-      "insert position (0 inserts before the header); omit to append at the end.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      table: z.string().min(1),
-      cells: z.array(z.string()),
-      index: z.number().int().optional(),
-    },
-  },
+// Schema + description now live in the shared registry (#294); the `table`
+// parameter name is the canonical one (the in-app layer was unified to it).
+registerShared(
+  SHARED_TOOL_SPECS.tableInsertRow,
   async ({ pageId, table, cells, index }) => {
     const result = await docmostClient.tableInsertRow(
       pageId,
@@ -254,22 +206,9 @@ server.registerTool(
 );
 
 // Tool: table_delete_row
-// NOT shared — same `table` (here) vs `tableRef` (in-app) parameter-name
-// divergence as table_insert_row.
-server.registerTool(
-  "table_delete_row",
-  {
-    description:
-      "Delete the row at 0-based `index` from a table (`table` = `#<index>` or " +
-      "a block id inside it). Refuses to delete the table's only row. An " +
-      "out-of-range `index` throws. Deleting `index` 0 removes the header row, " +
-      "and the next row becomes the new header.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      table: z.string().min(1),
-      index: z.number().int(),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.tableDeleteRow,
   async ({ pageId, table, index }) => {
     const result = await docmostClient.tableDeleteRow(pageId, table, index);
     return jsonContent(result);
@@ -277,24 +216,9 @@ server.registerTool(
 );
 
 // Tool: table_update_cell
-// NOT shared — same `table` (here) vs `tableRef` (in-app) parameter-name
-// divergence as table_insert_row.
-server.registerTool(
-  "table_update_cell",
-  {
-    description:
-      "Set the plain-text content of cell [row,col] (0-based) in a table " +
-      "(`table` = `#<index>` or a block id inside it). Replaces the cell's " +
-      "content with a single text paragraph; for rich formatting use patch_node " +
-      "on the cell's paragraph id from table_get.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      table: z.string().min(1),
-      row: z.number().int(),
-      col: z.number().int(),
-      text: z.string(),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.tableUpdateCell,
   async ({ pageId, table, row, col, text }) => {
     const result = await docmostClient.tableUpdateCell(
       pageId,
@@ -308,22 +232,9 @@ server.registerTool(
 );
 
 // Tool: create_page
-server.registerTool(
-  "create_page",
-  {
-    description:
-      "Create a new page from Markdown in a space. Pass parentPageId to nest " +
-      "it under a parent; omit it to create at the space root.",
-    inputSchema: {
-      title: z.string().min(1).describe("Title of the page"),
-      content: z.string().min(1).describe("Markdown content"),
-      spaceId: z.string().min(1),
-      parentPageId: z
-        .string()
-        .optional()
-        .describe("Optional parent page ID to nest under"),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.createPage,
   async ({ title, content, spaceId, parentPageId }) => {
     const result = await docmostClient.createPage(
       title,
@@ -336,32 +247,11 @@ server.registerTool(
 );
 
 // Tool: update_page_json
-server.registerTool(
-  "update_page_json",
-  {
-    description:
-      "Replace a page's content with a raw ProseMirror JSON document " +
-      "(lossless write: preserves the block ids, callouts, tables and " +
-      "attributes you pass in). Typical flow: get_page_json -> modify the " +
-      "JSON -> update_page_json. Keep existing node ids intact so heading " +
-      "anchors and history stay stable. Minimal full-doc example: " +
-      '{"type":"doc","content":[{"type":"paragraph","content":' +
-      '[{"type":"text","text":"Hi"}]}]}. `content` may be a JSON object or a ' +
-      "JSON string (both accepted), and is OPTIONAL: omit it to update only " +
-      "the title (though prefer rename_page for a title-only change). " +
-      "Supplying neither content nor title is an error.",
-    inputSchema: {
-      pageId: z.string().min(1).describe("ID of the page to update"),
-      content: z
-        .any()
-        .optional()
-        .describe(
-          'ProseMirror document {"type":"doc","content":[...]} (JSON object or ' +
-            "JSON string). Omit to rename only.",
-        ),
-      title: z.string().optional().describe("Optional new title"),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's content normalization (parse a JSON-string content,
+// pass undefined/null through for a title-only/no-op update).
+registerShared(
+  SHARED_TOOL_SPECS.updatePageJson,
   async ({ pageId, content, title }) => {
     // Only parse/validate the document when it was actually supplied; when it
     // is omitted, pass it straight through so the client performs a title-only
@@ -379,26 +269,11 @@ server.registerTool(
 );
 
 // Tool: export_page_markdown
-server.registerTool(
-  "export_page_markdown",
-  {
-    description:
-      "Export a page to a single self-contained, lossless Docmost-flavoured " +
-      "Markdown file (custom extensions): YAML-free meta header, body with " +
-      "inline comment anchors and diagrams, and a trailing comments-thread " +
-      "block. Designed for a download -> edit body -> import_page_markdown " +
-      "round-trip that preserves everything, including comment highlights. " +
-      "Comment THREADS are preserved in the file but are not re-pushed to the " +
-      "server on import.",
-    inputSchema: {
-      pageId: z.string().min(1),
-    },
-  },
-  async ({ pageId }) => {
-    const md = await docmostClient.exportPageMarkdown(pageId);
-    return { content: [{ type: "text" as const, text: md }] };
-  },
-);
+// Schema + description now live in the shared registry (#294).
+registerShared(SHARED_TOOL_SPECS.exportPageMarkdown, async ({ pageId }) => {
+  const md = await docmostClient.exportPageMarkdown(pageId);
+  return { content: [{ type: "text" as const, text: md }] };
+});
 
 // Tool: import_page_markdown
 registerShared(
@@ -422,22 +297,11 @@ registerShared(
 );
 
 // Tool: rename_page
-server.registerTool(
-  "rename_page",
-  {
-    description:
-      "Rename a page (change its title only) without touching or resending " +
-      "its content.",
-    inputSchema: {
-      pageId: z.string().min(1).describe("ID of the page to rename"),
-      title: z.string().min(1).describe("New title"),
-    },
-  },
-  async ({ pageId, title }) => {
-    const result = await docmostClient.renamePage(pageId, title);
-    return jsonContent(result);
-  },
-);
+// Schema + description now live in the shared registry (#294).
+registerShared(SHARED_TOOL_SPECS.renamePage, async ({ pageId, title }) => {
+  const result = await docmostClient.renamePage(pageId, title);
+  return jsonContent(result);
+});
 
 // Tool: edit_page_text
 registerShared(SHARED_TOOL_SPECS.editPageText, async ({ pageId, edits }) => {
@@ -516,6 +380,10 @@ registerShared(SHARED_TOOL_SPECS.deleteNode, async ({ pageId, nodeId }) => {
 });
 
 // Tool: insert_image
+// MCP-only by design (NOT in the shared registry): the in-app AI-chat agent
+// exposes no image tools (insert/replace), so there is no second layer to unify
+// — a SHARED_TOOL_SPECS entry's tier/catalogLine are in-app metadata and the
+// catalog-partition test forbids a spec without a live in-app tool (#294).
 server.registerTool(
   "insert_image",
   {
@@ -561,6 +429,7 @@ server.registerTool(
 );
 
 // Tool: replace_image
+// MCP-only by design (see insert_image): no in-app equivalent, stays inline.
 server.registerTool(
   "replace_image",
   {
@@ -603,25 +472,10 @@ server.registerTool(
 );
 
 // Tool: share_page
-// INTENTIONAL per-transport divergence (not shared): the in-app copy adds a
-// security-confirmation framing ("only share when the user explicitly asked,
-// since this exposes the page to anyone with the link") tuned for the in-app
-// agent; this transport keeps the plain public-URL wording.
-server.registerTool(
-  "share_page",
-  {
-    description:
-      "Make a page publicly accessible (idempotent) and return its public " +
-      "URL. The URL format is <app>/share/<key>/p/<slugId>. This exposes the " +
-      "page content to ANYONE with the URL — do it only when explicitly asked.",
-    inputSchema: {
-      pageId: z.string().min(1).describe("ID of the page to share"),
-      searchIndexing: z
-        .boolean()
-        .optional()
-        .describe("Allow search engines to index the page (default true)"),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's own `searchIndexing ?? true` default.
+registerShared(
+  SHARED_TOOL_SPECS.sharePage,
   async ({ pageId, searchIndexing }) => {
     const result = await docmostClient.sharePage(pageId, searchIndexing ?? true);
     return jsonContent(result);
@@ -641,29 +495,11 @@ registerShared(SHARED_TOOL_SPECS.listShares, async () => {
 });
 
 // Tool: move_page
-server.registerTool(
-  "move_page",
-  {
-    description:
-      "Move a page under a new parent (nesting) or to the space root.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      parentPageId: z
-        .string()
-        .nullable()
-        .optional()
-        .describe(
-          "Target parent page ID. Pass 'null' or empty string to move to root.",
-        ),
-      position: z
-        .string()
-        .min(5)
-        .optional()
-        .describe(
-          "fractional-index position key; min 5 chars; omit to append at the end.",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's cycle guard, its 'null'/'' -> null string coercion, and
+// its positive-confirmation check on the move response.
+registerShared(
+  SHARED_TOOL_SPECS.movePage,
   async ({ pageId, parentPageId, position }) => {
     const finalParentId =
       parentPageId === "" || parentPageId === "null" ? null : parentPageId;
@@ -698,49 +534,22 @@ server.registerTool(
 );
 
 // Tool: delete_page
-server.registerTool(
-  "delete_page",
-  {
-    description:
-      "Delete a single page by ID. SOFT delete only: the page is moved to " +
-      "trash and can be restored; nothing is permanently deleted.",
-    inputSchema: {
-      pageId: z.string().min(1),
-    },
-  },
-  async ({ pageId }) => {
-    await docmostClient.deletePage(pageId);
-    return {
-      content: [
-        { type: "text" as const, text: `Successfully deleted page ${pageId}` },
-      ],
-    };
-  },
-);
+// Schema + description now live in the shared registry (#294). The shared schema
+// exposes ONLY pageId, so no permanent/force-delete flag can reach the client.
+registerShared(SHARED_TOOL_SPECS.deletePage, async ({ pageId }) => {
+  await docmostClient.deletePage(pageId);
+  return {
+    content: [
+      { type: "text" as const, text: `Successfully deleted page ${pageId}` },
+    ],
+  };
+});
 
 // --- Comment tools (ported from upstream PR #3 by Max Nikitin) ---
 
 // Tool: list_comments
-server.registerTool(
-  "list_comments",
-  {
-    description:
-      "List comments on a page in one call (pagination is handled " +
-      "internally). By DEFAULT only ACTIVE threads are returned; resolved " +
-      "threads (a resolved top-level comment and all its replies) are hidden " +
-      "and their count reported as `resolvedThreadsHidden` so you can re-query " +
-      "with `includeResolved: true` to see everything. Returns " +
-      "`{ items, resolvedThreadsHidden }`. Content is returned as Markdown.",
-    inputSchema: {
-      pageId: z.string().describe("ID of the page"),
-      includeResolved: z
-        .boolean()
-        .optional()
-        .describe(
-          "default only active threads; true — include resolved",
-        ),
-    },
-  },
+registerShared(
+  SHARED_TOOL_SPECS.listComments,
   async ({ pageId, includeResolved }) => {
     const comments = await docmostClient.listComments(pageId, includeResolved);
     return jsonContent(comments);
@@ -748,55 +557,11 @@ server.registerTool(
 );
 
 // Tool: create_comment
-// INTENTIONAL per-transport divergence (not shared): the in-app copy tunes the
-// guidance for the in-app agent (e.g. "retry with a corrected EXACT selection"
-// and "Reversible via the comment UI"); this transport keeps its own wording.
-server.registerTool(
-  "create_comment",
-  {
-    description:
-      "Create a new comment on a page. The comment is ALWAYS inline and is " +
-      "anchored to (highlights) its `selection` text — there are no page-level " +
-      "comments. Content is provided as Markdown and automatically converted. " +
-      "A top-level comment REQUIRES an exact `selection`; if the selection " +
-      "cannot be found in the page the call fails (no orphan comment is left). " +
-      "Replies (parentCommentId set) inherit the parent's anchor and take no " +
-      "selection. You may also attach a `suggestedText` proposing a replacement " +
-      "for the `selection`; a human applies (or rejects) it from the UI. When " +
-      "`suggestedText` is set the `selection` MUST occur exactly once in the " +
-      "page — expand it with surrounding context if it is ambiguous.",
-    inputSchema: {
-      pageId: z.string().describe("ID of the page to comment on"),
-      content: z.string().min(1).describe("Comment content in Markdown format"),
-      selection: z
-        .string()
-        .min(1)
-        // Enforce the documented 250-char cap to match the description above.
-        .max(250)
-        .optional()
-        .describe(
-          "EXACT contiguous text from a single paragraph/block to anchor the " +
-            "comment on (<=250 chars). Required for a top-level comment; omit " +
-            "only when replying via parentCommentId.",
-        ),
-      parentCommentId: z
-        .string()
-        .optional()
-        .describe("Parent comment ID to create a reply (max 2 nesting levels)"),
-      suggestedText: z
-        .string()
-        .min(1)
-        .max(2000)
-        .optional()
-        .describe(
-          "Optional proposed replacement (PLAIN TEXT) for the `selection`, " +
-            "applied by a human via the UI (never auto-applied). REQUIRES a " +
-            "`selection`; NOT allowed on a reply. When set, the `selection` must " +
-            "be UNIQUE in the page — expand it with surrounding context (still " +
-            "<=250 chars) if it occurs more than once, or the call is refused.",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's own guards (require a selection for a top-level
+// comment; reject suggestedText on a reply / without a selection).
+registerShared(
+  SHARED_TOOL_SPECS.createComment,
   async ({ pageId, content, selection, parentCommentId, suggestedText }) => {
     if (!parentCommentId && (!selection || !selection.trim())) {
       throw new Error(
@@ -872,28 +637,9 @@ server.registerTool(
 );
 
 // Tool: resolve_comment
-server.registerTool(
-  "resolve_comment",
-  {
-    description:
-      "Resolve (close) or reopen a comment thread. Only top-level comments can " +
-      "be resolved — the server rejects resolving a reply. Reversible: pass " +
-      "resolved=false to reopen. Resolving keeps the thread and its replies " +
-      "(unlike delete_comment, which permanently removes them).",
-    inputSchema: {
-      commentId: z
-        .string()
-        .min(1)
-        .describe("ID of the top-level comment thread to resolve or reopen"),
-      resolved: z
-        .boolean()
-        .optional()
-        .default(true)
-        .describe(
-          "true (default) marks the thread resolved/closed; false reopens it",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294).
+registerShared(
+  SHARED_TOOL_SPECS.resolveComment,
   async ({ commentId, resolved }) => {
     const result = await docmostClient.resolveComment(commentId, resolved);
     return jsonContent(result);
@@ -901,30 +647,10 @@ server.registerTool(
 );
 
 // Tool: check_new_comments
-server.registerTool(
-  "check_new_comments",
-  {
-    description:
-      "Check for new comments across pages in a space since a given timestamp. " +
-      "Optionally scope to a page subtree (folder). Returns only comments " +
-      "created after the specified time.",
-    inputSchema: {
-      spaceId: z.string().describe("Space ID to check for new comments"),
-      since: z
-        .string()
-        .min(1)
-        .describe(
-          "ISO 8601 timestamp — only return comments created after this time (e.g. '2026-03-10T00:00:00Z')",
-        ),
-      parentPageId: z
-        .string()
-        .optional()
-        .describe(
-          "Optional root page ID to scope the check to a subtree (folder). " +
-            "Only pages under this parent will be checked.",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#294). The execute body
+// keeps this transport's own guard rejecting an unparseable `since` timestamp.
+registerShared(
+  SHARED_TOOL_SPECS.checkNewComments,
   async ({ spaceId, since, parentPageId }) => {
     // Reject an unparseable timestamp up front: otherwise the comparison
     // against NaN silently treats every comment as "not new" and the tool
@@ -1053,6 +779,8 @@ server.registerTool(
 );
 
 // Tool: insert_footnote
+// MCP-only by design (see insert_image): the in-app AI-chat agent exposes no
+// footnote tool, so there is no second layer to unify — stays inline (#294).
 server.registerTool(
   "insert_footnote",
   {
