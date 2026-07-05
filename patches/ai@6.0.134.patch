@@ -1,0 +1,68 @@
+diff --git a/dist/index.js b/dist/index.js
+index ae447a12f7823ec0a00837ee9f0eb809a610d5f8..a3402b2c2d021ef432cfa76e35d370073d525135 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -6578,9 +6578,19 @@ function createOutputTransformStream(output) {
+         controller.enqueue({ part: chunk, partialOutput: void 0 });
+         return;
+       }
+-      text2 += chunk.text;
+       textChunk += chunk.text;
+       textProviderMetadata = (_a21 = chunk.providerMetadata) != null ? _a21 : textProviderMetadata;
++      if (output == null) {
++        // PATCH(docmost #OOM): no output strategy requested -> publish each
++        // text-delta immediately and do NOT build cumulative partialOutput
++        // snapshots. Unpatched, the default text() output snapshots the ENTIRE
++        // accumulated turn text on every delta (O(n^2) memory) and those
++        // snapshots pile up in the never-consumed leftover tee branch of
++        // DefaultStreamTextResult.baseStream -> heap OOM on long agent turns.
++        publishTextChunk({ controller });
++        return;
++      }
++      text2 += chunk.text;
+       const result = await output.parsePartialOutput({ text: text2 });
+       if (result !== void 0) {
+         const currentJson = JSON.stringify(result.partial);
+@@ -6959,7 +6969,7 @@ var DefaultStreamTextResult = class {
+         })
+       );
+     }
+-    this.baseStream = stream.pipeThrough(createOutputTransformStream(output != null ? output : text())).pipeThrough(eventProcessor);
++    this.baseStream = stream.pipeThrough(createOutputTransformStream(output)).pipeThrough(eventProcessor);
+     const { maxRetries, retry } = prepareRetries({
+       maxRetries: maxRetriesArg,
+       abortSignal
+diff --git a/dist/index.mjs b/dist/index.mjs
+index 663875332e3f9a9bd167c25583c515876f42951b..b840b0502c9894df983e0154805abb80e70e6331 100644
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -6501,9 +6501,19 @@ function createOutputTransformStream(output) {
+         controller.enqueue({ part: chunk, partialOutput: void 0 });
+         return;
+       }
+-      text2 += chunk.text;
+       textChunk += chunk.text;
+       textProviderMetadata = (_a21 = chunk.providerMetadata) != null ? _a21 : textProviderMetadata;
++      if (output == null) {
++        // PATCH(docmost #OOM): no output strategy requested -> publish each
++        // text-delta immediately and do NOT build cumulative partialOutput
++        // snapshots. Unpatched, the default text() output snapshots the ENTIRE
++        // accumulated turn text on every delta (O(n^2) memory) and those
++        // snapshots pile up in the never-consumed leftover tee branch of
++        // DefaultStreamTextResult.baseStream -> heap OOM on long agent turns.
++        publishTextChunk({ controller });
++        return;
++      }
++      text2 += chunk.text;
+       const result = await output.parsePartialOutput({ text: text2 });
+       if (result !== void 0) {
+         const currentJson = JSON.stringify(result.partial);
+@@ -6882,7 +6892,7 @@ var DefaultStreamTextResult = class {
+         })
+       );
+     }
+-    this.baseStream = stream.pipeThrough(createOutputTransformStream(output != null ? output : text())).pipeThrough(eventProcessor);
++    this.baseStream = stream.pipeThrough(createOutputTransformStream(output)).pipeThrough(eventProcessor);
+     const { maxRetries, retry } = prepareRetries({
+       maxRetries: maxRetriesArg,
+       abortSignal
