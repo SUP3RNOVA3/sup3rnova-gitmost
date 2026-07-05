@@ -10,6 +10,7 @@ import { firstDivergence } from '../roundtrip-helpers.js';
 import {
   schema,
   allSchemaAttrKeys,
+  allSchemaMarkAttrKeys,
   attrIsValueFuzzed,
 } from './attr-arbitraries.js';
 import {
@@ -55,6 +56,33 @@ const ATTR_VALUE_FUZZ_ALLOWLIST = new Set<string>([
   'tableHeader.colwidth', 'tableHeader.rowspan',
   'video.align', 'video.aspectRatio', 'video.attachmentId', 'video.placeholder', 'video.size',
   'youtube.align', 'youtube.height', 'youtube.width',
+]);
+
+// ── MARK attribute-value coverage ───────────────────────────────────────────
+// Marks are fuzzed by the text generator (text-arbitraries.ts markedTextRunArb),
+// not the node OVERRIDES table, so their value-fuzz coverage is tracked with this
+// separate registry — otherwise the "no invisible coverage hole" guarantee would
+// hold for node attrs only, and a new mark attr (or a new attributed mark) would
+// silently escape the fuzz set. Every schema mark attr must be in exactly one of:
+//   MARK_ATTR_FUZZED    — actually driven at a non-default value by the generator;
+//   MARK_ATTR_ALLOWLIST — deliberately not value-fuzzed, with a reason.
+const MARK_ATTR_FUZZED = new Set<string>([
+  'mark:link.href', // markedTextRunArb sets a random webUrl href
+  'mark:link.title', // ...and an optional letter-bearing title
+  'mark:highlight.color', // highlight mark carries a generated color
+  'mark:textStyle.color', // textStyle mark carries a generated color
+  'mark:comment.commentId', // comment anchor id (alphanumeric token)
+  'mark:comment.resolved', // comment resolved flag (rides only when true)
+]);
+const MARK_ATTR_ALLOWLIST = new Set<string>([
+  // link presentational/routing attrs: not part of the markdown link surface the
+  // converter emits (it round-trips href + title only), so there is no
+  // non-default value to assert here — a deferred concern for a link-specific
+  // fixture, not the flat generative pass.
+  'mark:link.internal',
+  'mark:link.target',
+  'mark:link.rel',
+  'mark:link.class',
 ]);
 
 // Each run does a real convert + marked + jsdom parse (~ms). Give ample headroom
@@ -174,6 +202,31 @@ describe('#351 flat generative round-trip — completeness contract', () => {
         notFuzzed.has(key),
         `stale allowlist row (attr is now value-fuzzed, remove it): ${key}`,
       ).toBe(true);
+    }
+  });
+
+  it('every MARK attribute is value-fuzzed OR allowlisted (no invisible hole)', () => {
+    // The node guard above covers node attrs; marks are fuzzed by the text
+    // generator, so their coverage is tracked separately. A new mark attr (or a
+    // newly-attributed mark) that lands in neither set turns this red.
+    const unaccounted: string[] = [];
+    for (const key of allSchemaMarkAttrKeys()) {
+      if (!MARK_ATTR_FUZZED.has(key) && !MARK_ATTR_ALLOWLIST.has(key)) {
+        unaccounted.push(key);
+      }
+    }
+    expect(
+      unaccounted,
+      `these mark attrs are neither in MARK_ATTR_FUZZED nor MARK_ATTR_ALLOWLIST:\n  ${unaccounted.join(
+        '\n  ',
+      )}`,
+    ).toEqual([]);
+  });
+
+  it('the MARK fuzz/allowlist sets have no stale rows (every entry is a real schema mark attr)', () => {
+    const all = new Set(allSchemaMarkAttrKeys());
+    for (const key of [...MARK_ATTR_FUZZED, ...MARK_ATTR_ALLOWLIST]) {
+      expect(all.has(key), `stale mark-attr registry row: ${key}`).toBe(true);
     }
   });
 });

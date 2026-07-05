@@ -31,12 +31,11 @@
  *
  *       (a) ACCEPTED LIMITATION — the attribute has NO markdown representation,
  *           so the loss is inherent to targeting markdown, not a converter
- *           defect. GFM/CommonMark simply cannot encode it. These: `paragraph`/
- *           `heading` `indent`, `callout.icon`, `orderedList.type` (a/A/i
- *           markers), table `colspan`/`rowspan`/`colwidth`/`backgroundColor(Name)`
- *           (GFM tables are span-less/style-less). Each is tagged
- *           `// ACCEPTED:` inline. Freezing them is correct — there is nothing to
- *           preserve in the target format.
+ *           defect. These: `paragraph`/`heading` `indent`, `callout.icon`,
+ *           `orderedList.type` (a/A/i markers), table `colwidth` /
+ *           `backgroundColor(Name)` (dropped by the raw-<table> fallback). Each is
+ *           tagged `// ACCEPTED:` inline. Freezing them is correct — there is
+ *           nothing to preserve in the target format.
  *
  *       (b) PINNED BUG — the attribute IS representable in markdown but the
  *           converter drops it anyway (a real defect). These are NOT silently
@@ -46,6 +45,13 @@
  *           on accept-vs-fix (the epic guardrail reserves that call). These:
  *           `column.width` (parseFloat drops `%`), `orderedList.start` (non-1
  *           start renders as `1.`). Tagged `// PINNED-BUG:` inline.
+ *
+ *       (c) DEFERRED-BUG — representable AND round-trips, frozen only because the
+ *           flat generator can't yet build a valid instance. Table
+ *           `colspan`/`rowspan` round-trip via the raw-<table> fallback, but a
+ *           geometrically-valid spanned table is PR-2 structural work; the flat
+ *           generator hardcodes span = 1. Tagged `// DEFERRED-BUG:` inline so a
+ *           maintainer does not read them as an inherent limitation.
  *       - Several non-null-default attrs are MATERIALIZED on import but are not
  *         in canonicalize's KNOWN_DEFAULTS (`callout.type`, `status.color`,
  *         table `colspan`/`rowspan`, `columns.layout`/`widthMode`,
@@ -160,18 +166,26 @@ const OVERRIDES: Record<string, AttrPolicy> = {
   'callout.icon': { frozen: true }, // ACCEPTED: no md representation (dropped on export)
   'status.text': { noDefault: true, arb: phraseArb, degen: '' },
   'status.color': { always: true, arb: str('green', 'orange', 'red', 'blue', 'yellow', 'purple') },
-  // ── table cells — ACCEPTED: GFM tables cannot express spans / bg / colwidth ─
+  // ── table cells ────────────────────────────────────────────────────────────
+  // DEFERRED-BUG (not ACCEPTED): colspan/rowspan ARE representable and round-trip
+  // — a spanned cell makes the converter emit the whole table as a raw <table>
+  // with colspan/rowspan attrs (markdown-converter.ts tableToHtml), which the
+  // tiptap parser reads back. They are frozen only because generating a
+  // geometrically-valid spanned table is deferred STRUCTURAL work (the flat
+  // generator hardcodes colspan/rowspan = 1), NOT a markdown limitation.
   'tableCell.colspan': { always: true, frozen: true },
   'tableCell.rowspan': { always: true, frozen: true },
+  // ACCEPTED: colwidth / backgroundColor(Name) have no representation — the
+  // raw-<table> fallback (tableToHtml) drops them, so there is nothing to preserve.
   'tableCell.colwidth': { frozen: true },
   'tableCell.backgroundColor': { frozen: true },
   'tableCell.backgroundColorName': { frozen: true },
   'tableCell.align': { arb: str('left', 'center', 'right') },
-  'tableHeader.colspan': { always: true, frozen: true },
-  'tableHeader.rowspan': { always: true, frozen: true },
-  'tableHeader.colwidth': { frozen: true },
-  'tableHeader.backgroundColor': { frozen: true },
-  'tableHeader.backgroundColorName': { frozen: true },
+  'tableHeader.colspan': { always: true, frozen: true }, // DEFERRED-BUG (see tableCell.colspan)
+  'tableHeader.rowspan': { always: true, frozen: true }, // DEFERRED-BUG (see tableCell.rowspan)
+  'tableHeader.colwidth': { frozen: true }, // ACCEPTED: no representation
+  'tableHeader.backgroundColor': { frozen: true }, // ACCEPTED: no representation
+  'tableHeader.backgroundColorName': { frozen: true }, // ACCEPTED: no representation
   'tableHeader.align': { arb: str('left', 'center', 'right') },
   // ── details ──────────────────────────────────────────────────────────────
   'details.open': { always: true, arb: fc.constant(true) }, // boolean, default false
@@ -230,7 +244,7 @@ export function attrIsValueFuzzed(type: string, attr: string): boolean {
   return !!policyFor(type, attr, def).arb;
 }
 
-/** Every `type.attr` in the schema (excluding the auto `id`), sorted. */
+/** Every node `type.attr` in the schema (excluding the auto `id`), sorted. */
 export function allSchemaAttrKeys(): string[] {
   const keys: string[] = [];
   for (const type of Object.keys(schema.nodes)) {
@@ -238,6 +252,23 @@ export function allSchemaAttrKeys(): string[] {
       if (attr === 'id') continue;
       keys.push(`${type}.${attr}`);
     }
+  }
+  return keys.sort();
+}
+
+/**
+ * Every MARK attribute in the schema, keyed `mark:<name>.<attr>`, sorted. Marks
+ * are not driven by the node OVERRIDES table (they are fuzzed by the text
+ * generator, text-arbitraries.ts), so their value-fuzz coverage is tracked with a
+ * separate snapshot (see flat-roundtrip.property.test.ts) — without this the
+ * "no invisible coverage hole" guarantee would hold for node attrs only, letting a
+ * new mark attr slip through unfuzzed and unallowlisted.
+ */
+export function allSchemaMarkAttrKeys(): string[] {
+  const keys: string[] = [];
+  for (const [name, mark] of Object.entries(schema.marks)) {
+    const attrs = (mark.spec?.attrs ?? {}) as Record<string, unknown>;
+    for (const attr of Object.keys(attrs)) keys.push(`mark:${name}.${attr}`);
   }
   return keys.sort();
 }
