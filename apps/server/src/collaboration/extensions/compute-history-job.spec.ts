@@ -43,10 +43,10 @@ describe('computeHistoryJob (#370 — shared trailing idle pipeline)', () => {
   describe('max-wait ceiling', () => {
     const T0 = 1_000_000; // arbitrary fixed epoch for deterministic tests
 
-    it('early in the burst, the full trailing interval is used', () => {
-      // 1 minute into the burst: remaining budget (10m - 1m = 9m) still exceeds
-      // nothing that clamps it below the interval only if interval > remaining.
-      // For USER, interval 60m > remaining 9m, so delay clamps to the remaining.
+    it('once a burst is armed, delay clamps to the remaining max-wait budget', () => {
+      // 1 minute into the burst the USER interval (60m) far exceeds the remaining
+      // max-wait budget (10m - 1m = 9m), so the delay is clamped DOWN to that
+      // remaining budget — the full interval is NOT used once a ceiling applies.
       const { delay } = computeHistoryJob(page, 'user', T0, T0 + 60_000);
       expect(delay).toBe(IDLE_MAX_WAIT_USER - 60_000);
     });

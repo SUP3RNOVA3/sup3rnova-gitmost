@@ -40,16 +40,17 @@ export function historyKindMeta(kind?: string | null): HistoryKindMeta {
 
 interface HistoryItemProps {
   historyItem: IPageHistory;
-  index: number;
-  onSelect: (id: string, index: number) => void;
-  onHover?: (id: string, index: number) => void;
+  // The previous snapshot for diff/restore is resolved by id from the FULL list
+  // in the parent (resolvePrevSnapshotId), so the item only needs to report its
+  // own id — never a list index (which would be the filtered-view index).
+  onSelect: (id: string) => void;
+  onHover?: (id: string) => void;
   onHoverEnd?: () => void;
   isActive: boolean;
 }
 
 const HistoryItem = memo(function HistoryItem({
   historyItem,
-  index,
   onSelect,
   onHover,
   onHoverEnd,
@@ -60,12 +61,12 @@ const HistoryItem = memo(function HistoryItem({
   const kindMeta = historyKindMeta(historyItem.kind);
 
   const handleClick = useCallback(() => {
-    onSelect(historyItem.id, index);
-  }, [onSelect, historyItem.id, index]);
+    onSelect(historyItem.id);
+  }, [onSelect, historyItem.id]);
 
   const handleMouseEnter = useCallback(() => {
-    onHover?.(historyItem.id, index);
-  }, [onHover, historyItem.id, index]);
+    onHover?.(historyItem.id);
+  }, [onHover, historyItem.id]);
 
   const contributors = historyItem.contributors;
   const hasContributors = contributors && contributors.length > 0;

@@ -129,6 +129,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Save intentional page versions.** Press `Cmd/Ctrl+S` (or use the page menu)
+  to save a named version of a page. The history panel now distinguishes
+  intentional versions (a "Saved" / "Agent version" badge) from automatic
+  snapshots, dims autosaves, and offers an "Only versions" filter. Automatic
+  snapshots switched from a fixed interval to a trailing idle-flush with a
+  max-wait ceiling, and a boundary snapshot is pinned whenever the editing source
+  changes (e.g. a person's edits followed by the AI agent). (#370)
+
 - **Place several images side by side in a row.** A new "Inline (side by
   side)" alignment mode in the image bubble menu renders consecutive inline
   images as a row that wraps onto the next line on narrow screens. The row is

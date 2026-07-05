@@ -22,6 +22,7 @@ import {
 } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { useHistoryRestore } from "@/features/page-history/hooks";
+import { resolvePrevSnapshotId } from "@/features/page-history/utils/resolve-prev-snapshot";
 
 const PREFETCH_DELAY_MS = 150;
 
@@ -58,11 +59,6 @@ function HistoryList({ pageId }: Props) {
     (kind?: string | null) => kind === "manual" || kind === "agent",
     [],
   );
-  const originalIndexById = useMemo(() => {
-    const map = new Map<string, number>();
-    historyItems.forEach((item, index) => map.set(item.id, index));
-    return map;
-  }, [historyItems]);
   const visibleItems = useMemo(
     () =>
       onlyVersions
@@ -84,11 +80,13 @@ function HistoryList({ pageId }: Props) {
   }, []);
 
   const handleHover = useCallback(
-    (historyId: string, index: number) => {
+    (historyId: string) => {
       clearPrefetchTimeout();
       prefetchTimeoutRef.current = setTimeout(() => {
         prefetchPageHistory(historyId);
-        const prevId = historyItems[index + 1]?.id;
+        // The true previous snapshot in the FULL list (not the previous visible
+        // one under the "only versions" filter).
+        const prevId = resolvePrevSnapshotId(historyItems, historyId);
         if (prevId) {
           prefetchPageHistory(prevId);
         }
@@ -102,9 +100,11 @@ function HistoryList({ pageId }: Props) {
   }, [clearPrefetchTimeout]);
 
   const handleSelect = useCallback(
-    (id: string, index: number) => {
+    (id: string) => {
       setActiveHistoryId(id);
-      setActiveHistoryPrevId(historyItems[index + 1]?.id ?? "");
+      // Baseline = true previous snapshot in the FULL list, so the "only
+      // versions" filter never diffs/restores against the wrong item.
+      setActiveHistoryPrevId(resolvePrevSnapshotId(historyItems, id));
     },
     [historyItems, setActiveHistoryId, setActiveHistoryPrevId],
   );
@@ -173,9 +173,6 @@ function HistoryList({ pageId }: Props) {
           <HistoryItem
             key={historyItem.id}
             historyItem={historyItem}
-            // Index within the FULL list so diff/restore uses the true previous
-            // snapshot, not the previous visible one.
-            index={originalIndexById.get(historyItem.id) ?? 0}
             onSelect={handleSelect}
             onHover={handleHover}
             onHoverEnd={clearPrefetchTimeout}

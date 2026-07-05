@@ -66,6 +66,15 @@ describe('HistoryProcessor.process', () => {
     notificationQueue = { add: jest.fn().mockResolvedValue(undefined) };
     generalQueue = { add: jest.fn().mockResolvedValue(undefined) };
 
+    // #370 F3 — the processor now serializes its find+save under a page-row lock
+    // via executeTx. A db whose transaction().execute(fn) runs fn with a trx stub
+    // drives the real executeTx() helper without a database.
+    const db = {
+      transaction: () => ({
+        execute: (fn: (trx: any) => Promise<any>) => fn({ __trx: true }),
+      }),
+    };
+
     // WorkerHost's constructor reads `this.worker`; passing repos positionally
     // matches the constructor and avoids the Nest DI container.
     proc = new HistoryProcessor(
@@ -73,6 +82,7 @@ describe('HistoryProcessor.process', () => {
       pageRepo as any,
       collabHistory as any,
       watcherService as any,
+      db as any,
       notificationQueue as any,
       generalQueue as any,
     );
@@ -134,7 +144,8 @@ describe('HistoryProcessor.process', () => {
     );
     expect(pageHistoryRepo.saveHistory).toHaveBeenCalledWith(
       expect.objectContaining({ id: PAGE_ID }),
-      { contributorIds: ['u1', 'u2'], kind: 'idle' },
+      // #370 F3 — saveHistory now runs inside the locked tx, so it carries trx.
+      expect.objectContaining({ contributorIds: ['u1', 'u2'], kind: 'idle' }),
     );
     expect(generalQueue.add).toHaveBeenCalledWith(
       QueueJob.PAGE_BACKLINKS,

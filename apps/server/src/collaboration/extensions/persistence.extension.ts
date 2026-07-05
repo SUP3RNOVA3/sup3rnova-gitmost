@@ -767,12 +767,18 @@ export class PersistenceExtension implements Extension {
     // The FIRST arm of a burst records `burstStart`; computeHistoryJob shrinks
     // the delay to the remaining max-wait budget from that point, so a continuous
     // session cannot re-arm the trailing timer forever and starve the snapshot.
-    // A burst marker older than the (larger, USER) max-wait means the previous
-    // idle job has already fired — start a fresh window instead of firing
-    // immediately on the next edit.
+    // A burst marker older than THIS TIER's max-wait means the previous idle job
+    // has already fired — start a fresh window instead of firing immediately on
+    // the next edit. Must use the SAME source-specific max-wait computeHistoryJob
+    // uses (agent 5m / user 10m): a hardcoded USER ceiling would leave an agent
+    // burst's marker stale for 5..10m, forcing delay=0 on every store in that
+    // window and writing one idle row per store — exactly the per-store bloat the
+    // debounce exists to prevent, on the continuous-agent path.
+    const maxWait =
+      lastUpdatedSource === 'agent' ? IDLE_MAX_WAIT_AGENT : IDLE_MAX_WAIT_USER;
     const now = Date.now();
     let burstStart = this.idleBurstStart.get(page.id);
-    if (burstStart === undefined || now - burstStart >= IDLE_MAX_WAIT_USER) {
+    if (burstStart === undefined || now - burstStart >= maxWait) {
       burstStart = now;
       this.idleBurstStart.set(page.id, burstStart);
     }

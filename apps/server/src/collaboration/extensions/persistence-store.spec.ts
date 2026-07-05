@@ -570,7 +570,7 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       // The pending idle autosnapshot is cancelled by the explicit version.
       expect(historyQueue.remove).toHaveBeenCalledWith(PAGE_ID);
       const msg = JSON.parse(
-        (document as any).broadcastStateless.mock.calls.at(-1)[0],
+        (document as any).broadcastStateless.mock.calls[(document as any).broadcastStateless.mock.calls.length - 1][0],
       );
       expect(msg).toMatchObject({
         type: 'version.saved',
@@ -586,7 +586,7 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
       await emitSave(document, 'agent');
 
-      expect(pageHistoryRepo.saveHistory.mock.calls.at(-1)[1]).toEqual(
+      expect(pageHistoryRepo.saveHistory.mock.calls[pageHistoryRepo.saveHistory.mock.calls.length - 1][1]).toEqual(
         expect.objectContaining({ kind: 'agent' }),
       );
     });
@@ -611,7 +611,7 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       );
       expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
       const msg = JSON.parse(
-        (document as any).broadcastStateless.mock.calls.at(-1)[0],
+        (document as any).broadcastStateless.mock.calls[(document as any).broadcastStateless.mock.calls.length - 1][0],
       );
       expect(msg).toMatchObject({ historyId: 'auto-1', alreadySaved: false });
     });
@@ -631,7 +631,7 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       expect(pageHistoryRepo.updateHistoryKind).not.toHaveBeenCalled();
       expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
       const msg = JSON.parse(
-        (document as any).broadcastStateless.mock.calls.at(-1)[0],
+        (document as any).broadcastStateless.mock.calls[(document as any).broadcastStateless.mock.calls.length - 1][0],
       );
       expect(msg).toMatchObject({ alreadySaved: true, kind: 'manual' });
     });
