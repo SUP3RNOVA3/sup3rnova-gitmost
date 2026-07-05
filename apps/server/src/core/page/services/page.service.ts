@@ -52,7 +52,9 @@ import {
   INTERNAL_LINK_REGEX,
   extractPageSlugId,
 } from '../../../integrations/export/utils';
-import { markdownToHtml, canonicalizeFootnotes } from '@docmost/editor-ext';
+import { canonicalizeFootnotes } from '@docmost/editor-ext';
+import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
+import { normalizeForeignMarkdown } from '../../../integrations/import/utils/foreign-markdown';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';
@@ -1301,8 +1303,14 @@ export class PageService {
 
     switch (format) {
       case 'markdown': {
-        const html = await markdownToHtml(content as string);
-        prosemirrorJson = htmlToJson(html as string);
+        // Canonical markdown -> ProseMirror JSON directly via
+        // `@docmost/prosemirror-markdown` (issue #345) — no HTML intermediate,
+        // no editor-ext markdown layer. Foreign markdown surfaces the strict
+        // parser rejects (GFM `[^id]` reference footnotes) are normalized to the
+        // canonical inline form first.
+        prosemirrorJson = await markdownToProseMirror(
+          normalizeForeignMarkdown(content as string),
+        );
         break;
       }
       case 'html': {
