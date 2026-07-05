@@ -12,13 +12,19 @@ import { canonicalizeFootnotes } from '@docmost/editor-ext';
 
 /**
  * Integration-ish test for the USER-FACING markdown import path
- * (`ImportService.importPage`). It exercises the REAL markdown -> HTML -> JSON
- * conversion and asserts that the stored page content has its footnotes
- * canonicalized — the gap that issue #228 fixes: the import path builds
- * ProseMirror JSON directly (never running the editor's footnoteSyncPlugin), so
- * before this wiring the stored footnotes kept the markdown's physical
- * definition order (out of order vs. references), retained orphan definitions,
- * and did not collapse reused references.
+ * (`ImportService.importPage`). It exercises the REAL markdown -> ProseMirror
+ * conversion and asserts the stored page's footnotes are canonical: ordered by
+ * FIRST REFERENCE (not markdown definition order), reused references deduped to a
+ * single definition, and orphan definitions dropped.
+ *
+ * Since #345 the markdown parse runs through the canonical package
+ * (`normalizeForeignMarkdown` -> `markdownToProseMirror`), which owns this
+ * canonicalization: the input's GFM `[^id]` reference footnotes are normalized to
+ * inline `^[…]`, and the parser assigns fresh sequential ids (`fn-*`) in
+ * reference order while merging identical bodies — so we assert by definition
+ * BODY order, not by the source labels. `canonicalizeFootnotes` remains wired as
+ * an idempotent safety net (issue #228) and is a no-op on this already-canonical
+ * output.
  *
  * The DB/ydoc side-effects are stubbed: `getNewPagePosition` (DB query) and
  * `createYdoc` (Yjs encode) are spied, and `pageRepo.insertPage` captures the
@@ -67,24 +73,14 @@ function makeService() {
 }
 
 /** List the footnote-definition ids of the (single) footnotesList, in order. */
-function footnoteListIds(content: any): string[] {
+/** Definition body texts of the (single) footnotesList, in list order. */
+function footnoteListBodies(content: any): string[] {
   const list = (content.content ?? []).find(
     (n: any) => n.type === 'footnotesList',
   );
-  if (!list) return [];
-  return (list.content ?? [])
+  return (list?.content ?? [])
     .filter((n: any) => n.type === 'footnoteDefinition')
-    .map((n: any) => n.attrs?.id);
-}
-
-function definitionText(content: any, id: string): string | undefined {
-  const list = (content.content ?? []).find(
-    (n: any) => n.type === 'footnotesList',
-  );
-  const def = (list?.content ?? []).find(
-    (n: any) => n.type === 'footnoteDefinition' && n.attrs?.id === id,
-  );
-  return def?.content?.[0]?.content?.[0]?.text;
+    .map((n: any) => n.content?.[0]?.content?.[0]?.text);
 }
 
 describe('ImportService.importPage — footnote canonicalization (#228)', () => {
@@ -101,23 +97,23 @@ describe('ImportService.importPage — footnote canonicalization (#228)', () => 
     const content = getCaptured().content;
     expect(content).toBeTruthy();
 
-    // Reference order is c, a, b (NOT the markdown definition order a, b, c).
-    expect(footnoteListIds(content)).toEqual(['c', 'a', 'b']);
-
-    // Definitions preserved and attached to the right ids.
-    expect(definitionText(content, 'c')).toBe('note C');
-    expect(definitionText(content, 'a')).toBe('note A');
-    expect(definitionText(content, 'b')).toBe('note B');
+    // Definitions ordered by FIRST REFERENCE (C, A, B) — NOT the markdown
+    // definition order (A, B, C) — with the orphan [^z] dropped and the reused
+    // [^a] collapsed to a single definition. (Ids are the parser's fresh `fn-*`,
+    // so we pin the BODIES.)
+    expect(footnoteListBodies(content)).toEqual(['note C', 'note A', 'note B']);
 
     // Orphan definition [^z] is dropped.
-    expect(footnoteListIds(content)).not.toContain('z');
+    expect(footnoteListBodies(content)).not.toContain('orphan note');
 
     // Reused [^a] yields exactly ONE definition, and exactly one list.
     const lists = (content.content ?? []).filter(
       (n: any) => n.type === 'footnotesList',
     );
     expect(lists).toHaveLength(1);
-    expect(footnoteListIds(content).filter((id) => id === 'a')).toHaveLength(1);
+    expect(
+      footnoteListBodies(content).filter((b) => b === 'note A'),
+    ).toHaveLength(1);
   });
 
   it('is idempotent: canonicalizing the stored output again is a no-op', async () => {
@@ -134,6 +130,6 @@ describe('ImportService.importPage — footnote canonicalization (#228)', () => 
     // time must not change it (safe to wire into every write path).
     const second = canonicalizeFootnotes(stored);
     expect(second).toEqual(stored);
-    expect(footnoteListIds(second)).toEqual(['c', 'a', 'b']);
+    expect(footnoteListBodies(second)).toEqual(['note C', 'note A', 'note B']);
   });
 });

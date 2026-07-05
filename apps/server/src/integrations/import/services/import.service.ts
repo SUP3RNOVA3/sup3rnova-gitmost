@@ -17,7 +17,9 @@ import {
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import * as Y from 'yjs';
-import { markdownToHtml, canonicalizeFootnotes } from '@docmost/editor-ext';
+import { canonicalizeFootnotes } from '@docmost/editor-ext';
+import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
+import { normalizeForeignMarkdown } from '../utils/foreign-markdown';
 import {
   FileTaskStatus,
   FileTaskType,
@@ -85,11 +87,13 @@ export class ImportService {
 
     const extracted = this.extractTitleAndRemoveHeading(prosemirrorState);
     const title = extracted.title;
-    // Imported markdown/HTML is built via markdownToHtml -> htmlToJson, which
-    // never runs the editor's footnoteSyncPlugin, so the footnote topology keeps
-    // the source's PHYSICAL definition order (out of order vs. references),
-    // retains orphan definitions, and is not deduped. Canonicalize before
-    // persisting so the stored page matches the editor's invariant (issue #228).
+    // The markdown path now canonicalizes footnotes itself (the package parser),
+    // but the HTML path (processHTML -> htmlToJson) does NOT run the editor's
+    // footnoteSyncPlugin, so an imported HTML doc can keep its source's PHYSICAL
+    // definition order (out of order vs. references), retain orphan definitions,
+    // and not be deduped. Canonicalize before persisting so the stored page
+    // matches the editor's invariant (issue #228); it is an idempotent no-op on
+    // the already-canonical markdown output.
     // Pure + idempotent + shape-safe: a doc with no footnotes is unchanged.
     // (Future consolidation, architecture B: this import path persists directly
     // via pageRepo.insertPage rather than through PageService.createPage, so the
@@ -133,12 +137,15 @@ export class ImportService {
   }
 
   async processMarkdown(markdownInput: string): Promise<any> {
-    try {
-      const html = await markdownToHtml(markdownInput);
-      return this.processHTML(html);
-    } catch (err) {
-      throw err;
-    }
+    // Canonical markdown -> ProseMirror JSON directly via
+    // `@docmost/prosemirror-markdown` (issue #345) — no HTML intermediate and no
+    // second editor-ext markdown layer. Foreign markdown surfaces the strict
+    // canonical parser does not accept (GFM `[^id]` reference footnotes) are
+    // rewritten to the canonical inline form by `normalizeForeignMarkdown` first.
+    // The HTML-cleanup pass (`normalizeImportHtml`) is intentionally skipped here:
+    // it targets foreign *HTML* (Notion/XWiki), which only ever arrives on the
+    // `.html` path (`processHTML`), never as canonical markdown.
+    return markdownToProseMirror(normalizeForeignMarkdown(markdownInput));
   }
 
   async processHTML(htmlInput: string): Promise<any> {

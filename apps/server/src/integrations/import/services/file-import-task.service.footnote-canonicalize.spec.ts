@@ -17,6 +17,22 @@ jest.mock('image-dimensions', () => ({
   __esModule: true,
   imageDimensionsFromData: () => undefined,
 }));
+// FileImportTaskService -> PageService -> collaboration.gateway ->
+// metrics.registry imports `prom-client`, which is not resolvable in this
+// workspace's node_modules (types-only stub, no runtime entry). Metrics are
+// disabled on this path, so a virtual no-op mock keeps the module graph loadable.
+jest.mock(
+  'prom-client',
+  () => ({
+    collectDefaultMetrics: () => undefined,
+    Registry: class {},
+    Histogram: class {},
+    Gauge: class {},
+    Counter: class {},
+    Summary: class {},
+  }),
+  { virtual: true },
+);
 
 import { promises as fs } from 'fs';
 import * as os from 'os';
@@ -26,14 +42,17 @@ import { ImportService } from './import.service';
 
 /**
  * Binding test for issue #228 / review #5: FileImportTaskService.processGenericImport
- * is a NON-editor write path (markdownToHtml -> processHTML -> JSON, never runs
- * footnoteSyncPlugin), so it canonicalizes footnotes before persisting. This pins
- * that binding — the same one import.service has a spec for — which previously had
- * NO spec at all.
+ * is a NON-editor write path, so a zip-imported `.md` page ends up with canonical
+ * footnotes before persisting: ordered by first reference, reused refs deduped,
+ * orphan definitions dropped.
  *
- * The markdown -> HTML -> ProseMirror conversion is REAL (a real ImportService,
- * its createYdoc stubbed); the filesystem is a real temp dir with one .md file;
- * the DB transaction is stubbed to capture the persisted page content.
+ * Since #345 the `.md` parse runs `normalizeForeignMarkdown` ->
+ * `markdownToProseMirror` -> `jsonToHtml` (feeding the shared HTML attachment /
+ * link pipeline) -> `processHTML` -> `canonicalizeFootnotes`. The parser assigns
+ * fresh `fn-*` ids, so we assert by definition BODY order rather than the source
+ * labels. The conversion is REAL (a real ImportService, its createYdoc stubbed);
+ * the filesystem is a real temp dir with one .md file; the DB transaction is
+ * stubbed to capture the persisted page content.
  */
 
 // Out-of-order references (c, a, b), a REUSED reference ([^a] twice), and an
@@ -49,13 +68,14 @@ const MARKDOWN = [
   '[^z]: orphan note',
 ].join('\n');
 
-function footnoteListIds(content: any): string[] {
+/** Definition body texts of the (single) footnotesList, in list order. */
+function footnoteListBodies(content: any): string[] {
   const list = (content?.content ?? []).find(
     (n: any) => n.type === 'footnotesList',
   );
   return (list?.content ?? [])
     .filter((n: any) => n.type === 'footnoteDefinition')
-    .map((n: any) => n.attrs?.id);
+    .map((n: any) => n.content?.[0]?.content?.[0]?.text);
 }
 
 // A permissive chainable stub for the spaces lookup (selectFrom(...).select(...)
@@ -134,15 +154,23 @@ describe('FileImportTaskService.processGenericImport — footnote canonicalizati
 
       expect(captured).toBeTruthy();
       const content = captured.content;
-      // Reference order is c, a, b (NOT the markdown definition order a, b, c).
-      expect(footnoteListIds(content)).toEqual(['c', 'a', 'b']);
+      // Definitions ordered by FIRST REFERENCE (C, A, B), NOT the markdown
+      // definition order (A, B, C). Ids are the parser's fresh `fn-*`, so pin
+      // the BODIES.
+      expect(footnoteListBodies(content)).toEqual([
+        'note C',
+        'note A',
+        'note B',
+      ]);
       // Orphan [^z] dropped; reused [^a] collapses to one definition; one list.
-      expect(footnoteListIds(content)).not.toContain('z');
+      expect(footnoteListBodies(content)).not.toContain('orphan note');
       const lists = (content.content ?? []).filter(
         (n: any) => n.type === 'footnotesList',
       );
       expect(lists).toHaveLength(1);
-      expect(footnoteListIds(content).filter((id) => id === 'a')).toHaveLength(1);
+      expect(
+        footnoteListBodies(content).filter((b) => b === 'note A'),
+      ).toHaveLength(1);
     } finally {
       await fs.rm(extractDir, { recursive: true, force: true });
     }
