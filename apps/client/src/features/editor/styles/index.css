@@ -1,5 +1,6 @@
 @import "./core.css";
 @import "./collaboration.css";
+@import "./multi-cursor.css";
 @import "./task-list.css";
 @import "./placeholder.css";
 @import "./drag-handle.css";
