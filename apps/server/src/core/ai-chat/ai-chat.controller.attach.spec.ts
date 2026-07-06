@@ -322,3 +322,102 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     expect(raw.write).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * The begin-hook `open()` flag gate (#184 phase 1.5). `open()` lives ONLY in the
+ * stream() begin-hook, gated on the resumable flag. If it regressed, a flag-off
+ * turn would create an EMPTY registry entry (never bound, never finished) and a
+ * later attach would find a non-null paused attachment -> a hung SSE that never
+ * gets a frame and never ends, instead of a clean 204. These drive stream() only
+ * far enough to capture the runHooks it hands to the service, then invoke the
+ * begin-hook and assert whether the registry was opened.
+ */
+describe('AiChatController begin-hook open() flag gate (#184 phase 1.5)', () => {
+  const user = { id: 'u1' } as User;
+  const workspace = {
+    id: 'ws1',
+    settings: { ai: { chat: true, autonomousRuns: true } },
+  } as unknown as Workspace;
+
+  function makeController(opts: { resumable: boolean }) {
+    let capturedArgs: any;
+    const aiChatService = {
+      resolveRoleForRequest: jest.fn(async () => null),
+      getChatModel: jest.fn(async () => ({})),
+      stream: jest.fn(async (args: any) => {
+        capturedArgs = args;
+      }),
+    };
+    const aiChatRunService = {
+      getActiveForChat: jest.fn(async () => undefined),
+      beginRun: jest.fn(async () => ({
+        runId: 'run-1',
+        signal: new AbortController().signal,
+      })),
+    };
+    const streamRegistry = { open: jest.fn(), attach: jest.fn() };
+    const environment = {
+      isAiChatResumableStreamEnabled: () => opts.resumable,
+    };
+    const controller = new AiChatController(
+      aiChatService as never,
+      aiChatRunService as never,
+      {} as never, // aiChatRepo
+      {} as never, // aiChatMessageRepo
+      {} as never, // aiTranscription
+      {} as never, // pageRepo
+      streamRegistry as never,
+      environment as never,
+    );
+    return {
+      controller,
+      streamRegistry,
+      aiChatRunService,
+      getRunHooks: () => capturedArgs?.runHooks,
+    };
+  }
+
+  function makeReqRes() {
+    const req: any = {
+      raw: { sessionId: 'sess-1', once: jest.fn() },
+      body: {
+        messages: [
+          { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+        ],
+      },
+    };
+    const res: any = {
+      raw: { once: jest.fn(), on: jest.fn(), headersSent: false, writableEnded: false },
+      hijack: jest.fn(),
+    };
+    return { req, res };
+  }
+
+  it('flag OFF: the begin-hook does NOT open a registry entry (no hung empty entry)', async () => {
+    const { controller, streamRegistry, aiChatRunService, getRunHooks } =
+      makeController({ resumable: false });
+    const { req, res } = makeReqRes();
+    await controller.stream(req, res, user, workspace);
+
+    const runHooks = getRunHooks();
+    expect(runHooks).toBeDefined();
+    const handle = await runHooks.begin('chat-1');
+    // The run still begins (the durable-run feature is independent of resume)...
+    expect(aiChatRunService.beginRun).toHaveBeenCalled();
+    expect(handle).toEqual({ runId: 'run-1', signal: expect.anything() });
+    // ...but with the flag off the registry entry is NEVER opened.
+    expect(streamRegistry.open).not.toHaveBeenCalled();
+  });
+
+  it('flag ON: the begin-hook opens the registry entry with (chatId, runId)', async () => {
+    const { controller, streamRegistry, getRunHooks } = makeController({
+      resumable: true,
+    });
+    const { req, res } = makeReqRes();
+    await controller.stream(req, res, user, workspace);
+
+    const runHooks = getRunHooks();
+    await runHooks.begin('chat-1');
+    expect(streamRegistry.open).toHaveBeenCalledWith('chat-1', 'run-1');
+  });
+});

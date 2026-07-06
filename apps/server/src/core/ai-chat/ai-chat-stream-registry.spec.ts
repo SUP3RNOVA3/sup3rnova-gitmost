@@ -227,6 +227,37 @@ describe('AiChatStreamRegistryService', () => {
     expect(await registry.attach(CHAT, false, undefined, c2.cb)).toBeNull();
   });
 
+  it('a paused subscriber whose pending buffer overflows is dropped and ends on start(); other subscribers keep receiving', async () => {
+    registry.open(CHAT, 'run-1');
+    const src = makePushStream();
+    registry.bind(CHAT, 'run-1', 'assist-1', src.stream);
+
+    // A: paused (start() deliberately delayed to simulate the phase-2 await seam).
+    const a = collector();
+    const attA = (await registry.attach(CHAT, false, undefined, a.cb))!;
+    // B: live (started) — its delivery must be unaffected by A's overflow.
+    const b = collector();
+    const attB = (await registry.attach(CHAT, false, undefined, b.cb))!;
+    attB.start();
+
+    const oneMb = 'x'.repeat(1024 * 1024);
+    // 9 x 1MB = 9MB > 8MB per-subscriber cap; A's pending overflows, B streams live.
+    for (let i = 0; i < 9; i++) src.push(oneMb + i);
+    await flush();
+
+    const entry = (registry as any).entries.get(CHAT);
+    // A was dropped from the subscriber set on overflow; B (started) remains.
+    expect(entry.subscribers.size).toBe(1);
+    expect(a.frames).toEqual([]); // paused + overflowed: nothing was delivered
+    // B received every frame live (delivery unaffected by A's overflow).
+    expect(b.frames).toHaveLength(9);
+
+    // A's start() (arriving late) degrades to an immediate end, not a partial replay.
+    attA.start();
+    expect(a.frames).toEqual([]);
+    expect(a.ended()).toBe(1);
+  });
+
   it('open() over a LIVE entry ends started subscribers exactly once and a late done does not touch the new entry (invariant 3)', async () => {
     registry.open(CHAT, 'run-1');
     const src = makePushStream();

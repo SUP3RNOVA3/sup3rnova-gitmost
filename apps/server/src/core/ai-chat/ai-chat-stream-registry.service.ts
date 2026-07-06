@@ -39,6 +39,13 @@ export interface RunStreamAttachment {
 interface Subscriber extends RunStreamCallbacks {
   started: boolean;
   pending: string[];
+  // Byte size of `pending`, capped at SUBSCRIBER_MAX_BUFFERED_BYTES. `start()` is
+  // called in the SAME tick as `attach()` today (see attach), so `pending` never
+  // holds more than one microtask of frames — but the async `attach` signature is
+  // a phase-2 seam: an await between attach and start would let a stalled paused
+  // subscriber buffer the WHOLE run here. The cap is the structural backstop.
+  pendingBytes: number;
+  overflowed: boolean;
   pendingEnd: boolean;
 }
 
@@ -182,15 +189,33 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
       onEnd: cb.onEnd,
       started: false,
       pending: [],
+      pendingBytes: 0,
+      overflowed: false,
       pendingEnd: false,
     };
     entry.subscribers.add(sub);
     // Snapshot in the SAME synchronous block as the registration (invariant 4).
     const replay = entry.frames.slice();
+    // CONTRACT: the caller MUST call start() in the SAME tick as this attach()
+    // returns — no await between them. While a subscriber is paused, every frame
+    // is buffered in sub.pending; a delayed start() lets a whole run accumulate
+    // there. The pendingBytes cap (see ingestFrame) is the structural backstop if
+    // that contract is ever broken (e.g. the phase-2 Redis await seam).
     return {
       replay,
       finished: false,
       start: () => {
+        if (sub.overflowed) {
+          // The pending buffer overflowed while paused: end the stream instead of
+          // replaying a partial (a 204-equivalent post-attach degrade).
+          try {
+            sub.onEnd();
+          } catch {
+            // The socket is gone; nothing to end.
+          }
+          entry.subscribers.delete(sub);
+          return;
+        }
         // Deliver frames buffered while paused, in order, then go live.
         for (const frame of sub.pending) {
           try {
@@ -250,6 +275,16 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
         }
       } else {
         sub.pending.push(frame);
+        sub.pendingBytes += Buffer.byteLength(frame);
+        if (sub.pendingBytes > SUBSCRIBER_MAX_BUFFERED_BYTES) {
+          // The paused subscriber's buffer overflowed — only possible if start()
+          // was delayed past the same-tick contract (the phase-2 await seam).
+          // Drop it rather than buffer the whole run; on start() it degrades to an
+          // immediate end (a 204-equivalent) instead of replaying a partial.
+          sub.overflowed = true;
+          sub.pending = [];
+          entry.subscribers.delete(sub);
+        }
       }
     }
   }
