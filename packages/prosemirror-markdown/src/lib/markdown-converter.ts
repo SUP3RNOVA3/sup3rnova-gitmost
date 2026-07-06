@@ -49,6 +49,52 @@ export interface ConvertProseMirrorToMarkdownOptions {
 }
 
 /**
+ * Adjacent sibling lists that share a markdown MARKER FAMILY re-parse as ONE
+ * merged list — bulletList and taskList both emit `- ` markers (→ a single
+ * `<ul>`), and two orderedLists both emit `1.` markers (→ a single `<ol>`). The
+ * cross-type case is real data loss the editor CAN produce (e.g. a taskList
+ * followed by a bulletList: the merged `<ul>` has a mix of checkbox and plain
+ * items, so `bridgeTaskLists` refuses to convert it and every taskItem loses its
+ * checkbox). Between two such adjacent list children we emit an empty HTML comment
+ * `<!-- -->`: marked renders it as its own HTML block that interrupts the list, so
+ * the two lists stay distinct; on import the comment is inert (parseAttachedComment
+ * → null) and dropped by generateJSON, and re-export re-inserts it, so the marker
+ * is byte-stable. It fires ONLY between two adjacent same-family list nodes — no
+ * separator is emitted for any other join, so non-list output is unchanged.
+ */
+const LIST_MARKER_SEPARATOR = "<!-- -->";
+function listMarkerFamily(type: string | undefined): "ul" | "ol" | null {
+  if (type === "bulletList" || type === "taskList") return "ul";
+  if (type === "orderedList") return "ol";
+  return null;
+}
+function adjacentListsMerge(
+  prevType: string | undefined,
+  curType: string | undefined,
+): boolean {
+  const a = listMarkerFamily(prevType);
+  return a !== null && a === listMarkerFamily(curType);
+}
+/**
+ * Render each block child, inserting a `<!-- -->` separator entry between any two
+ * adjacent same-marker-family list nodes (see LIST_MARKER_SEPARATOR). Callers
+ * join the returned strings with their own context separator.
+ */
+function renderBlockChildren(
+  children: any[],
+  render: (n: any) => string,
+): string[] {
+  const out: string[] = [];
+  let prevType: string | undefined;
+  for (const child of children) {
+    if (adjacentListsMerge(prevType, child?.type)) out.push(LIST_MARKER_SEPARATOR);
+    out.push(render(child));
+    prevType = child?.type;
+  }
+  return out;
+}
+
+/**
  * Convert ProseMirror/TipTap JSON content to Markdown
  * Supports all Docmost-specific node types and extensions
  */
@@ -347,9 +393,15 @@ export function convertProseMirrorToMarkdown(
         // lossless (the body survives) and byte-stable (it re-exports identically),
         // so it is deliberately not treated as data loss.
         const parts: string[] = [];
+        let prevDocType: string | undefined;
         for (const child of nodeContent) {
           if (child?.type === "footnotesList") continue;
+          // Keep adjacent same-family sibling lists distinct (see renderBlockChildren).
+          if (adjacentListsMerge(prevDocType, child?.type)) {
+            parts.push(LIST_MARKER_SEPARATOR);
+          }
           parts.push(processNode(child));
+          prevDocType = child?.type;
         }
         for (const [id, def] of footnoteDefs) {
           if (!referencedFootnoteIds.has(id)) {
@@ -599,20 +651,34 @@ export function convertProseMirrorToMarkdown(
         return processTaskItem(node);
 
       case "listItem":
-        return nodeContent.map(processNode).join("\n");
+        // Direct-listItem path (lists normally render via processListItem, which
+        // handles the marker + indentation). Blank line between block children so
+        // multiple paragraphs do not merge on re-parse; a `<!-- -->` entry
+        // (renderBlockChildren) separates adjacent sibling lists.
+        return renderBlockChildren(nodeContent, processNode).join("\n\n");
 
-      case "blockquote":
+      case "blockquote": {
         // Prefix EVERY line of EVERY child with "> " and separate block-level
         // children with a blank ">" line so code blocks / multi-paragraph
-        // quotes round-trip correctly.
-        return nodeContent
-          .map((n: any) =>
+        // quotes round-trip correctly. A `> <!-- -->` separator line is inserted
+        // between two adjacent same-family sibling lists (renderBlockChildren)
+        // so they stay distinct inside the quote.
+        const bqParts: string[] = [];
+        let prevBqType: string | undefined;
+        for (const n of nodeContent) {
+          if (adjacentListsMerge(prevBqType, n?.type)) {
+            bqParts.push(`> ${LIST_MARKER_SEPARATOR}`);
+          }
+          bqParts.push(
             processNode(n)
               .split("\n")
               .map((line: string) => (line.length ? `> ${line}` : ">"))
               .join("\n"),
-          )
-          .join("\n>\n");
+          );
+          prevBqType = n?.type;
+        }
+        return bqParts.join("\n>\n");
+      }
 
       case "horizontalRule":
         return "---";
@@ -787,9 +853,12 @@ export function convertProseMirrorToMarkdown(
         // blockquote-prefixed; a blank line becomes a bare `>` so the callout is
         // not split.
         const calloutType = (node.attrs?.type || "info").toLowerCase();
-        const calloutBody = nodeContent
-          .map(processNode)
-          .join("\n")
+        const calloutBody = renderBlockChildren(nodeContent, processNode)
+          // Blank line between block children (rendered as a bare `>` after the
+          // prefix pass below) so multiple paragraphs stay separate nodes instead
+          // of merging on re-parse — same rule blockquote already uses. A
+          // `<!-- -->` entry (renderBlockChildren) separates adjacent sibling lists.
+          .join("\n\n")
           .split("\n")
           .map((l: string) => (l.length ? `> ${l}` : ">"))
           .join("\n");
@@ -809,7 +878,10 @@ export function convertProseMirrorToMarkdown(
         return `<summary>${renderInlineChildren(nodeContent)}</summary>\n\n`;
 
       case "detailsContent":
-        return `${nodeContent.map(processNode).join("\n")}\n`;
+        // Blank line between block children so multiple paragraphs in a details
+        // body survive as separate nodes (a single "\n" merges them on re-parse);
+        // a `<!-- -->` entry (renderBlockChildren) separates adjacent sibling lists.
+        return `${renderBlockChildren(nodeContent, processNode).join("\n\n")}\n`;
 
       case "mathInline": {
         // #293 canon #6: inline math serializes as Obsidian-native `$LaTeX$`
@@ -1338,11 +1410,19 @@ export function convertProseMirrorToMarkdown(
         // The code itself is element TEXT content (between <code> tags), so it
         // must escape < > & — NOT the attribute escaper. The language rides in
         // a class ATTRIBUTE, so it uses escapeAttr.
+        //
+        // Read the child text RAW (as `case "codeBlock"` does) and keep it
+        // VERBATIM — do NOT strip the trailing newline. Unlike the markdown fence
+        // path (which strips then relies on marked re-adding one `\n`), the schema
+        // codeBlock parseHTML reads the `<code>` text content back byte-for-byte,
+        // so stripping here would drop a trailing newline the node legitimately
+        // carries and break the round trip inside a column/cell.
         const code = escapeHtmlText(
           children
-            .map(processNode)
-            .join("")
-            .replace(/\n+$/, ""),
+            .map((child: any) =>
+              typeof child?.text === "string" ? child.text : "",
+            )
+            .join(""),
         );
         const cls = lang ? ` class="language-${escapeAttr(lang)}"` : "";
         return `<pre><code${cls}>${code}</code></pre>`;
@@ -1484,6 +1564,13 @@ export function convertProseMirrorToMarkdown(
     const indent = " ".repeat(indentWidth);
     const lines: string[] = [];
     childStrings.forEach((child, childIndex) => {
+      // Separate consecutive block children with a BLANK line so the item is a
+      // CommonMark "loose" list item and each block stays its own node. Without
+      // it, a second paragraph (`- a\n  b`) is re-parsed as a lazy continuation
+      // of the first and the two merge into one paragraph — silent data loss.
+      // The blank line still sits INSIDE the item (the following block keeps the
+      // continuation indent), so nested lists/code blocks remain nested.
+      if (childIndex > 0) lines.push("");
       child.split("\n").forEach((line, lineIndex) => {
         if (childIndex === 0 && lineIndex === 0) {
           // First physical line of the first block gets the marker.
@@ -1500,7 +1587,9 @@ export function convertProseMirrorToMarkdown(
 
   const processListItem = (item: any, prefix: string): string => {
     const itemContent = item.content || [];
-    const childStrings = itemContent.map(processNode);
+    // A `<!-- -->` entry separates two adjacent same-family sublists inside the
+    // item so they do not merge on re-parse (see renderBlockChildren).
+    const childStrings = renderBlockChildren(itemContent, processNode);
     if (childStrings.length === 0) return prefix;
     // The rendered marker is `${prefix} ` (prefix + one space), so its width —
     // and thus the continuation indent — is prefix.length + 1. This is correct
@@ -1514,7 +1603,9 @@ export function convertProseMirrorToMarkdown(
     const checkbox = checked ? "[x]" : "[ ]";
     const prefix = `- ${checkbox}`;
     const itemContent = item.content || [];
-    const childStrings = itemContent.map(processNode);
+    // A `<!-- -->` entry separates two adjacent same-family sublists inside the
+    // item so they do not merge on re-parse (see renderBlockChildren).
+    const childStrings = renderBlockChildren(itemContent, processNode);
     // An empty task item still needs its checkbox marker; without this guard
     // the indent below produces "" and the "- [ ]"/"- [x]" row disappears.
     if (childStrings.length === 0) return prefix;

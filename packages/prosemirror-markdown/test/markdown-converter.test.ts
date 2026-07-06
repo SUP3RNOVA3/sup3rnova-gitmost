@@ -198,7 +198,11 @@ describe('convertProseMirrorToMarkdown', () => {
         }),
       );
       // First line carries the marker; the nested list is indented 2 columns.
-      expect(out).toBe('- parent\n  - child');
+      // Block children of a list item are separated by a BLANK line (loose list):
+      // this is the #351 fix — a single "\n" let a following block merge into the
+      // first paragraph on re-parse (silent content loss). The blank line stays
+      // inside the item, so the sublist remains nested at the 2-col marker column.
+      expect(out).toBe('- parent\n\n  - child');
     });
 
     it('nested ordered list indents by the wider 3-col marker width', () => {
@@ -219,8 +223,9 @@ describe('convertProseMirrorToMarkdown', () => {
           ],
         }),
       );
-      // "1. " is 3 columns wide, so the continuation indent is 3 spaces.
-      expect(out).toBe('1. parent\n   1. child');
+      // "1. " is 3 columns wide, so the continuation indent is 3 spaces. Block
+      // children are blank-line separated (loose list) per the #351 fix.
+      expect(out).toBe('1. parent\n\n   1. child');
     });
   });
 
@@ -539,11 +544,12 @@ describe('convertProseMirrorToMarkdown', () => {
       );
 
       // The 10th marker is the 4-column "10. "; the nested sublist line must be
-      // indented exactly 4 spaces (prefix.length 3 + 1), NOT 3.
-      expect(out).toContain('10. j\n    1. x');
+      // indented exactly 4 spaces (prefix.length 3 + 1), NOT 3. Block children are
+      // blank-line separated (loose list) per the #351 fix.
+      expect(out).toContain('10. j\n\n    1. x');
       // Guard against the off-by-one (3-space) regression that would re-parse
       // the sublist as loose/sibling content on import.
-      expect(out).not.toContain('10. j\n   1. x');
+      expect(out).not.toContain('10. j\n\n   1. x');
       // And the single-digit items keep the narrower 3-column marker (no body
       // continuation here, but the marker itself must stay "1. ".."9. ").
       expect(out.startsWith('1. a\n2. b\n')).toBe(true);
@@ -580,17 +586,18 @@ describe('convertProseMirrorToMarkdown', () => {
           content: [para(text('line1')), para(text('line2'))],
         }),
       );
-      // NOTE(review): the spec predicted ':::warning\nline1\n\nline2\n:::' (a
-      // The converter joins the callout's rendered children with a single '\n'
-      // and emits an Obsidian-native callout: a `> [!type]` opener plus one
-      // `>`-prefixed body line per content line. We pin the lowercasing
-      // (WARNING -> warning) and the multi-child join.
-      expect(out).toBe('> [!warning]\n> line1\n> line2');
+      // The converter emits an Obsidian-native callout: a `> [!type]` opener plus
+      // one `>`-prefixed body line per content line. Block children are separated
+      // by a blank `>` line (#351 fix): a single '\n' let the two paragraphs merge
+      // into one on re-parse. We pin the lowercasing (WARNING -> warning) and the
+      // blank-line-separated multi-child join.
+      expect(out).toBe('> [!warning]\n> line1\n>\n> line2');
       // The type is lowercased (an uppercase `[!WARNING]` would not re-import).
       expect(out.startsWith('> [!warning]\n')).toBe(true);
       expect(out).not.toContain('[!WARNING]');
-      // Both paragraph children are present, each blockquote-prefixed.
-      expect(out).toContain('> line1\n> line2');
+      // Both paragraph children are present, each blockquote-prefixed, blank-`>`
+      // separated so they stay distinct paragraphs on re-parse.
+      expect(out).toContain('> line1\n>\n> line2');
     });
 
     // Spec 4 — blockquote per-line prefixer over a multi-line nested callout.
@@ -607,13 +614,11 @@ describe('convertProseMirrorToMarkdown', () => {
           ],
         }),
       );
-      // NOTE(review): the spec predicted '> :::info\n> a\n>\n> b\n> :::',
-      // assuming the nested callout body contains a blank line between 'a' and
-      // The nested callout renders as an Obsidian callout '> [!info]\n> a\n> b'
-      // (single-'\n' join, no blank line). The outer blockquote prefixer then
-      // prefixes each of those lines with '> ' again, yielding a doubly-nested
-      // blockquote — the realistic per-line-prefix loop over a multi-line child.
-      expect(out).toBe('> > [!info]\n> > a\n> > b');
+      // The nested callout renders as an Obsidian callout '> [!info]\n> a\n>\n> b'
+      // (blank-`>` separated children per the #351 fix). The outer blockquote
+      // prefixer then prefixes each of those lines with '> ' again, yielding a
+      // doubly-nested blockquote — the per-line-prefix loop over a multi-line child.
+      expect(out).toBe('> > [!info]\n> > a\n> >\n> > b');
       // Every produced line carries the '> ' prefix (no line escapes to col 0).
       for (const line of out.split('\n')) {
         expect(line.startsWith('>')).toBe(true);

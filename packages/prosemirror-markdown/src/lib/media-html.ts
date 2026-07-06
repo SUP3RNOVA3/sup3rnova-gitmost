@@ -46,7 +46,11 @@ export function videoToHtml(attrs: Record<string, any>): string {
   if (attrs.width != null) parts.push(`width="${escapeAttr(attrs.width)}"`);
   if (attrs.height != null) parts.push(`height="${escapeAttr(attrs.height)}"`);
   if (attrs.size != null) parts.push(`data-size="${escapeAttr(attrs.size)}"`);
-  if (attrs.align) parts.push(`data-align="${escapeAttr(attrs.align)}"`);
+  // align default is "center" (schema): OMIT it so a bare/center node stays
+  // clean and parse's re-materialized "center" default is not a P2 churn — only
+  // a genuinely non-default left/right emits data-align (mirrors imageToHtml).
+  if (attrs.align && attrs.align !== "center")
+    parts.push(`data-align="${escapeAttr(attrs.align)}"`);
   if (attrs.aspectRatio != null)
     parts.push(`data-aspect-ratio="${escapeAttr(attrs.aspectRatio)}"`);
   return `<div><video ${parts.join(" ")}></video></div>`;
@@ -62,7 +66,9 @@ export function youtubeToHtml(attrs: Record<string, any>): string {
     parts.push(`data-width="${escapeAttr(attrs.width)}"`);
   if (attrs.height != null)
     parts.push(`data-height="${escapeAttr(attrs.height)}"`);
-  if (attrs.align) parts.push(`data-align="${escapeAttr(attrs.align)}"`);
+  // "center" is the schema default -> omit (see videoToHtml rationale).
+  if (attrs.align && attrs.align !== "center")
+    parts.push(`data-align="${escapeAttr(attrs.align)}"`);
   return `<div ${parts.join(" ")}></div>`;
 }
 
@@ -97,7 +103,9 @@ export function diagramToHtml(
   if (attrs.size != null) parts.push(`data-size="${escapeAttr(attrs.size)}"`);
   if (attrs.aspectRatio != null)
     parts.push(`data-aspect-ratio="${escapeAttr(attrs.aspectRatio)}"`);
-  if (attrs.align) parts.push(`data-align="${escapeAttr(attrs.align)}"`);
+  // "center" is the schema default -> omit (see videoToHtml rationale).
+  if (attrs.align && attrs.align !== "center")
+    parts.push(`data-align="${escapeAttr(attrs.align)}"`);
   if (attrs.attachmentId)
     parts.push(`data-attachment-id="${escapeAttr(attrs.attachmentId)}"`);
   return `<div ${parts.join(" ")}></div>`;
@@ -110,10 +118,18 @@ export function embedToHtml(attrs: Record<string, any>): string {
     `data-src="${escapeAttr(attrs.src ?? "")}"`,
     `data-provider="${escapeAttr(attrs.provider ?? "")}"`,
   ];
-  if (attrs.align) parts.push(`data-align="${escapeAttr(attrs.align)}"`);
-  if (attrs.width != null)
+  // "center" is the schema default -> omit (see videoToHtml rationale).
+  if (attrs.align && attrs.align !== "center")
+    parts.push(`data-align="${escapeAttr(attrs.align)}"`);
+  // embed width/height default to the NUMBERS 800/600 (schema). Getting a data-
+  // attribute back always yields a STRING, so emitting the default here would
+  // round-trip 800 -> "800" (a number->string P1 divergence canonicalize does
+  // NOT normalize). OMIT the defaults so parse re-materializes the numeric
+  // default instead — mirrors the top-level embed path (markdown-converter.ts),
+  // which also emits width/height only when they differ from 800/600.
+  if (attrs.width != null && attrs.width !== 800)
     parts.push(`data-width="${escapeAttr(attrs.width)}"`);
-  if (attrs.height != null)
+  if (attrs.height != null && attrs.height !== 600)
     parts.push(`data-height="${escapeAttr(attrs.height)}"`);
   return `<div ${parts.join(" ")}></div>`;
 }
