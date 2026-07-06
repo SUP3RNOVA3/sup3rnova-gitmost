@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { generateId } from "ai";
 import { ActionIcon, Box, Group, Stack, Text, Tooltip } from "@mantine/core";
 import {
@@ -24,7 +25,14 @@ import {
 } from "@/features/ai-chat/utils/role-launch.ts";
 import { describeChatError } from "@/features/ai-chat/utils/error-message.ts";
 import { extractServerChatId } from "@/features/ai-chat/utils/adopt-chat-id.ts";
-import { mergeObservedMessage } from "@/features/ai-chat/utils/run-polling.ts";
+import { assistantMessageHasVisibleContent } from "@/features/ai-chat/utils/message-content.ts";
+import {
+  isStreamingTail,
+  isSettledAssistantTail,
+  seedRows,
+  mergeById,
+} from "@/features/ai-chat/utils/resume-helpers.ts";
+import { AI_CHAT_MESSAGES_RQ_KEY } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import {
   dequeue,
   enqueueMessage,
@@ -87,19 +95,13 @@ interface ChatThreadProps {
    *  Copy/export button available mid-stream). Distinct from onTurnFinished,
    *  which fires only at the terminal outcome. */
   onServerChatId?: (serverChatId?: string) => void;
-  /** #184 reconnect-and-live-follow. When THIS tab reopened a chat whose agent
-   *  run is still going (it is a PASSIVE OBSERVER — it did not start the run here),
-   *  the parent polls the reconnect endpoint and feeds the run's incrementally-
-   *  persisted assistant message here; we merge it into the live list so new
-   *  steps/tool-calls appear as they are persisted. Null when there is nothing to
-   *  observe (no run, feature off, or this tab IS the streamer). The merge is
-   *  ADDITIONALLY guarded by our own `isStreaming`, so a stale value can never
-   *  fight the local stream when we are the streamer. */
-  observedRow?: IAiChatMessageRow | null;
-  /** Report this tab's live streaming status up to the parent, so it can stop
-   *  polling the run while WE are the active streamer (the SSE owns the view) and
-   *  resume once we go idle. Called from an effect on every transition. */
-  onStreamingChange?: (streaming: boolean) => void;
+  /** #184 phase 1.5: arm/disarm the parent's degraded-poll fallback for THIS
+   *  chat's window. Called `true` when a resume attempt could not attach to the
+   *  live run (attach 204 / starved-or-torn resumed finish), so the window starts
+   *  a dumb timed poll of the message history to follow the detached run to settle;
+   *  called `false` the moment a local stream starts or the terminal settled row is
+   *  merged (invariant 8). The window owns the timer + its 10-min cap. */
+  onResumeFallback?: (active: boolean) => void;
   /** #184: whether detached/autonomous agent runs are enabled for this workspace.
    *  When true the Stop button must additionally hit the AUTHORITATIVE server stop
    *  (via onServerStop) — aborting only the local SSE is just a client disconnect,
@@ -155,15 +157,58 @@ export default function ChatThread({
   assistantName,
   onTurnFinished,
   onServerChatId,
-  observedRow,
-  onStreamingChange,
+  onResumeFallback,
   autonomousRunsEnabled,
   onServerStop,
 }: ChatThreadProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
+
+  // resume machinery refs (#184 phase 1.5)
+  const attachAbortRef = useRef<AbortController | null>(null);
+  const reconcileTailRef = useRef(false);
+  const noStreamHandledRef = useRef(false);
+  const onNoActiveStreamRef = useRef<(() => void) | null>(null);
+  // Live mount flag. The attach GET and the resumed `onFinish` are async and can
+  // land AFTER this thread unmounts (the parent remounts per chat via `key`); with
+  // chatIdRef then pointing at the NEW chat, an ungated late callback would arm a
+  // spurious poll + foreign invalidation on the newly-opened chat. Every parent-
+  // facing resume side-effect is gated on this.
+  const mountedRef = useRef(true);
+  const [resumedTurn, setResumedTurn] = useState(false);
+  const resumedTurnRef = useRef(false);
+  // Identity-stable pair setter (bare useState setter + ref write): it is closed
+  // over by the transport useMemo([]), so it MUST NOT capture state.
+  const setResumedTurnPair = useCallback((v: boolean) => {
+    resumedTurnRef.current = v;
+    setResumedTurn(v);
+  }, []);
+
+  // Mount-time resume gating (in refs — computed once for this mount; the parent
+  // remounts per chat via `key`).
+  //
+  // Attempt resume for any non-settled tail: a streaming tail (strip + expect
+  // live replay) or a user tail (the run may exist but its assistant row is not
+  // seeded yet — attach to the pre-opened registry entry and wait for frames).
+  // A settled assistant tail must NEVER resume: replaying a finished run into a
+  // store that already contains its message duplicates parts (SDK text-start
+  // always pushes a new part).
+  const stripRef = useRef(chatId !== null && isStreamingTail(initialRows ?? []));
+  const attemptResumeRef = useRef(
+    autonomousRunsEnabled === true &&
+      chatId !== null &&
+      !isSettledAssistantTail(initialRows ?? []),
+  );
+  const strippedRowRef = useRef<IAiChatMessageRow | null>(
+    stripRef.current ? (initialRows ?? [])[initialRows!.length - 1] : null,
+  );
 
   const initialMessages = useMemo<UIMessage[]>(
-    () => (initialRows ?? []).map(rowToUiMessage),
+    () =>
+      seedRows(
+        initialRows ?? [],
+        attemptResumeRef.current && stripRef.current,
+      ).map(rowToUiMessage),
     [initialRows],
   );
 
@@ -261,9 +306,12 @@ export default function ChatThread({
     const { head, rest } = dequeue(queuedRef.current);
     if (!head) return false;
     setQueue(rest);
+    // Local send: clear any resume-suppression flag so this genuine local turn's
+    // onFinish flushes normally (invariant 8).
+    setResumedTurnPair(false);
     sendMessageRef.current?.({ text: head.text });
     return true;
-  }, [setQueue]);
+  }, [setQueue, setResumedTurnPair]);
 
   const enqueue = useCallback(
     (text: string) => {
@@ -283,6 +331,47 @@ export default function ChatThread({
       new DefaultChatTransport<UIMessage>({
         api: "/api/ai-chat/stream",
         credentials: "include",
+        prepareReconnectToStreamRequest: () => ({
+          // SDK default URL uses the useChat STORE id — always build from the real chat id.
+          // ?expect=live&anchor=<row id> ONLY when we stripped a streaming tail: expect=live
+          // is the only case where a finished-retained replay is safe (the row is stripped,
+          // replay rebuilds it), and the anchor pins the replay to OUR run — a mismatching
+          // (newer) run must 204 into the restore+poll path instead of replaying a foreign
+          // transcript into this store.
+          api: `/api/ai-chat/runs/${chatIdRef.current}/stream${
+            stripRef.current
+              ? `?expect=live&anchor=${strippedRowRef.current!.id}`
+              : ""
+          }`,
+        }),
+        fetch: async (input: RequestInfo | URL, init: RequestInit = {}) => {
+          if ((init.method ?? "GET") !== "GET") return fetch(input, init); // send path untouched
+          // Reconnect GET: the SDK passes no AbortSignal, so wire our own controller
+          // for observer Stop / unmount abort.
+          const controller = new AbortController();
+          attachAbortRef.current = controller;
+          try {
+            const response = await fetch(input, {
+              ...init,
+              signal: controller.signal,
+            });
+            // No onFinish will come for a 204 (silent no-op) OR any non-2xx
+            // (5xx/502 — a server restart mid-attach). Both run the same
+            // no-active-stream recovery: restore the stripped row, invalidate, and
+            // arm the degraded poll (idempotent via noStreamHandledRef; its part-d
+            // also clears the resumedTurn flag). This is the restart-survival path
+            // the removed F7 latch used to guard — a transient attach failure must
+            // NOT drop the in-progress row or stop tracking the durable run.
+            if (response.status === 204 || !response.ok)
+              onNoActiveStreamRef.current?.();
+            return response;
+          } catch (err) {
+            // Network throw: same no-onFinish recovery, then rethrow so the SDK
+            // still surfaces the error to its own machinery.
+            onNoActiveStreamRef.current?.();
+            throw err;
+          }
+        },
         // Inject the chat id and the currently-open page alongside the useChat
         // messages so the server can resolve an existing chat (or create one
         // when null) and tell the agent which page "this page" refers to. Both
@@ -312,7 +401,15 @@ export default function ChatThread({
     [],
   );
 
-  const { messages, sendMessage, status, stop, error, setMessages } = useChat({
+  const {
+    messages,
+    sendMessage,
+    status,
+    stop,
+    error,
+    setMessages,
+    resumeStream,
+  } = useChat({
     // Stable per-mount key. Existing chats use their real id; new chats use a
     // generated client id (never `undefined`) so the store is NOT re-created on
     // every render mid-stream (see `chatStoreId` above).
@@ -330,6 +427,38 @@ export default function ChatThread({
     // would be wrong, so on Stop/disconnect/error the queue is left intact for
     // the user to decide.
     onFinish: ({ message, isAbort, isDisconnect, isError }) => {
+      // (1) Capture whether THIS finish belongs to a resumed (attach) turn and
+      // immediately clear the flag so it can never suppress a LATER local turn.
+      const wasResumed = resumedTurnRef.current;
+      setResumedTurnPair(false);
+      // (2) Recovery after a starved/torn resumed finish (invariant 9). The arm
+      // and the stripped-row restore are gated DIFFERENTLY. Skip entirely once
+      // unmounted (an abort-triggered onFinish landing after a chat switch must
+      // not arm a poll / invalidate on the new chat).
+      if (wasResumed && mountedRef.current) {
+        const hasVisibleContent = assistantMessageHasVisibleContent(message);
+        // ARM the reconcile + degraded poll when the resumed message carries no
+        // visible content (starved replay) OR the connection dropped mid-run — in
+        // both cases the poll must drive the row to its real terminal state.
+        if (isDisconnect || !hasVisibleContent) {
+          reconcileTailRef.current = true;
+          queryClient.invalidateQueries({
+            queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
+          });
+          onResumeFallback?.(true);
+        }
+        // RESTORE the stripped streaming row ONLY when the resumed message has no
+        // visible content. On isDisconnect WITH visible content restore is
+        // FORBIDDEN: the live stream may have advanced far past the mount-time
+        // snapshot, so restoring would clobber on-screen content (invariant 9) —
+        // the arm above suffices, the poll reaches the true terminal.
+        if (!hasVisibleContent && strippedRowRef.current) {
+          setMessages((prev) =>
+            mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
+          );
+        }
+      }
+      // (3) Standard branches.
       // Forward the authoritative server chatId (streamed on the assistant
       // message metadata) so the parent adopts the REAL created chat id for a new
       // chat — see adopt-chat-id.ts for the full #137 design. `threadKey` lets the
@@ -342,6 +471,10 @@ export default function ChatThread({
       else if (isAbort) setStopNotice("manual");
       else if (isDisconnect) setStopNotice("disconnect");
       else setStopNotice(null);
+      // A resumed turn NEVER flushes the queue (invariant 7): skip BOTH the
+      // flush-on-abort branch and the plain flush. The local streamer is the only
+      // tab that owns the queue.
+      if (wasResumed) return;
       // "Send now": WE triggered this abort to interrupt the current turn and
       // immediately send the promoted head. Flush it even though the turn was
       // aborted (the normal abort path below keeps the queue intact). The
@@ -423,26 +556,98 @@ export default function ChatThread({
 
   const isStreaming = status === "submitted" || status === "streaming";
 
-  // #184: report our live streaming status up so the parent stops polling the run
-  // while WE are the streamer (the SSE owns the view) and resumes once we go idle.
-  // Effect (not render) so it never updates parent state during our own render;
-  // fires on mount with `false`, which also re-syncs the parent after a chat
-  // switch remounts this thread (a fresh mount is idle until the user sends).
-  useEffect(() => {
-    onStreamingChange?.(isStreaming);
-  }, [isStreaming, onStreamingChange]);
+  // 204-handler (`onNoActiveStream`): the attach returned 204 — nothing live to
+  // resume (overflow / begin-failure / after retention / anchor-mismatch). One-
+  // shot via noStreamHandledRef (we do NOT null onNoActiveStreamRef). Exactly four
+  // parts. Kept in a ref (read by the transport's fetch closure) and refreshed
+  // each render below.
+  const onNoActiveStream = useCallback(() => {
+    // A late attach outcome after unmount must not arm a poll / invalidate on the
+    // now-different chat this thread's refs were reused for.
+    if (!mountedRef.current) return;
+    if (noStreamHandledRef.current) return;
+    noStreamHandledRef.current = true;
+    // (a) Restore the stripped streaming row to the store — ONLY when we actually
+    // stripped one (a user-tail 204 does NOT reach here with a stripped row, so do
+    // not dereference null).
+    if (strippedRowRef.current) {
+      setMessages((prev) =>
+        mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
+      );
+    }
+    // (b) Reconcile the tail from the message history + invalidate it so the
+    // degraded poll starts from a fresh fetch.
+    reconcileTailRef.current = true;
+    queryClient.invalidateQueries({
+      queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
+    });
+    // (c) Arm the degraded poll (a dumb timer with a 10-min cap in the window);
+    // the thread disarms it via onResumeFallback(false) on settle / local stream.
+    onResumeFallback?.(true);
+    // (d) 204 means onFinish will NOT fire — clear the suppression flag so it
+    // cannot swallow the NEXT local turn's queue flush.
+    setResumedTurnPair(false);
+  }, [setMessages, queryClient, onResumeFallback, setResumedTurnPair]);
+  onNoActiveStreamRef.current = onNoActiveStream;
 
-  // #184 passive-observer merge: when the parent feeds a polled run message (we
-  // reopened a chat whose run is still going and did NOT start it here), merge it
-  // into the live list so new steps/tool-calls appear as they are persisted. Hard-
-  // gated by `!isStreaming`: if THIS tab is actually the streamer, the local SSE
-  // owns the view and a stale observedRow must never overwrite it. `observedRow`
-  // is a stable per-poll object, so this runs once per poll, not per render.
+  // Mount effect: kick off the resume attempt for a non-settled tail. Marking the
+  // turn as resumed BEFORE resumeStream so onFinish (invariant 7/8) sees it.
   useEffect(() => {
-    if (isStreaming || !observedRow) return;
-    const observed = rowToUiMessage(observedRow);
-    setMessages((prev) => mergeObservedMessage(prev, observed));
-  }, [observedRow, isStreaming, setMessages]);
+    // Re-arm on (re)mount — StrictMode dev-mounts twice, and the cleanup below
+    // flips this false between the two.
+    mountedRef.current = true;
+    if (attemptResumeRef.current) {
+      setResumedTurnPair(true);
+      void resumeStream();
+    }
+    // Unmount: mark unmounted (gates late attach/onFinish side-effects) and abort
+    // the in-flight attach GET so its callbacks don't fire against the next chat.
+    return () => {
+      mountedRef.current = false;
+      attachAbortRef.current?.abort();
+    };
+    // Mount-only by design; the parent remounts per chat via `key`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Reconciliation + degraded-merge (invariant 8). Deps are EXACTLY
+  // [initialRows, isStreaming, setMessages].
+  useEffect(() => {
+    // A local stream owns the view: disarm BOTH the merge and the window poll.
+    if (isStreaming) {
+      reconcileTailRef.current = false;
+      onResumeFallback?.(false);
+      return;
+    }
+    if (!reconcileTailRef.current) return;
+    const rows = initialRows ?? [];
+    const tail = rows[rows.length - 1];
+    if (!tail || tail.role !== "assistant") return;
+    // Merge the polled assistant tail on EVERY initialRows update — while the
+    // degraded poll is active this IS the live per-step progress.
+    setMessages((prev) => mergeById(prev, rowToUiMessage(tail)));
+    // Anchor-mismatch coherence: when we restored a stripped streaming row A but a
+    // DIFFERENT run's row B is now the tail (A finished, B replaced the registry
+    // entry, so the attach 204'd), A would otherwise linger forever as an orphan
+    // jumping-dots row over the real run. Settle it from fresh history (where A is
+    // now persisted) so no phantom row survives. No-op in the common case where A
+    // IS the tail (id match).
+    const stripped = strippedRowRef.current;
+    if (stripped && stripped.id !== tail.id) {
+      const historical = rows.find((r) => r.id === stripped.id);
+      if (historical)
+        setMessages((prev) => mergeById(prev, rowToUiMessage(historical)));
+    }
+    // Settled: the terminal merge is done — disarm the flag AND the window poll
+    // explicitly (the window only has a time cap, it will not disarm itself).
+    if (tail.status !== "streaming") {
+      reconcileTailRef.current = false;
+      onResumeFallback?.(false);
+    }
+    // onResumeFallback intentionally omitted (parent-stable callback); deps are
+    // fixed by the resume design.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialRows, isStreaming, setMessages]);
 
   // "Send now" on a queued message: interrupt the current turn and immediately
   // send THIS message, keeping the agent's partial output. Other queued messages
@@ -469,10 +674,12 @@ export default function ChatThread({
         const msg = queuedRef.current.find((m) => m.id === id);
         if (!msg) return;
         setQueue(removeQueuedById(queuedRef.current, id));
+        // Local send: clear any resume-suppression flag (invariant 8).
+        setResumedTurnPair(false);
         sendMessageRef.current?.({ text: msg.text });
       }
     },
-    [setQueue, stop],
+    [setQueue, stop, setResumedTurnPair],
   );
 
   // Stop the current turn. ALWAYS abort the local SSE (`stop()`) so the composer
@@ -485,6 +692,9 @@ export default function ChatThread({
   // is not known yet — a brand-new chat in the first moment of its first turn —
   // only the local abort happens (there is no server-side run handle to stop yet).
   const handleStop = useCallback(() => {
+    // Abort the resume/attach GET first: the SDK does not pass it a signal, so an
+    // observer's Stop would otherwise leave the attach fetch running.
+    attachAbortRef.current?.abort();
     stop();
     if (!autonomousRunsEnabled) return;
     if (chatIdRef.current) {
@@ -617,17 +827,23 @@ export default function ChatThread({
                 <Text size="xs" lineClamp={2} className={classes.queuedText}>
                   {m.text}
                 </Text>
-                <Tooltip label={t("Interrupt and send now")} withArrow>
-                  <ActionIcon
-                    size="xs"
-                    variant="subtle"
-                    color="blue"
-                    onClick={() => sendNow(m.id)}
-                    aria-label={t("Send now")}
-                  >
-                    <IconPlayerPlayFilled size={12} />
-                  </ActionIcon>
-                </Tooltip>
+                {/* "Send now" (interrupt) is hidden on a RESUMED turn: a local
+                    stop() does not abort the resumed attach fetch, so the click
+                    would be swallowed while flushOnAbortRef would fire minutes
+                    later on the natural finish. Only the remove affordance stays. */}
+                {!resumedTurn && (
+                  <Tooltip label={t("Interrupt and send now")} withArrow>
+                    <ActionIcon
+                      size="xs"
+                      variant="subtle"
+                      color="blue"
+                      onClick={() => sendNow(m.id)}
+                      aria-label={t("Send now")}
+                    >
+                      <IconPlayerPlayFilled size={12} />
+                    </ActionIcon>
+                  </Tooltip>
+                )}
                 <ActionIcon
                   size="xs"
                   variant="subtle"
@@ -642,7 +858,11 @@ export default function ChatThread({
           </Stack>
         )}
         <ChatInput
-          onSend={(text) => sendMessage({ text })}
+          onSend={(text) => {
+            // Local send: clear any resume-suppression flag (invariant 8).
+            setResumedTurnPair(false);
+            sendMessage({ text });
+          }}
           onQueue={enqueue}
           onStop={handleStop}
           isStreaming={isStreaming}
