@@ -169,6 +169,12 @@ export default function ChatThread({
   const reconcileTailRef = useRef(false);
   const noStreamHandledRef = useRef(false);
   const onNoActiveStreamRef = useRef<(() => void) | null>(null);
+  // Live mount flag. The attach GET and the resumed `onFinish` are async and can
+  // land AFTER this thread unmounts (the parent remounts per chat via `key`); with
+  // chatIdRef then pointing at the NEW chat, an ungated late callback would arm a
+  // spurious poll + foreign invalidation on the newly-opened chat. Every parent-
+  // facing resume side-effect is gated on this.
+  const mountedRef = useRef(true);
   const [resumedTurn, setResumedTurn] = useState(false);
   const resumedTurnRef = useRef(false);
   // Identity-stable pair setter (bare useState setter + ref write): it is closed
@@ -341,9 +347,7 @@ export default function ChatThread({
         fetch: async (input: RequestInfo | URL, init: RequestInit = {}) => {
           if ((init.method ?? "GET") !== "GET") return fetch(input, init); // send path untouched
           // Reconnect GET: the SDK passes no AbortSignal, so wire our own controller
-          // for observer Stop; surface the silent 204; and clear the resumedTurn flag
-          // on ANY no-onFinish outcome (204, HTTP error, network throw) so it cannot
-          // suppress the NEXT local turn's queue flush.
+          // for observer Stop / unmount abort.
           const controller = new AbortController();
           attachAbortRef.current = controller;
           try {
@@ -351,11 +355,20 @@ export default function ChatThread({
               ...init,
               signal: controller.signal,
             });
-            if (response.status === 204) onNoActiveStreamRef.current?.();
-            else if (!response.ok) setResumedTurnPair(false); // resume error: no onFinish will come
+            // No onFinish will come for a 204 (silent no-op) OR any non-2xx
+            // (5xx/502 — a server restart mid-attach). Both run the same
+            // no-active-stream recovery: restore the stripped row, invalidate, and
+            // arm the degraded poll (idempotent via noStreamHandledRef; its part-d
+            // also clears the resumedTurn flag). This is the restart-survival path
+            // the removed F7 latch used to guard — a transient attach failure must
+            // NOT drop the in-progress row or stop tracking the durable run.
+            if (response.status === 204 || !response.ok)
+              onNoActiveStreamRef.current?.();
             return response;
           } catch (err) {
-            setResumedTurnPair(false); // network failure: no onFinish will come
+            // Network throw: same no-onFinish recovery, then rethrow so the SDK
+            // still surfaces the error to its own machinery.
+            onNoActiveStreamRef.current?.();
             throw err;
           }
         },
@@ -419,8 +432,10 @@ export default function ChatThread({
       const wasResumed = resumedTurnRef.current;
       setResumedTurnPair(false);
       // (2) Recovery after a starved/torn resumed finish (invariant 9). The arm
-      // and the stripped-row restore are gated DIFFERENTLY.
-      if (wasResumed) {
+      // and the stripped-row restore are gated DIFFERENTLY. Skip entirely once
+      // unmounted (an abort-triggered onFinish landing after a chat switch must
+      // not arm a poll / invalidate on the new chat).
+      if (wasResumed && mountedRef.current) {
         const hasVisibleContent = assistantMessageHasVisibleContent(message);
         // ARM the reconcile + degraded poll when the resumed message carries no
         // visible content (starved replay) OR the connection dropped mid-run — in
@@ -547,6 +562,9 @@ export default function ChatThread({
   // parts. Kept in a ref (read by the transport's fetch closure) and refreshed
   // each render below.
   const onNoActiveStream = useCallback(() => {
+    // A late attach outcome after unmount must not arm a poll / invalidate on the
+    // now-different chat this thread's refs were reused for.
+    if (!mountedRef.current) return;
     if (noStreamHandledRef.current) return;
     noStreamHandledRef.current = true;
     // (a) Restore the stripped streaming row to the store — ONLY when we actually
@@ -575,10 +593,19 @@ export default function ChatThread({
   // Mount effect: kick off the resume attempt for a non-settled tail. Marking the
   // turn as resumed BEFORE resumeStream so onFinish (invariant 7/8) sees it.
   useEffect(() => {
+    // Re-arm on (re)mount — StrictMode dev-mounts twice, and the cleanup below
+    // flips this false between the two.
+    mountedRef.current = true;
     if (attemptResumeRef.current) {
       setResumedTurnPair(true);
       void resumeStream();
     }
+    // Unmount: mark unmounted (gates late attach/onFinish side-effects) and abort
+    // the in-flight attach GET so its callbacks don't fire against the next chat.
+    return () => {
+      mountedRef.current = false;
+      attachAbortRef.current?.abort();
+    };
     // Mount-only by design; the parent remounts per chat via `key`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -599,6 +626,18 @@ export default function ChatThread({
     // Merge the polled assistant tail on EVERY initialRows update — while the
     // degraded poll is active this IS the live per-step progress.
     setMessages((prev) => mergeById(prev, rowToUiMessage(tail)));
+    // Anchor-mismatch coherence: when we restored a stripped streaming row A but a
+    // DIFFERENT run's row B is now the tail (A finished, B replaced the registry
+    // entry, so the attach 204'd), A would otherwise linger forever as an orphan
+    // jumping-dots row over the real run. Settle it from fresh history (where A is
+    // now persisted) so no phantom row survives. No-op in the common case where A
+    // IS the tail (id match).
+    const stripped = strippedRowRef.current;
+    if (stripped && stripped.id !== tail.id) {
+      const historical = rows.find((r) => r.id === stripped.id);
+      if (historical)
+        setMessages((prev) => mergeById(prev, rowToUiMessage(historical)));
+    }
     // Settled: the terminal merge is done — disarm the flag AND the window poll
     // explicitly (the window only has a time cap, it will not disarm itself).
     if (tail.status !== "streaming") {
