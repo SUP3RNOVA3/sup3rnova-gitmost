@@ -5,7 +5,6 @@ import {
   IAiChatListParams,
   IAiChatMessageRow,
   IAiChatMessagesParams,
-  IAiChatRunResponse,
   IAiRole,
   IAiRoleCatalog,
   IAiRoleCatalogBundle,
@@ -40,23 +39,6 @@ export async function getAiChatMessages(
     "/ai-chat/messages",
     params,
   );
-  return req.data;
-}
-
-/**
- * Reconnect to the latest agent run of a chat (#184). Returns the run's
- * persisted lifecycle state and the assistant message it materializes (the
- * partial output while the run is in-flight, the final output once it finished).
- * The DB is the source of truth, so this works for an in-flight run (the browser
- * dropped, the run kept going) and a finished one alike; `{ run: null }` when the
- * chat has never had a run. Owner-gated server-side (the requesting user must own
- * the chat); it is NOT flag-gated — when the feature is off the chat simply has no
- * runs, so the endpoint returns `{ run: null }`.
- */
-export async function getAiChatRun(
-  chatId: string,
-): Promise<IAiChatRunResponse> {
-  const req = await api.post<IAiChatRunResponse>("/ai-chat/run", { chatId });
   return req.data;
 }
 

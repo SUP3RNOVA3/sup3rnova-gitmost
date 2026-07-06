@@ -1,6 +1,13 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import {
+  render,
+  screen,
+  fireEvent,
+  act,
+  cleanup,
+} from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 // Shared, hoisted mock state so the @ai-sdk/react and "ai" module mocks (hoisted
 // above the imports) can expose the captured useChat callbacks / transport and
@@ -12,49 +19,60 @@ const h = vi.hoisted(() => ({
     sendMessage: vi.fn(),
     stop: vi.fn(),
     setMessages: vi.fn(),
+    resumeStream: vi.fn(),
+    // The messages array useChat was seeded with (to assert strip/seed behavior).
+    seededMessages: null as null | unknown[],
     transport: null as null | {
-      prepareSendMessagesRequest: (arg: {
+      prepareSendMessagesRequest?: (arg: {
         messages: unknown[];
         body: Record<string, unknown>;
       }) => { body: Record<string, unknown> };
+      prepareReconnectToStreamRequest?: () => { api?: string };
+      fetch?: (input: unknown, init?: { method?: string }) => Promise<unknown>;
     },
   },
 }));
 
-// Mock useChat: capture onFinish, return the spies and the controllable status.
+// Mock useChat: capture onFinish + seeded messages, return the spies and the
+// controllable status.
 vi.mock("@ai-sdk/react", () => ({
-  useChat: (opts: { onFinish?: (arg: Record<string, unknown>) => void }) => {
+  useChat: (opts: {
+    messages?: unknown[];
+    onFinish?: (arg: Record<string, unknown>) => void;
+  }) => {
     h.state.onFinish = opts.onFinish ?? null;
+    h.state.seededMessages = opts.messages ?? null;
     return {
       messages: [],
       sendMessage: h.state.sendMessage,
       status: h.state.status,
       stop: h.state.stop,
       error: null,
-      // #184: ChatThread reads setMessages to merge a polled observer run.
       setMessages: h.state.setMessages,
+      resumeStream: h.state.resumeStream,
     };
   },
 }));
 
 // Mock "ai": deterministic ids + a transport that records its options so the test
-// can invoke prepareSendMessagesRequest and assert the `interrupted` flag.
+// can invoke prepareSendMessagesRequest / prepareReconnectToStreamRequest / fetch.
 vi.mock("ai", () => {
   let counter = 0;
   return {
     generateId: () => `gid-${counter++}`,
     DefaultChatTransport: class {
-      constructor(opts: {
-        prepareSendMessagesRequest: (arg: {
-          messages: unknown[];
-          body: Record<string, unknown>;
-        }) => { body: Record<string, unknown> };
-      }) {
-        h.state.transport = opts;
+      constructor(opts: Record<string, unknown>) {
+        h.state.transport = opts as never;
       }
     },
   };
 });
+
+// Keep the ai-chat-query import light: ChatThread only needs the messages RQ key,
+// so stub the module to avoid pulling axios / i18n transitively.
+vi.mock("@/features/ai-chat/queries/ai-chat-query.ts", () => ({
+  AI_CHAT_MESSAGES_RQ_KEY: (chatId: string) => ["ai-chat-messages", chatId],
+}));
 
 // Stub the heavy children: MessageList (markdown/render) and ChatInput (the
 // composer). The ChatInput stub exposes a button that queues a message, the only
@@ -63,49 +81,90 @@ vi.mock("@/features/ai-chat/components/message-list.tsx", () => ({
   default: () => <div data-testid="message-list" />,
 }));
 vi.mock("@/features/ai-chat/components/chat-input.tsx", () => ({
-  default: ({ onQueue }: { onQueue: (text: string) => void }) => (
-    <button data-testid="queue-btn" onClick={() => onQueue("queued text")}>
-      queue
-    </button>
+  default: ({
+    onQueue,
+    onStop,
+  }: {
+    onQueue: (text: string) => void;
+    onStop: () => void;
+  }) => (
+    <>
+      <button data-testid="queue-btn" onClick={() => onQueue("queued text")}>
+        queue
+      </button>
+      <button aria-label="Stop" onClick={() => onStop()}>
+        stop
+      </button>
+    </>
   ),
 }));
 
 import ChatThread from "./chat-thread";
+import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.ts";
 
-function renderThread() {
+function row(
+  id: string,
+  role: string,
+  status?: string,
+  text = "",
+): IAiChatMessageRow {
+  return { id, role, content: text, status, createdAt: "2026-01-01T00:00:00Z" };
+}
+
+function renderThread(props?: {
+  chatId?: string | null;
+  initialRows?: IAiChatMessageRow[];
+  autonomousRunsEnabled?: boolean;
+}) {
   const onTurnFinished = vi.fn();
+  const onResumeFallback = vi.fn();
+  const onServerStop = vi.fn();
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
   render(
-    <MantineProvider>
-      <ChatThread chatId="c1" initialRows={[]} onTurnFinished={onTurnFinished} />
-    </MantineProvider>,
+    <QueryClientProvider client={queryClient}>
+      <MantineProvider>
+        <ChatThread
+          chatId={props?.chatId === undefined ? "c1" : props.chatId}
+          initialRows={props?.initialRows ?? []}
+          autonomousRunsEnabled={props?.autonomousRunsEnabled}
+          onTurnFinished={onTurnFinished}
+          onResumeFallback={onResumeFallback}
+          onServerStop={onServerStop}
+        />
+      </MantineProvider>
+    </QueryClientProvider>,
   );
-  return { onTurnFinished };
+  return { onTurnFinished, onResumeFallback, onServerStop, invalidateSpy };
+}
+
+function resetState() {
+  h.state.status = "streaming";
+  h.state.onFinish = null;
+  h.state.seededMessages = null;
+  h.state.transport = null;
+  h.state.sendMessage.mockClear();
+  h.state.stop.mockClear();
+  h.state.setMessages.mockClear();
+  h.state.resumeStream.mockClear();
 }
 
 describe("ChatThread — send now (#198)", () => {
-  beforeEach(() => {
-    h.state.status = "streaming";
-    h.state.onFinish = null;
-    h.state.sendMessage.mockClear();
-    h.state.stop.mockClear();
-    h.state.transport = null;
-  });
+  beforeEach(resetState);
 
   it("aborts the current turn and resends the queued message on the abort", () => {
     renderThread();
 
-    // Queue a message while the turn is streaming.
     fireEvent.click(screen.getByTestId("queue-btn"));
     const sendNowBtn = screen.getByLabelText("Send now");
     expect(sendNowBtn).toBeTruthy();
 
-    // "Send now" interrupts the current turn (stop), but does NOT send yet —
-    // the resend happens once the abort lands in onFinish.
     fireEvent.click(sendNowBtn);
     expect(h.state.stop).toHaveBeenCalledTimes(1);
     expect(h.state.sendMessage).not.toHaveBeenCalled();
 
-    // The abort we triggered reaches onFinish: the promoted head is flushed.
     act(() => {
       h.state.onFinish?.({
         message: { id: "a", role: "assistant", parts: [] },
@@ -122,10 +181,8 @@ describe("ChatThread — send now (#198)", () => {
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now"));
 
-    const prep = h.state.transport!.prepareSendMessagesRequest;
-    // The send right after "send now" carries interrupted: true...
+    const prep = h.state.transport!.prepareSendMessagesRequest!;
     expect(prep({ messages: [], body: {} }).body.interrupted).toBe(true);
-    // ...and only that one (the flag is read-and-cleared).
     expect(prep({ messages: [], body: {} }).body.interrupted).toBe(false);
   });
 
@@ -136,42 +193,24 @@ describe("ChatThread — send now (#198)", () => {
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now"));
 
-    // No turn to interrupt: sent straight away, no abort, not flagged.
     expect(h.state.stop).not.toHaveBeenCalled();
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-    const prep = h.state.transport!.prepareSendMessagesRequest;
+    const prep = h.state.transport!.prepareSendMessagesRequest!;
     expect(prep({ messages: [], body: {} }).body.interrupted).toBe(false);
   });
 });
 
-// The turn-end decision lives in the `onFinish` handler: given the terminal
-// outcome of a turn (`isAbort` / `isDisconnect` / `isError`, or none = clean),
-// it decides whether to CONTINUE (flush the next queued message) or END (leave
-// the queue intact for the user), and which stop notice — if any — to show.
-// `sendNow` is exercised above; these tests pin down the plain outcomes.
 describe("ChatThread — turn-end decision (onFinish)", () => {
-  beforeEach(() => {
-    h.state.status = "streaming";
-    h.state.onFinish = null;
-    h.state.sendMessage.mockClear();
-    h.state.stop.mockClear();
-    h.state.transport = null;
-  });
+  beforeEach(resetState);
 
-  // Drive a fresh onFinish with the given terminal flags after queueing a
-  // message, and report both what the parent was told and whether the queue was
-  // flushed (a resend to the sendMessage spy).
   function finishWith(flags: {
     isAbort?: boolean;
     isDisconnect?: boolean;
     isError?: boolean;
   }) {
-    // Tear down any prior render so the loop-driven "every outcome" case does
-    // not leave duplicate queue buttons in the DOM.
     cleanup();
     h.state.sendMessage.mockClear();
     const { onTurnFinished } = renderThread();
-    // Populate the queue while the turn is streaming.
     fireEvent.click(screen.getByTestId("queue-btn"));
     act(() => {
       h.state.onFinish?.({
@@ -187,16 +226,12 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
 
   it("CONTINUES — flushes the next queued message on a clean finish", () => {
     finishWith({});
-    // Clean finish (no terminal flag): the queued message is auto-sent.
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-    // A clean finish shows no stop notice.
     expect(screen.queryByText("Response stopped.")).toBeNull();
   });
 
   it("ENDS — keeps the queue intact on a user abort and shows the stopped notice", () => {
     finishWith({ isAbort: true });
-    // A plain Stop (not the sendNow interrupt path) must NOT auto-resend: the
-    // queue is preserved for the user to decide.
     expect(h.state.sendMessage).not.toHaveBeenCalled();
     expect(screen.getByText("Response stopped.")).toBeTruthy();
   });
@@ -211,15 +246,11 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
 
   it("ENDS — keeps the queue intact on a stream error (no auto-retry, no stopped notice)", () => {
     finishWith({ isError: true });
-    // Blindly retrying after a failure would be wrong; the queue is left alone.
     expect(h.state.sendMessage).not.toHaveBeenCalled();
-    // isError clears the neutral notice (the error banner covers this case).
     expect(screen.queryByText("Response stopped.")).toBeNull();
   });
 
   it("notifies the parent on EVERY terminal outcome", () => {
-    // The chat-list refresh / new-chat id adoption must run on success and on
-    // every failure path alike.
     for (const flags of [
       {},
       { isAbort: true },
@@ -232,55 +263,333 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
   });
 });
 
-// #184 passive-observer merge: when reconnecting to a still-running run, the
-// parent feeds the polled run message via `observedRow`; ChatThread merges it via
-// setMessages — but ONLY when this tab is NOT itself streaming (the streamer's
-// SSE owns the view, so a stale observedRow must never overwrite it).
-describe("ChatThread — observer run merge (#184)", () => {
-  beforeEach(() => {
-    h.state.onFinish = null;
-    h.state.setMessages.mockReset();
+// #184 phase 1.5: the resumable-SSE client. A reopened tab resumes the live run
+// via the SDK's reconnect transport (attach: replay + tail) instead of polling.
+describe("ChatThread — resume (attach) machinery (#184)", () => {
+  const streamingTail = () => [
+    row("u1", "user", undefined, "hi"),
+    row("a1", "assistant", "streaming", "partial"),
+  ];
+  const settledTail = () => [
+    row("u1", "user", undefined, "hi"),
+    row("a1", "assistant", "succeeded", "done"),
+  ];
+  const userTail = () => [row("u1", "user", undefined, "hi")];
+
+  const visibleMsg = {
+    id: "a1",
+    role: "assistant",
+    parts: [{ type: "text", text: "streamed answer" }],
+  };
+  const emptyMsg = { id: "a1", role: "assistant", parts: [] };
+
+  beforeEach(resetState);
+  // NOTE: do NOT vi.unstubAllGlobals() here — vitest.setup.ts installs
+  // matchMedia/localStorage via vi.stubGlobal and unstubbing wipes them for the
+  // rest of the file. Fetch is re-stubbed per test that needs it.
+  afterEach(cleanup);
+
+  it("resumes on mount only when the flag is on, chatId is set, and the tail is not a settled assistant", () => {
+    // streaming tail -> resume
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+
+    // user tail -> resume (the assistant row may not be seeded yet)
+    cleanup();
+    h.state.resumeStream.mockClear();
+    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+
+    // settled assistant tail -> NO resume
+    cleanup();
+    h.state.resumeStream.mockClear();
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+
+    // flag off -> NO resume
+    cleanup();
+    h.state.resumeStream.mockClear();
+    renderThread({ autonomousRunsEnabled: false, initialRows: streamingTail() });
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+
+    // no chatId -> NO resume
+    cleanup();
+    h.state.resumeStream.mockClear();
+    renderThread({
+      autonomousRunsEnabled: true,
+      chatId: null,
+      initialRows: streamingTail(),
+    });
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
   });
 
-  const observedRow = {
-    id: "a-run",
-    role: "assistant",
-    content: "step 1\nstep 2",
-    metadata: {
-      parts: [{ type: "text", text: "step 1\nstep 2" }],
-    },
-    createdAt: "2026-01-01T00:00:00Z",
-  } as const;
+  it("strips the streaming tail from the seed, but keeps a user tail whole", () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    // 2 rows in, streaming tail stripped -> 1 seeded message.
+    expect(h.state.seededMessages).toHaveLength(1);
 
-  function renderObserver(status: string) {
-    h.state.status = status;
-    render(
+    cleanup();
+    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
+    // user tail is not stripped.
+    expect(h.state.seededMessages).toHaveLength(1);
+  });
+
+  it("builds the attach URL with expect=live&anchor only when the streaming tail was stripped", () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream?expect=live&anchor=a1",
+    );
+
+    cleanup();
+    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
+  });
+
+  async function fetch204() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ status: 204, ok: false }),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+  }
+
+  it("204 on a user tail: no crash, no restore, reconcile+invalidate, onResumeFallback(true)", async () => {
+    const { onResumeFallback, invalidateSpy } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: userTail(),
+    });
+    await fetch204();
+    // No stripped row -> no restore merge.
+    expect(h.state.setMessages).not.toHaveBeenCalled();
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["ai-chat-messages", "c1"],
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+  });
+
+  it("204 on a streaming tail: restore + invalidate + onResumeFallback(true)", async () => {
+    const { onResumeFallback, invalidateSpy } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    await fetch204();
+    // Stripped row is restored to the store.
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["ai-chat-messages", "c1"],
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+  });
+
+  it("a resume fetch error clears resumedTurn so the next local turn flushes the queue", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    h.state.status = "ready";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ status: 500, ok: false }),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+    // Queue then clean-finish: suppression was cleared, so the queue flushes.
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    act(() => {
+      h.state.onFinish?.({
+        message: visibleMsg,
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+  });
+
+  it("a resumed turn's onFinish does NOT flush the queue", () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    act(() => {
+      h.state.onFinish?.({
+        message: visibleMsg,
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("a healthy resumed finish (visible content) arms nothing and keeps the store", () => {
+    h.state.status = "ready";
+    const { onResumeFallback } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    h.state.setMessages.mockClear();
+    onResumeFallback.mockClear();
+    act(() => {
+      h.state.onFinish?.({
+        message: visibleMsg,
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    // No restore (would clobber the fuller streamed message), no poll arm.
+    expect(h.state.setMessages).not.toHaveBeenCalled();
+    expect(onResumeFallback).not.toHaveBeenCalledWith(true);
+  });
+
+  it("isDisconnect WITH visible content arms the poll but does NOT restore", () => {
+    h.state.status = "ready";
+    const { onResumeFallback, invalidateSpy } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    h.state.setMessages.mockClear();
+    onResumeFallback.mockClear();
+    invalidateSpy.mockClear();
+    act(() => {
+      h.state.onFinish?.({
+        message: visibleMsg,
+        isAbort: false,
+        isDisconnect: true,
+        isError: false,
+      });
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["ai-chat-messages", "c1"],
+    });
+    // Restore forbidden: the on-screen partial must not roll back.
+    expect(h.state.setMessages).not.toHaveBeenCalled();
+  });
+
+  it("an empty resumed message (starved replay) restores the stripped row AND arms the poll", () => {
+    h.state.status = "ready";
+    const { onResumeFallback } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    h.state.setMessages.mockClear();
+    onResumeFallback.mockClear();
+    act(() => {
+      h.state.onFinish?.({
+        message: emptyMsg,
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1); // restore
+    expect(onResumeFallback).toHaveBeenCalledWith(true); // arm
+  });
+
+  it("degraded-merge: merges the tail per initialRows update, and settles disarm the poll", async () => {
+    h.state.status = "ready";
+    const { rerender, onResumeFallback } = renderResumable(streamingTail());
+    // Arm reconcile via a 204.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ status: 204, ok: false }),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+    h.state.setMessages.mockClear();
+    onResumeFallback.mockClear();
+
+    // A streaming-tail update: merge, poll stays armed.
+    rerender([
+      row("u1", "user", undefined, "hi"),
+      row("a1", "assistant", "streaming", "step 1\nstep 2"),
+    ]);
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    expect(onResumeFallback).not.toHaveBeenCalledWith(false);
+
+    // A settled-tail update: merge + disarm.
+    h.state.setMessages.mockClear();
+    rerender([
+      row("u1", "user", undefined, "hi"),
+      row("a1", "assistant", "succeeded", "final"),
+    ]);
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    expect(onResumeFallback).toHaveBeenCalledWith(false);
+  });
+
+  it("a local stream disarms both the merge and the poll", () => {
+    h.state.status = "streaming";
+    const { rerender, onResumeFallback } = renderResumable(streamingTail());
+    onResumeFallback.mockClear();
+    // A re-render while streaming: the reconciliation effect disarms.
+    rerender(streamingTail());
+    expect(onResumeFallback).toHaveBeenCalledWith(false);
+  });
+
+  it("Send now is hidden on a resumed turn but visible on a local stream", () => {
+    // Resumed turn: hidden.
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(screen.queryByLabelText("Send now")).toBeNull();
+
+    // Local streaming turn (no resume): visible.
+    cleanup();
+    resetState();
+    renderThread({ initialRows: [] });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(screen.getByLabelText("Send now")).toBeTruthy();
+  });
+
+  it("handleStop aborts the attach controller and calls onServerStop", async () => {
+    const { onServerStop } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    // Establish an attach controller via a (pending) reconnect GET.
+    let abortSeen = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((_input: unknown, init: RequestInit) => {
+        init.signal?.addEventListener("abort", () => {
+          abortSeen = true;
+        });
+        return new Promise(() => undefined); // never resolves
+      }),
+    );
+    act(() => {
+      void h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+    fireEvent.click(screen.getByLabelText("Stop"));
+    expect(abortSeen).toBe(true);
+    expect(onServerStop).toHaveBeenCalledWith("c1");
+  });
+});
+
+// Helper: render a resumable thread and expose a rerender that only swaps
+// initialRows (the degraded-merge effect depends on it).
+function renderResumable(initialRows: IAiChatMessageRow[]) {
+  const onResumeFallback = vi.fn();
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const Wrapper = ({ rows }: { rows: IAiChatMessageRow[] }) => (
+    <QueryClientProvider client={queryClient}>
       <MantineProvider>
         <ChatThread
           chatId="c1"
-          initialRows={[]}
+          initialRows={rows}
+          autonomousRunsEnabled
           onTurnFinished={vi.fn()}
-          observedRow={observedRow as never}
+          onResumeFallback={onResumeFallback}
         />
-      </MantineProvider>,
-    );
-  }
-
-  it("merges the polled run message when this tab is a passive observer", () => {
-    renderObserver("ready");
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
-    // The updater replaces/append the observed assistant row by id.
-    const updater = h.state.setMessages.mock.calls[0][0] as (
-      prev: { id: string; parts: { text: string }[] }[],
-    ) => { id: string; parts: { text: string }[] }[];
-    const merged = updater([{ id: "u1", parts: [{ text: "hi" }] }]);
-    expect(merged).toHaveLength(2);
-    expect(merged[1].id).toBe("a-run");
-    expect(merged[1].parts[0].text).toBe("step 1\nstep 2");
-  });
-
-  it("does NOT merge while THIS tab is the streamer (no double-render)", () => {
-    renderObserver("streaming");
-    expect(h.state.setMessages).not.toHaveBeenCalled();
-  });
-});
+      </MantineProvider>
+    </QueryClientProvider>
+  );
+  const view = render(<Wrapper rows={initialRows} />);
+  const rerender = (rows: IAiChatMessageRow[]) =>
+    act(() => view.rerender(<Wrapper rows={rows} />));
+  return { rerender, onResumeFallback };
+}
