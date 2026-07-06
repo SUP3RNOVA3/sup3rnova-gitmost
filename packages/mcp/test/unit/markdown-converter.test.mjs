@@ -25,9 +25,11 @@ test("nested bulletList with 3 children keeps all children indented under the pa
     ),
   );
 
+  // Block children of a list item are blank-line separated (loose list) since
+  // the #351 converter fix; the sublist stays nested at the 2-col marker column.
   assert.equal(
     convertProseMirrorToMarkdown(input),
-    "- Parent\n  - A\n  - B\n  - C",
+    "- Parent\n\n  - A\n  - B\n  - C",
   );
 });
 
@@ -41,9 +43,10 @@ test("nested list under an ordered item indents 3 spaces", () => {
     ),
   );
 
+  // Blank-line separated block children (loose list) per the #351 converter fix.
   assert.equal(
     convertProseMirrorToMarkdown(input),
-    "1. Parent\n   - Child",
+    "1. Parent\n\n   - Child",
   );
 });
 
