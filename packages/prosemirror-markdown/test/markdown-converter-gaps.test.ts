@@ -217,8 +217,9 @@ const colChildOf = (doc2: any) =>
   doc2?.content?.[0]?.content?.[0]?.content?.[0];
 
 describe('converter gap coverage — emission branches (specs 1–11)', () => {
-  // 1. orderedList renders index+1 and DROPS the start attribute.
-  it('orderedList start:5 restarts numbering at 1 (start attr ignored)', () => {
+  // 1. orderedList honors the start attribute (FIXED #351): markers count up
+  //    from `start` ("5.","6.",…), which CommonMark round-trips.
+  it('orderedList start:5 numbers from 5 (start attr honored)', () => {
     const out = convertProseMirrorToMarkdown(
       doc({
         type: 'orderedList',
@@ -229,7 +230,7 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
         ],
       }),
     );
-    expect(out).toBe('1. a\n2. b');
+    expect(out).toBe('5. a\n6. b');
   });
 
   // 2. An empty paragraph contributes an empty segment between two "\n\n" joins.

@@ -11,6 +11,7 @@ import {
 } from '../../src/lib/index.js';
 import { firstDivergence } from '../roundtrip-helpers.js';
 import { schema, docArb } from './doc-generator.js';
+import { envInt } from './env-int.js';
 
 // Each run does a real convert + jsdom parse; give ample headroom so the suite
 // is deterministic under parallel worker load (matching the flat sibling suite).
@@ -33,12 +34,19 @@ vi.setConfig({ testTimeout: 60000 });
 // failure prints the shrunk minimal counterexample for triage.
 // ---------------------------------------------------------------------------
 
-const SEED = 20250705;
+// Both are overridable via the PROPERTY_SEED / PROPERTY_NUM_RUNS env vars (an
+// invalid/empty value → NaN → falls back to the default below); the nightly
+// cron (.github/workflows/nightly-property.yml) cranks NUM_RUNS up with a
+// random seed to hunt for deeper counterexamples.
+// An unset/empty/non-numeric value falls back to the default; an explicit 0 is
+// honored (a valid fast-check seed) — `Number(x) || default` would swallow it.
+// The parser is shared with the flat suite (env-int.ts) and unit-tested there.
+const SEED = envInt(process.env.PROPERTY_SEED, 20250705);
 // The nested walk builds far heavier docs than the flat suite (each P1/P2 run
 // parses the emitted markdown through jsdom), so keep the run count moderate to
 // hold runtime and worker memory in budget while still exercising deep
 // structures. P4 (cheap string parsing) runs at a higher count below.
-const NUM_RUNS = 100;
+const NUM_RUNS = envInt(process.env.PROPERTY_NUM_RUNS, 100);
 
 const pmToMd = (doc: unknown): string => convertProseMirrorToMarkdown(doc);
 const mdToPm = (md: string): Promise<any> => markdownToProseMirror(md);

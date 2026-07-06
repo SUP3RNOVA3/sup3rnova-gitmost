@@ -365,7 +365,7 @@ describe('media / attachment / container full-attribute golden coverage', () => 
     );
   });
 
-  it('orderedList inside a column renders via blockToHtml as <ol> (start attr DROPPED) with bold->strong, code->code', () => {
+  it('orderedList inside a column renders via blockToHtml as <ol start="N"> (start attr PRESERVED) with bold->strong, code->code', () => {
     const out = c({
       type: 'columns',
       attrs: { layout: 'two' },
@@ -391,13 +391,13 @@ describe('media / attachment / container full-attribute golden coverage', () => 
         },
       ],
     });
-    // blockToHtml orderedList path emits a plain <ol> with no start attribute,
-    // and inlineToHtml maps bold->strong, code->code.
+    // blockToHtml orderedList path emits <ol start="3"> (FIXED #351), and
+    // inlineToHtml maps bold->strong, code->code.
     expect(out).toContain(
-      '<ol><li><p><strong>a</strong></p></li><li><p><code>b</code></p></li></ol>',
+      '<ol start="3"><li><p><strong>a</strong></p></li><li><p><code>b</code></p></li></ol>',
     );
-    // The start:3 attr is NOT preserved in the HTML/column container path.
-    expect(out).not.toContain('start=');
+    // The start:3 attr IS preserved in the HTML/column container path.
+    expect(out).toContain('start="3"');
   });
 
   it('hardBreak inside a column renders as <br> via inlineToHtml (not the markdown two-space form)', () => {

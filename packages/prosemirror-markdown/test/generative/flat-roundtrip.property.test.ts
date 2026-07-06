@@ -18,6 +18,7 @@ import {
   coveredTypes,
   KNOWN_UNCOVERED,
 } from './node-generators.js';
+import { envInt } from './env-int.js';
 
 // ── Attribute-value coverage allowlist ──────────────────────────────────────
 // The node/mark completeness contract guarantees every TYPE is generated, but
@@ -28,34 +29,32 @@ import {
 // a NEW attribute (or a newly-frozen one) that lands in this bucket flips the
 // snapshot test red and forces a reviewer to classify it. Each belongs to one of:
 //   - internal/opaque ids & placeholders (attachmentId, slugId, placeholder,
-//     creatorId, anchorId) — no meaningful non-default to assert;
-//   - dimensions/among the media family with no standalone md form here
-//     (aspectRatio, size, caption, drawio/excalidraw/pdf/video/youtube w/h/align)
-//     — round-trip candidates deferred to a later PR, not silently dropped;
+//     creatorId, anchorId, mime) — no meaningful non-default to assert. These stay
+//     frozen: their value is an opaque token carried verbatim, not a round-trip
+//     shape worth fuzzing;
 //   - ACCEPTED limitations with no md representation (indent, callout.icon,
-//     orderedList.type, table spans/bg/colwidth);
-//   - PINNED bugs (column.width, orderedList.start) tracked in
-//     counterexamples.test.ts.
+//     orderedList.type, table spans/bg/colwidth).
+// The media dimension/family attrs (image/video/youtube/drawio/excalidraw/pdf/
+// embed width/height/align/size/aspectRatio/caption/title/alt) that were
+// previously "deferred to a later PR" are IMPLEMENTED (value-fuzzed) in THIS PR
+// via the OVERRIDES table in attr-arbitraries.ts — they ride in the discriminator
+// comment JSON and round-trip byte-stably, so they are no longer allowlisted.
 const ATTR_VALUE_FUZZ_ALLOWLIST = new Set<string>([
   'attachment.attachmentId', 'attachment.mime', 'attachment.placeholder', 'attachment.size',
   'audio.attachmentId', 'audio.placeholder', 'audio.size',
-  'callout.icon', 'column.width',
-  'drawio.align', 'drawio.alt', 'drawio.aspectRatio', 'drawio.attachmentId',
-  'drawio.height', 'drawio.size', 'drawio.title', 'drawio.width',
-  'embed.align', 'embed.height', 'embed.width',
-  'excalidraw.align', 'excalidraw.alt', 'excalidraw.aspectRatio', 'excalidraw.attachmentId',
-  'excalidraw.height', 'excalidraw.size', 'excalidraw.title', 'excalidraw.width',
+  'callout.icon',
+  'drawio.attachmentId',
+  'excalidraw.attachmentId',
   'heading.indent',
-  'image.aspectRatio', 'image.attachmentId', 'image.caption', 'image.placeholder', 'image.size',
+  'image.attachmentId', 'image.placeholder',
   'mention.anchorId', 'mention.creatorId', 'mention.slugId',
-  'orderedList.start', 'orderedList.type', 'paragraph.indent',
-  'pdf.attachmentId', 'pdf.height', 'pdf.placeholder', 'pdf.size', 'pdf.width',
+  'orderedList.type', 'paragraph.indent',
+  'pdf.attachmentId', 'pdf.placeholder',
   'tableCell.backgroundColor', 'tableCell.backgroundColorName', 'tableCell.colspan',
   'tableCell.colwidth', 'tableCell.rowspan',
   'tableHeader.backgroundColor', 'tableHeader.backgroundColorName', 'tableHeader.colspan',
   'tableHeader.colwidth', 'tableHeader.rowspan',
-  'video.align', 'video.aspectRatio', 'video.attachmentId', 'video.placeholder', 'video.size',
-  'youtube.align', 'youtube.height', 'youtube.width',
+  'video.attachmentId', 'video.placeholder',
 ]);
 
 // ── MARK attribute-value coverage ───────────────────────────────────────────
@@ -113,13 +112,20 @@ vi.setConfig({ testTimeout: 30000 });
 
 // Fixed seed so every failure is reproducible; fast-check also prints the
 // shrunk counterexample. numRuns starts modest to keep CI under budget — the
-// issue's CI target is ~300-500 per property; the nightly / PR 3 will crank
-// this up further. Each property runs over the UNION (fc.oneof) of all flat
-// node generators, so the runs are shared across node types (one test per
-// property keeps the jsdom import cost and memory bounded — a per-generator ×
-// per-property matrix is ~200 heavy tests that OOMs the worker).
-const SEED = 20250705;
-const NUM_RUNS = 300;
+// issue's CI target is ~300-500 per property. Both are overridable via the
+// PROPERTY_SEED / PROPERTY_NUM_RUNS env vars (an invalid/empty value → NaN →
+// falls back to the default below): the nightly cron
+// (.github/workflows/nightly-property.yml) cranks NUM_RUNS to ~5000 with a
+// random seed to hunt for deeper counterexamples. Each property runs over the
+// UNION (fc.oneof) of all flat node generators, so the runs are shared across
+// node types (one test per property keeps the jsdom import cost and memory
+// bounded — a per-generator × per-property matrix is ~200 heavy tests that
+// OOMs the worker).
+// An unset/empty/non-numeric value falls back to the default; an explicit 0 is
+// honored (a valid fast-check seed) — `Number(x) || default` would swallow it.
+// The parser is shared with the nested suite (env-int.ts) and unit-tested there.
+const SEED = envInt(process.env.PROPERTY_SEED, 20250705);
+const NUM_RUNS = envInt(process.env.PROPERTY_NUM_RUNS, 300);
 
 const P1_GENERATORS = buildGenerators('p1');
 const FUZZ_GENERATORS = buildGenerators('fuzz');

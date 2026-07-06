@@ -178,12 +178,12 @@ describe('blockToHtml: heading / codeBlock(lang & no-lang) / bulletList inside c
 // A colspan>1 cell forces the WHOLE table to the raw-<table> HTML fallback
 // (markdown-converter.ts ~287-331). renderHtmlCell emits colspan + align attrs
 // (312-316) and renders each block child via blockToHtml. An orderedList child
-// hits the blockToHtml orderedList branch (726-729), which emits
-// <ol><li><p>..</p></li>..</ol> — the schema's `start` attr is NOT emitted by
-// this HTML <ol> branch.
+// hits the blockToHtml orderedList branch, which emits
+// <ol start="N"><li><p>..</p></li>..</ol> — the schema's non-1 `start` attr IS
+// emitted by this HTML <ol> branch (FIXED #351).
 // ---------------------------------------------------------------------------
 describe('spanned table: renderHtmlCell colspan/align + orderedList block child', () => {
-  it('renders the colspan/align cell with an <ol> (start attr is dropped)', () => {
+  it('renders the colspan/align cell with an <ol start="N"> (start attr preserved)', () => {
     const out = convertProseMirrorToMarkdown(
       doc({
         type: 'table',
@@ -213,11 +213,11 @@ describe('spanned table: renderHtmlCell colspan/align + orderedList block child'
     expect(out).toBe(
       '<table><tbody><tr>' +
         '<td colspan="2" align="center">' +
-        '<ol><li><p>one</p></li><li><p>two</p></li></ol>' +
+        '<ol start="3"><li><p>one</p></li><li><p>two</p></li></ol>' +
         '</td>' +
         '</tr></tbody></table>',
     );
-    // The HTML <ol> branch does not propagate the ProseMirror `start` attribute.
-    expect(out).not.toContain('start');
+    // The HTML <ol> branch propagates the ProseMirror `start` attribute.
+    expect(out).toContain('start="3"');
   });
 });

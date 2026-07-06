@@ -1006,6 +1006,8 @@ const Column = Node.create({
       width: {
         default: null,
         parseHTML: (el: HTMLElement) => {
+          // Mirrors editor-ext (column.ts): width is a unitless flex-grow
+          // number, so parse it to a Number for parity with the canonical schema.
           const value = el.getAttribute("data-width");
           return value ? parseFloat(value) : null;
         },
