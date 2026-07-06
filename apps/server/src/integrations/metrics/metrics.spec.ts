@@ -25,6 +25,61 @@ describe('resolveRouteLabel (histogram route label)', () => {
     const req = { url: '/x' } as unknown as FastifyRequest;
     expect(resolveRouteLabel(req)).toBe('unknown');
   });
+
+  it.each([
+    '/assets/index-CAbxDtto.js',
+    '/assets/chunk-3OPIFGDE-CJOt9nr5.js',
+    '/assets/excalidraw-menu-DpsI0kFW.js',
+    '/vad/silero_vad_v5.onnx',
+    '/brand/logo.svg',
+    '/locales/en.json',
+    '/icons/app-icon-192x192.png',
+  ])('collapses hashed/static asset %p to "static" (#362 cardinality)', (url) => {
+    // @fastify/static serves each file through a route whose matched url is the
+    // raw (hashed) file path, so routeOptions.url is itself unbounded here.
+    const req = {
+      url,
+      routeOptions: { url },
+    } as unknown as FastifyRequest;
+    const label = resolveRouteLabel(req);
+    expect(label).toBe('static');
+    expect(label).not.toContain('.js');
+    expect(label).not.toContain('index-');
+  });
+
+  it('strips the query string before the static-prefix check', () => {
+    const req = {
+      url: '/assets/index-CAbxDtto.js?v=2',
+      routeOptions: { url: '/assets/index-CAbxDtto.js' },
+    } as unknown as FastifyRequest;
+    expect(resolveRouteLabel(req)).toBe('static');
+  });
+
+  it('does NOT collapse a real API route that merely mentions assets', () => {
+    // A templated API route is kept as-is; only the static path PREFIXES collapse.
+    const req = {
+      url: '/api/pages/assets-guide',
+      routeOptions: { url: '/api/pages/:id' },
+    } as unknown as FastifyRequest;
+    expect(resolveRouteLabel(req)).toBe('/api/pages/:id');
+  });
+
+  it.each([
+    // The TRAILING SLASH on the prefix is the anti-false-collapse guard: a path
+    // that is the prefix WITHOUT its slash, or merely shares the prefix as a
+    // substring of a longer segment, must NOT collapse. These would collapse
+    // under a buggy `includes('/assets/')` / slashless-prefix impl.
+    '/assets',
+    '/assetsx/foo.js',
+    '/iconset/x.png',
+  ])('does NOT collapse the prefix-boundary case %p', (url) => {
+    const req = {
+      url,
+      routeOptions: { url: '/some/:route' },
+    } as unknown as FastifyRequest;
+    expect(resolveRouteLabel(req)).not.toBe('static');
+    expect(resolveRouteLabel(req)).toBe('/some/:route');
+  });
 });
 
 describe('isStreamingResponse (SSE exclusion)', () => {
