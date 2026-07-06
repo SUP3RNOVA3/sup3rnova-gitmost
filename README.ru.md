@@ -126,6 +126,32 @@ Gitmost повторяет процесс установки upstream-Docmost. �
 смотрите в [документации](https://docmost.com/docs) Docmost; где это применимо, заменяйте образ
 `docmost/docmost` на `ghcr.io/vvzvlad/gitmost`.
 
+### Reverse proxy: SSE-стриминговые пути
+
+AI-агент стримит ответы через Server-Sent Events. Эти эндпоинты отдают долгоживущий
+`text/event-stream`-ответ и **обязаны обходить буферизацию И сжатие ответов** на каждом
+прокси перед приложением:
+
+- `POST /api/ai-chat/stream` — живой стрим хода агента
+- `GET /api/ai-chat/runs/<chatId>/stream` — подключение/резюм detached-рана
+  (`AI_CHAT_RESUMABLE_STREAM`)
+- `POST /api/shares/ai/stream` — анонимный ассистент публичных шар
+
+Буферизующий или сжимающий прокси не ломает эти пути с ошибкой — он тихо их портит:
+запрос висит в `pending`, токены не стримятся и вываливаются одним куском в конце хода,
+а перезагруженная вкладка падает в грубый поллинг. Диагностический признак в DevTools —
+заголовок `Content-Encoding: gzip/zstd` на ответе с `text/event-stream`.
+
+Сервер уже шлёт `X-Accel-Buffering: no` (nginx учитывает его по умолчанию), но
+compression-мидлвари управляются конфигом прокси, а не заголовками:
+
+- **nginx** — `proxy_buffering off; proxy_cache off; gzip off;` для этих location,
+  например `location ~ ^/api/(ai-chat/(stream$|runs/.+/stream$)|shares/ai/) { ... }`
+- **Traefik** — вести эти пути через отдельный роутер **без** `compress`-мидлвари
+  (compress буферизует SSE-кадры до закрытия ответа), например
+  ``PathPrefix(`/api/ai-chat/stream`) || PathPrefix(`/api/ai-chat/runs/`)``. Для надёжности:
+  `traefik.http.middlewares.<name>.compress.excludedcontenttypes: text/event-stream`.
+
 ## Миграция с Docmost
 
 Схема БД Gitmost — это **строгий superset** схемы Docmost. Все Gitmost-специфичные миграции только

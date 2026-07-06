@@ -125,6 +125,32 @@ Gitmost follows the upstream Docmost setup. See the Docmost
 [documentation](https://docmost.com/docs) for self-hosting and development instructions; replace the
 `docmost/docmost` image with `ghcr.io/vvzvlad/gitmost` where applicable.
 
+### Reverse proxy: SSE streaming paths
+
+The AI agent streams its answers over Server-Sent Events. These endpoints produce a
+long-lived `text/event-stream` response and **must bypass response buffering AND response
+compression** at every proxy in front of the app:
+
+- `POST /api/ai-chat/stream` — the live agent turn stream
+- `GET /api/ai-chat/runs/<chatId>/stream` — attach/resume of a detached agent run
+  (`AI_CHAT_RESUMABLE_STREAM`)
+- `POST /api/shares/ai/stream` — the anonymous public-share assistant
+
+A buffering or compressing proxy does not break these with an error — it silently ruins them:
+the request hangs in `pending`, tokens stop streaming and arrive in one burst when the turn
+ends, or a reloaded tab falls back to coarse polling. The tell in DevTools is a
+`Content-Encoding: gzip/zstd` response header on a `text/event-stream` response.
+
+The server already sends `X-Accel-Buffering: no` (honored by nginx unless ignored), but
+compression middleware is applied by proxy configuration, not headers:
+
+- **nginx** — `proxy_buffering off; proxy_cache off; gzip off;` for these locations, e.g.
+  `location ~ ^/api/(ai-chat/(stream$|runs/.+/stream$)|shares/ai/) { ... }`
+- **Traefik** — route these paths through a dedicated router **without** the `compress`
+  middleware (a `compress` middleware buffers SSE frames until the response closes), e.g.
+  ``PathPrefix(`/api/ai-chat/stream`) || PathPrefix(`/api/ai-chat/runs/`)``. Belt-and-braces:
+  `traefik.http.middlewares.<name>.compress.excludedcontenttypes: text/event-stream`.
+
 ## Migration from Docmost
 
 Gitmost's database schema is a **strict superset** of Docmost's. Every Gitmost-specific migration
