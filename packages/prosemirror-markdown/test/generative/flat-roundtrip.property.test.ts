@@ -111,13 +111,21 @@ vi.setConfig({ testTimeout: 30000 });
 
 // Fixed seed so every failure is reproducible; fast-check also prints the
 // shrunk counterexample. numRuns starts modest to keep CI under budget — the
-// issue's CI target is ~300-500 per property; the nightly / PR 3 will crank
-// this up further. Each property runs over the UNION (fc.oneof) of all flat
-// node generators, so the runs are shared across node types (one test per
-// property keeps the jsdom import cost and memory bounded — a per-generator ×
-// per-property matrix is ~200 heavy tests that OOMs the worker).
-const SEED = 20250705;
-const NUM_RUNS = 300;
+// issue's CI target is ~300-500 per property. Both are overridable via the
+// PROPERTY_SEED / PROPERTY_NUM_RUNS env vars (an invalid/empty value → NaN →
+// falls back to the default below): the nightly cron
+// (.github/workflows/nightly-property.yml) cranks NUM_RUNS to ~5000 with a
+// random seed to hunt for deeper counterexamples. Each property runs over the
+// UNION (fc.oneof) of all flat node generators, so the runs are shared across
+// node types (one test per property keeps the jsdom import cost and memory
+// bounded — a per-generator × per-property matrix is ~200 heavy tests that
+// OOMs the worker).
+// An unset/empty/non-numeric value falls back to the default; an explicit 0 is
+// honored (a valid fast-check seed) — `Number(x) || default` would swallow it.
+const envInt = (v: string | undefined, dflt: number): number =>
+  v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : dflt;
+const SEED = envInt(process.env.PROPERTY_SEED, 20250705);
+const NUM_RUNS = envInt(process.env.PROPERTY_NUM_RUNS, 300);
 
 const P1_GENERATORS = buildGenerators('p1');
 const FUZZ_GENERATORS = buildGenerators('fuzz');

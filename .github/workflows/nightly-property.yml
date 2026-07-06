@@ -1,0 +1,122 @@
+name: Nightly property fuzz
+
+# The daily heavy property run for the ProseMirror<->Markdown converter
+# (packages/prosemirror-markdown). The PR/CI test run keeps NUM_RUNS modest to
+# stay under budget; this cron cranks it up (~5000) with a RANDOM seed to hunt
+# for deeper round-trip counterexamples than a fixed-seed PR run can reach.
+#
+# Counterexample -> fixture workflow: when a run fails, fast-check prints the
+# SHRUNK minimal counterexample plus the reproducing seed. This job files a
+# Gitea issue containing that seed + counterexample. A human then commits the
+# shrunk doc as a PERMANENT fixture under
+# packages/prosemirror-markdown/test/fixtures/counterexamples/ with a case in
+# counterexamples.test.ts, and FIXES the converter (never weakens a property to
+# hide the bug). See packages/prosemirror-markdown/README.md.
+
+on:
+  schedule:
+    # 03:00 UTC daily.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      num_runs:
+        description: 'fast-check runs per property'
+        required: false
+        default: '5000'
+      seed:
+        description: 'fast-check seed (empty = random)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  property-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # No build step: the generative suite imports the converter from src/
+      # directly (e.g. `from '../../src/lib/markdown-converter.js'`), so it runs
+      # against source without the package's build/. Skipping the build also
+      # keeps a tsc build error from masquerading as a property-test failure and
+      # filing a bogus counterexample issue.
+      - name: Resolve seed and run count
+        id: params
+        run: |
+          set -euo pipefail
+          SEED="${{ inputs.seed }}"
+          # Empty seed (cron, or a dispatch that left it blank) -> random. Combine
+          # two RANDOMs so the seed spans more than RANDOM's 0..32767 range.
+          [ -z "$SEED" ] && SEED=$(( (RANDOM << 15) | RANDOM ))
+          NUM_RUNS="${{ inputs.num_runs || '5000' }}"
+          echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+          echo "num_runs=$NUM_RUNS" >> "$GITHUB_OUTPUT"
+          echo "Property fuzz: PROPERTY_SEED=$SEED PROPERTY_NUM_RUNS=$NUM_RUNS"
+
+      - name: Run generative property suite
+        env:
+          PROPERTY_SEED: ${{ steps.params.outputs.seed }}
+          PROPERTY_NUM_RUNS: ${{ steps.params.outputs.num_runs }}
+        run: |
+          set -o pipefail
+          pnpm --filter @docmost/prosemirror-markdown exec \
+            vitest run test/generative/ 2>&1 | tee property-output.txt
+
+      # On failure fast-check has already printed the shrunk counterexample and
+      # its reproducing seed into property-output.txt. File a Gitea issue with
+      # the seed, run count and the tail of that output so a human can turn the
+      # counterexample into a permanent fixture (see the header comment).
+      - name: File issue on failure
+        if: failure()
+        env:
+          SEED: ${{ steps.params.outputs.seed }}
+          NUM_RUNS: ${{ steps.params.outputs.num_runs }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TITLE="Nightly property test failure (seed=${SEED})"
+
+          # Best-effort dedup: skip if an open issue with the shared title prefix
+          # already exists. A failure of this check must NOT block issue creation.
+          EXISTING=""
+          if EXISTING=$(curl -sS \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues?state=open&limit=100"); then
+            if printf '%s' "$EXISTING" \
+                | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let a;try{a=JSON.parse(s)}catch{process.exit(1)}if(!Array.isArray(a))process.exit(1);process.exit(a.some(i=>typeof i.title==="string"&&i.title.startsWith("Nightly property test failure"))?0:1)})'; then
+              echo "An open 'Nightly property test failure' issue already exists — skipping creation."
+              exit 0
+            fi
+          fi
+
+          # Build the JSON body with the test output SAFELY escaped (never hand-
+          # interpolate the counterexample into JSON).
+          BODY_TEXT=$(printf 'The nightly property fuzz run failed.\n\n- seed: `%s`\n- NUM_RUNS: `%s`\n- run: %s\n\nReproduce locally:\n\n```\nPROPERTY_SEED=%s PROPERTY_NUM_RUNS=%s pnpm --filter @docmost/prosemirror-markdown exec vitest run test/generative/\n```\n\nfast-check shrinks the failure to a minimal counterexample. Commit it as a permanent fixture under `packages/prosemirror-markdown/test/fixtures/counterexamples/` + a case in `counterexamples.test.ts`, then FIX the converter (do not weaken a property). See `packages/prosemirror-markdown/README.md`.\n\nTail of the test output (contains the shrunk counterexample):\n\n```\n%s\n```\n' \
+            "$SEED" "$NUM_RUNS" "$RUN_URL" "$SEED" "$NUM_RUNS" "$(tail -n 120 property-output.txt)")
+
+          jq -n --arg title "$TITLE" --arg body "$BODY_TEXT" \
+            '{title: $title, body: $body}' > payload.json
+
+          curl -sS -X POST \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues" \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d @payload.json
