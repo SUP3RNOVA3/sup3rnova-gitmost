@@ -41,7 +41,10 @@ import {
   HISTORY_INTERVAL,
 } from '../constants';
 import { TransclusionService } from '../../core/page/transclusion/transclusion.service';
-import { observeCollabStore } from '../../integrations/metrics/metrics.registry';
+import {
+  observeCollabLoad,
+  observeCollabStore,
+} from '../../integrations/metrics/metrics.registry';
 
 /**
  * #251 — wire format of the client→server stateless message that signals a
@@ -150,10 +153,14 @@ export class PersistenceExtension implements Extension {
     const { documentName, document } = data;
     const pageId = getPageId(documentName);
 
+    // #402 — the early return below (live doc already non-empty) does NOT touch
+    // the DB, so it is deliberately NOT timed. We only observe the real DB-load
+    // work, and only on each real-load return, tagged by the loaded doc size.
     if (!document.isEmpty('default')) {
       return;
     }
 
+    const startedAt = performance.now();
     const page = await this.pageRepo.findById(pageId, {
       includeContent: true,
       includeYdoc: true,
@@ -171,6 +178,7 @@ export class PersistenceExtension implements Extension {
       const dbState = new Uint8Array(page.ydoc);
 
       Y.applyUpdate(doc, dbState);
+      observeCollabLoad(dbState.length, (performance.now() - startedAt) / 1000);
       return doc;
     }
 
@@ -184,26 +192,42 @@ export class PersistenceExtension implements Extension {
         tiptapExtensions,
       );
 
-      Y.encodeStateAsUpdate(ydoc);
+      // Reuse this single encode for the size label (do NOT add a second one).
+      const encoded = Y.encodeStateAsUpdate(ydoc);
+      observeCollabLoad(
+        encoded.byteLength,
+        (performance.now() - startedAt) / 1000,
+      );
       return ydoc;
     }
 
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
+    observeCollabLoad(0, (performance.now() - startedAt) / 1000);
     return new Y.Doc();
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
     // #355 — time the full store (persist + post-store side effects) into
-    // collab_store_duration_seconds. No-op when METRICS_PORT is unset.
+    // collab_store_duration_seconds. #402 — also tag by document size bucket.
+    // No-op when METRICS_PORT is unset.
     const startedAt = performance.now();
+    // Default 0 so a throw before storeDocument returns still records a
+    // (smallest-bucket) observation rather than dropping the timing entirely.
+    let bytes = 0;
     try {
-      await this.storeDocument(data);
+      bytes = await this.storeDocument(data);
     } finally {
-      observeCollabStore((performance.now() - startedAt) / 1000);
+      observeCollabStore(bytes, (performance.now() - startedAt) / 1000);
     }
   }
 
-  private async storeDocument(data: onStoreDocumentPayload) {
+  /**
+   * Persist the document. Returns the serialized ydoc byte size (used as the
+   * store histogram's size_bucket). The single Y.encodeStateAsUpdate below is
+   * the ONLY serialization — its byteLength is reused for the label (no second
+   * encode).
+   */
+  private async storeDocument(data: onStoreDocumentPayload): Promise<number> {
     const { documentName, document, context } = data;
 
     const pageId = getPageId(documentName);
@@ -455,6 +479,11 @@ export class PersistenceExtension implements Extension {
 
       await this.enqueuePageHistory(page, lastUpdatedSource);
     }
+
+    // #402 — report the serialized size for the store histogram's size_bucket.
+    // ydocState is always computed above (there is no earlier no-write return in
+    // this method), so this reflects the doc that was serialized this store.
+    return ydocState.byteLength;
   }
 
   /**

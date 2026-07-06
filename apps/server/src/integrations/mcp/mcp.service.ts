@@ -30,6 +30,11 @@ import {
   ResolvedMcpAuth,
 } from './mcp-auth.helpers';
 import { SandboxStore } from '../sandbox/sandbox.store';
+import {
+  isMetricsEnabled,
+  observeMcpTool,
+  incConnectTimeout,
+} from '../metrics/metrics.registry';
 
 // Minimal shape of the embedded MCP HTTP handler exported by @docmost/mcp/http.
 interface McpHttpHandler {
@@ -331,7 +336,31 @@ export class McpService implements OnModuleDestroy {
             // can store blobs in the shared in-RAM store regardless of which
             // credential variant resolved. The sink (put/has/evict + uri↔id
             // mapping) is owned by SandboxStore.asSink().
-            return { ...resolved.config, sandbox: this.sandboxStore.asSink() };
+            // Route the package's dependency-neutral metric samples onto the
+            // prom-client registry. When metrics are disabled, onMetric is
+            // undefined → the package's tool-timer/timeout hooks are a
+            // negligible-overhead no-op: the registerTool wrapper still runs a
+            // performance.now() + async try/finally per tool call, but the
+            // `onMetric?.()` short-circuits so no label/object is built. (Cost
+            // is immaterial at LLM tool-call rate.) labels?.tool is guarded
+            // defensively (the tool wrapper always sets it).
+            return {
+              ...resolved.config,
+              sandbox: this.sandboxStore.asSink(),
+              onMetric: isMetricsEnabled()
+                ? (
+                    name: string,
+                    value: number,
+                    labels?: Record<string, string>,
+                  ) => {
+                    if (name === 'mcp_tool_duration_seconds') {
+                      observeMcpTool(labels?.tool ?? 'other', value);
+                    } else if (name === 'collab_connect_timeouts_total') {
+                      incConnectTimeout();
+                    }
+                  }
+                : undefined,
+            };
           },
           {
             identify: (req: IncomingMessage) => {

@@ -2,12 +2,28 @@
  * Perf-metrics contract (#355). These names/labels are FIXED by the already
  * deployed scrape+dashboard infra (VictoriaMetrics scraping docmost:9464,
  * Grafana dashboards, alerts). Do NOT rename them.
+ *
+ * #402 extends the #355 table with the collab-lifecycle + MCP-tool families
+ * (grouped below). These are the fixed contract from #402; same "do not rename"
+ * rule applies. Server-side families land in Pass 1; the MCP-tool histogram is
+ * fed by the MCP callback in a later pass but its NAME is fixed here now.
  */
 export const METRIC_HTTP_REQUEST_DURATION = 'http_request_duration_seconds';
 export const METRIC_DB_QUERY_DURATION = 'db_query_duration_seconds';
 export const METRIC_BULLMQ_QUEUE_DEPTH = 'bullmq_queue_depth';
 export const METRIC_BULLMQ_JOB_DURATION = 'bullmq_job_duration_seconds';
 export const METRIC_COLLAB_STORE_DURATION = 'collab_store_duration_seconds';
+
+// #402 additions — collaboration lifecycle + MCP tool timing.
+export const METRIC_COLLAB_LOAD_DURATION = 'collab_doc_load_duration_seconds';
+export const METRIC_COLLAB_DOCS_OPEN = 'collab_docs_open';
+export const METRIC_COLLAB_DOC_LOADS_TOTAL = 'collab_doc_loads_total';
+export const METRIC_COLLAB_DOC_UNLOADS_TOTAL = 'collab_doc_unloads_total';
+export const METRIC_COLLAB_CONNECT_DURATION = 'collab_connect_duration_seconds';
+export const METRIC_COLLAB_CONNECT_TIMEOUTS_TOTAL =
+  'collab_connect_timeouts_total';
+export const METRIC_COLLAB_AUTH_DURATION = 'collab_auth_duration_seconds';
+export const METRIC_MCP_TOOL_DURATION = 'mcp_tool_duration_seconds';
 
 // Histogram buckets (seconds). Chosen to give useful p50/p95/p99 resolution
 // for typical web/DB latencies without exploding series cardinality.
@@ -22,6 +38,12 @@ export const COLLAB_BUCKETS = [
 ];
 export const JOB_BUCKETS = [
   0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120,
+];
+// #402 — MCP tool-call latency. Same shape as COLLAB_BUCKETS but stretched to
+// 10s at the top: an MCP tool round-trip (LLM-driven doc ops) can be slower
+// than a single collab store, so keep resolution out to 10s.
+export const MCP_TOOL_BUCKETS = [
+  0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 ];
 
 /**
@@ -56,6 +78,30 @@ export function firstSqlToken(sql: string | undefined): string {
   if (!match) return 'other';
   const token = match[1].toLowerCase();
   return KNOWN_SQL_TOKENS.has(token) ? token : 'other';
+}
+
+/**
+ * #402 — bucket a document byte size into ONE of four fixed labels for the
+ * collab load/store histograms' `size_bucket` label. Using the raw byte count
+ * would be a continuous, unbounded label; four coarse buckets keep series
+ * cardinality bounded (each of collab_doc_load / collab_store gets ×4 series).
+ *
+ * The SAME function is shared by both the load and store paths so their buckets
+ * can never drift apart. Non-finite / negative sizes collapse to the smallest
+ * bucket ('lt64k') as a safe default (they can't be legitimately huge and we
+ * must never throw here — this runs on every store/load when metrics are on).
+ */
+// Module-const thresholds, built once (not per observe).
+const SIZE_THRESHOLDS = { lt64k: 65536, lt256k: 262144, lt1m: 1048576 } as const;
+
+export function sizeBucket(
+  bytes: number | undefined | null,
+): 'lt64k' | 'lt256k' | 'lt1m' | 'ge1m' {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return 'lt64k';
+  if (bytes < SIZE_THRESHOLDS.lt64k) return 'lt64k';
+  if (bytes < SIZE_THRESHOLDS.lt256k) return 'lt256k';
+  if (bytes < SIZE_THRESHOLDS.lt1m) return 'lt1m';
+  return 'ge1m';
 }
 
 /**

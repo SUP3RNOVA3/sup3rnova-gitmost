@@ -16,6 +16,7 @@ import { isUserDisabled } from '../../common/helpers';
 import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
 import { resolveProvenance } from '../../common/decorators/auth-provenance.decorator';
+import { observeCollabAuth } from '../../integrations/metrics/metrics.registry';
 
 @Injectable()
 export class AuthenticationExtension implements Extension {
@@ -30,6 +31,18 @@ export class AuthenticationExtension implements Extension {
   ) {}
 
   async onAuthenticate(data: onAuthenticatePayload) {
+    // #402 — time the whole auth (verify + user/page/permission lookups) into
+    // collab_auth_duration_seconds. finally so failed auths are timed too.
+    // No-op when METRICS_PORT is unset. Behavior unchanged.
+    const start = performance.now();
+    try {
+      return await this.doAuthenticate(data);
+    } finally {
+      observeCollabAuth((performance.now() - start) / 1000);
+    }
+  }
+
+  private async doAuthenticate(data: onAuthenticatePayload) {
     const { documentName, token } = data;
     const pageId = getPageId(documentName);
 

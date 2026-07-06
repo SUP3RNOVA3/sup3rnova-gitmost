@@ -1,6 +1,23 @@
 import { FastifyRequest } from 'fastify';
 import { resolveRouteLabel } from './http-metrics.hook';
-import { firstSqlToken, isStreamingResponse } from './metrics.constants';
+import {
+  firstSqlToken,
+  isStreamingResponse,
+  sizeBucket,
+} from './metrics.constants';
+import {
+  getMetricsRegistry,
+  incConnectTimeout,
+  incDocLoad,
+  incDocUnload,
+  isMetricsEnabled,
+  observeCollabAuth,
+  observeCollabConnect,
+  observeCollabLoad,
+  observeCollabStore,
+  observeMcpTool,
+  registerDocsOpenSource,
+} from './metrics.registry';
 
 describe('resolveRouteLabel (histogram route label)', () => {
   it('uses the ROUTE TEMPLATE, never the raw URL', () => {
@@ -121,5 +138,69 @@ describe('firstSqlToken (bounded db label)', () => {
     expect(firstSqlToken(undefined)).toBe('other');
     expect(firstSqlToken('123 not sql')).toBe('other');
     expect(firstSqlToken('vacuum analyze')).toBe('other');
+  });
+});
+
+describe('sizeBucket (#402 bounded size label)', () => {
+  it('maps sizes to the four fixed buckets at their boundaries', () => {
+    // Boundaries are exclusive-upper: <65536 → lt64k, etc.
+    expect(sizeBucket(0)).toBe('lt64k');
+    expect(sizeBucket(65535)).toBe('lt64k');
+    expect(sizeBucket(65536)).toBe('lt256k');
+    expect(sizeBucket(262143)).toBe('lt256k');
+    expect(sizeBucket(262144)).toBe('lt1m');
+    expect(sizeBucket(1048575)).toBe('lt1m');
+    expect(sizeBucket(1048576)).toBe('ge1m');
+    expect(sizeBucket(5_000_000)).toBe('ge1m');
+  });
+
+  it('falls back to the smallest bucket for invalid sizes', () => {
+    // Non-finite / negative / nullish collapse to the smallest, safe default.
+    expect(sizeBucket(-1)).toBe('lt64k');
+    expect(sizeBucket(NaN)).toBe('lt64k');
+    expect(sizeBucket(Infinity)).toBe('lt64k');
+    expect(sizeBucket(undefined)).toBe('lt64k');
+    expect(sizeBucket(null)).toBe('lt64k');
+  });
+
+  it('only ever returns one of the four fixed labels (bounded cardinality)', () => {
+    const labels = new Set(
+      [0, 65536, 262144, 1048576, -5, NaN].map((b) => sizeBucket(b)),
+    );
+    for (const l of labels) {
+      expect(['lt64k', 'lt256k', 'lt1m', 'ge1m']).toContain(l);
+    }
+  });
+});
+
+describe('metrics helpers are safe no-ops when METRICS_PORT is unset', () => {
+  // These specs run without METRICS_PORT, so the registry is never created and
+  // every observe/inc/set helper must be a cheap `?.` no-op that never throws.
+  beforeAll(() => {
+    // Guard the contract this suite depends on: if a CI env set METRICS_PORT,
+    // the assertions below would be meaningless, so fail loudly instead.
+    expect(process.env.METRICS_PORT).toBeUndefined();
+  });
+
+  it('reports metrics disabled and a null registry', () => {
+    expect(isMetricsEnabled()).toBe(false);
+    expect(getMetricsRegistry()).toBeNull();
+  });
+
+  it('does not throw from any #402 collab/MCP helper', () => {
+    expect(() => {
+      observeCollabLoad(123456, 0.01);
+      observeCollabStore(123456, 0.02);
+      observeCollabConnect(0.03);
+      observeCollabAuth(0.04);
+      observeMcpTool('some-tool', 0.05);
+      incDocLoad();
+      incDocUnload();
+      incConnectTimeout();
+      // Registering a source must not create the gauge or invoke the fn.
+      registerDocsOpenSource(() => {
+        throw new Error('docsOpenSource must NOT be called when disabled');
+      });
+    }).not.toThrow();
   });
 });
