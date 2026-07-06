@@ -374,7 +374,9 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
         ],
       }),
     );
-    expect(out).toBe('- [ ] top\n  - child');
+    // Block children of a task item are blank-line separated (loose list) per the
+    // #351 fix; the sublist stays at the fixed 2-column continuation indent.
+    expect(out).toBe('- [ ] top\n\n  - child');
   });
 
   // 10. A bulletList inside a blockquote: each list line independently prefixed.

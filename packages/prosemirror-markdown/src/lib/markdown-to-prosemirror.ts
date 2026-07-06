@@ -270,9 +270,10 @@ const CALLOUT_CLOSE_RE = /^:::\s*$/;
  * optional title after the type is allowed but ignored (the Docmost callout
  * schema has no title). The body is the following contiguous blockquote lines.
  */
-const CALLOUT_BQ_OPEN_RE = /^>\s*\[!(\w+)\]/;
-/** Matches any blockquote continuation line (`>` … ). */
-const BLOCKQUOTE_LINE_RE = /^>/;
+// The callout's own `>` marker may be preceded by an ENCLOSING container prefix:
+// list-item indentation (`  `) and/or blockquote markers (`> `). Group 1 captures
+// that prefix (lazily, so the LAST `>` before `[!type]` is the callout's own).
+const CALLOUT_BQ_OPEN_RE = /^([>\s]*?)>\s*\[!(\w+)\]/;
 /** Matches the start/end of a code fence (``` or ~~~), capturing the marker. */
 const CODE_FENCE_RE = /^(\s*)(`{3,}|~{3,})/;
 
@@ -402,20 +403,47 @@ async function preprocessCallouts(markdown: string): Promise<string> {
       // recurse so nested callouts (`> > [!type]`) are handled, then emit the same
       // callout div the `:::` path produces. A normal blockquote (no `[!type]` on
       // its first line) does not match and stays a blockquote.
+      //
+      // PREFIX-aware: a callout nested inside a list item and/or a blockquote is
+      // serialized with the enclosing container prefix in front of its own `>`
+      // marker — `  > [!type]` (list indent) or `> > [!type]` (blockquote). We
+      // capture that prefix, take only continuation lines carrying `prefix>`, strip
+      // it, and re-apply the prefix to the emitted HTML block so the callout div
+      // stays WITHIN its container (an unprefixed div would escape and re-parse as
+      // a top-level callout / plain blockquote — silent structure loss).
       const bqOpen = line.match(CALLOUT_BQ_OPEN_RE);
       if (bqOpen) {
-        const type = bqOpen[1].toLowerCase();
+        const prefix = bqOpen[1];
+        const type = bqOpen[2].toLowerCase();
+        const cont = prefix + ">"; // a body line = prefix + the callout's own `>`
         const bodyLines: string[] = [];
         let j = i + 1;
         for (; j < lines.length; j++) {
-          if (!BLOCKQUOTE_LINE_RE.test(lines[j])) break;
-          bodyLines.push(lines[j].replace(/^>\s?/, ""));
+          if (!lines[j].startsWith(cont)) break;
+          // Drop the prefix + `>` + one optional space, leaving the body content.
+          bodyLines.push(lines[j].slice(prefix.length).replace(/^>\s?/, ""));
         }
         const inner = await transform(bodyLines);
         const renderedInner = await markedInstance.parse(inner);
-        out.push(
-          `\n<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>\n`,
-        );
+        const block = `<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>`;
+        if (prefix.length === 0) {
+          // Top-level callout: blank lines isolate the HTML block.
+          out.push(`\n${block}\n`);
+        } else if (prefix.includes(">")) {
+          // Enclosing BLOCKQUOTE: prefix every line and add NO surrounding blank
+          // lines — a blank line would terminate the blockquote and split the
+          // callout out of it.
+          out.push(block.split("\n").map((l) => prefix + l).join("\n"));
+        } else {
+          // Pure LIST-ITEM indentation: re-indent and keep the blank-line
+          // separators (a loose list item), so the div sits at the marker column.
+          out.push(
+            `\n${block
+              .split("\n")
+              .map((l) => (l.length ? prefix + l : l))
+              .join("\n")}\n`,
+          );
+        }
         i = j;
         continue;
       }
@@ -597,6 +625,40 @@ function bridgeTaskLists(html: string): string {
  * (null from parseAttachedComment), an unknown name, a wrong-position comment, or
  * an unknown/empty attr value is ignored.
  */
+/**
+ * A directive comment is in ATTACHED position when it sits inside a `<p>`/`<hN>`
+ * textblock — bound to that block's text (the `attrs`/`img` conventions). Every
+ * other parent (body, document level, a block container like blockquote/details/
+ * li/column div) is STANDALONE position, where a lone-block directive
+ * (subpages/pagebreak/pageembed/transclusion) is materialized. Broadening
+ * standalone beyond body/document is what lets these nodes survive NESTED inside
+ * a blockquote/callout/details/list item (previously dropped -> silent data loss).
+ */
+function isAttachedPosition(tag: string): boolean {
+  return tag === "p" || /^h[1-6]$/.test(tag);
+}
+
+/**
+ * Place a materialized standalone-directive element in the DOM: replace the
+ * comment IN PLACE when it has a real element parent inside <body> (body itself
+ * or a nested block container), preserving document order; queue it as a leading
+ * div only when the comment is at document level (no parentElement) or directly
+ * under `<html>` (outside <body>, which `document.body.innerHTML` would drop).
+ */
+function placeStandalone(
+  comment: any,
+  el: any,
+  tag: string,
+  leadingDivs: any[],
+): void {
+  if (comment.parentElement && tag !== "html") {
+    comment.replaceWith(el);
+  } else {
+    comment.remove();
+    leadingDivs.push(el);
+  }
+}
+
 function applyCommentDirectives(html: string): string {
   // Cheap early-out: no comments at all -> nothing to intercept.
   if (!html.includes("<!--")) return html;
@@ -664,13 +726,13 @@ function applyCommentDirectives(html: string): string {
 
     if (parsed.name === "subpages" || parsed.name === "pagebreak") {
       // #293 canon #5 STANDALONE machinery. A lone comment line is rendered by
-      // marked as an HTML block; the parser places it either directly under
-      // <body> (when other content surrounds it) or at document level (when it
-      // leads the output). Both are STANDALONE position. A `subpages`/`pagebreak`
-      // comment sitting inside a `<p>`/`<hN>` (or any other element) is attached
-      // position -> INERT.
-      const standalone = tag === "" || tag === "body" || tag === "html";
-      if (!standalone) continue; // wrong position -> inert
+      // marked as its own HTML block; the parser places it under <body>, at
+      // document level (leading), or — when the directive is NESTED — inside a
+      // block CONTAINER (`<blockquote>` for blockquote/callout, `<details>`,
+      // `<li>`, a column `<div>`, …). All of those are STANDALONE position. Only a
+      // comment ATTACHED inside a `<p>`/`<hN>` (bound to that block's text) is
+      // attached position -> INERT.
+      if (isAttachedPosition(tag)) continue; // wrong position -> inert
       const div = document.createElement("div");
       if (parsed.name === "pagebreak") {
         div.setAttribute("data-type", "pageBreak");
@@ -680,26 +742,18 @@ function applyCommentDirectives(html: string): string {
           div.setAttribute("data-recursive", "true");
         }
       }
-      if (tag === "body") {
-        // In-body: replace in place so surrounding content keeps its order.
-        comment.replaceWith(div);
-      } else {
-        // Document-level (leading): drop the stray comment and queue the div to
-        // be prepended into body below.
-        comment.remove();
-        leadingDivs.push(div);
-      }
+      placeStandalone(comment, div, tag, leadingDivs);
       continue;
     }
 
     if (parsed.name === "pageembed" || parsed.name === "transclusion") {
       // #293 canon #8 STANDALONE media. Like subpages/pagebreak: a lone comment
-      // line placed under <body> or at document level (leading). An attached-
-      // position comment (inside a <p>/<hN> with a sibling) is INERT. We rebuild
-      // the schema div the raw-HTML path emits (media-html.ts) from the decoded
-      // attrs so serialize/parse stay in sync.
-      const standalone = tag === "" || tag === "body" || tag === "html";
-      if (!standalone) continue; // wrong position -> inert
+      // line placed under <body>, at document level (leading), or NESTED inside a
+      // block container (blockquote/callout/details/li/column). An ATTACHED-
+      // position comment (inside a `<p>`/`<hN>`) is INERT. We rebuild the schema
+      // div the raw-HTML path emits (media-html.ts) from the decoded attrs so
+      // serialize/parse stay in sync.
+      if (isAttachedPosition(tag)) continue; // wrong position -> inert
       const el = buildElement(
         parsed.name === "pageembed"
           ? pageEmbedToHtml({ sourcePageId: parsed.attrs.sourcePageId })
@@ -709,12 +763,7 @@ function applyCommentDirectives(html: string): string {
             }),
       );
       if (!el) continue; // defensive: builder always yields an element
-      if (tag === "body") {
-        comment.replaceWith(el);
-      } else {
-        comment.remove();
-        leadingDivs.push(el);
-      }
+      placeStandalone(comment, el, tag, leadingDivs);
       continue;
     }
 
@@ -806,18 +855,36 @@ function applyCommentDirectives(html: string): string {
 
     if (!parent) continue; // attrs comment must have an element parent
     if (parsed.name !== "attrs") continue; // unknown name -> inert
-    // #293 canon #9 ATTACHED attrs: honored only in attached position.
-    const isBlock = tag === "p" || /^h[1-6]$/.test(tag);
-    if (!isBlock) continue; // misplaced comment -> inert
     const align = parsed.attrs.textAlign;
-    if (typeof align === "string" && align) {
-      // Re-express as an inline style; the schema's textAlign parseHTML reads
-      // `el.style.textAlign` back onto the paragraph/heading node.
-      parent.style.textAlign = align;
+    // #293 canon #9 ATTACHED attrs: honored only in attached position.
+    if (tag === "p" || /^h[1-6]$/.test(tag)) {
+      // A real <p>/<hN> host (loose list item, top-level block, …): re-express as
+      // an inline style; the schema's textAlign parseHTML reads `el.style.textAlign`
+      // back onto the paragraph/heading node.
+      if (typeof align === "string" && align) parent.style.textAlign = align;
+      comment.remove();
+    } else if (tag === "li" || tag === "td" || tag === "th") {
+      // TIGHT list item / GFM table cell: marked emits the paragraph's inline
+      // content DIRECTLY inside the <li>/<td>/<th> with NO <p> wrapper, so there
+      // is no element to carry the style — generateJSON materializes the
+      // paragraph later. Wrap the host's LEADING inline content (everything up to
+      // the comment; any trailing block child such as a nested list stays put) in
+      // a <p> carrying the alignment, so the materialized paragraph re-reads it.
+      if (typeof align === "string" && align) {
+        const p = document.createElement("p");
+        p.style.textAlign = align;
+        while (parent.firstChild && parent.firstChild !== comment) {
+          p.appendChild(parent.firstChild);
+        }
+        parent.insertBefore(p, comment);
+      }
+      comment.remove();
+    } else {
+      // Misplaced `attrs` comment (not a textblock/li/cell host): inert. Consume
+      // it anyway so no attached marker ever survives into the parsed body
+      // (matches the pre-existing "consume regardless" behaviour).
+      comment.remove();
     }
-    // Consume the marker regardless (unknown keys are simply ignored) so no
-    // attached comment ever survives into the parsed body.
-    comment.remove();
   }
   // Prepend any document-level (leading) standalone divs into body, preserving
   // their document order relative to each other and ahead of existing content.
