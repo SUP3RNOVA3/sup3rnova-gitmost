@@ -23,7 +23,20 @@ import { hashPassword } from '../../../common/helpers';
  * unthrottled password-guessing oracle.
  */
 
+// bcrypt cost-12 hashing/compare takes ~300ms idle but multiple seconds when
+// parallel jest workers saturate all CPU cores; the 5s default flakes.
+jest.setTimeout(30_000);
+
 const WORKSPACE_ID = 'ws-1';
+
+let passwordHash: string;
+
+// Hoist the expensive work: compute ONE bcrypt cost-12 hash shared by all
+// tests instead of five. The hash is a read-only string and each test builds
+// its own user object around it, so sharing is safe.
+beforeAll(async () => {
+  passwordHash = await hashPassword('correct-horse');
+}, 30_000);
 
 // Build an AuthService with the dependencies verifyUserCredentials/login touch
 // stubbed, and a userRepo whose findByEmail is overridable per test. Only the
@@ -95,7 +108,6 @@ describe('AuthService.verifyUserCredentials (live credentials-mismatch contract)
   it('DISABLED user -> throws exactly CREDENTIALS_MISMATCH_MESSAGE (no password oracle)', async () => {
     // A deactivated user must be indistinguishable from a wrong password: same
     // message, before any password comparison.
-    const passwordHash = await hashPassword('correct-horse');
     const disabledUser = {
       id: 'u-1',
       email: 'disabled@example.com',
@@ -117,7 +129,6 @@ describe('AuthService.verifyUserCredentials (live credentials-mismatch contract)
   });
 
   it('WRONG password -> throws exactly CREDENTIALS_MISMATCH_MESSAGE', async () => {
-    const passwordHash = await hashPassword('correct-horse');
     const user = {
       id: 'u-1',
       email: 'user@example.com',
@@ -139,7 +150,6 @@ describe('AuthService.verifyUserCredentials (live credentials-mismatch contract)
   });
 
   it('CORRECT credentials -> resolves the matched user (no side effects here)', async () => {
-    const passwordHash = await hashPassword('correct-horse');
     const user = {
       id: 'u-1',
       email: 'user@example.com',
@@ -179,7 +189,6 @@ describe('AuthService.login (live credentials-mismatch contract via verifyUserCr
   });
 
   it('WRONG password -> login throws exactly CREDENTIALS_MISMATCH_MESSAGE', async () => {
-    const passwordHash = await hashPassword('correct-horse');
     const user = {
       id: 'u-1',
       email: 'user@example.com',
@@ -201,7 +210,6 @@ describe('AuthService.login (live credentials-mismatch contract via verifyUserCr
   });
 
   it('CORRECT credentials -> login mints the session (the side-effecting path)', async () => {
-    const passwordHash = await hashPassword('correct-horse');
     const user = {
       id: 'u-1',
       email: 'user@example.com',
