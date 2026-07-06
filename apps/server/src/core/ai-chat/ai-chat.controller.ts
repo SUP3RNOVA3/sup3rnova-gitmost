@@ -4,11 +4,15 @@ import {
   ConflictException,
   Controller,
   ForbiddenException,
+  Get,
   HttpCode,
   HttpException,
   HttpStatus,
   Logger,
+  Param,
+  ParseUUIDPipe,
   Post,
+  Query,
   Req,
   Res,
   ServiceUnavailableException,
@@ -54,6 +58,12 @@ import {
 } from './dto/ai-chat.dto';
 import { describeProviderError } from '../../integrations/ai/ai-error.util';
 import { buildChatMarkdown } from './chat-markdown.util';
+import {
+  AiChatStreamRegistryService,
+  SUBSCRIBER_MAX_BUFFERED_BYTES,
+} from './ai-chat-stream-registry.service';
+import { startSseHeartbeat } from './sse-resilience';
+import { EnvironmentService } from '../../integrations/environment/environment.service';
 
 /**
  * Per-user AI chat API (§6.1). Routes are POST to match this codebase's
@@ -72,6 +82,11 @@ export class AiChatController {
     private readonly aiChatMessageRepo: AiChatMessageRepo,
     private readonly aiTranscription: AiTranscriptionService,
     private readonly pageRepo: PageRepo,
+    // #184 phase 1.5. OPTIONAL so existing positional constructions (controller
+    // specs) compile unchanged; Nest always injects the real providers in
+    // production. Only touched on the resumable-stream (flag-on) path.
+    private readonly streamRegistry?: AiChatStreamRegistryService,
+    private readonly environment?: EnvironmentService,
   ) {}
 
   /** List the requesting user's chats in this workspace (paginated). */
@@ -233,6 +248,102 @@ export class AiChatController {
     return { stopped };
   }
 
+  /**
+   * Attach to a chat's live run stream (#184 phase 1.5). A late/reloaded tab
+   * replays the frames buffered so far and then follows the live tail as a normal
+   * streamer. Owner-gated via assertOwnedChat (same gate as getRun). When there is
+   * nothing to resume — no entry, a finished run without expect=live, an
+   * overflowed buffer, or an anchor that pins a DIFFERENT run — the endpoint
+   * answers 204, the ONLY "nothing to resume" signal the AI SDK's reconnect
+   * accepts (it maps 204 to a silent no-op). With AI_CHAT_RESUMABLE_STREAM off the
+   * registry is never populated, so attach always 204s.
+   *
+   * `expect=live` opts into replaying a finished-but-retained run (safe only when
+   * the client stripped the streaming tail); `anchor` is the client's assistant
+   * row id, which must match this run's (invariant 6) or a foreign run's
+   * transcript would be replayed into the store.
+   */
+  @SkipTransform()
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  @Throttle({ [AI_CHAT_THROTTLER]: { limit: 60, ttl: 60000 } })
+  @Get('runs/:chatId/stream')
+  async attachRunStream(
+    @Param('chatId', new ParseUUIDPipe()) chatId: string,
+    @Query('expect') expect: string | undefined,
+    @Query('anchor') anchor: string | undefined,
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<void> {
+    await this.assertOwnedChat(chatId, user, workspace); // same gate as getRun
+    let stopHeartbeat: () => void = () => undefined;
+    const attachment = await this.streamRegistry?.attach(
+      chatId,
+      expect === 'live',
+      anchor,
+      {
+        onFrame: (frame) => {
+          // Backpressure guard: 2x the replay cap, so the initial replay burst
+          // alone can never trip it; only a genuinely stalled socket can.
+          try {
+            if (res.raw.writableLength > SUBSCRIBER_MAX_BUFFERED_BYTES) {
+              res.raw.destroy(); // 'close' fires -> unsubscribe below
+              return;
+            }
+            if (!res.raw.writableEnded) res.raw.write(frame);
+          } catch {
+            res.raw.destroy();
+          }
+        },
+        onEnd: () => {
+          stopHeartbeat();
+          if (!res.raw.writableEnded) res.raw.end();
+        },
+      },
+    );
+    if (!attachment) {
+      res.status(204).send(); // the ONLY "nothing to resume" signal the SDK accepts
+      return;
+    }
+    res.hijack();
+    // Cleanup BEFORE any write (invariant 5): a torn-down socket must not orphan
+    // a paused subscriber whose pending queue would buffer the whole run.
+    req.raw.once('close', () => {
+      attachment.unsubscribe();
+      stopHeartbeat();
+    });
+    // A close emitted DURING the awaits above was missed by the listener — check.
+    // (Healthy pending GETs have req.raw.destroyed === false, so no false
+    // positives; returning without end() is fine — the socket is gone.)
+    if (req.raw.destroyed) {
+      attachment.unsubscribe();
+      return;
+    }
+    res.raw.on('error', () => undefined);
+    try {
+      res.raw.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        'x-vercel-ai-ui-message-stream': 'v1',
+        'x-accel-buffering': 'no',
+        // deliberately NO Connection/Keep-Alive (hop-by-hop; Safari/HTTP2)
+      });
+      res.raw.flushHeaders?.();
+      for (const frame of attachment.replay) res.raw.write(frame);
+      if (attachment.finished) {
+        res.raw.end();
+        return;
+      }
+      stopHeartbeat = startSseHeartbeat(res.raw, 15_000);
+      attachment.start(); // drain pending accumulated during replay, go live
+    } catch {
+      attachment.unsubscribe();
+      stopHeartbeat();
+      res.raw.destroy();
+    }
+  }
+
   /** Rename a chat. */
   @HttpCode(HttpStatus.OK)
   @Post('rename')
@@ -344,13 +455,25 @@ export class AiChatController {
     // its progress, and settle its terminal status — see AiChatRunService.
     const runHooks: AiChatRunHooks | undefined = autonomousRuns
       ? {
-          begin: (chatId) =>
-            this.aiChatRunService.beginRun({
+          begin: async (chatId) => {
+            const handle = await this.aiChatRunService.beginRun({
               chatId,
               workspaceId: workspace.id,
               userId: user.id,
               trigger: 'user',
-            }),
+            });
+            // #184 phase 1.5: register the run-stream entry at BEGIN (before any
+            // frame) so a tab that attaches in the begin->seed window finds an
+            // entry to wait on. Gated on AI_CHAT_RESUMABLE_STREAM: with the flag
+            // off nothing is registered and attach always 204s.
+            if (
+              handle?.runId &&
+              this.environment?.isAiChatResumableStreamEnabled?.()
+            ) {
+              this.streamRegistry?.open(chatId, handle.runId);
+            }
+            return handle;
+          },
           onAssistantSeeded: (runId, messageId) =>
             this.aiChatRunService.linkAssistantMessage(
               runId,
