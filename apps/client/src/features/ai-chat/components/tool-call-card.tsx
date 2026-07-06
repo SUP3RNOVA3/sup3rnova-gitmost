@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import {
   getToolName,
   toolCitations,
+  toolInputSummary,
   toolLabelKey,
   toolRunState,
   ToolUiPart,
@@ -21,6 +22,14 @@ interface ToolCallCardProps {
    * (the action log itself) while dropping the unusable links.
    */
   showCitations?: boolean;
+  /**
+   * Whether to render the one-line summary of the call's arguments (e.g. the
+   * search query) under the label. Defaults to true (the internal chat). The
+   * public share passes false: an anonymous reader should not see the agent's
+   * raw query/argument text. Conservative and reversible — it only suppresses
+   * the extra summary line, leaving the card (the action log) intact.
+   */
+  showInput?: boolean;
 }
 
 /**
@@ -31,12 +40,14 @@ interface ToolCallCardProps {
 export default function ToolCallCard({
   part,
   showCitations = true,
+  showInput = true,
 }: ToolCallCardProps) {
   const { t } = useTranslation();
   const toolName = getToolName(part);
   const state = toolRunState(part.state);
   const { key, values } = toolLabelKey(toolName);
   const citations = showCitations ? toolCitations(part) : [];
+  const inputSummary = showInput ? toolInputSummary(part) : undefined;
 
   return (
     <div className={classes.toolCard}>
@@ -56,6 +67,12 @@ export default function ToolCallCard({
           {t(key, values)}
         </Text>
       </Group>
+
+      {inputSummary && (
+        <Text size="xs" c="dimmed" mt={2} lineClamp={2}>
+          {inputSummary}
+        </Text>
+      )}
 
       {state === "error" && part.errorText && (
         <Text size="xs" c="red" mt={2}>

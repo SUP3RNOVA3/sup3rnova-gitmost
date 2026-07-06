@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   toolCitations,
+  toolInputSummary,
   toolRunState,
   type ToolUiPart,
 } from "./tool-parts";
@@ -74,6 +75,102 @@ describe("toolCitations", () => {
       output: { title: "Only a title" },
     };
     expect(toolCitations(part)).toEqual([]);
+  });
+});
+
+describe("toolInputSummary", () => {
+  it("returns the primary `query` string", () => {
+    const part: ToolUiPart = {
+      type: "tool-Search_web_search",
+      state: "input-available",
+      input: { query: "hello world" },
+    };
+    expect(toolInputSummary(part)).toBe("hello world");
+  });
+
+  it("summarizes a primary array field with a (+N) suffix", () => {
+    // `urls` is an external MCP read_pages-style list; the first element plus a
+    // count of the rest.
+    const part: ToolUiPart = {
+      type: "tool-read_pages",
+      state: "input-available",
+      input: { urls: ["a", "b", "c"] },
+    };
+    expect(toolInputSummary(part)).toBe("a (+2)");
+  });
+
+  it("omits the (+N) suffix for a single-element array", () => {
+    const part: ToolUiPart = {
+      type: "tool-read_pages",
+      state: "input-available",
+      input: { urls: ["only"] },
+    };
+    expect(toolInputSummary(part)).toBe("only");
+  });
+
+  it("falls back to `title` for a page op with no query", () => {
+    const part: ToolUiPart = {
+      type: "tool-createPage",
+      state: "input-available",
+      input: { pageId: "x", title: "My Page" },
+    };
+    expect(toolInputSummary(part)).toBe("My Page");
+  });
+
+  it("clamps a long value to ~140 chars with an ellipsis", () => {
+    const long = "a".repeat(300);
+    const part: ToolUiPart = {
+      type: "tool-Search_web_search",
+      state: "input-available",
+      input: { query: long },
+    };
+    const out = toolInputSummary(part)!;
+    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(141);
+  });
+
+  it("collapses newlines and repeated spaces to single spaces", () => {
+    const part: ToolUiPart = {
+      type: "tool-Search_web_search",
+      state: "input-available",
+      input: { query: "  foo\n\n  bar   baz  " },
+    };
+    expect(toolInputSummary(part)).toBe("foo bar baz");
+  });
+
+  it("returns undefined with no input", () => {
+    expect(
+      toolInputSummary({ type: "tool-x", state: "input-available" }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for an empty object input", () => {
+    expect(
+      toolInputSummary({
+        type: "tool-x",
+        state: "input-available",
+        input: {},
+      }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for a non-object input", () => {
+    expect(
+      toolInputSummary({
+        type: "tool-x",
+        state: "input-available",
+        input: "just a string",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined while the input is still streaming (even with a full input)", () => {
+    const part: ToolUiPart = {
+      type: "tool-Search_web_search",
+      state: "input-streaming",
+      input: { query: "hello world" },
+    };
+    expect(toolInputSummary(part)).toBeUndefined();
   });
 });
 
