@@ -37,14 +37,19 @@
  *           tagged `// ACCEPTED:` inline. Freezing them is correct — there is
  *           nothing to preserve in the target format.
  *
- *       (b) PINNED BUG — the attribute IS representable in markdown but the
- *           converter drops it anyway (a real defect). These are NOT silently
- *           frozen: each is captured as a LOUD `it.fails` counterexample in
- *           test/fixtures/counterexamples/ + counterexamples.test.ts, and the
- *           freeze here only keeps the P1/P2 union green until a MAINTAINER rules
- *           on accept-vs-fix (the epic guardrail reserves that call). These:
- *           `column.width` (parseFloat drops `%`), `orderedList.start` (non-1
- *           start renders as `1.`). Tagged `// PINNED-BUG:` inline.
+ *       (b) FIXED & VALUE-FUZZED — attributes that were once PINNED converter
+ *           bugs (representable in markdown but dropped) and are now FIXED in
+ *           src/, so they are value-fuzzed here at legal non-default values like
+ *           any healthy attr. `orderedList.start` (the non-1 start once rendered
+ *           as `1.`; the converter now emits the start marker / `<ol start="N">`)
+ *           and `column.width` (a unitless flex-grow number that round-trips via
+ *           parseFloat) are both fuzzed in OVERRIDES below. The former held-out
+ *           `it.fails` cases are gone; `ordered-list-start.json` +
+ *           counterexamples.test.ts now stand as PASSING regression pins (per the
+ *           epic guardrail, the minimal doc stays forever to guard re-regression).
+ *           The #351 media-family sizing attrs (image/video/youtube/pdf/drawio/
+ *           excalidraw/embed width/height/size/aspectRatio) are likewise fuzzed
+ *           now that they ride round-trip-safely in the per-node `<!--…-->` JSON.
  *
  *       (c) DEFERRED-BUG — representable AND round-trips, frozen only because the
  *           flat generator can't yet build a valid instance. Table
@@ -64,8 +69,10 @@
  *         number re-parses as a string), EXCEPT `embed.width/height` which the
  *         embed schema keeps numeric — handled per-attr.
  *
- * Both PINNED-BUG attrs (`column.width` P2 churn, `orderedList.start` P1 loss)
- * are captured as committed `it.fails` counterexamples — NOT hidden here.
+ * The two former PINNED-BUG attrs (`column.width` P2 churn, `orderedList.start`
+ * P1 loss) are now FIXED and value-fuzzed; `ordered-list-start.json` in
+ * counterexamples.test.ts is a permanent PASSING regression pin, not an
+ * `it.fails` hold-out.
  */
 import fc from 'fast-check';
 import { getSchema } from '@tiptap/core';
@@ -142,7 +149,7 @@ const OVERRIDES: Record<string, AttrPolicy> = {
   // FIXED (#351): the converter now emits the start marker ("5." / <ol start="5">)
   // and it round-trips, so the start number is value-fuzzed. See
   // counterexamples.test.ts (ordered-list-start.json) for the regression pin.
-  'orderedList.start': { always: true, arb: num(2, 3, 5) },
+  'orderedList.start': { always: true, arb: num(2, 3, 5, 42) },
   'orderedList.type': { frozen: true }, // ACCEPTED: a/A/i markers not expressible in GFM
   'taskItem.checked': { always: true, arb: fc.constant(true) }, // boolean, default false
   // ── codeBlock ────────────────────────────────────────────────────────────

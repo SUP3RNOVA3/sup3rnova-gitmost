@@ -11,6 +11,7 @@ import {
 } from '../../src/lib/index.js';
 import { firstDivergence } from '../roundtrip-helpers.js';
 import { schema, docArb } from './doc-generator.js';
+import { envInt } from './env-int.js';
 
 // Each run does a real convert + jsdom parse; give ample headroom so the suite
 // is deterministic under parallel worker load (matching the flat sibling suite).
@@ -39,8 +40,7 @@ vi.setConfig({ testTimeout: 60000 });
 // random seed to hunt for deeper counterexamples.
 // An unset/empty/non-numeric value falls back to the default; an explicit 0 is
 // honored (a valid fast-check seed) — `Number(x) || default` would swallow it.
-const envInt = (v: string | undefined, dflt: number): number =>
-  v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : dflt;
+// The parser is shared with the flat suite (env-int.ts) and unit-tested there.
 const SEED = envInt(process.env.PROPERTY_SEED, 20250705);
 // The nested walk builds far heavier docs than the flat suite (each P1/P2 run
 // parses the emitted markdown through jsdom), so keep the run count moderate to

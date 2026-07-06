@@ -18,6 +18,7 @@ import {
   coveredTypes,
   KNOWN_UNCOVERED,
 } from './node-generators.js';
+import { envInt } from './env-int.js';
 
 // ── Attribute-value coverage allowlist ──────────────────────────────────────
 // The node/mark completeness contract guarantees every TYPE is generated, but
@@ -122,8 +123,7 @@ vi.setConfig({ testTimeout: 30000 });
 // OOMs the worker).
 // An unset/empty/non-numeric value falls back to the default; an explicit 0 is
 // honored (a valid fast-check seed) — `Number(x) || default` would swallow it.
-const envInt = (v: string | undefined, dflt: number): number =>
-  v !== undefined && v !== '' && Number.isFinite(Number(v)) ? Number(v) : dflt;
+// The parser is shared with the nested suite (env-int.ts) and unit-tested there.
 const SEED = envInt(process.env.PROPERTY_SEED, 20250705);
 const NUM_RUNS = envInt(process.env.PROPERTY_NUM_RUNS, 300);
 
