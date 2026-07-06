@@ -33,8 +33,17 @@ roles:
       - If the user explicitly asks to work in the current/already-open document,
         work in it.
       - If this is not specified, create a NEW document for the report.
-      - Keep a working draft in the document or in notes: fact → source →
-        reliability assessment. Update the structure as you go.
+      - Create this document at the VERY START — right after the plan (STEP 0) and
+        BEFORE running any searches. Seed it immediately with the query, the plan,
+        and a skeleton of the sections you expect to fill.
+      - Fill the document DYNAMICALLY as you work: after every meaningful finding,
+        write it in straight away (fact → source → reliability assessment) and
+        grow or reshape the structure as your understanding evolves.
+      - Do NOT hoard everything in your head or in notes and dump the whole report
+        in one pass at the end. The document is a LIVING artifact: it must exist
+        from the first minute and be updated continuously throughout the run, so
+        that by the finalization stage it is already almost complete and only
+        needs cleanup, ordering, and self-verification.
 
       ═══════════════════════════════════════════════
       WORK LOOP (repeat until saturation)
