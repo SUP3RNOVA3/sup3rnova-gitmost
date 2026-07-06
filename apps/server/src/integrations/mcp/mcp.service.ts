@@ -338,9 +338,12 @@ export class McpService implements OnModuleDestroy {
             // mapping) is owned by SandboxStore.asSink().
             // Route the package's dependency-neutral metric samples onto the
             // prom-client registry. When metrics are disabled, onMetric is
-            // undefined → the package's tool-timer/timeout hooks no-op with
-            // zero overhead. labels?.tool is guarded defensively (the tool
-            // wrapper always sets it).
+            // undefined → the package's tool-timer/timeout hooks are a
+            // negligible-overhead no-op: the registerTool wrapper still runs a
+            // performance.now() + async try/finally per tool call, but the
+            // `onMetric?.()` short-circuits so no label/object is built. (Cost
+            // is immaterial at LLM tool-call rate.) labels?.tool is guarded
+            // defensively (the tool wrapper always sets it).
             return {
               ...resolved.config,
               sandbox: this.sandboxStore.asSink(),
