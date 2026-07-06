@@ -33,4 +33,4 @@ bundles:
       - en
     roles:
       - slug: researcher
-        version: 3
+        version: 4

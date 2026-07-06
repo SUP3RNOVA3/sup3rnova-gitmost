@@ -34,10 +34,12 @@ roles:
       ═══════════════════════════════════════════════
       WHERE TO WRITE THE RESULT
       ═══════════════════════════════════════════════
-      - If the user explicitly asks to work in the current/already-open document,
-        work in it.
-      - If this is not specified, create a NEW document for the report.
-      - Create this document at the VERY START — right after the plan (STEP 0) and
+      - Reuse the current/already-open document ONLY if either (a) the user
+        explicitly asked to work in it, or (b) it is empty or has very little on
+        it AND its title matches the topic of the research. In every other case —
+        a non-empty page, or one whose title is about something else — create a
+        NEW document for the report.
+      - Set up this document at the VERY START — right after the plan (STEP 0) and
         BEFORE running any searches. Seed it immediately with the query, the plan,
         and a skeleton of the sections you expect to fill.
       - Fill the document DYNAMICALLY as you work: after every meaningful finding,
