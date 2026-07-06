@@ -120,6 +120,11 @@ interface AttrPolicy {
 const num = (...xs: number[]) => fc.constantFrom(...xs);
 const str = (...xs: string[]) => fc.constantFrom(...xs);
 const widthStr = str('120', '320', '640');
+// Media `aspectRatio`/`size` are stringified numerics too (converter emits
+// String(value)); the schema parseHTML reads them back as strings. Fuzz as
+// plausible numeric strings so they round-trip byte-stably like widthStr.
+const aspectRatioStr = str('1.5', '0.75', '1');
+const sizeStr = str('320', '640');
 
 // The documented override table, keyed `type.attr`. Every entry is grounded in
 // the empirical converter probe (see flat-roundtrip.property.test.ts header).
@@ -149,16 +154,57 @@ const OVERRIDES: Record<string, AttrPolicy> = {
   'image.title': { arb: letterPhraseArb },
   'image.width': { arb: widthStr, degen: '' },
   'image.height': { arb: widthStr, degen: '' },
+  // #351 (this PR): media sizing/family attrs ride in the `<!--img {…}-->`
+  // comment JSON via String(value); parseHTML reads them back as strings, so a
+  // numeric string round-trips byte-stably (mirrors image.width).
+  'image.size': { arb: sizeStr, degen: '' },
+  'image.aspectRatio': { arb: aspectRatioStr },
+  // caption is text carried verbatim in the comment JSON (mirrors image.alt).
+  'image.caption': { arb: letterPhraseArb, degen: '' },
   'video.src': { noDefault: true, arb: urlArb, degen: '' },
   'video.alt': { arb: letterPhraseArb },
   'video.width': { arb: widthStr },
   'video.height': { arb: widthStr },
+  // #351 (this PR): video sizing/align ride in the `<!--video {…}-->` comment.
+  'video.size': { arb: sizeStr },
+  'video.aspectRatio': { arb: aspectRatioStr },
+  // align default "center" is dropped on export; fuzz non-center only.
+  'video.align': { arb: str('left', 'right') },
   'audio.src': { noDefault: true, arb: urlArb, degen: '' },
   'youtube.src': { noDefault: true, arb: urlArb },
+  // #351 (this PR): youtube width/height/align ride in the `<!--youtube {…}-->`
+  // comment JSON (String()-coerced dimensions, non-center align only).
+  'youtube.width': { arb: widthStr },
+  'youtube.height': { arb: widthStr },
+  'youtube.align': { arb: str('left', 'right') },
   'pdf.src': { noDefault: true, arb: urlArb },
   'pdf.name': { arb: phraseArb },
+  // #351 (this PR): pdf size/width/height ride in the `<!--pdf {…}-->` comment
+  // (String()-coerced dimensions, read back as strings).
+  'pdf.size': { arb: sizeStr },
+  'pdf.width': { arb: widthStr },
+  'pdf.height': { arb: widthStr },
   'drawio.src': { noDefault: true, arb: urlArb },
+  // #351 (this PR): drawio family attrs ride in the `<!--drawio {…}-->` comment.
+  // Dimensions/size/aspectRatio are String()-coerced numeric strings; title/alt
+  // are text carried verbatim; align fuzzed non-center only.
+  'drawio.width': { arb: widthStr },
+  'drawio.height': { arb: widthStr },
+  'drawio.size': { arb: sizeStr },
+  'drawio.aspectRatio': { arb: aspectRatioStr },
+  'drawio.align': { arb: str('left', 'right') },
+  'drawio.title': { arb: letterPhraseArb },
+  'drawio.alt': { arb: letterPhraseArb },
   'excalidraw.src': { noDefault: true, arb: urlArb },
+  // #351 (this PR): excalidraw family attrs ride in the `<!--excalidraw {…}-->`
+  // comment (same shape as the drawio family above).
+  'excalidraw.width': { arb: widthStr },
+  'excalidraw.height': { arb: widthStr },
+  'excalidraw.size': { arb: sizeStr },
+  'excalidraw.aspectRatio': { arb: aspectRatioStr },
+  'excalidraw.align': { arb: str('left', 'right') },
+  'excalidraw.title': { arb: letterPhraseArb },
+  'excalidraw.alt': { arb: letterPhraseArb },
   'attachment.url': { noDefault: true, arb: urlArb },
   'attachment.name': { arb: phraseArb },
   // ── callout / status ─────────────────────────────────────────────────────
@@ -201,8 +247,19 @@ const OVERRIDES: Record<string, AttrPolicy> = {
   // ── embed (schema keeps width/height NUMERIC, not string-coerced) ─────────
   'embed.src': { noDefault: true, arb: urlArb, degen: '' },
   'embed.provider': { noDefault: true, arb: str('iframe', 'youtube', 'vimeo') },
-  'embed.width': { always: true, frozen: true },
-  'embed.height': { always: true, frozen: true },
+  // #351 (this PR): the embed schema defaults width/height to the NUMBERS 800/600
+  // and the converter only emits them when they differ. But the value round-trips
+  // as a STRING: export stringifies into the comment JSON (String(width)) and the
+  // import path (embedToHtml -> data-width -> embed parseHTML) reads it back as a
+  // string, so an authored NUMBER 400 would diverge under P1 (400 vs "400"). Fuzz
+  // as numeric STRINGS avoiding "800"/"600" so they round-trip byte-stably. The
+  // 800/600 numeric default state still round-trips (omitted on export, re-
+  // materialized as the numeric default). `always` stays because these are
+  // materialized on import but absent from canonicalize's KNOWN_DEFAULTS.
+  'embed.width': { always: true, arb: str('400', '1000', '1200') },
+  'embed.height': { always: true, arb: str('300', '500', '900') },
+  // align default "center" is dropped on export; fuzz non-center only.
+  'embed.align': { arb: str('left', 'right') },
   // ── subpages / math / htmlEmbed ──────────────────────────────────────────
   'subpages.recursive': { always: true, arb: fc.constant(true) }, // boolean, default false
   'mathBlock.text': { noDefault: true, arb: str('x^2', 'a < b', '\\frac{1}{2}'), degen: '' },

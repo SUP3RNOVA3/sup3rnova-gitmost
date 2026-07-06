@@ -28,32 +28,32 @@ import {
 // a NEW attribute (or a newly-frozen one) that lands in this bucket flips the
 // snapshot test red and forces a reviewer to classify it. Each belongs to one of:
 //   - internal/opaque ids & placeholders (attachmentId, slugId, placeholder,
-//     creatorId, anchorId) — no meaningful non-default to assert;
-//   - dimensions/among the media family with no standalone md form here
-//     (aspectRatio, size, caption, drawio/excalidraw/pdf/video/youtube w/h/align)
-//     — round-trip candidates deferred to a later PR, not silently dropped;
+//     creatorId, anchorId, mime) — no meaningful non-default to assert. These stay
+//     frozen: their value is an opaque token carried verbatim, not a round-trip
+//     shape worth fuzzing;
 //   - ACCEPTED limitations with no md representation (indent, callout.icon,
 //     orderedList.type, table spans/bg/colwidth).
+// The media dimension/family attrs (image/video/youtube/drawio/excalidraw/pdf/
+// embed width/height/align/size/aspectRatio/caption/title/alt) that were
+// previously "deferred to a later PR" are IMPLEMENTED (value-fuzzed) in THIS PR
+// via the OVERRIDES table in attr-arbitraries.ts — they ride in the discriminator
+// comment JSON and round-trip byte-stably, so they are no longer allowlisted.
 const ATTR_VALUE_FUZZ_ALLOWLIST = new Set<string>([
   'attachment.attachmentId', 'attachment.mime', 'attachment.placeholder', 'attachment.size',
   'audio.attachmentId', 'audio.placeholder', 'audio.size',
   'callout.icon',
-  'drawio.align', 'drawio.alt', 'drawio.aspectRatio', 'drawio.attachmentId',
-  'drawio.height', 'drawio.size', 'drawio.title', 'drawio.width',
-  'embed.align', 'embed.height', 'embed.width',
-  'excalidraw.align', 'excalidraw.alt', 'excalidraw.aspectRatio', 'excalidraw.attachmentId',
-  'excalidraw.height', 'excalidraw.size', 'excalidraw.title', 'excalidraw.width',
+  'drawio.attachmentId',
+  'excalidraw.attachmentId',
   'heading.indent',
-  'image.aspectRatio', 'image.attachmentId', 'image.caption', 'image.placeholder', 'image.size',
+  'image.attachmentId', 'image.placeholder',
   'mention.anchorId', 'mention.creatorId', 'mention.slugId',
   'orderedList.type', 'paragraph.indent',
-  'pdf.attachmentId', 'pdf.height', 'pdf.placeholder', 'pdf.size', 'pdf.width',
+  'pdf.attachmentId', 'pdf.placeholder',
   'tableCell.backgroundColor', 'tableCell.backgroundColorName', 'tableCell.colspan',
   'tableCell.colwidth', 'tableCell.rowspan',
   'tableHeader.backgroundColor', 'tableHeader.backgroundColorName', 'tableHeader.colspan',
   'tableHeader.colwidth', 'tableHeader.rowspan',
-  'video.align', 'video.aspectRatio', 'video.attachmentId', 'video.placeholder', 'video.size',
-  'youtube.align', 'youtube.height', 'youtube.width',
+  'video.attachmentId', 'video.placeholder',
 ]);
 
 // ── MARK attribute-value coverage ───────────────────────────────────────────
