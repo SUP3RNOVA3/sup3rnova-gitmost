@@ -156,8 +156,13 @@ export interface BuildSystemPromptInput {
    * has an id, a CONTEXT line is added so the agent can resolve "this page" /
    * "the current page" to that pageId. The page is NOT fetched here — the agent
    * uses its CASL-enforced read/write page tools with the id when needed.
+   *
+   * `selection` (#388) is present only when the user has a non-empty editor
+   * selection; the prompt adds ONLY a fixed one-line flag from it — the
+   * selection TEXT is untrusted page content and stays out of the prompt (it is
+   * surfaced solely via the getCurrentPage tool result).
    */
-  openedPage?: { id?: string; title?: string } | null;
+  openedPage?: { id?: string; title?: string; selection?: object | null } | null;
   /**
    * Admin-authored, per-EXTERNAL-MCP-server guidance ("how/when to use this
    * server's tools"), built by `McpClientsService.toolsFor` for servers that
@@ -309,6 +314,14 @@ export function buildSystemPrompt({
         ? escapeAttr(openedPage.title)
         : 'Untitled';
     context += `\nThe user is currently viewing the page "${title}" (pageId: ${pageId.trim()}). When they refer to "this page", "the current page", or similar, operate on that pageId — use the read/write page tools with it.`;
+    // Editor-selection flag (#388). A FIXED one-liner only — the selection TEXT
+    // is untrusted collaborative-page content and must never enter the prompt; it
+    // is surfaced solely through the getCurrentPage tool result (SAFETY_FRAMEWORK
+    // treats a tool result as data). Nested under the page block so it is added
+    // only alongside a resolved page (a selection cannot outlive its page).
+    if (openedPage?.selection) {
+      context += `\nThe user currently has text SELECTED on this page — call getCurrentPage to see the selection. When they say "this", "here", "the selected text" or similar, they mean that selection.`;
+    }
   }
 
   // Interrupt-resume marker (#198). Added to the context section (inside the

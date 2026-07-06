@@ -98,7 +98,8 @@ export const INLINE_TOOL_TIERS: Record<
   },
   getCurrentPage: {
     tier: 'core',
-    catalogLine: 'getCurrentPage — the page the user is currently viewing.',
+    catalogLine:
+      'getCurrentPage — the page the user is currently viewing and their current text selection on it.',
   },
   // NOTE: getPage and listPages moved to @docmost/mcp's SHARED_TOOL_SPECS
   // (#294); they carry their own tier ('core') + catalogLine there.

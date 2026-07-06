@@ -200,6 +200,74 @@ describe("ChatThread — send now (#198)", () => {
   });
 });
 
+// #388: the editor selection is snapshotted at send time and nested inside
+// openPage on the wire. The getter is read live from a ref, so each send ships a
+// fresh snapshot.
+describe("ChatThread — editor selection wiring (#388)", () => {
+  beforeEach(resetState);
+  afterEach(cleanup);
+
+  function renderWithSelection(props: {
+    openPage?: { id: string; title: string } | null;
+    getEditorSelection?: () => unknown;
+  }) {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MantineProvider>
+          <ChatThread
+            chatId="c1"
+            initialRows={[]}
+            openPage={props.openPage as never}
+            getEditorSelection={props.getEditorSelection as never}
+            onTurnFinished={vi.fn()}
+            onResumeFallback={vi.fn()}
+            onServerStop={vi.fn()}
+          />
+        </MantineProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("nests the snapshot from the getter into openPage.selection at send time", () => {
+    const selection = { text: "fix this", blockIds: ["b1"], before: "a " };
+    renderWithSelection({
+      openPage: { id: "p1", title: "Doc" },
+      getEditorSelection: () => selection,
+    });
+    const prep = h.state.transport!.prepareSendMessagesRequest!;
+    const openPage = prep({ messages: [], body: {} }).body.openPage as Record<
+      string,
+      unknown
+    >;
+    expect(openPage).toEqual({ id: "p1", title: "Doc", selection });
+  });
+
+  it("sends selection: null when the getter returns null", () => {
+    renderWithSelection({
+      openPage: { id: "p1", title: "Doc" },
+      getEditorSelection: () => null,
+    });
+    const prep = h.state.transport!.prepareSendMessagesRequest!;
+    const openPage = prep({ messages: [], body: {} }).body.openPage as Record<
+      string,
+      unknown
+    >;
+    expect(openPage).toEqual({ id: "p1", title: "Doc", selection: null });
+  });
+
+  it("does not send selection at all on a non-page route (openPage null)", () => {
+    const getter = vi.fn(() => ({ text: "sel" }));
+    renderWithSelection({ openPage: null, getEditorSelection: getter });
+    const prep = h.state.transport!.prepareSendMessagesRequest!;
+    expect(prep({ messages: [], body: {} }).body.openPage).toBeNull();
+    // The getter must not even be consulted when there is no page.
+    expect(getter).not.toHaveBeenCalled();
+  });
+});
+
 describe("ChatThread — turn-end decision (onFinish)", () => {
   beforeEach(resetState);
 

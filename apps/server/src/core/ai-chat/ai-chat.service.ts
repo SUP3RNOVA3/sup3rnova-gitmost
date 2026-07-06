@@ -43,6 +43,10 @@ import {
 } from './tools/tool-tiers';
 import { RunAlreadyActiveError } from './ai-chat-run.service';
 import { computePageChange } from './page-change/page-change.util';
+import {
+  sanitizeSelection,
+  type SelectionContext,
+} from './tools/current-page.util';
 import { roleModelOverride } from './roles/role-model-config';
 import {
   startSseHeartbeat,
@@ -189,7 +193,12 @@ export interface AiChatStreamBody {
   // page" refers to; the page itself is never fetched server-side here. The id
   // is attacker-controllable but harmless: the agent reads/writes via its
   // CASL-enforced page tools, which 403 on a page the user cannot access.
-  openPage?: { id?: string; title?: string } | null;
+  //
+  // `selection` is the user's editor selection snapshotted client-side at send
+  // time (#388). It is CLIENT-controlled and UNTRUSTED — a loose `unknown` here
+  // (the body is parsed off req.body without a DTO) that is type-checked and
+  // capped by `sanitizeSelection` before it is ever surfaced to the model.
+  openPage?: { id?: string; title?: string; selection?: unknown } | null;
   // Set by the client "send now" action (#198): this turn immediately follows a
   // user interruption of the previous turn. A hint only — the server re-confirms
   // it against persisted history (`isInterruptResume`) before injecting the
@@ -365,10 +374,18 @@ export class AiChatService implements OnModuleInit {
    * page, or any non-Forbidden access-check fault, returns null.
    */
   private async resolveOpenPageContext(
-    openPage: { id?: string; title?: string } | null | undefined,
+    openPage:
+      | { id?: string; title?: string; selection?: unknown }
+      | null
+      | undefined,
     workspace: Workspace,
     user: User,
-  ): Promise<{ id: string; title: string; updatedAt: Date } | null> {
+  ): Promise<{
+    id: string;
+    title: string;
+    updatedAt: Date;
+    selection: SelectionContext | null;
+  } | null> {
     const candidatePageId = openPage?.id;
     if (!candidatePageId) return null;
     const page = await this.pageRepo.findById(candidatePageId);
@@ -390,7 +407,18 @@ export class AiChatService implements OnModuleInit {
     // updatedAt is the page's last-modified instant, used by the #274 per-turn
     // page-change detection as a cheap fast path (unchanged instant => skip the
     // render + diff). The system-prompt / tool consumers ignore the extra field.
-    return { id: page.id, title: page.title ?? '', updatedAt: page.updatedAt };
+    //
+    // The sanitized editor selection (#388) is attached ONLY here, on a
+    // successful page resolve: the fail-closed branches above return null for the
+    // WHOLE context, so a selection can never outlive a foreign/missing/deleted
+    // page (decision 3). Downstream consumers that don't care (detectPageChange,
+    // snapshotOpenPage) ignore the extra field, same as updatedAt.
+    return {
+      id: page.id,
+      title: page.title ?? '',
+      updatedAt: page.updatedAt,
+      selection: sanitizeSelection(openPage?.selection),
+    };
   }
 
   /**

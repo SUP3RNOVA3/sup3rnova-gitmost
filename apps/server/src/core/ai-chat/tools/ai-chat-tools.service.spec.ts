@@ -651,3 +651,69 @@ describe('AiChatToolsService #294 changed execute wirings', () => {
     expect(calls.tableUpdateCell).toEqual([['p1', '#0', 1, 2, 'x']]);
   });
 });
+
+/**
+ * getCurrentPage selection contract (#388): the tool surfaces the selection that
+ * was sanitized + nested onto the resolved open-page context (last forUser arg).
+ * No page => selection is null. The tool never fetches or verifies anything — it
+ * just projects the resolved context.
+ */
+describe('AiChatToolsService getCurrentPage selection (#388)', () => {
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return {} as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+    );
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = (openedPage: unknown) =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+      openedPage as never,
+    );
+
+  it('returns the nested selection from the resolved context', async () => {
+    const selection = { text: 'fix this', blockIds: ['b1'], before: 'a ' };
+    const tools = await buildTools({ id: 'p1', title: 'Doc', selection });
+    expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
+      { page: { id: 'p1', title: 'Doc' }, selection },
+    );
+  });
+
+  it('returns selection: null when the context has no selection', async () => {
+    const tools = await buildTools({ id: 'p1', title: 'Doc' });
+    expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
+      { page: { id: 'p1', title: 'Doc' }, selection: null },
+    );
+  });
+
+  it('returns { page: null, selection: null } when no page is open', async () => {
+    const tools = await buildTools(null);
+    expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
+      { page: null, selection: null },
+    );
+  });
+});
