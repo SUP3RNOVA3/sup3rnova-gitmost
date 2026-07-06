@@ -1,4 +1,13 @@
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, Logger } from '@nestjs/common';
+// Mock ONLY streamText so a driven stream() call can capture the pipe-options
+// object (consumeSseStream / generateMessageId). Everything else in the AI SDK
+// stays REAL (requireActual), so the pure-helper suites in this file are
+// unaffected — none of them call stream()/streamText.
+jest.mock('ai', () => ({
+  ...jest.requireActual('ai'),
+  streamText: jest.fn(),
+}));
+import { streamText } from 'ai';
 import {
   AiChatService,
   compactToolOutput,
@@ -1057,5 +1066,183 @@ describe('isInterruptResume', () => {
 
   it('false when there is no preceding turn (only the new user row)', () => {
     expect(isInterruptResume(withPrev(null), true)).toBe(false);
+  });
+});
+
+/**
+ * #184 phase 1.5 — the run-wrapped pipe options (unit). Drives stream() to the
+ * pipe call with streamText mocked, capturing the options object, and asserts:
+ *  - flag OFF while a runId IS present -> the LEGACY option shape (no
+ *    consumeSseStream, no generateMessageId), and the registry is never touched.
+ *    This is the exact dormancy guarantee this PR rests on.
+ *  - flag ON + runId -> consumeSseStream tees into the registry and
+ *    generateMessageId returns the seeded assistant DB row id.
+ *  - flag ON but no runHooks (runId undefined) -> legacy (the runId gate).
+ *  - flag ON + runId -> the outer catch releases the entry via abortEntry.
+ */
+describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () => {
+  const streamTextMock = streamText as unknown as jest.Mock;
+  let pipeMock: jest.Mock;
+
+  beforeEach(() => {
+    streamTextMock.mockReset();
+    pipeMock = jest.fn();
+    streamTextMock.mockReturnValue({
+      consumeStream: jest.fn(),
+      pipeUIMessageStreamToResponse: pipeMock,
+    });
+    // Silence the service's diagnostic logging for a clean test run.
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined as never);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  // A raw-response stub sufficient for the post-streamText wiring.
+  function makeRes() {
+    return {
+      raw: {
+        writeHead: jest.fn(),
+        write: jest.fn(),
+        once: jest.fn(),
+        on: jest.fn(),
+        flushHeaders: jest.fn(),
+        writableEnded: false,
+        destroyed: false,
+      },
+    };
+  }
+
+  // Wire only the deps reached on the way to the pipe call, plus a spy registry.
+  function makeService(opts: { resumable: boolean }) {
+    const aiChatRepo = {
+      findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
+      insert: jest.fn(),
+    };
+    const aiChatMessageRepo = {
+      // Both the user insert and the assistant seed return the same row id.
+      insert: jest.fn(async () => ({ id: 'msg-1' })),
+      findAllByChat: jest.fn(async () => []),
+      update: jest.fn(async () => ({ id: 'msg-1' })),
+    };
+    const aiSettings = { resolve: jest.fn(async () => ({})) };
+    const tools = { forUser: jest.fn(async () => ({})) };
+    const mcpClients = {
+      toolsFor: jest.fn(async () => ({
+        tools: {},
+        clients: [],
+        outcomes: [],
+        instructions: [],
+      })),
+    };
+    const streamRegistry = {
+      open: jest.fn(),
+      bind: jest.fn(),
+      abortEntry: jest.fn(),
+    };
+    const svc = new AiChatService(
+      {} as never, // ai (model is injected)
+      aiChatRepo as never,
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo
+      aiSettings as never,
+      tools as never,
+      mcpClients as never,
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo (openPage undefined -> never touched)
+      {} as never, // pageAccess
+      {
+        isAiChatDeferredToolsEnabled: () => false,
+        isAiChatResumableStreamEnabled: () => opts.resumable,
+      } as never,
+      streamRegistry as never,
+    );
+    return { svc, streamRegistry };
+  }
+
+  const body = {
+    chatId: 'chat-1',
+    messages: [
+      { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+    ],
+  };
+
+  const makeRunHooks = () => ({
+    begin: jest.fn(async () => ({
+      runId: 'run-1',
+      signal: new AbortController().signal,
+    })),
+    onAssistantSeeded: jest.fn(),
+    onStep: jest.fn(),
+    onSettled: jest.fn(),
+  });
+
+  async function drive(svc: AiChatService, hooks: unknown): Promise<void> {
+    await svc.stream({
+      user: { id: 'u1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 's1',
+      body: body as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      runHooks: hooks as never,
+    });
+  }
+
+  it('flag OFF + runId present: LEGACY option shape (no consumeSseStream / generateMessageId); registry untouched', async () => {
+    const { svc, streamRegistry } = makeService({ resumable: false });
+    await drive(svc, makeRunHooks());
+    expect(pipeMock).toHaveBeenCalledTimes(1);
+    const options = pipeMock.mock.calls[0][1];
+    // The dormancy guarantee: a live run with the flag off tees NOTHING and does
+    // not stamp a message id — byte-for-byte the pre-1.5 wire.
+    expect(options.consumeSseStream).toBeUndefined();
+    expect(options.generateMessageId).toBeUndefined();
+    expect(streamRegistry.bind).not.toHaveBeenCalled();
+    expect(streamRegistry.abortEntry).not.toHaveBeenCalled();
+  });
+
+  it('flag ON + runId: consumeSseStream tees into the registry; generateMessageId returns the seeded row id', async () => {
+    const { svc, streamRegistry } = makeService({ resumable: true });
+    await drive(svc, makeRunHooks());
+    const options = pipeMock.mock.calls[0][1];
+    expect(typeof options.consumeSseStream).toBe('function');
+    expect(typeof options.generateMessageId).toBe('function');
+    // generateMessageId stamps the seeded assistant DB row id.
+    expect(options.generateMessageId()).toBe('msg-1');
+    // consumeSseStream binds the tee: (chatId, runId, assistantId, stream).
+    const fakeStream = {} as ReadableStream<string>;
+    options.consumeSseStream({ stream: fakeStream });
+    expect(streamRegistry.bind).toHaveBeenCalledWith(
+      'chat-1',
+      'run-1',
+      'msg-1',
+      fakeStream,
+    );
+  });
+
+  it('flag ON but NO runHooks (runId undefined): pipe options stay legacy (the runId gate)', async () => {
+    const { svc, streamRegistry } = makeService({ resumable: true });
+    await drive(svc, undefined);
+    const options = pipeMock.mock.calls[0][1];
+    expect(options.consumeSseStream).toBeUndefined();
+    expect(options.generateMessageId).toBeUndefined();
+    expect(streamRegistry.bind).not.toHaveBeenCalled();
+  });
+
+  it('flag ON + runId: the outer catch calls abortEntry when the stream throws', async () => {
+    const { svc, streamRegistry } = makeService({ resumable: true });
+    streamTextMock.mockImplementation(() => {
+      throw new Error('boom');
+    });
+    await expect(drive(svc, makeRunHooks())).rejects.toThrow('boom');
+    expect(streamRegistry.abortEntry).toHaveBeenCalledWith('chat-1', 'run-1');
   });
 });

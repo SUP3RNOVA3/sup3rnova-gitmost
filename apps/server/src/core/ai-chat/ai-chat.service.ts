@@ -32,6 +32,7 @@ import {
 import { AiChatToolsService } from './tools/ai-chat-tools.service';
 import { McpClientsService } from './external-mcp/mcp-clients.service';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
+import { AiChatStreamRegistryService } from './ai-chat-stream-registry.service';
 import { buildSystemPrompt } from './ai-chat.prompt';
 import {
   CORE_TOOL_KEYS,
@@ -276,6 +277,10 @@ export class AiChatService implements OnModuleInit {
     // Reads the AI_CHAT_DEFERRED_TOOLS toggle (#332). Injected last so existing
     // positional constructor callers (tests) only append one stub.
     private readonly environment: EnvironmentService,
+    // #184 phase 1.5 run-stream registry. OPTIONAL so existing positional
+    // constructions (int-specs) compile unchanged; Nest always injects the real
+    // provider in production. Only ever touched on the run-wrapped + flag-on path.
+    private readonly streamRegistry?: AiChatStreamRegistryService,
   ) {}
 
   /**
@@ -1174,6 +1179,35 @@ export class AiChatService implements OnModuleInit {
         // as the cumulative authoritative usage so the client never jumps DOWN.
         let cumulativeStepUsage: ChatStreamUsage | undefined;
         result.pipeUIMessageStreamToResponse(res.raw, {
+          // #184 phase 1.5: run-wrapped mode only — the legacy path (flag off) stays
+          // byte-for-byte identical, including the absence of start.messageId. Both
+          // fields are gated on `runId` (present only for a durable run) AND the
+          // AI_CHAT_RESUMABLE_STREAM flag; the seed `assistantId` is unconditional,
+          // so gating on `assistantId` alone would change the legacy wire.
+          ...(runId && this.environment?.isAiChatResumableStreamEnabled?.()
+            ? {
+                // Tee the SSE frames into the run-stream registry so late tabs can
+                // attach (replay + live tail).
+                consumeSseStream: ({
+                  stream,
+                }: {
+                  stream: ReadableStream<string>;
+                }) =>
+                  this.streamRegistry?.bind(
+                    chatId,
+                    runId!,
+                    assistantId,
+                    stream,
+                  ),
+                // Stamp the persisted assistant row's DB id onto the streamed
+                // message so every tab renders the SAME id as the DB row (id-based
+                // reconciliation). Seeding is best-effort: when it failed, let the
+                // client generate the id.
+                ...(assistantId
+                  ? { generateMessageId: () => assistantId }
+                  : {}),
+              }
+            : {}),
           headers: { 'X-Accel-Buffering': 'no' },
           // Surface the authoritative chatId on the streamed assistant UI message so
           // the client adopts the REAL id of the row we created, instead of guessing
@@ -1239,6 +1273,12 @@ export class AiChatService implements OnModuleInit {
       // finalizeRun (onSettled) is idempotent — a settle here and a settle from a
       // streamText callback collapse to a single terminal write.
       if (runId) {
+        // #184 phase 1.5: a failure here means the tee `done` will never arrive,
+        // so release the registry entry's subscribers explicitly — otherwise an
+        // attached tab hangs forever. Same flag gate as the tee wiring above.
+        if (this.environment?.isAiChatResumableStreamEnabled?.()) {
+          this.streamRegistry?.abortEntry(chatId, runId);
+        }
         await runHooks?.onSettled?.(
           runId,
           'error',
