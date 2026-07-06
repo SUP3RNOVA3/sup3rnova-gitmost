@@ -58,6 +58,15 @@ import {
 // multi-search research questions are not cut off mid-investigation.
 const MAX_AGENT_STEPS = 20;
 
+// Wall-clock ceiling for building the external MCP toolset during the per-turn
+// setup phase (before streamText owns the lifecycle). Defense-in-depth ABOVE the
+// per-server connect bound in mcp-clients.service (CONNECT_TIMEOUT_MS): even if
+// that per-server timeout regressed, this outer deadline — together with the run's
+// abort signal — guarantees the setup phase can never wedge a turn at step 0 (the
+// production hang) and the run always finalizes. Generous: the per-server bound
+// should fire first in practice; this only backstops a total build stall.
+const MCP_TOOLSET_BUILD_DEADLINE_MS = 60_000;
+
 // System-prompt addendum injected ONLY on the final step (see prepareAgentStep).
 // It forbids further tool calls and tells the model to synthesize the best
 // answer it can from what it already gathered, so a tool-heavy turn never ends
@@ -174,6 +183,78 @@ export function sameInstant(
   const tb = new Date(b).getTime();
   if (Number.isNaN(ta) || Number.isNaN(tb)) return false;
   return ta === tb;
+}
+
+/**
+ * Race `work` against an abort signal AND a wall-clock deadline, so a hung
+ * external-MCP toolset build during the pre-streamText setup phase can NEITHER
+ * wedge the turn NOR make it un-stoppable, and the run always finalizes. It
+ *  - resolves with `work`'s value when it settles first;
+ *  - REJECTS EARLY if `signal` aborts (with `signal.reason` when that is an Error,
+ *    else a generic `Error('aborted')`) — so an explicit Stop is honored mid-setup;
+ *  - REJECTS EARLY if `deadlineMs` elapses (defense-in-depth backstop);
+ *  - invokes `onLateResolve(value)` when `work` settles AFTER the race was already
+ *    lost, so the caller can release any resources that abandoned value owns
+ *    (e.g. close leased MCP clients that would otherwise leak their sockets).
+ *
+ * A rejection handler is attached to `work` so a late rejection is never an
+ * unhandledRejection; the timer is unref'd and cleared once the race settles.
+ */
+export function raceAgainstAbortAndTimeout<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+  deadlineMs: number,
+  onLateResolve?: (value: T) => void,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(
+        signal.reason instanceof Error ? signal.reason : new Error('aborted'),
+      );
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(`setup timed out after ${deadlineMs}ms`));
+    }, deadlineMs);
+    // Do not keep the process alive just for this setup-deadline timer.
+    timer.unref?.();
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    work.then(
+      (value) => {
+        if (settled) {
+          // The race was already lost (abort/deadline): hand the abandoned value to
+          // the caller so it can release the resources that value owns.
+          onLateResolve?.(value);
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (err: unknown) => {
+        // A late rejection after the race is already handled — swallow so it is
+        // never an unhandledRejection.
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
 }
 
 /**
@@ -704,10 +785,40 @@ export class AiChatService implements OnModuleInit {
         instructions: [],
       };
       try {
-        external = await this.mcpClients.toolsFor(workspace.id);
+        // Bound the external-MCP toolset build by BOTH the run's abort signal and
+        // a generous wall-clock deadline. This is the pre-streamText setup phase,
+        // which streamText's terminal callbacks do NOT yet govern — so without this
+        // a hung build would hang the turn at step 0 forever (the production hang),
+        // unobservant of an explicit Stop. The deadline is defense-in-depth ABOVE
+        // the per-server connect bound in mcp-clients.service. On a LATE resolve
+        // (the race was already lost) close the abandoned toolset's leased clients
+        // so their transports are not leaked.
+        external = await raceAgainstAbortAndTimeout(
+          this.mcpClients.toolsFor(workspace.id),
+          effectiveSignal,
+          MCP_TOOLSET_BUILD_DEADLINE_MS,
+          (late) => {
+            void Promise.all(
+              late.clients.map((c) => c.close().catch(() => undefined)),
+            );
+          },
+        );
       } catch (err) {
-        // Building the external toolset must never break the turn; proceed with
-        // Docmost-only tools. Never log URLs/headers — short message only.
+        // An explicit Stop reached the RUN's signal DURING setup: re-throw so the
+        // outer catch finalizes the run as aborted — never swallow a Stop. Gated on
+        // `runId`: the re-throw exists ONLY to finalize the run, which exists only
+        // in autonomous mode. On the legacy path (no runId) `effectiveSignal` is the
+        // SOCKET signal (it aborts on a client disconnect); re-throwing there would
+        // change prior behavior and make the controller write JSON to an already-
+        // closed socket (it only attaches res.raw.on('error') in autonomous mode).
+        // So legacy keeps its prior behavior — warn + proceed, and streamText then
+        // observes the aborted socket signal.
+        if (runId && effectiveSignal.aborted) {
+          throw err;
+        }
+        // Otherwise a down/slow server (build timeout or other fault) must never
+        // break the turn: proceed with Docmost-only tools. Never log URLs/headers —
+        // short message only.
         this.logger.warn(
           `External MCP toolset unavailable: ${
             err instanceof Error ? err.message : 'unknown error'
@@ -1307,12 +1418,19 @@ export class AiChatService implements OnModuleInit {
         if (this.environment?.isAiChatResumableStreamEnabled?.()) {
           this.streamRegistry?.abortEntry(chatId, runId);
         }
+        // Distinguish an explicit Stop (the run's signal aborted during setup) from
+        // a real failure, so the run settles with the correct terminal status
+        // instead of always 'error'. onSettled/finalizeRun is idempotent, so this
+        // is safe even if a streamText callback also settles the run.
+        const settleStatus = effectiveSignal.aborted ? 'aborted' : 'error';
         await runHooks?.onSettled?.(
           runId,
-          'error',
-          err instanceof Error
-            ? err.message
-            : 'Agent run failed before streaming started',
+          settleStatus,
+          settleStatus === 'aborted'
+            ? undefined
+            : err instanceof Error
+              ? err.message
+              : 'Agent run failed before streaming started',
         );
       }
       throw err;

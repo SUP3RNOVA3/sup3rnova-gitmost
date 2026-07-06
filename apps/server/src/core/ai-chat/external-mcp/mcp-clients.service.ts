@@ -195,7 +195,7 @@ export class McpClientsService {
   ): Promise<{ ok: true; tools: string[] } | { ok: false; error: string }> {
     let client: McpClient | undefined;
     try {
-      client = await this.connect(server);
+      client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
       const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
       return { ok: true, tools: Object.keys(raw) };
     } catch (err) {
@@ -256,10 +256,18 @@ export class McpClientsService {
     const instructions: McpServerInstruction[] = [];
 
     for (const server of servers) {
+      // Track the connected client OUTSIDE the try so the catch can close it when
+      // it was obtained but not yet registered in `clients` (e.g. tools() threw or
+      // timed out after a successful connect). `registered` flips only once the
+      // client is owned by `clients` (closed at entry teardown), so the catch never
+      // double-closes a registered client.
+      let client: McpClient | undefined;
+      let registered = false;
       try {
-        const client = await this.connect(server);
+        client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
         const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
         clients.push(client);
+        registered = true;
         const allow = server.toolAllowlist;
         const picked =
           Array.isArray(allow) && allow.length > 0 ? pick(raw, allow) : raw;
@@ -290,9 +298,15 @@ export class McpClientsService {
           });
         }
       } catch (err) {
-        // A failed server is skipped — the turn proceeds with the rest. Log a
-        // short warning (never the URL/headers) so ops can see degradation, and
-        // record the outcome so the UI can show "tool X unavailable".
+        // A failed server is skipped — the turn proceeds with the rest. If connect
+        // returned a live client but a later step (tools()) threw, that client was
+        // never registered in `clients`, so close it here or its transport/socket
+        // leaks (compounding every 60s cache rebuild during a flaky-server outage).
+        if (client && !registered) {
+          void client.close().catch(() => undefined);
+        }
+        // Log a short warning (never the URL/headers) so ops can see degradation,
+        // and record the outcome so the UI can show "tool X unavailable".
         const reason = shortError(err);
         this.logger.warn(
           `External MCP server "${server.name}" unavailable: ${reason}`,
@@ -381,6 +395,55 @@ export class McpClientsService {
       },
     })) as unknown as McpClient;
     return client;
+  }
+
+  /**
+   * Race {@link connect} against a SETTLING timeout so a hung MCP handshake can
+   * never POISON the per-workspace build cache. `createMCPClient` (inside connect)
+   * is NOT bounded internally, and — exactly like @ai-sdk/mcp's tool calls
+   * (see wrapToolWithCallTimeout) — its promise does NOT settle on abort. So a
+   * transient network blip mid-handshake can make connect hang FOREVER. Because
+   * getOrBuildEntry caches the build PROMISE, a never-settling connect would then
+   * wedge EVERY later turn for the workspace (each awaits the same pending build,
+   * step_count stuck at 0, run row leaks 'running', chat 409s forever). Bounding
+   * connect here guarantees buildEntry always gets a client OR a rejection within
+   * `ms` — so the build completes (bad server skipped) and the cache stays clean.
+   *
+   * If connect resolves LATE (after we already rejected on the timeout), we close
+   * the orphaned client so its transport/socket is not leaked.
+   */
+  private connectWithTimeout(
+    server: Pick<AiMcpServer, 'transport' | 'url' | 'headersEnc'>,
+    ms: number,
+  ): Promise<McpClient> {
+    return new Promise<McpClient>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        reject(new Error(`MCP connect timed out after ${ms}ms`));
+      }, ms);
+      // Do not keep the process alive just for this connect-timeout timer.
+      timer.unref?.();
+      this.connect(server).then(
+        (client) => {
+          if (settled) {
+            // The race was already lost to the timeout: close the orphaned client
+            // so its socket is not leaked, and drop the late result.
+            void client.close().catch(() => undefined);
+            return;
+          }
+          clearTimeout(timer);
+          settled = true;
+          resolve(client);
+        },
+        (err: unknown) => {
+          if (settled) return; // late rejection after the timeout — already handled
+          clearTimeout(timer);
+          settled = true;
+          reject(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+    });
   }
 
   /**
