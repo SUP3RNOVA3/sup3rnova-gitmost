@@ -13,7 +13,10 @@ import {
   type DocmostClientLike,
   type SharedToolSpec,
 } from './docmost-client.loader';
-import { resolveCurrentPageResult } from './current-page.util';
+import {
+  resolveCurrentPageResult,
+  type SelectionContext,
+} from './current-page.util';
 import { parseNodeArg } from './parse-node-arg';
 import { modelFriendlyInput } from './model-friendly-input';
 import { SandboxStore } from '../../../integrations/sandbox/sandbox.store';
@@ -153,8 +156,13 @@ export class AiChatToolsService {
     // The page the user currently has open (from the request context), exposed
     // to the model via getCurrentPage. Optional and last so existing callers
     // keep compiling. Kept proxy-robust: the model can CALL for the current
-    // page instead of relying on it surviving in the system prompt text.
-    openedPage?: { id?: string; title?: string } | null,
+    // page instead of relying on it surviving in the system prompt text. The
+    // `selection` (#388) is already sanitized + nested by resolveOpenPageContext.
+    openedPage?: {
+      id?: string;
+      title?: string;
+      selection?: SelectionContext | null;
+    } | null,
   ): Promise<Record<string, Tool>> {
     // Build the per-user loopback client (carrying the access + collab
     // provenance tokens) and load the shared tool-spec registry. Client
@@ -309,9 +317,15 @@ export class AiChatToolsService {
       getCurrentPage: tool({
         description:
           'Return the page the user is currently viewing — i.e. what "this page", ' +
-          '"the current page", or "here" refers to. Returns the page id and title, ' +
-          'or null if the user is not currently on a page. Call this first whenever ' +
-          'the user refers to the current page without giving an explicit id.',
+          '"the current page", or "here" refers to — plus the text the user ' +
+          'currently has SELECTED on that page (what "this", "here", "the selected ' +
+          'fragment" refers to), or selection: null when nothing is selected. The ' +
+          'selection is a client-side snapshot taken when the user sent the message ' +
+          'and includes the ids of the blocks it covers plus surrounding context; ' +
+          'it is NOT verified server-side — locate it in the page (searchInPage / ' +
+          'getNode) before editing. Returns page: null if the user is not currently ' +
+          'on a page. Call this first whenever the user refers to the current page ' +
+          'or a selected fragment without giving an explicit id.',
         inputSchema: modelFriendlyInput({}),
         execute: async () => resolveCurrentPageResult(openedPage),
       }),

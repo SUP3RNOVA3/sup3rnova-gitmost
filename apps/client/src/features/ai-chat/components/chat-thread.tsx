@@ -33,6 +33,7 @@ import {
   mergeById,
 } from "@/features/ai-chat/utils/resume-helpers.ts";
 import { AI_CHAT_MESSAGES_RQ_KEY } from "@/features/ai-chat/queries/ai-chat-query.ts";
+import type { EditorSelectionContext } from "@/features/editor/utils/get-editor-selection.ts";
 import {
   dequeue,
   enqueueMessage,
@@ -69,6 +70,10 @@ interface ChatThreadProps {
   /** The page currently open in the workspace, or null on a non-page route.
    *  Sent with each turn so the agent knows what "this page" refers to. */
   openPage?: OpenPageContext | null;
+  /** #388: snapshot the user's current editor selection at SEND time. Invoked
+   *  inside prepareSendMessagesRequest and nested into openPage on the wire, so a
+   *  fresh snapshot ships each turn. Null/absent => nothing selected. */
+  getEditorSelection?: () => EditorSelectionContext | null;
   /** The agent role selected for a NEW chat (null = universal assistant). Sent
    *  in the request body so the server persists it on chat creation; ignored by
    *  the server for existing chats (the role is read from the chat row). */
@@ -151,6 +156,7 @@ export default function ChatThread({
   threadKey,
   initialRows,
   openPage,
+  getEditorSelection,
   roleId,
   roles,
   onRolePicked,
@@ -225,6 +231,14 @@ export default function ChatThread({
   // the `chatStoreId` note below). Read live inside `prepareSendMessagesRequest`.
   const openPageRef = useRef<OpenPageContext | null>(openPage ?? null);
   openPageRef.current = openPage ?? null;
+
+  // Keep the selection snapshotter in a ref, same rationale as openPageRef: the
+  // transport useMemo([]) closes it over, so prop-identity churn must not matter.
+  // Called at send time inside prepareSendMessagesRequest (#388).
+  const getEditorSelectionRef = useRef<
+    (() => EditorSelectionContext | null) | undefined
+  >(getEditorSelection);
+  getEditorSelectionRef.current = getEditorSelection;
 
   // Keep the selected role id in a ref, same rationale as openPageRef. Only the
   // FIRST request of a brand-new chat uses it (the server persists it then and
@@ -388,7 +402,16 @@ export default function ChatThread({
             body: {
               ...body,
               chatId: chatIdRef.current,
-              openPage: openPageRef.current,
+              // Attach the live editor selection to the open-page context at send
+              // time — "this"/"here" in the user's message means THIS selection.
+              // Nested inside openPage so it dies with the page when the server
+              // rejects the page id (#388). Null when nothing is selected.
+              openPage: openPageRef.current
+                ? {
+                    ...openPageRef.current,
+                    selection: getEditorSelectionRef.current?.() ?? null,
+                  }
+                : null,
               // Honoured by the server only when creating a new chat; null =>
               // universal assistant.
               roleId: roleIdRef.current,

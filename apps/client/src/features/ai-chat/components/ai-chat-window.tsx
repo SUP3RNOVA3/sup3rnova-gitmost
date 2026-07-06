@@ -37,6 +37,14 @@ import {
   mobileSidebarAtom,
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import {
+  pageEditorAtom,
+  readOnlyEditorAtom,
+} from "@/features/editor/atoms/editor-atoms.ts";
+import {
+  getEditorSelectionContext,
+  type EditorSelectionContext,
+} from "@/features/editor/utils/get-editor-selection.ts";
 import { extractPageSlugId } from "@/lib";
 import {
   AI_CHATS_RQ_KEY,
@@ -313,6 +321,27 @@ export default function AiChatWindow() {
   const openPage = openPageData
     ? { id: openPageData.id, title: openPageData.title }
     : null;
+
+  // Live editor handles for the selection snapshot (#388). Both are published by
+  // the page editor; the read-only editor is used in read mode. Reading the
+  // selection off `editor.state` stays valid after the editor blurs (ProseMirror
+  // keeps state.selection), mirroring the comment button (comment-dialog.tsx).
+  const pageEditor = useAtomValue(pageEditorAtom);
+  const readOnlyEditor = useAtomValue(readOnlyEditorAtom);
+
+  // Snapshot the user's current editor selection at send time. Edit-mode editor
+  // wins; the read-only editor is the fallback (read mode). Null when neither
+  // holds a non-empty selection. Passed to <ChatThread>, which reads it live
+  // from a ref inside prepareSendMessagesRequest — so each turn ships a fresh
+  // snapshot and multi-turn works without recreating the transport.
+  const getEditorSelection = useCallback((): EditorSelectionContext | null => {
+    for (const editor of [pageEditor, readOnlyEditor]) {
+      if (!editor || editor.isDestroyed) continue;
+      const sel = getEditorSelectionContext(editor.state);
+      if (sel) return sel;
+    }
+    return null;
+  }, [pageEditor, readOnlyEditor]);
 
   // The AI-chat thread-identity lifecycle (mount key, both new-chat id adoption
   // paths, the history-loaded latch, the render-phase reconciler) lives in this
@@ -936,6 +965,9 @@ export default function AiChatWindow() {
               chatId={activeChatId}
               initialRows={activeChatId ? messageRows : []}
               openPage={openPage}
+              // #388: live snapshotter for the user's editor selection, read at
+              // send time and nested inside openPage on the wire.
+              getEditorSelection={getEditorSelection}
               // Honoured only for a new chat; null = universal assistant.
               roleId={activeChatId === null ? selectedRoleId : null}
               // Role cards are the new-chat empty-state; offered only when this

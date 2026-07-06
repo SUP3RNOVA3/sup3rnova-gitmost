@@ -698,6 +698,7 @@ describe('AiChatService.resolveOpenPageContext (#159 current-page validation)', 
       id: string;
       title: string;
       updatedAt: Date;
+      selection: unknown;
     } | null>;
 
   it('returns null when no page is open (no id)', async () => {
@@ -743,8 +744,14 @@ describe('AiChatService.resolveOpenPageContext (#159 current-page validation)', 
     });
     // The client claims it is on "Page A" but the id points at page B.
     const result = await call(svc, { id: 'p-1', title: 'Page A' });
-    // updatedAt (#274 page-change fast path) is carried through from the DB row.
-    expect(result).toEqual({ id: 'p-1', title: 'Real Title B', updatedAt });
+    // updatedAt (#274 page-change fast path) is carried through from the DB row;
+    // selection is null when the client sent none (#388).
+    expect(result).toEqual({
+      id: 'p-1',
+      title: 'Real Title B',
+      updatedAt,
+      selection: null,
+    });
   });
 
   it('coerces a null DB title to an empty string', async () => {
@@ -757,7 +764,54 @@ describe('AiChatService.resolveOpenPageContext (#159 current-page validation)', 
       id: 'p-1',
       title: '',
       updatedAt,
+      selection: null,
     });
+  });
+
+  // #388: the selection rides ONLY on a successful page resolve, and is
+  // sanitized on the way through.
+  it('attaches the SANITIZED selection on a successful resolve', async () => {
+    const updatedAt = new Date('2026-07-02T10:00:00Z');
+    const svc = makeService({
+      page: { id: 'p-1', workspaceId: 'ws-1', title: 'Doc', updatedAt },
+      canView: true,
+    });
+    const result = await call(svc, {
+      id: 'p-1',
+      selection: {
+        text: 'fix this',
+        blockIds: ['b1', 123, 'y'.repeat(65)], // garbage stripped by sanitize
+        before: 'please ',
+      },
+    });
+    expect(result).toEqual({
+      id: 'p-1',
+      title: 'Doc',
+      updatedAt,
+      selection: { text: 'fix this', blockIds: ['b1'], before: 'please ' },
+    });
+  });
+
+  it('drops a blank/garbage selection to null on a successful resolve', async () => {
+    const updatedAt = new Date('2026-07-02T10:00:00Z');
+    const svc = makeService({
+      page: { id: 'p-1', workspaceId: 'ws-1', title: 'Doc', updatedAt },
+      canView: true,
+    });
+    expect(
+      await call(svc, { id: 'p-1', selection: { text: '   ' } }),
+    ).toEqual({ id: 'p-1', title: 'Doc', updatedAt, selection: null });
+  });
+
+  it('selection does NOT survive a foreign/inaccessible page (dies with the page)', async () => {
+    // Forbidden page => the WHOLE context is null, so the selection is gone too.
+    const svc = makeService({
+      page: { id: 'p-1', workspaceId: 'ws-1', title: 'Restricted' },
+      canView: false,
+    });
+    expect(
+      await call(svc, { id: 'p-1', selection: { text: 'secret sel' } }),
+    ).toBeNull();
   });
 });
 

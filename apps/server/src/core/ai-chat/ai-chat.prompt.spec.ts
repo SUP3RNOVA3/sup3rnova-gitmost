@@ -153,6 +153,41 @@ describe('buildSystemPrompt current-page context', () => {
     expect(prompt).not.toContain('pageId:');
   });
 
+  // #388: editor-selection flag. Only a FIXED one-liner is added — the selection
+  // TEXT (untrusted page content) must never reach the prompt.
+  const SELECTION_FLAG = 'currently has text SELECTED on this page';
+
+  it('adds the selection flag when a selection is present with a page', () => {
+    const prompt = buildSystemPrompt({
+      workspace,
+      openedPage: {
+        id: 'pg-123',
+        title: 'Doc',
+        selection: { text: 'SECRET-SELECTED-TEXT', blockIds: ['b1'] },
+      },
+    });
+    expect(prompt).toContain(SELECTION_FLAG);
+    // The selection TEXT itself is NEVER in the prompt.
+    expect(prompt).not.toContain('SECRET-SELECTED-TEXT');
+    expect(prompt).not.toContain('b1');
+  });
+
+  it('omits the selection flag when there is no selection', () => {
+    const prompt = buildSystemPrompt({
+      workspace,
+      openedPage: { id: 'pg-123', title: 'Doc' },
+    });
+    expect(prompt).not.toContain(SELECTION_FLAG);
+  });
+
+  it('omits the selection flag when selection is null', () => {
+    const prompt = buildSystemPrompt({
+      workspace,
+      openedPage: { id: 'pg-123', title: 'Doc', selection: null },
+    });
+    expect(prompt).not.toContain(SELECTION_FLAG);
+  });
+
   it('escapes a malicious opened-page title so it cannot inject tags (F1)', () => {
     const prompt = buildSystemPrompt({
       workspace,
