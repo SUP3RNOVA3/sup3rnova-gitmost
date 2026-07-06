@@ -13,7 +13,6 @@ import {
   deleteAiChat,
   deleteAiRole,
   getAiChatMessages,
-  getAiChatRun,
   getAiChats,
   getAiRoleCatalog,
   getAiRoleCatalogBundle,
@@ -26,7 +25,6 @@ import {
 import {
   IAiChat,
   IAiChatMessageRow,
-  IAiChatRunResponse,
   IAiRole,
   IAiRoleCatalog,
   IAiRoleCatalogBundle,
@@ -37,7 +35,6 @@ import {
   IAiRoleUpdateFromCatalogResult,
 } from "@/features/ai-chat/types/ai-chat.types.ts";
 import { IPagination } from "@/lib/types.ts";
-import { runPollInterval } from "@/features/ai-chat/utils/run-polling.ts";
 
 export const AI_CHATS_RQ_KEY = ["ai-chats"];
 export const AI_ROLES_RQ_KEY = ["ai-roles"];
@@ -55,7 +52,6 @@ export const AI_CHAT_MESSAGES_RQ_KEY = (chatId: string) => [
   "ai-chat-messages",
   chatId,
 ];
-export const AI_CHAT_RUN_RQ_KEY = (chatId: string) => ["ai-chat-run", chatId];
 
 /** Paginated list of the current user's chats (auto-loads further pages). */
 export function useAiChatsQuery() {
@@ -89,7 +85,15 @@ export function useAiChatsQuery() {
  * Load all persisted messages of a chat (oldest first), flattening the
  * paginated server response. Used to seed `useChat` initial messages.
  */
-export function useAiChatMessagesQuery(chatId: string | undefined) {
+export function useAiChatMessagesQuery(
+  chatId: string | undefined,
+  // #184 phase 1.5: the degraded-poll fallback. When a tab could not attach to a
+  // still-running run (the attach returned 204 / the resumed stream ended with no
+  // terminal row), the window arms a dumb timed poll of the message history to
+  // follow the detached run to settle. The callback form lives in AiChatWindow;
+  // threaded here verbatim so this query owns the polling. Undefined => no poll.
+  refetchInterval?: number | false | (() => number | false),
+) {
   const query = useInfiniteQuery({
     queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatId ?? ""),
     queryFn: ({ pageParam }) =>
@@ -100,6 +104,7 @@ export function useAiChatMessagesQuery(chatId: string | undefined) {
         ? (lastPage.meta.nextCursor ?? undefined)
         : undefined,
     enabled: !!chatId,
+    refetchInterval,
   });
 
   // useInfiniteQuery only fetches the first page on its own. The hook's contract
@@ -137,34 +142,6 @@ export function useAiChatMessagesQuery(chatId: string | undefined) {
     isLoading: query.isLoading || query.hasNextPage,
     isError: query.isError,
   };
-}
-
-/**
- * Reconnect to a chat's latest agent run and LIVE-FOLLOW it (#184). While the run
- * is active the query re-polls every {@link runPollInterval} ms (driven off the
- * fetched `run.status`, the same status-keyed refetchInterval pattern as the
- * embeddings reindex polling); once the run reaches a terminal status — or there
- * is no run — the interval returns `false` and polling stops on its own. Polling
- * is thus naturally bounded by the run terminating; no separate timeout cap.
- *
- * `enabled` gates the whole thing: callers pass `false` when the autonomous-runs
- * feature is off (the endpoint is NOT flag-gated server-side, but with the feature
- * off the chat has no runs, so polling would only ever return `{ run: null }`) OR
- * when THIS tab is the one actively streaming the run (the live SSE owns the view,
- * so we must not also poll/merge). The global `retry: false` means a failed fetch
- * leaves `data` undefined, so refetchInterval(undefined run) returns false — a
- * failed fetch can never spin a tight loop.
- */
-export function useAiChatRunQuery(
-  chatId: string | undefined,
-  enabled: boolean,
-) {
-  return useQuery<IAiChatRunResponse, Error>({
-    queryKey: AI_CHAT_RUN_RQ_KEY(chatId ?? ""),
-    queryFn: () => getAiChatRun(chatId as string),
-    enabled: !!chatId && enabled,
-    refetchInterval: (query) => runPollInterval(query.state.data?.run),
-  });
 }
 
 export function useRenameAiChatMutation() {
