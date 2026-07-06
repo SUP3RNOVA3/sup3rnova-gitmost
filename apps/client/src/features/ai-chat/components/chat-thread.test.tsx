@@ -123,7 +123,7 @@ function renderThread(props?: {
     defaultOptions: { queries: { retry: false } },
   });
   const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
-  render(
+  const { unmount } = render(
     <QueryClientProvider client={queryClient}>
       <MantineProvider>
         <ChatThread
@@ -137,7 +137,7 @@ function renderThread(props?: {
       </MantineProvider>
     </QueryClientProvider>,
   );
-  return { onTurnFinished, onResumeFallback, onServerStop, invalidateSpy };
+  return { onTurnFinished, onResumeFallback, onServerStop, invalidateSpy, unmount };
 }
 
 function resetState() {
@@ -383,6 +383,84 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
       queryKey: ["ai-chat-messages", "c1"],
     });
     expect(onResumeFallback).toHaveBeenCalledWith(true);
+  });
+
+  it("F7 restart-survival: a 500 attach failure restores the stripped row AND arms the poll (not lost)", async () => {
+    const { onResumeFallback, invalidateSpy } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ status: 500, ok: false }),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1); // stripped row restored
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["ai-chat-messages", "c1"],
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(true); // degraded poll armed
+  });
+
+  it("F7 restart-survival: a network throw restores the stripped row AND arms the poll", async () => {
+    const { onResumeFallback, invalidateSpy } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("network down")),
+    );
+    await act(async () => {
+      await h.state
+        .transport!.fetch!("http://x", { method: "GET" })
+        .catch(() => undefined); // the wrapper rethrows; swallow here
+    });
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["ai-chat-messages", "c1"],
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+  });
+
+  it("unmount during a pending attach aborts the controller and gates late callbacks", async () => {
+    const { onResumeFallback, invalidateSpy, unmount } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    let abortSeen = false;
+    let resolveFetch!: (v: unknown) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((_input: unknown, init: RequestInit) => {
+        init.signal?.addEventListener("abort", () => {
+          abortSeen = true;
+        });
+        return new Promise((res) => {
+          resolveFetch = res;
+        });
+      }),
+    );
+    // Kick a reconnect GET (stays pending).
+    let pending!: Promise<unknown>;
+    act(() => {
+      pending = h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+    // Unmount: the cleanup aborts the in-flight attach.
+    unmount();
+    expect(abortSeen).toBe(true);
+    // A late 204 landing after unmount must NOT arm a poll / invalidate the (now
+    // different) chat.
+    onResumeFallback.mockClear();
+    invalidateSpy.mockClear();
+    await act(async () => {
+      resolveFetch({ status: 204, ok: false });
+      await pending;
+    });
+    expect(onResumeFallback).not.toHaveBeenCalledWith(true);
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
   it("a resume fetch error clears resumedTurn so the next local turn flushes the queue", async () => {
