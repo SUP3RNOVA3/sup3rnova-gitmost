@@ -55,10 +55,15 @@ describe('stabilizePageFile — normalize-on-write fixpoint (SPEC §11)', () => 
     const file2 = await stabilizePageFile(doc2, meta);
     expect(file2).toBe(file1);
 
-    // The materialized diagram default is present in the stabilized body (proof
-    // that the convergence pass actually ran, not just that two naive exports
-    // happened to match).
-    expect(body1).toContain('data-align="center"');
+    // The drawio node was materialized to its canonical HTML form by the
+    // convergence pass — a bare `{ src }` doc node becomes the full
+    // `<div data-type="drawio" data-src=...>` — proof the pass actually ran, not
+    // just two naive exports happening to match. Assert on the stable canonical
+    // markers rather than `data-align="center"`: center is a schema default the
+    // converter may omit (see prosemirror-markdown media-html.ts), so it is not
+    // a reliable convergence proof.
+    expect(body1).toContain('data-type="drawio"');
+    expect(body1).toContain('data-src="/d.drawio"');
   });
 
   it('already-stable content is unchanged by the pass (idempotent)', async () => {
