@@ -230,6 +230,24 @@ pnpm build                   # nx run-many -t build (all packages)
 pnpm collab:dev              # run the collaboration server process standalone (see "Two server processes")
 ```
 
+> **Build the shared packages before running a consumer's `tsc`/tests in
+> isolation.** The `build/` dirs of `@docmost/prosemirror-markdown`,
+> `@docmost/git-sync`, and `@docmost/mcp` are **gitignored** (not committed), and
+> a single-package `pnpm --filter <pkg> test` / `tsc` or a bare `pnpm -r test`
+> does **NOT** honour the Nx `dependsOn: ["^build"]` ordering. So a consumer — the
+> server's `tsc`, `git-sync`'s vitest typecheck, `mcp`'s `pretest: tsc` — fails
+> with `error TS2307: Cannot find module '@docmost/…'` until those packages are
+> built first:
+> ```bash
+> pnpm --filter @docmost/prosemirror-markdown build
+> pnpm --filter @docmost/editor-ext build
+> pnpm --filter @docmost/git-sync build && pnpm --filter @docmost/mcp build
+> ```
+> `pnpm build` (nx run-many) does this for you; CI does it explicitly in
+> `.github/workflows/test.yml` (prosemirror-markdown → git-sync/mcp → server, in
+> that order). Reach for it whenever you run a consumer package's checks on their
+> own rather than through the full `pnpm build`.
+
 **Lint** (per package — there is no root lint script):
 ```bash
 pnpm --filter server lint    # eslint --fix on server .ts
