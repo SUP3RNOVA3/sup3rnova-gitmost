@@ -1,5 +1,6 @@
 import {
   collectDefaultMetrics,
+  Counter,
   Histogram,
   Gauge,
   Registry,
@@ -9,11 +10,21 @@ import {
   DB_BUCKETS,
   HTTP_BUCKETS,
   JOB_BUCKETS,
+  MCP_TOOL_BUCKETS,
   METRIC_BULLMQ_JOB_DURATION,
   METRIC_BULLMQ_QUEUE_DEPTH,
+  METRIC_COLLAB_AUTH_DURATION,
+  METRIC_COLLAB_CONNECT_DURATION,
+  METRIC_COLLAB_CONNECT_TIMEOUTS_TOTAL,
+  METRIC_COLLAB_DOC_LOADS_TOTAL,
+  METRIC_COLLAB_DOC_UNLOADS_TOTAL,
+  METRIC_COLLAB_DOCS_OPEN,
+  METRIC_COLLAB_LOAD_DURATION,
   METRIC_COLLAB_STORE_DURATION,
   METRIC_DB_QUERY_DURATION,
   METRIC_HTTP_REQUEST_DURATION,
+  METRIC_MCP_TOOL_DURATION,
+  sizeBucket,
 } from './metrics.constants';
 
 /**
@@ -39,7 +50,24 @@ let httpHist: Histogram<'method' | 'route' | 'status'> | null = null;
 let dbHist: Histogram<'op'> | null = null;
 let queueDepthGauge: Gauge<'queue'> | null = null;
 let jobHist: Histogram<'queue'> | null = null;
-let collabHist: Histogram | null = null;
+// #402 — collab store now carries a size_bucket label (see sizeBucket()).
+let collabHist: Histogram<'size_bucket'> | null = null;
+// #402 collab-lifecycle + MCP instruments.
+let collabLoadHist: Histogram<'size_bucket'> | null = null;
+let docsOpenGauge: Gauge | null = null;
+let docLoadsCounter: Counter | null = null;
+let docUnloadsCounter: Counter | null = null;
+let connectTimeoutsCounter: Counter | null = null;
+let collabConnectHist: Histogram | null = null;
+let collabAuthHist: Histogram | null = null;
+let mcpToolHist: Histogram<'tool'> | null = null;
+
+// #402 — read-on-scrape source for collab_docs_open. The gauge is NEVER
+// inc/dec'd (that drifts under crashes/handoffs); instead its collect() callback
+// pulls the authoritative live count from here on every scrape. Registered once,
+// gated, by the collaboration gateway via registerDocsOpenSource(). Null until
+// then → the collect() is a no-op.
+let docsOpenSource: (() => number) | null = null;
 
 function init(): void {
   if (registry || !enabled) return;
@@ -82,8 +110,69 @@ function init(): void {
 
   collabHist = new Histogram({
     name: METRIC_COLLAB_STORE_DURATION,
-    help: 'Collaboration onStoreDocument duration in seconds',
+    help: 'Collaboration onStoreDocument duration in seconds, by document size bucket',
+    labelNames: ['size_bucket'],
     buckets: COLLAB_BUCKETS,
+    registers: [registry],
+  });
+
+  collabLoadHist = new Histogram({
+    name: METRIC_COLLAB_LOAD_DURATION,
+    help: 'Collaboration onLoadDocument DB-load duration in seconds, by document size bucket',
+    labelNames: ['size_bucket'],
+    buckets: COLLAB_BUCKETS,
+    registers: [registry],
+  });
+
+  docsOpenGauge = new Gauge({
+    name: METRIC_COLLAB_DOCS_OPEN,
+    help: 'Number of collaboration documents currently open in memory',
+    registers: [registry],
+    // Read-on-scrape: pull the live count from the registered source (the
+    // hocuspocus instance) so the value can never drift. No-op until a source
+    // is registered.
+    collect() {
+      if (docsOpenSource) this.set(docsOpenSource());
+    },
+  });
+
+  docLoadsCounter = new Counter({
+    name: METRIC_COLLAB_DOC_LOADS_TOTAL,
+    help: 'Total collaboration documents loaded into memory',
+    registers: [registry],
+  });
+
+  docUnloadsCounter = new Counter({
+    name: METRIC_COLLAB_DOC_UNLOADS_TOTAL,
+    help: 'Total collaboration documents unloaded from memory',
+    registers: [registry],
+  });
+
+  connectTimeoutsCounter = new Counter({
+    name: METRIC_COLLAB_CONNECT_TIMEOUTS_TOTAL,
+    help: 'Total collaboration connection setup timeouts',
+    registers: [registry],
+  });
+
+  collabConnectHist = new Histogram({
+    name: METRIC_COLLAB_CONNECT_DURATION,
+    help: 'Collaboration connection acceptance duration in seconds (onConnect→connected)',
+    buckets: COLLAB_BUCKETS,
+    registers: [registry],
+  });
+
+  collabAuthHist = new Histogram({
+    name: METRIC_COLLAB_AUTH_DURATION,
+    help: 'Collaboration onAuthenticate duration in seconds',
+    buckets: COLLAB_BUCKETS,
+    registers: [registry],
+  });
+
+  mcpToolHist = new Histogram({
+    name: METRIC_MCP_TOOL_DURATION,
+    help: 'MCP tool-call duration in seconds, by tool name',
+    labelNames: ['tool'],
+    buckets: MCP_TOOL_BUCKETS,
     registers: [registry],
   });
 }
@@ -121,6 +210,46 @@ export function observeJobDuration(queue: string, seconds: number): void {
   jobHist?.observe({ queue }, seconds);
 }
 
-export function observeCollabStore(seconds: number): void {
-  collabHist?.observe(seconds);
+export function observeCollabStore(bytes: number, seconds: number): void {
+  collabHist?.observe({ size_bucket: sizeBucket(bytes) }, seconds);
+}
+
+export function observeCollabLoad(bytes: number, seconds: number): void {
+  collabLoadHist?.observe({ size_bucket: sizeBucket(bytes) }, seconds);
+}
+
+/**
+ * Register the live open-document count source for the collab_docs_open gauge.
+ * Called ONCE, gated by isMetricsEnabled(), by the collaboration gateway. The
+ * gauge reads this on every scrape (collect()); nothing inc/dec's it.
+ */
+export function registerDocsOpenSource(fn: () => number): void {
+  docsOpenSource = fn;
+}
+
+export function incDocLoad(): void {
+  docLoadsCounter?.inc();
+}
+
+export function incDocUnload(): void {
+  docUnloadsCounter?.inc();
+}
+
+export function incConnectTimeout(): void {
+  connectTimeoutsCounter?.inc();
+}
+
+export function observeCollabConnect(seconds: number): void {
+  collabConnectHist?.observe(seconds);
+}
+
+export function observeCollabAuth(seconds: number): void {
+  collabAuthHist?.observe(seconds);
+}
+
+export function observeMcpTool(tool: string, seconds: number): void {
+  // `tool` MUST be a bounded, registration-derived MCP tool name (the caller
+  // guarantees it comes from the registered-tool set) — never free-form input —
+  // so this label stays low-cardinality with no 'other' bucketing needed.
+  mcpToolHist?.observe({ tool }, seconds);
 }

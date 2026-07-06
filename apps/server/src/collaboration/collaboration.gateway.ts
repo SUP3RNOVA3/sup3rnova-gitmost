@@ -1,4 +1,9 @@
-import { Hocuspocus } from '@hocuspocus/server';
+import {
+  connectedPayload,
+  Extension,
+  Hocuspocus,
+  onConnectPayload,
+} from '@hocuspocus/server';
 import { IncomingMessage } from 'http';
 import WebSocket from 'ws';
 import { AuthenticationExtension } from './extensions/authentication.extension';
@@ -25,6 +30,56 @@ import {
   CollaborationHandler,
   CollabEventHandlers,
 } from './collaboration.handler';
+import {
+  incDocLoad,
+  incDocUnload,
+  isMetricsEnabled,
+  observeCollabConnect,
+  registerDocsOpenSource,
+} from '../integrations/metrics/metrics.registry';
+
+/**
+ * #402 — collab lifecycle metrics as a lightweight hocuspocus extension.
+ *
+ * - afterLoadDocument / afterUnloadDocument (fire once PER DOCUMENT) drive the
+ *   doc load/unload counters.
+ * - collab_connect_duration_seconds: I time the onConnect→connected hook pair,
+ *   i.e. connection ACCEPTANCE (which includes the auth handshake). This is the
+ *   cleanest per-connection correlation hocuspocus exposes: both payloads carry
+ *   the SAME `request` IncomingMessage object, so a WeakMap keyed on it gives a
+ *   per-connection start with NO leak (the entry is GC'd with the request if a
+ *   connection is rejected in onAuthenticate and `connected` never fires).
+ *   I deliberately do NOT observe at afterLoadDocument: that hook fires per
+ *   DOCUMENT, not per connection, so a second client joining an already-open
+ *   doc would be missed. auth/load latencies are their own separate metrics.
+ *
+ * All helpers are no-ops when METRICS_PORT is unset; these hooks are per
+ * connect/load/unload (never per message), so there is no hot-path cost.
+ */
+class CollabMetricsExtension implements Extension {
+  // Keyed by the per-connection request object → connect start time (ms).
+  private readonly connectStarts = new WeakMap<object, number>();
+
+  async onConnect(data: onConnectPayload) {
+    this.connectStarts.set(data.request, performance.now());
+  }
+
+  async connected(data: connectedPayload) {
+    const start = this.connectStarts.get(data.request);
+    if (start !== undefined) {
+      observeCollabConnect((performance.now() - start) / 1000);
+      this.connectStarts.delete(data.request);
+    }
+  }
+
+  async afterLoadDocument() {
+    incDocLoad();
+  }
+
+  async afterUnloadDocument() {
+    incDocUnload();
+  }
+}
 
 @Injectable()
 export class CollaborationGateway {
@@ -58,8 +113,17 @@ export class CollaborationGateway {
         this.authenticationExtension,
         this.persistenceExtension,
         this.loggerExtension,
+        // #402 collab lifecycle + connect-duration metrics (no-op when off).
+        new CollabMetricsExtension(),
       ],
     });
+
+    // #402 — read-on-scrape source for collab_docs_open. Wire ONCE, gated, so
+    // nothing runs when metrics are disabled. The gauge's collect() pulls the
+    // live count from the hocuspocus instance on each scrape (no inc/dec drift).
+    if (isMetricsEnabled()) {
+      registerDocsOpenSource(() => this.hocuspocus.getDocumentsCount());
+    }
 
     if (this.withRedis) {
       this.redisClient = new RedisClient({
