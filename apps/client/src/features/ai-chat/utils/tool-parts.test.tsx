@@ -117,6 +117,42 @@ describe("toolInputSummary", () => {
     expect(toolInputSummary(part)).toBe("My Page");
   });
 
+  it("prefers the earlier primary field when several are present", () => {
+    const part: ToolUiPart = {
+      type: "tool-x",
+      state: "input-available",
+      // `query` outranks `title` in PRIMARY_INPUT_FIELDS — the ordered list is
+      // the contract, so a reordering must break this test.
+      input: { query: "Q", title: "T" },
+    };
+    expect(toolInputSummary(part)).toBe("Q");
+  });
+
+  it("does not clamp a value exactly at the 140-char limit", () => {
+    const exact = "a".repeat(140);
+    const part: ToolUiPart = {
+      type: "tool-Search_web_search",
+      state: "input-available",
+      input: { query: exact },
+    };
+    const out = toolInputSummary(part)!;
+    expect(out).toBe(exact);
+    expect(out.endsWith("…")).toBe(false);
+    expect(out.length).toBe(140);
+  });
+
+  it("clamps one char over the limit (141 -> 140 + ellipsis)", () => {
+    const part: ToolUiPart = {
+      type: "tool-Search_web_search",
+      state: "input-available",
+      input: { query: "a".repeat(141) },
+    };
+    const out = toolInputSummary(part)!;
+    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBe(141);
+    expect(out).toBe("a".repeat(140) + "…");
+  });
+
   it("clamps a long value to ~140 chars with an ellipsis", () => {
     const long = "a".repeat(300);
     const part: ToolUiPart = {
