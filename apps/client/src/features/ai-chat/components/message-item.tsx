@@ -41,6 +41,13 @@ interface MessageItemProps {
    */
   showCitations?: boolean;
   /**
+   * Forwarded to ToolCallCard: whether tool cards render the one-line summary of
+   * a call's arguments (e.g. the search query). Defaults to true (internal
+   * chat). The public share passes false so an anonymous reader doesn't see the
+   * agent's raw query/argument text.
+   */
+  showInput?: boolean;
+  /**
    * Neutralize internal/relative markdown links in the rendered answer (drop
    * their href so they become inert text). Defaults to false (internal chat,
    * links stay clickable). The anonymous public share passes true so internal
@@ -117,6 +124,7 @@ const MarkdownPart = memo(function MarkdownPart({
 function MessageItem({
   message,
   showCitations = true,
+  showInput = true,
   neutralizeInternalLinks = false,
   assistantName,
   turnStreaming = false,
@@ -210,6 +218,7 @@ function MessageItem({
               key={index}
               part={part as unknown as ToolUiPart}
               showCitations={showCitations}
+              showInput={showInput}
             />
           );
         }
@@ -274,6 +283,7 @@ export function arePropsEqual(
   return (
     prev.signature === next.signature &&
     prev.showCitations === next.showCitations &&
+    prev.showInput === next.showInput &&
     prev.neutralizeInternalLinks === next.neutralizeInternalLinks &&
     prev.assistantName === next.assistantName &&
     // The turn-end flip re-renders every row once (cheap, terminal event) —
