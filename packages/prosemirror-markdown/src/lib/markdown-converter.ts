@@ -635,12 +635,20 @@ export function convertProseMirrorToMarkdown(
           .map((item: any) => processListItem(item, "-"))
           .join("\n");
 
-      case "orderedList":
+      case "orderedList": {
+        // Honor a non-1 `start`: CommonMark expresses it as the first marker
+        // ("5." starts the list at 5), and marked parses that back into
+        // <ol start="5">. Emitting `${start + index}.` keeps a start=5 list as
+        // "5.","6.",… while a default (start=1) list stays "1.","2.",… See #351.
+        // `Number(...) || 1` coerces a numeric-or-absent start and guards against
+        // a stray non-numeric `start` string-concatenating into the marker.
+        const start = Number(node.attrs?.start) || 1;
         return nodeContent
           .map((item: any, index: number) =>
-            processListItem(item, `${index + 1}.`),
+            processListItem(item, `${start + index}.`),
           )
           .join("\n");
+      }
 
       case "taskList":
         return nodeContent.map((item: any) => processTaskItem(item)).join("\n");
@@ -1401,10 +1409,16 @@ export function convertProseMirrorToMarkdown(
         return `<ul>${children
           .map((li: any) => `<li>${blockChildrenToHtml(li)}</li>`)
           .join("")}</ul>`;
-      case "orderedList":
-        return `<ol>${children
+      case "orderedList": {
+        // Carry a non-1 `start` on the raw-HTML path (columns/spanned cells) via
+        // the <ol start="N"> attribute, which the tiptap parser reads back into
+        // attrs.start. A default (start=1) list stays a bare <ol>. See #351.
+        const start = block.attrs?.start ?? 1;
+        const startAttr = start > 1 ? ` start="${start}"` : "";
+        return `<ol${startAttr}>${children
           .map((li: any) => `<li>${blockChildrenToHtml(li)}</li>`)
           .join("")}</ol>`;
+      }
       case "codeBlock": {
         const lang = block.attrs?.language || "";
         // The code itself is element TEXT content (between <code> tags), so it

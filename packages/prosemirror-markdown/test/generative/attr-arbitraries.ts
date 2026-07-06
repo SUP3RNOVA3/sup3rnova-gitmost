@@ -134,10 +134,10 @@ const OVERRIDES: Record<string, AttrPolicy> = {
   'heading.textAlign': { arb: str('center', 'right', 'justify') },
   'heading.indent': { frozen: true }, // ACCEPTED: no md representation
   // ── lists ────────────────────────────────────────────────────────────────
-  // PINNED-BUG: markdown CAN express a non-1 start ("5."), but the converter
-  // renders "1." and drops it -> P1 loss. See counterexamples.test.ts
-  // (ordered-list-start.json). Frozen only until the maintainer rules accept-vs-fix.
-  'orderedList.start': { always: true, frozen: true },
+  // FIXED (#351): the converter now emits the start marker ("5." / <ol start="5">)
+  // and it round-trips, so the start number is value-fuzzed. See
+  // counterexamples.test.ts (ordered-list-start.json) for the regression pin.
+  'orderedList.start': { always: true, arb: num(2, 3, 5) },
   'orderedList.type': { frozen: true }, // ACCEPTED: a/A/i markers not expressible in GFM
   'taskItem.checked': { always: true, arb: fc.constant(true) }, // boolean, default false
   // ── codeBlock ────────────────────────────────────────────────────────────
@@ -194,9 +194,10 @@ const OVERRIDES: Record<string, AttrPolicy> = {
   // widthMode round-trips via the `data-width-mode` attribute (verified P1+P2),
   // so it is fuzzed, not frozen.
   'columns.widthMode': { always: true, arb: str('custom') },
-  // PINNED-BUG: parseFloat import drops the `%` unit -> P2 churn. See
-  // counterexamples.test.ts (columns-column-width-percent.json).
-  'column.width': { frozen: true },
+  // column.width is a unitless flex-grow NUMBER (matches editor-ext column.ts);
+  // parseHTML does parseFloat, so String(50) === "50" both ways and a numeric
+  // width round-trips byte-stably. Value-fuzzed as a number.
+  'column.width': { arb: num(25, 50, 75) },
   // ── embed (schema keeps width/height NUMERIC, not string-coerced) ─────────
   'embed.src': { noDefault: true, arb: urlArb, degen: '' },
   'embed.provider': { noDefault: true, arb: str('iframe', 'youtube', 'vimeo') },

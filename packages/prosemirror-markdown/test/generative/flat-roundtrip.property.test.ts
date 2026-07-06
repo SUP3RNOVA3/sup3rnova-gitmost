@@ -33,13 +33,11 @@ import {
 //     (aspectRatio, size, caption, drawio/excalidraw/pdf/video/youtube w/h/align)
 //     — round-trip candidates deferred to a later PR, not silently dropped;
 //   - ACCEPTED limitations with no md representation (indent, callout.icon,
-//     orderedList.type, table spans/bg/colwidth);
-//   - PINNED bugs (column.width, orderedList.start) tracked in
-//     counterexamples.test.ts.
+//     orderedList.type, table spans/bg/colwidth).
 const ATTR_VALUE_FUZZ_ALLOWLIST = new Set<string>([
   'attachment.attachmentId', 'attachment.mime', 'attachment.placeholder', 'attachment.size',
   'audio.attachmentId', 'audio.placeholder', 'audio.size',
-  'callout.icon', 'column.width',
+  'callout.icon',
   'drawio.align', 'drawio.alt', 'drawio.aspectRatio', 'drawio.attachmentId',
   'drawio.height', 'drawio.size', 'drawio.title', 'drawio.width',
   'embed.align', 'embed.height', 'embed.width',
@@ -48,7 +46,7 @@ const ATTR_VALUE_FUZZ_ALLOWLIST = new Set<string>([
   'heading.indent',
   'image.aspectRatio', 'image.attachmentId', 'image.caption', 'image.placeholder', 'image.size',
   'mention.anchorId', 'mention.creatorId', 'mention.slugId',
-  'orderedList.start', 'orderedList.type', 'paragraph.indent',
+  'orderedList.type', 'paragraph.indent',
   'pdf.attachmentId', 'pdf.height', 'pdf.placeholder', 'pdf.size', 'pdf.width',
   'tableCell.backgroundColor', 'tableCell.backgroundColorName', 'tableCell.colspan',
   'tableCell.colwidth', 'tableCell.rowspan',
