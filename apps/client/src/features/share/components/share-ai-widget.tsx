@@ -165,6 +165,9 @@ export default function ShareAiWidget({
             isStreaming={isStreaming}
             assistantName={assistantName}
             showCitations={false}
+            // Anonymous reader: suppress the tool-argument summary line so the
+            // agent's raw query/argument text isn't shown on the public share.
+            showInput={false}
             // Anonymous reader: neutralize internal/relative links in the
             // assistant's markdown so internal UUIDs/auth-gated routes don't
             // leak as clickable links (external http(s) links are kept).

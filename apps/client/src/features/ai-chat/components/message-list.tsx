@@ -26,6 +26,13 @@ interface MessageListProps {
    */
   showCitations?: boolean;
   /**
+   * Forwarded to MessageItem -> ToolCallCard: whether tool cards render the
+   * one-line summary of a call's arguments (e.g. the search query). Defaults to
+   * true (internal chat). The public share passes false so an anonymous reader
+   * doesn't see the agent's raw query/argument text.
+   */
+  showInput?: boolean;
+  /**
    * Forwarded to MessageItem: neutralize internal/relative markdown links in
    * the rendered answers (drop their href so they render as inert text).
    * Defaults to false (internal chat). The public share passes true so internal
@@ -119,6 +126,7 @@ export default function MessageList({
   isStreaming,
   emptyState,
   showCitations = true,
+  showInput = true,
   neutralizeInternalLinks = false,
   assistantName,
 }: MessageListProps) {
@@ -208,6 +216,7 @@ export default function MessageList({
             message={message}
             signature={messageSignature(message)}
             showCitations={showCitations}
+            showInput={showInput}
             neutralizeInternalLinks={neutralizeInternalLinks}
             assistantName={assistantName}
             // Turn-level liveness, gated to the TAIL row: only the tail message
