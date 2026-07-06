@@ -149,6 +149,15 @@ export type DocmostMcpConfig = (
     has?: (uri: string) => boolean;
     evict?: (uri: string) => void;
   };
+  // Dependency-neutral metrics sink injected by McpService (mirror of the
+  // package's onMetric). The package emits generic (name, value, labels)
+  // samples; McpService maps them onto the prom-client registry. Undefined
+  // when metrics are disabled → the package no-ops.
+  onMetric?: (
+    name: string,
+    value: number,
+    labels?: Record<string, string>,
+  ) => void;
 };
 
 export interface ResolvedMcpAuth {

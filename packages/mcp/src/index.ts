@@ -64,6 +64,33 @@ const jsonContent = (data: any) => ({
  * REST + the collaboration WebSocket using the provided service-account
  * credentials and auto-re-authenticates.
  */
+/**
+ * Wrap a tool handler so its wall-clock duration is reported through the host's
+ * dependency-neutral sink as `mcp_tool_duration_seconds` (labelled by tool
+ * name). Pure and side-effect-free apart from the optional `onMetric` call:
+ *  - preserves the handler's exact return value (awaited);
+ *  - observes in a `finally`, so it records on BOTH success and throw, then
+ *    rethrows the original error unchanged (never swallowed);
+ *  - with no `onMetric` (standalone/stdio) it is a transparent pass-through.
+ * Exported so the timing contract can be unit-tested without a live transport.
+ */
+export function timeToolHandler(
+  name: string,
+  handler: (...args: any[]) => any,
+  onMetric?: (name: string, value: number, labels?: Record<string, string>) => void,
+): (...args: any[]) => Promise<any> {
+  return async (...handlerArgs: any[]) => {
+    const start = performance.now();
+    try {
+      return await handler(...handlerArgs);
+    } finally {
+      onMetric?.("mcp_tool_duration_seconds", (performance.now() - start) / 1000, {
+        tool: name,
+      });
+    }
+  };
+}
+
 export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   // Pass the whole config union through: the client branches internally on
   // credentials vs. getToken, so both the external /mcp (creds) and the
@@ -77,6 +104,26 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
     },
     { instructions: SERVER_INSTRUCTIONS },
   );
+
+  // Single choke point for MCP tool timing. Both `registerShared` (below) and
+  // the inline `server.registerTool(...)` calls funnel through this one method,
+  // so monkeypatching it HERE — before any tool is registered and before
+  // `registerShared` captures a reference to it — times every tool with no
+  // per-tool boilerplate. The wrapped handler records wall-clock duration and,
+  // in a `finally`, feeds the host's dependency-neutral sink
+  // `config.onMetric("mcp_tool_duration_seconds", seconds, { tool })`. The tool
+  // name is the registration name (bounded cardinality). When no onMetric is
+  // provided (standalone/stdio) the wrapper is a pure pass-through: it still
+  // returns the original result and rethrows the original error unchanged.
+  const originalRegisterTool = server.registerTool.bind(server) as (
+    ...args: any[]
+  ) => any;
+  (server as any).registerTool = (...args: any[]) => {
+    const name = args[0] as string;
+    const handler = args[args.length - 1];
+    const timedHandler = timeToolHandler(name, handler, config.onMetric);
+    return originalRegisterTool(...args.slice(0, -1), timedHandler);
+  };
 
   // Register a tool from the shared, zod-agnostic spec registry. The spec owns
   // the canonical name + model-facing description + (optional) schema builder;

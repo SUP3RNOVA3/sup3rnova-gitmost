@@ -137,6 +137,15 @@ export type DocmostMcpConfig = { apiUrl: string } & (
       has?: (uri: string) => boolean;
       evict?: (uri: string) => void;
     };
+    // Dependency-neutral metrics sink. When present, the client emits generic
+    // (name, value, labels) samples; the HOST maps those names onto its own
+    // metrics registry (the package never depends on prom-client or the server).
+    // Absent in standalone/stdio mode → the client is a complete no-op here.
+    onMetric?: (
+      name: string,
+      value: number,
+      labels?: Record<string, string>,
+    ) => void;
   };
 
 // Canonical UUID shape (versions 1–8, matching the `uuid` package's `validate`
@@ -173,6 +182,11 @@ export class DocmostClient {
   // op's image blobs if the final doc put throws. Null when the sink omits them.
   private sandboxHas: ((uri: string) => boolean) | null = null;
   private sandboxEvict: ((uri: string) => void) | null = null;
+  // Optional dependency-neutral metrics sink (see DocmostMcpConfig.onMetric).
+  // Null on the legacy positional form and whenever the host omits it → no-op.
+  private onMetricFn:
+    | ((name: string, value: number, labels?: Record<string, string>) => void)
+    | null = null;
   // In-flight login dedup: when the token expires, the 401 interceptor,
   // ensureAuthenticated, getCollabTokenWithReauth and the two multipart retries
   // can all call login() at once. Memoizing a single promise collapses that
@@ -222,6 +236,8 @@ export class DocmostClient {
       this.sandboxHas = config.sandbox.has ?? null;
       this.sandboxEvict = config.sandbox.evict ?? null;
     }
+    // Legacy positional form carries no onMetric → null (complete no-op).
+    this.onMetricFn = config.onMetric ?? null;
     this.client = axios.create({
       baseURL: this.apiUrl,
       // Default request timeout so a hung connection cannot wedge a per-page
@@ -447,6 +463,10 @@ export class DocmostClient {
       };
 
       connectTimer = setTimeout(() => {
+        // Only the actual 25s collab connect timeout fires here — the agent's
+        // collab connection to the server never became ready. This is the
+        // connect-vs-unload signal; the other finish() paths must NOT emit it.
+        this.onMetricFn?.("collab_connect_timeouts_total", 1);
         finish(new Error("Connection timeout to collaboration server"));
       }, CONNECT_TIMEOUT_MS);
 
