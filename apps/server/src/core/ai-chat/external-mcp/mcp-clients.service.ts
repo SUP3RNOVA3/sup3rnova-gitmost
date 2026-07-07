@@ -255,54 +255,49 @@ export class McpClientsService {
     const callTimeoutMs = mcpCallTimeoutMs();
     const instructions: McpServerInstruction[] = [];
 
-    for (const server of servers) {
-      // Track the connected client OUTSIDE the try so the catch can close it when
-      // it was obtained but not yet registered in `clients` (e.g. tools() threw or
-      // timed out after a successful connect). `registered` flips only once the
-      // client is owned by `clients` (closed at entry teardown), so the catch never
-      // double-closes a registered client.
+    // Per-server connect+tools result, still tagged with its server so the merge
+    // below can be applied in the SAME order as `servers` (see the parallel note).
+    type PerServerResult =
+      | { ok: true; client: McpClient; guarded: Record<string, Tool> }
+      | { ok: false; reason: string };
+
+    // Connect to (and list tools for) every enabled server CONCURRENTLY, so the
+    // total build time is bounded by the SLOWEST single server (~2×
+    // CONNECT_TIMEOUT_MS: connect + tools), NOT the SUM across servers. The
+    // sequential loop this replaced summed those bounds, so with enough all-timing-
+    // out servers the outer MCP_TOOLSET_BUILD_DEADLINE_MS could fire before the
+    // per-server bounds, dropping ALL external tools and inverting the "per-server
+    // bound is primary, outer is a backstop" invariant. Each server keeps its OWN
+    // try/catch + connectWithTimeout/withTimeout bound + close-on-failure logic; a
+    // failed server is skipped, never fatal. Nothing here mutates the shared
+    // arrays — every result is merged IN SERVER ORDER after Promise.all, so tool-
+    // key precedence/disambiguation, `outcomes`, `instructions` and `clients`
+    // ordering all match the previous sequential behavior exactly.
+    const perServer = async (
+      server: (typeof servers)[number],
+    ): Promise<PerServerResult> => {
+      // Track the connected client so the catch can close it when it was obtained
+      // but tools() then threw/timed out (connectWithTimeout closes its OWN orphan
+      // on a connect timeout, so `client` stays undefined on that path). On success
+      // the client is handed back and registered by the merge below (owned by the
+      // entry, closed at teardown) — so it is never double-closed.
       let client: McpClient | undefined;
-      let registered = false;
       try {
         client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
         const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
-        clients.push(client);
-        registered = true;
         const allow = server.toolAllowlist;
         const picked =
           Array.isArray(allow) && allow.length > 0 ? pick(raw, allow) : raw;
         // Bound each tool's execute with a per-call total-timeout guard before
         // merging, so a single chatty-but-stuck call is aborted after the cap.
         const guarded = wrapToolsWithCallTimeout(picked, callTimeoutMs);
-        // Namespace each tool with the sanitized server name AND disambiguate
-        // against names already merged from earlier servers, so no external
-        // tool is silently overwritten on collision. The returned count drives
-        // whether this server's prompt guidance is included (≥1 tool merged).
-        const merged = this.mergeNamespaced(
-          tools,
-          guarded,
-          server.name,
-          server.id,
-        );
-        outcomes.push({ name: server.name, ok: true });
-        // Include this server's guidance ONLY when it actually contributed at
-        // least one tool the agent can call (allowlist may have filtered all of
-        // them out) AND the admin authored non-blank instructions. The header
-        // prefix is the sanitized server name (= the tool namespace prefix).
-        const guide = server.instructions?.trim();
-        if (merged.count > 0 && guide) {
-          instructions.push({
-            serverName: server.name,
-            toolPrefix: merged.prefix,
-            instructions: guide,
-          });
-        }
+        return { ok: true, client, guarded };
       } catch (err) {
         // A failed server is skipped — the turn proceeds with the rest. If connect
         // returned a live client but a later step (tools()) threw, that client was
         // never registered in `clients`, so close it here or its transport/socket
         // leaks (compounding every 60s cache rebuild during a flaky-server outage).
-        if (client && !registered) {
+        if (client) {
           void client.close().catch(() => undefined);
         }
         // Log a short warning (never the URL/headers) so ops can see degradation,
@@ -311,7 +306,45 @@ export class McpClientsService {
         this.logger.warn(
           `External MCP server "${server.name}" unavailable: ${reason}`,
         );
-        outcomes.push({ name: server.name, ok: false, reason });
+        return { ok: false, reason };
+      }
+    };
+
+    // Promise.all preserves array order regardless of settle order, so `results[i]`
+    // is `servers[i]`'s outcome — the merge below stays deterministic and matches
+    // the old sequential order (later servers still override/disambiguate against
+    // earlier ones on a tool-key clash).
+    const results = await Promise.all(servers.map(perServer));
+    for (let i = 0; i < servers.length; i += 1) {
+      const server = servers[i];
+      const result = results[i];
+      if (result.ok !== true) {
+        outcomes.push({ name: server.name, ok: false, reason: result.reason });
+        continue;
+      }
+      clients.push(result.client);
+      // Namespace each tool with the sanitized server name AND disambiguate
+      // against names already merged from earlier servers, so no external
+      // tool is silently overwritten on collision. The returned count drives
+      // whether this server's prompt guidance is included (≥1 tool merged).
+      const merged = this.mergeNamespaced(
+        tools,
+        result.guarded,
+        server.name,
+        server.id,
+      );
+      outcomes.push({ name: server.name, ok: true });
+      // Include this server's guidance ONLY when it actually contributed at
+      // least one tool the agent can call (allowlist may have filtered all of
+      // them out) AND the admin authored non-blank instructions. The header
+      // prefix is the sanitized server name (= the tool namespace prefix).
+      const guide = server.instructions?.trim();
+      if (merged.count > 0 && guide) {
+        instructions.push({
+          serverName: server.name,
+          toolPrefix: merged.prefix,
+          instructions: guide,
+        });
       }
     }
 

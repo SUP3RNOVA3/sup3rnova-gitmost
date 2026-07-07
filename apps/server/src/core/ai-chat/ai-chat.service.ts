@@ -63,8 +63,12 @@ const MAX_AGENT_STEPS = 20;
 // per-server connect bound in mcp-clients.service (CONNECT_TIMEOUT_MS): even if
 // that per-server timeout regressed, this outer deadline — together with the run's
 // abort signal — guarantees the setup phase can never wedge a turn at step 0 (the
-// production hang) and the run always finalizes. Generous: the per-server bound
-// should fire first in practice; this only backstops a total build stall.
+// production hang) and the run always finalizes. It stays a TRUE backstop because
+// buildEntry connects to the servers CONCURRENTLY, so the total build time is
+// bounded by the SLOWEST single server (~2×CONNECT_TIMEOUT_MS), not the SUM across
+// them — the per-server bound fires first no matter how many servers are enabled,
+// and this outer deadline only catches a total build stall the per-server bound
+// somehow missed.
 const MCP_TOOLSET_BUILD_DEADLINE_MS = 60_000;
 
 // System-prompt addendum injected ONLY on the final step (see prepareAgentStep).
@@ -791,8 +795,11 @@ export class AiChatService implements OnModuleInit {
         // a hung build would hang the turn at step 0 forever (the production hang),
         // unobservant of an explicit Stop. The deadline is defense-in-depth ABOVE
         // the per-server connect bound in mcp-clients.service. On a LATE resolve
-        // (the race was already lost) close the abandoned toolset's leased clients
-        // so their transports are not leaked.
+        // (the race was already lost) RELEASE the abandoned toolset's leases —
+        // c.close() here is the lease handle, so it decrements the cache entry's
+        // refcount; it does NOT force-close the transports (the cache OWNS the
+        // clients and closes them on TTL/evict). This just prevents the lease
+        // refcount from being pinned >=1 forever by a toolset nobody will consume.
         external = await raceAgainstAbortAndTimeout(
           this.mcpClients.toolsFor(workspace.id),
           effectiveSignal,
