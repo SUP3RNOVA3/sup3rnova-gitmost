@@ -1877,6 +1877,45 @@ export async function applyFinalize(
 }
 
 /**
+ * Deep-strip NUL characters (`\u0000`) from every string in a value, returning
+ * the SAME reference when nothing changed (so the no-NUL common case allocates
+ * nothing). Postgres rejects a NUL in BOTH `text` and `jsonb` columns ("invalid
+ * input syntax for type json" / "unsupported Unicode escape sequence"), so a
+ * stray NUL in model output or a tool result — e.g. a truncated multibyte read
+ * of a web page — otherwise fails EVERY persist of the assistant row, silently
+ * dropping that turn's content from the DB while the live stream still shows it.
+ * Applied at the flushAssistant choke point so content + toolCalls + metadata are
+ * all covered. Exported for the unit test.
+ */
+export function stripNulChars<T>(value: T): T {
+  if (typeof value === 'string') {
+    return (value.includes('\u0000')
+      ? value.replace(/\u0000/g, '')
+      : value) as T;
+  }
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = value.map((v) => {
+      const s = stripNulChars(v);
+      if (s !== v) changed = true;
+      return s;
+    });
+    return (changed ? out : value) as T;
+  }
+  if (value && typeof value === 'object') {
+    let changed = false;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const s = stripNulChars(v);
+      if (s !== v) changed = true;
+      out[k] = s;
+    }
+    return (changed ? out : value) as T;
+  }
+  return value;
+}
+
+/**
  * PURE assistant-row builder (#183 step-granular durability). Given the turn's
  * accumulated steps + the in-progress (not-yet-finished) text + the lifecycle
  * status, it returns the row patch to persist. The SAME path runs for the
@@ -1945,12 +1984,16 @@ export function flushAssistant(
     };
   }
 
-  return {
+  // Strip NUL chars from the whole row before persisting: Postgres rejects a NUL
+  // in both the `content` (text) and `toolCalls`/`metadata` (jsonb) columns, and a
+  // single stray NUL in model/tool output would otherwise fail EVERY write of this
+  // row and silently drop the turn's content from the DB (see stripNulChars).
+  return stripNulChars({
     content: stepsText + trailing,
     toolCalls: serializeSteps(finished),
     metadata,
     status,
-  };
+  });
 }
 
 /**

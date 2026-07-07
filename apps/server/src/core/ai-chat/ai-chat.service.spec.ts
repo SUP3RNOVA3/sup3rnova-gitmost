@@ -16,6 +16,7 @@ import {
   rowToUiMessage,
   prepareAgentStep,
   flushAssistant,
+  stripNulChars,
   chatStreamMetadata,
   accumulateStepUsage,
   isInterruptResume,
@@ -445,6 +446,45 @@ describe('flushAssistant', () => {
 
     const omitted = flushAssistant([], '', 'streaming');
     expect('pageChanged' in omitted.metadata).toBe(false);
+  });
+});
+
+/**
+ * stripNulChars: a NUL (U+0000) is rejected by Postgres in BOTH the `content`
+ * (text) and `toolCalls`/`metadata` (jsonb) columns, so it must be stripped from
+ * every persisted string. String.fromCharCode(0) avoids embedding a raw NUL byte
+ * in this source file.
+ */
+describe('stripNulChars', () => {
+  const NUL = String.fromCharCode(0);
+
+  it('deep-strips NUL from strings in nested objects/arrays', () => {
+    const out = stripNulChars({
+      content: `a${NUL}b`,
+      parts: [{ type: 'text', text: `x${NUL}${NUL}y` }],
+      nested: [`p${NUL}q`, 42, null],
+    });
+    expect(out.content).toBe('ab');
+    expect((out.parts[0] as { text: string }).text).toBe('xy');
+    expect(out.nested[0]).toBe('pq');
+    expect(out.nested[1]).toBe(42);
+    expect(out.nested[2]).toBeNull();
+    expect(JSON.stringify(out).includes(NUL)).toBe(false);
+  });
+
+  it('returns the SAME reference when there is no NUL (no needless clone)', () => {
+    const input = { a: 'clean', b: [1, 2, { c: 'ok' }] };
+    expect(stripNulChars(input)).toBe(input);
+  });
+
+  it('flushAssistant produces a NUL-free row even when the turn text carries one', () => {
+    const f = flushAssistant([], `partial${NUL}answer`, 'error', {
+      error: `bo${NUL}om`,
+    });
+    expect(f.content).toBe('partialanswer');
+    const serialized =
+      f.content + JSON.stringify(f.toolCalls) + JSON.stringify(f.metadata);
+    expect(serialized.includes(NUL)).toBe(false);
   });
 });
 
