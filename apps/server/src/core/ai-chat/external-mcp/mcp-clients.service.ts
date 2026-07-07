@@ -523,12 +523,12 @@ export function validateResolvedAddresses(addrs: readonly LookupAddress[]): {
  */
 function buildPinnedDispatcher(): Agent {
   // External-MCP traffic uses a DEDICATED, shorter silence timeout
-  // (`AI_MCP_STREAM_TIMEOUT_MS`, default 5 min) — deliberately tighter than the
+  // (`AI_MCP_STREAM_TIMEOUT_MS`, default 1 min) — deliberately tighter than the
   // chat provider's 15-min `streamTimeoutMs()` — so a byte-silent/hung MCP
-  // upstream is broken in ~5 min instead of 15. We keep the keep-alive options
+  // upstream is broken in ~1 min instead of 15. We keep the keep-alive options
   // from `streamingDispatcherOptions()` but OVERRIDE headers/body timeouts.
   // Accepted trade-off: a legitimately long but byte-silent single tool call,
-  // and an SSE transport idling >5 min BETWEEN tool calls, are also cut here; the
+  // and an SSE transport idling >1 min BETWEEN tool calls, are also cut here; the
   // per-call total cap (wrapToolsWithCallTimeout, `AI_MCP_CALL_TIMEOUT_MS`) is the
   // complementary guard for chatty-but-stuck calls that keep the socket warm yet
   // never return.

@@ -21,10 +21,24 @@ import { recordHttpResponse } from './integrations/metrics/http-metrics.hook';
 import { startMetricsServer } from './integrations/metrics/metrics.server';
 
 async function bootstrap() {
+  // Fastify JSON body cap. Fastify defaults to 1 MiB, which a long AI-chat
+  // research turn exceeds: the client resends the FULL message history (every
+  // tool call + search result) on each turn, so a deep conversation's POST to
+  // /api/ai-chat/stream can be several MB and would otherwise be rejected with
+  // FST_ERR_CTP_BODY_TOO_LARGE (413). Raise the cap; override with
+  // HTTP_JSON_BODY_LIMIT (bytes). A missing/invalid/non-positive value keeps the
+  // 25 MiB default. Multipart uploads are unaffected (their own @fastify/multipart
+  // limits apply); this only bounds JSON/urlencoded request bodies.
+  const bodyLimitEnv = Number(process.env.HTTP_JSON_BODY_LIMIT);
+  const bodyLimit =
+    Number.isFinite(bodyLimitEnv) && bodyLimitEnv > 0
+      ? bodyLimitEnv
+      : 25 * 1024 * 1024;
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({
       trustProxy: resolveTrustProxy(process.env.TRUST_PROXY),
+      bodyLimit,
       routerOptions: {
         maxParamLength: 1000,
         ignoreTrailingSlash: true,
