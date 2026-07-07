@@ -141,6 +141,33 @@ export interface DocmostClientLike {
     doc?: unknown,
     title?: string,
   ): Promise<Record<string, unknown>>;
+  // Attach an author-inline footnote after the first occurrence of anchorText;
+  // numbering + the footnotes list are derived server-side.
+  insertFootnote(
+    pageId: string,
+    anchorText: string,
+    text: string,
+  ): Promise<Record<string, unknown>>;
+  // Download a web image and insert it into the page (append, or replace/after a
+  // text anchor). `url` is the image http(s) URL.
+  insertImage(
+    pageId: string,
+    url: string,
+    opts?: {
+      align?: 'left' | 'center' | 'right';
+      alt?: string;
+      replaceText?: string;
+      afterText?: string;
+    },
+  ): Promise<Record<string, unknown>>;
+  // Swap an existing image (by its attachmentId) for a new one fetched from a web
+  // URL, repointing every reference in the live document.
+  replaceImage(
+    pageId: string,
+    oldAttachmentId: string,
+    url: string,
+    opts?: { align?: 'left' | 'center' | 'right'; alt?: string },
+  ): Promise<Record<string, unknown>>;
   tableInsertRow(
     pageId: string,
     tableRef: string,

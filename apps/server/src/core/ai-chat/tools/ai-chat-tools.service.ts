@@ -697,6 +697,38 @@ export class AiChatToolsService {
         },
       ),
 
+      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#410).
+      // Promoted from MCP-only so the in-app agent can attach a REAL footnote to
+      // already-written text instead of leaving a literal `^[...]` string.
+      insertFootnote: sharedTool(
+        sharedToolSpecs.insertFootnote,
+        async ({ pageId, anchorText, text }) =>
+          await client.insertFootnote(pageId, anchorText, text),
+      ),
+
+      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#410).
+      // The schema field is `imageUrl`; the client method takes it positionally.
+      insertImage: sharedTool(
+        sharedToolSpecs.insertImage,
+        async ({ pageId, imageUrl, align, alt, replaceText, afterText }) =>
+          await client.insertImage(pageId, imageUrl, {
+            align,
+            alt,
+            replaceText,
+            afterText,
+          }),
+      ),
+
+      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#410).
+      replaceImage: sharedTool(
+        sharedToolSpecs.replaceImage,
+        async ({ pageId, attachmentId, imageUrl, align, alt }) =>
+          await client.replaceImage(pageId, attachmentId, imageUrl, {
+            align,
+            alt,
+          }),
+      ),
+
       // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
       // The table reference parameter was unified to `table` (was `tableRef`).
       tableInsertRow: sharedTool(

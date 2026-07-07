@@ -1003,4 +1003,116 @@ export const SHARED_TOOL_SPECS = {
       text: z.string().describe('The new cell text.'),
     }),
   },
+
+  // --- footnote + image write tools (promoted from inline MCP-only, #410) ---
+  //
+  // These three were previously registered inline in index.ts as MCP-only,
+  // because the in-app AI-chat agent had no equivalent. #410 promotes them so the
+  // in-app agent (esp. the Researcher role) can attach real footnotes/images
+  // instead of writing literal `^[...]` / placeholder text via editPageText. The
+  // schema + description are MOVED VERBATIM from the old inline registrations so
+  // external MCP clients see identical tool names, fields and text.
+
+  insertFootnote: {
+    mcpName: 'insert_footnote',
+    inAppKey: 'insertFootnote',
+    description:
+      'Insert an AUTHOR-INLINE footnote: you specify only WHERE (anchorText) ' +
+      'and WHAT (text). The footnote marker is placed right after anchorText in ' +
+      'the body, and the bottom footnotes list + the numbering are derived ' +
+      'deterministically server-side. You do NOT assign a number, and you ' +
+      "never see or edit the footnotes list — so footnotes cannot end up out " +
+      "of order, orphaned, or as a raw '[^id]' block. If a footnote with the " +
+      'SAME text already exists, its number is REUSED (one definition, several ' +
+      "references). The write is atomic and won't clobber concurrent edits; if " +
+      'anchorText is not found, nothing is written and an error is returned.',
+    // CORE for the in-app agent (#410): keeping it deferred would recreate the
+    // original asymmetry (footnote tool hidden while editPageText is core), which
+    // is exactly what makes the agent fall back to literal `^[...]`.
+    tier: 'core',
+    catalogLine:
+      'insertFootnote — attach a numbered footnote right after a snippet of existing body text.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      anchorText: z
+        .string()
+        .min(1)
+        .describe(
+          'A snippet of existing body text; the footnote marker is inserted ' +
+            'immediately after its first occurrence (mark-safe).',
+        ),
+      text: z
+        .string()
+        .min(1)
+        .describe('The footnote content as markdown (becomes the definition).'),
+    }),
+  },
+
+  insertImage: {
+    mcpName: 'insert_image',
+    inAppKey: 'insertImage',
+    description:
+      'Download an image from a web (http/https) URL and insert it into ' +
+      'a page in one step. By default ' +
+      'appends the image at the end of the page. With replaceText, replaces the ' +
+      'first top-level block whose text contains that string (handy for ' +
+      'swapping a text placeholder like "[image: foo.png]" for the real image). ' +
+      'With afterText, inserts the image right after the first block containing ' +
+      'that string. Preserves all other block ids.',
+    tier: 'deferred',
+    catalogLine:
+      'insertImage — download a web image and insert it into a page.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      imageUrl: z
+        .string()
+        .min(1)
+        .describe('http(s) URL of the image to download and upload'),
+      align: z.enum(['left', 'center', 'right']).optional(),
+      alt: z.string().optional(),
+      replaceText: z
+        .string()
+        .optional()
+        .describe(
+          'Replace the first top-level block whose text contains this string with the image',
+        ),
+      afterText: z
+        .string()
+        .optional()
+        .describe(
+          'Insert the image right after the first top-level block whose text contains this string',
+        ),
+    }),
+  },
+
+  replaceImage: {
+    mcpName: 'replace_image',
+    inAppKey: 'replaceImage',
+    description:
+      'Replace an existing image on a page with a new image fetched from a web ' +
+      '(http/https) URL: uploads the new file as a NEW ' +
+      'attachment (fresh clean URL that renders and busts browser caches), then ' +
+      'repoints every image node referencing the old attachmentId (recursively, ' +
+      'incl. callouts/tables) via the live document, preserving comments, ' +
+      'alignment and alt. The old attachment is left as an unreferenced orphan ' +
+      '(Docmost has no API to delete a single attachment; it is removed only when ' +
+      'the page/space is deleted). In-place byte overwrite is avoided because some ' +
+      'Docmost versions corrupt the attachment (HTTP 500) on overwrite.',
+    tier: 'deferred',
+    catalogLine:
+      'replaceImage — swap an existing page image for one fetched from a web URL.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      attachmentId: z
+        .string()
+        .min(1)
+        .describe('attachmentId of the image currently in the page to replace'),
+      imageUrl: z
+        .string()
+        .min(1)
+        .describe('http(s) URL of the new image to download'),
+      align: z.enum(['left', 'center', 'right']).optional(),
+      alt: z.string().optional(),
+    }),
+  },
 } satisfies Record<string, SharedToolSpec>;

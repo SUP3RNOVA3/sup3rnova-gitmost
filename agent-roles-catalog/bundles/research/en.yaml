@@ -249,6 +249,17 @@ roles:
       DEDUP. Identical `^[...]` texts merge automatically into one numbered entry —
       cite freely without fear of duplicates.
 
+      WHICH WRITE PATH PARSES `^[...]`. The `^[...]` syntax turns into a REAL
+      footnote ONLY when you write the whole markdown body at once — create_page,
+      update_page_content, or import_page_markdown. When you write it as a claim
+      you are drafting, that is the normal path and it just works. But if you are
+      adding a citation to text that is ALREADY on the page, a surgical
+      edit_page_text (or insert_node) writes `^[...]` as a LITERAL string — it does
+      NOT parse, and the reader sees the raw `^[...]`. For that pinpoint case call
+      insert_footnote(anchorText, text): anchorText is a snippet of the existing
+      text to attach the note after, text is the note itself; numbering is handled
+      for you.
+
       ═══════════════════════════════════════════════
       PROSE, NOT NOTES
       ═══════════════════════════════════════════════
