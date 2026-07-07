@@ -427,43 +427,10 @@ registerShared(SHARED_TOOL_SPECS.deleteNode, async ({ pageId, nodeId }) => {
 });
 
 // Tool: insert_image
-// MCP-only by design (NOT in the shared registry): the in-app AI-chat agent
-// exposes no image tools (insert/replace), so there is no second layer to unify
-// — a SHARED_TOOL_SPECS entry's tier/catalogLine are in-app metadata and the
-// catalog-partition test forbids a spec without a live in-app tool (#294).
-server.registerTool(
-  "insert_image",
-  {
-    description:
-      "Download an image from a web (http/https) URL and insert it into " +
-      "a page in one step. By default " +
-      "appends the image at the end of the page. With replaceText, replaces the " +
-      "first top-level block whose text contains that string (handy for " +
-      'swapping a text placeholder like "[image: foo.png]" for the real image). ' +
-      "With afterText, inserts the image right after the first block containing " +
-      "that string. Preserves all other block ids.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      imageUrl: z
-        .string()
-        .min(1)
-        .describe("http(s) URL of the image to download and upload"),
-      align: z.enum(["left", "center", "right"]).optional(),
-      alt: z.string().optional(),
-      replaceText: z
-        .string()
-        .optional()
-        .describe(
-          "Replace the first top-level block whose text contains this string with the image",
-        ),
-      afterText: z
-        .string()
-        .optional()
-        .describe(
-          "Insert the image right after the first top-level block whose text contains this string",
-        ),
-    },
-  },
+// Schema + description now live in the shared registry (#410) so BOTH this MCP
+// server and the in-app AI-chat agent expose it. The execute body is unchanged.
+registerShared(
+  SHARED_TOOL_SPECS.insertImage,
   async ({ pageId, imageUrl, align, alt, replaceText, afterText }) => {
     const result = await docmostClient.insertImage(pageId, imageUrl, {
       align,
@@ -476,34 +443,9 @@ server.registerTool(
 );
 
 // Tool: replace_image
-// MCP-only by design (see insert_image): no in-app equivalent, stays inline.
-server.registerTool(
-  "replace_image",
-  {
-    description:
-      "Replace an existing image on a page with a new image fetched from a web " +
-      "(http/https) URL: uploads the new file as a NEW " +
-      "attachment (fresh clean URL that renders and busts browser caches), then " +
-      "repoints every image node referencing the old attachmentId (recursively, " +
-      "incl. callouts/tables) via the live document, preserving comments, " +
-      "alignment and alt. The old attachment is left as an unreferenced orphan " +
-      "(Docmost has no API to delete a single attachment; it is removed only when " +
-      "the page/space is deleted). In-place byte overwrite is avoided because some " +
-      "Docmost versions corrupt the attachment (HTTP 500) on overwrite.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      attachmentId: z
-        .string()
-        .min(1)
-        .describe("attachmentId of the image currently in the page to replace"),
-      imageUrl: z
-        .string()
-        .min(1)
-        .describe("http(s) URL of the new image to download"),
-      align: z.enum(["left", "center", "right"]).optional(),
-      alt: z.string().optional(),
-    },
-  },
+// Schema + description now live in the shared registry (#410).
+registerShared(
+  SHARED_TOOL_SPECS.replaceImage,
   async ({ pageId, attachmentId, imageUrl, align, alt }) => {
     const result = await docmostClient.replaceImage(
       pageId,
@@ -826,36 +768,10 @@ server.registerTool(
 );
 
 // Tool: insert_footnote
-// MCP-only by design (see insert_image): the in-app AI-chat agent exposes no
-// footnote tool, so there is no second layer to unify — stays inline (#294).
-server.registerTool(
-  "insert_footnote",
-  {
-    description:
-      "Insert an AUTHOR-INLINE footnote: you specify only WHERE (anchorText) " +
-      "and WHAT (text). The footnote marker is placed right after anchorText in " +
-      "the body, and the bottom footnotes list + the numbering are derived " +
-      "deterministically server-side. You do NOT assign a number, and you " +
-      "never see or edit the footnotes list — so footnotes cannot end up out " +
-      "of order, orphaned, or as a raw '[^id]' block. If a footnote with the " +
-      "SAME text already exists, its number is REUSED (one definition, several " +
-      "references). The write is atomic and won't clobber concurrent edits; if " +
-      "anchorText is not found, nothing is written and an error is returned.",
-    inputSchema: {
-      pageId: z.string().min(1),
-      anchorText: z
-        .string()
-        .min(1)
-        .describe(
-          "A snippet of existing body text; the footnote marker is inserted " +
-            "immediately after its first occurrence (mark-safe).",
-        ),
-      text: z
-        .string()
-        .min(1)
-        .describe("The footnote content as markdown (becomes the definition)."),
-    },
-  },
+// Schema + description now live in the shared registry (#410) so the in-app
+// AI-chat agent exposes it too. The execute body is unchanged.
+registerShared(
+  SHARED_TOOL_SPECS.insertFootnote,
   async ({ pageId, anchorText, text }) => {
     const result = await docmostClient.insertFootnote(pageId, anchorText, text);
     return jsonContent(result);

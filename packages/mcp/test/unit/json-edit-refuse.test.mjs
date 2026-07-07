@@ -141,6 +141,36 @@ test("typo fix wrapped in markdown still applies (not refused)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// (iv) #410 footnote token: a `replace` containing `^[...]` is refused into
+// failed[] (it would be written as a LITERAL string, never a real footnote).
+// Nothing is applied; the reason points at insert_footnote.
+// ---------------------------------------------------------------------------
+test("replace containing a `^[...]` footnote token is refused, not applied", () => {
+  const input = doc(paragraph(textNode("The claim stands.")));
+  const snapshot = JSON.parse(JSON.stringify(input));
+
+  const { doc: out, results, failed } = applyTextEdits(input, [
+    { find: "The claim stands.", replace: "The claim stands.^[See source, p.42]" },
+  ]);
+
+  assert.equal(results.length, 0, "nothing applied");
+  assert.equal(failed.length, 1, "one refused edit");
+  assert.equal(failed[0].find, "The claim stands.");
+  assert.match(failed[0].reason, /insert_footnote/);
+  // The document is byte-for-byte untouched — no literal `^[` was written.
+  assert.deepEqual(out, snapshot);
+});
+
+test("a plain replace with no footnote token still applies (no false positive)", () => {
+  const input = doc(paragraph(textNode("a caret ^ and a bracket ] apart")));
+  const { results, failed } = applyTextEdits(input, [
+    { find: "apart", replace: "separate" },
+  ]);
+  assert.equal(failed.length, 0, "not refused");
+  assert.equal(results.length, 1, "applied");
+});
+
+// ---------------------------------------------------------------------------
 // A plain text fix is unaffected by the refuse logic.
 // ---------------------------------------------------------------------------
 test("plain find/replace is not refused", () => {

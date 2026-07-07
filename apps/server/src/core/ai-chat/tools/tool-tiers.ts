@@ -38,10 +38,13 @@ export interface ToolCatalogEntry {
 }
 
 /**
- * CORE (always-active) in-app tool keys — 13 frequent/tiny tools. `searchInPage`
- * (#330) is added to core on top of the issue's original tier list: it is
- * frequent for the editorial roles this feature targets. `loadTools` is active
- * too but is not a normal tool key (it is added to activeTools separately).
+ * CORE (always-active) in-app tool keys — 13 frequent/tiny tools + `searchInPage`
+ * (#330) + `insertFootnote` (#410). `searchInPage` is core because it is frequent
+ * for the editorial roles this feature targets; `insertFootnote` is core so the
+ * footnote tool is NOT hidden while its natural sibling `editPageText` is always
+ * active (that asymmetry is exactly what pushed the agent to write literal
+ * `^[...]`). `loadTools` is active too but is not a normal tool key (it is added
+ * to activeTools separately).
  */
 export const CORE_TOOL_KEYS = [
   'searchPages',
@@ -60,6 +63,9 @@ export const CORE_TOOL_KEYS = [
   // #330 search_in_page — frequent for editorial sweeps; core despite predating
   // the issue's tier list.
   'searchInPage',
+  // #410 insert_footnote — core so pinpoint citations to already-written text
+  // don't degrade into literal `^[...]`; kept symmetric with editPageText.
+  'insertFootnote',
 ] as const;
 
 /** O(1) membership test for the core tier. */

@@ -305,6 +305,21 @@ export function applyTextEdits(
       continue;
     }
 
+    // HARD-REFUSE inline footnote tokens (#410). `^[...]` in a `replace` is
+    // markdown that only becomes a real footnote when a whole markdown body is
+    // written (create_page / update_page_content / import_page_markdown). Written
+    // through edit_page_text it stays a LITERAL string in the text — the exact
+    // failure mode #410 fixes — so refuse it here (defense-in-depth) and point the
+    // caller at insert_footnote, mirroring the formatting-marker refusal above.
+    if (/\^\[[\s\S]*?\]/.test(edit.replace)) {
+      failed.push({
+        find: edit.find,
+        reason:
+          "edit_page_text writes the replacement as LITERAL text, so a `^[...]` footnote token does not parse into a real footnote (it would appear verbatim in the page). To add a footnote to existing text, use insert_footnote (anchorText = where, text = the note).",
+      });
+      continue;
+    }
+
     // Gather every inline block in document order (recurse the whole tree so
     // nested containers — callouts, list items, table cells, blockquotes — are
     // all covered).

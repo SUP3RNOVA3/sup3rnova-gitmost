@@ -27,11 +27,24 @@ import type { DocmostClientLike } from './docmost-client.loader';
  */
 
 describe('tool tier metadata (#332)', () => {
-  it('core set is the documented 13 + searchInPage (14)', () => {
-    expect(CORE_TOOL_KEYS).toHaveLength(14);
+  it('core set is the documented 13 + searchInPage + insertFootnote (15)', () => {
+    expect(CORE_TOOL_KEYS).toHaveLength(15);
     expect(CORE_TOOL_SET.has('searchInPage')).toBe(true); // #330, promoted to core
+    expect(CORE_TOOL_SET.has('insertFootnote')).toBe(true); // #410, promoted to core
     // loadTools is a meta-tool, not a normal core key.
     expect(CORE_TOOL_SET.has(LOAD_TOOLS_NAME)).toBe(false);
+  });
+
+  it('#410 image tools are DEFERRED, footnote tool is CORE', () => {
+    // insert_footnote is core (symmetric with editPageText); the image tools stay
+    // deferred (rare, fat — loaded on demand). Assert both the spec tier and the
+    // CORE_TOOL_SET membership so a future tier edit that desyncs them fails here.
+    expect(SHARED_TOOL_SPECS.insertFootnote.tier).toBe('core');
+    expect(CORE_TOOL_SET.has('insertFootnote')).toBe(true);
+    expect(SHARED_TOOL_SPECS.insertImage.tier).toBe('deferred');
+    expect(CORE_TOOL_SET.has('insertImage')).toBe(false);
+    expect(SHARED_TOOL_SPECS.replaceImage.tier).toBe('deferred');
+    expect(CORE_TOOL_SET.has('replaceImage')).toBe(false);
   });
 
   it('SHARED_TOOL_SPECS tier agrees with CORE_TOOL_SET for every shared tool', () => {

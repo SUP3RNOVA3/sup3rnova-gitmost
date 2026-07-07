@@ -653,6 +653,125 @@ describe('AiChatToolsService #294 changed execute wirings', () => {
 });
 
 /**
+ * #410 — the footnote + image tools were promoted from MCP-only into the shared
+ * registry and are now wired in-app. Assert they are REGISTERED in the in-app
+ * toolset and forward their args to the client with the correct arg->method
+ * mapping (the schema fields `imageUrl`/`attachmentId` map onto the client's
+ * positional `url`/`oldAttachmentId`). A field destructured under the wrong name
+ * would silently pass `undefined` (execute is `any`-cast, so tsc won't catch it).
+ */
+describe('AiChatToolsService #410 footnote + image tools', () => {
+  const calls: Record<string, unknown[][]> = {
+    insertFootnote: [],
+    insertImage: [],
+    replaceImage: [],
+  };
+  const fakeClient: Partial<DocmostClientLike> = {
+    insertFootnote: (...args: unknown[]) => {
+      calls.insertFootnote.push(args);
+      return Promise.resolve({ success: true, footnoteId: 'fn1', reused: false });
+    },
+    insertImage: (...args: unknown[]) => {
+      calls.insertImage.push(args);
+      return Promise.resolve({ success: true, attachmentId: 'att1' });
+    },
+    replaceImage: (...args: unknown[]) => {
+      calls.replaceImage.push(args);
+      return Promise.resolve({ success: true, replaced: 1 });
+    },
+  };
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    for (const k of Object.keys(calls)) calls[k].length = 0;
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return fakeClient as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+    );
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+
+  it('registers all three tools in the in-app toolset', async () => {
+    const tools = await buildTools();
+    expect(tools.insertFootnote).toBeDefined();
+    expect(tools.insertImage).toBeDefined();
+    expect(tools.replaceImage).toBeDefined();
+  });
+
+  it('insertFootnote forwards (pageId, anchorText, text) positionally', async () => {
+    const tools = await buildTools();
+    const r = await tools.insertFootnote.execute(
+      { pageId: 'p1', anchorText: 'the claim', text: 'See source.' } as never,
+      {} as never,
+    );
+    expect(calls.insertFootnote).toEqual([['p1', 'the claim', 'See source.']]);
+    expect(r).toMatchObject({ footnoteId: 'fn1' });
+  });
+
+  it('insertImage maps imageUrl->url and packs the option fields', async () => {
+    const tools = await buildTools();
+    await tools.insertImage.execute(
+      {
+        pageId: 'p1',
+        imageUrl: 'https://x/img.png',
+        align: 'center',
+        alt: 'A',
+        replaceText: '[img]',
+        afterText: undefined,
+      } as never,
+      {} as never,
+    );
+    expect(calls.insertImage).toEqual([
+      [
+        'p1',
+        'https://x/img.png',
+        { align: 'center', alt: 'A', replaceText: '[img]', afterText: undefined },
+      ],
+    ]);
+  });
+
+  it('replaceImage maps attachmentId->oldAttachmentId and imageUrl->url', async () => {
+    const tools = await buildTools();
+    await tools.replaceImage.execute(
+      {
+        pageId: 'p1',
+        attachmentId: 'att-old',
+        imageUrl: 'https://x/new.png',
+        align: 'right',
+        alt: 'B',
+      } as never,
+      {} as never,
+    );
+    expect(calls.replaceImage).toEqual([
+      ['p1', 'att-old', 'https://x/new.png', { align: 'right', alt: 'B' }],
+    ]);
+  });
+});
+
+/**
  * getCurrentPage selection contract (#388): the tool surfaces the selection that
  * was sanitized + nested onto the resolved open-page context (last forUser arg).
  * No page => selection is null. The tool never fetches or verifies anything — it
