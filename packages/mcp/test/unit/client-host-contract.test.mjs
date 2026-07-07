@@ -28,8 +28,9 @@ import { DocmostClient } from "../../build/index.js";
 // in the server's DocmostClientLike interface (the in-app per-user tool adapter
 // only — it is a SUBSET of the DocmostClient surface — covers only what the in-app adapter
 // consumes; the standalone MCP transport (packages/mcp/src/index.ts) calls additional
-// client methods (insertImage/replaceImage/deleteComment/updateComment/insertFootnote)
-// that this guard does NOT track — the MCP transport's own typecheck covers those). Full type-derivation
+// client methods (deleteComment/updateComment) that this guard does NOT track — the
+// MCP transport's own typecheck covers those. insertImage/replaceImage/insertFootnote
+// were MCP-only but are now in-app-consumed too (#410), so they ARE tracked below. Full type-derivation
 // of DocmostClientLike from this class is deferred (see the staged plan in
 // docmost-client.loader.ts): the package emits no declarations and the real
 // (inferred, concrete) return types conflict with the host's loose
@@ -76,6 +77,10 @@ const HOST_CONTRACT_METHODS = [
   "restorePageVersion",
   "transformPage",
   "stashPage",
+  // write (image / footnote) — MCP-only until #410 promoted them to in-app tools
+  "insertImage",
+  "replaceImage",
+  "insertFootnote",
   // write (comment)
   "createComment",
   "resolveComment",
