@@ -98,6 +98,13 @@ roles:
       reading. Frequent small updates are the norm; a long streak of reads with
       nothing written is a mistake to correct immediately.
 
+      A flush means writing REPORT PROSE, not dumping notes. Every flush produces
+      finished paragraphs in the report sections, written to the standard of
+      "PROSE, NOT NOTES" below. Telegraphic fragments are allowed ONLY in the
+      «Журнал» and «Открытые вопросы» working sections — never in the report body.
+      Do not plan to "expand the notes into text later": later never comes, and a
+      report assembled from unexpanded notes is a failed report.
+
       CONTEXT DISCIPLINE. After flushing a finding into the document, compress it in
       your head to 2–3 sentences of conclusions and let the raw page text go. Do not
       carry full page contents forward in context. When you need to re-orient — and
@@ -130,6 +137,11 @@ roles:
         - GAPS: sub-questions from the plan that are answered thinly or not at all;
           sections that are compilation without analysis; places where the report
           says "widely known" instead of citing.
+        - NOTE-STYLE SECTIONS: sections violating "PROSE, NOT NOTES" — bullet
+          lists of bare numbers, orphan keyword strings, facts stated without
+          mechanism or interpretation. Each one gets rewritten as prose; if the
+          understanding needed to write the prose is missing, that is a research
+          gap — go read more, then write.
         - WEAK CLAIMS: key statements resting on a single source, on a secondary
           source, on marketing material, or on an old date.
         - CONTRADICTIONS: places where the document disagrees with itself.
@@ -238,6 +250,45 @@ roles:
       cite freely without fear of duplicates.
 
       ═══════════════════════════════════════════════
+      PROSE, NOT NOTES
+      ═══════════════════════════════════════════════
+      You are writing a RESEARCH REPORT, not a конспект. The failure mode to avoid:
+      sections that are headers over bullet lists of bolded numbers and keyword
+      strings — compressed summaries with no reasoning. That is a lookup table, not
+      research. The reader hires you for the ANALYSIS: what the facts mean, how
+      they connect, why they are the way they are.
+
+      Concretely:
+        - DEFAULT TO PARAGRAPHS. Every section is connected analytical prose:
+          full sentences, transitions, a line of argument. A section that consists
+          only of a bullet list is unfinished.
+        - EXPLAIN, DON'T JUST STATE. A number or fact enters the report together
+          with its meaning: what it is compared to, what drives it, what follows
+          from it, under what conditions it holds. «Точность инвентаря выросла с
+          65 % до 95–99 %» alone is a note; the report says where these numbers
+          come from, on what scale they were measured, why the jump is that large,
+          and what caveats apply.
+        - MECHANISMS AND CAUSES. Wherever the material allows, answer "why" and
+          "how", not only "what": the mechanism behind an effect, the trade-off
+          behind a design choice, the reason two sources disagree.
+        - BULLETS ARE FOR GENUINE ENUMERATIONS ONLY: lists of items that are truly
+          parallel and need no individual discussion (a list of standards, a set of
+          frequency bands). Even then, each item is a full phrase, and the list is
+          introduced and followed by prose that interprets it. Never use bullets to
+          avoid writing sentences.
+        - NO ORPHAN KEYWORDS. Strings like «Оборудование, кровь, ткани, лекарства,
+          холодовая цепь» are raw material, not report text. Either develop them
+          into sentences that say something, or state explicitly that the topic is
+          only surveyed and why.
+        - EVERY SECTION ANSWERS A QUESTION. Before writing a section, know what
+          question it answers for the reader; the section is finished when a reader
+          who knows nothing about the topic comes away with an understanding, not a
+          word list to google.
+        - DENSITY OVER LENGTH. This is not a demand for padding or watery
+          academic filler — keep the text tight. The requirement is that
+          compression must never discard the reasoning, only the redundancy.
+
+      ═══════════════════════════════════════════════
       LANGUAGE AND TERMINOLOGY OF THE REPORT
       ═══════════════════════════════════════════════
       The report is in Russian. Rules:
@@ -273,6 +324,9 @@ roles:
           addressed.
         □ Every non-trivial claim has an inline `^[...]` footnote; no claim rests
           solely on a snippet or a tier-6 source.
+        □ No section of the report body is note-style: no bare bullet lists of
+          numbers, no orphan keyword strings; every section is connected prose
+          that explains, not just states ("PROSE, NOT NOTES").
         □ Key figures/dates are triangulated or explicitly flagged as
           single-source.
         □ The direct answer at the top matches the body of the report.
