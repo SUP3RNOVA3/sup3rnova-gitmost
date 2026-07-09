@@ -92,6 +92,29 @@ export function stripBalancedWrappers(s: string): string {
  * ORIGINAL string is returned so a locator can never normalize down to "" and
  * match everything.
  */
+export function stripInlineMarkdown(s: string): string {
+  if (typeof s !== "string" || s.length === 0) return s;
+
+  // 1 + 2. Shared link/image and balanced-wrapper passes.
+  let out = stripWrappersAndLinks(s);
+
+  // 3. Trim leading/trailing decoration: whitespace, leftover markdown markers,
+  //    and emoji (Extended_Pictographic plus the VS16 / ZWJ joiners, plus the
+  //    regional-indicator range U+1F1E6–U+1F1FF for flag emoji, which are NOT
+  //    Extended_Pictographic). The `u` flag enables the Unicode property escape.
+  //    Anchored runs only — interior text and sentence punctuation are untouched.
+  const DECORATION =
+    "[\\s*_~\\x60\\p{Extended_Pictographic}\\u{1F1E6}-\\u{1F1FF}\\u{FE0F}\\u{200D}]+";
+  out = out
+    .replace(new RegExp("^" + DECORATION, "u"), "")
+    .replace(new RegExp(DECORATION + "$", "u"), "");
+
+  // 4. Never normalize a locator down to nothing.
+  if (out.length === 0) return s;
+
+  return out;
+}
+
 /**
  * Build a bounded "closest text" hint for an anchor/find MISS, shared by
  * edit_page_text (json-edit) and create_comment (client) so both surface the
@@ -124,27 +147,4 @@ export function closestBlockHint(
   const snippet =
     points.length > 120 ? points.slice(0, 120).join("") + "…" : hitBlock;
   return ` Closest block text: "${snippet}".`;
-}
-
-export function stripInlineMarkdown(s: string): string {
-  if (typeof s !== "string" || s.length === 0) return s;
-
-  // 1 + 2. Shared link/image and balanced-wrapper passes.
-  let out = stripWrappersAndLinks(s);
-
-  // 3. Trim leading/trailing decoration: whitespace, leftover markdown markers,
-  //    and emoji (Extended_Pictographic plus the VS16 / ZWJ joiners, plus the
-  //    regional-indicator range U+1F1E6–U+1F1FF for flag emoji, which are NOT
-  //    Extended_Pictographic). The `u` flag enables the Unicode property escape.
-  //    Anchored runs only — interior text and sentence punctuation are untouched.
-  const DECORATION =
-    "[\\s*_~\\x60\\p{Extended_Pictographic}\\u{1F1E6}-\\u{1F1FF}\\u{FE0F}\\u{200D}]+";
-  out = out
-    .replace(new RegExp("^" + DECORATION, "u"), "")
-    .replace(new RegExp(DECORATION + "$", "u"), "");
-
-  // 4. Never normalize a locator down to nothing.
-  if (out.length === 0) return s;
-
-  return out;
 }
