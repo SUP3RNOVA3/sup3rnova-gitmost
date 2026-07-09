@@ -19,6 +19,7 @@ import { WebSocketServer } from "ws";
 import { Hocuspocus } from "@hocuspocus/server";
 import { DocmostClient } from "../../build/client.js";
 import { buildYDoc } from "../../build/lib/collaboration.js";
+import { destroyAllSessions } from "../../build/lib/collab-session.js";
 // Import the SAME page-lock module instance that build/client.js imports. ESM
 // caches modules by resolved URL, so this `withPageLock` shares the very
 // per-page mutex map (`chains`) the client uses — letting the replaceImage test
@@ -188,6 +189,10 @@ async function spawnCollabStack(opts = {}) {
 
 const openStacks = [];
 after(async () => {
+  // #400: tests now leave a cached live CollabSession per page. Destroy them
+  // first (closes the client ws) so the server.close() below is not racing an
+  // open collab connection.
+  destroyAllSessions();
   await Promise.all(
     openStacks.map(
       ({ server, hocuspocus }) =>
@@ -270,17 +275,23 @@ test("a UUID input is passed through unchanged and triggers NO /pages/info fetch
   );
 });
 
-test("a repeated slugId edit resolves the UUID only once (cache)", async () => {
+test("repeated slugId edits reuse ONE live collab session and resolve the UUID only once (#400 cache)", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
-  // Each mock connection re-seeds a fresh "hello world" doc (the mock does not
-  // persist across connects), so both edits target "hello". The cache assertion
-  // only concerns the slugId->uuid resolution, not the document content.
+  // #400: a series of edits on the same page reuses ONE live CollabSession, so
+  // the connect/handshake happens once and the collab doc is OPENED a single
+  // time (not per edit). The live ydoc persists between edits (the whole point),
+  // so the second edit sees the first edit's result: after "hello" -> "hi world"
+  // it targets the still-present "world".
   await client.editPageText(SLUG, [{ find: "hello", replace: "hi" }]);
-  await client.editPageText(SLUG, [{ find: "hello", replace: "hey" }]);
+  await client.editPageText(SLUG, [{ find: "world", replace: "planet" }]);
 
-  assert.deepEqual(state.docNames, [`page.${UUID}`, `page.${UUID}`]);
+  assert.deepEqual(
+    state.docNames,
+    [`page.${UUID}`],
+    "the two edits must reuse one live collab session -> a single collab-doc open (#400)",
+  );
   assert.equal(
     state.pagesInfoCalls.length,
     1,
@@ -325,8 +336,9 @@ test("replaceImage opens by the resolved UUID AND keys its page lock by that UUI
   await uploadStarted; // deterministic: replaceImage now holds its page lock.
 
   // (a) OPEN BY UUID: the only collab doc opened so far (the scan pass) used the
-  // canonical UUID, never the slugId. (The write pass opens a second time after
-  // we release the gate; asserted at the end.)
+  // canonical UUID, never the slugId. (#400: the write pass will REUSE this same
+  // live session rather than reopen, so docNames stays a single entry — asserted
+  // at the end.)
   assert.deepEqual(
     state.docNames,
     [`page.${UUID}`],
@@ -378,8 +390,9 @@ test("replaceImage opens by the resolved UUID AND keys its page lock by that UUI
 
   assert.equal(res.success, true);
   assert.equal(res.replaced, 1, "the one seeded image must be repointed");
-  // Both opens (scan pass + write pass) used the UUID; the slugId never appears.
-  assert.deepEqual(state.docNames, [`page.${UUID}`, `page.${UUID}`]);
+  // #400: the write pass REUSES the scan pass's live session, so the collab doc
+  // is opened ONCE across both passes (never reopened, never by the slugId).
+  assert.deepEqual(state.docNames, [`page.${UUID}`]);
   assert.ok(
     !state.docNames.includes(`page.${SLUG}`),
     "replaceImage must NEVER open the collab doc by the slugId (the #260 bug)",
