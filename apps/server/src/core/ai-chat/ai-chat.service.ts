@@ -1637,6 +1637,17 @@ type StepLike = {
     toolName?: string;
     output?: unknown;
   }>;
+  // ai@6.0.134: a tool that THREW surfaces as a `tool-error` content part
+  // ({ type:'tool-error', toolCallId, toolName, input, error }), NOT as a
+  // `toolResults` entry (which holds only successes). Read from here so failed
+  // calls are persisted with their real error instead of being dropped.
+  content?: ReadonlyArray<{
+    type?: string;
+    toolCallId?: string;
+    toolName?: string;
+    input?: unknown;
+    error?: unknown;
+  }>;
 };
 
 /**
@@ -1740,6 +1751,26 @@ function compactValue(value: unknown, depth: number): unknown {
 }
 
 /**
+ * Extract a bounded string message from a `tool-error` part's `error` field for
+ * persistence and history replay. The field may be an `Error`, a string, or an
+ * arbitrary object, so pull a message robustly. The result is passed through
+ * `compactValue` so a very long error honors the SAME truncation limits the file
+ * already applies to tool outputs (no new limit is introduced here).
+ */
+function normalizeToolError(error: unknown): string {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'string'
+        ? error
+        : error != null &&
+            typeof (error as { message?: unknown }).message === 'string'
+          ? (error as { message: string }).message
+          : String(error);
+  return compactValue(message, 0) as string;
+}
+
+/**
  * Rebuild the FULL UIMessage `parts` for an assistant turn from the SDK steps,
  * so multi-turn history replays prior tool-calls/results to the model (not just
  * the final text). Per step we emit the step's text part (if any) followed by a
@@ -1771,6 +1802,14 @@ export function assistantParts(
     for (const r of step.toolResults ?? []) {
       if (r.toolCallId) resultsById.set(r.toolCallId, r.output);
     }
+    // Index this step's THROWN tool failures (ai@6 `tool-error` content parts)
+    // by tool call id, so a call that failed replays with its real error text.
+    const errorsById = new Map<string, unknown>();
+    for (const part of step.content ?? []) {
+      if (part.type === 'tool-error' && part.toolCallId) {
+        errorsById.set(part.toolCallId, part.error);
+      }
+    }
     for (const call of step.toolCalls ?? []) {
       if (!call.toolName || !call.toolCallId) continue;
       const hasResult = resultsById.has(call.toolCallId);
@@ -1783,9 +1822,21 @@ export function assistantParts(
           input: call.input,
           output: compactToolOutput(resultsById.get(call.toolCallId)),
         });
+      } else if (errorsById.has(call.toolCallId)) {
+        // The tool THREW: replay the REAL error so the model on the next turn
+        // knows WHY the call failed (and does not blindly repeat it). An
+        // output-error round-trips through convertToModelMessages as a balanced
+        // tool-call + tool-result, keeping the rebuilt history valid.
+        parts.push({
+          type: `tool-${call.toolName}`,
+          toolCallId: call.toolCallId,
+          state: 'output-error',
+          input: call.input,
+          errorText: normalizeToolError(errorsById.get(call.toolCallId)),
+        });
       } else {
-        // No paired result (e.g. aborted mid-step). Persisting a bare
-        // tool-call (input-available) would replay as an unpaired call and
+        // No paired result AND no tool-error (e.g. aborted mid-step). Persisting
+        // a bare tool-call (input-available) would replay as an unpaired call and
         // throw MissingToolResultsError on the next turn (convertToModelMessages
         // emits no tool-result for it). Emit a SYNTHETIC paired result instead:
         // an output-error round-trips through convertToModelMessages as a
@@ -2021,16 +2072,37 @@ export function serializeSteps(
   steps: ReadonlyArray<{
     toolCalls?: ReadonlyArray<{ toolName?: string; input?: unknown }>;
     toolResults?: ReadonlyArray<{ toolName?: string; output?: unknown }>;
+    content?: ReadonlyArray<{
+      type?: string;
+      toolName?: string;
+      error?: unknown;
+    }>;
   }>,
 ): unknown {
-  const calls: Array<{ toolName?: string; input?: unknown; output?: unknown }> =
-    [];
+  const calls: Array<{
+    toolName?: string;
+    input?: unknown;
+    output?: unknown;
+    error?: string;
+  }> = [];
   for (const step of steps ?? []) {
     for (const call of step.toolCalls ?? []) {
       calls.push({ toolName: call.toolName, input: call.input });
     }
     for (const r of step.toolResults ?? []) {
       calls.push({ toolName: r.toolName, output: compactToolOutput(r.output) });
+    }
+    // ai@6 surfaces a THROWN tool failure as a `tool-error` content part, NOT as
+    // a `toolResults` entry. Record it as its own paired element (mirroring how a
+    // successful result is appended) so the failure and its reason survive in the
+    // trace instead of leaving an orphaned call with no result.
+    for (const part of step.content ?? []) {
+      if (part.type === 'tool-error') {
+        calls.push({
+          toolName: part.toolName,
+          error: normalizeToolError(part.error),
+        });
+      }
     }
   }
   return calls.length > 0 ? calls : null;

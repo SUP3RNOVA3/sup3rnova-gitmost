@@ -148,6 +148,53 @@ describe('assistantParts', () => {
     expect(toolPart).not.toHaveProperty('output');
   });
 
+  it('replays the REAL error text for a THROWN tool (tool-error part)', () => {
+    const steps = [
+      {
+        text: '',
+        toolCalls: [
+          { toolCallId: 'c7', toolName: 'editPageText', input: { id: 'p1' } },
+        ],
+        // A thrown tool is a `tool-error` content part; toolResults holds only
+        // successes and stays empty for this call.
+        toolResults: [],
+        content: [
+          {
+            type: 'tool-error',
+            toolCallId: 'c7',
+            toolName: 'editPageText',
+            input: { id: 'p1' },
+            error: new Error('page is locked'),
+          },
+        ],
+      },
+    ];
+    const parts = assistantParts(steps, '') as AnyPart[];
+    const toolPart = parts.find((p) => p.type === 'tool-editPageText');
+    expect(toolPart).toBeDefined();
+    expect(toolPart!.state).toBe('output-error');
+    // The REAL error is replayed, NOT the 'Tool call did not complete.' placeholder.
+    expect(toolPart!.errorText).toBe('page is locked');
+    expect(toolPart).not.toHaveProperty('output');
+  });
+
+  it('keeps the placeholder ONLY for a call with neither result nor tool-error', () => {
+    const steps = [
+      {
+        text: '',
+        toolCalls: [
+          { toolCallId: 'c8', toolName: 'insertNode', input: { node: {} } },
+        ],
+        toolResults: [],
+        content: [], // aborted mid-step: no result AND no tool-error
+      },
+    ];
+    const parts = assistantParts(steps, '') as AnyPart[];
+    const toolPart = parts.find((p) => p.type === 'tool-insertNode');
+    expect(toolPart!.state).toBe('output-error');
+    expect(toolPart!.errorText).toBe('Tool call did not complete.');
+  });
+
   it('skips malformed tool-calls (missing toolName or toolCallId)', () => {
     const steps = [
       {
@@ -194,6 +241,45 @@ describe('serializeSteps', () => {
     expect(trace).toHaveLength(2);
     expect(trace[0]).toEqual({ toolName: 'getPage', input: { id: 'p1' } });
     expect(trace[1]).toEqual({ toolName: 'getPage', output: { title: 'T' } });
+  });
+
+  it('records a THROWN tool failure (tool-error part) with its error message', () => {
+    const trace = serializeSteps([
+      {
+        toolCalls: [{ toolName: 'editPageText', input: { id: 'p1' } }],
+        toolResults: [],
+        content: [
+          {
+            type: 'tool-error',
+            toolName: 'editPageText',
+            error: new Error('page is locked'),
+          },
+        ],
+      },
+    ]) as Array<Record<string, unknown>>;
+    // The call element is followed by a paired error element (mirroring how a
+    // successful result is appended), so the failure survives in the trace.
+    expect(trace).toHaveLength(2);
+    expect(trace[0]).toEqual({ toolName: 'editPageText', input: { id: 'p1' } });
+    expect(trace[1]).toEqual({
+      toolName: 'editPageText',
+      error: 'page is locked',
+    });
+  });
+
+  it('truncates a very long tool-error message to the tool-output limit', () => {
+    const long = 'x'.repeat(5000);
+    const trace = serializeSteps([
+      {
+        toolCalls: [{ toolName: 'editPageText', input: {} }],
+        toolResults: [],
+        content: [{ type: 'tool-error', toolName: 'editPageText', error: long }],
+      },
+    ]) as Array<Record<string, unknown>>;
+    const errorText = trace[1].error as string;
+    // Truncated (not the full 5000 chars) and carries the omission marker.
+    expect(errorText.length).toBeLessThan(long.length);
+    expect(errorText).toContain('chars omitted');
   });
 });
 
