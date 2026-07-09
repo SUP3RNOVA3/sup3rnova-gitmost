@@ -29,11 +29,13 @@ import { buildSystemPrompt } from './ai-chat.prompt';
 import type { McpClientsService } from './external-mcp/mcp-clients.service';
 
 /**
- * Unit tests for compactToolOutput: the pure helper that shrinks LARGE tool
- * outputs before they are persisted (and re-sent to the provider on later
- * turns). The contract is: small outputs pass through unchanged (by identity);
- * large outputs keep their shape and small scalar fields (id/title/pageId — the
- * client reads these to render citations) while big payloads are truncated.
+ * Unit tests for compactToolOutput: the pure helper that shrinks tool outputs
+ * before they are persisted (and re-sent to the provider on later turns). The
+ * contract is: small and normal outputs — including whole page reads (tens of
+ * KB) — pass through unchanged (by identity); only an output above the high
+ * safety cap (> 200 KB) is compacted, and even then it keeps its shape and
+ * small scalar fields (id/title/pageId — the client reads these to render
+ * citations) while the big payloads are reduced.
  */
 describe('compactToolOutput', () => {
   it('returns a small object unchanged (by identity)', () => {
@@ -42,7 +44,7 @@ describe('compactToolOutput', () => {
   });
 
   it('truncates a large getPage-shaped markdown body but keeps the title', () => {
-    const big = 'x'.repeat(20000);
+    const big = 'x'.repeat(300000);
     const result = compactToolOutput({ title: 'T', markdown: big }) as {
       title: string;
       markdown: string;
@@ -50,15 +52,16 @@ describe('compactToolOutput', () => {
     // Shallow scalar field is preserved (citations depend on it).
     expect(result.title).toBe('T');
     // The big payload is shrunk far below the original size.
-    expect(result.markdown.length).toBeLessThan(20000);
-    expect(result.markdown).toContain('[truncated');
+    expect(result.markdown.length).toBeLessThan(300000);
+    expect(result.markdown).toContain('omitted from stored chat history');
   });
 
   it('caps a long array and appends a single truncation marker', () => {
-    // 200 small objects, each padded so the total serialized size > 4000 bytes.
+    // 200 objects, each padded so the total serialized size
+    // > 200000 bytes (the new safety cap).
     const long = Array.from({ length: 200 }, (_, i) => ({
       id: 'n' + i,
-      pad: 'y'.repeat(40),
+      pad: 'y'.repeat(1200),
     }));
     const result = compactToolOutput(long) as Array<Record<string, unknown>>;
     // 50 kept + 1 marker.
@@ -76,8 +79,8 @@ describe('compactToolOutput', () => {
 
   it('replaces a subtree beyond the depth cap with a marker', () => {
     // Build a deeply nested object (> TOOL_OUTPUT_MAX_DEPTH levels) with a big
-    // string at the bottom so the total serialized size exceeds the threshold.
-    let nested: Record<string, unknown> = { leaf: 'z'.repeat(8000) };
+    // string at the bottom so the total serialized size exceeds the 200 KB cap.
+    let nested: Record<string, unknown> = { leaf: 'z'.repeat(250000) };
     for (let i = 0; i < 20; i++) {
       nested = { child: nested };
     }
@@ -86,7 +89,7 @@ describe('compactToolOutput', () => {
   });
 
   it('produces a much smaller JSON than the original for a large input', () => {
-    const big = 'x'.repeat(20000);
+    const big = 'x'.repeat(300000);
     const original = { title: 'T', markdown: big };
     const result = compactToolOutput(original);
     const originalBytes = Buffer.byteLength(JSON.stringify(original), 'utf8');

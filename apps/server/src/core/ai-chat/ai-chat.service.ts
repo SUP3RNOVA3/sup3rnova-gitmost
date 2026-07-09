@@ -1642,16 +1642,25 @@ type StepLike = {
 /**
  * Compaction tunables for persisted tool OUTPUTS. Read tools (getPage,
  * getPageJson, getNode, diffPageVersions, exportPageMarkdown, ...) return whole
- * pages with no size cap. Their outputs are stored in `metadata.parts` and
- * RE-SENT to the provider on every later turn via convertToModelMessages, so an
- * uncompacted large body grows token cost, latency, and DB row size on every
- * turn. We shrink the big payloads while preserving the object's shape and its
- * small scalar fields (id/title/pageId) the client reads to render citations.
+ * pages. Their outputs are stored in `metadata.parts` and RE-SENT to the
+ * provider on every later turn via convertToModelMessages. We deliberately keep
+ * these outputs FULL up to a high safety cap (MAX_TOOL_OUTPUT_BYTES) so the
+ * model never sees a shortened copy of content it already fetched: an earlier
+ * 4000-byte cap shrank normal page reads (often tens of KB) to a tiny preview,
+ * and the model — seeing a truncation marker in its OWN history — re-read the
+ * same page, wasting tokens. Only a single output LARGER than the cap is
+ * compacted at all, purely as a backstop against a pathological payload; even
+ * then we preserve the object's shape and its small scalar fields
+ * (id/title/pageId) that the client reads to render citations.
  */
-// Only outputs whose JSON serialization exceeds this are compacted at all
-// (fast path: smaller outputs are returned unchanged, by identity).
-const MAX_TOOL_OUTPUT_BYTES = 4000;
-// A string longer than this is truncated to a leading preview.
+// HIGH safety backstop: only an output whose JSON serialization EXCEEDS this is
+// compacted at all. Normal reads (whole pages, tens of KB) stay well under it
+// and are stored + replayed VERBATIM (fast path: returned unchanged, by
+// identity). Only a single pathologically huge output (> 200 KB) is compacted.
+const MAX_TOOL_OUTPUT_BYTES = 200_000;
+// Inside the backstop path only (i.e. once the whole output already exceeded
+// MAX_TOOL_OUTPUT_BYTES), a string longer than this is reduced to a leading
+// preview; normal outputs never reach this branch.
 const TOOL_OUTPUT_STRING_LIMIT = 600;
 // Number of leading characters kept from a truncated string.
 const TOOL_OUTPUT_STRING_PREVIEW = 500;
@@ -1694,9 +1703,9 @@ export function compactToolOutput(output: unknown): unknown {
 function compactValue(value: unknown, depth: number): unknown {
   if (typeof value === 'string') {
     if (value.length > TOOL_OUTPUT_STRING_LIMIT) {
-      return `${value.slice(0, TOOL_OUTPUT_STRING_PREVIEW)}…[truncated ${
+      return `${value.slice(0, TOOL_OUTPUT_STRING_PREVIEW)}…[${
         value.length - TOOL_OUTPUT_STRING_PREVIEW
-      } chars]`;
+      } chars omitted from stored chat history to bound replay size — call the tool again to read the full output]`;
     }
     return value;
   }
