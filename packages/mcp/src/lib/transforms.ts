@@ -14,6 +14,7 @@
  *  - `marks` arrays are preserved verbatim when fragments are split/reordered.
  */
 
+import { normalizeAndMergeFootnotes } from "./footnote-normalize-merge.js";
 import {
   blockPlainText,
   footnoteContentKey,
@@ -766,6 +767,8 @@ export function insertInlineFootnote(
     appendDefinition(working, makeFootnoteDefinition(footnoteId, inline));
   }
 
+  // #419: normalize + merge glyph-forked definitions before canonicalizing.
+  working = normalizeAndMergeFootnotes(working);
   // Derive numbering + the single bottom list deterministically.
   working = canonicalizeFootnotes(working);
   return { doc: working, inserted: true, footnoteId, reused };
