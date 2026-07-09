@@ -39,6 +39,7 @@ const HOST_CONTRACT_METHODS = [
   // read
   "search",
   "getPage",
+  "getPageRaw",
   "getWorkspace",
   "getSpaces",
   "listPages",

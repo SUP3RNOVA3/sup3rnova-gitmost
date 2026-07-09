@@ -6,6 +6,11 @@ import { dirname, join } from "path";
 import { DocmostClient, DocmostMcpConfig } from "./client.js";
 import { parseNodeArg } from "./lib/parse-node-arg.js";
 import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
+import {
+  createCommentSignalTracker,
+  CommentSignalTracker,
+  DEFAULT_COMMENT_SIGNAL_DEBOUNCE_MS,
+} from "./comment-signal.js";
 
 // Re-export the client and its config type so embedding hosts (e.g. the gitmost
 // NestJS server) can `import('@docmost/mcp')` and construct a DocmostClient
@@ -18,6 +23,24 @@ export type { DocmostMcpConfig } from "./client.js";
 // internals directly; it goes through loadDocmostMcp()).
 export { SHARED_TOOL_SPECS } from "./tool-specs.js";
 export type { SharedToolSpec } from "./tool-specs.js";
+
+// Re-export the shared "new comments: N" signal helper (#417) so the in-app
+// layer reads the SAME watermark/debounce/injection-safe line builder off the
+// loaded module (same pattern as SHARED_TOOL_SPECS). Both surfaces then differ
+// only in their per-surface probe + result shaping.
+export {
+  createCommentSignalTracker,
+  buildCommentSignalLine,
+  defangCommentSignalTitle,
+  COMMENT_SIGNAL_EXCLUDED_TOOLS,
+  DEFAULT_COMMENT_SIGNAL_DEBOUNCE_MS,
+} from "./comment-signal.js";
+export type {
+  CommentSignalTracker,
+  CommentSignalProbe,
+  CommentSignalProbeResult,
+  CommentSignalTrackerOptions,
+} from "./comment-signal.js";
 
 // Read version from package.json
 const __filename = fileURLToPath(import.meta.url);
@@ -91,6 +114,67 @@ export function timeToolHandler(
   };
 }
 
+/** Resolve the per-page comment-signal debounce (ms) from the environment,
+ *  falling back to the shared default. A non-positive/unparseable value keeps
+ *  the default so a bad env var can never disable the rate limit. */
+function resolveCommentSignalDebounceMs(): number {
+  const parsed = parseInt(
+    process.env.MCP_COMMENT_SIGNAL_DEBOUNCE_MS ?? "",
+    10,
+  );
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_COMMENT_SIGNAL_DEBOUNCE_MS;
+}
+
+/**
+ * Wrap a tool handler so a passive "new comments: N" line (#417) is APPENDED as
+ * an extra text content element when the session's watermark advances. ADDITIVE
+ * and non-destructive:
+ *  - records the call's `pageId` (if any) into the working set;
+ *  - for a comment tool (list/check/create), the result is tautological, so no
+ *    signal is added and the watermark is advanced instead — the agent just
+ *    consumed the feed, so those comments must not re-signal next call;
+ *  - otherwise it asks the tracker for a line; when there is NONE the ORIGINAL
+ *    result object is returned UNCHANGED (byte-identical no-signal path), and
+ *    when there is one it returns a shallow copy with the extra text element
+ *    pushed onto `content` (the main result is never mutated in place).
+ * Exported so the wrapper contract can be unit-tested without a live transport.
+ */
+export function withCommentSignal(
+  name: string,
+  handler: (...args: any[]) => any,
+  tracker: CommentSignalTracker,
+): (...args: any[]) => Promise<any> {
+  return async (...handlerArgs: any[]) => {
+    const input = handlerArgs[0];
+    const pageId =
+      input && typeof input === "object" ? (input as any).pageId : undefined;
+    tracker.noteWorkingPage(pageId);
+
+    const result = await handler(...handlerArgs);
+
+    if (tracker.isExcludedTool(name)) {
+      tracker.advanceWatermark();
+      return result;
+    }
+    // Only MCP text/content results can carry the extra element; anything else
+    // (should not happen — every tool returns a content array) passes through.
+    if (!result || !Array.isArray((result as any).content)) return result;
+
+    const line = await tracker.maybeSignal(name);
+    if (!line) return result; // no signal => byte-identical original object
+
+    return {
+      ...result,
+      content: [
+        ...(result as any).content,
+        { type: "text" as const, text: line },
+      ],
+    };
+  };
+}
+
 export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   // Pass the whole config union through: the client branches internally on
   // credentials vs. getToken, so both the external /mcp (creds) and the
@@ -115,6 +199,44 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   // name is the registration name (bounded cardinality). When no onMetric is
   // provided (standalone/stdio) the wrapper is a pure pass-through: it still
   // returns the original result and rethrows the original error unchanged.
+  // Passive "new comments: N" signal (#417). Per-SESSION state (this factory runs
+  // once per MCP session — http.ts creates one server + one DocmostClient per
+  // session), so the watermark/working-set/debounce live right next to the
+  // client. REST-only surface => the count source (option 2) is a rate-limited
+  // `listComments` over the working-set pages: the tracker guarantees at most one
+  // list call per page per debounce window, and the page title is fetched ONLY
+  // when there is something to report (count>0), so the steady no-signal cost is
+  // a single list call per page per window and an empty working set => zero calls.
+  const commentSignal = createCommentSignalTracker({
+    debounceMs: resolveCommentSignalDebounceMs(),
+    probe: async (pageId: string, sinceMs: number) => {
+      // Full feed (incl. resolved) so a human's comment on any thread is seen;
+      // count only those created strictly after the watermark.
+      const { items } = await docmostClient.listComments(pageId, true);
+      const count = (items as any[]).filter((c) => {
+        const created = c && c.createdAt ? new Date(c.createdAt).getTime() : NaN;
+        return Number.isFinite(created) && created > sinceMs;
+      }).length;
+      let title: string | undefined;
+      if (count > 0) {
+        // Title labels the signal; untrusted, defanged by the shared builder.
+        // Fetched only on a hit, so the no-signal path never pays for it.
+        try {
+          const page: any = await docmostClient.getPageRaw(pageId);
+          title = page?.title ?? undefined;
+        } catch {
+          // Title is optional — omit it if the page can't be fetched.
+        }
+      }
+      return { count, title };
+    },
+  });
+
+  // Single choke point again: the timing monkeypatch (above) and the new comment
+  // signal wrapper both funnel through server.registerTool, so wrapping HERE adds
+  // the passive signal to EVERY tool result with no per-tool boilerplate. The
+  // signal wrapper is OUTERMOST (it wraps the timed handler) so the probe latency
+  // is never counted as the tool's own `mcp_tool_duration_seconds`.
   const originalRegisterTool = server.registerTool.bind(server) as (
     ...args: any[]
   ) => any;
@@ -122,7 +244,8 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
     const name = args[0] as string;
     const handler = args[args.length - 1];
     const timedHandler = timeToolHandler(name, handler, config.onMetric);
-    return originalRegisterTool(...args.slice(0, -1), timedHandler);
+    const signalledHandler = withCommentSignal(name, timedHandler, commentSignal);
+    return originalRegisterTool(...args.slice(0, -1), signalledHandler);
   };
 
   // Register a tool from the shared, zod-agnostic spec registry. The spec owns
