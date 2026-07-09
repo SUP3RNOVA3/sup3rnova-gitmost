@@ -8,6 +8,7 @@ import {
   applyAnchorInDoc,
   countAnchorMatches,
   getAnchoredText,
+  resolveAnchorSelection,
 } from "../../build/lib/comment-anchor.js";
 
 const COMMENT_ID = "cmt-123";
@@ -307,4 +308,71 @@ test("getAnchoredText spans consecutive text nodes and returns their raw slices"
 test("getAnchoredText returns null when the selection does not anchor", () => {
   const doc = paragraphDoc([{ type: "text", text: "hello world" }]);
   assert.equal(getAnchoredText(doc, "not present"), null);
+});
+
+// ---------------------------------------------------------------------------
+// #408 MARKDOWN-STRIP FALLBACK. A selection copied with inline markdown still
+// carries `**`/`` ` ``/`[t](u)` markers the plain document text lacks. When the
+// verbatim selection anchors nowhere, all four entry points retry with the
+// markdown stripped — consistently, so the suggestion-uniqueness gate stays
+// coherent — while what gets STORED remains the raw document substring.
+// ---------------------------------------------------------------------------
+test("a markdown-styled selection anchors against plain doc text via the strip fallback", () => {
+  const doc = paragraphDoc([{ type: "text", text: "a bold word here" }]);
+  // The agent quoted "**bold** word" from a styled view; the doc is plain text.
+  const sel = "**bold** word";
+  const resolved = resolveAnchorSelection(doc, sel);
+  assert.equal(resolved.found, true, "strip fallback finds the anchor");
+  assert.equal(resolved.normalized, true, "reports the soft-warning flag");
+  assert.equal(canAnchorInDoc(doc, sel), true);
+  assert.equal(countAnchorMatches(doc, sel), 1);
+
+  const ok = applyAnchorInDoc(doc, sel, COMMENT_ID);
+  assert.equal(ok, true);
+  const marked = doc.content[0].content.filter((p) => commentMark(p));
+  assert.equal(marked.map((m) => m.text).join(""), "bold word",
+    "the mark lands on the plain-text span");
+});
+
+test("getAnchoredText stores the RAW doc substring even when matched via the strip fallback", () => {
+  // Doc uses a smart apostrophe; the agent typed ASCII + markdown emphasis.
+  const doc = paragraphDoc([{ type: "text", text: "it’s bold now" }]);
+  const stored = getAnchoredText(doc, "it's **bold**");
+  assert.equal(stored, "it’s bold",
+    "stored selection is the raw document text, not the stripped/ASCII locator");
+});
+
+test("the strip fallback does not flip a raw-unique selection to ambiguous", () => {
+  // "config" appears twice, but the raw phrase "config value" appears once.
+  const doc = {
+    type: "doc",
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "the config value here" }] },
+      { type: "paragraph", content: [{ type: "text", text: "another config here" }] },
+    ],
+  };
+  // Raw phrase is unique -> exactly 1, and no strip happens (nothing to strip).
+  assert.equal(countAnchorMatches(doc, "config value"), 1);
+  assert.equal(resolveAnchorSelection(doc, "config value").normalized, false);
+});
+
+test("EXACT WINS: a raw match short-circuits the strip fallback (count reflects raw)", () => {
+  // A literal "**" run exists raw once; its stripped form would also appear.
+  const doc = paragraphDoc([{ type: "text", text: "use **stars** and stars" }]);
+  // Raw "**stars**" occurs once -> count 1 from the verbatim locator; the
+  // fallback (which would find two "stars") never runs.
+  assert.equal(countAnchorMatches(doc, "**stars**"), 1);
+  assert.equal(resolveAnchorSelection(doc, "**stars**").normalized, false);
+});
+
+test("a markdown selection whose stripped form is ambiguous is counted as ambiguous", () => {
+  const doc = {
+    type: "doc",
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "first config here" }] },
+      { type: "paragraph", content: [{ type: "text", text: "second config here" }] },
+    ],
+  };
+  // Verbatim "**config**" matches nothing; stripped "config" matches twice.
+  assert.equal(countAnchorMatches(doc, "**config**"), 2);
 });

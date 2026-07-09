@@ -548,3 +548,94 @@ test("suggestedText: the stored selection is the doc's RAW typographic substring
   );
   assert.equal(createPayload.suggestedText, "goodbye");
 });
+
+// -----------------------------------------------------------------------------
+// 8) #408: a not-found selection error QUOTES the closest block text so the
+//    model can self-correct instead of blind-retrying.
+// -----------------------------------------------------------------------------
+test("a not-found selection error includes a 'Closest block text' hint", async () => {
+  let createCalls = 0;
+  const { baseURL } = await spawn(async (req, res) => {
+    await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    if (req.url === "/api/pages/info") {
+      sendJson(res, 200, {
+        data: {
+          id: "page-1",
+          content: {
+            type: "doc",
+            content: [
+              { type: "paragraph", content: [{ type: "text", text: "The quick brown fox jumps" }] },
+            ],
+          },
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/create") {
+      createCalls++;
+      sendJson(res, 200, { data: { id: "should-not-happen" } });
+      return;
+    }
+    sendJson(res, 404, { message: "not found" });
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+  await assert.rejects(
+    () => client.createComment("page-1", "body", "inline", "quick brown cat"),
+    /Closest block text: "The quick brown fox jumps"/,
+    "a not-found selection must quote the closest block text",
+  );
+  assert.equal(createCalls, 0, "/comments/create must NOT be called on a miss");
+});
+
+// -----------------------------------------------------------------------------
+// 9) #408: a selection that straddles two blocks gets the explicit
+//    "spans multiple blocks" message instead of a bare not-found.
+// -----------------------------------------------------------------------------
+test("a selection spanning multiple blocks gets the explicit spans-multiple-blocks message", async () => {
+  let createCalls = 0;
+  const { baseURL } = await spawn(async (req, res) => {
+    await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    if (req.url === "/api/pages/info") {
+      sendJson(res, 200, {
+        data: {
+          id: "page-1",
+          content: {
+            type: "doc",
+            content: [
+              { type: "paragraph", content: [{ type: "text", text: "the quick brown" }] },
+              { type: "paragraph", content: [{ type: "text", text: "fox jumps over" }] },
+            ],
+          },
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/create") {
+      createCalls++;
+      sendJson(res, 200, { data: { id: "should-not-happen" } });
+      return;
+    }
+    sendJson(res, 404, { message: "not found" });
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+  await assert.rejects(
+    () => client.createComment("page-1", "body", "inline", "brown fox"),
+    /spans multiple blocks/,
+    "a cross-block selection must report the spans-multiple-blocks hint",
+  );
+  assert.equal(createCalls, 0, "/comments/create must NOT be called on a miss");
+});

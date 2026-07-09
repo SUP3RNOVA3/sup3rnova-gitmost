@@ -92,6 +92,40 @@ export function stripBalancedWrappers(s: string): string {
  * ORIGINAL string is returned so a locator can never normalize down to "" and
  * match everything.
  */
+/**
+ * Build a bounded "closest text" hint for an anchor/find MISS, shared by
+ * edit_page_text (json-edit) and create_comment (client) so both surface the
+ * same self-correction affordance.
+ *
+ * Take the longest whitespace-delimited token (>= 3 chars) of the locator
+ * (markdown-stripped first, so `**bold**` contributes `bold`), find the FIRST
+ * of `blockTexts` that contains it, and return ` Closest block text: "…".` with
+ * the block quoted (truncated to 120 code points + ellipsis). Returns "" when
+ * no token qualifies or no block contains it, so the caller can append it
+ * unconditionally.
+ */
+export function closestBlockHint(
+  blockTexts: string[],
+  locator: string,
+): string {
+  if (typeof locator !== "string" || locator.length === 0) return "";
+  const stripped = stripInlineMarkdown(locator);
+  const tokenSource = stripped.length > 0 ? stripped : locator;
+  const longestToken = tokenSource
+    .split(/\s+/)
+    .filter((t) => t.length >= 3)
+    .sort((a, b) => b.length - a.length)[0];
+  if (!longestToken) return "";
+  const hitBlock = blockTexts.find((plain) => plain.includes(longestToken));
+  if (!hitBlock) return "";
+  // Truncate by code point (spread iterates by code point) so a surrogate pair
+  // is never split; append the ellipsis only when the text was actually longer.
+  const points = [...hitBlock];
+  const snippet =
+    points.length > 120 ? points.slice(0, 120).join("") + "…" : hitBlock;
+  return ` Closest block text: "${snippet}".`;
+}
+
 export function stripInlineMarkdown(s: string): string {
   if (typeof s !== "string" || s.length === 0) return s;
 

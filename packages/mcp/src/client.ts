@@ -40,6 +40,7 @@ import {
   deleteNodeById,
   assertUnambiguousMatch,
   insertNodeRelative,
+  blockPlainText,
   buildOutline,
   getNodeByRef,
   readTable,
@@ -59,10 +60,12 @@ import { getCollabToken, performLogin } from "./lib/auth-utils.js";
 import { diffDocs, summarizeChange } from "./lib/diff.js";
 import {
   applyAnchorInDoc,
-  canAnchorInDoc,
   countAnchorMatches,
   getAnchoredText,
+  resolveAnchorSelection,
+  normalizeForMatch,
 } from "./lib/comment-anchor.js";
+import { closestBlockHint } from "./lib/text-normalize.js";
 import {
   blockText,
   walk,
@@ -2474,6 +2477,64 @@ export class DocmostClient {
     };
   }
 
+  /** Plain text of each TOP-LEVEL block of `doc`, for anchor-failure hints. */
+  private topLevelBlockTexts(doc: any): string[] {
+    const content = doc && Array.isArray(doc.content) ? doc.content : [];
+    return content
+      .map((b: any) => blockPlainText(b))
+      .filter((t: string) => t.length > 0);
+  }
+
+  /**
+   * True when per-block anchoring failed but the (normalized) selection DOES
+   * appear in the blocks' joined plain text — i.e. it straddles a block
+   * boundary. Blocks are joined with a newline (collapsed to one space by
+   * normalizeForMatch) so a selection whose parts are separated by a paragraph
+   * break still matches. Callers only reach here after single-block anchoring
+   * (incl. the markdown-strip fallback) has already failed.
+   */
+  private selectionSpansMultipleBlocks(
+    blockTexts: string[],
+    selection: string,
+  ): boolean {
+    const normSel = normalizeForMatch(selection).norm.trim();
+    if (normSel.length === 0) return false;
+    const joined = normalizeForMatch(blockTexts.join("\n")).norm;
+    return joined.indexOf(normSel) !== -1;
+  }
+
+  /**
+   * Build the actionable error for a create_comment anchor MISS, porting
+   * edit_page_text's self-correction affordances: an explicit "spans multiple
+   * blocks" message when the selection straddles a block boundary, otherwise a
+   * "closest block text" hint quoting the block that holds the selection's
+   * longest token. `live` switches the wording between the pre-check (reading the
+   * persisted page) and the post-create live-anchor failure (which rolls back).
+   */
+  private anchorNotFoundError(
+    doc: any,
+    selection: string,
+    live: boolean,
+  ): Error {
+    const blockTexts = this.topLevelBlockTexts(doc);
+    const rolled = live ? " The comment was rolled back." : "";
+    if (this.selectionSpansMultipleBlocks(blockTexts, selection)) {
+      return new Error(
+        "create_comment: the selection spans multiple blocks; anchor on a " +
+          "contiguous fragment within a SINGLE paragraph/block (<=250 chars)." +
+          rolled,
+      );
+    }
+    const where = live ? "in the live document" : "in the page";
+    return new Error(
+      `create_comment: could not find the selection text ${where} to anchor ` +
+        "the comment. Provide the EXACT contiguous text from a single " +
+        "paragraph/block (<=250 chars)." +
+        closestBlockHint(blockTexts, selection) +
+        rolled,
+    );
+  }
+
   /**
    * Create an inline comment anchored to its `selection` text, or a reply.
    *
@@ -2535,6 +2596,10 @@ export class DocmostClient {
     // Captured in the pre-check below (which already reads the page) and used as
     // payload.selection. Ordinary comments keep sending the raw agent selection.
     let anchoredSelection: string | null = null;
+    // Set when the anchor matched only after stripping markdown from the
+    // selection (the strip fallback); surfaced as a soft warning like
+    // edit_page_text does, so a stale-markdown selection is flagged.
+    let anchorNormalized = false;
 
     // For a top-level comment, fail BEFORE creating anything when the selection
     // is not present in the persisted document — this avoids leaving an orphan
@@ -2550,10 +2615,7 @@ export class DocmostClient {
           // rejected BEFORE creating the comment.
           const matches = countAnchorMatches(page.content, selection);
           if (matches === 0) {
-            throw new Error(
-              "create_comment: could not find the selection text in the page to anchor the comment. " +
-                "Provide the EXACT contiguous text from a single paragraph/block (<=250 chars).",
-            );
+            throw this.anchorNotFoundError(page.content, selection, false);
           }
           if (matches >= 2) {
             throw new Error(
@@ -2567,18 +2629,27 @@ export class DocmostClient {
           // null despite countAnchorMatches===1 (shouldn't happen), fall back to
           // the raw agent selection below rather than crash.
           anchoredSelection = getAnchoredText(page.content, selection);
-        } else if (!canAnchorInDoc(page.content, selection)) {
-          throw new Error(
-            "create_comment: could not find the selection text in the page to anchor the comment. " +
-              "Provide the EXACT contiguous text from a single paragraph/block (<=250 chars).",
-          );
+          anchorNormalized = resolveAnchorSelection(
+            page.content,
+            selection,
+          ).normalized;
+        } else {
+          const resolved = resolveAnchorSelection(page.content, selection);
+          if (!resolved.found) {
+            throw this.anchorNotFoundError(page.content, selection, false);
+          }
+          anchorNormalized = resolved.normalized;
         }
       } catch (e) {
-        // Rethrow our own "not found"/"ambiguous" errors; swallow read/network
-        // errors so the live anchor step can still try (and enforce) anchoring.
+        // Rethrow our own "not found"/"ambiguous"/"spans multiple blocks" errors;
+        // swallow read/network errors so the live anchor step can still try (and
+        // enforce) anchoring.
         if (
           e instanceof Error &&
           (e.message.startsWith("create_comment: could not find the selection") ||
+            e.message.startsWith(
+              "create_comment: the selection spans multiple blocks",
+            ) ||
             e.message.startsWith(
               "create_comment: the suggestion's selection is ambiguous",
             ))
@@ -2650,6 +2721,10 @@ export class DocmostClient {
     // Set inside the transform when a suggestion's live anchor is ambiguous
     // (>=2 occurrences), so the rollback path can surface the right error.
     let ambiguousInLiveDoc = false;
+    // Captured inside the transform on a not-found abort, so the rollback path
+    // can surface the closest-block / spans-multiple-blocks hint built from the
+    // LIVE document (the pre-check page is not in scope there).
+    let liveNotFoundError: Error | null = null;
     try {
       const collabToken = await this.getCollabTokenWithReauth();
       // Open the collab doc by the canonical UUID, never the slugId (#260). The
@@ -2677,6 +2752,13 @@ export class DocmostClient {
             const liveCount = countAnchorMatches(doc, selection as string);
             if (liveCount !== 1) {
               ambiguousInLiveDoc = liveCount >= 2;
+              if (liveCount === 0) {
+                liveNotFoundError = this.anchorNotFoundError(
+                  doc,
+                  selection as string,
+                  true,
+                );
+              }
               return null;
             }
           }
@@ -2686,6 +2768,11 @@ export class DocmostClient {
           }
           // Selection text not found in the LIVE document: abort the write. The
           // rollback + throw below turns this into a hard error.
+          liveNotFoundError = this.anchorNotFoundError(
+            doc,
+            selection as string,
+            true,
+          );
           return null;
         },
       );
@@ -2702,11 +2789,26 @@ export class DocmostClient {
       // suggestion, was ambiguous) in the live document. Roll back the comment
       // and surface a hard error.
       await this.safeDeleteComment(newCommentId);
-      throw new Error(
-        ambiguousInLiveDoc
-          ? "create_comment: the suggestion's selection is ambiguous in the live document (multiple occurrences); the comment was rolled back. Expand the selection with surrounding context so it is unique."
-          : "create_comment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
+      if (ambiguousInLiveDoc) {
+        throw new Error(
+          "create_comment: the suggestion's selection is ambiguous in the live document (multiple occurrences); the comment was rolled back. Expand the selection with surrounding context so it is unique.",
+        );
+      }
+      throw (
+        liveNotFoundError ??
+        new Error(
+          "create_comment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
+        )
       );
+    }
+
+    // Soft warning (like edit_page_text): the selection only matched after
+    // stripping markdown, so the caller likely quoted a styled fragment.
+    if (anchorNormalized) {
+      result.warning =
+        "The selection matched only after stripping markdown syntax; the comment " +
+        "was anchored on the document's plain text. Copy the selection verbatim " +
+        "from get_page / search_in_page output to avoid this.";
     }
 
     result.anchored = true;
