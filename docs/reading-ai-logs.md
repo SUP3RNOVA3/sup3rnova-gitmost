@@ -63,13 +63,17 @@ index 0: { "toolName": "getPage",  "input":  { "pageId": "…" } }   ← tool-ca
 index 1: { "toolName": "getPage",  "output": { … } }                ← tool-result (has output, NO input)
 ```
 
-The **only** keys that ever appear on an element are `toolName`, `input`, `output`.
-There is no `state`, no `errorText`, no `type`. Consequences:
+The keys that appear on an element are `toolName`, `input`, `output`, and — for a
+**thrown** failure on rows written after the #407 fix — `error` (the tool's error
+message; see the "Hard failures" section below). There is no `state`, no `errorText`,
+no `type`. On pre-#407 rows a thrown failure has NO paired result element at all
+(silent orphan). Consequences:
 
-1. **Real invocation count = elements that have `output`.** Counting every element
-   double-counts (you get ~2× and a spurious "~50% of every tool has no output").
-2. **Pairing:** a successful call = a `tool-call` part followed by its `tool-result`
-   part. Both carry `toolName`, so you can group by tool on either.
+1. **Real invocation count = elements that have `output` or `error`.** Counting every
+   element double-counts (you get ~2× and a spurious "~50% of every tool has no output").
+2. **Pairing:** a call = a `tool-call` part followed by its result part. A success
+   carries `output`; a thrown failure (post-#407) carries `error` instead. Both carry
+   `toolName`, so you can group by tool on either.
 
 ## The two classes of failure (and which the DB can see)
 
