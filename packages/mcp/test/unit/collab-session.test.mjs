@@ -210,6 +210,34 @@ test("a pending write resolves when the server acks (unsyncedChanges -> 0)", asy
   assert.ok(r.doc);
 });
 
+test("concurrent mutate on one session: the second rejects, the first is unaffected", async () => {
+  __setCollabProviderFactory(factory({ unsynced: 1 })); // first stays pending after write
+  const session = await acquireCollabSession("page-1", "tok", "http://h/api");
+  // First mutate: write happens synchronously, persistence ack still pending.
+  const first = session.mutate(() => docWith("first"));
+  // Second overlapping mutate on the SAME session must fail fast.
+  await assert.rejects(
+    session.mutate(() => docWith("second")),
+    /mutate already in-flight; caller must serialize \(hold the page lock\)/,
+  );
+  // The first op is untouched: its rejector was not clobbered. Ack it now.
+  FakeProvider.last()._ack();
+  const r = await first;
+  assert.ok(r.doc, "the first in-flight mutate still resolves on its own ack");
+  assert.equal(FakeProvider.connectCount, 1, "no reconnect from the rejected overlap");
+});
+
+test("sequential mutates on one session both succeed (the guard doesn't break serialized use)", async () => {
+  const session = await acquireCollabSession("page-1", "tok", "http://h/api");
+  // Await the first fully, then run the second: inflightReject was cleared by
+  // localFinish before the first settled, so the guard is clear for the second.
+  const r1 = await session.mutate(() => docWith("one"));
+  assert.ok(r1.doc, "first sequential mutate resolves");
+  const r2 = await session.mutate(() => docWith("two"));
+  assert.ok(r2.doc, "second sequential mutate resolves — guard not tripped");
+  assert.equal(FakeProvider.connectCount, 1, "sequential mutates reuse one provider");
+});
+
 test("connect timeout rejects with the connect-timeout text and fires the metric hook", async () => {
   mock.timers.enable({ apis: ["setTimeout"] });
   __setCollabProviderFactory(factory({ autoSync: false }));

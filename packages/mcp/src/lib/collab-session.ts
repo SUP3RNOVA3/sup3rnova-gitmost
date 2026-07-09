@@ -309,6 +309,14 @@ export class CollabSession {
    * unsyncedChanges is already 0, else wait for the unsyncedChanges->0 event
    * (PERSIST_TIMEOUT_MS), guarded by connectionLost so a reconnect handshake
    * cannot report a false success.
+   *
+   * CONCURRENCY: not safe to invoke concurrently on ONE session — the caller
+   * MUST serialize (hold the per-page lock), mirroring acquireCollabSession.
+   * The in-flight op is tracked in a single `inflightReject` field, so an
+   * overlapping second call would clobber the first's rejector and leave it
+   * hanging on disconnect. A fail-fast guard below rejects the overlap instead.
+   * Sequential (awaited) mutates are fine: localFinish clears inflightReject
+   * before the promise settles, so the guard is clear by the time the next runs.
    */
   mutate(
     transform: (liveDoc: any) => any | null,
@@ -324,6 +332,18 @@ export class CollabSession {
     ) {
       return Promise.reject(
         new Error("Collaboration session is not in a ready state"),
+      );
+    }
+
+    // Fail-fast on concurrent use: a second overlapping mutate would overwrite
+    // the first's inflightReject, so a disconnect would only reject the second
+    // and hang the first until PERSIST_TIMEOUT_MS. Reject the overlap WITHOUT
+    // touching the in-flight op's state (no localFinish/teardown here).
+    if (this.inflightReject) {
+      return Promise.reject(
+        new Error(
+          "mutate already in-flight; caller must serialize (hold the page lock)",
+        ),
       );
     }
 
