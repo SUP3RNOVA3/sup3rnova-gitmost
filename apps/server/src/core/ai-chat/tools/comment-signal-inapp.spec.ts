@@ -182,6 +182,80 @@ describe('wrapToolsWithCommentSignal (in-app non-destructive delivery)', () => {
     expect(signalLineOf(searchModel)).toBe(line);
     expect(signalLineOf(createModel)).toBe(line);
   });
+
+  it("COMPOSES a tool's OWN toModelOutput (text base): no-signal honors it verbatim; signal appends", async () => {
+    const original = { raw: 'data' };
+    // A tool that ships a CUSTOM toModelOutput (a text shape, not the SDK json
+    // default). The wrapper must honor it, not overwrite it with json(output).
+    const custom: Tool = {
+      description: 'x',
+      inputSchema: {},
+      execute: async () => original,
+      toModelOutput: () => ({ type: 'text' as const, value: 'CUSTOM' }),
+    } as unknown as Tool;
+
+    // No-signal path: the wrapper returns the tool's own base verbatim.
+    const noSig = wrapToolsWithCommentSignal({ getPage: custom }, fakeTracker(null));
+    const { output: o1, model: m1 } = await run(noSig.getPage, { pageId: 'p1' });
+    expect(o1).toBe(original); // part.output still RAW execute result
+    expect(m1).toEqual({ type: 'text', value: 'CUSTOM' });
+
+    // Signal path: the base parts are preserved AND the signal is appended, in
+    // order — both present.
+    const line =
+      '[signal] new comments: 4 on page p1 — call listComments(pageId) for details';
+    const sig = wrapToolsWithCommentSignal({ getPage: custom }, fakeTracker(line));
+    const { output: o2, model: m2 } = await run(sig.getPage, { pageId: 'p1' });
+    expect(o2).toBe(original); // part.output unchanged by the signal
+    const mm = m2 as { type: string; value: Array<{ type: string; text: string }> };
+    expect(mm.type).toBe('content');
+    expect(mm.value[0]).toEqual({ type: 'text', text: 'CUSTOM' }); // base kept
+    expect(mm.value[mm.value.length - 1]).toEqual({ type: 'text', text: line });
+    expect(mm.value).toHaveLength(2);
+  });
+
+  it("COMPOSES a tool's OWN toModelOutput (content base): base parts survive, signal appended after", async () => {
+    const original = { raw: 'data' };
+    // A custom toModelOutput already returning a multi-part `content` shape.
+    const custom: Tool = {
+      description: 'x',
+      inputSchema: {},
+      execute: async () => original,
+      toModelOutput: () => ({
+        type: 'content' as const,
+        value: [
+          { type: 'text' as const, text: 'part-A' },
+          { type: 'text' as const, text: 'part-B' },
+        ],
+      }),
+    } as unknown as Tool;
+
+    // No-signal path: content base returned verbatim.
+    const noSig = wrapToolsWithCommentSignal({ getPage: custom }, fakeTracker(null));
+    const { model: m1 } = await run(noSig.getPage, { pageId: 'p1' });
+    expect(m1).toEqual({
+      type: 'content',
+      value: [
+        { type: 'text', text: 'part-A' },
+        { type: 'text', text: 'part-B' },
+      ],
+    });
+
+    // Signal path: both original parts survive (spread), signal appended last.
+    const line =
+      '[signal] new comments: 1 on page p1 — call listComments(pageId) for details';
+    const sig = wrapToolsWithCommentSignal({ getPage: custom }, fakeTracker(line));
+    const { output, model: m2 } = await run(sig.getPage, { pageId: 'p1' });
+    expect(output).toBe(original);
+    expect(m2).toEqual({
+      type: 'content',
+      value: [
+        { type: 'text', text: 'part-A' },
+        { type: 'text', text: 'part-B' },
+        { type: 'text', text: line },
+      ],
+    });
+  });
 });
 
 describe('AiChatToolsService forUser + comment signal (real tracker)', () => {

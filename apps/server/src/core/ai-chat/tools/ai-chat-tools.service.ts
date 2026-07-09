@@ -881,6 +881,13 @@ export class AiChatToolsService {
  * A per-`toolCallId` map bridges `execute` -> `toModelOutput` (both receive the
  * toolCallId), so parallel tool calls never cross-talk. Exported for unit
  * testing without a live model/transport.
+ *
+ * NOTE for future tool authors: this wrapper OWNS `toModelOutput` on every
+ * wrapped tool, but it COMPOSES rather than discards a tool's OWN
+ * `toModelOutput`. If a tool defines one, it is used as the base model output
+ * (honored verbatim on the no-signal path; flattened and kept, with the signal
+ * appended, on the signal path). A custom `toModelOutput` is therefore never
+ * silently dropped.
  */
 export function wrapToolsWithCommentSignal(
   tools: Record<string, Tool>,
@@ -901,8 +908,39 @@ export function wrapToolsWithCommentSignal(
       ? { type: 'text' as const, value: output }
       : { type: 'json' as const, value: (output ?? null) as unknown };
 
+  // Flatten a BASE model-output (the tool's OWN toModelOutput result, or the SDK
+  // default) into SDK `content` parts, so the passive signal can be appended as a
+  // trailing text element WITHOUT discarding the base. Covers the three real SDK
+  // shapes (text/json/content); falls back defensively for anything else. Every
+  // returned item is a valid SDK content item (text, or a file part spread from
+  // an existing `content` base).
+  const modelOutputToParts = (base: unknown, rawOutput: unknown): unknown[] => {
+    const b = base as { type?: string; value?: unknown };
+    if (b?.type === 'text') {
+      return [{ type: 'text' as const, text: b.value as string }];
+    }
+    if (b?.type === 'json') {
+      // `?? null` keeps this symmetric with the fallback branch below: a tool that
+      // (invalidly) returns {type:'json', value:undefined} would otherwise yield a
+      // non-string text. No current tool defines toModelOutput, so this is defensive.
+      return [{ type: 'text' as const, text: JSON.stringify(b.value ?? null) }];
+    }
+    if (b?.type === 'content' && Array.isArray(b.value)) {
+      return [...b.value];
+    }
+    return [
+      { type: 'text' as const, text: JSON.stringify(b?.value ?? rawOutput ?? null) },
+    ];
+  };
+
   for (const [name, toolDef] of Object.entries(tools)) {
     const originalExecute = toolDef.execute;
+    // Capture the tool's OWN toModelOutput (if any) BEFORE we install ours. The
+    // comment-signal wrapper OWNS `toModelOutput` on the wrapped tool, but it
+    // COMPOSES rather than discards a tool-defined one: the base model output is
+    // computed from `origToModelOutput` when present (see below), so a future
+    // tool that ships its own `toModelOutput` is honored, not silently dropped.
+    const origToModelOutput = toolDef.toModelOutput;
     if (typeof originalExecute !== 'function') {
       wrapped[name] = toolDef;
       continue;
@@ -946,7 +984,9 @@ export function wrapToolsWithCommentSignal(
         return result;
       }) as Tool['execute'],
       // Model-only delivery: append the signal as a SEPARATE content element,
-      // leaving the streamed/persisted `output` untouched (mirrors MCP).
+      // leaving the streamed/persisted `output` untouched (mirrors MCP). This
+      // OWNS toModelOutput but COMPOSES the tool's own (origToModelOutput) into
+      // the base, so a custom toModelOutput is honored on BOTH paths.
       toModelOutput: ((info: {
         toolCallId?: string;
         input?: unknown;
@@ -960,16 +1000,22 @@ export function wrapToolsWithCommentSignal(
         if (typeof toolCallId === 'string' && line !== undefined) {
           pendingSignals.delete(toolCallId);
         }
-        if (!line) return defaultModelOutput(output);
-        // Signal present: the raw result as one text element + the signal as a
-        // second — the model sees BOTH, and the model must NOT dig under a
-        // `.result` wrapper (the raw shape is unchanged).
-        const base =
-          typeof output === 'string' ? output : JSON.stringify(output ?? null);
+        // BASE = the authoritative model-facing representation of THIS tool's
+        // result: the tool's own toModelOutput when it defined one, else the
+        // reproduced SDK default (string -> text, else json).
+        const base = origToModelOutput
+          ? (origToModelOutput as (i: unknown) => unknown)(info)
+          : defaultModelOutput(output);
+        // No signal: return the BASE unchanged — byte-identical to what the SDK
+        // (or the tool's own toModelOutput) would have produced.
+        if (!line) return base;
+        // Signal present: flatten BASE into content parts, then append the
+        // signal as a trailing text element — the model sees BOTH the tool's own
+        // model output AND the signal, with no `.result` wrapper to dig under.
         return {
           type: 'content' as const,
           value: [
-            { type: 'text' as const, text: base },
+            ...modelOutputToParts(base, output),
             { type: 'text' as const, text: line },
           ],
         };
