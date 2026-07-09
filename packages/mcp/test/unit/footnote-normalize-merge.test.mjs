@@ -149,6 +149,52 @@ test("marks are kept on merged (surviving) definition text", () => {
   assert.equal(defText(defs(out)[0]), '"x"');
 });
 
+// --- Inline code is verbatim (not typography) ------------------------------
+
+test("text inside a code mark is left verbatim; prose in the same def is normalized", () => {
+  const d = doc(
+    para(ref("A")),
+    list({
+      type: "footnoteDefinition",
+      attrs: { id: "A" },
+      content: [
+        para(
+          txt("a—b «x»", [{ type: "code" }]),
+          txt(" prose «y» — z"),
+        ),
+      ],
+    }),
+  );
+  const out = normalizeAndMergeFootnotes(d);
+  const nodes = findAll(defs(out)[0], "text");
+  // Code node: byte-for-byte unchanged (typography preserved).
+  assert.equal(nodes[0].text, "a—b «x»");
+  // Prose node: dashes/quotes normalized to ASCII.
+  assert.equal(nodes[1].text, ' prose "y" - z');
+});
+
+test("two notes differing ONLY by glyphs inside a code mark do NOT merge", () => {
+  const d = doc(
+    para(ref("A"), ref("B")),
+    list(
+      def("A", txt("«x»", [{ type: "code" }]), txt(" same prose «q»")),
+      def("B", txt('"x"', [{ type: "code" }]), txt(" same prose «q»")),
+    ),
+  );
+  const out = normalizeAndMergeFootnotes(d);
+  // Prose is identical after normalization, but the code literals differ raw
+  // -> the merge key diverges -> both definitions survive, no re-hang.
+  assert.deepEqual(refIds(out), ["A", "B"]);
+  assert.deepEqual(defIds(out), ["A", "B"]);
+  // Each code literal stays verbatim.
+  assert.equal(defs(out)[0].content[0].content[0].text, "«x»");
+  assert.equal(defs(out)[1].content[0].content[0].text, '"x"');
+  // Both survive canonicalization (neither is an orphan).
+  const canon = canonicalizeFootnotes(out);
+  assert.deepEqual(defIds(canon), ["A", "B"]);
+  assert.deepEqual(refIds(canon), ["A", "B"]);
+});
+
 // --- Composition with the canonicalizer ------------------------------------
 
 test("pass + canonicalize: single tail list and sequential numbering", () => {

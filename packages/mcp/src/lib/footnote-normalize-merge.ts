@@ -137,14 +137,29 @@ function collectDefinitions(node: any, out: any[]): void {
 function normalizeDefinitionText(def: any): void {
   const textNodes: any[] = [];
   collectTextNodes(def, textNodes);
-  for (const t of textNodes) t.text = normalizeAndCollapse(t.text);
+  for (const t of textNodes) {
+    // Skip text carrying a `code` mark: inline code is a verbatim literal, not
+    // prose typography. Rewriting quotes/dashes/special-spaces there would
+    // corrupt the literal's meaning (a string literal, an em-dash flag, i18n).
+    // Leaving it untouched also makes it contribute its RAW text to
+    // `footnoteMergeKey`, so two notes differing only by glyphs inside code
+    // stay distinct (while prose glyph-forks still merge). See #419.
+    if ((t.marks || []).some((m: any) => m?.type === "code")) continue;
+    t.text = normalizeAndCollapse(t.text);
+  }
   if (textNodes.length === 0) return;
+  const hasCodeMark = (t: any): boolean =>
+    (t.marks || []).some((m: any) => m?.type === "code");
   const first = textNodes[0];
-  const startTrimmed = first.text.replace(/^ +/, "");
-  if (startTrimmed !== "") first.text = startTrimmed;
+  if (!hasCodeMark(first)) {
+    const startTrimmed = first.text.replace(/^ +/, "");
+    if (startTrimmed !== "") first.text = startTrimmed;
+  }
   const last = textNodes[textNodes.length - 1];
-  const endTrimmed = last.text.replace(/ +$/, "");
-  if (endTrimmed !== "") last.text = endTrimmed;
+  if (!hasCodeMark(last)) {
+    const endTrimmed = last.text.replace(/ +$/, "");
+    if (endTrimmed !== "") last.text = endTrimmed;
+  }
 }
 
 /** Rewrite `footnoteReference` ids IN PLACE using `defIdToCanon` (deep). */
