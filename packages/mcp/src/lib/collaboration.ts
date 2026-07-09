@@ -14,7 +14,7 @@ import { JSDOM } from "jsdom";
 import { markdownToProseMirror } from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
-import { sanitizeForYjs, findUnstorableAttr } from "./node-ops.js";
+import { sanitizeForYjs, findUnstorableAttr } from "@docmost/prosemirror-markdown";
 import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 import { summarizeChange, VerifyReport } from "./diff.js";
 

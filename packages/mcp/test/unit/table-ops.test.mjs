@@ -6,7 +6,7 @@ import {
   insertTableRow,
   deleteTableRow,
   updateTableCell,
-} from "../../build/lib/node-ops.js";
+} from "@docmost/prosemirror-markdown";
 
 // ---------------------------------------------------------------------------
 // Builders. Tables/rows/cells carry NO attrs.id — only the paragraph inside a

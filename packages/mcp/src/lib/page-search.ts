@@ -33,7 +33,7 @@
 
 import RE2 from "re2";
 
-import { blockPlainText } from "./node-ops.js";
+import { blockPlainText } from "@docmost/prosemirror-markdown";
 
 /** An RE2 regex instance (RE2 extends `RegExp`, so it is usable as one). */
 type Re2Regex = InstanceType<typeof RE2>;

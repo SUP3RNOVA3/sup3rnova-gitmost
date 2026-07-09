@@ -46,7 +46,7 @@ import {
   insertTableRow,
   deleteTableRow,
   updateTableCell,
-} from "./lib/node-ops.js";
+} from "@docmost/prosemirror-markdown";
 import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
 import {
