@@ -3,6 +3,30 @@ import type { McpServerInstruction } from './external-mcp/mcp-clients.service';
 import type { ToolCatalogEntry } from './tools/tool-tiers';
 
 /**
+ * The in-app tool names this prompt refers to BY NAME in its guidance notes
+ * (issue #448). Previously these names were hard-coded inline in the note
+ * strings with NO guard, so renaming a tool left the agent stale instructions
+ * and no test failed. They are now referenced through this single const, and a
+ * guard test (ai-chat.prompt.tool-names.spec.ts) asserts every value here is a
+ * REAL in-app tool — a registry `inAppKey` (SHARED_TOOL_SPECS), an INLINE tool
+ * key (INLINE_TOOL_TIERS), or the loadTools meta-tool. Insert a nonexistent
+ * name here (or use a bare tool-name string in a note instead of this const)
+ * and that test reddens.
+ *
+ * `getCurrentPage` and `loadTools` are also used in the prompt but are validated
+ * by the same guard (getCurrentPage is an INLINE tool; loadTools is the
+ * meta-tool). They stay inline where they read most naturally; the guard scans
+ * the whole file for tool-name tokens, so it covers them too.
+ */
+export const PROMPT_TOOL_NAMES = {
+  getPage: 'getPage',
+  editPageText: 'editPageText',
+  patchNode: 'patchNode',
+  insertNode: 'insertNode',
+  deleteNode: 'deleteNode',
+} as const;
+
+/**
  * Default agent persona used when the admin has not configured a custom system
  * prompt (`settings.ai.provider.systemPrompt`).
  */
@@ -91,15 +115,15 @@ const PAGE_CHANGED_NOTE =
   'NOTE: The user edited the open page AFTER your last response in this ' +
   'conversation, so any copy of that page you produced or remember from earlier ' +
   'is now STALE and must not be reused. Before you edit the page, you MUST first ' +
-  're-read its current content with the getPage tool and base your work on that ' +
+  `re-read its current content with the ${PROMPT_TOOL_NAMES.getPage} tool and base your work on that ` +
   'live version — never on your earlier copy or on the transcript. The unified ' +
   'diff below shows exactly what the user changed since you last spoke (lines ' +
   'starting with "-" were removed, "+" were added) and is the source of truth. ' +
   'Preserve every one of the user\'s edits: make the smallest change that ' +
-  'satisfies the request using the targeted edit tools (editPageText, patchNode, ' +
-  'insertNode, deleteNode) rather than replacing the whole page, and do not ' +
-  'revert, drop, or overwrite anything the user changed. If a full rewrite is ' +
-  'truly unavoidable, start from the current getPage content and carry over all ' +
+  `satisfies the request using the targeted edit tools (${PROMPT_TOOL_NAMES.editPageText}, ${PROMPT_TOOL_NAMES.patchNode}, ` +
+  `${PROMPT_TOOL_NAMES.insertNode}, ${PROMPT_TOOL_NAMES.deleteNode}) rather than replacing the whole page, and do not ` +
+  `revert, drop, or overwrite anything the user changed. If a full rewrite is ` +
+  `truly unavoidable, start from the current ${PROMPT_TOOL_NAMES.getPage} content and carry over all ` +
   'of the user\'s edits.';
 
 /**

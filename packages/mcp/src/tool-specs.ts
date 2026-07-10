@@ -14,10 +14,15 @@
 // some write tools, different limits, hybrid-RRF search, etc.) stay defined
 // per-layer and are NOT represented here.
 //
-// MAINTENANCE RULE: adding, renaming, or removing a spec here (or an inline
-// registerTool in index.ts) REQUIRES updating SERVER_INSTRUCTIONS in
-// packages/mcp/src/index.ts — the intent-routing guide MCP clients receive on
-// initialize. Enforced by test/unit/server-instructions.test.mjs.
+// SERVER_INSTRUCTIONS note (issue #448): the intent-routing guide MCP clients
+// receive on initialize is now SPLIT — its tool INVENTORY is GENERATED from this
+// registry (mcpName + catalogLine) by server-instructions.ts, so adding /
+// renaming / removing a spec here updates the guide's inventory AUTOMATICALLY;
+// no prose edit is needed. Only an INLINE MCP-only tool (registerTool in
+// index.ts, not a spec here) needs a hand-written line in INLINE_MCP_INVENTORY —
+// enforced by test/unit/tool-inventory.test.mjs. The routing PROSE (the "when to
+// use what" hints) in server-instructions.ts stays manual, but it is no longer a
+// drift-guard for the tool set.
 
 // Loose on purpose — see the comment above. The two zod majors expose different
 // static type surfaces, so typing this precisely would couple the registry to
