@@ -552,16 +552,18 @@ export class DocmostClient {
     // forever and accumulate duplicates).
     const MAX_PAGES = 50;
 
-    let page = 1;
+    let cursor: string | undefined;
     let allItems: T[] = [];
-    let hasNextPage = true;
+    let truncated = false;
 
-    while (hasNextPage && page <= MAX_PAGES) {
-      const response = await this.client.post(endpoint, {
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const payload: Record<string, any> = {
         ...basePayload,
         limit: clampedLimit,
-        page,
-      });
+      };
+      if (cursor) payload.cursor = cursor;
+
+      const response = await this.client.post(endpoint, payload);
 
       const data = response.data;
       const items = data.data?.items || data.items || [];
@@ -569,22 +571,28 @@ export class DocmostClient {
 
       allItems = allItems.concat(items);
 
-      // Stop if the page is empty or shorter than the requested size: a full
-      // page worth of items is the only situation where another page can exist,
-      // so this defends against a stuck hasNextPage flag in addition to it.
-      if (items.length === 0 || items.length < clampedLimit) {
+      // Advance strictly via the server-issued cursor. A missing nextCursor (or
+      // hasNextPage false) means we reached the end. A cursor identical to the
+      // one we just sent means the server did not understand our pagination
+      // param — stop instead of re-fetching page one forever and duplicating.
+      const next = meta?.hasNextPage ? meta?.nextCursor : null;
+      if (!next || next === cursor) {
+        // If the server still reports more pages but stopped issuing a usable
+        // cursor at the ceiling, flag the result as truncated below.
+        if (page === MAX_PAGES - 1 && meta?.hasNextPage) truncated = true;
         break;
       }
+      cursor = next;
 
-      hasNextPage = meta?.hasNextPage || false;
-      page++;
+      // Reaching the ceiling with more pages still available means the result
+      // set is truncated.
+      if (page === MAX_PAGES - 1) truncated = true;
     }
 
     // If the loop stopped because it hit the MAX_PAGES ceiling while the server
-    // still reported more results (hasNextPage true and the last page was
-    // full), the result set is truncated — warn so the caller is not silently
-    // handed an incomplete list.
-    if (hasNextPage && page > MAX_PAGES) {
+    // still reported more results, the result set is truncated — warn so the
+    // caller is not silently handed an incomplete list.
+    if (truncated) {
       console.warn(
         `paginateAll: results from "${endpoint}" truncated at the ${MAX_PAGES}-page cap; more pages exist on the server`,
       );
@@ -618,9 +626,10 @@ export class DocmostClient {
    * Tree (`tree` true): the space's FULL page hierarchy as a nested tree (each
    * node has a `children` array). This mode REQUIRES `spaceId` (a page tree is
    * scoped to one space) and IGNORES `limit` — the whole hierarchy is returned.
-   * It walks the sidebar tree via `enumerateSpacePages`, which performs N
-   * sidebar requests and is bounded by that method's 10000-node cap (and skips
-   * soft-deleted pages server-side).
+   * It fetches the tree via `enumerateSpacePages`, which on the fork server
+   * resolves to a single `/pages/tree` request returning the whole
+   * permission-filtered flat page set (soft-deleted pages excluded
+   * server-side).
    */
   async listPages(spaceId?: string, limit: number = 50, tree: boolean = false) {
     await this.ensureAuthenticated();
@@ -631,8 +640,8 @@ export class DocmostClient {
           "list_pages: tree mode requires a spaceId (a page tree is scoped to one space). Pass spaceId, or omit tree to get the recent-pages list.",
         );
       }
-      const nodes = await this.enumerateSpacePages(spaceId);
-      return buildPageTree(nodes);
+      const { pages } = await this.enumerateSpacePages(spaceId);
+      return buildPageTree(pages);
     }
 
     const clampedLimit = Math.max(1, Math.min(100, limit));
@@ -654,56 +663,122 @@ export class DocmostClient {
   async listSidebarPages(spaceId: string, pageId?: string) {
     await this.ensureAuthenticated();
 
-    // Paginate: the endpoint returns server-paged children, so posting only
-    // { page: 1 } silently dropped every child beyond the first page. Loop on
-    // meta.hasNextPage (with a MAX_PAGES ceiling like paginateAll, guarding
-    // against a stuck hasNextPage flag) and accumulate all children.
+    // Paginate via the server-issued cursor. The server switched from OFFSET
+    // (`page`) to CURSOR (`cursor`/`nextCursor`) pagination, and the global
+    // ValidationPipe(whitelist:true) SILENTLY STRIPS the obsolete `page` field
+    // — so the old offset loop got the SAME first page every time (with
+    // hasNextPage stuck true) and dropped every child beyond the first page.
     const MAX_PAGES = 50;
-    let page = 1;
+    let cursor: string | undefined;
     let allItems: any[] = [];
-    let hasNextPage = true;
+    let truncated = false;
 
-    while (hasNextPage && page <= MAX_PAGES) {
+    for (let i = 0; i < MAX_PAGES; i++) {
+      // limit: 100 is the server-side Max; cuts request count 5x vs the default 20.
+      const payload: Record<string, any> = { spaceId, limit: 100 };
       // Only send pageId when scoping to a page's children; omit it for roots.
-      const payload: Record<string, any> = { spaceId, page };
       if (pageId) payload.pageId = pageId;
+      if (cursor) payload.cursor = cursor;
 
-      const response = await this.client.post("/pages/sidebar-pages", payload);
-      const data = response.data?.data ?? response.data;
-      const items = data?.items || [];
-      allItems = allItems.concat(items);
+      const data = (await this.client.post("/pages/sidebar-pages", payload)).data
+        ?.data;
+      allItems = allItems.concat(data?.items ?? []);
 
-      hasNextPage = data?.meta?.hasNextPage || false;
-      page++;
+      // Advance strictly via the server-issued cursor; a missing/repeated cursor
+      // means the protocol drifted again — stop instead of looping on page one.
+      const next = data?.meta?.hasNextPage ? data?.meta?.nextCursor : null;
+      if (!next || next === cursor) break;
+      cursor = next;
+
+      // Reaching the ceiling with more pages still available means the child
+      // list is truncated (mirrors paginateAll).
+      if (i === MAX_PAGES - 1) truncated = true;
+    }
+
+    // Warn on real truncation (ceiling hit while the server still had pages) so
+    // the caller is not silently handed an incomplete child list.
+    if (truncated) {
+      console.warn(
+        `listSidebarPages: children of "${pageId ?? spaceId}" truncated at the ${MAX_PAGES}-page cap; more pages exist on the server`,
+      );
     }
 
     return allItems;
   }
 
   /**
-   * Enumerate EVERY page in a space (or in a subtree, when rootPageId is given)
-   * by walking the sidebar-pages tree.
+   * Enumerate EVERY page in a space (or in a subtree, when rootPageId is given).
    *
-   * Starting set: the children of rootPageId when provided, otherwise the
-   * space root pages. From there it does an iterative breadth-first walk: each
-   * node is collected, and when node.hasChildren is true its direct children
-   * are fetched via listSidebarPages(spaceId, node.id) and enqueued.
+   * Primary path (fork server): a SINGLE `POST /pages/tree` returns the whole
+   * space (or a subtree) as a flat, permission-filtered list in one request, in
+   * the exact node shape buildPageTree consumes. This replaces the old
+   * per-node BFS, which issued N sidebar requests and — after the server moved
+   * to cursor pagination — silently lost every child past the first sidebar
+   * page (the obsolete `page` param was stripped by ValidationPipe).
    *
-   * This replaces the old "/pages/recent" enumeration, which is a bounded
-   * recent-activity feed (~5000 cap) and therefore misses comments on older
-   * pages that were never recently touched.
+   * The subtree variant (rootPageId given) INCLUDES the root node itself
+   * (getPageAndDescendants seeds with id = rootPageId), unlike the old BFS
+   * which started from the root's children.
    *
-   * Safeguards: a `visited` Set of page ids prevents re-processing a node
-   * (cycles / duplicate references), and a hard node cap bounds pathological
-   * trees so the walk always terminates.
+   * Fallback path (stdio mode may target STOCK upstream Docmost, which lacks
+   * `/pages/tree`): on a 404/405 it falls back to the cursor-based BFS below,
+   * walking direct children via the fixed cursor listSidebarPages. Safeguards:
+   * a `visited` Set of page ids prevents re-processing a node (cycles /
+   * duplicate references), and a hard node cap bounds pathological trees so the
+   * walk always terminates.
+   *
+   * Returns `{ pages, truncated }`. `truncated` is true ONLY when the fallback
+   * BFS stopped at its MAX_NODES cap — the primary /pages/tree path is uncapped
+   * and always returns the complete set, so it never reports truncation.
    */
   private async enumerateSpacePages(
     spaceId: string,
     rootPageId?: string,
-  ): Promise<any[]> {
+  ): Promise<{ pages: any[]; truncated: boolean }> {
+    await this.ensureAuthenticated();
+
+    // Single request replaces the whole BFS: /pages/tree returns the full
+    // permission-filtered flat page set of a space (or a subtree) at once. This
+    // path is uncapped, so it is never truncated.
+    const payload = rootPageId ? { pageId: rootPageId } : { spaceId };
+    try {
+      const response = await this.client.post("/pages/tree", payload);
+      const pages = (response.data?.data ?? response.data)?.items ?? [];
+      return { pages, truncated: false };
+    } catch (e: any) {
+      // Only fall back when the endpoint is absent (stock upstream Docmost);
+      // any other error is a genuine failure and must propagate.
+      if (
+        !axios.isAxiosError(e) ||
+        (e.response?.status !== 404 && e.response?.status !== 405)
+      ) {
+        throw e;
+      }
+    }
+
+    // Fallback: cursor-based breadth-first walk via listSidebarPages.
     const MAX_NODES = 10000;
     const result: any[] = [];
     const visited = new Set<string>();
+
+    // Seed with the root node itself when scoping to a subtree, so its own
+    // comments aren't dropped: the primary /pages/tree seeds
+    // getPageAndDescendants with id = rootPageId (root included), but
+    // listSidebarPages(spaceId, rootPageId) returns only the root's CHILDREN.
+    // The `visited` set below prevents a double-add if the root also appears
+    // among the children. getPageRaw returns a page whose id/title/spaceId are
+    // exactly what buildPageTree and check_new_comments consume.
+    if (rootPageId) {
+      try {
+        const root = await this.getPageRaw(rootPageId);
+        if (root?.id) {
+          result.push(root);
+          visited.add(root.id);
+        }
+      } catch {
+        // Non-fatal: if the root can't be read, fall through to children-only.
+      }
+    }
 
     // Seed the queue with the starting level (subtree children or roots).
     const queue: any[] = await this.listSidebarPages(spaceId, rootPageId);
@@ -729,7 +804,12 @@ export class DocmostClient {
       }
     }
 
-    return result;
+    // Truncated only when the cap was hit with the queue still non-empty (real
+    // truncation, not a natural end at exactly MAX_NODES).
+    return {
+      pages: result,
+      truncated: result.length >= MAX_NODES && queue.length > 0,
+    };
   }
 
   /** Raw page info including the ProseMirror JSON content and slugId. */
@@ -2360,7 +2440,13 @@ export class DocmostClient {
     let allComments: any[] = [];
     let cursor: string | null = null;
 
-    do {
+    // Hard ceiling + immovable-cursor guard (mirrors paginateAll): if /comments
+    // ever stops advancing the cursor (the exact #442 drift scenario) this loop
+    // would otherwise spin forever accumulating duplicates.
+    const MAX_PAGES = 50;
+    let truncated = false;
+
+    for (let page = 0; page < MAX_PAGES; page++) {
       const payload: Record<string, any> = { pageId, limit: 100 };
       if (cursor) payload.cursor = cursor;
 
@@ -2368,8 +2454,23 @@ export class DocmostClient {
       const data = response.data.data || response.data;
       const items = data.items || [];
       allComments = allComments.concat(items);
-      cursor = data.meta?.nextCursor || null;
-    } while (cursor);
+
+      // Advance strictly via the server-issued cursor. A missing nextCursor or a
+      // cursor identical to the one we just sent means the end (or a server that
+      // ignores our pagination param) — stop instead of re-fetching page one.
+      const next: string | null = data.meta?.nextCursor || null;
+      if (!next || next === cursor) break;
+      cursor = next;
+
+      // Reaching the ceiling with a still-advancing cursor means truncation.
+      if (page === MAX_PAGES - 1) truncated = true;
+    }
+
+    if (truncated) {
+      console.warn(
+        `listComments: comments for "${pageId}" truncated at the ${MAX_PAGES}-page cap; more pages exist on the server`,
+      );
+    }
 
     const mapped = allComments.map((comment: any) => {
       const markdown = comment.content
@@ -2842,36 +2943,27 @@ export class DocmostClient {
       );
     }
 
-    // 1. Enumerate the FULL set of pages in scope by walking the sidebar-pages
-    // tree (a complete page index), NOT the bounded "/pages/recent" feed which
-    // caps at ~5000 recent items and silently misses comments on older pages.
+    // 1. Enumerate the FULL set of pages in scope via the page tree (a complete
+    // page index), NOT the bounded "/pages/recent" feed which caps at ~5000
+    // recent items and silently misses comments on older pages.
     //
     // Subtree scope: when parentPageId is given, the scope is that page ITSELF
-    // plus every descendant (enumerateSpacePages walks its children). Otherwise
-    // the scope is the whole space (all roots and their descendants).
+    // plus every descendant. Otherwise the scope is the whole space (all roots
+    // and their descendants).
     //
     // NOTE: do NOT pre-filter by page.updatedAt — creating a comment does not
     // bump it (verified on a live server), so such a filter silently misses
     // comments on pages that were not otherwise edited. The complete tree walk
     // already restricts the scope correctly, so no recent-feed allow-list is
     // needed any more.
-    let pagesInScope: any[];
-    if (parentPageId) {
-      const subtree = await this.enumerateSpacePages(spaceId, parentPageId);
-      // Include the parent page node itself alongside its descendants. Fetch it
-      // so its title/id are available even though it is not returned by its own
-      // children listing.
-      let parentNode: any = { id: parentPageId };
-      try {
-        parentNode = await this.getPageRaw(parentPageId);
-      } catch (e: any) {
-        // Fall back to a minimal node if the parent can't be fetched; its
-        // comments are still attempted below (the fetch there is non-fatal).
-      }
-      pagesInScope = [parentNode, ...subtree];
-    } else {
-      pagesInScope = await this.enumerateSpacePages(spaceId);
-    }
+    //
+    // The subtree scope (parentPageId given) already INCLUDES the root node
+    // itself: /pages/tree seeds getPageAndDescendants with id = parentPageId, so
+    // no separate getPageRaw fetch for the parent is needed.
+    const { pages: pagesInScope, truncated } = await this.enumerateSpacePages(
+      spaceId,
+      parentPageId,
+    );
 
     // 2. Fetch comments for each page, keep ones created after since
     const results: any[] = [];
@@ -2900,10 +2992,9 @@ export class DocmostClient {
       0,
     );
 
-    // enumerateSpacePages caps traversal at 10000 nodes; flag when that cap was
-    // hit so the caller knows the scan may be incomplete (some pages skipped).
-    const truncated = pagesInScope.length >= 10000;
-
+    // `truncated` is reported by enumerateSpacePages: it is true ONLY when the
+    // stdio fallback BFS hit its node cap. The primary /pages/tree path is
+    // uncapped, so a space with legitimately many pages is not falsely flagged.
     return {
       since,
       scope: parentPageId ? `subtree of ${parentPageId}` : `space ${spaceId}`,
