@@ -287,6 +287,14 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
       // Wire the REAL factory so the in-app path is exercised end to end.
       createCommentSignalTracker:
         createCommentSignalTracker as unknown as loader.CommentSignalTrackerFactory,
+      // Pure no-network draw.io helpers (#424) — required on the loader return;
+      // this comment-signal test doesn't exercise them, so no-op stubs suffice.
+      searchShapes: (() => []) as unknown as loader.SearchShapesFn,
+      getGuideSection: (() => ({
+        section: '',
+        content: '',
+        sections: [],
+      })) as unknown as loader.GetGuideSectionFn,
     });
     return new AiChatToolsService(
       tokenServiceStub as never,

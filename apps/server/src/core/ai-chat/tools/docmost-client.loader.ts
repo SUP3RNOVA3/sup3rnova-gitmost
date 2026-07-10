@@ -62,7 +62,10 @@ type DocmostClientMethod =
   | 'insertImage'
   | 'replaceImage'
   | 'insertFootnote'
-  // --- draw.io diagrams (#423, stage 1) ---
+  // --- draw.io diagrams (#423 stage 1, #424 stage 2) ---
+  // DERIVED from the real DocmostClient (#446): drawioCreate/drawioUpdate carry
+  // the optional layout:"elk" 5th arg in the real signature, so the layout parity
+  // (#440) is inherited automatically — no hand-written mirror to keep in sync.
   | 'drawioGet'
   | 'drawioCreate'
   | 'drawioUpdate'
@@ -141,6 +144,19 @@ export type CommentSignalTrackerFactory = (options: {
   debounceMs?: number;
 }) => CommentSignalTrackerLike;
 
+// Pure, no-network draw.io helpers (#424). These are plain functions on the
+// module (NOT DocmostClient methods) — the in-app AI-SDK service calls them
+// directly to wire drawio_shapes / drawio_guide, mirroring the MCP server.
+export type SearchShapesFn = (
+  query: string,
+  opts?: { category?: string; limit?: number },
+) => Array<Record<string, unknown>>;
+export type GetGuideSectionFn = (section?: string) => {
+  section: string;
+  content: string;
+  sections: string[];
+};
+
 interface DocmostMcpModule {
   DocmostClient: DocmostClientCtor;
   SHARED_TOOL_SPECS: Record<string, SharedToolSpec>;
@@ -153,6 +169,15 @@ interface DocmostMcpModule {
   // the mocked loader in unit tests) — the stale-check below is a NO-OP when it
   // is missing, so an older build never wrongly fails startup.
   REGISTRY_STAMP?: string;
+  // Pure, no-network draw.io helpers (#424) backing drawio_shapes / drawio_guide.
+  // Those two specs are `inlineBothHosts` (they stay in SHARED_TOOL_SPECS for the
+  // shared contract but carry no execute — their catalog loader uses import.meta
+  // and can't be value-imported into the zod-agnostic tool-specs.ts), so the
+  // in-app service wires them INLINE off these helpers, mirroring the standalone
+  // MCP host. Exposed off the loaded module so the service and its test mocks can
+  // reach them.
+  searchShapes: SearchShapesFn;
+  getGuideSection: GetGuideSectionFn;
 }
 
 /**
@@ -216,6 +241,8 @@ export async function loadDocmostMcp(): Promise<{
   DocmostClient: DocmostClientCtor;
   sharedToolSpecs: Record<string, SharedToolSpec>;
   createCommentSignalTracker?: CommentSignalTrackerFactory;
+  searchShapes: SearchShapesFn;
+  getGuideSection: GetGuideSectionFn;
 }> {
   if (!modulePromise) {
     modulePromise = (async () => {
@@ -261,5 +288,8 @@ export async function loadDocmostMcp(): Promise<{
     // Optional: forwarded when present so the in-app layer can build the passive
     // comment signal (#417); undefined on a stale build => signal disabled.
     createCommentSignalTracker: mod.createCommentSignalTracker,
+    // Pure no-network draw.io helpers (#424); not client methods.
+    searchShapes: mod.searchShapes,
+    getGuideSection: mod.getGuideSection,
   };
 }

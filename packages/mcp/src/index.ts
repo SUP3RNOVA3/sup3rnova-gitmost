@@ -5,6 +5,8 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { DocmostClient, DocmostMcpConfig } from "./client.js";
 import { parseNodeArg } from "@docmost/prosemirror-markdown";
+import { searchShapes } from "./lib/drawio-shapes.js";
+import { getGuideSection } from "./lib/drawio-guide.js";
 import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
 import { SERVER_INSTRUCTIONS } from "./server-instructions.js";
 import {
@@ -55,6 +57,13 @@ export type {
   CommentSignalProbeResult,
   CommentSignalTrackerOptions,
 } from "./comment-signal.js";
+// Re-export the pure, no-network draw.io helpers (#424) so the in-app AI-SDK
+// service can wire drawio_shapes / drawio_guide off the loaded module. These are
+// NOT client methods (no page/backend hit) — the in-app handler calls them
+// directly, mirroring how the standalone MCP server wires them here.
+export { searchShapes } from "./lib/drawio-shapes.js";
+export type { SearchShapesOptions } from "./lib/drawio-shapes.js";
+export { getGuideSection } from "./lib/drawio-guide.js";
 
 // Read version from package.json
 const __filename = fileURLToPath(import.meta.url);
@@ -80,6 +89,11 @@ const VERSION = packageJson.version;
 // (SHARED_TOOL_SPECS + INLINE_MCP_INVENTORY), so it can no longer drift out of
 // sync with the registered tools. Re-exported here (its old home) so existing
 // importers are unaffected; the composition lives in server-instructions.ts.
+// The drawio_shapes / drawio_guide tools (#424) stay in SHARED_TOOL_SPECS (so the
+// generated <tool_inventory> picks them up from their catalogLine automatically)
+// but are flagged `inlineBothHosts` and registered inline below (their pure
+// helpers can't cross into tool-specs.ts); only the hand-written routing prose in
+// server-instructions.ts is updated to mention them.
 export { SERVER_INSTRUCTIONS };
 
 // Helper to format JSON responses
@@ -272,6 +286,11 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   // the wrapping is typed loosely and cast — runtime behaviour is unchanged.
   const registerSharedFromSpec = (spec: SharedToolSpec) => {
     if (spec.inAppOnly) return;
+    // `inlineBothHosts` specs (drawio_shapes / drawio_guide) carry no execute —
+    // their pure helper cannot cross into the zod-agnostic tool-specs.ts, so they
+    // are registered INLINE below (searchShapes / getGuideSection). Skip them here
+    // so the loop never dereferences a missing `execute`.
+    if (spec.inlineBothHosts) return;
     const handler = async (args: any) => {
       if (spec.mcpExecute) {
         // The override owns the full MCP result envelope (not re-wrapped).
@@ -294,6 +313,45 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
 
   for (const spec of Object.values(SHARED_TOOL_SPECS)) {
     registerSharedFromSpec(spec as SharedToolSpec);
+  }
+
+  // --- INLINE drawio helper tools (IN the shared registry, but inlineBothHosts) ---
+  // drawio_shapes / drawio_guide (#424) live in SHARED_TOOL_SPECS (so the shared
+  // contract pins their name/description/schema across both hosts) but carry the
+  // `inlineBothHosts` flag and NO execute: their pure backing helpers
+  // (searchShapes / getGuideSection) cannot be value-imported into the
+  // zod-agnostic tool-specs.ts without breaking the in-app server's commonjs
+  // type-check (searchShapes' catalog loader uses import.meta). So both hosts wire
+  // them directly. Here on the MCP host they reuse the spec's name/description/
+  // schema and wrap the raw helper result as JSON text content — byte-identical to
+  // what the registry loop would have produced. The in-app host mirrors this in
+  // ai-chat-tools.service.ts.
+  {
+    // Cast registerTool like the loop's registerSharedFromSpec does: the spec's
+    // buildShape returns the loose zod-agnostic ZodRawShape (Record<string,
+    // unknown>) and the handler args are the SDK-validated, type-erased input.
+    const registerInline = server.registerTool as any;
+    const shapesSpec = SHARED_TOOL_SPECS.drawioShapes as SharedToolSpec;
+    registerInline(
+      shapesSpec.mcpName,
+      {
+        description: shapesSpec.description,
+        inputSchema: shapesSpec.buildShape!(z),
+      },
+      async ({ query, category, limit }: any) => {
+        const results = searchShapes(query, { category, limit });
+        return jsonContent({ query, count: results.length, results });
+      },
+    );
+    const guideSpec = SHARED_TOOL_SPECS.drawioGuide as SharedToolSpec;
+    registerInline(
+      guideSpec.mcpName,
+      {
+        description: guideSpec.description,
+        inputSchema: guideSpec.buildShape!(z),
+      },
+      async ({ section }: any) => jsonContent(getGuideSection(section)),
+    );
   }
 
   // --- INLINE tools kept per-transport (NOT in the shared registry) ---

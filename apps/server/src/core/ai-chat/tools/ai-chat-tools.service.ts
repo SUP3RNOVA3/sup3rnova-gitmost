@@ -111,10 +111,12 @@ function __assertClientCallContract(client: DocmostClientLike): void {
     afterText: s,
   });
   void client.replaceImage(s, s, s, { align, alt: s });
-  // --- draw.io diagrams (#423) ---
+  // --- draw.io diagrams (#423 stage 1, #424 stage 2) ---
+  // The 5th `layout` arg (#424) is exercised so this parity assertion fails if the
+  // client signature drops it — it must reach the client from the shared execute.
   void client.drawioGet(s, s, 'xml');
-  void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s);
-  void client.drawioUpdate(s, s, s, s);
+  void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s, 'elk');
+  void client.drawioUpdate(s, s, s, s, 'elk');
   // --- write (comment) ---
   void client.createComment(s, s, 'inline', s, s, s);
   void client.resolveComment(s, true);
@@ -263,8 +265,19 @@ export class AiChatToolsService {
     // provenance tokens) and load the shared tool-spec registry. Client
     // construction is shared with the page-change detection path (#274) via
     // buildDocmostClient so both go over the exact same authenticated route.
-    const { sharedToolSpecs, createCommentSignalTracker } =
-      await loadDocmostMcp();
+    // searchShapes / getGuideSection (#424) are the PURE, no-network helpers
+    // backing drawio_shapes / drawio_guide. They are `inlineBothHosts` specs (no
+    // canonical execute — their catalog loader uses import.meta and can't be
+    // value-imported into the zod-agnostic tool-specs.ts under the server's
+    // commonjs type-check), so the shared registry loop below SKIPS them and this
+    // service wires them inline (see drawioShapes/drawioGuide entries), mirroring
+    // how index.ts registers them on the standalone MCP host.
+    const {
+      sharedToolSpecs,
+      createCommentSignalTracker,
+      searchShapes,
+      getGuideSection,
+    } = await loadDocmostMcp();
     const client = await this.buildDocmostClient(
       user,
       sessionId,
@@ -555,6 +568,8 @@ export class AiChatToolsService {
     // WHICH mapping to run and returns its value directly (no envelope). For each
     // spec:
     //   - skip `mcpOnly` specs (they belong to the standalone MCP host only);
+    //   - skip `inlineBothHosts` specs (drawio_shapes / drawio_guide): they carry
+    //     no execute and are wired INLINE just below, calling the pure helpers;
     //   - use `inAppExecute` when the spec declares a DELIBERATE per-layer
     //     difference (a projected result shape, a different guardrail message);
     //   - otherwise use the canonical `execute` (raw client result, identical to
@@ -564,6 +579,7 @@ export class AiChatToolsService {
     // arg mapping lives — it can no longer silently drift from the MCP host.
     for (const spec of Object.values(sharedToolSpecs)) {
       if (spec.mcpOnly) continue;
+      if (spec.inlineBothHosts) continue;
       const run = spec.inAppExecute ?? spec.execute;
       if (!run) continue; // defensive: a shared spec always carries one of them.
       tools[spec.inAppKey] = sharedTool(
@@ -572,6 +588,25 @@ export class AiChatToolsService {
           run(client, args as Record<string, unknown>)) as Tool['execute'],
       );
     }
+
+    // drawio_shapes / drawio_guide (#424): `inlineBothHosts` registry specs wired
+    // here with the SAME schema+description the shared spec pins, but calling the
+    // pure searchShapes / getGuideSection helpers off the loaded @docmost/mcp
+    // module — they are not client methods and their catalog loader uses
+    // import.meta, so they cannot live in the zod-agnostic shared execute. The raw
+    // result is identical to the MCP host's (which wraps it as JSON text); here
+    // the in-app host returns it plain, exactly like every other shared tool.
+    tools[sharedToolSpecs.drawioShapes.inAppKey] = sharedTool(
+      sharedToolSpecs.drawioShapes,
+      async ({ query, category, limit }) => {
+        const results = searchShapes(query, { category, limit });
+        return { query, count: results.length, results };
+      },
+    );
+    tools[sharedToolSpecs.drawioGuide.inAppKey] = sharedTool(
+      sharedToolSpecs.drawioGuide,
+      async ({ section }) => getGuideSection(section),
+    );
 
     // Passive "new comments: N" signal (#417). PER-TURN state (forUser runs once
     // per turn), so the watermark starts now and only comments a human leaves

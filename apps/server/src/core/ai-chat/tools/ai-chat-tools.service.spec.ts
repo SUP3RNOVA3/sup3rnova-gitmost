@@ -24,6 +24,14 @@ import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs
 const mockLoaded = (DocmostClient: loader.DocmostClientCtor) => ({
   DocmostClient,
   sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+  // Pure no-network draw.io helpers (#424). Type-correct stubs: these tests
+  // never execute the drawio_shapes / drawio_guide tool bodies.
+  searchShapes: (() => []) as unknown as loader.SearchShapesFn,
+  getGuideSection: (() => ({
+    section: 'index',
+    content: '',
+    sections: [],
+  })) as unknown as loader.GetGuideSectionFn,
 });
 
 /**
@@ -845,5 +853,111 @@ describe('AiChatToolsService getCurrentPage selection (#388)', () => {
     expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
       { page: null, selection: null },
     );
+  });
+});
+
+/**
+ * #440 review: the in-app drawio_create / drawio_update handlers must forward
+ * the optional `layout:"elk"` param to the client (5th positional arg), exactly
+ * like the MCP host. It was silently dropped, so ELK auto-layout worked only via
+ * the standalone MCP server, not in-app. These tests pin per-host parity.
+ */
+describe('AiChatToolsService drawio layout passthrough (#440)', () => {
+  const createCalls: unknown[][] = [];
+  const updateCalls: unknown[][] = [];
+
+  // FakeDocmostClient (not Partial<DocmostClientLike>): since #446 derived
+  // DocmostClientLike from the real client, its drawioCreate/drawioUpdate return
+  // the concrete result shape, so a minimal stub object would not be assignable.
+  // FakeDocmostClient types every method as (...args) => Promise<any>, which is
+  // exactly what these arg-capturing doubles need.
+  const fakeClient: FakeDocmostClient = {
+    drawioCreate: (...args: unknown[]) => {
+      createCalls.push(args);
+      return Promise.resolve({ success: true, nodeId: '#0' });
+    },
+    drawioUpdate: (...args: unknown[]) => {
+      updateCalls.push(args);
+      return Promise.resolve({ success: true, nodeId: '#0' });
+    },
+  };
+
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    createCalls.length = 0;
+    updateCalls.length = 0;
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return fakeClient as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+    );
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+
+  it('forwards layout:"elk" to client.drawioCreate as the 5th positional arg', async () => {
+    const tools = await buildTools();
+    await tools.drawioCreate.execute(
+      {
+        pageId: 'p-1',
+        xml: '<mxGraphModel/>',
+        position: 'append',
+        layout: 'elk',
+      } as never,
+      {} as never,
+    );
+    expect(createCalls).toHaveLength(1);
+    // drawioCreate(pageId, where, xml, title, layout) — layout is args[4].
+    expect(createCalls[0][4]).toBe('elk');
+  });
+
+  it('forwards layout:"elk" to client.drawioUpdate as the 5th positional arg', async () => {
+    const tools = await buildTools();
+    await tools.drawioUpdate.execute(
+      {
+        pageId: 'p-1',
+        node: '#0',
+        xml: '<mxGraphModel/>',
+        baseHash: 'h',
+        layout: 'elk',
+      } as never,
+      {} as never,
+    );
+    expect(updateCalls).toHaveLength(1);
+    // drawioUpdate(pageId, node, xml, baseHash, layout) — layout is args[4].
+    expect(updateCalls[0][4]).toBe('elk');
+  });
+
+  it('omits layout (undefined 5th arg) when not requested', async () => {
+    const tools = await buildTools();
+    await tools.drawioCreate.execute(
+      { pageId: 'p-1', xml: '<mxGraphModel/>', position: 'append' } as never,
+      {} as never,
+    );
+    expect(createCalls[0][4]).toBeUndefined();
   });
 });

@@ -2,6 +2,11 @@
 .env.dev
 .env.prod
 data
+# Exception: the committed draw.io shape catalog (issue #424) lives in a `data/`
+# dir, but the bare `data` ignore above is meant for runtime state, not this
+# bundled build asset. Re-include the directory and its contents.
+!packages/mcp/data/
+!packages/mcp/data/**
 # compiled output
 /dist
 node_modules

@@ -461,6 +461,308 @@ export function absolutePos(
   return { x, y };
 }
 
+// --- quality warnings (geometry, non-blocking) -----------------------------
+//
+// These are computed purely from geometry — NO rendering — and are returned as
+// WARNINGS (never errors): they do not block the write, they nudge the model to
+// self-correct ("fix the warnings and retry, max 2 iterations"). They replace
+// the vision-self-check a render backend would have done.
+
+interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Absolute rect of a vertex (following the container chain), or null. */
+function rectOf(cell: DrawioCell, byId: Map<string, DrawioCell>): Rect | null {
+  if (!cell.vertex || !cell.geometry.hasGeometry) return null;
+  const g = cell.geometry;
+  if (g.width == null || g.height == null) return null;
+  const { x, y } = absolutePos(cell, byId);
+  return { x, y, w: g.width, h: g.height };
+}
+
+/** True if `ancestorId` is somewhere up `cell`'s parent chain. */
+function isAncestor(
+  ancestorId: string,
+  cell: DrawioCell,
+  byId: Map<string, DrawioCell>,
+): boolean {
+  const seen = new Set<string>([cell.id]);
+  let p = cell.parent;
+  while (p && !seen.has(p)) {
+    if (p === ancestorId) return true;
+    seen.add(p);
+    p = byId.get(p)?.parent;
+  }
+  return false;
+}
+
+/** Strict interior overlap of two rects (touching edges do NOT count). */
+function rectsOverlap(a: Rect, b: Rect): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+function center(r: Rect): { x: number; y: number } {
+  return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+}
+
+/**
+ * Liang-Barsky: does segment p->q pass through the INTERIOR of rect r? Used to
+ * detect an edge crossing a shape that is not one of its endpoints.
+ */
+function segCrossesRect(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+  r: Rect,
+): boolean {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  // Canonical Liang-Barsky: for each of the 4 slabs, p*t <= q.
+  const p = [-dx, dx, -dy, dy];
+  const q = [a.x - r.x, r.x + r.w - a.x, a.y - r.y, r.y + r.h - a.y];
+  let t0 = 0;
+  let t1 = 1;
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) {
+      if (q[i] < 0) return false; // parallel to this slab AND outside it
+      continue;
+    }
+    const t = q[i] / p[i];
+    if (p[i] < 0) {
+      if (t > t1) return false;
+      if (t > t0) t0 = t;
+    } else {
+      if (t < t0) return false;
+      if (t < t1) t1 = t;
+    }
+  }
+  return t1 > t0; // strictly non-degenerate overlap with the rect interior
+}
+
+function cross(
+  ox: number,
+  oy: number,
+  ax: number,
+  ay: number,
+  bx: number,
+  by: number,
+): number {
+  return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
+}
+
+/** Collinear + overlapping test for two straight segments (edge-on-edge). */
+function segmentsOverlap(
+  a1: { x: number; y: number },
+  a2: { x: number; y: number },
+  b1: { x: number; y: number },
+  b2: { x: number; y: number },
+): boolean {
+  const EPS = 1;
+  // b1 and b2 must be (near-)collinear with segment a.
+  if (
+    Math.abs(cross(a1.x, a1.y, a2.x, a2.y, b1.x, b1.y)) > EPS * dist(a1, a2) ||
+    Math.abs(cross(a1.x, a1.y, a2.x, a2.y, b2.x, b2.y)) > EPS * dist(a1, a2)
+  ) {
+    return false;
+  }
+  // Project all four points onto the dominant axis and test 1-D overlap length.
+  const horizontal = Math.abs(a2.x - a1.x) >= Math.abs(a2.y - a1.y);
+  const pa = horizontal ? [a1.x, a2.x] : [a1.y, a2.y];
+  const pb = horizontal ? [b1.x, b2.x] : [b1.y, b2.y];
+  const loA = Math.min(pa[0], pa[1]);
+  const hiA = Math.max(pa[0], pa[1]);
+  const loB = Math.min(pb[0], pb[1]);
+  const hiB = Math.max(pb[0], pb[1]);
+  const overlap = Math.min(hiA, hiB) - Math.max(loA, loB);
+  return overlap > 5; // >5px of shared collinear run
+}
+
+function dist(
+  a: { x: number; y: number },
+  b: { x: number; y: number },
+): number {
+  return Math.hypot(a.x - b.x, a.y - b.y) || 1;
+}
+
+/** Approximate rendered text width (px) of a cell value at a font size. */
+function estimateLabelWidth(value: string, fontSize: number): number {
+  // Decode explicit line breaks, strip tags/entities, take the longest line.
+  const lines = value
+    .replace(/&#xa;/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&[a-z]+;/gi, "x")
+    .split("\n");
+  let longest = 0;
+  for (const l of lines) longest = Math.max(longest, l.trim().length);
+  // ~0.6em per glyph is a decent average for proportional fonts.
+  return longest * fontSize * 0.6;
+}
+
+/** Page size declared on the model root, defaulting to Letter (850x1100). */
+function parsePageSize(modelXml: string): { w: number; h: number } {
+  const w = /pageWidth="(\d+)"/.exec(modelXml);
+  const h = /pageHeight="(\d+)"/.exec(modelXml);
+  return {
+    w: w ? Number(w[1]) : 850,
+    h: h ? Number(h[1]) : 1100,
+  };
+}
+
+/** Minimum required gap between adjacent shapes (appendix heuristic). */
+export const MIN_SHAPE_GAP = 150;
+
+/**
+ * Compute the geometry-derived quality warnings for a parsed model. Each is a
+ * `[rule] message` string. Pure — no rendering, no I/O.
+ */
+export function computeQualityWarnings(
+  cells: DrawioCell[],
+  modelXml?: string,
+): string[] {
+  const warnings: string[] = [];
+  const byId = new Map(cells.map((c) => [c.id, c]));
+  const verts = cells.filter((c) => c.vertex && c.id !== "0" && c.id !== "1");
+  const isContainer = (id: string) =>
+    verts.some((v) => v.parent === id);
+  const rects = new Map<string, Rect>();
+  for (const v of verts) {
+    const r = rectOf(v, byId);
+    if (r) rects.set(v.id, r);
+  }
+
+  // 1. Shape bbox overlap (excluding a container overlapping its own child).
+  for (let i = 0; i < verts.length; i++) {
+    for (let j = i + 1; j < verts.length; j++) {
+      const a = verts[i];
+      const b = verts[j];
+      const ra = rects.get(a.id);
+      const rb = rects.get(b.id);
+      if (!ra || !rb) continue;
+      if (isAncestor(a.id, b, byId) || isAncestor(b.id, a, byId)) continue;
+      if (rectsOverlap(ra, rb)) {
+        warnings.push(
+          `[shape-overlap] shapes "${a.id}" and "${b.id}" overlap; separate them (>=${MIN_SHAPE_GAP}px apart) or use layout:"elk"`,
+        );
+      }
+    }
+  }
+
+  // 2. Edge passing through a non-endpoint LEAF shape's bbox.
+  const edges = cells.filter((c) => c.edge);
+  for (const e of edges) {
+    if (!e.source || !e.target) continue;
+    const rs = rects.get(e.source);
+    const rt = rects.get(e.target);
+    if (!rs || !rt) continue;
+    const p = center(rs);
+    const q = center(rt);
+    for (const v of verts) {
+      if (v.id === e.source || v.id === e.target) continue;
+      if (isContainer(v.id)) continue; // an edge legitimately crosses container frames
+      const rv = rects.get(v.id);
+      if (!rv) continue;
+      // shrink to avoid flagging a graze at a shared layer boundary
+      const shrunk: Rect = { x: rv.x + 6, y: rv.y + 6, w: rv.w - 12, h: rv.h - 12 };
+      if (shrunk.w <= 0 || shrunk.h <= 0) continue;
+      if (segCrossesRect(p, q, shrunk)) {
+        warnings.push(
+          `[edge-through-shape] edge "${e.id}" passes through shape "${v.id}" (not its source/target); add exitX/exitY/entryX/entryY or a waypoint`,
+        );
+        break;
+      }
+    }
+  }
+
+  // 3. Edge-on-edge overlap (parallel duplicates or collinear shared runs).
+  const edgeSegs: { id: string; a: any; b: any; key: string }[] = [];
+  for (const e of edges) {
+    if (!e.source || !e.target) continue;
+    const rs = rects.get(e.source);
+    const rt = rects.get(e.target);
+    if (!rs || !rt) continue;
+    const key = [e.source, e.target].sort().join("::");
+    edgeSegs.push({ id: e.id, a: center(rs), b: center(rt), key });
+  }
+  for (let i = 0; i < edgeSegs.length; i++) {
+    for (let j = i + 1; j < edgeSegs.length; j++) {
+      const ea = edgeSegs[i];
+      const eb = edgeSegs[j];
+      const dup = ea.key === eb.key;
+      if (dup || segmentsOverlap(ea.a, ea.b, eb.a, eb.b)) {
+        warnings.push(
+          `[edge-overlap] edges "${ea.id}" and "${eb.id}" lie on top of each other; offset one (distinct exit/entry points) or reroute`,
+        );
+      }
+    }
+  }
+
+  // 4. Adjacent SIBLING leaf shapes closer than MIN_SHAPE_GAP.
+  for (let i = 0; i < verts.length; i++) {
+    for (let j = i + 1; j < verts.length; j++) {
+      const a = verts[i];
+      const b = verts[j];
+      if ((a.parent ?? "") !== (b.parent ?? "")) continue;
+      if (isContainer(a.id) || isContainer(b.id)) continue;
+      const ra = rects.get(a.id);
+      const rb = rects.get(b.id);
+      if (!ra || !rb || rectsOverlap(ra, rb)) continue;
+      const yOverlap = ra.y < rb.y + rb.h && rb.y < ra.y + ra.h;
+      const xOverlap = ra.x < rb.x + rb.w && rb.x < ra.x + ra.w;
+      let gap = Infinity;
+      if (yOverlap) {
+        gap = Math.min(
+          gap,
+          ra.x >= rb.x ? ra.x - (rb.x + rb.w) : rb.x - (ra.x + ra.w),
+        );
+      }
+      if (xOverlap) {
+        gap = Math.min(
+          gap,
+          ra.y >= rb.y ? ra.y - (rb.y + rb.h) : rb.y - (ra.y + ra.h),
+        );
+      }
+      if (gap > 0 && gap < MIN_SHAPE_GAP) {
+        warnings.push(
+          `[gap-too-small] shapes "${a.id}" and "${b.id}" are ${Math.round(gap)}px apart (<${MIN_SHAPE_GAP}px); increase spacing`,
+        );
+      }
+    }
+  }
+
+  // 5. Label visibly wider than its shape (skip labels drawn OUTSIDE the shape).
+  for (const v of verts) {
+    if (!v.value || isContainer(v.id)) continue;
+    if (v.styleMap.verticalLabelPosition || v.styleMap.labelPosition) continue;
+    const r = rects.get(v.id);
+    if (!r) continue;
+    const fontSize = Number(v.styleMap.fontSize) || 12;
+    const est = estimateLabelWidth(v.value, fontSize);
+    if (est > r.w * 1.15) {
+      warnings.push(
+        `[label-overflow] label of "${v.id}" (~${Math.round(est)}px) is wider than its shape (${r.w}px); widen it, shorten the text, or wrap with &#xa;`,
+      );
+    }
+  }
+
+  // 6. Negative / off-page (top-left) coordinates.
+  const page = parsePageSize(modelXml ?? "");
+  for (const v of verts) {
+    const r = rects.get(v.id);
+    if (!r) continue;
+    if (r.x < 0 || r.y < 0) {
+      warnings.push(
+        `[out-of-bounds] shape "${v.id}" has negative coordinates (${Math.round(r.x)},${Math.round(r.y)}); move it into the positive quadrant (page ${page.w}x${page.h})`,
+      );
+    }
+  }
+
+  return warnings;
+}
+
 // --- linter ----------------------------------------------------------------
 
 /**
@@ -755,12 +1057,15 @@ export function prepareModel(inputXml: string): PreparedModel {
   const modelXml = normalizeXml(rawModel);
   const bbox = computeBBox(cells);
   const cellCount = cells.filter((c) => c.id !== "0" && c.id !== "1").length;
+  // Geometry quality warnings (non-blocking) are appended to any structural
+  // warnings from the linter. The model surfaces these and can self-correct.
+  const quality = computeQualityWarnings(cells, modelXml);
   return {
     modelXml,
     cells,
     bbox,
     cellCount,
-    warnings,
+    warnings: [...warnings, ...quality],
     hash: mxHash(modelXml),
   };
 }

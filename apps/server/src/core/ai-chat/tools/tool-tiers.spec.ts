@@ -124,6 +124,13 @@ describe('deferred catalog ↔ live forUser() toolset partition (#332, F3)', () 
         return {} as DocmostClientLike;
       } as unknown as loader.DocmostClientCtor,
       sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+      // Pure no-network draw.io helpers (#424); tool bodies are never executed here.
+      searchShapes: (() => []) as unknown as loader.SearchShapesFn,
+      getGuideSection: (() => ({
+        section: 'index',
+        content: '',
+        sections: [],
+      })) as unknown as loader.GetGuideSectionFn,
     });
     const service = new AiChatToolsService(
       {

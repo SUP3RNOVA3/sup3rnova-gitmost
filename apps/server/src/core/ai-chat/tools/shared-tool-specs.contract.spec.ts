@@ -45,6 +45,16 @@ describe('SHARED_TOOL_SPECS contract parity', () => {
         string,
         loader.SharedToolSpec
       >,
+      // Pure no-network draw.io helpers (#424). The contract test never executes
+      // a tool body, so type-correct stubs suffice (the real functions can't be
+      // imported here — drawio-shapes.ts uses import.meta, incompatible with the
+      // CommonJS jest transform).
+      searchShapes: (() => []) as unknown as loader.SearchShapesFn,
+      getGuideSection: (() => ({
+        section: 'index',
+        content: '',
+        sections: [],
+      })) as unknown as loader.GetGuideSectionFn,
     });
     const service = new AiChatToolsService(
       tokenServiceStub as never,

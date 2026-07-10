@@ -172,6 +172,18 @@ export interface SharedToolSpec {
   mcpOnly?: boolean;
   /** Registered only on the in-app host (skipped by the MCP registry loop). */
   inAppOnly?: boolean;
+  /**
+   * The spec stays in the registry (so the shared contract still pins its name /
+   * description / schema across both hosts) but carries NO `execute`/override and
+   * is registered INLINE by BOTH hosts instead of through the registry loop. Used
+   * for tools whose implementation cannot cross into this zod-agnostic file — the
+   * drawio_shapes / drawio_guide pure helpers, whose backing module resolves a
+   * bundled data file via `import.meta` and so cannot be value-imported here
+   * without breaking the in-app server's commonjs type-check of this source. Both
+   * registry loops SKIP a spec with this flag; the per-host inline registrations
+   * own it (index.ts on MCP, ai-chat-tools.service.ts in-app).
+   */
+  inlineBothHosts?: boolean;
 }
 
 // --- Shared execute helpers -------------------------------------------------
@@ -191,6 +203,29 @@ export interface SharedToolSpec {
 const mcpJson = (data: unknown) => ({
   content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
 });
+
+/**
+ * Compact HARD-RULES block injected into the drawio_create / drawio_update
+ * descriptions (issue #424 — the jgraph/drawio-mcp pattern of putting the
+ * must-follow rules right where the model reads them at call time). Deliberately
+ * terse; the long-form authoring guidance lives in drawio_guide.
+ */
+export const DRAWIO_HARD_RULES =
+  ' RULES: id="0" and id="1"(parent="0") sentinels are MANDATORY; each cell is ' +
+  'vertex="1" XOR edge="1" (a container/group is neither); every edge carries a ' +
+  'child <mxGeometry relative="1" as="geometry"/>; ids are unique; NO XML ' +
+  'comments; put html=1 in styles and XML-escape value (& -> &amp;, < -> &lt;); a ' +
+  "newline in a label is &#xa;, never a literal \\n; containers are TRANSPARENT " +
+  "(fillColor=none;container=1;dropTarget=1;) with children set parent=<groupId> " +
+  'and RELATIVE coords, and an edge between different containers is parent="1"; set ' +
+  'adaptiveColors="auto" on <mxGraphModel> (free dark-theme adaptation for ' +
+  'strokeColor/fillColor/fontColor="default"); do NOT guess shape=mxgraph.* names ' +
+  "(a wrong name renders as an empty box) — call drawio_shapes first; call " +
+  "drawio_guide(section) for authoring help. Pass layout:\"elk\" to let the server " +
+  "compute coordinates from your rough placement. The result carries geometry " +
+  "WARNINGS (overlaps, an edge through a shape, edge-on-edge, gaps <150px, a label " +
+  "wider than its shape, negative coords) — they do NOT block the write; fix them " +
+  "and retry, max 2 iterations.";
 
 export const SHARED_TOOL_SPECS = {
   // --- no-argument read tools ---
@@ -1619,7 +1654,7 @@ export const SHARED_TOOL_SPECS = {
       }),
   },
 
-  // --- draw.io diagrams (issue #423, stage 1) ---
+  // --- draw.io diagrams (issue #423 stage 1, #424 stage 2) ---
 
   drawioGet: {
     mcpName: 'drawio_get',
@@ -1673,7 +1708,8 @@ export const SHARED_TOOL_SPECS = {
       'back into drawio_get / drawio_update for THIS document. It is positional, ' +
       'so if you add or remove blocks before it, re-resolve via get_outline. The ' +
       'diagram is editable in the draw.io editor and can be re-read with ' +
-      'drawio_get.',
+      'drawio_get.' +
+      DRAWIO_HARD_RULES,
     tier: 'deferred',
     catalogLine:
       'drawioCreate — create a draw.io diagram from mxGraph XML and insert it.',
@@ -1697,9 +1733,19 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Anchor text fragment (for before/after).'),
       title: z.string().optional().describe('Optional diagram title.'),
+      layout: z
+        .enum(['elk'])
+        .optional()
+        .describe(
+          'Optional: "elk" runs an ELK layered auto-layout (honouring nested ' +
+            'containers) and rewrites all coordinates — give rough placement and ' +
+            'let the server compute pixels.',
+        ),
     }),
     // The flat schema fields are regrouped into the client's `where` object.
-    execute: (client, { pageId, xml, position, anchorNodeId, anchorText, title }) =>
+    // `layout` is the 5th arg: dropping it silently disables ELK auto-layout
+    // (a reviewed #440 parity fix — MUST reach the client on both hosts).
+    execute: (client, { pageId, xml, position, anchorNodeId, anchorText, title, layout }) =>
       client.drawioCreate(
         pageId as string,
         {
@@ -1709,6 +1755,7 @@ export const SHARED_TOOL_SPECS = {
         },
         xml as string,
         title as string | undefined,
+        layout as 'elk' | undefined,
       ),
   },
 
@@ -1722,7 +1769,8 @@ export const SHARED_TOOL_SPECS = {
       '(a human or another agent edited it) the hash mismatches and the update ' +
       'is refused with a conflict error — re-read with drawio_get and retry. On ' +
       'success it overwrites the diagram attachment and updates the node ' +
-      'width/height. `node` is the drawio node attrs.id or "#<index>".',
+      'width/height. `node` is the drawio node attrs.id or "#<index>".' +
+      DRAWIO_HARD_RULES,
     tier: 'deferred',
     catalogLine:
       'drawioUpdate — replace a draw.io diagram (optimistic-locked by baseHash).',
@@ -1742,13 +1790,101 @@ export const SHARED_TOOL_SPECS = {
         .string()
         .min(1)
         .describe('The meta.hash from the drawio_get this edit is based on.'),
+      layout: z
+        .enum(['elk'])
+        .optional()
+        .describe(
+          'Optional: "elk" runs an ELK layered auto-layout and rewrites all ' +
+            'coordinates before writing.',
+        ),
     }),
-    execute: (client, { pageId, node, xml, baseHash }) =>
+    // `layout` is the 5th arg: forward layout:"elk" (a reviewed #440 parity fix)
+    // so both hosts run the ELK auto-layout before writing.
+    execute: (client, { pageId, node, xml, baseHash, layout }) =>
       client.drawioUpdate(
         pageId as string,
         node as string,
         xml as string,
         baseHash as string,
+        layout as 'elk' | undefined,
       ),
+  },
+
+  drawioShapes: {
+    mcpName: 'drawio_shapes',
+    inAppKey: 'drawioShapes',
+    description:
+      'Look up VERIFIED draw.io stencil style-strings so you never guess a ' +
+      '`shape=mxgraph.*` name (a wrong name renders as an EMPTY BOX). Searches a ' +
+      'bundled catalog of ~10 400 shapes (the jgraph/drawio-mcp index) by ' +
+      'substring, tags and loose fuzzy match, plus a curated overlay for AWS ' +
+      'icons: it returns the correct resIcon for rebranded services (OpenSearch ' +
+      '-> elasticsearch_service, MSK -> managed_streaming_for_kafka, VPC Peering ' +
+      '-> peering, IAM Identity Center -> single_sign_on) and maps known-broken ' +
+      'stencils to working replacements (e.g. dynamodb_table -> dynamodb) with a ' +
+      'note. Each hit is { style, w, h, title, type, category?, note? } — copy ' +
+      '`style` verbatim onto the cell and use w/h as the default size. Call this ' +
+      'BEFORE drawio_create/drawio_update whenever you need a specific icon ' +
+      '(AWS/Azure/GCP/network/UML/flowchart).',
+    tier: 'deferred',
+    catalogLine:
+      'drawioShapes — look up verified draw.io stencil style-strings (no empty boxes).',
+    buildShape: (z) => ({
+      query: z
+        .string()
+        .min(1)
+        .describe('What to find, e.g. "lambda", "s3", "azure cosmos", "vpc group".'),
+      category: z
+        .string()
+        .optional()
+        .describe('Optional filter, e.g. an AWS category name ("Compute").'),
+      limit: z
+        .number()
+        .optional()
+        .describe('Max results (default 12, capped at 50).'),
+    }),
+    // INLINE on both hosts (no `execute`): drawio_shapes calls the PURE helper
+    // searchShapes, which is NOT a client method — it reads the bundled shape
+    // catalog via `import.meta.url` (drawio-shapes.ts). tool-specs.ts is
+    // type-checked FROM SOURCE by the in-app server under module:commonjs, where a
+    // static value-import of that `import.meta` module is a compile error
+    // (TS1343), so its execute CANNOT live here. `inlineBothHosts` tells BOTH
+    // registry loops to skip it; index.ts (MCP) and ai-chat-tools.service.ts
+    // (in-app) each register it directly, calling searchShapes from the loaded
+    // module. It STAYS in this registry so the shared-tool-specs contract still
+    // pins its name/description/schema across both hosts.
+    inlineBothHosts: true,
+  },
+
+  drawioGuide: {
+    mcpName: 'drawio_guide',
+    inAppKey: 'drawioGuide',
+    description:
+      'Progressive-disclosure draw.io authoring reference. Call with a `section` ' +
+      'to pull one focused, <=4KB chapter instead of bloating context: ' +
+      '"skeleton" (canonical mxGraph XML, sentinels, the accepted inputs, hard ' +
+      'rules), "layout" (spacing heuristics, edge routing, the layout:"elk" ' +
+      'option, the quality warnings), "containers" (transparent groups, relative ' +
+      'child coords, cross-container edges, swimlanes), "icons-aws" (the ' +
+      'service/resource icon patterns, category colors, rebrandings, blocklist), ' +
+      '"icons-azure" (portable image-style paths). Omit `section` to get the ' +
+      'index of sections. Pair with drawio_shapes for exact stencil styles.',
+    tier: 'deferred',
+    catalogLine:
+      'drawioGuide — on-demand draw.io authoring reference (skeleton/layout/containers/icons).',
+    buildShape: (z) => ({
+      section: z
+        .enum(['skeleton', 'layout', 'containers', 'icons-aws', 'icons-azure'])
+        .optional()
+        .describe('Which section to read; omit for the section index.'),
+    }),
+    // INLINE on both hosts (no `execute`) — same reason as drawio_shapes above:
+    // drawio_guide calls the PURE helper getGuideSection (drawio-guide.ts, no
+    // client, no network). getGuideSection itself has no `import.meta`, but it is
+    // kept inline for SYMMETRY with drawio_shapes (both drawio helper tools wired
+    // the same way in one place) and to avoid pulling any drawio lib source into
+    // the in-app server's commonjs type-check. `inlineBothHosts` makes both loops
+    // skip it; index.ts and ai-chat-tools.service.ts register it directly.
+    inlineBothHosts: true,
   },
 } satisfies Record<string, SharedToolSpec>;

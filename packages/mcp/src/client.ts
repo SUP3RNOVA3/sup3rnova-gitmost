@@ -55,6 +55,7 @@ import {
   countUserCells,
 } from "./lib/drawio-xml.js";
 import { renderDiagramShapes } from "./lib/drawio-preview.js";
+import { applyElkLayout } from "./lib/drawio-layout.js";
 import {
   applyTextEdits,
   TextEdit,
@@ -3984,6 +3985,7 @@ export class DocmostClient {
     },
     xml: string,
     title?: string,
+    layout?: "elk",
   ): Promise<{
     success: boolean;
     nodeId: string;
@@ -4014,8 +4016,12 @@ export class DocmostClient {
       }
     }
 
+    // Optional server-side ELK auto-layout: the model declares structure with
+    // rough coords, ELK computes the pixels (best-effort — returns the input
+    // unchanged on any layout failure).
+    const laidOutXml = layout === "elk" ? await applyElkLayout(xml) : xml;
     // Pre-write pipeline (throws a structured DrawioLintError on any violation).
-    const prepared = prepareModel(xml);
+    const prepared = prepareModel(laidOutXml);
     const inner = renderDiagramShapes(prepared.cells, prepared.bbox);
     const diagramTitle = title || "Page-1";
     const svg = buildDrawioSvg(prepared.modelXml, inner, prepared.bbox, diagramTitle);
@@ -4129,6 +4135,7 @@ export class DocmostClient {
     node: string,
     xml: string,
     baseHash: string,
+    layout?: "elk",
   ): Promise<{
     success: boolean;
     nodeId: string;
@@ -4166,8 +4173,10 @@ export class DocmostClient {
       );
     }
 
+    // Optional server-side ELK auto-layout (best-effort; see drawioCreate).
+    const laidOutXml = layout === "elk" ? await applyElkLayout(xml) : xml;
     // Pipeline for the new content (throws a structured DrawioLintError).
-    const prepared = prepareModel(xml);
+    const prepared = prepareModel(laidOutXml);
     const inner = renderDiagramShapes(prepared.cells, prepared.bbox);
     const diagramTitle = oldAttrs.title || "Page-1";
     const svg = buildDrawioSvg(prepared.modelXml, inner, prepared.bbox, diagramTitle);
