@@ -6,7 +6,7 @@
  * typographic quotes («…»/“…”) vs ASCII "…", em/en-dash vs `-`, non-breaking
  * space vs normal space, differing space counts — are not recognized as equal
  * and "fork": two definitions appear where the author meant one. The existing
- * de-dup paths miss this: `footnoteContentKey` (footnote-authoring.ts) only
+ * de-dup paths miss this: `footnoteContentKey` (@docmost/prosemirror-markdown) only
  * collapses ASCII whitespace (quotes/dashes/NBSP untouched), and
  * `canonicalizeFootnotes` keys purely by `attrs.id` (the two forks have
  * different ids), so neither glues the forks together.
@@ -195,7 +195,7 @@ function stableAttrs(attrs: any): string {
 
 /**
  * ATTRS-AWARE merge key for a footnote definition. Deliberately DIVERGES from
- * the shared `footnoteContentKey` (footnote-authoring.ts): that key's mark
+ * the shared `footnoteContentKey` (@docmost/prosemirror-markdown): that key's mark
  * signature is TYPE-ONLY (`m.type`), so two definitions with identical visible
  * text but marks differing only in ATTRIBUTES — most importantly a `link` with a
  * different `href` (footnotes are usually citations/links), also `code` /
