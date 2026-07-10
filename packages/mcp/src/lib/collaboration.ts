@@ -1,4 +1,3 @@
-import { HocuspocusProvider } from "@hocuspocus/provider";
 import { TiptapTransformer } from "@hocuspocus/transformer";
 import * as Y from "yjs";
 import WebSocket from "ws";
@@ -16,7 +15,8 @@ import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
 import { sanitizeForYjs, findUnstorableAttr } from "./node-ops.js";
 import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
-import { summarizeChange, VerifyReport } from "./diff.js";
+import { VerifyReport } from "./diff.js";
+import { acquireCollabSession } from "./collab-session.js";
 
 export { markdownToProseMirror };
 
@@ -194,25 +194,26 @@ export function assertYjsEncodable(doc: any): void {
   }
 }
 
-/** Time we wait for the initial handshake/sync before giving up. */
-const CONNECT_TIMEOUT_MS = 25000;
-/** Time we wait for the server to acknowledge our write before giving up. */
-const PERSIST_TIMEOUT_MS = 20000;
-
 /**
  * Safely mutate the live content of a page over the collaboration websocket.
  *
  * This is the single safe write path for every MCP content mutation. It:
  *   1. serializes per-page writes through withPageLock (no two MCP writes on
  *      the same page overlap);
- *   2. connects to Hocuspocus and waits for the initial sync so the local ydoc
- *      mirrors the authoritative server doc — INCLUDING edits/comments/images
- *      that are not yet in the debounced REST snapshot;
- *   3. inside onSynced, SYNCHRONOUSLY reads the live doc, runs `transform`, and
- *      writes the result back — with no `await` between read and write so no
- *      remote update can interleave and clobber concurrent human edits;
+ *   2. acquires a LIVE, synced CollabSession for the page (issue #400) — a
+ *      cached provider whose local ydoc mirrors the authoritative server doc
+ *      (INCLUDING edits/comments/images not yet in the debounced REST snapshot),
+ *      reused across a series of edits instead of a fresh connect/auth/sync per
+ *      call;
+ *   3. SYNCHRONOUSLY reads the live doc, runs `transform`, and writes the result
+ *      back — with no `await` between read and write so no remote update can
+ *      interleave and clobber concurrent human edits (CollabSession.mutate);
  *   4. waits for the server to acknowledge the write (unsyncedChanges -> 0)
  *      before resolving, so the next operation observes our change.
+ *
+ * On any mutate failure the session is destroyed so the next call reconnects
+ * fresh; the page lock is held for the whole acquire+mutate so the session's
+ * synchronous read->write window never overlaps another MCP write on the page.
  *
  * `transform` receives the live ProseMirror doc and returns the NEW full
  * ProseMirror doc to write, or `null` to abort with no write (a no-op). If
@@ -230,7 +231,7 @@ export async function mutatePageContent(
   baseUrl: string,
   transform: (liveDoc: any) => any | null,
 ): Promise<MutationResult> {
-  return withPageLock(pageId, () => {
+  return withPageLock(pageId, async () => {
     if (process.env.DEBUG) {
       console.error(`Starting realtime content mutate for page ${pageId}`);
       // Token prefix is sensitive; only log it under DEBUG.
@@ -239,202 +240,15 @@ export async function mutatePageContent(
       );
     }
 
-    const ydoc = new Y.Doc();
-    const wsUrl = buildCollabWsUrl(baseUrl);
-    if (process.env.DEBUG) console.error(`Connecting to WebSocket: ${wsUrl}`);
-
-    return new Promise<MutationResult>((resolve, reject) => {
-      let provider: HocuspocusProvider | undefined;
-      let applied = false; // onSynced may fire again on reconnect — apply once.
-      let settled = false;
-      // Set true on disconnect/close so a reconnect-driven unsyncedChanges->0
-      // cannot be mistaken for a successful persist of our write.
-      let connectionLost = false;
-      let connectTimer: ReturnType<typeof setTimeout> | undefined;
-      let persistTimer: ReturnType<typeof setTimeout> | undefined;
-      let unsyncedHandler: ((data: { number: number }) => void) | undefined;
-
-      const cleanup = () => {
-        if (connectTimer) clearTimeout(connectTimer);
-        if (persistTimer) clearTimeout(persistTimer);
-        if (provider) {
-          if (unsyncedHandler) {
-            try {
-              provider.off("unsyncedChanges", unsyncedHandler);
-            } catch (err) {}
-          }
-          try {
-            provider.destroy();
-          } catch (err) {}
-        }
-      };
-
-      const finish = (err: Error | null, value?: MutationResult) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (err) reject(err);
-        else resolve(value as MutationResult);
-      };
-
-      connectTimer = setTimeout(() => {
-        finish(new Error("Connection timeout to collaboration server"));
-      }, CONNECT_TIMEOUT_MS);
-
-      // Resolve once the server has acknowledged our update. The provider
-      // increments unsyncedChanges when our local update is sent and
-      // decrements it when the server replies with a SyncStatus(applied=true);
-      // reaching 0 means the authoritative in-memory ydoc on the server now
-      // contains our write.
-      const waitForPersistence = () => {
-        if (settled) return;
-        // A missing provider is a failure, not a success: without it the write
-        // can never have been acknowledged. Only an actual unsyncedChanges===0
-        // on a live provider counts as persisted.
-        if (!provider) {
-          finish(new Error("collab provider gone before persistence"));
-          return;
-        }
-        if (provider.unsyncedChanges === 0) {
-          finish(null, mutationResult);
-          return;
-        }
-        persistTimer = setTimeout(() => {
-          finish(
-            new Error(
-              "Timeout waiting for collaboration server to persist the update",
-            ),
-          );
-        }, PERSIST_TIMEOUT_MS);
-        unsyncedHandler = (data: { number: number }) => {
-          // Only treat unsyncedChanges->0 as success when the connection is
-          // still up. A transient disconnect + reconnect handshake can drive
-          // the counter back to 0 without our write being re-transmitted; in
-          // that case let the disconnect/close error win instead.
-          if (data.number === 0 && !connectionLost) {
-            finish(null, mutationResult);
-          }
-        };
-        provider.on("unsyncedChanges", unsyncedHandler);
-      };
-
-      // The verifiable result resolved on every success/abort path. Set on
-      // abort (no-op report) and after a real write (computed change report).
-      let mutationResult: MutationResult;
-
-      provider = new HocuspocusProvider({
-        url: wsUrl,
-        name: `page.${pageId}`,
-        document: ydoc,
-        token: collabToken,
-        // @ts-ignore - Required for Node.js environment
-        WebSocketPolyfill: WebSocket,
-        onConnect: () => {
-          if (process.env.DEBUG) console.error("WS Connect");
-        },
-        // An unexpected disconnect/close while we are still waiting (during the
-        // connect-wait before onSynced, or during the persistence wait after the
-        // write) means the update will never be acknowledged — surface it now
-        // instead of hanging until the connect/persist timeout fires. `finish`
-        // is idempotent via the `settled` flag, so the onClose that our own
-        // cleanup()->provider.destroy() triggers (after settled=true is set) is
-        // a harmless no-op and cannot cause a double-resolve.
-        onDisconnect: () => {
-          if (process.env.DEBUG) console.error("WS Disconnect");
-          // Mark BEFORE finish so the unsyncedChanges handler (if it races)
-          // sees the connection as lost and won't report a false success.
-          connectionLost = true;
-          finish(
-            new Error(
-              "Collaboration connection closed before the update was persisted/synced",
-            ),
-          );
-        },
-        onClose: () => {
-          if (process.env.DEBUG) console.error("WS Close");
-          // Mark BEFORE finish so the unsyncedChanges handler (if it races)
-          // sees the connection as lost and won't report a false success.
-          connectionLost = true;
-          finish(
-            new Error(
-              "Collaboration connection closed before the update was persisted/synced",
-            ),
-          );
-        },
-        onSynced: () => {
-          if (applied || settled) return;
-          applied = true;
-          if (process.env.DEBUG) console.error("Connected and synced!");
-
-          // CRITICAL: everything between reading the live doc and writing it
-          // back must stay synchronous (no await). While the JS event loop is
-          // not yielded, no incoming remote update can interleave, so any
-          // already-synced concurrent edits are preserved in liveDoc.
-          let newDoc: any;
-          let beforeDoc: any;
-          try {
-            let liveDoc = TiptapTransformer.fromYdoc(ydoc, "default");
-            if (
-              !liveDoc ||
-              typeof liveDoc !== "object" ||
-              !Array.isArray(liveDoc.content)
-            ) {
-              liveDoc = { type: "doc", content: [] };
-            }
-
-            // Snapshot the before-doc for the change report. Docs are
-            // JSON-serializable, so this is a safe deep clone.
-            beforeDoc = JSON.parse(JSON.stringify(liveDoc));
-
-            newDoc = transform(liveDoc);
-
-            if (newDoc == null) {
-              // Transform aborted — write nothing, return the live doc with a
-              // no-op change report.
-              mutationResult = {
-                doc: liveDoc,
-                verify: {
-                  changed: false,
-                  textInserted: 0,
-                  textDeleted: 0,
-                  blocksChanged: 0,
-                  marks: {},
-                  summary: "no changes (transform aborted)",
-                },
-              };
-              finish(null, mutationResult);
-              return;
-            }
-
-            // Structural diff into the live fragment (issue #152): preserves
-            // the Yjs ids of unchanged nodes, so an open editor's cursor is not
-            // yanked to the end of the document on every agent write.
-            applyDocToFragment(ydoc, newDoc);
-          } catch (e) {
-            // Includes errors thrown by transform (e.g. "afterText not found",
-            // "text not found"): propagate them verbatim to the caller.
-            finish(e instanceof Error ? e : new Error(String(e)));
-            return;
-          }
-
-          // Compute the verifiable change report AFTER the transact write: it
-          // only needs the JSON before/after, so it cannot affect the atomic
-          // read->write window, and summarizeChange never throws.
-          mutationResult = {
-            doc: newDoc,
-            verify: summarizeChange(beforeDoc, newDoc),
-          };
-          if (process.env.DEBUG)
-            console.error("Content written, waiting for server to persist...");
-          waitForPersistence();
-        },
-        onAuthenticationFailed: () => {
-          finish(
-            new Error("Authentication failed for collaboration connection"),
-          );
-        },
-      });
-    });
+    const session = await acquireCollabSession(pageId, collabToken, baseUrl);
+    try {
+      return await session.mutate(transform);
+    } catch (e) {
+      // Drop the session on any failure so the next call reconnects fresh (this
+      // also closes the "reconnect drove the counter to 0" false-success class).
+      session.destroy("mutate failed");
+      throw e;
+    }
   });
 }
 

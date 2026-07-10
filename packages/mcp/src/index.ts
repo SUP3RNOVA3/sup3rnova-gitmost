@@ -13,6 +13,11 @@ import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
 export { DocmostClient } from "./client.js";
 export type { DocmostMcpConfig } from "./client.js";
 
+// Teardown for the live per-page CollabSession cache (issue #400). An embedding
+// HTTP host (the gitmost NestJS server) should call this from its own shutdown
+// hook so no cached collab provider outlives the process.
+export { destroyAllSessions } from "./lib/collab-session.js";
+
 // Re-export the zod-agnostic shared tool-spec registry so the in-app AI-SDK
 // service can read it off the loaded module (it cannot import the ESM package's
 // internals directly; it goes through loadDocmostMcp()).

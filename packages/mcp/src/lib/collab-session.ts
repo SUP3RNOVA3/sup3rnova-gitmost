@@ -1,0 +1,668 @@
+import { HocuspocusProvider } from "@hocuspocus/provider";
+import { TiptapTransformer } from "@hocuspocus/transformer";
+import * as Y from "yjs";
+import WebSocket from "ws";
+import {
+  buildCollabWsUrl,
+  applyDocToFragment,
+  MutationResult,
+} from "./collaboration.js";
+import { summarizeChange } from "./diff.js";
+
+/**
+ * Live per-page collaboration session cache (issue #400).
+ *
+ * The one-shot write path (collaboration.mutatePageContent /
+ * client.mutateLiveContentUnlocked) used to open a NEW HocuspocusProvider, run
+ * the full connect -> auth -> onLoadDocument -> initial-sync handshake, apply a
+ * single edit, wait for persistence, and then `provider.destroy()` — for EVERY
+ * content mutation. Disconnecting after every edit means that once the pause
+ * between calls exceeds the server's write debounce, the server does a full
+ * store -> unload -> reload per cell, causing 25s connect timeouts and
+ * event-loop lag under a burst of edits on one page.
+ *
+ * This module keeps ONE live provider + ydoc per (wsUrl, pageId, token) alive
+ * across a SERIES of edits. While the provider stays connected the server never
+ * enters store -> unload -> reload, its debounce coalesces N writes into 1-2
+ * stores, and the repeated auth/load/initial-sync disappears.
+ *
+ * The synchronous read -> transform -> write section and the per-edit
+ * persistence-ack logic are preserved VERBATIM from the one-shot machine — the
+ * only change is that they run on a persistent provider instead of a throwaway
+ * one. See CollabSession.mutate.
+ */
+
+/** Time we wait for the initial handshake/sync before giving up. */
+const CONNECT_TIMEOUT_MS = 25000;
+/** Time we wait for the server to acknowledge our write before giving up. */
+const PERSIST_TIMEOUT_MS = 20000;
+
+/**
+ * Tunables, read fresh from the environment on every acquire so tests (and a
+ * live rollback) can change them without reloading the module. Mirrors how
+ * http.ts parses MCP_SESSION_IDLE_MS.
+ *   - MCP_COLLAB_SESSION_IDLE_MS: idle TTL, reset after every op. Default 60s.
+ *     0 (or negative) DISABLES the cache — every op opens its own provider and
+ *     destroys it after the op, i.e. the exact legacy per-op-provider behavior
+ *     (the rollback path).
+ *   - MCP_COLLAB_SESSION_MAX_AGE_MS: hard lifetime checked at acquire; bounds
+ *     the permission-staleness window. Default 10 min.
+ *   - MCP_COLLAB_SESSION_MAX_ENTRIES: registry cap; the least-recently-used
+ *     session is destroy-evicted when the cap is reached. Default 32.
+ */
+interface SessionConfig {
+  idleMs: number;
+  maxAgeMs: number;
+  maxEntries: number;
+}
+
+function parseEnvInt(value: string | undefined, fallback: number): number {
+  const parsed = parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function readConfig(): SessionConfig {
+  // idleMs: allow 0 (disable). A malformed value falls back to the default.
+  const idleRaw = parseInt(process.env.MCP_COLLAB_SESSION_IDLE_MS ?? "", 10);
+  const idleMs = Number.isFinite(idleRaw) ? Math.max(0, idleRaw) : 60 * 1000;
+  const maxAgeMs = Math.max(
+    0,
+    parseEnvInt(process.env.MCP_COLLAB_SESSION_MAX_AGE_MS, 10 * 60 * 1000),
+  );
+  const maxEntriesRaw = parseEnvInt(
+    process.env.MCP_COLLAB_SESSION_MAX_ENTRIES,
+    32,
+  );
+  const maxEntries = maxEntriesRaw > 0 ? maxEntriesRaw : 32;
+  return { idleMs, maxAgeMs, maxEntries };
+}
+
+/**
+ * The subset of HocuspocusProvider this module depends on, so the provider can
+ * be replaced with a fake in unit tests (there is no server in the test env).
+ */
+export interface CollabProviderLike {
+  synced: boolean;
+  unsyncedChanges: number;
+  destroy(): void;
+  on(event: "unsyncedChanges", handler: (data: { number: number }) => void): void;
+  off(event: "unsyncedChanges", handler: (data: { number: number }) => void): void;
+}
+
+/** The configuration object passed to the provider factory. */
+export interface CollabProviderConfig {
+  url: string;
+  name: string;
+  document: Y.Doc;
+  token: string;
+  WebSocketPolyfill: unknown;
+  onConnect: () => void;
+  onSynced: () => void;
+  onDisconnect: () => void;
+  onClose: () => void;
+  onAuthenticationFailed: () => void;
+}
+
+export type CollabProviderFactory = (
+  config: CollabProviderConfig,
+) => CollabProviderLike;
+
+const defaultProviderFactory: CollabProviderFactory = (config) =>
+  // @ts-ignore - WebSocketPolyfill is required for the Node.js environment.
+  new HocuspocusProvider(config) as unknown as CollabProviderLike;
+
+let providerFactory: CollabProviderFactory = defaultProviderFactory;
+
+/**
+ * TEST SEAM: swap the provider factory (pass null to restore the real one).
+ * Not part of the public API — used only by the unit tests, which cannot reach
+ * a real collaboration server.
+ */
+export function __setCollabProviderFactory(
+  factory: CollabProviderFactory | null,
+): void {
+  providerFactory = factory ?? defaultProviderFactory;
+}
+
+/** Optional per-acquire hooks (metrics), passed through from the call site. */
+export interface AcquireOptions {
+  /** Invoked when the initial connect handshake times out (CONNECT_TIMEOUT_MS). */
+  onConnectTimeout?: () => void;
+}
+
+type SessionState = "connecting" | "ready" | "dead";
+
+/**
+ * One live provider + ydoc for a single (wsUrl, pageId, token) triple.
+ *
+ * Lifecycle: connecting -> ready -> dead. A session becomes `dead` on the first
+ * disconnect/close/auth-failure at ANY time, on an idle/eviction/max-age
+ * teardown, or on an explicit destroy(); death is terminal and removes the
+ * session from the registry so the next acquire opens a fresh one. We never use
+ * the provider's auto-reconnect — destroying on the first disconnect closes the
+ * "reconnect drove unsyncedChanges to 0 without retransmitting our write" class
+ * of false success.
+ */
+export class CollabSession {
+  readonly key: string;
+  readonly pageId: string;
+  readonly wsUrl: string;
+  readonly token: string;
+  readonly createdAt: number;
+  state: SessionState = "connecting";
+  /**
+   * Set true on disconnect/close/auth-failure so a reconnect-driven
+   * unsyncedChanges->0 cannot be mistaken for a successful persist of our
+   * write (preserved verbatim from the one-shot machine).
+   */
+  connectionLost = false;
+
+  provider: CollabProviderLike | undefined;
+  private readonly ydoc: Y.Doc;
+  private readonly cfg: SessionConfig;
+  /**
+   * Ephemeral sessions (cache disabled, MCP_COLLAB_SESSION_IDLE_MS<=0) are never
+   * registered and self-destroy after their single op — the legacy
+   * provider-per-op behavior.
+   */
+  private readonly ephemeral: boolean;
+  private readonly opts: AcquireOptions | undefined;
+
+  private dead = false;
+  private connectTimer: ReturnType<typeof setTimeout> | undefined;
+  private idleTimer: ReturnType<typeof setTimeout> | undefined;
+  private openPromise: Promise<void> | undefined;
+  private openResolve: (() => void) | undefined;
+  private openReject: ((err: Error) => void) | undefined;
+  private openSettled = false;
+  /**
+   * The rejector of the CURRENT in-flight mutate, if any. A disconnect/close/
+   * auth-failure or timeout at ANY time rejects the in-flight op through this
+   * with the SAME error text the one-shot machine emitted.
+   */
+  private inflightReject: ((err: Error) => void) | undefined;
+
+  constructor(
+    key: string,
+    pageId: string,
+    wsUrl: string,
+    token: string,
+    cfg: SessionConfig,
+    ephemeral: boolean,
+    opts: AcquireOptions | undefined,
+  ) {
+    this.key = key;
+    this.pageId = pageId;
+    this.wsUrl = wsUrl;
+    this.token = token;
+    this.cfg = cfg;
+    this.ephemeral = ephemeral;
+    this.opts = opts;
+    this.createdAt = Date.now();
+    this.ydoc = new Y.Doc();
+  }
+
+  /**
+   * A cached session may be reused only when it is fully ready, still synced,
+   * has not lost its connection, and has not exceeded its max age (invariant 5
+   * "validate on reuse" + the max-age acquire check).
+   */
+  isReusable(): boolean {
+    return (
+      !this.dead &&
+      this.state === "ready" &&
+      !this.connectionLost &&
+      !!this.provider &&
+      this.provider.synced === true &&
+      Date.now() - this.createdAt < this.cfg.maxAgeMs
+    );
+  }
+
+  /**
+   * Connect and wait for the initial sync (onSynced) within CONNECT_TIMEOUT_MS.
+   * Idempotent: repeated calls return the same in-flight/settled promise.
+   */
+  open(): Promise<void> {
+    if (this.openPromise) return this.openPromise;
+    this.openPromise = new Promise<void>((resolve, reject) => {
+      this.openResolve = resolve;
+      this.openReject = reject;
+
+      this.connectTimer = setTimeout(() => {
+        // The 25s connect timeout: the collab connection never became ready.
+        this.opts?.onConnectTimeout?.();
+        this.teardown(
+          new Error("Connection timeout to collaboration server"),
+          false,
+        );
+      }, CONNECT_TIMEOUT_MS);
+
+      if (process.env.DEBUG)
+        console.error(`Connecting to WebSocket: ${this.wsUrl}`);
+
+      this.provider = providerFactory({
+        url: this.wsUrl,
+        name: `page.${this.pageId}`,
+        document: this.ydoc,
+        token: this.token,
+        WebSocketPolyfill: WebSocket,
+        onConnect: () => {
+          if (process.env.DEBUG) console.error("WS Connect");
+        },
+        // An unexpected disconnect/close at ANY time (during the connect-wait,
+        // between edits, or during a persistence wait) makes the session dead:
+        // surface it now instead of hanging, reject any in-flight op with the
+        // same error text as the one-shot machine, and remove ourselves from
+        // the registry so the next acquire opens fresh. `teardown` is idempotent
+        // so the onClose our own destroy() triggers is a harmless no-op.
+        onDisconnect: () => {
+          if (process.env.DEBUG) console.error("WS Disconnect");
+          this.teardown(
+            new Error(
+              "Collaboration connection closed before the update was persisted/synced",
+            ),
+            true,
+          );
+        },
+        onClose: () => {
+          if (process.env.DEBUG) console.error("WS Close");
+          this.teardown(
+            new Error(
+              "Collaboration connection closed before the update was persisted/synced",
+            ),
+            true,
+          );
+        },
+        onSynced: () => {
+          if (this.dead || this.openSettled) return;
+          if (process.env.DEBUG) console.error("Connected and synced!");
+          if (this.connectTimer) {
+            clearTimeout(this.connectTimer);
+            this.connectTimer = undefined;
+          }
+          this.state = "ready";
+          this.openSettled = true;
+          this.openResolve?.();
+        },
+        onAuthenticationFailed: () => {
+          this.teardown(
+            new Error("Authentication failed for collaboration connection"),
+            true,
+          );
+        },
+      });
+    });
+    return this.openPromise;
+  }
+
+  /**
+   * Run one atomic read -> transform -> write against the LIVE doc and wait for
+   * the server to acknowledge the write.
+   *
+   * INVARIANT 1 (read->write atomicity): between `TiptapTransformer.fromYdoc`
+   * and `applyDocToFragment` there is NO `await`. Yjs applies remote updates
+   * only when the event loop yields, so this synchronous block sees a consistent
+   * live doc and no concurrent human edit can interleave and be clobbered —
+   * exactly as in the one-shot onSynced code, just on a persistent provider.
+   *
+   * INVARIANT 2 (per-edit ack): after the write, resolve immediately if
+   * unsyncedChanges is already 0, else wait for the unsyncedChanges->0 event
+   * (PERSIST_TIMEOUT_MS), guarded by connectionLost so a reconnect handshake
+   * cannot report a false success.
+   *
+   * CONCURRENCY: not safe to invoke concurrently on ONE session — the caller
+   * MUST serialize (hold the per-page lock), mirroring acquireCollabSession.
+   * The in-flight op is tracked in a single `inflightReject` field, so an
+   * overlapping second call would clobber the first's rejector and leave it
+   * hanging on disconnect. A fail-fast guard below rejects the overlap instead.
+   * Sequential (awaited) mutates are fine: localFinish clears inflightReject
+   * before the promise settles, so the guard is clear by the time the next runs.
+   */
+  mutate(
+    transform: (liveDoc: any) => any | null,
+  ): Promise<MutationResult> {
+    // Belt-and-suspenders (acquire already validated): refuse to write on a
+    // session that is not in a live, synced, ready state.
+    if (
+      this.dead ||
+      this.state !== "ready" ||
+      this.connectionLost ||
+      !this.provider ||
+      this.provider.synced !== true
+    ) {
+      return Promise.reject(
+        new Error("Collaboration session is not in a ready state"),
+      );
+    }
+
+    // Fail-fast on concurrent use: a second overlapping mutate would overwrite
+    // the first's inflightReject, so a disconnect would only reject the second
+    // and hang the first until PERSIST_TIMEOUT_MS. Reject the overlap WITHOUT
+    // touching the in-flight op's state (no localFinish/teardown here).
+    if (this.inflightReject) {
+      return Promise.reject(
+        new Error(
+          "mutate already in-flight; caller must serialize (hold the page lock)",
+        ),
+      );
+    }
+
+    return new Promise<MutationResult>((resolve, reject) => {
+      let settled = false;
+      let persistTimer: ReturnType<typeof setTimeout> | undefined;
+      let unsyncedHandler:
+        | ((data: { number: number }) => void)
+        | undefined;
+      // The verifiable result resolved on every success/abort path. Set on
+      // abort (no-op report) and after a real write (computed change report).
+      let mutationResult: MutationResult;
+
+      const localFinish = (err: Error | null, value?: MutationResult) => {
+        if (settled) return;
+        settled = true;
+        if (persistTimer) clearTimeout(persistTimer);
+        if (unsyncedHandler && this.provider) {
+          try {
+            this.provider.off("unsyncedChanges", unsyncedHandler);
+          } catch (e) {}
+        }
+        this.inflightReject = undefined;
+        if (err) reject(err);
+        else resolve(value as MutationResult);
+        // Post-settle lifecycle: an ephemeral (cache-disabled) session dies with
+        // its single op; a cached session that is still alive re-arms its idle
+        // TTL so the clock starts from the LAST op.
+        if (this.ephemeral) {
+          this.destroy("ephemeral op complete");
+        } else if (!this.dead) {
+          this.armIdle();
+        }
+      };
+
+      // Register so a disconnect/close/auth-failure/teardown rejects THIS op
+      // with the connection-loss error text. localFinish's `settled` guard makes
+      // a racing teardown + normal resolve safe (first one wins).
+      this.inflightReject = (e: Error) => localFinish(e);
+
+      // Resolve once the server acknowledges our update: the provider increments
+      // unsyncedChanges when the local update is sent and decrements it on the
+      // server's SyncStatus(applied=true); reaching 0 means the authoritative
+      // in-memory ydoc on the server now contains our write.
+      const waitForPersistence = () => {
+        if (settled) return;
+        // A missing provider is a failure, not a success: without it the write
+        // can never have been acknowledged.
+        if (!this.provider) {
+          localFinish(new Error("collab provider gone before persistence"));
+          return;
+        }
+        if (this.provider.unsyncedChanges === 0) {
+          localFinish(null, mutationResult);
+          return;
+        }
+        persistTimer = setTimeout(() => {
+          localFinish(
+            new Error(
+              "Timeout waiting for collaboration server to persist the update",
+            ),
+          );
+        }, PERSIST_TIMEOUT_MS);
+        unsyncedHandler = (data: { number: number }) => {
+          // Only treat unsyncedChanges->0 as success when the connection is
+          // still up. A transient disconnect + reconnect handshake can drive the
+          // counter back to 0 without our write being re-transmitted; in that
+          // case let the disconnect/close error win instead.
+          if (data.number === 0 && !this.connectionLost) {
+            localFinish(null, mutationResult);
+          }
+        };
+        this.provider.on("unsyncedChanges", unsyncedHandler);
+      };
+
+      // CRITICAL: everything between reading the live doc and writing it back
+      // must stay synchronous (no await). While the JS event loop is not
+      // yielded, no incoming remote update can interleave, so any already-synced
+      // concurrent edits are preserved in liveDoc.
+      let newDoc: any;
+      let beforeDoc: any;
+      try {
+        let liveDoc = TiptapTransformer.fromYdoc(this.ydoc, "default");
+        if (
+          !liveDoc ||
+          typeof liveDoc !== "object" ||
+          !Array.isArray(liveDoc.content)
+        ) {
+          liveDoc = { type: "doc", content: [] };
+        }
+
+        // Snapshot the before-doc for the change report. Docs are
+        // JSON-serializable, so this is a safe deep clone.
+        beforeDoc = JSON.parse(JSON.stringify(liveDoc));
+
+        newDoc = transform(liveDoc);
+
+        if (newDoc == null) {
+          // Transform aborted — write nothing, return the live doc with a no-op
+          // change report.
+          mutationResult = {
+            doc: liveDoc,
+            verify: {
+              changed: false,
+              textInserted: 0,
+              textDeleted: 0,
+              blocksChanged: 0,
+              marks: {},
+              summary: "no changes (transform aborted)",
+            },
+          };
+          localFinish(null, mutationResult);
+          return;
+        }
+
+        // Structural diff into the live fragment (issue #152): preserves the Yjs
+        // ids of unchanged nodes, so an open editor's cursor is not yanked to the
+        // end of the document on every agent write.
+        applyDocToFragment(this.ydoc, newDoc);
+      } catch (e) {
+        // Includes errors thrown by transform (e.g. "afterText not found",
+        // "text not found"): propagate them verbatim to the caller.
+        localFinish(e instanceof Error ? e : new Error(String(e)));
+        return;
+      }
+
+      // Compute the verifiable change report AFTER the transact write: it only
+      // needs the JSON before/after, so it cannot affect the atomic read->write
+      // window, and summarizeChange never throws.
+      mutationResult = {
+        doc: newDoc,
+        verify: summarizeChange(beforeDoc, newDoc),
+      };
+      if (process.env.DEBUG)
+        console.error("Content written, waiting for server to persist...");
+      waitForPersistence();
+    });
+  }
+
+  /** (Re)arm the idle TTL so the clock starts from the most recent activity. */
+  armIdle(): void {
+    if (this.dead || this.ephemeral) return;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    if (this.cfg.idleMs > 0) {
+      this.idleTimer = setTimeout(() => {
+        this.destroy("idle timeout");
+      }, this.cfg.idleMs);
+      // Never let the idle timer keep the process alive.
+      (this.idleTimer as any).unref?.();
+    }
+  }
+
+  /**
+   * Idempotent teardown: mark dead, clear timers, remove from the registry, fail
+   * any pending open/in-flight op, and destroy the provider. `inflightError` is
+   * the error a pending open or in-flight op is rejected with; `connectionLoss`
+   * marks the session as connection-lost so the ack guard cannot report a false
+   * success on a racing unsyncedChanges->0.
+   */
+  private teardown(inflightError: Error | null, connectionLoss: boolean): void {
+    if (this.dead) return;
+    this.dead = true;
+    this.state = "dead";
+    if (connectionLoss) this.connectionLost = true;
+
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = undefined;
+    }
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+
+    // Remove ourselves from the registry (only if we are still the live entry —
+    // a re-open under the same key must not be evicted by our teardown).
+    if (sessions.get(this.key) === this) {
+      sessions.delete(this.key);
+    }
+
+    // Fail a pending open() and any in-flight mutate with the terminal error.
+    if (!this.openSettled) {
+      this.openSettled = true;
+      this.openReject?.(
+        inflightError ?? new Error("Collaboration session destroyed"),
+      );
+    }
+    if (this.inflightReject) {
+      const rej = this.inflightReject;
+      this.inflightReject = undefined;
+      rej(inflightError ?? new Error("Collaboration session destroyed"));
+    }
+
+    if (this.provider) {
+      try {
+        this.provider.destroy();
+      } catch (e) {}
+      this.provider = undefined;
+    }
+  }
+
+  /**
+   * Public idempotent teardown used by the acquire/eviction paths and by a
+   * caller that wants the session dropped after a failed op ("next call
+   * reconnects fresh").
+   */
+  destroy(reason: string): void {
+    if (this.dead) return;
+    if (process.env.DEBUG)
+      console.error(`Destroying collab session ${this.pageId}: ${reason}`);
+    this.teardown(new Error(`Collaboration session destroyed: ${reason}`), false);
+  }
+}
+
+/** key = wsUrl + pageId + collabToken (identity isolation: invariant 4). */
+const sessions = new Map<string, CollabSession>();
+
+function sessionKey(wsUrl: string, pageId: string, token: string): string {
+  // The token is part of the key so sessions are NEVER shared between different
+  // users' MCP sessions (HTTP mode), and a token rotation makes a new entry
+  // while the old one idles out.
+  return `${wsUrl} ${pageId} ${token}`;
+}
+
+/**
+ * Get a live, synced CollabSession for a page, reusing a cached one when it is
+ * still valid or opening a fresh one otherwise. Does NOT take the per-page lock
+ * — the caller MUST already hold it (both call sites run inside withPageLock,
+ * which is not reentrant, so acquiring the lock here would deadlock
+ * mutateLiveContentUnlocked).
+ */
+export async function acquireCollabSession(
+  pageId: string,
+  collabToken: string,
+  baseUrl: string,
+  opts?: AcquireOptions,
+): Promise<CollabSession> {
+  const cfg = readConfig();
+  const wsUrl = buildCollabWsUrl(baseUrl);
+
+  // Cache disabled (rollback path): open an unregistered ephemeral session that
+  // self-destroys after its single op — the exact legacy per-op-provider flow.
+  if (cfg.idleMs <= 0) {
+    const session = new CollabSession(
+      sessionKey(wsUrl, pageId, collabToken),
+      pageId,
+      wsUrl,
+      collabToken,
+      cfg,
+      true,
+      opts,
+    );
+    await session.open();
+    return session;
+  }
+
+  const key = sessionKey(wsUrl, pageId, collabToken);
+  const existing = sessions.get(key);
+  if (existing) {
+    if (existing.isReusable()) {
+      // Reuse. Refresh LRU order (re-insert = most recently used) and re-arm the
+      // idle TTL so the reuse counts as activity.
+      sessions.delete(key);
+      sessions.set(key, existing);
+      existing.armIdle();
+      if (process.env.DEBUG)
+        console.error(`Reusing collab session for page ${pageId}`);
+      return existing;
+    }
+    // Stale (not synced / past max age / lost): drop it and open fresh.
+    existing.destroy("stale on reuse");
+  }
+
+  // Enforce the registry cap before inserting: destroy-evict the least recently
+  // used (the first entry in insertion order) until there is room.
+  while (sessions.size >= cfg.maxEntries) {
+    const oldestKey: string | undefined = sessions.keys().next().value;
+    if (oldestKey === undefined) break;
+    const victim = sessions.get(oldestKey);
+    if (victim) victim.destroy("evicted (LRU cap)");
+    // destroy() removes it from the map; guard against a no-op destroy.
+    if (sessions.has(oldestKey)) sessions.delete(oldestKey);
+  }
+
+  const session = new CollabSession(
+    key,
+    pageId,
+    wsUrl,
+    collabToken,
+    cfg,
+    false,
+    opts,
+  );
+  sessions.set(key, session);
+  try {
+    await session.open();
+  } catch (e) {
+    // Failed connect/sync: make sure it is not left cached.
+    session.destroy("open failed");
+    throw e;
+  }
+  session.armIdle();
+  if (process.env.DEBUG)
+    console.error(`Opened new collab session for page ${pageId}`);
+  return session;
+}
+
+/**
+ * Destroy every cached session. Wired into the process shutdown so a hanging
+ * session does not keep a doc loaded on the server past exit.
+ */
+export function destroyAllSessions(): void {
+  for (const session of [...sessions.values()]) {
+    session.destroy("process shutdown");
+  }
+  sessions.clear();
+}
+
+/** TEST-ONLY: number of currently cached sessions. */
+export function __sessionCountForTests(): number {
+  return sessions.size;
+}

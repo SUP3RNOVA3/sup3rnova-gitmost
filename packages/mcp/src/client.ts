@@ -8,10 +8,6 @@ import {
   filterComment,
   filterSearchResult,
 } from "./lib/filters.js";
-import { HocuspocusProvider } from "@hocuspocus/provider";
-import { TiptapTransformer } from "@hocuspocus/transformer";
-import * as Y from "yjs";
-import WebSocket from "ws";
 import { convertProseMirrorToMarkdown } from "./lib/markdown-converter.js";
 import {
   collectInternalFileNodes,
@@ -24,11 +20,10 @@ import {
   markdownToProseMirror,
   markdownToProseMirrorCanonical,
   mutatePageContent,
-  buildCollabWsUrl,
   assertYjsEncodable,
-  applyDocToFragment,
   MutationResult,
 } from "./lib/collaboration.js";
+import { acquireCollabSession } from "./lib/collab-session.js";
 import { footnoteWarningsField } from "./lib/footnote-analyze.js";
 import { buildPageTree } from "./lib/tree.js";
 import {
@@ -417,177 +412,32 @@ export class DocmostClient {
    * change report. The report is computed AFTER the atomic read->write and
    * never throws.
    */
-  private mutateLiveContentUnlocked(
+  private async mutateLiveContentUnlocked(
     pageId: string,
     collabToken: string,
     transform: (liveDoc: any) => any | null,
   ): Promise<MutationResult> {
-    const CONNECT_TIMEOUT_MS = 25000;
-    const PERSIST_TIMEOUT_MS = 20000;
-    const ydoc = new Y.Doc();
-    const wsUrl = buildCollabWsUrl(this.apiUrl);
-
-    return new Promise<MutationResult>((resolve, reject) => {
-      let provider: HocuspocusProvider | undefined;
-      let applied = false; // onSynced may fire again on reconnect — apply once.
-      let settled = false;
-      let connectionLost = false;
-      let connectTimer: ReturnType<typeof setTimeout> | undefined;
-      let persistTimer: ReturnType<typeof setTimeout> | undefined;
-      let unsyncedHandler: ((data: { number: number }) => void) | undefined;
-      // The verifiable result resolved on every success/abort path. Set on abort
-      // (no-op report) and after a real write (computed change report).
-      let mutationResult: MutationResult;
-
-      const cleanup = () => {
-        if (connectTimer) clearTimeout(connectTimer);
-        if (persistTimer) clearTimeout(persistTimer);
-        if (provider) {
-          if (unsyncedHandler) {
-            try {
-              provider.off("unsyncedChanges", unsyncedHandler);
-            } catch (err) {}
-          }
-          try {
-            provider.destroy();
-          } catch (err) {}
-        }
-      };
-
-      const finish = (err: Error | null, value?: MutationResult) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        if (err) reject(err);
-        else resolve(value as MutationResult);
-      };
-
-      connectTimer = setTimeout(() => {
-        // Only the actual 25s collab connect timeout fires here — the agent's
-        // collab connection to the server never became ready. This is the
-        // connect-vs-unload signal; the other finish() paths must NOT emit it.
-        this.onMetricFn?.("collab_connect_timeouts_total", 1);
-        finish(new Error("Connection timeout to collaboration server"));
-      }, CONNECT_TIMEOUT_MS);
-
-      const waitForPersistence = () => {
-        if (settled) return;
-        if (!provider) {
-          finish(new Error("collab provider gone before persistence"));
-          return;
-        }
-        if (provider.unsyncedChanges === 0) {
-          finish(null, mutationResult);
-          return;
-        }
-        persistTimer = setTimeout(() => {
-          finish(
-            new Error(
-              "Timeout waiting for collaboration server to persist the update",
-            ),
-          );
-        }, PERSIST_TIMEOUT_MS);
-        unsyncedHandler = (data: { number: number }) => {
-          if (data.number === 0 && !connectionLost) {
-            finish(null, mutationResult);
-          }
-        };
-        provider.on("unsyncedChanges", unsyncedHandler);
-      };
-
-      provider = new HocuspocusProvider({
-        url: wsUrl,
-        name: `page.${pageId}`,
-        document: ydoc,
-        token: collabToken,
-        // @ts-ignore - Required for Node.js environment
-        WebSocketPolyfill: WebSocket,
-        onDisconnect: () => {
-          connectionLost = true;
-          finish(
-            new Error(
-              "Collaboration connection closed before the update was persisted/synced",
-            ),
-          );
-        },
-        onClose: () => {
-          connectionLost = true;
-          finish(
-            new Error(
-              "Collaboration connection closed before the update was persisted/synced",
-            ),
-          );
-        },
-        onSynced: () => {
-          if (applied || settled) return;
-          applied = true;
-
-          // CRITICAL: keep everything between reading and writing the live doc
-          // synchronous (no await) so no remote update can interleave.
-          let newDoc: any;
-          let beforeDoc: any;
-          try {
-            let liveDoc = TiptapTransformer.fromYdoc(ydoc, "default");
-            if (
-              !liveDoc ||
-              typeof liveDoc !== "object" ||
-              !Array.isArray(liveDoc.content)
-            ) {
-              liveDoc = { type: "doc", content: [] };
-            }
-
-            // Snapshot the before-doc for the change report (safe deep clone).
-            beforeDoc = JSON.parse(JSON.stringify(liveDoc));
-
-            newDoc = transform(liveDoc);
-
-            if (newDoc == null) {
-              // Transform aborted — write nothing, return the live doc with a
-              // no-op change report.
-              mutationResult = {
-                doc: liveDoc,
-                verify: {
-                  changed: false,
-                  textInserted: 0,
-                  textDeleted: 0,
-                  blocksChanged: 0,
-                  marks: {},
-                  summary: "no changes (transform aborted)",
-                },
-              };
-              finish(null, mutationResult);
-              return;
-            }
-
-            // Structural diff into the live fragment (issue #152), mirroring
-            // the main write path: preserves the Yjs ids of unchanged nodes so
-            // an open editor's cursor is not yanked to the end of the document.
-            // The previous destructive rewrite (delete-all + applyUpdate of a
-            // fresh Y.Doc) discarded every node id, so replaceImage — the only
-            // caller of this method — still reproduced the #152 cursor jump
-            // (#164). applyDocToFragment runs its own atomic `transact`.
-            applyDocToFragment(ydoc, newDoc);
-          } catch (e) {
-            finish(e instanceof Error ? e : new Error(String(e)));
-            return;
-          }
-
-          // Compute the verifiable change report AFTER the transact write: it
-          // only needs the JSON before/after, so it cannot affect the atomic
-          // read->write window, and summarizeChange never throws.
-          mutationResult = {
-            doc: newDoc,
-            verify: summarizeChange(beforeDoc, newDoc),
-          };
-          waitForPersistence();
-        },
-        onAuthenticationFailed: () => {
-          finish(
-            new Error("Authentication failed for collaboration connection"),
-          );
-        },
-      });
+    // Reuse a live CollabSession for the page (issue #400) instead of opening a
+    // fresh provider per op. acquireCollabSession does NOT take the per-page
+    // lock — the caller (replaceImage) already holds ONE withPageLock across its
+    // scan -> upload -> write sequence, and the mutex is not reentrant, so
+    // taking it here would deadlock. The synchronous read->write section and the
+    // unsyncedChanges/connectionLost ack logic live in CollabSession.mutate,
+    // preserved verbatim from the old inline machine (incl. the #152 structural
+    // diff that keeps a live editor's cursor anchored).
+    const session = await acquireCollabSession(pageId, collabToken, this.apiUrl, {
+      // Only the actual 25s collab connect timeout emits this — the connect-vs-
+      // unload signal; the other failure paths must NOT emit it.
+      onConnectTimeout: () =>
+        this.onMetricFn?.("collab_connect_timeouts_total", 1),
     });
+    try {
+      return await session.mutate(transform);
+    } catch (e) {
+      // Drop the session on any failure so the next call reconnects fresh.
+      session.destroy("mutate failed");
+      throw e;
+    }
   }
 
   /**
