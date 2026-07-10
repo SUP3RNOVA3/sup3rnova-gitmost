@@ -84,7 +84,10 @@ export const LOAD_TOOLS_DESCRIPTION =
   'block in your instructions. Pass the EXACT tool names from the catalog; this\n' +
   'call only ACTIVATES them and returns { loaded: [...] } — the tools become\n' +
   'callable on your NEXT step. Load several names in one call when the task clearly\n' +
-  'needs them. Unknown names are rejected with the list of valid ones.';
+  'needs them. Unknown names are rejected with the list of valid ones.\n' +
+  'Tools NOT listed in the catalog are CORE and ALWAYS active — call them directly,\n' +
+  'NEVER via loadTools (e.g. createComment, listComments, resolveComment,\n' +
+  'editPageText, searchInPage).';
 
 /**
  * Tier + catalogLine for the INLINE ai-chat tools — those defined per-layer in

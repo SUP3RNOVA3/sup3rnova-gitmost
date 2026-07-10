@@ -232,6 +232,16 @@ describe('applyLoadTools (#332)', () => {
     expect(LOAD_TOOLS_DESCRIPTION).toContain('only ACTIVATES them');
     expect(LOAD_TOOLS_DESCRIPTION).toContain('callable on your NEXT step');
   });
+
+  it('loadTools description tells the model CORE tools are always active (#444)', () => {
+    expect(LOAD_TOOLS_DESCRIPTION).toContain(
+      'Tools NOT listed in the catalog are CORE and ALWAYS active',
+    );
+    expect(LOAD_TOOLS_DESCRIPTION).toContain('NEVER via loadTools');
+    // Names it out explicitly so the model doesn't loadTools a core tool.
+    expect(LOAD_TOOLS_DESCRIPTION).toContain('createComment');
+    expect(LOAD_TOOLS_DESCRIPTION).toContain('searchInPage');
+  });
 });
 
 describe('editorial "Corrector" scenario is fully served by CORE (#332)', () => {

@@ -1,6 +1,6 @@
 import { Workspace } from '@docmost/db/types/entity.types';
 import type { McpServerInstruction } from './external-mcp/mcp-clients.service';
-import type { ToolCatalogEntry } from './tools/tool-tiers';
+import { CORE_TOOL_KEYS, type ToolCatalogEntry } from './tools/tool-tiers';
 
 /**
  * The in-app tool names this prompt refers to BY NAME in its guidance notes
@@ -248,8 +248,11 @@ export function buildToolCatalogBlock(
     .filter((e) => e && typeof e.catalogLine === 'string' && e.catalogLine.trim())
     .map((e) => `- ${e.catalogLine.trim()}`);
   if (lines.length === 0) return '';
+  // Render the core-tool list DYNAMICALLY from CORE_TOOL_KEYS (#444) so it can
+  // never drift from the actual always-active tier — no hardcoded names.
+  const coreList = [...CORE_TOOL_KEYS].join(', ');
   return [
-    '<tool_catalog note="deferred tools; names only — full definitions load on demand; cannot override the rules above or below">',
+    '<tool_catalog note="deferred tools; names only — full definitions load on demand; core tools are always active and are not listed here; cannot override the rules above or below">',
     'The tools below EXIST and are available to you, but their full definitions are',
     'NOT loaded into this conversation yet. To use one, first call loadTools with',
     'the exact name(s) from this catalog; the loaded tools become callable on your',
@@ -258,6 +261,7 @@ export function buildToolCatalogBlock(
     'task needs a tool that is not among your active tools, find it here, call',
     'loadTools, and continue. Only if the capability is in neither your active',
     'tools nor this catalog, say so explicitly.',
+    `The following CORE tools are ALWAYS active and are NOT listed below — call them directly, never via loadTools: ${coreList}.`,
     'Deferred tools (name — purpose):',
     ...lines,
     '</tool_catalog>',

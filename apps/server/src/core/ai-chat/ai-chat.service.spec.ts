@@ -15,6 +15,7 @@ import {
   serializeSteps,
   rowToUiMessage,
   prepareAgentStep,
+  stepBudgetWarning,
   flushAssistant,
   stripNulChars,
   chatStreamMetadata,
@@ -22,7 +23,11 @@ import {
   isInterruptResume,
   sameInstant,
   MAX_AGENT_STEPS,
+  STEP_BUDGET_WARNING_LEAD,
   FINAL_STEP_INSTRUCTION,
+  FINAL_STEP_NUDGE,
+  STEP_LIMIT_NO_ANSWER_MARKER,
+  OUTPUT_DEGENERATION_ERROR,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
@@ -311,43 +316,67 @@ describe('rowToUiMessage', () => {
 
 /**
  * Unit tests for prepareAgentStep: the pure helper that decides per-step
- * overrides for the agent loop. Early steps return undefined (default
- * behavior); the final allowed step (stepNumber === MAX_AGENT_STEPS - 1) forces
- * a text-only synthesis answer (toolChoice 'none') with the FINAL_STEP_INSTRUCTION
- * appended onto — not replacing — the original system prompt.
+ * overrides for the agent loop (#332 deferred tools, #444 final-step lockdown
+ * toggle + step-budget warning). Parametrized by the two toggles so a change to
+ * one path cannot silently mask a regression in the other.
+ *
+ * Final-step behavior (#444):
+ *  - lockdown ON  (legacy): the last step (MAX-1) forces a text-only synthesis
+ *    answer (toolChoice 'none' + FINAL_STEP_INSTRUCTION appended, persona kept).
+ *  - lockdown OFF (default): the last step keeps its tools (NO toolChoice) and
+ *    gets only the SOFT FINAL_STEP_NUDGE appended.
  */
 // Narrowing helpers for the prepareAgentStep union return type.
 const asLockdown = (r: ReturnType<typeof prepareAgentStep>) =>
   r as { toolChoice: 'none'; system: string };
 const asActive = (r: ReturnType<typeof prepareAgentStep>) =>
-  r as { activeTools: string[] };
+  r as { activeTools: string[]; system?: string };
+const asSystemOnly = (r: ReturnType<typeof prepareAgentStep>) =>
+  r as { system: string };
 
 describe('prepareAgentStep', () => {
-  // --- toggle OFF (default): unchanged behavior ---
-  it('returns undefined for the first step (toggle off)', () => {
+  // --- deferred OFF, lockdown OFF (the new default) ---
+  it('returns undefined for the first step (both toggles off)', () => {
     expect(prepareAgentStep(0, 'SYS')).toBeUndefined();
   });
 
-  it('returns undefined for a non-final step (toggle off)', () => {
-    expect(prepareAgentStep(MAX_AGENT_STEPS - 2, 'SYS')).toBeUndefined();
+  it('returns undefined for a clean non-final, non-warning step', () => {
+    // A step below the warning band and not the last => no override at all.
+    expect(prepareAgentStep(MAX_AGENT_STEPS - 10, 'SYS')).toBeUndefined();
   });
 
-  it('forces a text-only synthesis on the final allowed step (toggle off)', () => {
-    const result = asLockdown(prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS'));
+  it('final step (lockdown OFF) keeps tools and appends only the SOFT nudge', () => {
+    const result = asSystemOnly(prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS'));
     expect(result).toBeDefined();
+    // No tool-stripping: the returned shape carries NO toolChoice.
+    expect(
+      (result as unknown as { toolChoice?: string }).toolChoice,
+    ).toBeUndefined();
+    expect(result.system.startsWith('SYS')).toBe(true);
+    expect(result.system).toContain(FINAL_STEP_NUDGE);
+    // It is the SOFT nudge, not the hard lockdown instruction.
+    expect(result.system).not.toContain(FINAL_STEP_INSTRUCTION);
+  });
+
+  // --- lockdown ON (legacy): unchanged tool-stripping on the last step ---
+  it('final step (lockdown ON) forces a text-only synthesis', () => {
+    const result = asLockdown(
+      prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS', [], false, true),
+    );
     expect(result.toolChoice).toBe('none');
     // The original persona is preserved (prefix), not replaced.
     expect(result.system.startsWith('SYS')).toBe(true);
-    // The synthesis instruction is appended.
+    // The synthesis instruction is appended (NOT the soft nudge).
     expect(result.system).toContain(FINAL_STEP_INSTRUCTION);
+    expect(result.system).not.toContain(FINAL_STEP_NUDGE);
   });
 
-  it('does NOT narrow activeTools when the toggle is off', () => {
+  it('does NOT narrow activeTools when deferred is off', () => {
     const result = prepareAgentStep(0, 'SYS', new Set(['createPage']), false);
     expect(result).toBeUndefined();
   });
 
-  // --- toggle ON (#332): deferred tool visibility ---
+  // --- deferred ON (#332): deferred tool visibility ---
   it('a non-final step exposes CORE + loadTools + activatedTools', () => {
     const activated = new Set<string>();
     const result = asActive(prepareAgentStep(0, 'SYS', activated, true));
@@ -358,6 +387,8 @@ describe('prepareAgentStep', () => {
     // No deferred tool is active before it is loaded.
     expect(result.activeTools).not.toContain('createPage');
     expect(result.activeTools).not.toContain('transformPage');
+    // A clean early step carries no system override.
+    expect(result.system).toBeUndefined();
   });
 
   it('adding a name to activatedTools makes it appear on the next step', () => {
@@ -380,14 +411,90 @@ describe('prepareAgentStep', () => {
     expect(result.activeTools).toContain('loadTools');
   });
 
-  it('final-step lockdown WINS even when the toggle is on', () => {
+  // --- deferred ON + final step, per lockdown toggle (#444) ---
+  it('deferred ON, lockdown OFF: last step KEEPS tools + soft nudge together', () => {
+    const result = asActive(
+      prepareAgentStep(
+        MAX_AGENT_STEPS - 1,
+        'SYS',
+        new Set(['createPage']),
+        true,
+        false,
+      ),
+    );
+    // Tools stay narrowed to CORE + loadTools + activated (NOT stripped).
+    expect(result.activeTools).toContain('editPageText');
+    expect(result.activeTools).toContain('loadTools');
+    expect(result.activeTools).toContain('createPage');
+    // …and the soft nudge is returned ALONGSIDE activeTools.
+    expect(result.system).toContain(FINAL_STEP_NUDGE);
+    expect(
+      (result as unknown as { toolChoice?: string }).toolChoice,
+    ).toBeUndefined();
+  });
+
+  it('deferred ON, lockdown ON: lockdown WINS (tools stripped)', () => {
     const result = asLockdown(
-      prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS', new Set(['createPage']), true),
+      prepareAgentStep(
+        MAX_AGENT_STEPS - 1,
+        'SYS',
+        new Set(['createPage']),
+        true,
+        true,
+      ),
     );
     // The lockdown shape (toolChoice none + synthesis) — not the activeTools shape.
     expect(result.toolChoice).toBe('none');
     expect(result.system).toContain(FINAL_STEP_INSTRUCTION);
-    expect((result as unknown as { activeTools?: string[] }).activeTools).toBeUndefined();
+    expect(
+      (result as unknown as { activeTools?: string[] }).activeTools,
+    ).toBeUndefined();
+  });
+});
+
+/**
+ * Step-budget warning boundaries (#444). At MAX_AGENT_STEPS=50 the warning fires
+ * on steps MAX-6 .. MAX-2 (44..48) with a decreasing remaining-count, is CLEAN
+ * below the band (0..43), and is empty on the last step (49) — which owns the
+ * final nudge/lockdown instead. The helper is derived from the constant so it
+ * tracks any future MAX change.
+ */
+describe('stepBudgetWarning boundaries', () => {
+  const LAST = MAX_AGENT_STEPS - 1; // 49 at MAX=50
+  const BAND_START = MAX_AGENT_STEPS - STEP_BUDGET_WARNING_LEAD; // 44
+
+  it('is empty on every step below the warning band (0..BAND_START-1)', () => {
+    for (let s = 0; s < BAND_START; s++) {
+      expect(stepBudgetWarning(s)).toBe('');
+    }
+  });
+
+  it('fires on BAND_START..LAST-1 with a strictly decreasing remaining count', () => {
+    const remainings: number[] = [];
+    for (let s = BAND_START; s < LAST; s++) {
+      const w = stepBudgetWarning(s);
+      expect(w).toContain('tool-use steps remain');
+      const m = w.match(/Only (\d+) tool-use steps remain/);
+      expect(m).not.toBeNull();
+      remainings.push(Number(m![1]));
+    }
+    // Exactly STEP_BUDGET_WARNING_LEAD-1 warning steps (44..48).
+    expect(remainings).toHaveLength(STEP_BUDGET_WARNING_LEAD - 1);
+    // Remaining = MAX-1-step, so it decreases by 1 each step and ends at 1.
+    for (let i = 1; i < remainings.length; i++) {
+      expect(remainings[i]).toBe(remainings[i - 1] - 1);
+    }
+    expect(remainings[remainings.length - 1]).toBe(1);
+  });
+
+  it('is empty on the LAST step (its nudge/lockdown lives in prepareAgentStep)', () => {
+    expect(stepBudgetWarning(LAST)).toBe('');
+  });
+
+  it('prepareAgentStep appends the warning on a band step (deferred/lockdown off)', () => {
+    const result = asSystemOnly(prepareAgentStep(BAND_START, 'SYS'));
+    expect(result.system).toContain('Stop exploring and start acting now');
+    expect(result.system).not.toContain(FINAL_STEP_NUDGE);
   });
 });
 
@@ -1341,6 +1448,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
       {} as never, // pageAccess
       {
         isAiChatDeferredToolsEnabled: () => false,
+        isAiChatFinalStepLockdownEnabled: () => false,
         isAiChatResumableStreamEnabled: () => opts.resumable,
       } as never,
       streamRegistry as never,
@@ -1427,5 +1535,350 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
     });
     await expect(drive(svc, makeRunHooks())).rejects.toThrow('boom');
     expect(streamRegistry.abortEntry).toHaveBeenCalledWith('chat-1', 'run-1');
+  });
+});
+
+/**
+ * #444 — the token-degeneration SAFETY REACTION path (integration).
+ *
+ * output-degeneration.spec.ts proves the detector DETECTS; this proves the wired
+ * REACTION: a degenerate stream must (1) trip the detector in onChunk, (2) abort
+ * the turn via the INTERNAL degeneration controller (distinct from a user Stop),
+ * (3) truncate the runaway tail before persist in onAbort, (4) persist status
+ * 'error' with the OUTPUT_DEGENERATION_ERROR message (not a bare 'aborted' and not
+ * a swept 'streaming'), and (5) still release the leased external MCP clients.
+ *
+ * Harness: streamText is the SAME jest.fn mocked at the top of this file. Unlike
+ * the pipe-options suite above (which only inspects the pipe call), this mock
+ * CAPTURES the streamText options (onChunk/onAbort/onFinish + abortSignal) so the
+ * test can drive the callbacks exactly as the AI SDK would — feeding degenerate
+ * text-delta chunks through onChunk until the service's own AbortController fires,
+ * then invoking onAbort (which the SDK does on an aborted signal). No new mocking
+ * style is invented; it reuses the makeRes / service-construction shape above.
+ */
+describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
+  const streamTextMock = streamText as unknown as jest.Mock;
+
+  beforeEach(() => {
+    streamTextMock.mockReset();
+    jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined as never);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  function makeRes() {
+    return {
+      raw: {
+        writeHead: jest.fn(),
+        write: jest.fn(),
+        once: jest.fn(),
+        on: jest.fn(),
+        flushHeaders: jest.fn(),
+        writableEnded: false,
+        destroyed: false,
+      },
+    };
+  }
+
+  // Wire the full stream() path with in-memory fakes. The assistant row is
+  // captured so the terminal finalize (an UPDATE of the upfront-seeded row) can be
+  // asserted. One external MCP client with a close() spy lets us assert leases are
+  // released on the terminal path. lockdown OFF (default) so the detector is the
+  // active guard.
+  function makeService() {
+    // The upfront insert seeds the assistant row; findById/insert stamp a stable
+    // id so planFinalizeAssistant picks the UPDATE path.
+    let seq = 0;
+    const inserted: Array<Record<string, unknown>> = [];
+    const updated: Array<{
+      id: string;
+      workspaceId: string;
+      patch: Record<string, unknown>;
+    }> = [];
+    const aiChatRepo = {
+      findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
+      insert: jest.fn(),
+    };
+    const aiChatMessageRepo = {
+      insert: jest.fn(async (row: Record<string, unknown>) => {
+        inserted.push(row);
+        return { id: row.role === 'assistant' ? 'assistant-1' : `user-${++seq}` };
+      }),
+      findAllByChat: jest.fn(async () => []),
+      update: jest.fn(
+        async (
+          id: string,
+          workspaceId: string,
+          patch: Record<string, unknown>,
+        ) => {
+          updated.push({ id, workspaceId, patch });
+          return { id };
+        },
+      ),
+    };
+    const aiSettings = { resolve: jest.fn(async () => ({})) };
+    const tools = { forUser: jest.fn(async () => ({})) };
+    const mcpClose = jest.fn(async () => undefined);
+    const mcpClients = {
+      toolsFor: jest.fn(async () => ({
+        tools: {},
+        clients: [{ close: mcpClose }],
+        outcomes: [],
+        instructions: [],
+      })),
+    };
+    const streamRegistry = { open: jest.fn(), bind: jest.fn(), abortEntry: jest.fn() };
+    const svc = new AiChatService(
+      {} as never,
+      aiChatRepo as never,
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo (no open page -> never touched)
+      aiSettings as never,
+      tools as never,
+      mcpClients as never,
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo (no open page)
+      {} as never, // pageAccess
+      {
+        isAiChatDeferredToolsEnabled: () => false,
+        // lockdown OFF => the degeneration detector is the anti-babble guard.
+        isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatResumableStreamEnabled: () => false,
+      } as never,
+      streamRegistry as never,
+    );
+    return { svc, inserted, updated, mcpClose };
+  }
+
+  const body = {
+    chatId: 'chat-1',
+    messages: [
+      { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+    ],
+  };
+
+  // Capture the streamText options so the test can drive the SDK callbacks. The
+  // returned result stub is enough for the post-streamText wiring (consumeStream +
+  // pipeUIMessageStreamToResponse are no-ops here).
+  function captureStreamText(): { opts: () => Record<string, any> } {
+    let captured: Record<string, any> | undefined;
+    streamTextMock.mockImplementation((options: Record<string, any>) => {
+      captured = options;
+      return {
+        consumeStream: jest.fn(),
+        pipeUIMessageStreamToResponse: jest.fn(),
+      };
+    });
+    return {
+      opts: () => {
+        if (!captured) throw new Error('streamText was not called');
+        return captured;
+      },
+    };
+  }
+
+  async function drive(svc: AiChatService): Promise<void> {
+    await svc.stream({
+      user: { id: 'u1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 's1',
+      body: body as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      runHooks: undefined as never,
+    });
+  }
+
+  it('degenerate stream: detects → internal abort → onAbort truncates + records OUTPUT_DEGENERATION_ERROR; leases released', async () => {
+    const { svc, updated, mcpClose } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+
+    const opts = cap.opts();
+    // The turn's abort signal is the UNION of the socket/run signal and the
+    // internal degeneration controller — untripped before any output.
+    expect(opts.abortSignal.aborted).toBe(false);
+
+    // Feed a runaway "loadTools.\n" loop the way the SDK streams it: many small
+    // text-delta chunks. The onChunk throttle only re-checks every ~2000 chars, so
+    // deliver well past that so the detector's identical-line rule (>=25 lines)
+    // and the ~2000-char throttle both fire.
+    const line = 'loadTools.\n';
+    let delivered = 0;
+    for (let i = 0; i < 400 && !opts.abortSignal.aborted; i++) {
+      opts.onChunk({ chunk: { type: 'text-delta', text: line } });
+      delivered += line.length;
+    }
+
+    // The detector must have tripped and aborted via the INTERNAL controller — the
+    // reason carries the degeneration message, distinguishing it from a user Stop
+    // (which aborts with no such reason) or a socket disconnect.
+    expect(opts.abortSignal.aborted).toBe(true);
+    expect(delivered).toBeGreaterThan(2000);
+    expect(String(opts.abortSignal.reason)).toContain(
+      'Output degeneration detected',
+    );
+
+    // The SDK reacts to the aborted signal by invoking onAbort. `steps` is empty
+    // (the runaway never finished a step); the in-progress runaway text is what
+    // gets truncated + persisted.
+    await opts.onAbort({ steps: [] });
+
+    // Terminal finalize = an UPDATE of the upfront-seeded assistant row (assistant
+    // row was inserted upfront, so planFinalizeAssistant -> UPDATE).
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as {
+      status: string;
+      content: string;
+      metadata: Record<string, unknown>;
+    };
+    // (4) status 'error' with the degeneration message — NOT 'aborted' and NOT a
+    // swept 'streaming'. This distinguishes it from a user Stop / server restart.
+    expect(patch.status).toBe('error');
+    expect(patch.metadata.error).toBe(OUTPUT_DEGENERATION_ERROR);
+    expect(patch.metadata.finishReason).toBe('error');
+    // (3) the runaway tail is TRUNCATED, not the full multi-KB babble: the marker
+    // is present and the persisted content is far shorter than what was streamed.
+    expect(patch.content).toContain('output truncated');
+    expect(patch.content.length).toBeLessThan(delivered);
+    // Only a few loop reps survive (truncateDegeneratedTail keeps a handful).
+    expect((patch.content.match(/loadTools\./g) ?? []).length).toBeLessThan(10);
+
+    // (5) the leased external MCP client is still released on this terminal path.
+    expect(mcpClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('degeneration onAbort differs from a NORMAL/user abort (no truncation, no error)', async () => {
+    // Same harness, but the stream is NOT degenerate: a clean short answer, then a
+    // user Stop reaches onAbort WITHOUT the degeneration controller having fired.
+    const { svc, updated, mcpClose } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    opts.onChunk({ chunk: { type: 'text-delta', text: 'A normal partial answer.' } });
+    // The detector never tripped -> the union signal is NOT aborted by us.
+    expect(opts.abortSignal.aborted).toBe(false);
+
+    // A user Stop / disconnect drives onAbort with the partial (clean) text.
+    await opts.onAbort({ steps: [] });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as {
+      status: string;
+      content: string;
+      metadata: Record<string, unknown>;
+    };
+    // A normal abort persists status 'aborted' with NO error and NO truncation
+    // marker — the branch is genuinely distinguished from the degeneration path.
+    expect(patch.status).toBe('aborted');
+    expect('error' in patch.metadata).toBe(false);
+    expect(patch.content).toBe('A normal partial answer.');
+    expect(patch.content).not.toContain('output truncated');
+    // Cleanup still runs on the normal abort path too.
+    expect(mcpClose).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Empty-turn marker (#444): onFinish appends STEP_LIMIT_NO_ANSWER_MARKER only
+   * when the turn burned ALL its steps (steps.length >= MAX_AGENT_STEPS) AND never
+   * produced any text. The negative: a normal turn ending WITH text is left alone.
+   */
+  it('empty turn (no text + steps exhausted) persists the STEP_LIMIT_NO_ANSWER_MARKER', async () => {
+    const { svc, updated } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    // MAX_AGENT_STEPS text-less steps (only tool calls) => step-exhausted, no text.
+    const steps = Array.from({ length: MAX_AGENT_STEPS }, () => ({
+      text: '',
+      toolCalls: [{ toolCallId: 'c1', toolName: 'searchPages', input: {} }],
+      toolResults: [
+        { toolCallId: 'c1', toolName: 'searchPages', output: { hits: [] } },
+      ],
+    }));
+    await opts.onFinish({
+      text: '',
+      finishReason: 'tool-calls',
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
+      steps,
+    });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as { status: string; content: string };
+    expect(patch.status).toBe('completed');
+    // The synthetic marker is the trailing text of the persisted content.
+    expect(patch.content).toContain(STEP_LIMIT_NO_ANSWER_MARKER);
+  });
+
+  it('normal turn ending WITH text does NOT get the empty-turn marker', async () => {
+    const { svc, updated } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    // A single step that produced a real answer, well under the step cap.
+    const steps = [
+      { text: 'Here is the finished answer.', toolCalls: [], toolResults: [] },
+    ];
+    await opts.onFinish({
+      text: 'Here is the finished answer.',
+      finishReason: 'stop',
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
+      steps,
+    });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as { status: string; content: string };
+    expect(patch.status).toBe('completed');
+    expect(patch.content).toBe('Here is the finished answer.');
+    expect(patch.content).not.toContain(STEP_LIMIT_NO_ANSWER_MARKER);
+  });
+
+  it('step-exhausted turn that DID produce text keeps the text, no marker (guards the AND)', async () => {
+    // Exhausting the step budget alone must NOT append the marker when SOME step
+    // produced text — the marker keys off "no text" too. Drive the real onFinish
+    // with MAX_AGENT_STEPS steps where the last one carries the answer.
+    const { svc, updated } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    const steps = Array.from({ length: MAX_AGENT_STEPS }, (_, i) => ({
+      text: i === MAX_AGENT_STEPS - 1 ? 'Final synthesized answer.' : '',
+      toolCalls:
+        i === MAX_AGENT_STEPS - 1
+          ? []
+          : [{ toolCallId: `c${i}`, toolName: 'searchPages', input: {} }],
+      toolResults:
+        i === MAX_AGENT_STEPS - 1
+          ? []
+          : [{ toolCallId: `c${i}`, toolName: 'searchPages', output: {} }],
+    }));
+    await opts.onFinish({
+      text: 'Final synthesized answer.',
+      finishReason: 'stop',
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
+      steps,
+    });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as { content: string };
+    expect(patch.content).toContain('Final synthesized answer.');
+    expect(patch.content).not.toContain(STEP_LIMIT_NO_ANSWER_MARKER);
   });
 });

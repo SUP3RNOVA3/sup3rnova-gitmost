@@ -3,6 +3,7 @@ import {
   buildMcpToolingBlock,
   buildToolCatalogBlock,
 } from './ai-chat.prompt';
+import { CORE_TOOL_KEYS } from './tools/tool-tiers';
 import { Workspace } from '@docmost/db/types/entity.types';
 
 /**
@@ -463,6 +464,19 @@ describe('buildToolCatalogBlock (#332)', () => {
     expect(block).toContain('- createPage — create a new page.');
     expect(block).toContain('- transformPage — run a JS transform.');
     expect(block).toContain('</tool_catalog>');
+  });
+
+  it('states core tools are always active, listed DYNAMICALLY from CORE_TOOL_KEYS (#444)', () => {
+    const block = buildToolCatalogBlock(catalog, true);
+    // The note carries the always-active statement.
+    expect(block).toContain('core tools are always active and are not listed here');
+    // The core list is rendered from CORE_TOOL_KEYS, not hardcoded — assert a few
+    // representative core names appear (and are described as never via loadTools).
+    expect(block).toContain('ALWAYS active');
+    expect(block).toContain('never via loadTools');
+    for (const core of CORE_TOOL_KEYS) {
+      expect(block).toContain(core);
+    }
   });
 });
 
