@@ -44,6 +44,7 @@
     "@docmost/mcp": "workspace:*",
     "@docmost/pdf-inspector": "1.9.6",
     "@docmost/prosemirror-markdown": "workspace:*",
+    "@fastify/compress": "^9.0.0",
     "@fastify/cookie": "^11.0.2",
     "@fastify/multipart": "^10.0.0",
     "@fastify/static": "^9.1.3",

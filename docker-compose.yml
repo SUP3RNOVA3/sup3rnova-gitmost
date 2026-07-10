@@ -12,6 +12,11 @@ services:
     ports:
       - "3000:3000"
     restart: unless-stopped
+    # The app already serves precompressed (brotli/gzip) static assets with
+    # long-lived cache headers and gzips dynamic API responses. For the best
+    # cold-load latency you can OPTIONALLY put a reverse proxy (caddy / nginx /
+    # traefik) in front with HTTP/2 (or HTTP/3) and brotli enabled — none is
+    # required for compression to work.
     volumes:
       - docmost:/app/data/storage
 

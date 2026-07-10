@@ -474,6 +474,19 @@ export class AttachmentController {
     const fileSize = Number(attachment.fileSize);
     const rangeHeader = req.headers.range;
 
+    // Opt this download route out of the global @fastify/compress hook.
+    // Attachment bytes are final and mostly binary, so on-the-fly compression
+    // only burns CPU — and on the 206/Range branch it is actively corrupting:
+    // compress decides purely by Content-Type, so for a compressible mime
+    // (application/octet-stream fallback, image/svg+xml, text/*) it would gzip
+    // the byte slice and drop Content-Length while Content-Range still
+    // describes the RAW offsets and the status stays 206. A resuming client
+    // (`curl -C -`, download managers) then appends the encoded bytes as if
+    // raw and ends up with a broken file. @fastify/compress skips whenever the
+    // request carries `x-no-compression` (see its onSend hook), so setting it
+    // here covers both the 200 (full file) and 206 (range) responses.
+    req.headers['x-no-compression'] = 'true';
+
     res.header('Accept-Ranges', 'bytes');
     res.header(
       'Content-Security-Policy',

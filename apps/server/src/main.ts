@@ -10,6 +10,7 @@ import { TransformHttpResponseInterceptor } from './common/interceptors/http-res
 import { WsRedisIoAdapter } from './ws/adapter/ws-redis.adapter';
 import fastifyMultipart from '@fastify/multipart';
 import fastifyCookie from '@fastify/cookie';
+import fastifyCompress from '@fastify/compress';
 import fastifyIp from 'fastify-ip';
 import { InternalLogFilter } from './common/logger/internal-log-filter';
 import { EnvironmentService } from './integrations/environment/environment.service';
@@ -77,6 +78,17 @@ async function bootstrap() {
   await app.register(fastifyIp);
   await app.register(fastifyMultipart);
   await app.register(fastifyCookie);
+  // Compress dynamic responses (API JSON, the rewritten share-SEO HTML) when the
+  // client accepts br/gzip. @fastify/compress only compresses content-types that
+  // mime-db flags `compressible` (application/json, text/html, …); `text/event-stream`
+  // is not in mime-db, so SSE is never compressed by the allowlist. The AI-chat
+  // stream additionally hijacks the raw socket (pipeUIMessageStreamToResponse ->
+  // res.raw in ai-chat.service.ts), bypassing Fastify's reply/onSend lifecycle
+  // entirely, so this hook can never buffer that stream.
+  await app.register(fastifyCompress, {
+    // Skip tiny payloads where compression overhead outweighs the savings.
+    threshold: 1024,
+  });
 
   const environmentService = app.get(EnvironmentService);
   const frameHeader = resolveFrameHeader(

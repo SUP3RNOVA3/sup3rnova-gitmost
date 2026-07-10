@@ -1,5 +1,6 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
+import { compression } from "vite-plugin-compression2";
 import * as path from "path";
 import { execSync } from "node:child_process";
 
@@ -53,7 +54,25 @@ export default defineConfig(({ mode }) => {
       },
       APP_VERSION: JSON.stringify(resolveAppVersion(envPath)),
     },
-    plugins: [react()],
+    plugins: [
+      react(),
+      // Emit .br and .gz next to every built asset so the server can serve the
+      // precompressed copy (see @fastify/static preCompressed in static.module.ts).
+      compression({
+        algorithms: ["brotliCompress", "gzip"],
+        // vite-plugin-compression2's default `include` only covers text-ish
+        // bundle output (js/mjs/json/css/html/svg/…). Extend it with the large
+        // VAD binaries copied from public/vad (.wasm ~26MB, .onnx ~2.3MB) so
+        // they are brotli/gzip'd once at build time and served via
+        // @fastify/static preCompressed — otherwise @fastify/compress would
+        // re-brotli them on EVERY request. The default types are repeated here
+        // because setting `include` replaces (does not extend) the default.
+        include: /\.(html|xml|css|json|js|mjs|svg|yaml|yml|toml|wasm|onnx)$/,
+        // index.html is rewritten at server boot (window.CONFIG injection); a
+        // precompressed copy would go stale — NEVER precompress it.
+        exclude: [/index\.html$/],
+      }),
+    ],
     build: {
       rolldownOptions: {
         output: {
