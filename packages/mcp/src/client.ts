@@ -3528,14 +3528,6 @@ export class DocmostClient {
     return buffer.toString("utf-8");
   }
 
-  /** Short random block id for a freshly inserted drawio node (nanoid-ish). */
-  private freshBlockId(): string {
-    return (
-      Math.random().toString(36).slice(2, 12) +
-      Math.random().toString(36).slice(2, 6)
-    );
-  }
-
   /**
    * Resolve a drawio node on a page by `attrs.id` or `#<index>` and return the
    * node plus its ref. Throws a clear error if the ref does not resolve to a

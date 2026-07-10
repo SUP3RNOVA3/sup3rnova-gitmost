@@ -340,6 +340,80 @@ test("drawio_create -> get/update: returned #<index> handle resolves on the save
   assert.equal(updated.attrs.width, 340);
 });
 
+// --- error paths: the LLM must get a clean error, not a crash --------------
+
+test("drawio_get: a bad node ref -> clean 'no node found' error", async () => {
+  // Page has one paragraph; the requested ref resolves to nothing.
+  const pageDoc = {
+    type: "doc",
+    content: [{ type: "paragraph", attrs: { id: "p1" }, content: [] }],
+  };
+  const { client } = makeClient({ pageDoc, attachmentSvg: svgFor(MODEL) });
+  await assert.rejects(
+    () => client.drawioGet("page1", "does-not-exist", "xml"),
+    /no node found for "does-not-exist"/,
+  );
+});
+
+test("drawio_get: a drawio node with no src -> clean 'has no src to read' error", async () => {
+  const pageDoc = {
+    type: "doc",
+    content: [
+      // A drawio node that carries no `src` (e.g. a half-written node).
+      { type: "drawio", attrs: { id: "d1", attachmentId: "att-1" } },
+    ],
+  };
+  const { client } = makeClient({ pageDoc, attachmentSvg: svgFor(MODEL) });
+  await assert.rejects(
+    () => client.drawioGet("page1", "d1", "xml"),
+    /node "d1" on page page1 has no src to read/,
+  );
+});
+
+test("drawio_update: the resolved node is NOT a drawio node -> clean error, no upload", async () => {
+  // "#0" resolves to a paragraph. The update must refuse cleanly rather than
+  // crash or repoint the wrong node.
+  const pageDoc = {
+    type: "doc",
+    content: [{ type: "paragraph", attrs: { id: "p1" }, content: [] }],
+  };
+  const { client, calls } = makeClient({ pageDoc, attachmentSvg: svgFor(MODEL) });
+  await assert.rejects(
+    () => client.drawioUpdate("page1", "#0", UPDATED_MODEL, "any-nonempty-hash"),
+    /node "#0" on page page1 is a paragraph, not a drawio diagram/,
+  );
+  assert.equal(calls.uploads.length, 0, "no upload when the node is not a diagram");
+  assert.equal(calls.mutations.length, 0, "no write when the node is not a diagram");
+});
+
+test("drawio_create: anchor not found -> clean error that reports the orphan attachment", async () => {
+  // The upload happens before the mutate transform; when the anchor cannot be
+  // found the write is skipped and the (now unreferenced) attachment is named
+  // in the error, exactly as the code documents.
+  const pageDoc = {
+    type: "doc",
+    content: [{ type: "paragraph", attrs: { id: "p1" }, content: [] }],
+  };
+  const { client, calls } = makeClient({ pageDoc });
+  await assert.rejects(
+    () =>
+      client.drawioCreate(
+        "page1",
+        { position: "after", anchorNodeId: "nope" },
+        MODEL,
+        "T",
+      ),
+    (err) =>
+      /anchor not found/.test(err.message) &&
+      /unreferenced orphan/.test(err.message) &&
+      /att-1/.test(err.message),
+  );
+  // The orphan was uploaded (and reported), but no node was written.
+  assert.equal(calls.uploads.length, 1, "attachment uploaded before the failed insert");
+  const drawios = calls.mutations.length ? findDrawio(calls.mutations[0].doc) : [];
+  assert.equal(drawios.length, 0, "no drawio node written when the anchor is missing");
+});
+
 // --- Fix 2: update targets ONLY the resolved node --------------------------
 
 test("drawio_update: repoints ONLY the addressed node, not siblings sharing an attachmentId", async () => {

@@ -324,3 +324,37 @@ test("inflateDiagramPayload: rejects an over-cap decompression bomb", () => {
     /decompression bomb/,
   );
 });
+
+test("encode/build: a title with < > \" & round-trips without corrupting the SVG", async () => {
+  // A user-supplied title full of XML metacharacters must be escaped so the
+  // inner <mxfile> stays well-formed and the outer content="..." attribute is
+  // never broken out of. Prove it survives the encode -> build -> decode chain.
+  const title = 'A < B > C " D & E';
+  const model = normalizeXml(VALID_MODEL);
+  const svg = buildDrawioSvg(model, "<g/>", { width: 200, height: 120 }, title);
+
+  // The outer content="..." attribute must not be broken by the title: the raw
+  // title metacharacters never appear literally in the SVG markup (they are
+  // base64-encoded inside content=, and escaped inside the file XML).
+  const contentMatch = /content="([^"]*)"/.exec(svg);
+  assert.ok(contentMatch, "SVG has a single well-formed content= attribute");
+
+  // The diagram model still decodes losslessly despite the exotic title.
+  assert.equal(decodeDrawioSvg(svg), model);
+
+  // The file XML is well-formed: the title lives in name="..." as escaped
+  // entities, so unescaping recovers the original title byte-for-byte.
+  const fileXml = Buffer.from(contentMatch[1], "base64").toString("utf-8");
+  const nameMatch = /<diagram id="[^"]*" name="([^"]*)">/.exec(fileXml);
+  assert.ok(nameMatch, "the diagram name attribute is intact and quote-safe");
+  const decodedTitle = nameMatch[1]
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&");
+  assert.equal(decodedTitle, title);
+
+  // encodeDrawioFile alone produces the same escaped, well-formed envelope.
+  const file = encodeDrawioFile(model, title);
+  assert.match(file, /name="A &lt; B &gt; C &quot; D &amp; E">/);
+});
