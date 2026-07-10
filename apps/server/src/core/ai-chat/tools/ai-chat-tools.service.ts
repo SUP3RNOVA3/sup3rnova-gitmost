@@ -123,6 +123,23 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.drawioGet(s, s, 'xml');
   void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s, 'elk');
   void client.drawioUpdate(s, s, s, s, 'elk');
+  // --- draw.io high-level semantic tools (#425 stage 3) ---
+  void client.drawioEditCells(s, s, [{ op: 'delete', cellId: s }], s);
+  void client.drawioFromGraph(
+    s,
+    { position: 'append', anchorNodeId: s },
+    { nodes: [{ id: s, label: s }] },
+    'LR',
+    s,
+    'full',
+    s,
+  );
+  void client.drawioFromMermaid(
+    s,
+    { position: 'append', anchorNodeId: s },
+    s,
+    s,
+  );
   // --- write (comment) ---
   void client.createComment(s, s, 'inline', s, s, s);
   void client.resolveComment(s, true);

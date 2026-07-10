@@ -100,6 +100,9 @@ export type DocmostClientLike = Pick<
   | 'drawioGet'
   | 'drawioCreate'
   | 'drawioUpdate'
+  | 'drawioEditCells'
+  | 'drawioFromGraph'
+  | 'drawioFromMermaid'
   | 'createComment'
   | 'resolveComment'
 >;
@@ -2010,6 +2013,234 @@ export const SHARED_TOOL_SPECS = {
         xml as string,
         baseHash as string,
         layout as 'elk' | undefined,
+      ),
+  },
+
+  drawioEditCells: {
+    mcpName: 'drawioEditCells',
+    inAppKey: 'drawioEditCells',
+    description:
+      'Make TARGETED, id-based edits to an existing draw.io diagram instead of ' +
+      'resending the whole XML (a full-XML diff is fragile — draw.io reorders ' +
+      'attributes). `operations` is an ordered list of: ' +
+      '{ op:"add", xml:"<mxCell .../>" } (append a new cell), ' +
+      '{ op:"update", cellId:"n3", xml:"<mxCell id=\\"n3\\" .../>" } (replace that ' +
+      'cell; the id MUST stay the same), or { op:"delete", cellId:"n5" } — a ' +
+      'delete CASCADES to the cell\'s container children AND to every edge whose ' +
+      'source/target is deleted. Ids are STABLE across edits so diffs stay ' +
+      'meaningful. `baseHash` is MANDATORY: pass the hash from the drawioGet you ' +
+      'based the edit on; if the diagram changed since, the edit is refused with ' +
+      'a conflict error — re-read with drawioGet and retry. The edited model goes ' +
+      'through the same lint + quality-warning pipeline as drawioUpdate. `node` is ' +
+      'the drawio node attrs.id or "#<index>". Use this to tweak a diagram (move ' +
+      'or restyle a few cells, add/remove nodes); to (re)generate a whole diagram ' +
+      'from a description use drawioFromGraph.' +
+      DRAWIO_HARD_RULES,
+    tier: 'deferred',
+    catalogLine:
+      'drawioEditCells — id-based add/update/delete edits to a draw.io diagram (cascade delete).',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      node: z
+        .string()
+        .min(1)
+        .describe('The drawio node attrs.id, or "#<index>" for a top-level block.'),
+      operations: z
+        .array(
+          z.object({
+            op: z.enum(['add', 'update', 'delete']),
+            cellId: z
+              .string()
+              .optional()
+              .describe('Target cell id (required for update/delete).'),
+            xml: z
+              .string()
+              .optional()
+              .describe('The <mxCell> element (required for add/update).'),
+          }),
+        )
+        .describe('Ordered add/update/delete operations keyed by cell id.'),
+      baseHash: z
+        .string()
+        .min(1)
+        .describe('The meta.hash from the drawioGet this edit is based on.'),
+    }),
+    execute: (client, { pageId, node, operations, baseHash }) =>
+      client.drawioEditCells(
+        pageId as string,
+        node as string,
+        operations as any,
+        baseHash as string,
+      ),
+  },
+
+  drawioFromGraph: {
+    mcpName: 'drawioFromGraph',
+    inAppKey: 'drawioFromGraph',
+    description:
+      'Build a draw.io diagram from a SEMANTIC graph — you describe nodes, groups ' +
+      'and edges by MEANING and the server picks every coordinate, color and icon ' +
+      'so the whole class of layout/icon mistakes (overlaps, edges through shapes, ' +
+      'empty-box stencils) cannot happen. This is the PREFERRED tool for ' +
+      'architecture / cloud / network diagrams. `graph` = { nodes:[{ id, label, ' +
+      'kind?, icon?, group?, layer?, sameLayerAs?, pinned? }], groups?:[{ id, ' +
+      'label, kind? }], edges?:[{ from, to, label?, kind? }] }. Node `kind` picks ' +
+      'a palette color (service/db/queue/gateway/error/external/security); `icon` ' +
+      '(e.g. "aws:lambda", "aws:dynamodb", "azure:cosmos") resolves to the exact ' +
+      'verified stencil — an unknown icon degrades to a labelled generic shape, ' +
+      'never an empty box. Edge `kind` sets the line style (sync=solid, ' +
+      'async=dashed, error=red-dashed). Groups are TRANSPARENT containers. ' +
+      '`direction` (LR/RL/TB/BT) and `preset` (default/dark/colorblind-safe) tune ' +
+      'the layout/palette. Layout hints: `layer` (column index), `sameLayerAs` ' +
+      '(align two nodes), `pinned:{x,y}` (fix a node). `layout`: "full" (default, ' +
+      'auto-place everything), "incremental" (with `node`: keep the existing ' +
+      'diagram\'s coordinates, place only new cells), "none" (no auto-layout). The ' +
+      'result reports { iconsResolved, iconsMissing } so you can verify all icons ' +
+      'resolved. For standard flowcharts you can also write Mermaid and call ' +
+      'drawioFromMermaid; for exotic/wireframe diagrams use raw XML via drawioCreate.',
+    tier: 'deferred',
+    catalogLine:
+      'drawioFromGraph — build a draw.io diagram from a semantic node/group/edge graph (server picks layout+icons).',
+    buildShape: (z) => {
+      const node = z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        kind: z
+          .string()
+          .optional()
+          .describe(
+            'Palette slot: service/db/queue/gateway/error/external/security.',
+          ),
+        icon: z
+          .string()
+          .optional()
+          .describe('Icon ref, e.g. "aws:lambda", "aws:dynamodb", "azure:cosmos".'),
+        group: z.string().optional().describe('Id of the group (container) it sits in.'),
+        layer: z.number().optional().describe('Layer/column index hint (>=0).'),
+        sameLayerAs: z
+          .string()
+          .optional()
+          .describe('Put this node in the same layer as another node id.'),
+        pinned: z
+          .object({ x: z.number(), y: z.number() })
+          .optional()
+          .describe('Fix the node at these exact coordinates.'),
+      });
+      const group = z.object({
+        id: z.string().min(1),
+        label: z.string().min(1),
+        kind: z.string().optional(),
+      });
+      const edge = z.object({
+        from: z.string().min(1),
+        to: z.string().min(1),
+        label: z.string().optional(),
+        kind: z
+          .string()
+          .optional()
+          .describe('sync (solid), async (dashed), error (red-dashed).'),
+      });
+      return {
+        pageId: z.string().min(1),
+        graph: z
+          .object({
+            nodes: z.array(node),
+            groups: z.array(group).optional(),
+            edges: z.array(edge).optional(),
+            direction: z.enum(['LR', 'RL', 'TB', 'BT']).optional(),
+            preset: z.enum(['default', 'dark', 'colorblind-safe']).optional(),
+          })
+          .describe('The semantic graph: nodes, groups, edges.'),
+        position: z
+          .enum(['before', 'after', 'append'])
+          .describe('Where to insert relative to the anchor.'),
+        anchorNodeId: z.string().optional().describe('Anchor block id (for before/after).'),
+        anchorText: z.string().optional().describe('Anchor text fragment (for before/after).'),
+        direction: z
+          .enum(['LR', 'RL', 'TB', 'BT'])
+          .optional()
+          .describe('Layout direction (overrides graph.direction).'),
+        preset: z
+          .enum(['default', 'dark', 'colorblind-safe'])
+          .optional()
+          .describe('Color preset (overrides graph.preset).'),
+        layout: z
+          .enum(['none', 'full', 'incremental'])
+          .optional()
+          .describe(
+            '"full" (default) auto-places all; "incremental" (with node) keeps ' +
+              'existing coords and places only new cells; "none" no auto-layout.',
+          ),
+        node: z
+          .string()
+          .optional()
+          .describe(
+            'An existing diagram to (re)build into — required for layout:"incremental".',
+          ),
+      };
+    },
+    execute: (
+      client,
+      { pageId, graph, position, anchorNodeId, anchorText, direction, preset, layout, node },
+    ) =>
+      client.drawioFromGraph(
+        pageId as string,
+        {
+          position: position as 'before' | 'after' | 'append',
+          anchorNodeId: anchorNodeId as string | undefined,
+          anchorText: anchorText as string | undefined,
+        },
+        graph as any,
+        direction as 'LR' | 'RL' | 'TB' | 'BT' | undefined,
+        preset as string | undefined,
+        layout as 'none' | 'full' | 'incremental' | undefined,
+        node as string | undefined,
+      ),
+  },
+
+  drawioFromMermaid: {
+    mcpName: 'drawioFromMermaid',
+    inAppKey: 'drawioFromMermaid',
+    description:
+      'Convert Mermaid `flowchart` text into an EDITABLE draw.io diagram (LLMs ' +
+      'write Mermaid reliably). Best for STANDARD flowcharts/decision trees: ' +
+      'write the mermaid, the server parses it (pure parser — no browser/CLI), ' +
+      'maps it to the same semantic pipeline as drawioFromGraph, and inserts a ' +
+      'real draw.io diagram you can then refine with drawioEditCells. Node shapes ' +
+      'map to palette colors (a `{decision}` -> yellow, a `[(db)]` -> green, etc.); ' +
+      '`subgraph … end` becomes a transparent group; dotted `-.->` edges become ' +
+      'dashed. ONLY flowchart/graph is supported — for sequence/class diagrams, or ' +
+      'for cloud/architecture diagrams with real service icons, use drawioFromGraph ' +
+      'instead. `where` positions the block like insertNode.',
+    tier: 'deferred',
+    catalogLine:
+      'drawioFromMermaid — turn Mermaid flowchart text into an editable draw.io diagram.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      mermaid: z
+        .string()
+        .min(1)
+        .describe('Mermaid flowchart source (flowchart/graph LR|TB|...).'),
+      position: z
+        .enum(['before', 'after', 'append'])
+        .describe('Where to insert relative to the anchor.'),
+      anchorNodeId: z.string().optional().describe('Anchor block id (for before/after).'),
+      anchorText: z.string().optional().describe('Anchor text fragment (for before/after).'),
+      preset: z
+        .enum(['default', 'dark', 'colorblind-safe'])
+        .optional()
+        .describe('Color preset.'),
+    }),
+    execute: (client, { pageId, mermaid, position, anchorNodeId, anchorText, preset }) =>
+      client.drawioFromMermaid(
+        pageId as string,
+        {
+          position: position as 'before' | 'after' | 'append',
+          anchorNodeId: anchorNodeId as string | undefined,
+          anchorText: anchorText as string | undefined,
+        },
+        mermaid as string,
+        preset as string | undefined,
       ),
   },
 
