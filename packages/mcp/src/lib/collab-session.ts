@@ -203,6 +203,21 @@ export class CollabSession {
   }
 
   /**
+   * Shared diagnostic suffix (issue #437) appended to the connect-timeout,
+   * persist-timeout and connection-closed error texts: names the offending
+   * pageId and tells the agent this class of failure is transient (retry once)
+   * vs. a persistent collab-server outage, so it can self-correct instead of
+   * blind-looping. The Yjs-encode error is deliberately NOT touched — it
+   * already names the offending attribute.
+   */
+  private hint(): string {
+    return (
+      `(pageId ${this.pageId}; transient — retry once; persistent failures ` +
+      `mean the collab server is unreachable/overloaded)`
+    );
+  }
+
+  /**
    * A cached session may be reused only when it is fully ready, still synced,
    * has not lost its connection, and has not exceeded its max age (invariant 5
    * "validate on reuse" + the max-age acquire check).
@@ -232,7 +247,9 @@ export class CollabSession {
         // The 25s connect timeout: the collab connection never became ready.
         this.opts?.onConnectTimeout?.();
         this.teardown(
-          new Error("Connection timeout to collaboration server"),
+          new Error(
+            `Connection timeout to collaboration server ${this.hint()}`,
+          ),
           false,
         );
       }, CONNECT_TIMEOUT_MS);
@@ -259,7 +276,7 @@ export class CollabSession {
           if (process.env.DEBUG) console.error("WS Disconnect");
           this.teardown(
             new Error(
-              "Collaboration connection closed before the update was persisted/synced",
+              `Collaboration connection closed before the update was persisted/synced ${this.hint()}`,
             ),
             true,
           );
@@ -268,7 +285,7 @@ export class CollabSession {
           if (process.env.DEBUG) console.error("WS Close");
           this.teardown(
             new Error(
-              "Collaboration connection closed before the update was persisted/synced",
+              `Collaboration connection closed before the update was persisted/synced ${this.hint()}`,
             ),
             true,
           );
@@ -403,7 +420,7 @@ export class CollabSession {
         persistTimer = setTimeout(() => {
           localFinish(
             new Error(
-              "Timeout waiting for collaboration server to persist the update",
+              `Timeout waiting for collaboration server to persist the update ${this.hint()}`,
             ),
           );
         }, PERSIST_TIMEOUT_MS);
