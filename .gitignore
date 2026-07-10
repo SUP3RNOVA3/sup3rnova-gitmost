@@ -19,6 +19,11 @@ packages/prosemirror-markdown/build/
 # markdown convention; the package is private and rebuilt at deploy.
 packages/mcp/build/
 
+# mcp REGISTRY_STAMP codegen output (issue #447). Regenerated into src/ by
+# scripts/gen-registry-stamp.mjs on every `build`/`pretest` (before tsc), so it
+# is a build artifact like build/ — never committed, always fresh.
+packages/mcp/src/registry-stamp.generated.ts
+
 # Logs
 logs
 *.log

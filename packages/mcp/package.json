@@ -13,10 +13,11 @@
     "docmost-mcp": "./build/stdio.js"
   },
   "scripts": {
-    "build": "tsc",
+    "gen:stamp": "node scripts/gen-registry-stamp.mjs",
+    "build": "node scripts/gen-registry-stamp.mjs && tsc",
     "start": "node build/stdio.js",
-    "watch": "tsc --watch",
-    "pretest": "tsc",
+    "watch": "node scripts/gen-registry-stamp.mjs && tsc --watch",
+    "pretest": "node scripts/gen-registry-stamp.mjs && tsc",
     "test": "node --test \"test/unit/*.test.mjs\" \"test/mock/*.test.mjs\"",
     "test:unit": "node --test \"test/unit/*.test.mjs\"",
     "test:mock": "node --test \"test/mock/*.test.mjs\"",

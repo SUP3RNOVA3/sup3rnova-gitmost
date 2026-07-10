@@ -29,6 +29,14 @@ export { destroyAllSessions } from "./lib/collab-session.js";
 export { SHARED_TOOL_SPECS } from "./tool-specs.js";
 export type { SharedToolSpec } from "./tool-specs.js";
 
+// Re-export the build-time REGISTRY_STAMP (issue #447): a deterministic hash of
+// the tool-specs registry content, generated into src/registry-stamp.generated.ts
+// by scripts/gen-registry-stamp.mjs BEFORE tsc, so it lands in build/. The in-app
+// loader recomputes the same hash from src/tool-specs.ts (dev/test only) and
+// refuses to run on a mismatch, catching a build/ vs src/ skew (a spec edited in
+// src without rebuilding the package the server actually loads from build/).
+export { REGISTRY_STAMP } from "./registry-stamp.generated.js";
+
 // Re-export the shared "new comments: N" signal helper (#417) so the in-app
 // layer reads the SAME watermark/debounce/injection-safe line builder off the
 // loaded module (same pattern as SHARED_TOOL_SPECS). Both surfaces then differ

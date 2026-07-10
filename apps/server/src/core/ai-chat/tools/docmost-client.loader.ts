@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 /**
@@ -344,6 +347,50 @@ interface DocmostMcpModule {
   // loader in unit tests. The in-app layer treats an absent factory as "signal
   // disabled" — a pure no-op that leaves tool results byte-identical.
   createCommentSignalTracker?: CommentSignalTrackerFactory;
+  // Optional (#447): a deterministic hash of the tool-specs registry content,
+  // generated into build/ by the package's build. Absent on a pre-#447 build (or
+  // the mocked loader in unit tests) — the stale-check below is a NO-OP when it
+  // is missing, so an older build never wrongly fails startup.
+  REGISTRY_STAMP?: string;
+}
+
+/**
+ * Recompute the REGISTRY_STAMP (#447) from the @docmost/mcp source tree, if it is
+ * present. Returns the stamp string, or `null` when the source is absent (a prod
+ * image ships only build/, no src/). MUST stay byte-for-byte identical to
+ * packages/mcp/scripts/gen-registry-stamp.mjs's `computeRegistryStamp` so the
+ * build-time and src-time hashes agree: same input file (src/tool-specs.ts), same
+ * normalization (CRLF -> LF, strip a single trailing newline), same sha256.
+ *
+ * DEV vs PROD detection is by FILE EXISTENCE, not NODE_ENV: we resolve the
+ * package's own directory from `require.resolve('@docmost/mcp')` (which points at
+ * build/index.js) and look for ../src/tool-specs.ts next to it. In a dev/test
+ * worktree that file exists; in a prod image (build/ only, src/ stripped) it does
+ * not, so this returns null and the caller skips the check. Any error (ENOENT, a
+ * bad resolve) is swallowed to null — the stale-check must NEVER break startup.
+ *
+ * Exported for unit testing (docmost-client.loader.spec.ts): the export keyword
+ * is behaviourally a no-op — the module-internal caller `loadDocmostMcp` is
+ * unaffected. The test drives the null (no-src) path and asserts this
+ * normalize+sha256 stays identical to the codegen's `computeRegistryStamp`.
+ */
+export function computeSrcRegistryStamp(packageEntry: string): string | null {
+  try {
+    // packageEntry is <pkg>/build/index.js; the source lives at <pkg>/src/.
+    const toolSpecsPath = join(
+      dirname(dirname(packageEntry)),
+      'src',
+      'tool-specs.ts',
+    );
+    if (!existsSync(toolSpecsPath)) return null; // prod: no src tree -> skip.
+    const source = readFileSync(toolSpecsPath, 'utf8');
+    const normalized = source.replace(/\r\n/g, '\n').replace(/\n$/, '');
+    return createHash('sha256').update(normalized, 'utf8').digest('hex');
+  } catch {
+    // Never let a resolution/read hiccup break server startup — treat as "no
+    // src available" and skip the check (identical to the prod no-op path).
+    return null;
+  }
 }
 
 // TS with module:commonjs downlevels a literal `import()` to `require()`, which
@@ -375,6 +422,23 @@ export async function loadDocmostMcp(): Promise<{
       const mod = (await esmImport(
         pathToFileURL(entry).href,
       )) as DocmostMcpModule;
+      // #447 stale-build guard (dev/test only). The server loads the COMPILED
+      // build/ of @docmost/mcp, but the parity/tier guard tests read src/. If a
+      // tool spec is edited in src without rebuilding the package, build/ and src/
+      // silently diverge and the running server serves the OLD tools. Here we
+      // recompute the stamp from src/tool-specs.ts and compare it to the stamp
+      // baked into build/. In PROD the src tree is absent (image ships build/
+      // only), so computeSrcRegistryStamp returns null and this is a pure no-op.
+      const srcStamp = computeSrcRegistryStamp(entry);
+      if (
+        srcStamp !== null &&
+        typeof mod.REGISTRY_STAMP === 'string' &&
+        srcStamp !== mod.REGISTRY_STAMP
+      ) {
+        throw new Error(
+          '@docmost/mcp build is stale (tool-specs changed since last build) — run: pnpm --filter @docmost/mcp build',
+        );
+      }
       return mod;
     })().catch((err) => {
       // Do not cache a rejected import — allow the next call to retry.
