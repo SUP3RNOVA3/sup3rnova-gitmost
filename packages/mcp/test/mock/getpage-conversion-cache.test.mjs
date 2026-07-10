@@ -10,7 +10,7 @@
 //     skipping the conversion;
 //   - a changed updatedAt is a fresh key -> MISS again;
 //   - the returned shape still resolves page + subpages.
-import { test, after } from "node:test";
+import { test, after, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { DocmostClient } from "../../build/client.js";
@@ -220,4 +220,32 @@ test("on a conversion HIT, the {{SUBPAGES}} block reflects the LIVE subpages, no
   assert.ok(second.data.content.includes("[Beta](page:" + CHILD_B + ")"), "live list B spliced in on a HIT");
   assert.ok(!second.data.content.includes("Alpha"), "stale list A is NOT frozen into the output");
   assert.deepEqual(second.data.subpages, [{ id: CHILD_B, title: "Beta" }], "subpages field reflects list B");
+});
+
+test("a cache HIT SKIPS the convertProseMirrorToMarkdown CPU walk (called once across MISS+HIT)", async () => {
+  // The single reason the cache exists: on a hit the expensive PM-tree walk must
+  // NOT run. The miss counter alone can't prove this — a broken hit branch that
+  // re-converted (same output, misses=1) would leave every other assert green.
+  // So spy directly on the conversion seam and assert the call COUNT.
+  const state = { info: 0, sidebar: 0, updatedAt: "2026-01-01T00:00:00Z", text: "Body text" };
+  const baseURL = await spawn(state);
+  const metrics = {};
+  const client = makeClient(baseURL, metrics);
+
+  // Spy on the seam that wraps convertProseMirrorToMarkdown; it still delegates,
+  // so output stays real and byte-identical — we only count invocations.
+  const spy = mock.method(client, "convertPageMarkdown");
+
+  await client.getPage(PAGE_UUID); // MISS -> converts once
+  assert.equal(spy.mock.callCount(), 1, "the miss converts exactly once");
+
+  await client.getPage(PAGE_UUID); // HIT -> must NOT convert again
+  assert.equal(
+    spy.mock.callCount(),
+    1,
+    "the hit skips the conversion: still exactly one call across MISS+HIT",
+  );
+  assert.equal(metrics["mcp_getpage_cache_hits_total"], 1, "and it was recorded as a hit");
+
+  spy.mock.restore();
 });

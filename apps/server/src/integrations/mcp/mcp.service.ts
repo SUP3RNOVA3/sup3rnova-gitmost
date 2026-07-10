@@ -34,6 +34,8 @@ import {
   isMetricsEnabled,
   observeMcpTool,
   incConnectTimeout,
+  incGetPageCacheHit,
+  incGetPageCacheMiss,
 } from '../metrics/metrics.registry';
 
 // Minimal shape of the embedded MCP HTTP handler exported by @docmost/mcp/http.
@@ -357,6 +359,10 @@ export class McpService implements OnModuleDestroy {
                       observeMcpTool(labels?.tool ?? 'other', value);
                     } else if (name === 'collab_connect_timeouts_total') {
                       incConnectTimeout();
+                    } else if (name === 'mcp_getpage_cache_hits_total') {
+                      incGetPageCacheHit();
+                    } else if (name === 'mcp_getpage_cache_misses_total') {
+                      incGetPageCacheMiss();
                     }
                   }
                 : undefined,

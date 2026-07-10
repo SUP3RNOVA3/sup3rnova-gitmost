@@ -10,7 +10,10 @@ import {
   filterComment,
   filterSearchResult,
 } from "../lib/filters.js";
-import { convertProseMirrorToMarkdown } from "../lib/markdown-converter.js";
+import {
+  convertProseMirrorToMarkdown,
+  type ConvertProseMirrorToMarkdownOptions,
+} from "../lib/markdown-converter.js";
 import {
   GetPageConversionCache,
   hashConvertOptions,
@@ -399,6 +402,19 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
 
   /** Raw page info including the ProseMirror JSON content and slugId. */
 
+  /**
+   * Overridable seam over convertProseMirrorToMarkdown (issue #479). Production
+   * just delegates; it exists as a method so a unit test can spy on it and
+   * assert the conversion is genuinely SKIPPED on a getPage cache HIT (the whole
+   * point of the cache) — an ESM named import cannot be intercepted otherwise.
+   */
+  protected convertPageMarkdown(
+    content: any,
+    options: ConvertProseMirrorToMarkdownOptions,
+  ): string {
+    return convertProseMirrorToMarkdown(content, options);
+  }
+
   async getPage(pageId: string) {
     await this.ensureAuthenticated();
     const resultData = await this.getPageRaw(pageId);
@@ -438,7 +454,9 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
         content = cached;
         this.onMetricFn?.("mcp_getpage_cache_hits_total", 1);
       } else {
-        content = convertProseMirrorToMarkdown(resultData.content, convertOptions);
+        // Goes through the convertPageMarkdown seam (not the raw import) so a
+        // test can assert the conversion is SKIPPED on a hit (issue #479 F2).
+        content = this.convertPageMarkdown(resultData.content, convertOptions);
         if (cacheKey) this.getPageCache.set(cacheKey, content);
         // A non-cacheable page (missing id/updatedAt) is still a genuine
         // conversion, so it counts as a miss for an honest hit-rate.
