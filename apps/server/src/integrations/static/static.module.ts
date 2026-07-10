@@ -115,6 +115,11 @@ export class StaticModule implements OnModuleInit {
         // Serve the build-time .br/.gz neighbour when the client accepts it
         // (see vite-plugin-compression2 in apps/client/vite.config.ts).
         preCompressed: true,
+        // @fastify/static's default cacheControl:true writes its own
+        // Cache-Control (from maxAge, default 0) AFTER the setHeaders callback,
+        // silently overwriting the immutable header that resolveStaticAssetHeaders
+        // sets — disable it so setHeaders/resolveStaticAssetHeaders own the header.
+        cacheControl: false,
         setHeaders: (res, filePath) => {
           for (const [name, value] of Object.entries(
             resolveStaticAssetHeaders(filePath),
