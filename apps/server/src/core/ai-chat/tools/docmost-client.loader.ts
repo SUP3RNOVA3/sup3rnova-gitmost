@@ -168,6 +168,32 @@ export interface DocmostClientLike {
     url: string,
     opts?: { align?: 'left' | 'center' | 'right'; alt?: string },
   ): Promise<Record<string, unknown>>;
+  // --- draw.io diagrams (#423, stage 1) ---
+  // Read a diagram as decoded mxGraph XML (default) or the raw .drawio.svg.
+  // meta.hash is the optimistic-lock key drawioUpdate expects as baseHash.
+  drawioGet(
+    pageId: string,
+    node: string,
+    format?: 'xml' | 'svg',
+  ): Promise<Record<string, unknown>>;
+  // Lint mxGraph XML, build the .drawio.svg attachment and insert a drawio node.
+  drawioCreate(
+    pageId: string,
+    where: {
+      position: 'before' | 'after' | 'append';
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+    xml: string,
+    title?: string,
+  ): Promise<Record<string, unknown>>;
+  // Optimistic-locked full replacement of a diagram (baseHash from drawioGet).
+  drawioUpdate(
+    pageId: string,
+    node: string,
+    xml: string,
+    baseHash: string,
+  ): Promise<Record<string, unknown>>;
   tableInsertRow(
     pageId: string,
     tableRef: string,

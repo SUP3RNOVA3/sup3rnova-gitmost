@@ -81,6 +81,10 @@ const HOST_CONTRACT_METHODS = [
   "insertImage",
   "replaceImage",
   "insertFootnote",
+  // draw.io diagrams (#423, stage 1) — read + create + optimistic-locked update
+  "drawioGet",
+  "drawioCreate",
+  "drawioUpdate",
   // write (comment)
   "createComment",
   "resolveComment",

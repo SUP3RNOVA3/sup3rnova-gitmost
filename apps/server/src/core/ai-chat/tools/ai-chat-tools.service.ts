@@ -729,6 +729,35 @@ export class AiChatToolsService {
           }),
       ),
 
+      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#423).
+      // meta.hash in the result is the baseHash drawioUpdate requires.
+      drawioGet: sharedTool(
+        sharedToolSpecs.drawioGet,
+        async ({ pageId, node, format }) =>
+          await client.drawioGet(pageId, node, format ?? 'xml'),
+      ),
+
+      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#423).
+      // The flat schema fields are regrouped into the client's `where` object.
+      drawioCreate: sharedTool(
+        sharedToolSpecs.drawioCreate,
+        async ({ pageId, xml, position, anchorNodeId, anchorText, title }) =>
+          await client.drawioCreate(
+            pageId,
+            { position, anchorNodeId, anchorText },
+            xml,
+            title,
+          ),
+      ),
+
+      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#423).
+      // baseHash is the optimistic lock: mismatch => structured conflict error.
+      drawioUpdate: sharedTool(
+        sharedToolSpecs.drawioUpdate,
+        async ({ pageId, node, xml, baseHash }) =>
+          await client.drawioUpdate(pageId, node, xml, baseHash),
+      ),
+
       // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
       // The table reference parameter was unified to `table` (was `tableRef`).
       tableInsertRow: sharedTool(
