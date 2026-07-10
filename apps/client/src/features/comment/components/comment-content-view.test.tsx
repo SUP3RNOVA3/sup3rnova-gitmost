@@ -15,6 +15,7 @@ vi.mock("@/features/comment/components/comment-editor", () => ({
 // case renders in isolation.
 vi.mock("@/features/page/queries/page-query.ts", () => ({
   usePageQuery: () => ({ data: undefined, isLoading: false, isError: false }),
+  usePageMetaQuery: () => ({ data: undefined, isLoading: false, isError: false }),
 }));
 vi.mock("@/features/share/queries/share-query.ts", () => ({
   useSharePageQuery: () => ({ data: undefined }),

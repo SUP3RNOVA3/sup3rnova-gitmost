@@ -10,7 +10,7 @@ import { useTranslation } from "react-i18next";
 import React from "react";
 import { EmptyState } from "@/components/ui/empty-state.tsx";
 import { IconAlertTriangle, IconFileOff } from "@tabler/icons-react";
-import { Button } from "@mantine/core";
+import { Button, Skeleton } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { ErrorBoundary } from "react-error-boundary";
 const MemoizedFullEditor = React.memo(FullEditor);
@@ -58,7 +58,7 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
     (space?.settings?.comments?.allowViewerComments === true);
 
   if (isLoading) {
-    return <></>;
+    return <PageSkeleton />;
   }
 
   if (isError || !page) {
@@ -87,7 +87,7 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
   }
 
   if (!space) {
-    return <></>;
+    return <PageSkeleton />;
   }
 
   return (
@@ -114,5 +114,20 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
         <MemoizedHistoryModal pageId={page.id} />
       </div>
     )
+  );
+}
+
+// Lightweight loading placeholder shown instead of a blank fragment while the
+// page (or its space) is loading, so navigation into a not-yet-cached page no
+// longer flashes empty. Approximates the title + first content lines.
+function PageSkeleton() {
+  return (
+    <div>
+      <Skeleton height={34} width="45%" mt="xl" radius="sm" />
+      <Skeleton height={16} mt="xl" radius="sm" />
+      <Skeleton height={16} mt="sm" radius="sm" />
+      <Skeleton height={16} mt="sm" width="85%" radius="sm" />
+      <Skeleton height={16} mt="sm" width="70%" radius="sm" />
+    </div>
   );
 }

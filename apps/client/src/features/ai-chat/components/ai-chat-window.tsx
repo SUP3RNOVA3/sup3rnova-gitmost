@@ -36,7 +36,7 @@ import {
   desktopSidebarAtom,
   mobileSidebarAtom,
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
-import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import {
   pageEditorAtom,
   readOnlyEditorAtom,
@@ -245,7 +245,9 @@ export default function AiChatWindow() {
   // left partly off-screen).
   const [geom, setGeom] = useAtom(aiChatWindowGeomAtom);
 
-  const { data: chats } = useAiChatsQuery();
+  // Gated on windowOpen: the chat list is only needed once the window is open,
+  // so a closed window issues no chat-list request/refetch on navigation.
+  const { data: chats } = useAiChatsQuery(windowOpen);
   // Roles for the new-chat picker (any member may list them). Only fetched while
   // the window is open.
   const { data: roles } = useAiRolesQuery(windowOpen);
@@ -291,6 +293,10 @@ export default function AiChatWindow() {
         Date.now() - lastActivityAtRef.current < DEGRADED_POLL_IDLE_MAX_MS
           ? 2500
           : false,
+      // #344: gate on windowOpen too — no message history is fetched (and no
+      // degraded poll runs) while the window is closed; it loads when the window
+      // opens with an active chat.
+      windowOpen,
     );
 
   // #430: re-stamp the activity clock whenever the polled rows change while the
@@ -336,7 +342,7 @@ export default function AiChatWindow() {
   // reads/writes via its CASL-enforced page tools using the id.
   const pageRouteMatch = useMatch("/s/:spaceSlug/p/:pageSlug");
   const pageSlug = pageRouteMatch?.params?.pageSlug;
-  const { data: openPageData } = usePageQuery({
+  const { data: openPageData } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
   const openPage = openPageData

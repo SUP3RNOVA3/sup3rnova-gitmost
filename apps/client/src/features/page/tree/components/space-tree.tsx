@@ -15,7 +15,7 @@ import { notifications } from "@mantine/notifications";
 import {
   fetchAllAncestorChildren,
   useGetRootSidebarPagesQuery,
-  usePageQuery,
+  usePageMetaQuery,
 } from "@/features/page/queries/page-query.ts";
 import classes from "@/features/page/tree/styles/tree.module.css";
 import { treeDataAtom } from "@/features/page/tree/atoms/tree-data-atom.ts";
@@ -76,7 +76,7 @@ const SpaceTree = forwardRef<SpaceTreeApi, SpaceTreeProps>(function SpaceTree(
   const [isDataLoaded, setIsDataLoaded] = useState(false);
   const spaceIdRef = useRef(spaceId);
   spaceIdRef.current = spaceId;
-  const { data: currentPage } = usePageQuery({
+  const { data: currentPage } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
 
