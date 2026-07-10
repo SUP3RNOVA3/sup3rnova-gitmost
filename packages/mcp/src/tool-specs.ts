@@ -24,6 +24,92 @@
 // one of them. Each builder uses only the common, stable subset of the API.
 type ZodLike = any;
 
+// The `node` normalizer shared by BOTH hosts (patch_node / insert_node /
+// update_page_json): the model sometimes serializes a ProseMirror node arg as a
+// JSON string, so we parse a string to an object (throwing a documented message
+// on invalid JSON) and pass an object through. It lives in the converter package
+// (#414) so it is the ONE copy both the MCP server and the in-app server import;
+// putting it in a shared execute here keeps that single normalization in one
+// place instead of hand-mirrored per host. Pure — safe across the zod boundary.
+import { parseNodeArg } from '@docmost/prosemirror-markdown';
+// Type-only import (erased at compile) of the real client so `DocmostClientLike`
+// is DERIVED from it (issue #446), not hand-mirrored. The loosest correct client
+// surface both hosts satisfy: the in-app host passes its own DERIVED
+// `DocmostClientLike` (a Pick of the same class) and the MCP host passes the real
+// `DocmostClient`, so both are structurally assignable to this shared alias.
+import type { DocmostClient } from './client.js';
+
+/**
+ * The client surface a shared `execute` may call — the LOOSEST correct type both
+ * hosts satisfy: a `Pick` of the real `DocmostClient` methods the executes below
+ * use. DERIVED from the real class (issue #446) so a signature change to any
+ * consumed method surfaces as a compile error in the execute bodies here, not a
+ * silent runtime "wrong argument". Kept as a Pick (not the whole class) so the
+ * standalone MCP host's full `DocmostClient` AND the in-app host's OWN narrower
+ * `DocmostClientLike` (also a Pick of the same class, a superset of these methods)
+ * are both structurally assignable to it. `import type` is fully erased, so
+ * tool-specs.ts pulls in no runtime dependency on the client and still crosses the
+ * zod-major boundary freely. When you add a client call to an execute below, add
+ * its method name here too (a compile error will point you at it).
+ */
+export type DocmostClientLike = Pick<
+  DocmostClient,
+  | 'getWorkspace'
+  | 'getSpaces'
+  | 'listShares'
+  | 'listPages'
+  | 'getPage'
+  | 'getPageJson'
+  | 'getOutline'
+  | 'getNode'
+  | 'searchInPage'
+  | 'listComments'
+  | 'checkNewComments'
+  | 'listPageHistory'
+  | 'diffPageVersions'
+  | 'exportPageMarkdown'
+  | 'createPage'
+  | 'renamePage'
+  | 'movePage'
+  | 'deletePage'
+  | 'editPageText'
+  | 'patchNode'
+  | 'insertNode'
+  | 'deleteNode'
+  | 'updatePageJson'
+  | 'tableInsertRow'
+  | 'tableDeleteRow'
+  | 'tableUpdateCell'
+  | 'copyPageContent'
+  | 'importPageMarkdown'
+  | 'sharePage'
+  | 'unsharePage'
+  | 'restorePageVersion'
+  | 'stashPage'
+  | 'insertFootnote'
+  | 'insertImage'
+  | 'replaceImage'
+  | 'drawioGet'
+  | 'drawioCreate'
+  | 'drawioUpdate'
+  | 'createComment'
+  | 'resolveComment'
+>;
+
+/**
+ * A shared tool `execute`: the single canonical mapping from validated schema
+ * args to the client call. Plain JS — it crosses the zod-major boundary (v3 in
+ * the MCP package, v4 on the server) freely, receiving the already-validated,
+ * type-erased args from whichever host invoked it. It returns RAW data; the host
+ * applies its own result envelope (the MCP transport wraps it as JSON text
+ * content, the in-app AI-SDK host returns it as-is). Host-specific overrides
+ * (`mcpExecute`/`inAppExecute`) return a value the host uses instead of wrapping.
+ */
+export type SharedToolExecute = (
+  client: DocmostClientLike,
+  args: Record<string, unknown>,
+) => Promise<unknown>;
+
 export interface SharedToolSpec {
   /** snake_case tool name passed to McpServer.registerTool. */
   mcpName: string;
@@ -54,7 +140,52 @@ export interface SharedToolSpec {
    * in-app side uses z.object({})).
    */
   buildShape?: (z: ZodLike) => Record<string, unknown>;
+  /**
+   * Single canonical mapping from validated schema args to the client call,
+   * shared by BOTH hosts. Returns RAW data — the MCP host wraps it as JSON text
+   * content (jsonContent), the in-app host returns it as-is. Present on tools
+   * whose mapping AND raw result are identical across the two layers. When a host
+   * needs a genuinely different mapping or result shape, it supplies an override
+   * (below) and the host uses that INSTEAD of `execute`.
+   */
+  execute?: SharedToolExecute;
+  /**
+   * MCP-host override for a DELIBERATE per-layer difference (a guardrail, an
+   * omitted param, or a non-JSON result envelope like a resource_link / a bare
+   * success line). When present, the MCP host calls this and uses its return
+   * value VERBATIM (it is NOT re-wrapped in jsonContent), so this override owns
+   * the full MCP content envelope.
+   */
+  mcpExecute?: SharedToolExecute;
+  /**
+   * In-app-host override for a DELIBERATE per-layer difference (a projected
+   * result shape, a different guardrail message). When present, the in-app host
+   * calls this and returns its value as the tool result (no wrapping).
+   */
+  inAppExecute?: SharedToolExecute;
+  /** Registered only on the MCP host (skipped by the in-app registry loop). */
+  mcpOnly?: boolean;
+  /** Registered only on the in-app host (skipped by the MCP registry loop). */
+  inAppOnly?: boolean;
 }
+
+// --- Shared execute helpers -------------------------------------------------
+//
+// Each helper is the ONE canonical arg->client mapping for a tool (or a host
+// override where the two layers deliberately differ). They are attached to their
+// spec below. Kept as named functions (not inline) so the spec table stays
+// readable and each mapping is individually greppable/testable.
+//
+// The `args` are the host's already-validated, zod-erased input; we read the
+// same fields the tool's buildShape declares. Return RAW data unless the name is
+// an mcp*/inApp* override that owns the host's full result shape.
+
+/** Format a JSON payload as the MCP transport's text-content envelope. Mirrors
+ *  the private `jsonContent` in index.ts so an mcpExecute override that must NOT
+ *  be re-wrapped can still emit the standard envelope for the data part. */
+const mcpJson = (data: unknown) => ({
+  content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }],
+});
 
 export const SHARED_TOOL_SPECS = {
   // --- no-argument read tools ---
@@ -65,6 +196,7 @@ export const SHARED_TOOL_SPECS = {
     description: 'Fetch metadata about the current workspace (name, settings).',
     tier: 'core',
     catalogLine: 'getWorkspace — fetch current workspace metadata (name, settings).',
+    execute: (client) => client.getWorkspace(),
   },
 
   listSpaces: {
@@ -75,6 +207,7 @@ export const SHARED_TOOL_SPECS = {
       'spaces (id, name, slug, ...).',
     tier: 'core',
     catalogLine: 'listSpaces — list the spaces the user can access (id, name, slug).',
+    execute: (client) => client.getSpaces(),
   },
 
   listShares: {
@@ -84,6 +217,7 @@ export const SHARED_TOOL_SPECS = {
       'List all public shares in the workspace with page titles and public URLs.',
     tier: 'deferred',
     catalogLine: 'listShares — list all public shares in the workspace with their URLs.',
+    execute: (client) => client.listShares(),
   },
 
   // --- single-pageId read tools ---
@@ -102,6 +236,7 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1),
     }),
+    execute: (client, { pageId }) => client.getPageJson(pageId as string),
   },
 
   getOutline: {
@@ -119,6 +254,7 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1),
     }),
+    execute: (client, { pageId }) => client.getOutline(pageId as string),
   },
 
   // --- two-id read tool ---
@@ -139,6 +275,8 @@ export const SHARED_TOOL_SPECS = {
       pageId: z.string().min(1),
       nodeId: z.string().min(1),
     }),
+    execute: (client, { pageId, nodeId }) =>
+      client.getNode(pageId as string, nodeId as string),
   },
 
   // --- in-page occurrence search (client-side, over ProseMirror plain text) ---
@@ -196,6 +334,12 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Max matches to RETURN (default 50, max 200); total is always reported.'),
     }),
+    execute: (client, { pageId, query, regex, caseSensitive, limit }) =>
+      client.searchInPage(pageId as string, query as string, {
+        regex: regex as boolean | undefined,
+        caseSensitive: caseSensitive as boolean | undefined,
+        limit: limit as number | undefined,
+      }),
   },
 
   // --- node delete ---
@@ -212,6 +356,8 @@ export const SHARED_TOOL_SPECS = {
       pageId: z.string().min(1),
       nodeId: z.string().min(1),
     }),
+    execute: (client, { pageId, nodeId }) =>
+      client.deleteNode(pageId as string, nodeId as string),
   },
 
   // --- single-block structural write (patch / insert) ---
@@ -262,6 +408,11 @@ export const SHARED_TOOL_SPECS = {
             'JSON object or JSON string both accepted.',
         ),
     }),
+    // parseNodeArg normalizes a JSON-string node into an object (the model
+    // sometimes serializes it as a string) before the client's typeof-object
+    // guard rejects it — identical on both hosts.
+    execute: (client, { pageId, nodeId, node }) =>
+      client.patchNode(pageId as string, nodeId as string, parseNodeArg(node)),
   },
 
   insertNode: {
@@ -318,6 +469,12 @@ export const SHARED_TOOL_SPECS = {
             'are tolerated as a fallback; prefer plain text or anchorNodeId.',
         ),
     }),
+    execute: (client, { pageId, node, position, anchorNodeId, anchorText }) =>
+      client.insertNode(pageId as string, parseNodeArg(node), {
+        position: position as 'before' | 'after' | 'append',
+        anchorNodeId: anchorNodeId as string | undefined,
+        anchorText: anchorText as string | undefined,
+      }),
   },
 
   // --- share management ---
@@ -348,6 +505,11 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Allow public search engines to index it (default true).'),
     }),
+    // `searchIndexing ?? true` is a no-op default: the client method already
+    // defaults searchIndexing to true, so passing `undefined` (the in-app form)
+    // and `?? true` (the old MCP form) are byte-identical — one canonical mapping.
+    execute: (client, { pageId, searchIndexing }) =>
+      client.sharePage(pageId as string, (searchIndexing as boolean | undefined) ?? true),
   },
 
   unsharePage: {
@@ -359,6 +521,7 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('ID of the page to unshare'),
     }),
+    execute: (client, { pageId }) => client.unsharePage(pageId as string),
   },
 
   // --- version history ---
@@ -387,6 +550,12 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe("historyId, or 'current'/omit for current content"),
     }),
+    execute: (client, { pageId, from, to }) =>
+      client.diffPageVersions(
+        pageId as string,
+        from as string | undefined,
+        to as string | undefined,
+      ),
   },
 
   listPageHistory: {
@@ -406,6 +575,8 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Pagination cursor from a previous nextCursor'),
     }),
+    execute: (client, { pageId, cursor }) =>
+      client.listPageHistory(pageId as string, cursor as string | undefined),
   },
 
   restorePageVersion: {
@@ -422,6 +593,8 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       historyId: z.string().min(1),
     }),
+    execute: (client, { historyId }) =>
+      client.restorePageVersion(historyId as string),
   },
 
   // --- markdown round-trip ---
@@ -443,6 +616,8 @@ export const SHARED_TOOL_SPECS = {
       pageId: z.string().min(1),
       markdown: z.string().min(1),
     }),
+    execute: (client, { pageId, markdown }) =>
+      client.importPageMarkdown(pageId as string, markdown as string),
   },
 
   // --- server-side content copy ---
@@ -465,6 +640,8 @@ export const SHARED_TOOL_SPECS = {
         .min(1)
         .describe('Page whose content is REPLACED (title/slug kept)'),
     }),
+    execute: (client, { sourcePageId, targetPageId }) =>
+      client.copyPageContent(sourcePageId as string, targetPageId as string),
   },
 
   // --- surgical text edit (folds in the documented drift-bug fix) ---
@@ -514,6 +691,11 @@ export const SHARED_TOOL_SPECS = {
         .min(1)
         .describe('List of find/replace operations, applied in order'),
     }),
+    execute: (client, { pageId, edits }) =>
+      client.editPageText(
+        pageId as string,
+        edits as Parameters<DocmostClientLike['editPageText']>[1],
+      ),
   },
 
   // --- hand a large page to an external consumer without bloating context ---
@@ -542,6 +724,33 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1),
     }),
+    // In-app returns the full documented `{ uri, size, sha256, images }` object
+    // as-is (the canonical execute).
+    execute: (client, { pageId }) => client.stashPage(pageId as string),
+    // The MCP transport must deliver the body as a resource_link (so it never
+    // enters the model context) PLUS a structuredContent mirror of the documented
+    // shape (sha256 = the blob's ETag, mirror counts). Owns its full envelope, so
+    // it is NOT wrapped in jsonContent.
+    mcpExecute: async (client, { pageId }) => {
+      const result = await client.stashPage(pageId as string);
+      return {
+        content: [
+          {
+            type: 'resource_link' as const,
+            uri: result.uri,
+            name: 'page.json',
+            mimeType: 'application/json',
+            size: result.size,
+          },
+        ],
+        structuredContent: {
+          uri: result.uri,
+          sha256: result.sha256,
+          size: result.size,
+          images: result.images,
+        },
+      };
+    },
   },
 
   // --- page tools (unified from the per-layer inline definitions, #294) ---
@@ -568,6 +777,20 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('The id (or slugId) of the page.'),
     }),
+    // MCP wraps the raw `{ data, success }` as JSON. The in-app host instead
+    // projects a token-efficient `{ title, markdown }` (its long-standing shape).
+    execute: (client, { pageId }) => client.getPage(pageId as string),
+    inAppExecute: async (client, { pageId }) => {
+      // getPage(pageId) -> { data: filterPage(page, markdown), success }.
+      const result = (await client.getPage(pageId as string)) as {
+        data?: { title?: string; content?: string };
+      };
+      const data = result?.data ?? {};
+      return {
+        title: data.title ?? '',
+        markdown: typeof data.content === 'string' ? data.content : '',
+      };
+    },
   },
 
   listPages: {
@@ -602,6 +825,15 @@ export const SHARED_TOOL_SPECS = {
             'Requires spaceId; ignores limit.',
         ),
     }),
+    // `limit ?? 50` / `tree ?? false` are no-op defaults: the client method
+    // already defaults limit=50, tree=false, so the old MCP explicit-default form
+    // and the in-app pass-through form are byte-identical — one canonical mapping.
+    execute: (client, { spaceId, limit, tree }) =>
+      client.listPages(
+        spaceId as string | undefined,
+        (limit as number | undefined) ?? 50,
+        (tree as boolean | undefined) ?? false,
+      ),
   },
 
   createPage: {
@@ -630,6 +862,28 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Optional parent page id to nest the new page under.'),
     }),
+    // MCP wraps the raw create response as JSON. In-app projects `{ id, title }`
+    // and defensively coerces a missing body to '' (the schema makes content a
+    // required string, so `?? ''` only guards an absent field — preserved).
+    execute: (client, { title, content, spaceId, parentPageId }) =>
+      client.createPage(
+        title as string,
+        content as string,
+        spaceId as string,
+        parentPageId as string | undefined,
+      ),
+    inAppExecute: async (client, { title, content, spaceId, parentPageId }) => {
+      // createPage(title, content, spaceId, parentPageId?) ->
+      // { data: filterPage(page, markdown), success }.
+      const result = (await client.createPage(
+        title as string,
+        (content as string | undefined) ?? '',
+        spaceId as string,
+        parentPageId as string | undefined,
+      )) as { data?: { id?: string; slugId?: string; title?: string } };
+      const data = result?.data ?? {};
+      return { id: data.id ?? data.slugId, title: data.title ?? (title as string) };
+    },
   },
 
   movePage: {
@@ -667,6 +921,62 @@ export const SHARED_TOOL_SPECS = {
             'append at the end.',
         ),
     }),
+    // The MCP host keeps its robustness guards (coerce 'null'/'' -> null, a cheap
+    // self-cycle guard, and a POSITIVE { success: true } confirmation) and its
+    // human-readable success envelope — owns its full result, so it is NOT
+    // wrapped in jsonContent.
+    mcpExecute: async (client, { pageId, parentPageId, position }) => {
+      const finalParentId =
+        parentPageId === '' || parentPageId === 'null'
+          ? null
+          : (parentPageId as string | null | undefined);
+
+      // Cheap cycle guard: a page cannot be moved directly under itself.
+      // (Deeper descendant-cycle detection is intentionally out of scope.)
+      if (finalParentId !== null && finalParentId === pageId) {
+        throw new Error('cannot move a page under itself');
+      }
+
+      const result = await client.movePage(
+        pageId as string,
+        finalParentId || null,
+        position as string | undefined,
+      );
+
+      // Require POSITIVE confirmation: the live /pages/move success shape is
+      // exactly { success: true, status: 200 }. An empty body, a 204, or any odd
+      // shape lacking success === true must NOT be reported as a successful move.
+      if (
+        !(
+          result &&
+          typeof result === 'object' &&
+          (result as { success?: unknown }).success === true
+        )
+      ) {
+        throw new Error(
+          `Failed to move page ${pageId}: ${JSON.stringify(result)}`,
+        );
+      }
+
+      return mcpJson({
+        message: `Successfully moved page ${pageId} to parent ${finalParentId || 'root'}`,
+        result,
+      });
+    },
+    // The in-app host has no guards; it forwards `parentPageId ?? null` + the
+    // optional position and projects `{ pageId, parentPageId, moved }`.
+    inAppExecute: async (client, { pageId, parentPageId, position }) => {
+      await client.movePage(
+        pageId as string,
+        (parentPageId as string | null | undefined) ?? null,
+        position as string | undefined,
+      );
+      return {
+        pageId,
+        parentPageId: (parentPageId as string | null | undefined) ?? null,
+        moved: true,
+      };
+    },
   },
 
   renamePage: {
@@ -681,6 +991,13 @@ export const SHARED_TOOL_SPECS = {
       pageId: z.string().min(1).describe('The id of the page to rename.'),
       title: z.string().min(1).describe('The new title.'),
     }),
+    // MCP wraps the raw rename response; in-app projects `{ pageId, title }`.
+    execute: (client, { pageId, title }) =>
+      client.renamePage(pageId as string, title as string),
+    inAppExecute: async (client, { pageId, title }) => {
+      await client.renamePage(pageId as string, title as string);
+      return { pageId, title };
+    },
   },
 
   deletePage: {
@@ -697,6 +1014,23 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('The id of the page to move to trash.'),
     }),
+    // deletePage(pageId) hits POST /pages/delete with { pageId } only — the
+    // soft-delete (trash) path. GUARDRAIL: the schema exposes ONLY pageId, so no
+    // permanent/force-delete flag can reach the client on either host (asserted by
+    // ai-chat-tools.service.spec.ts). MCP emits a bare success line (owns its full
+    // envelope); in-app projects `{ pageId, trashed }`.
+    mcpExecute: async (client, { pageId }) => {
+      await client.deletePage(pageId as string);
+      return {
+        content: [
+          { type: 'text' as const, text: `Successfully deleted page ${pageId}` },
+        ],
+      };
+    },
+    inAppExecute: async (client, { pageId }) => {
+      await client.deletePage(pageId as string);
+      return { pageId, trashed: true };
+    },
   },
 
   updatePageJson: {
@@ -730,6 +1064,19 @@ export const SHARED_TOOL_SPECS = {
         ),
       title: z.string().optional().describe('Optional new title'),
     }),
+    // Content normalization is identical on both hosts: only parse/validate the
+    // document when actually supplied; undefined/null passes straight through so
+    // the client performs a title-only (or no-op) update. A string is JSON.parsed
+    // (an empty string "" therefore throws), an object passes through unchanged.
+    execute: (client, { pageId, content, title }) => {
+      let doc: unknown;
+      if (content === undefined || content === null) {
+        doc = undefined;
+      } else {
+        doc = parseNodeArg(content, 'content was a string but not valid JSON');
+      }
+      return client.updatePageJson(pageId as string, doc, title as string | undefined);
+    },
   },
 
   exportPageMarkdown: {
@@ -750,6 +1097,17 @@ export const SHARED_TOOL_SPECS = {
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('The id of the page to export.'),
     }),
+    // The markdown is a bare string. MCP returns it as a single text-content
+    // element (NOT jsonContent — that would JSON-quote the whole document);
+    // in-app projects `{ markdown }`.
+    mcpExecute: async (client, { pageId }) => {
+      const md = await client.exportPageMarkdown(pageId as string);
+      return { content: [{ type: 'text' as const, text: md }] };
+    },
+    inAppExecute: async (client, { pageId }) => {
+      const markdown = await client.exportPageMarkdown(pageId as string);
+      return { markdown };
+    },
   },
 
   // --- comment tools (unified from the per-layer inline definitions, #294) ---
@@ -832,6 +1190,69 @@ export const SHARED_TOOL_SPECS = {
             'refused.',
         ),
     }),
+    // Both hosts enforce the SAME guardrails (a top-level comment requires a
+    // selection; suggestedText is forbidden on a reply / without a selection) but
+    // with per-layer error wording (snake_case 'create_comment:' on the MCP
+    // surface, camelCase 'createComment' in-app) and different result shapes (MCP
+    // jsonContent, in-app projects `{ commentId, pageId }`). Preserved byte-for-
+    // byte via the two overrides.
+    mcpExecute: async (client, { pageId, content, selection, parentCommentId, suggestedText }) => {
+      if (!parentCommentId && (!selection || !(selection as string).trim())) {
+        throw new Error(
+          "create_comment: a 'selection' (exact text to anchor on) is required for a top-level comment; omit it only when replying via parentCommentId.",
+        );
+      }
+      if (suggestedText !== undefined) {
+        if (parentCommentId) {
+          throw new Error(
+            "create_comment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
+          );
+        }
+        if (!selection || !(selection as string).trim()) {
+          throw new Error(
+            "create_comment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
+          );
+        }
+      }
+      const result = await client.createComment(
+        pageId as string,
+        content as string,
+        'inline',
+        selection as string | undefined,
+        parentCommentId as string | undefined,
+        suggestedText as string | undefined,
+      );
+      return mcpJson(result);
+    },
+    inAppExecute: async (client, { pageId, content, selection, parentCommentId, suggestedText }) => {
+      if (!parentCommentId && (!selection || !(selection as string).trim())) {
+        throw new Error(
+          "createComment requires a 'selection' (exact text to anchor on) for a new top-level comment.",
+        );
+      }
+      if (suggestedText !== undefined) {
+        if (parentCommentId) {
+          throw new Error(
+            "createComment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
+          );
+        }
+        if (!selection || !(selection as string).trim()) {
+          throw new Error(
+            "createComment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
+          );
+        }
+      }
+      const result = (await client.createComment(
+        pageId as string,
+        content as string,
+        'inline',
+        selection as string | undefined,
+        parentCommentId as string | undefined,
+        suggestedText as string | undefined,
+      )) as { data?: { id?: string } };
+      const data = result?.data ?? {};
+      return { commentId: data.id, pageId };
+    },
   },
 
   listComments: {
@@ -857,6 +1278,8 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('default only active threads; true — include resolved'),
     }),
+    execute: (client, { pageId, includeResolved }) =>
+      client.listComments(pageId as string, includeResolved as boolean | undefined),
   },
 
   resolveComment: {
@@ -890,6 +1313,13 @@ export const SHARED_TOOL_SPECS = {
           'true (default) marks the thread resolved/closed; false reopens it',
         ),
     }),
+    // MCP wraps the raw resolve response; in-app projects `{ commentId, resolved }`.
+    execute: (client, { commentId, resolved }) =>
+      client.resolveComment(commentId as string, resolved as boolean),
+    inAppExecute: async (client, { commentId, resolved }) => {
+      await client.resolveComment(commentId as string, resolved as boolean);
+      return { commentId, resolved };
+    },
   },
 
   checkNewComments: {
@@ -925,6 +1355,30 @@ export const SHARED_TOOL_SPECS = {
             'Only pages under this parent will be checked.',
         ),
     }),
+    // The in-app host has NO `since` guard (the canonical execute, raw). The MCP
+    // host additionally rejects an unparseable `since` up front — otherwise the
+    // NaN comparison silently treats every comment as "not new" and returns zero
+    // without signalling the bad input. This guard is a DELIBERATE per-layer
+    // difference (the in-app surface never had it), preserved via mcpExecute.
+    execute: (client, { spaceId, since, parentPageId }) =>
+      client.checkNewComments(
+        spaceId as string,
+        since as string,
+        parentPageId as string | undefined,
+      ),
+    mcpExecute: async (client, { spaceId, since, parentPageId }) => {
+      if (Number.isNaN(Date.parse(since as string))) {
+        throw new Error(
+          `Invalid 'since' timestamp: ${JSON.stringify(since)} — expected an ISO 8601 date (e.g. '2026-03-10T00:00:00Z')`,
+        );
+      }
+      const result = await client.checkNewComments(
+        spaceId as string,
+        since as string,
+        parentPageId as string | undefined,
+      );
+      return mcpJson(result);
+    },
   },
 
   // --- table tools (unified from the per-layer inline definitions, #294) ---
@@ -971,6 +1425,13 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('0-based insert position (0 inserts before the header); omit to append.'),
     }),
+    execute: (client, { pageId, table, cells, index }) =>
+      client.tableInsertRow(
+        pageId as string,
+        table as string,
+        cells as string[],
+        index as number | undefined,
+      ),
   },
 
   tableDeleteRow: {
@@ -992,6 +1453,8 @@ export const SHARED_TOOL_SPECS = {
         .describe('"#<index>" from the page outline, or a block id in the table.'),
       index: z.number().int().describe('0-based row index to delete.'),
     }),
+    execute: (client, { pageId, table, index }) =>
+      client.tableDeleteRow(pageId as string, table as string, index as number),
   },
 
   tableUpdateCell: {
@@ -1015,6 +1478,14 @@ export const SHARED_TOOL_SPECS = {
       col: z.number().int().describe('0-based column index.'),
       text: z.string().describe('The new cell text.'),
     }),
+    execute: (client, { pageId, table, row, col, text }) =>
+      client.tableUpdateCell(
+        pageId as string,
+        table as string,
+        row as number,
+        col as number,
+        text as string,
+      ),
   },
 
   // --- footnote + image write tools (promoted from inline MCP-only, #410) ---
@@ -1059,6 +1530,8 @@ export const SHARED_TOOL_SPECS = {
         .min(1)
         .describe('The footnote content as markdown (becomes the definition).'),
     }),
+    execute: (client, { pageId, anchorText, text }) =>
+      client.insertFootnote(pageId as string, anchorText as string, text as string),
   },
 
   insertImage: {
@@ -1096,6 +1569,13 @@ export const SHARED_TOOL_SPECS = {
           'Insert the image right after the first top-level block whose text contains this string',
         ),
     }),
+    execute: (client, { pageId, imageUrl, align, alt, replaceText, afterText }) =>
+      client.insertImage(pageId as string, imageUrl as string, {
+        align: align as 'left' | 'center' | 'right' | undefined,
+        alt: alt as string | undefined,
+        replaceText: replaceText as string | undefined,
+        afterText: afterText as string | undefined,
+      }),
   },
 
   replaceImage: {
@@ -1127,6 +1607,11 @@ export const SHARED_TOOL_SPECS = {
       align: z.enum(['left', 'center', 'right']).optional(),
       alt: z.string().optional(),
     }),
+    execute: (client, { pageId, attachmentId, imageUrl, align, alt }) =>
+      client.replaceImage(pageId as string, attachmentId as string, imageUrl as string, {
+        align: align as 'left' | 'center' | 'right' | undefined,
+        alt: alt as string | undefined,
+      }),
   },
 
   // --- draw.io diagrams (issue #423, stage 1) ---
@@ -1156,6 +1641,12 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('"xml" (default) for mxGraph XML, or "svg" for the raw .drawio.svg.'),
     }),
+    execute: (client, { pageId, node, format }) =>
+      client.drawioGet(
+        pageId as string,
+        node as string,
+        (format as 'xml' | 'svg' | undefined) ?? 'xml',
+      ),
   },
 
   drawioCreate: {
@@ -1202,6 +1693,18 @@ export const SHARED_TOOL_SPECS = {
         .describe('Anchor text fragment (for before/after).'),
       title: z.string().optional().describe('Optional diagram title.'),
     }),
+    // The flat schema fields are regrouped into the client's `where` object.
+    execute: (client, { pageId, xml, position, anchorNodeId, anchorText, title }) =>
+      client.drawioCreate(
+        pageId as string,
+        {
+          position: position as 'before' | 'after' | 'append',
+          anchorNodeId: anchorNodeId as string | undefined,
+          anchorText: anchorText as string | undefined,
+        },
+        xml as string,
+        title as string | undefined,
+      ),
   },
 
   drawioUpdate: {
@@ -1235,5 +1738,12 @@ export const SHARED_TOOL_SPECS = {
         .min(1)
         .describe('The meta.hash from the drawio_get this edit is based on.'),
     }),
+    execute: (client, { pageId, node, xml, baseHash }) =>
+      client.drawioUpdate(
+        pageId as string,
+        node as string,
+        xml as string,
+        baseHash as string,
+      ),
   },
 } satisfies Record<string, SharedToolSpec>;

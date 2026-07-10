@@ -292,6 +292,17 @@ export class AiChatToolsService {
         execute,
       });
 
+    // The in-app toolset. It starts with the tools kept INLINE here for a
+    // documented per-layer reason: an intentional behaviour/schema divergence from
+    // the standalone MCP surface (searchPages' hybrid RRF, updatePageContent's
+    // Markdown write, transformPage's guardrailed shorter schema), a
+    // snake_case/camelCase naming clash the shared registry forbids (getTable vs
+    // the MCP `table_get`), per-request state the registry loop cannot provide
+    // (getCurrentPage reads the resolved openedPage; searchPages closes over the
+    // per-request user/embedding deps), or a tool with no MCP twin
+    // (listSidebarPages/getComment/getPageHistory). Every SHARED tool is then added
+    // by the registry loop below (see it), so there is exactly one arg-mapping per
+    // shared tool and it can never drift from the MCP host again (#445).
     const tools: Record<string, Tool> = {
       // INTENTIONAL per-transport divergence (not in the shared registry): this
       // in-app search runs a semantic + keyword hybrid (RRF) with in-process
@@ -426,43 +437,7 @@ export class AiChatToolsService {
         execute: async () => resolveCurrentPageResult(openedPage),
       }),
 
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // The execute body keeps this layer's { title, markdown } projection.
-      getPage: sharedTool(sharedToolSpecs.getPage, async ({ pageId }) => {
-        // getPage(pageId) -> { data: filterPage(page, markdown), success }.
-        const result = await client.getPage(pageId);
-        const data = (result?.data ?? {}) as {
-          title?: string;
-          content?: string;
-        };
-        return {
-          title: data.title ?? '',
-          markdown: typeof data.content === 'string' ? data.content : '',
-        };
-      }),
-
       // --- WRITE tools (all reversible — history/trash; §6.5 / D3) ---
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      createPage: sharedTool(
-        sharedToolSpecs.createPage,
-        async ({ title, content, spaceId, parentPageId }) => {
-          // createPage(title, content, spaceId, parentPageId?) ->
-          // { data: filterPage(page, markdown), success }.
-          const result = await client.createPage(
-            title,
-            content ?? '',
-            spaceId,
-            parentPageId,
-          );
-          const data = (result?.data ?? {}) as {
-            id?: string;
-            slugId?: string;
-            title?: string;
-          };
-          return { id: data.id ?? data.slugId, title: data.title ?? title };
-        },
-      ),
 
       updatePageContent: tool({
         description:
@@ -486,121 +461,6 @@ export class AiChatToolsService {
         },
       }),
 
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      renamePage: sharedTool(
-        sharedToolSpecs.renamePage,
-        async ({ pageId, title }) => {
-          // renamePage(pageId, title) -> { success, pageId, title }.
-          await client.renamePage(pageId, title);
-          return { pageId, title };
-        },
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // The shared schema adds the optional `position` field this layer lacked
-      // before; the execute now forwards it (the client already accepted it).
-      movePage: sharedTool(
-        sharedToolSpecs.movePage,
-        async ({ pageId, parentPageId, position }) => {
-          // movePage(pageId, parentPageId, position?) -> raw move response.
-          await client.movePage(pageId, parentPageId ?? null, position);
-          return { pageId, parentPageId: parentPageId ?? null, moved: true };
-        },
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // GUARDRAIL (§14 H4) preserved: the shared schema exposes ONLY pageId, so
-      // permanentlyDelete/forceDelete are never part of the input and can never
-      // be forwarded — the agent physically cannot permanently delete a page.
-      deletePage: sharedTool(sharedToolSpecs.deletePage, async ({ pageId }) => {
-        // deletePage(pageId) hits POST /pages/delete with { pageId } only,
-        // which is the soft-delete (trash) path on the server.
-        await client.deletePage(pageId);
-        return { pageId, trashed: true };
-      }),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // This layer keeps only its own execute-side guards (require a selection
-      // for a top-level comment; reject suggestedText on a reply / without a
-      // selection) — the schema+description are shared.
-      createComment: sharedTool(
-        sharedToolSpecs.createComment,
-        async ({
-          pageId,
-          content,
-          selection,
-          parentCommentId,
-          suggestedText,
-        }) => {
-          // createComment(pageId, content, type, selection?, parentCommentId?,
-          // suggestedText?). Top-level comments are inline and must carry a
-          // selection to anchor on; replies inherit the parent's anchor (no
-          // selection). Throwing here surfaces a tool error to the model (Vercel
-          // `ai` SDK) so the agent retries with a better selection — do not
-          // catch/suppress it.
-          if (!parentCommentId && (!selection || !selection.trim())) {
-            throw new Error(
-              "createComment requires a 'selection' (exact text to anchor on) for a new top-level comment.",
-            );
-          }
-          if (suggestedText !== undefined) {
-            if (parentCommentId) {
-              throw new Error(
-                "createComment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
-              );
-            }
-            if (!selection || !selection.trim()) {
-              throw new Error(
-                "createComment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
-              );
-            }
-          }
-          const result = await client.createComment(
-            pageId,
-            content,
-            'inline',
-            selection,
-            parentCommentId,
-            suggestedText,
-          );
-          const data = (result?.data ?? {}) as { id?: string };
-          return { commentId: data.id, pageId };
-        },
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      resolveComment: sharedTool(
-        sharedToolSpecs.resolveComment,
-        async ({ commentId, resolved }) => {
-          // resolveComment(commentId, resolved) -> { success, commentId, resolved }.
-          await client.resolveComment(commentId, resolved);
-          return { commentId, resolved };
-        },
-      ),
-
-      // --- READ tools (added) ---
-
-      getWorkspace: sharedTool(
-        sharedToolSpecs.getWorkspace,
-        async () => await client.getWorkspace(),
-      ),
-
-      listSpaces: sharedTool(
-        sharedToolSpecs.listSpaces,
-        async () => await client.getSpaces(),
-      ),
-
-      // INTENTIONAL per-transport divergence (not shared): keeps the `tree:true`
-      // hierarchy mode but is worded for the in-app agent; the standalone MCP
-      // `list_pages` carries its own wording. Kept per-layer so each side tunes
-      // its own guidance.
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      listPages: sharedTool(
-        sharedToolSpecs.listPages,
-        async ({ spaceId, limit, tree }) =>
-          await client.listPages(spaceId, limit, tree),
-      ),
-
       listSidebarPages: tool({
         description:
           'List sidebar pages for a space. With no pageId, returns the ' +
@@ -618,31 +478,6 @@ export class AiChatToolsService {
         execute: async ({ spaceId, pageId }) =>
           await client.listSidebarPages(spaceId, pageId),
       }),
-
-      getOutline: sharedTool(
-        sharedToolSpecs.getOutline,
-        async ({ pageId }) => await client.getOutline(pageId),
-      ),
-
-      getPageJson: sharedTool(
-        sharedToolSpecs.getPageJson,
-        async ({ pageId }) => await client.getPageJson(pageId),
-      ),
-
-      getNode: sharedTool(
-        sharedToolSpecs.getNode,
-        async ({ pageId, nodeId }) => await client.getNode(pageId, nodeId),
-      ),
-
-      searchInPage: sharedTool(
-        sharedToolSpecs.searchInPage,
-        async ({ pageId, query, regex, caseSensitive, limit }) =>
-          await client.searchInPage(pageId, query, {
-            regex,
-            caseSensitive,
-            limit,
-          }),
-      ),
 
       // NOT shared (kept inline): the MCP tool name `table_get` is noun-first
       // while this key is `getTable` (verb-first), breaking the
@@ -666,13 +501,6 @@ export class AiChatToolsService {
           await client.getTable(pageId, table),
       }),
 
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      listComments: sharedTool(
-        sharedToolSpecs.listComments,
-        async ({ pageId, includeResolved }) =>
-          await client.listComments(pageId, includeResolved),
-      ),
-
       getComment: tool({
         description: 'Fetch a single comment by id (content as Markdown).',
         inputSchema: modelFriendlyInput({
@@ -680,24 +508,6 @@ export class AiChatToolsService {
         }),
         execute: async ({ commentId }) => await client.getComment(commentId),
       }),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      checkNewComments: sharedTool(
-        sharedToolSpecs.checkNewComments,
-        async ({ spaceId, since, parentPageId }) =>
-          await client.checkNewComments(spaceId, since, parentPageId),
-      ),
-
-      listShares: sharedTool(
-        sharedToolSpecs.listShares,
-        async () => await client.listShares(),
-      ),
-
-      listPageHistory: sharedTool(
-        sharedToolSpecs.listPageHistory,
-        async ({ pageId, cursor }) =>
-          await client.listPageHistory(pageId, cursor),
-      ),
 
       getPageHistory: tool({
         description:
@@ -710,202 +520,7 @@ export class AiChatToolsService {
           await client.getPageHistory(historyId),
       }),
 
-      diffPageVersions: sharedTool(
-        sharedToolSpecs.diffPageVersions,
-        async ({ pageId, from, to }) =>
-          await client.diffPageVersions(pageId, from, to),
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      exportPageMarkdown: sharedTool(
-        sharedToolSpecs.exportPageMarkdown,
-        async ({ pageId }) => {
-          const markdown = await client.exportPageMarkdown(pageId);
-          return { markdown };
-        },
-      ),
-
       // --- WRITE tools (added; reversible via page history/trash) ---
-
-      editPageText: sharedTool(
-        sharedToolSpecs.editPageText,
-        async ({ pageId, edits }) => await client.editPageText(pageId, edits),
-      ),
-
-      // Returns ONLY the short link object — never the document body — so a
-      // large page can be handed to an external consumer without bloating
-      // context.
-      stashPage: sharedTool(
-        sharedToolSpecs.stashPage,
-        async ({ pageId }) => await client.stashPage(pageId),
-      ),
-
-      // Schema + description from the shared registry (identical across both
-      // transports). The execute body keeps its OWN parseNodeArg normalization:
-      // the model sometimes serializes the node as a JSON string, and we parse it
-      // before the client's typeof-object guard rejects it (parity with the
-      // standalone MCP server, index.ts patch_node).
-      patchNode: sharedTool(
-        sharedToolSpecs.patchNode,
-        async ({ pageId, nodeId, node }) => {
-          const parsedNode = parseNodeArg(node);
-          return await client.patchNode(pageId, nodeId, parsedNode);
-        },
-      ),
-
-      // Shared registry schema + description; execute retains parseNodeArg on the
-      // incoming node (parity with the standalone MCP server, index.ts
-      // insert_node).
-      insertNode: sharedTool(
-        sharedToolSpecs.insertNode,
-        async ({ pageId, node, position, anchorNodeId, anchorText }) => {
-          const parsedNode = parseNodeArg(node);
-          return await client.insertNode(pageId, parsedNode, {
-            position,
-            anchorNodeId,
-            anchorText,
-          });
-        },
-      ),
-
-      deleteNode: sharedTool(
-        sharedToolSpecs.deleteNode,
-        async ({ pageId, nodeId }) => await client.deleteNode(pageId, nodeId),
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // The execute body keeps this layer's content normalization (parity with
-      // the standalone MCP server, index.ts update_page_json).
-      updatePageJson: sharedTool(
-        sharedToolSpecs.updatePageJson,
-        async ({ pageId, content, title }) => {
-          // undefined/null pass through as undefined (title-only / no-op); any
-          // string is JSON.parsed (so an empty string "" throws, matching the
-          // MCP server); an object is passed through unchanged.
-          let doc;
-          if (content === undefined || content === null) {
-            doc = undefined;
-          } else {
-            // String -> JSON.parse (throwing on invalid); object passes through.
-            doc = parseNodeArg(content, 'content was a string but not valid JSON');
-          }
-          return await client.updatePageJson(pageId, doc, title);
-        },
-      ),
-
-      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#410).
-      // Promoted from MCP-only so the in-app agent can attach a REAL footnote to
-      // already-written text instead of leaving a literal `^[...]` string.
-      insertFootnote: sharedTool(
-        sharedToolSpecs.insertFootnote,
-        async ({ pageId, anchorText, text }) =>
-          await client.insertFootnote(pageId, anchorText, text),
-      ),
-
-      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#410).
-      // The schema field is `imageUrl`; the client method takes it positionally.
-      insertImage: sharedTool(
-        sharedToolSpecs.insertImage,
-        async ({ pageId, imageUrl, align, alt, replaceText, afterText }) =>
-          await client.insertImage(pageId, imageUrl, {
-            align,
-            alt,
-            replaceText,
-            afterText,
-          }),
-      ),
-
-      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#410).
-      replaceImage: sharedTool(
-        sharedToolSpecs.replaceImage,
-        async ({ pageId, attachmentId, imageUrl, align, alt }) =>
-          await client.replaceImage(pageId, attachmentId, imageUrl, {
-            align,
-            alt,
-          }),
-      ),
-
-      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#423).
-      // meta.hash in the result is the baseHash drawioUpdate requires.
-      drawioGet: sharedTool(
-        sharedToolSpecs.drawioGet,
-        async ({ pageId, node, format }) =>
-          await client.drawioGet(pageId, node, format ?? 'xml'),
-      ),
-
-      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#423).
-      // The flat schema fields are regrouped into the client's `where` object.
-      drawioCreate: sharedTool(
-        sharedToolSpecs.drawioCreate,
-        async ({ pageId, xml, position, anchorNodeId, anchorText, title }) =>
-          await client.drawioCreate(
-            pageId,
-            { position, anchorNodeId, anchorText },
-            xml,
-            title,
-          ),
-      ),
-
-      // Schema + description live in @docmost/mcp's SHARED_TOOL_SPECS (#423).
-      // baseHash is the optimistic lock: mismatch => structured conflict error.
-      drawioUpdate: sharedTool(
-        sharedToolSpecs.drawioUpdate,
-        async ({ pageId, node, xml, baseHash }) =>
-          await client.drawioUpdate(pageId, node, xml, baseHash),
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // The table reference parameter was unified to `table` (was `tableRef`).
-      tableInsertRow: sharedTool(
-        sharedToolSpecs.tableInsertRow,
-        async ({ pageId, table, cells, index }) =>
-          await client.tableInsertRow(pageId, table, cells, index),
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      tableDeleteRow: sharedTool(
-        sharedToolSpecs.tableDeleteRow,
-        async ({ pageId, table, index }) =>
-          await client.tableDeleteRow(pageId, table, index),
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      tableUpdateCell: sharedTool(
-        sharedToolSpecs.tableUpdateCell,
-        async ({ pageId, table, row, col, text }) =>
-          await client.tableUpdateCell(pageId, table, row, col, text),
-      ),
-
-      copyPageContent: sharedTool(
-        sharedToolSpecs.copyPageContent,
-        async ({ sourcePageId, targetPageId }) =>
-          await client.copyPageContent(sourcePageId, targetPageId),
-      ),
-
-      importPageMarkdown: sharedTool(
-        sharedToolSpecs.importPageMarkdown,
-        async ({ pageId, markdown }) =>
-          await client.importPageMarkdown(pageId, markdown),
-      ),
-
-      // Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294).
-      // Both layers already carried the security-confirmation framing, so there
-      // was no real divergence to preserve — only wording drift.
-      sharePage: sharedTool(
-        sharedToolSpecs.sharePage,
-        async ({ pageId, searchIndexing }) =>
-          await client.sharePage(pageId, searchIndexing),
-      ),
-
-      unsharePage: sharedTool(
-        sharedToolSpecs.unsharePage,
-        async ({ pageId }) => await client.unsharePage(pageId),
-      ),
-
-      restorePageVersion: sharedTool(
-        sharedToolSpecs.restorePageVersion,
-        async ({ historyId }) => await client.restorePageVersion(historyId),
-      ),
 
       // INTENTIONAL per-transport divergence (not shared): deliberately omits the
       // `deleteComments` schema field (comment-deletion guardrail) and carries a
@@ -934,6 +549,29 @@ export class AiChatToolsService {
           await client.transformPage(pageId, transformJs, { dryRun }),
       }),
     };
+
+    // Add EVERY shared tool from the zod-agnostic registry in one loop (#445).
+    // The spec owns the canonical arg->client mapping; this host only decides
+    // WHICH mapping to run and returns its value directly (no envelope). For each
+    // spec:
+    //   - skip `mcpOnly` specs (they belong to the standalone MCP host only);
+    //   - use `inAppExecute` when the spec declares a DELIBERATE per-layer
+    //     difference (a projected result shape, a different guardrail message);
+    //   - otherwise use the canonical `execute` (raw client result, identical to
+    //     the MCP host's before it wraps it as JSON).
+    // The execute receives the AI-SDK-validated, type-erased input; the spec reads
+    // the same fields its buildShape declares. This is the SINGLE place the in-app
+    // arg mapping lives — it can no longer silently drift from the MCP host.
+    for (const spec of Object.values(sharedToolSpecs)) {
+      if (spec.mcpOnly) continue;
+      const run = spec.inAppExecute ?? spec.execute;
+      if (!run) continue; // defensive: a shared spec always carries one of them.
+      tools[spec.inAppKey] = sharedTool(
+        spec,
+        (async (args) =>
+          run(client, args as Record<string, unknown>)) as Tool['execute'],
+      );
+    }
 
     // Passive "new comments: N" signal (#417). PER-TURN state (forUser runs once
     // per turn), so the watermark starts now and only comments a human leaves
