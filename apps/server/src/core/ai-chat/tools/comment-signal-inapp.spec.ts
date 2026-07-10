@@ -7,6 +7,16 @@ import type {
   DocmostClientLike,
   CommentSignalTrackerLike,
 } from './docmost-client.loader';
+
+// Test-double type for the loopback client. `DocmostClientLike` is now DERIVED
+// from the real `DocmostClient` (issue #446), so its method RETURN types are the
+// concrete client shapes. These probe stubs deliberately return minimal shapes
+// (e.g. `getPageRaw` yielding only `{ title }`), so the doubles use the same
+// method NAMES but loose async returns; each is cast to `DocmostClientLike` at
+// the (return-erased) mock site, leaving production positional-call safety intact.
+type FakeDocmostClient = Partial<
+  Record<keyof DocmostClientLike, (...args: any[]) => Promise<any>>
+>;
 import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs';
 // The REAL shared tracker factory, imported from source (same cross-boundary
 // approach the tool-specs spec uses) so the in-app wiring is exercised against
@@ -268,7 +278,7 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
   // seeded at forUser time).
   const future = new Date(Date.now() + 3_600_000).toISOString();
 
-  function buildService(fakeClient: Partial<DocmostClientLike>) {
+  function buildService(fakeClient: FakeDocmostClient) {
     jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue({
       DocmostClient: function () {
         return fakeClient as DocmostClientLike;
@@ -317,7 +327,7 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('emits the signal (model-only) on a non-comment tool when a new comment exists', async () => {
-    const fakeClient: Partial<DocmostClientLike> = {
+    const fakeClient: FakeDocmostClient = {
       getPage: async () => ({
         data: { title: 'Иранские языки', content: 'body' },
         success: true,
@@ -342,7 +352,7 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
   });
 
   it('does NOT add the signal to the listComments tool itself (tautological)', async () => {
-    const fakeClient: Partial<DocmostClientLike> = {
+    const fakeClient: FakeDocmostClient = {
       listComments: async () => ({
         items: [{ createdAt: future }],
         resolvedThreadsHidden: 0,
@@ -356,7 +366,7 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
   });
 
   it('no new comments => tool output is byte-identical AND the model sees no signal', async () => {
-    const fakeClient: Partial<DocmostClientLike> = {
+    const fakeClient: FakeDocmostClient = {
       getPage: async () => ({
         data: { title: 'T', content: 'body' },
         success: true,
@@ -372,7 +382,7 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
   });
 
   it('injection-safety: a malicious page title cannot forge a second signal', async () => {
-    const fakeClient: Partial<DocmostClientLike> = {
+    const fakeClient: FakeDocmostClient = {
       getPage: async () => ({
         data: { title: 'body-title', content: 'body' },
         success: true,

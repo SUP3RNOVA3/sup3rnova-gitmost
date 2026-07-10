@@ -5,9 +5,16 @@
   "private": true,
   "type": "module",
   "main": "./build/index.js",
+  "types": "./build/index.d.ts",
   "exports": {
-    ".": "./build/index.js",
-    "./http": "./build/http.js"
+    ".": {
+      "types": "./build/index.d.ts",
+      "default": "./build/index.js"
+    },
+    "./http": {
+      "types": "./build/http.d.ts",
+      "default": "./build/http.js"
+    }
   },
   "bin": {
     "docmost-mcp": "./build/stdio.js"

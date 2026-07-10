@@ -27,6 +27,100 @@ import {
 } from './tool-tiers';
 
 /**
+ * Compile-time contract (issue #446): the in-app tool `execute` closures below
+ * call the loopback `DocmostClient` POSITIONALLY (e.g.
+ * `client.drawioGet(pageId, node, format ?? 'xml')`). Those closures receive an
+ * AI-SDK-erased (`any`) input, so a positional call inside them is NOT checked
+ * against the real signature — a parameter reorder/type-change in
+ * `packages/mcp/src/client.ts` would otherwise reach production as a runtime
+ * "wrong argument" tool failure with zero compile signal (the restored #294
+ * debt). This never-called function reproduces every positional call with
+ * correctly-typed placeholder arguments against the DERIVED `DocmostClientLike`
+ * (a `Pick` of the real `DocmostClient`), so any such reorder/rename becomes a
+ * SERVER COMPILE ERROR here. It emits nothing (types only) and is never invoked;
+ * keep each call in lockstep with the matching `execute` body below.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function __assertClientCallContract(client: DocmostClientLike): void {
+  // Placeholders standing in for the AI-SDK-erased execute inputs. Their types
+  // are deliberately concrete so the positional calls are checked end-to-end.
+  const s = '' as string;
+  const n = 0 as number;
+  const node: unknown = null;
+  const edits: Array<{ find: string; replace: string; replaceAll?: boolean }> =
+    [];
+  const cells: string[] = [];
+  const align = undefined as 'left' | 'center' | 'right' | undefined;
+
+  // --- read ---
+  void client.search(s, undefined, n);
+  void client.getPage(s);
+  void client.getPageRaw(s);
+  void client.getWorkspace();
+  void client.getSpaces();
+  void client.listPages(s, n, true);
+  void client.listSidebarPages(s, s);
+  void client.getOutline(s);
+  void client.getPageJson(s);
+  void client.getNode(s, s);
+  void client.searchInPage(s, s, {
+    regex: true,
+    caseSensitive: true,
+    limit: n,
+  });
+  void client.getTable(s, s);
+  void client.listComments(s, true);
+  void client.getComment(s);
+  void client.checkNewComments(s, s, s);
+  void client.listShares();
+  void client.listPageHistory(s, s);
+  void client.getPageHistory(s);
+  void client.diffPageVersions(s, s, s);
+  void client.exportPageMarkdown(s);
+  // --- write (page) ---
+  void client.createPage(s, s, s, s);
+  void client.updatePage(s, s, s);
+  void client.renamePage(s, s);
+  void client.movePage(s, s, s);
+  void client.deletePage(s);
+  void client.editPageText(s, edits);
+  void client.patchNode(s, s, node);
+  void client.insertNode(s, node, {
+    position: 'append',
+    anchorNodeId: s,
+    anchorText: s,
+  });
+  void client.deleteNode(s, s);
+  void client.updatePageJson(s, node, s);
+  void client.tableInsertRow(s, s, cells, n);
+  void client.tableDeleteRow(s, s, n);
+  void client.tableUpdateCell(s, s, n, n, s);
+  void client.copyPageContent(s, s);
+  void client.importPageMarkdown(s, s);
+  void client.sharePage(s, true);
+  void client.unsharePage(s);
+  void client.restorePageVersion(s);
+  void client.transformPage(s, s, { dryRun: true });
+  void client.stashPage(s);
+  // --- write (image / footnote), in-app since #410 ---
+  void client.insertFootnote(s, s, s);
+  void client.insertImage(s, s, {
+    align,
+    alt: s,
+    replaceText: s,
+    afterText: s,
+  });
+  void client.replaceImage(s, s, s, { align, alt: s });
+  // --- draw.io diagrams (#423) ---
+  void client.drawioGet(s, s, 'xml');
+  void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s);
+  void client.drawioUpdate(s, s, s, s);
+  // --- write (comment) ---
+  void client.createComment(s, s, 'inline', s, s, s);
+  void client.resolveComment(s, true);
+}
+
+/**
  * Per-user, per-request adapter that exposes Docmost READ operations to the
  * agent as AI SDK tools (STAGE A = read only).
  *
