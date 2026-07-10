@@ -5,6 +5,139 @@ repository. It has two layers: **how to run a task end-to-end** (the
 sections below), and **how the codebase is built** (the technical sections
 further down, formerly in `CLAUDE.md`).
 
+## ARCHITECTURAL INVARIANTS — NON-NEGOTIABLE
+
+THE TEN RULES BELOW ARE HARD CONSTRAINTS. Each one was paid for with a real
+production incident or a multi-PR bug chain in THIS repository (cited inline).
+They override convenience, deadlines and "it's just a small feature". A PR that
+violates any of them MUST be rejected in review regardless of how good the rest
+of it is. If a task genuinely seems to require breaking one — STOP and raise it
+with the owner; do not code around it.
+
+### 1. EVERY BUFFER, CACHE, HISTORY AND PAYLOAD HAS AN EXPLICIT SIZE BUDGET
+
+Nothing accumulates unboundedly. A row/item cap is NOT a byte cap. Anything
+replayed to a model, buffered in memory, persisted per step, or refetched by a
+poll must state its budget in bytes/tokens and enforce it. Rewriting a growing
+structure in full on every increment is FORBIDDEN — append or diff instead;
+O(n²) write/serialize patterns do not pass review.
+(Paid for by: full-row rewrite on every agent step — hundreds of MB of Postgres
+writes per 50-step run, with every tool output serialized twice; unbounded
+history replay killing long chats on the provider context window; 32 MB replay
+buffers per active run.)
+
+### 2. EVERYTHING LONG-RUNNING TERMINATES BY CONSTRUCTION
+
+Every run / row / session / lease / subscriber / queue entry must define AT
+DESIGN TIME: its owner; every terminal state; who writes the terminal state on
+EVERY path (success, error, abort, disconnect in each phase, process restart);
+retries for the terminal write; and a periodic sweeper that does not depend on
+a reboot. A best-effort terminal write with no retry and no sweep is FORBIDDEN.
+(Paid for by: assistant rows stuck 'streaming' forever; runs stuck 'running'
+409-locking their chat until a restart — the #183/#184 follow-up chain.)
+
+### 3. EVERY AWAIT IS CANCELLABLE AND DEADLINED; NEVER BLOCK THE EVENT LOOP
+
+Every async step inside a request or agent turn honors the turn's AbortSignal
+AND a wall-clock deadline — including in-app tools, lock queues and pagination
+loops, not just external calls. Synchronous CPU work beyond ~50 ms goes to a
+worker_thread. Promise.race DOES NOT cancel synchronous work — using it as a
+"timeout" for sync computation is forbidden (the timer only fires after the
+event loop is free again, i.e. after the damage is done).
+(Paid for by: in-app tools ignoring abortSignal and writing pages AFTER Stop;
+the synchronous ELK layout freezing every SSE stream in the process; the
+step-0 MCP handshake hang — #397.)
+
+### 4. ONE SOURCE OF TRUTH; EVERYTHING ELSE IS A REBUILDABLE CACHE
+
+Postgres is the authoritative state. Every in-memory structure (registries,
+caches, client stores) must be reconstructible from the DB and treated as
+lossy. The client renders SERVER-DECLARED state — "a run is active" is a server
+fact delivered as data, never inferred from side signals (204 vs 2xx, the
+flavor of a disconnect). A new feature must name the owner of each piece of
+state before implementation starts.
+(Paid for by: the strip/restore resume machinery, silently frozen UIs and
+ghost sends after unmount — the #381→#432→#456 chain.)
+
+### 5. STATE MACHINES ARE EXPLICIT — ONE-SHOT FLAGS ARE FORBIDDEN
+
+A complex lifecycle (chat thread, resume/reconnect, run) lives in a named-state
+automaton (reducer / enum) where every state has an owner and a rendered
+representation — including the failure states. Adding a boolean ref that one
+callback arms and another reads-and-clears is FORBIDDEN in the AI-chat client.
+New behavior = a new named state + explicit transitions, and the interruption
+matrix (disconnect in each phase × restart × stop × supersede) is enumerated at
+design time, not discovered one incident at a time.
+(Paid for by: 26 one-shot useRef flags in chat-thread.tsx and the drip of
+"one more missing transition" across #381→#386/#389→#432→#456.)
+
+### 6. NO NEW MODE FORKS; A FLAG IS FOR ROLLOUT, THEN IT DIES
+
+A behavior flag that forks a code path must ship with a written sunset
+condition; stacking a new flag onto the existing matrix without deleting or
+scheduling an old one is forbidden. While a temporary fork exists, BOTH sides
+must share identical lifecycle handling (abort semantics, error listeners,
+concurrency gates) — asymmetric forks are outlawed.
+(Paid for by: legacy vs autonomous divergence — the one-active-run gate and
+the socket 'error' listener each existing on only ONE side; 2^4 flag
+combinations each with different abort semantics.)
+
+### 7. NO HAND-SYNCED MIRRORS — CODEGEN OR A CI PARITY TEST, NOTHING LESS
+
+Two copies of the same knowledge (schema, tool registry, glyph map, probe
+body, hash/normalize algorithm, label list) require either generation from a
+single source or a CI test that FAILS on drift. A "mirror this change over
+there" comment is NOT a guard and does not pass review.
+(Paid for by: #293 — three drifting converter copies losing data; #447 —
+REGISTRY_STAMP covering only one of the mirrored files; ~10 still-unguarded
+mirrors across the MCP layer.)
+
+### 8. CACHES, HEADERS, BUFFERS AND FSM TRANSITIONS GET AN INTEGRATION TEST OF THE OBSERVABLE PROPERTY
+
+A unit test of a pure helper DOES NOT COUNT for these. Test the real header on
+the real HTTP response, the real cache hit under real token sources, the real
+transition under a really-killed socket. If the observable property cannot be
+tested, the design is wrong — fix the design, not the test.
+(Paid for by: #431→#439 — a cache keyed on a fresh-per-call JWT, so it NEVER
+hit and became prod incident #435 while its unit tests stayed green; and by
+the #352→#455 immutable-cache header silently overwritten by a framework
+default AFTER the unit-tested code ran.)
+
+### 9. CLIENT INPUT IS HOSTILE UNTIL VALIDATED — ALSO BEFORE PERSISTENCE
+
+Anything from the browser (message parts, ids, titles, selections, flags) is
+validated/sanitized BEFORE it is persisted into a row that will later be
+replayed into a prompt, a converter or another subsystem. A poisoned row must
+never be able to permanently brick a chat or a page on every subsequent read.
+(Paid for by: unvalidated UIMessage parts persisted verbatim — one bad row
+500s the chat on every later turn; #159 client-spoofed page titles; #388
+selection re-sanitized server-side for the same reason.)
+
+### 10. FAILURES ARE LOUD AND SPECIFIC; SILENT DEGRADATION IS FORBIDDEN
+
+Extends the error convention below: a fire-and-forget write is allowed ONLY
+with a metric or a greppable ERROR log; a degraded mode (dead cached MCP
+client, stopped poll, exhausted retries, evicted buffer) must be VISIBLE to
+the user or the operator. A feature that can quietly stop working — a frozen
+"streaming…" UI, a poll that silently gives up, a cache serving corpses — does
+not pass review.
+(Paid for by: the degraded poll's silent 10-minute death leaving a forever-
+"streaming" answer; dead MCP clients served from cache while every external
+tool call failed; #435 being caught in minutes ONLY because metrics — #403 —
+existed.)
+
+## Default skill for feature design
+
+For any feature-design request — the user hands over a raw feature idea, asks
+to design or think through a feature, or to draft an issue («спроектируй»,
+«продумай фичу», «составь ишью», "design X", "write an issue for X") — invoke
+the `orchestrator-feature-designer` skill (Skill tool) BEFORE any other work.
+It is the default operating mode for design work in this repository: research
+→ design checklist (R1–R10) → forks resolved with the human → adversarial
+self-attack → filed PR-sized issues. Do not design features or write issues
+ad-hoc while this skill is available. This does not apply to non-design work
+(bug fixes, reviews, retrospectives, refactors already specified by an issue).
+
 ## Task lifecycle
 
 ### 1. Start: sync with develop
