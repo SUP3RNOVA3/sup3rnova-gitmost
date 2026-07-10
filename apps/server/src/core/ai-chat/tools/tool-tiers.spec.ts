@@ -27,10 +27,12 @@ import type { DocmostClientLike } from './docmost-client.loader';
  */
 
 describe('tool tier metadata (#332)', () => {
-  it('core set is the documented 13 + searchInPage + insertFootnote (15)', () => {
-    expect(CORE_TOOL_KEYS).toHaveLength(15);
+  it('core set is the documented 13 + searchInPage + insertFootnote + getTree + getPageContext (17, #443)', () => {
+    expect(CORE_TOOL_KEYS).toHaveLength(17);
     expect(CORE_TOOL_SET.has('searchInPage')).toBe(true); // #330, promoted to core
     expect(CORE_TOOL_SET.has('insertFootnote')).toBe(true); // #410, promoted to core
+    expect(CORE_TOOL_SET.has('getTree')).toBe(true); // #443, promoted to core
+    expect(CORE_TOOL_SET.has('getPageContext')).toBe(true); // #443, promoted to core
     // loadTools is a meta-tool, not a normal core key.
     expect(CORE_TOOL_SET.has(LOAD_TOOLS_NAME)).toBe(false);
   });

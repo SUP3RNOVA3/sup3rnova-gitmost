@@ -39,12 +39,14 @@ export interface ToolCatalogEntry {
 
 /**
  * CORE (always-active) in-app tool keys — 13 frequent/tiny tools + `searchInPage`
- * (#330) + `insertFootnote` (#410). `searchInPage` is core because it is frequent
- * for the editorial roles this feature targets; `insertFootnote` is core so the
- * footnote tool is NOT hidden while its natural sibling `editPageText` is always
- * active (that asymmetry is exactly what pushed the agent to write literal
- * `^[...]`). `loadTools` is active too but is not a normal tool key (it is added
- * to activeTools separately).
+ * (#330) + `insertFootnote` (#410) + `getTree`/`getPageContext` (#443).
+ * `searchInPage` is core because it is frequent for the editorial roles this
+ * feature targets; `insertFootnote` is core so the footnote tool is NOT hidden
+ * while its natural sibling `editPageText` is always active (that asymmetry is
+ * exactly what pushed the agent to write literal `^[...]`). `getTree` and
+ * `getPageContext` are the single-call navigation/lookup tools — core so the
+ * agent never has to loadTools just to orient itself. `loadTools` is active too
+ * but is not a normal tool key (it is added to activeTools separately).
  */
 export const CORE_TOOL_KEYS = [
   'searchPages',
@@ -66,6 +68,11 @@ export const CORE_TOOL_KEYS = [
   // #410 insertFootnote — core so pinpoint citations to already-written text
   // don't degrade into literal `^[...]`; kept symmetric with editPageText.
   'insertFootnote',
+  // #443 getTree + getPageContext — cheap single-call navigation/lookup tools
+  // (the core listPages even points to getTree); core so the agent never has
+  // to loadTools just to orient itself.
+  'getTree',
+  'getPageContext',
 ] as const;
 
 /** O(1) membership test for the core tier. */
