@@ -197,6 +197,157 @@ function readCollabTokenTtlMs(): number {
   return Number.isFinite(raw) ? Math.max(0, raw) : 5 * 60 * 1000;
 }
 
+// --- Issue #437: central error diagnostics -------------------------------
+// The agent only ever sees the thrown exception's `error.message`, so a failed
+// tool must return an ACTIONABLE message (method, path, status, and the
+// server's own validation text) instead of the opaque "Request failed with
+// status code 400". These helpers + the response interceptor in the
+// constructor are the single authoritative place that text is composed.
+
+// Overall cap on the composed diagnostic message so the model context stays
+// compact and a (whitelisted) server string can never blow up the text.
+const ERROR_MESSAGE_CAP = 300;
+// Only attempt to JSON.parse an arraybuffer body under this size: a larger
+// binary body is never a JSON error envelope, so parsing it just wastes memory
+// (fetchInternalFile uses responseType:"arraybuffer", so a failed file fetch
+// carries the JSON error envelope as raw bytes here).
+const ERROR_BUFFER_PARSE_CAP = 4096;
+
+// Canonical 36-char UUID (8-4-4-4-12 hex). Deliberately version/variant-
+// AGNOSTIC: the ids are UUIDv7 (e.g. 019f499a-9f8c-7d68-...), so only the
+// canonical shape/length is enforced, not the version/variant nibble.
+const FULL_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Throw an actionable error BEFORE any network call when `value` is not a full
+ * canonical UUID. Absorbs #436: a truncated/short comment id used to reach the
+ * server and bounce back as an opaque 400/404 the agent could not self-correct;
+ * failing fast here names the exact fix.
+ */
+export function assertFullUuid(
+  tool: string,
+  param: string,
+  value: string,
+): void {
+  if (typeof value !== "string" || !FULL_UUID_RE.test(value)) {
+    throw new Error(
+      `${tool}: '${param}' must be the FULL comment UUID (36 chars, e.g. ` +
+        `019f499a-9f8c-7d68-b7be-ce100d7c6c56), got '${value}'. Copy the id ` +
+        `verbatim from list_comments / create_comment output.`,
+    );
+  }
+}
+
+// Keep ONLY the pathname of a request (no host, no query string, no fragment)
+// so the message never leaks a host or query params. Resolves a relative
+// config.url against config.baseURL, then discards everything but the path.
+function requestPath(config: any): string {
+  const rawUrl = typeof config?.url === "string" ? config.url : "";
+  const base =
+    typeof config?.baseURL === "string" ? config.baseURL : undefined;
+  try {
+    // A dummy base makes an absolute config.url parse too; its host is dropped.
+    return new URL(rawUrl, base ?? "http://localhost").pathname;
+  } catch {
+    // Malformed url: still strip any query/fragment manually.
+    return rawUrl.split(/[?#]/)[0] || rawUrl;
+  }
+}
+
+/**
+ * Compose the server-facing message from `error.response.data`, using ONLY the
+ * whitelisted `message`/`error` fields or the HTTP statusText. SECURITY: the
+ * raw response body, headers (Authorization!) and config are NEVER read here —
+ * a string/HTML body (e.g. a proxy's 502 page) is deliberately dropped in
+ * favour of the statusText.
+ */
+function extractServerMessage(data: any, statusText: string): string {
+  // class-validator envelope: { message: string | string[], error?: string }.
+  if (
+    data &&
+    typeof data === "object" &&
+    !Buffer.isBuffer(data) &&
+    !(data instanceof ArrayBuffer)
+  ) {
+    const msg = (data as any).message;
+    if (Array.isArray(msg)) {
+      const joined = msg.filter((m) => typeof m === "string").join("; ");
+      if (joined) return joined;
+    } else if (typeof msg === "string" && msg) {
+      return msg;
+    }
+    const err = (data as any).error;
+    if (typeof err === "string" && err) return err;
+    return statusText;
+  }
+
+  // Buffer / ArrayBuffer body: attempt a size-capped, guarded JSON.parse so a
+  // failed arraybuffer fetch still surfaces the server's validation text.
+  if (Buffer.isBuffer(data) || data instanceof ArrayBuffer) {
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    if (buf.length > 0 && buf.length <= ERROR_BUFFER_PARSE_CAP) {
+      try {
+        return extractServerMessage(JSON.parse(buf.toString("utf8")), statusText);
+      } catch {
+        return statusText;
+      }
+    }
+    return statusText;
+  }
+
+  // A raw string / HTML body is never surfaced (may echo server internals).
+  return statusText;
+}
+
+/**
+ * Reformat an AxiosError's `.message` IN PLACE into an actionable diagnostic:
+ *   `<METHOD> <path> failed (<status> <statusText>): <serverMessage>`
+ * or, when the request never got a response:
+ *   `<METHOD> <path> failed: <code> (no response from server)`.
+ *
+ * Mutates the SAME error object (never a custom subclass) so the live
+ * axios.isAxiosError / error.response?.status / config._retry checks around the
+ * client keep working, and sets `_docmostFormatted` as a double-processing
+ * guard. A no-op on a non-axios or already-formatted error.
+ */
+export function formatDocmostAxiosError(error: any): void {
+  if (!error || error._docmostFormatted) return;
+  if (!axios.isAxiosError(error)) return;
+
+  const config: any = error.config ?? {};
+  const method =
+    typeof config.method === "string" ? config.method.toUpperCase() : "";
+  const methodPath = `${method} ${requestPath(config)}`.trim();
+  const response = error.response;
+
+  let message: string;
+  if (response) {
+    const statusText =
+      typeof response.statusText === "string" ? response.statusText : "";
+    const serverMessage = extractServerMessage(response.data, statusText);
+    message = `${methodPath} failed (${response.status} ${statusText}): ${serverMessage}`;
+    // Full body only to stderr under DEBUG (parity with downloadImage).
+    if (process.env.DEBUG) {
+      console.error(
+        "Docmost request failed; response body:",
+        JSON.stringify(response.data),
+      );
+    }
+  } else {
+    // No response at all (ECONNREFUSED / ETIMEDOUT / ECONNRESET / DNS / timeout).
+    const reason = error.code ?? error.message ?? "network error";
+    message = `${methodPath} failed: ${reason} (no response from server)`;
+  }
+
+  if (message.length > ERROR_MESSAGE_CAP) {
+    message = message.slice(0, ERROR_MESSAGE_CAP - 1) + "…";
+  }
+
+  error.message = message;
+  (error as any)._docmostFormatted = true;
+}
+
 export class DocmostClient {
   private client: AxiosInstance;
   private token: string | null = null;
@@ -334,6 +485,22 @@ export class DocmostClient {
           return this.client.request(config);
         }
 
+        return Promise.reject(error);
+      },
+    );
+
+    // Diagnostics interceptor (issue #437). Registered AFTER the re-login
+    // interceptor so a successful re-login retry (which resolves to a real
+    // response) is never seen here as an error; only a genuine failure reaches
+    // this rejection handler. It reformats error.message IN PLACE (see
+    // formatDocmostAxiosError — kept as a mutation, not a custom Error class, so
+    // the surrounding axios.isAxiosError / error.response?.status / config._retry
+    // checks keep working) and re-rejects the SAME error. The _docmostFormatted
+    // flag makes a re-processed retry-failure a no-op.
+    this.client.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        formatDocmostAxiosError(error);
         return Promise.reject(error);
       },
     );
@@ -2411,6 +2578,8 @@ export class DocmostClient {
   }
 
   async getComment(commentId: string) {
+    // Fail fast (#436): reject a truncated id before any network call.
+    assertFullUuid("get_comment", "commentId", commentId);
     await this.ensureAuthenticated();
     const response = await this.client.post("/comments/info", { commentId });
     const comment = response.data.data || response.data;
@@ -2500,6 +2669,12 @@ export class DocmostClient {
     parentCommentId?: string,
     suggestedText?: string,
   ) {
+    // Fail fast (#436): a provided parent id must be a full UUID before any
+    // network call. Validate only when truthy — a falsy parentCommentId means
+    // "top-level comment" (mirrors the isReply computation below), not a reply.
+    if (parentCommentId) {
+      assertFullUuid("create_comment", "parentCommentId", parentCommentId);
+    }
     await this.ensureAuthenticated();
 
     const isReply = !!parentCommentId;
@@ -2782,6 +2957,8 @@ export class DocmostClient {
   }
 
   async updateComment(commentId: string, content: string) {
+    // Fail fast (#436): reject a truncated id before any network call.
+    assertFullUuid("update_comment", "commentId", commentId);
     await this.ensureAuthenticated();
     // NON-canonicalizing on purpose (comment body — see createComment).
     const jsonContent = await markdownToProseMirror(content);
@@ -2797,6 +2974,8 @@ export class DocmostClient {
   }
 
   async deleteComment(commentId: string) {
+    // Fail fast (#436): reject a truncated id before any network call.
+    assertFullUuid("delete_comment", "commentId", commentId);
     await this.ensureAuthenticated();
     return this.client
       .post("/comments/delete", { commentId })
@@ -2809,6 +2988,8 @@ export class DocmostClient {
    * rejects resolving a reply. Hits POST /comments/resolve.
    */
   async resolveComment(commentId: string, resolved: boolean) {
+    // Fail fast (#436): reject a truncated id before any network call.
+    assertFullUuid("resolve_comment", "commentId", commentId);
     await this.ensureAuthenticated();
     const response = await this.client.post("/comments/resolve", {
       commentId,
