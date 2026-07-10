@@ -323,7 +323,9 @@ test("MCP_COLLAB_SESSION_IDLE_MS=0 disables the cache (legacy provider-per-op)",
 });
 
 test("replaceImage-shaped flow: acquire under an EXTERNAL page lock does not deadlock and reuses one session", async () => {
-  const pageId = "page-lock";
+  // withPageLock now asserts a canonical UUID key (#449); this flow takes the
+  // real page lock (mirroring replaceImage), so the key must be a valid UUID.
+  const pageId = "77777777-7777-4777-8777-777777777777";
   // Mirror replaceImage: hold ONE withPageLock across scan (read-only) + write,
   // each going through the non-locking acquireCollabSession.
   const result = await withPageLock(pageId, async () => {

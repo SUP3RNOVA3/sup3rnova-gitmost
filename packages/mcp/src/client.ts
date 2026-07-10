@@ -53,7 +53,7 @@ import {
   findUnrepresentableTableAttrs,
 } from "./lib/markdown-fragment.js";
 import { searchInDoc, SearchOptions } from "./lib/page-search.js";
-import { withPageLock } from "./lib/page-lock.js";
+import { withPageLock, isUuid } from "./lib/page-lock.js";
 import {
   prepareModel,
   decodeDrawioSvg,
@@ -175,17 +175,14 @@ export type DocmostMcpConfig = { apiUrl: string } & (
     ) => void;
   };
 
-// Canonical UUID shape (versions 1–8, matching the `uuid` package's `validate`
-// that the server's isValidUUID uses). page.repo.ts treats any non-UUID pageId
-// as a slugId, so the MCP detects a UUID locally and skips a /pages/info
-// round-trip in resolvePageId. A 10-char nanoid slugId never contains dashes,
-// so it can never be misread as a UUID here.
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-function isUuid(value: string): boolean {
-  return typeof value === "string" && UUID_RE.test(value);
-}
+// Canonical UUID predicate. Single source of truth lives in page-lock.ts (the
+// module that ASSERTS the mutex key is a UUID, issue #449) and is reused here so
+// resolvePageId's "already a UUID?" short-circuit and withPageLock's fail-fast
+// assert can never diverge. page.repo.ts treats any non-UUID pageId as a slugId,
+// so the MCP detects a UUID locally and skips a /pages/info round-trip in
+// resolvePageId. A 10-char nanoid slugId never contains dashes, so it can never
+// be misread as a UUID here.
+// (isUuid imported from ./lib/page-lock.js; see import block above.)
 
 /**
  * Collab-token cache TTL in milliseconds (issue #435). Read fresh from the
@@ -2185,14 +2182,23 @@ export class DocmostClient {
    * delegates; it exists as an overridable method so the insertFootnote wrapper
    * (transform abort-on-not-found + response shaping) can be unit-tested without
    * standing up a live Hocuspocus collab socket.
+   *
+   * SELF-RESOLVES the pageId to the canonical UUID (issue #449, "resolve-then-
+   * lock"): every write must lock and key its CollabSession by the UUID, never a
+   * raw slugId (#260). resolvePageId is cached/idempotent, so a caller that
+   * already resolved pays no extra round-trip; centralizing it here means a
+   * caller that reaches this seam with a raw slugId still locks correctly instead
+   * of silently splitting the mutex key. withPageLock also asserts the key is a
+   * UUID as a hard backstop.
    */
-  protected mutatePage(
+  protected async mutatePage(
     pageId: string,
     collabToken: string,
     apiUrl: string,
     transform: (doc: any) => any,
   ): Promise<{ doc?: any; verify?: any }> {
-    return mutatePageContent(pageId, collabToken, apiUrl, transform);
+    const pageUuid = await this.resolvePageId(pageId);
+    return mutatePageContent(pageUuid, collabToken, apiUrl, transform);
   }
 
   /**
@@ -2200,14 +2206,19 @@ export class DocmostClient {
    * just delegates; it exists as an overridable method so the full-doc write
    * tools (updatePageJson, copyPageContent) can have their footnote-
    * canonicalization binding unit-tested without a live Hocuspocus collab socket.
+   *
+   * SELF-RESOLVES the pageId to the canonical UUID (issue #449, "resolve-then-
+   * lock") for the same reason as mutatePage above — the lock/CollabSession key
+   * is guaranteed canonical here, not left to the caller's discipline.
    */
-  protected replacePage(
+  protected async replacePage(
     pageId: string,
     doc: any,
     collabToken: string,
     apiUrl: string,
   ): Promise<{ doc?: any; verify?: any }> {
-    return replacePageContent(pageId, doc, collabToken, apiUrl);
+    const pageUuid = await this.resolvePageId(pageId);
+    return replacePageContent(pageUuid, doc, collabToken, apiUrl);
   }
 
   /**

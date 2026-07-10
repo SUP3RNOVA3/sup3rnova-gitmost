@@ -440,9 +440,16 @@ export class CollabSession {
       // must stay synchronous (no await). While the JS event loop is not
       // yielded, no incoming remote update can interleave, so any already-synced
       // concurrent edits are preserved in liveDoc.
+      //
+      // INVARIANT 1 is machine-checked: the BEGIN/END markers below delimit the
+      // no-await window, and test/unit/no-await-critical-window.test.mjs scans
+      // this source and FAILS if any `await` (or `for await`/`yield`) appears
+      // between them. Do NOT add an await inside this block — an accidental
+      // async boundary here silently reopens the clobber-live-edits race (#152).
       let newDoc: any;
       let beforeDoc: any;
       try {
+        // === MUTATE-CRITICAL-WINDOW: BEGIN (no await between here and END #449) ===
         let liveDoc = TiptapTransformer.fromYdoc(this.ydoc, "default");
         if (
           !liveDoc ||
@@ -480,6 +487,7 @@ export class CollabSession {
         // ids of unchanged nodes, so an open editor's cursor is not yanked to the
         // end of the document on every agent write.
         applyDocToFragment(this.ydoc, newDoc);
+        // === MUTATE-CRITICAL-WINDOW: END (#449) ===
       } catch (e) {
         // Includes errors thrown by transform (e.g. "afterText not found",
         // "text not found"): propagate them verbatim to the caller.

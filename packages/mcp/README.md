@@ -293,8 +293,28 @@ so capable clients steer the model automatically.
   the debounced REST snapshot), then **reads → transforms → writes synchronously** in one
   tick so no remote update can interleave, and **waits for persistence acknowledgement**
   before returning.
-- **Per-page write serialization.** A per-`pageId` async mutex ensures two MCP writes to
-  the same page never overlap; different pages never block each other.
+- **Per-page write serialization.** A per-`pageId` async mutex (keyed by the resolved
+  page **UUID**, never a slugId) ensures two MCP writes to the same page never overlap;
+  different pages never block each other. The lock helper fails fast if it is ever handed
+  a non-UUID key, so a write path that forgot to resolve the id can never silently lock
+  under a split key.
+
+  **Deploy requirement — single instance or sticky sessions.** This mutex is an
+  in-process `Map`, and the cached collab sessions and the `stash_page` blob store are
+  RAM-only and process-local. Behind a **multi-replica** load balancer **without sticky
+  sessions**, two replicas can each "hold" the lock for the same page at once and per-page
+  serialization is silently lost. Run the MCP/app as a **single instance**, or pin each
+  page's traffic to one replica (sticky sessions / consistent hashing on the page id).
+  There is deliberately no cross-process (e.g. Postgres advisory) lock yet — a conscious
+  documented constraint. See the `Dockerfile` comment and the `MCP collaboration write
+  path` block in `.env.example`.
+
+  **Rights-staleness window.** A cached collab session writes under the token captured at
+  connect time (and the collab-token cache reuses a token for its TTL), so a **revoked**
+  page access can lag by up to `MCP_COLLAB_SESSION_MAX_AGE_MS` (the hard session lifetime,
+  default 10 min) before the next re-auth picks it up. Lower it to shorten the lag at the
+  cost of more reconnects. This bounded window is an accepted trade-off; there is no
+  push-based cache invalidation on a rights change.
 - **Transparent re-authentication.** Login uses email/password; expired tokens are
   refreshed automatically on the first 401/403 (covering JSON, multipart upload, and the
   collaboration-token path), with in-flight login de-duplication so a burst of calls
