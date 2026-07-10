@@ -9,6 +9,7 @@ import {
   __sessionCountForTests,
 } from "../../build/lib/collab-session.js";
 import { withPageLock } from "../../build/lib/page-lock.js";
+import { DocmostClient } from "../../build/client.js";
 
 // A stand-in for HocuspocusProvider: it shares the ydoc (so the real yjs
 // read/transform/write in CollabSession.mutate runs unchanged), auto-completes
@@ -89,6 +90,7 @@ const ENV_KEYS = [
   "MCP_COLLAB_SESSION_IDLE_MS",
   "MCP_COLLAB_SESSION_MAX_AGE_MS",
   "MCP_COLLAB_SESSION_MAX_ENTRIES",
+  "MCP_COLLAB_TOKEN_TTL_MS",
 ];
 let savedEnv;
 
@@ -343,6 +345,86 @@ test("replaceImage-shaped flow: acquire under an EXTERNAL page lock does not dea
     1,
     "both passes under the held lock reuse ONE live session",
   );
+});
+
+// --- #439: the collab-token cache is what makes the session cache ACTUALLY hit ---
+//
+// WHY these two tests exist (the #435 incident): the session registry keys on
+// (wsUrl, pageId, token) for identity isolation, but BOTH production token
+// sources mint a FRESH JWT on every call (the in-app provider re-signs a JWT
+// whose iat/exp changes every second; the external MCP POSTs /auth/collab-token
+// per call). The fresh token per call made the session-registry key unstable,
+// so the prod hit-rate was 0% — connect storms, 25s timeouts, zombie sessions —
+// while every other test in this file stayed green because they pass a FIXED
+// "tok" string. The #439 fix is the per-client collab-token cache
+// (DocmostClient.getCollabTokenWithReauth + MCP_COLLAB_TOKEN_TTL_MS); these
+// tests drive the token through it with a source that returns a DIFFERENT
+// fresh JWT per mint, exactly like prod, so a regression in EITHER the token
+// cache or the registry keying turns them red.
+//
+// getCollabTokenWithReauth is TS-private, but the compiled JS exposes it; the
+// tests call it directly because that is exactly the per-op composition of the
+// production call sites (updatePage etc.: mint the token, then acquire).
+
+test("#439 token cache ON: fresh-JWT-per-mint source, two ops => ONE connect (session cache hits)", async () => {
+  process.env.MCP_COLLAB_TOKEN_TTL_MS = "300000"; // cache ON (explicit, not default-dependent)
+  let mints = 0;
+  const client = new DocmostClient({
+    apiUrl: "http://h/api",
+    getToken: async () => "user-jwt",
+    // Like both prod sources: a DIFFERENT fresh JWT on every mint.
+    getCollabToken: async () => `fresh-jwt-${++mints}`,
+  });
+
+  // Op 1: mint the collab token through the client, then acquire + mutate.
+  const tok1 = await client.getCollabTokenWithReauth();
+  const s1 = await acquireCollabSession("page-1", tok1, "http://h/api");
+  await s1.mutate(() => docWith("one"));
+
+  // Op 2: the same identity mints again — the cache must serve the SAME token.
+  const tok2 = await client.getCollabTokenWithReauth();
+  const s2 = await acquireCollabSession("page-1", tok2, "http://h/api");
+  await s2.mutate(() => docWith("two"));
+
+  assert.equal(mints, 1, "the second op is served from the token cache");
+  assert.equal(tok2, tok1, "stable token => stable session-registry key");
+  assert.equal(s2, s1, "the live session is reused");
+  assert.equal(
+    FakeProvider.connectCount,
+    1,
+    "two mutations over one identity must cost exactly ONE real connect",
+  );
+  assert.equal(__sessionCountForTests(), 1);
+});
+
+test("#439 negative control: token cache OFF (TTL=0) reproduces the #435 churn — two ops => TWO connects", async () => {
+  process.env.MCP_COLLAB_TOKEN_TTL_MS = "0"; // explicit 0 disables the cache (fetch-per-call legacy)
+  let mints = 0;
+  const client = new DocmostClient({
+    apiUrl: "http://h/api",
+    getToken: async () => "user-jwt",
+    getCollabToken: async () => `fresh-jwt-${++mints}`,
+  });
+
+  const tok1 = await client.getCollabTokenWithReauth();
+  const s1 = await acquireCollabSession("page-1", tok1, "http://h/api");
+  await s1.mutate(() => docWith("one"));
+
+  const tok2 = await client.getCollabTokenWithReauth();
+  const s2 = await acquireCollabSession("page-1", tok2, "http://h/api");
+  await s2.mutate(() => docWith("two"));
+
+  assert.equal(mints, 2, "without the cache every op mints its own token");
+  assert.notEqual(tok2, tok1, "unstable token => unstable session-registry key");
+  assert.notEqual(s2, s1, "no session reuse");
+  assert.equal(
+    FakeProvider.connectCount,
+    2,
+    "a full reconnect per op — the #435 storm in miniature",
+  );
+  // The first session lingers under its now-unreachable key until its idle
+  // TTL — the zombie-session symptom of the incident.
+  assert.equal(__sessionCountForTests(), 2);
 });
 
 test("destroyAllSessions tears down every cached session", async () => {

@@ -121,13 +121,20 @@ export default function AiMcpServerForm({
   async function handleSubmit(values: FormValues) {
     const headers = resolveHeaders();
 
+    // An empty tag field means "no restriction" and must be sent as null —
+    // since #476 the server persists a literal `[]` as deny-all (zero tools),
+    // so an empty array from this form would silently disable every tool of
+    // the server. Deny-all remains expressible via the API, not via this form.
+    const toolAllowlist =
+      values.toolAllowlist.length === 0 ? null : values.toolAllowlist;
+
     if (isEdit && server) {
       const payload: IAiMcpServerUpdate = {
         id: server.id,
         name: values.name,
         transport: values.transport,
         url: values.url,
-        toolAllowlist: values.toolAllowlist,
+        toolAllowlist,
         // Always sent: a blank value clears the stored guidance (server -> null).
         instructions: values.instructions,
         enabled: values.enabled,
@@ -140,7 +147,7 @@ export default function AiMcpServerForm({
         name: values.name,
         transport: values.transport,
         url: values.url,
-        toolAllowlist: values.toolAllowlist,
+        toolAllowlist,
         // Blank => server stores null (no guidance).
         instructions: values.instructions,
         enabled: values.enabled,
