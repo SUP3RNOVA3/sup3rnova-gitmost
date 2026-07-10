@@ -17,7 +17,7 @@ import {
   resolveCurrentPageResult,
   type SelectionContext,
 } from './current-page.util';
-import { parseNodeArg } from './parse-node-arg';
+import { parseNodeArg } from '@docmost/prosemirror-markdown';
 import { modelFriendlyInput } from './model-friendly-input';
 import { SandboxStore } from '../../../integrations/sandbox/sandbox.store';
 import {

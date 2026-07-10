@@ -5,7 +5,7 @@ import { canonicalizeFootnotes } from "../../build/lib/footnote-canonicalize.js"
 import {
   footnoteContentKey,
   generateFootnoteId,
-} from "../../build/lib/footnote-authoring.js";
+} from "@docmost/prosemirror-markdown";
 import { insertInlineFootnote } from "../../build/lib/transforms.js";
 import { markdownToProseMirrorCanonical } from "../../build/lib/collaboration.js";
 

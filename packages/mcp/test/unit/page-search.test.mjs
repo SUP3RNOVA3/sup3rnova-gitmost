@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { searchInDoc } from "../../build/lib/page-search.js";
-import { getNodeByRef } from "../../build/lib/node-ops.js";
+import { getNodeByRef } from "@docmost/prosemirror-markdown";
 
 // ---------------------------------------------------------------------------
 // Document builders. Mirror the Docmost ProseMirror shape: paragraphs/headings

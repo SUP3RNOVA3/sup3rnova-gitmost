@@ -4,7 +4,7 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { DocmostClient, DocmostMcpConfig } from "./client.js";
-import { parseNodeArg } from "./lib/parse-node-arg.js";
+import { parseNodeArg } from "@docmost/prosemirror-markdown";
 import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
 
 // Re-export the client and its config type so embedding hosts (e.g. the gitmost

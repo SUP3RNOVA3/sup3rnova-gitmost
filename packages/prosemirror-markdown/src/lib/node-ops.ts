@@ -14,6 +14,8 @@
  * `content`, non-object nodes, and absent `attrs` are tolerated.
  */
 
+import { stripInlineMarkdown } from "./text-normalize.js";
+
 /** Deep-clone a JSON-serializable value without mutating the original. */
 function clone<T>(value: T): T {
   if (typeof structuredClone === "function") {
@@ -97,12 +99,15 @@ export function buildOutline(doc: any): OutlineEntry[] {
     const entry: OutlineEntry = {
       index: i,
       type,
-      id: isObject(block) && isObject(block.attrs) ? block.attrs.id ?? null : null,
+      id:
+        isObject(block) && isObject(block.attrs)
+          ? (block.attrs.id ?? null)
+          : null,
       firstText: truncate(blockPlainText(block), 100),
     };
 
     if (type === "heading") {
-      entry.level = isObject(block.attrs) ? block.attrs.level ?? null : null;
+      entry.level = isObject(block.attrs) ? (block.attrs.level ?? null) : null;
     } else if (type === "table") {
       const headerRow = block.content?.[0]?.content ?? [];
       entry.rows = block.content?.length ?? 0;
@@ -248,6 +253,33 @@ export function deleteNodeById(
 }
 
 /**
+ * Throw a clear, model-actionable error when a node-id write op did NOT match
+ * exactly one node (#159). `count === 0` -> "no node found"; `count > 1` ->
+ * "ambiguous, refused" — Docmost duplicates block ids on copy/paste, so a write
+ * by id could clobber/remove EVERY duplicate. The caller skips the write for any
+ * `count !== 1` (the transform returns null), so this only REPORTS; nothing was
+ * changed. No-op for the unambiguous single-match case.
+ */
+export function assertUnambiguousMatch(
+  op: "patch_node" | "delete_node",
+  verb: "replace" | "delete",
+  count: number,
+  nodeId: string,
+  pageId: string,
+): void {
+  if (count === 0) {
+    throw new Error(
+      `${op}: no node with id "${nodeId}" found on page ${pageId}`,
+    );
+  }
+  if (count > 1) {
+    throw new Error(
+      `${op}: id "${nodeId}" is ambiguous — ${count} nodes on page ${pageId} share it (block ids are duplicated on copy/paste). Refusing to ${verb} all of them; nothing was changed. Re-target with a more specific anchor.`,
+    );
+  }
+}
+
+/**
  * Deep-clone `doc` and strip every node/mark attribute whose value is strictly
  * `undefined`, so the result is safe to hand to Yjs (which throws an opaque
  * "Unexpected content type" when asked to store an `undefined` attribute value).
@@ -365,6 +397,31 @@ const REQUIRED_CONTAINER: Record<string, string> = {
 };
 
 /**
+ * Find the index of the first TOP-LEVEL block whose plain text includes the
+ * anchor, with a markdown-stripping FALLBACK. Returns -1 when none matches.
+ *
+ * Two passes preserve "exact wins globally":
+ *  - Pass 1: first block containing the verbatim `anchorText`.
+ *  - Pass 2 (only if pass 1 found nothing): first block containing the
+ *    markdown-stripped anchor, when stripping actually changed it.
+ */
+function findAnchorTextIndex(content: any[], anchorText: string): number {
+  if (!Array.isArray(content)) return -1;
+  // Pass 1: exact.
+  for (let i = 0; i < content.length; i++) {
+    if (blockPlainText(content[i]).includes(anchorText)) return i;
+  }
+  // Pass 2: markdown-stripped fallback.
+  const a = stripInlineMarkdown(anchorText);
+  if (a !== anchorText && a.length > 0) {
+    for (let i = 0; i < content.length; i++) {
+      if (blockPlainText(content[i]).includes(a)) return i;
+    }
+  }
+  return -1;
+}
+
+/**
  * Locate an anchor and return its ancestor chain (from `doc` down to and
  * including the matched node). Each chain entry is `{ node, index }` where
  * `index` is the node's position inside its parent's `content` array (the root
@@ -399,14 +456,14 @@ function findAnchorChain(
   }
 
   // By text: only top-level blocks are scanned (same rule as the JSON path).
+  // Exact match wins; a markdown-stripped fallback is tried only on a miss.
   if (opts.anchorText != null && Array.isArray(doc.content)) {
-    for (let i = 0; i < doc.content.length; i++) {
-      if (blockPlainText(doc.content[i]).includes(opts.anchorText)) {
-        return [
-          { node: doc, index: -1 },
-          { node: doc.content[i], index: i },
-        ];
-      }
+    const i = findAnchorTextIndex(doc.content, opts.anchorText);
+    if (i !== -1) {
+      return [
+        { node: doc, index: -1 },
+        { node: doc.content[i], index: i },
+      ];
     }
   }
 
@@ -540,13 +597,13 @@ export function insertNodeRelative(
     return { doc: out, inserted };
   }
 
-  // Resolve by text: only top-level doc.content blocks are scanned.
+  // Resolve by text: only top-level doc.content blocks are scanned. Exact
+  // match wins; a markdown-stripped fallback is tried only on a miss.
   if (opts.anchorText != null && isObject(out) && Array.isArray(out.content)) {
-    for (let i = 0; i < out.content.length; i++) {
-      if (blockPlainText(out.content[i]).includes(opts.anchorText)) {
-        out.content.splice(i + offset, 0, fresh);
-        return { doc: out, inserted: true };
-      }
+    const i = findAnchorTextIndex(out.content, opts.anchorText);
+    if (i !== -1) {
+      out.content.splice(i + offset, 0, fresh);
+      return { doc: out, inserted: true };
     }
   }
 
@@ -617,7 +674,8 @@ function locateTable(
   if (!isObject(rootClone)) return null;
 
   // "#<n>": index into the top-level content array; must be a table.
-  const indexMatch = typeof tableRef === "string" ? tableRef.match(/^#(\d+)$/) : null;
+  const indexMatch =
+    typeof tableRef === "string" ? tableRef.match(/^#(\d+)$/) : null;
   if (indexMatch) {
     const index = Number(indexMatch[1]);
     const block = Array.isArray(rootClone.content)
@@ -717,7 +775,7 @@ export function readTable(
         : undefined;
       const id =
         isObject(firstPara) && isObject(firstPara.attrs)
-          ? firstPara.attrs.id ?? null
+          ? (firstPara.attrs.id ?? null)
           : null;
       rowIds.push(id);
     }
@@ -751,14 +809,17 @@ export function insertTableRow(
   if (!Array.isArray(table.content)) table.content = [];
   const rows = table.content.length;
   const headerRow = table.content[0];
-  const headerCells = Array.isArray(headerRow?.content) ? headerRow.content : [];
+  const headerCells = Array.isArray(headerRow?.content)
+    ? headerRow.content
+    : [];
 
   // Column count is the WIDEST existing row, so the guard below stays
   // meaningful for ragged tables and the new row matches the table's width.
   // Fall back to the supplied cell count only when the table has no rows.
   let colCount = 0;
   for (const r of table.content) {
-    if (isObject(r) && Array.isArray(r.content)) colCount = Math.max(colCount, r.content.length);
+    if (isObject(r) && Array.isArray(r.content))
+      colCount = Math.max(colCount, r.content.length);
   }
   if (colCount === 0) colCount = Array.isArray(cells) ? cells.length : 0;
 
@@ -771,7 +832,10 @@ export function insertTableRow(
   // Resolve the landing index up front so the cell-type decision and the splice
   // below agree: a valid integer in [0, rows] splices there, else we append.
   const landingIndex =
-    typeof index === "number" && Number.isInteger(index) && index >= 0 && index <= rows
+    typeof index === "number" &&
+    Number.isInteger(index) &&
+    index >= 0 &&
+    index <= rows
       ? index
       : rows;
 
@@ -790,7 +854,8 @@ export function insertTableRow(
     // A row landing at index 0 becomes the new header row, so inherit the
     // current header cell's type per column (Docmost uses "tableHeader" there);
     // every other position is a plain data cell.
-    const cellType = landingIndex === 0 ? headerCells[i]?.type ?? "tableCell" : "tableCell";
+    const cellType =
+      landingIndex === 0 ? (headerCells[i]?.type ?? "tableCell") : "tableCell";
     newCells.push({
       type: cellType,
       attrs,
@@ -862,9 +927,10 @@ export function updateTableCell(
   const rowNodes = Array.isArray(table.content) ? table.content : [];
   const rows = rowNodes.length;
   const rowNode = rowNodes[row];
-  const cols = isObject(rowNode) && Array.isArray(rowNode.content)
-    ? rowNode.content.length
-    : 0;
+  const cols =
+    isObject(rowNode) && Array.isArray(rowNode.content)
+      ? rowNode.content.length
+      : 0;
 
   if (
     !Number.isInteger(row) ||
