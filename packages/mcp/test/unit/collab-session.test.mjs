@@ -168,7 +168,9 @@ test("an in-flight mutate rejects with the connection-closed text on disconnect"
   FakeProvider.last()._disconnect();
   await assert.rejects(
     p,
-    /Collaboration connection closed before the update was persisted\/synced/,
+    // Assert the #437 diagnostic hint tail too (pageId + transient/retry cue),
+    // so a refactor that drops hint() can't pass this vacuously.
+    /Collaboration connection closed before the update was persisted\/synced \(pageId page-1; transient/,
   );
 });
 
@@ -248,7 +250,11 @@ test("connect timeout rejects with the connect-timeout text and fires the metric
     },
   });
   mock.timers.tick(25000);
-  await assert.rejects(p, /Connection timeout to collaboration server/);
+  await assert.rejects(
+    p,
+    // Assert the #437 diagnostic hint tail too (pageId + transient/retry cue).
+    /Connection timeout to collaboration server \(pageId page-1; transient/,
+  );
   assert.equal(metricFired, 1);
   assert.equal(__sessionCountForTests(), 0);
 });

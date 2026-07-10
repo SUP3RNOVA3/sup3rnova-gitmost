@@ -203,14 +203,16 @@ test("a reply creates without selection or anchoring and is stored as type 'page
     "reply body",
     "inline",
     undefined,
-    "parent-123",
+    // #437: a parentCommentId must be a full canonical UUID.
+    "019f499a-9f8c-7d68-b7be-ce100d7c6c56",
   );
 
   assert.equal(result.success, true, "a reply must resolve successfully");
   assert.ok(createPayload, "/comments/create must have been called");
   assert.equal(
     createPayload.parentCommentId,
-    "parent-123",
+    // #437: a parentCommentId must be a full canonical UUID.
+    "019f499a-9f8c-7d68-b7be-ce100d7c6c56",
     "the reply payload must carry the parentCommentId",
   );
   assert.equal(
@@ -321,7 +323,9 @@ test("suggestedText on a reply is rejected", async () => {
         "body",
         "inline",
         undefined,
-        "parent-1",
+        // #437: use a valid full UUID so the reply+suggestion rejection fires
+        // (not the id-shape guard).
+        "019f499a-9f8c-7d68-b7be-ce100d7c6c56",
         "replacement",
       ),
     /reply/i,
