@@ -23,7 +23,7 @@ import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs
 // sync.
 const mockLoaded = (DocmostClient: loader.DocmostClientCtor) => ({
   DocmostClient,
-  sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+  sharedToolSpecs: SHARED_TOOL_SPECS as unknown as Record<string, loader.SharedToolSpec>,
   // Pure no-network draw.io helpers (#424). Type-correct stubs: these tests
   // never execute the drawio_shapes / drawio_guide tool bodies.
   searchShapes: (() => []) as unknown as loader.SearchShapesFn,
@@ -283,6 +283,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
   const patchNodeCalls: unknown[][] = [];
   const insertNodeCalls: unknown[][] = [];
   const updatePageJsonCalls: unknown[][] = [];
+  const updatePageCalls: unknown[][] = [];
 
   const fakeClient: FakeDocmostClient = {
     patchNode: (...args: unknown[]) => {
@@ -297,6 +298,11 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       updatePageJsonCalls.push(args);
       return Promise.resolve({ ok: true });
     },
+    // Backs the plain-Markdown full-body-replace tool updatePageMarkdown (#411).
+    updatePage: (...args: unknown[]) => {
+      updatePageCalls.push(args);
+      return Promise.resolve({ success: true });
+    },
   };
 
   const tokenServiceStub = {
@@ -310,6 +316,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     patchNodeCalls.length = 0;
     insertNodeCalls.length = 0;
     updatePageJsonCalls.length = 0;
+    updatePageCalls.length = 0;
     jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
       mockLoaded(function () {
         return fakeClient as DocmostClientLike;
@@ -444,6 +451,54 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       ),
     ).rejects.toThrow('content was a string but not valid JSON');
     expect(updatePageJsonCalls).toHaveLength(0);
+  });
+
+  // #411: the plain-Markdown full-body-replace tool is now the shared
+  // `updatePageMarkdown` (was inline `updatePageContent`). It forwards to
+  // client.updatePage(pageId, content, title) -> updatePageContentRealtime ->
+  // markdownToProseMirrorCanonical, so `^[...]` footnotes materialize.
+  it('updatePageMarkdown forwards { pageId, content, title } to client.updatePage', async () => {
+    const tools = await buildTools();
+    await tools.updatePageMarkdown.execute(
+      { pageId: 'p1', content: 'Body^[a note]', title: 'New title' } as never,
+      {} as never,
+    );
+    expect(updatePageCalls).toHaveLength(1);
+    expect(updatePageCalls[0]).toEqual(['p1', 'Body^[a note]', 'New title']);
+  });
+
+  it('updatePageMarkdown returns the RAW client result in-app (deliberate #411 shape change, documented on the spec)', async () => {
+    const tools = await buildTools();
+    // Registry canonical execute returns client.updatePage's result verbatim.
+    // The old inline tool projected to { pageId, updated }; the rename now
+    // surfaces the raw result (nothing reads the removed `.updated`; the raw
+    // shape carries footnote/verify warnings and matches the on-both-hosts
+    // registry convention). fakeClient.updatePage resolves { success: true }.
+    const result = await tools.updatePageMarkdown.execute(
+      { pageId: 'p1', content: '# Hi' } as never,
+      {} as never,
+    );
+    expect(result).toEqual({ success: true });
+  });
+
+  it('updatePageMarkdown forwards title=undefined when omitted', async () => {
+    const tools = await buildTools();
+    await tools.updatePageMarkdown.execute(
+      { pageId: 'p1', content: '# Hi' } as never,
+      {} as never,
+    );
+    expect(updatePageCalls[0]).toEqual(['p1', '# Hi', undefined]);
+  });
+
+  // #411 surface split: the plain-Markdown replace tool exists in-app under the
+  // new key; the OLD inline updatePageContent key is gone; importPageMarkdown is
+  // still present IN-APP (only the external MCP surface drops it — asserted in
+  // packages/mcp/test/unit/tool-inventory.test.mjs).
+  it('exposes updatePageMarkdown in-app, no legacy updatePageContent, keeps importPageMarkdown', async () => {
+    const tools = await buildTools();
+    expect(tools.updatePageMarkdown).toBeDefined();
+    expect((tools as Record<string, unknown>).updatePageContent).toBeUndefined();
+    expect(tools.importPageMarkdown).toBeDefined();
   });
 });
 

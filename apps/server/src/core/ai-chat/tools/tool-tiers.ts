@@ -124,12 +124,9 @@ export const INLINE_TOOL_TIERS: Record<
   // --- deferred inline ---
   // NOTE: createPage, renamePage, movePage, deletePage, updatePageJson and
   // exportPageMarkdown moved to @docmost/mcp's SHARED_TOOL_SPECS (#294); they
-  // carry their own deferred tier + catalogLine there.
-  updatePageContent: {
-    tier: 'deferred',
-    catalogLine:
-      "updatePageContent — replace a page's body (and optionally title) with new Markdown.",
-  },
+  // carry their own deferred tier + catalogLine there. updatePageContent moved
+  // there too as updatePageMarkdown (#411) — a shared registry spec now, so it
+  // is no longer an inline tier entry.
   listSidebarPages: {
     tier: 'deferred',
     catalogLine:

@@ -283,7 +283,7 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
       DocmostClient: function () {
         return fakeClient as DocmostClientLike;
       } as unknown as loader.DocmostClientCtor,
-      sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+      sharedToolSpecs: SHARED_TOOL_SPECS as unknown as Record<string, loader.SharedToolSpec>,
       // Wire the REAL factory so the in-app path is exercised end to end.
       createCommentSignalTracker:
         createCommentSignalTracker as unknown as loader.CommentSignalTrackerFactory,

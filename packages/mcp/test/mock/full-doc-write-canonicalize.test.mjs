@@ -3,7 +3,7 @@
 // footnote-canonical doc. These override the `replacePage` seam (symmetric to the
 // `mutatePage` seam used by the insert-footnote-wrapper test) to capture the
 // persisted doc WITHOUT a live Hocuspocus collab socket. Symmetric to the
-// server-side focus specs for createPage / updatePageContent('replace').
+// server-side focus specs for createPage / updatePage (markdown 'replace').
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DocmostClient } from "../../build/client.js";

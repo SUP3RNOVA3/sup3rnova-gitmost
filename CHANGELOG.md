@@ -10,6 +10,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **External MCP: `import_page_markdown` removed, `update_page_markdown` added.**
+  The external `/mcp` surface no longer exposes `import_page_markdown` (the
+  round-trip parser for a self-contained *exported* Docmost-Markdown file). In
+  its place it now exposes **`update_page_markdown`** — a plain-Markdown
+  full-body replace (`{pageId, content, title?}`) that pairs with
+  `update_page_json`, re-imports the whole body (block ids regenerate) and
+  parses Docmost-flavoured markdown including `^[...]` inline footnotes.
+  *Migration:* MCP clients that called `import_page_markdown` to overwrite a
+  page's body from Markdown should call `update_page_markdown` instead (pass the
+  markdown as `content`). Round-tripping an exported Docmost-Markdown file with
+  comment anchors/diagrams is no longer available on the external MCP surface;
+  export remains via `export_page_markdown`. The in-app AI agent is unaffected —
+  it keeps both `importPageMarkdown` and the renamed `updatePageMarkdown` (was
+  `updatePageContent`). The total MCP tool count is unchanged (−1 / +1). (#411)
+
 ### Added
 
 - **Place several images side by side in a row.** A new "Inline (side by

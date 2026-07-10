@@ -27,7 +27,8 @@ const SRC = join(HERE, "..", "..", "src");
 /**
  * Every tool name the MCP server registers, scraped from the SOURCE:
  *  - inline `server.registerTool("name", ...)` calls in index.ts;
- *  - shared specs in tool-specs.ts (`mcpName: 'name'`).
+ *  - shared specs in tool-specs.ts (`mcpName: 'name'`), EXCEPT `inAppOnly`
+ *    specs, which the registry loop in index.ts SKIPS on the MCP host (#411).
  * Same two registration mechanisms the old guard covered.
  */
 function registeredToolNames() {
@@ -37,8 +38,13 @@ function registeredToolNames() {
   for (const m of indexSrc.matchAll(/registerTool\(\s*"([a-z0-9_]+)"/g)) {
     names.add(m[1]);
   }
-  for (const m of specsSrc.matchAll(/mcpName:\s*['"]([a-z0-9_]+)['"]/g)) {
-    names.add(m[1]);
+  // Each spec is one `{ ... }` block; scrape its mcpName but skip a block that
+  // carries `inAppOnly: true` (not registered on the external MCP host).
+  for (const block of specsSrc.split(/\n\s{2}\w+:\s*\{/)) {
+    const nameMatch = block.match(/mcpName:\s*['"]([a-z0-9_]+)['"]/);
+    if (!nameMatch) continue;
+    if (/inAppOnly:\s*true/.test(block)) continue;
+    names.add(nameMatch[1]);
   }
   return names;
 }
@@ -73,6 +79,30 @@ test("the inventory has no phantom tool (every line is a real registered tool)",
     phantom,
     [],
     `<tool_inventory> lists tools that are NOT registered: ${phantom.join(", ")}`,
+  );
+});
+
+// #411: the external MCP surface gains update_page_markdown and LOSES
+// import_page_markdown (now inAppOnly). The in-app agent still keeps
+// importPageMarkdown — asserted in the server-side contract spec.
+test("update_page_markdown is on the MCP surface; import_page_markdown is NOT", () => {
+  const inventory = new Set(buildToolInventoryLines().map((l) => l.name));
+  assert.ok(
+    inventory.has("update_page_markdown"),
+    "update_page_markdown should be registered on the external MCP surface",
+  );
+  assert.ok(
+    !inventory.has("import_page_markdown"),
+    "import_page_markdown must be dropped from the external MCP surface (#411)",
+  );
+  // And the routing prose no longer points MCP clients at it.
+  assert.ok(
+    !ROUTING_PROSE.includes("import_page_markdown"),
+    "ROUTING_PROSE still mentions the removed import_page_markdown",
+  );
+  assert.ok(
+    ROUTING_PROSE.includes("update_page_markdown"),
+    "ROUTING_PROSE should mention update_page_markdown",
   );
 });
 
