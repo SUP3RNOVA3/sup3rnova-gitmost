@@ -99,6 +99,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `updatePageContent`). The total MCP tool count is unchanged (−1 / +1). The
   external names shown here are the post-#412 camelCase names. (#411)
 
+- **`getNode` now returns Markdown by default (was ProseMirror JSON).** The
+  block-level read/write tools default to Markdown so a block round trip is
+  `getNode` (markdown) → edit → `patchNode` (markdown). `getNode` now returns
+  `{ …, format: "markdown", markdown }` unless you pass `format: "json"` (which
+  restores the previous `{ …, node }` ProseMirror subtree); comment anchors —
+  including resolved ones — are preserved in the markdown so a write-back never
+  orphans a thread, and a node that cannot be a document top-level block
+  (`tableRow`/`tableCell`/`tableHeader` addressed via `#<index>`) auto-falls back
+  to JSON with `format: "json"` in the response. `patchNode`/`insertNode` gain a
+  `markdown` input alongside `node` (provide exactly one): the markdown fragment
+  may rewrite/insert several blocks at once and supports `^[...]` footnotes.
+  *Migration (external MCP clients only):* a client that consumed `getNode`'s
+  `node` field must now either read `markdown`, or pass `format: "json"` to keep
+  the old ProseMirror-JSON output. Released together with the `#411`/`#412`
+  breaking window so external configs break exactly once. (#413)
+
 ### Added
 
 - **Place several images side by side in a row.** A new "Inline (side by

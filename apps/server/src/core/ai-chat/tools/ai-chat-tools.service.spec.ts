@@ -355,23 +355,32 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     content: [{ type: 'text', text: 'Hello' }],
   };
 
-  it('patchNode parses a JSON-string node and forwards it as an object', async () => {
+  it('patchNode parses a JSON-string node and forwards it as { node } (object)', async () => {
     const tools = await buildTools();
     await tools.patchNode.execute(
       { pageId: 'p1', nodeId: 'n1', node: JSON.stringify(NODE_OBJ) } as never,
       {} as never,
     );
     expect(patchNodeCalls).toHaveLength(1);
-    expect(patchNodeCalls[0]).toEqual(['p1', 'n1', NODE_OBJ]);
+    // #413: the 3rd arg is now the XOR input { markdown?, node? }.
+    expect(patchNodeCalls[0]).toEqual([
+      'p1',
+      'n1',
+      { markdown: undefined, node: NODE_OBJ },
+    ]);
   });
 
-  it('patchNode passes an object node through unchanged', async () => {
+  it('patchNode passes an object node through unchanged inside { node }', async () => {
     const tools = await buildTools();
     await tools.patchNode.execute(
       { pageId: 'p1', nodeId: 'n1', node: NODE_OBJ } as never,
       {} as never,
     );
-    expect(patchNodeCalls[0]).toEqual(['p1', 'n1', NODE_OBJ]);
+    expect(patchNodeCalls[0]).toEqual([
+      'p1',
+      'n1',
+      { markdown: undefined, node: NODE_OBJ },
+    ]);
   });
 
   it('patchNode throws the documented message on invalid JSON string', async () => {
@@ -385,7 +394,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     expect(patchNodeCalls).toHaveLength(0);
   });
 
-  it('insertNode parses a JSON-string node and forwards it as an object', async () => {
+  it('insertNode parses a JSON-string node and forwards it inside { node }', async () => {
     const tools = await buildTools();
     await tools.insertNode.execute(
       {
@@ -396,9 +405,15 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       {} as never,
     );
     expect(insertNodeCalls).toHaveLength(1);
-    const [pageId, node] = insertNodeCalls[0];
+    // #413: the 2nd arg is the XOR input { markdown?, node? }, the 3rd is opts.
+    const [pageId, input, opts] = insertNodeCalls[0] as [
+      string,
+      { markdown?: unknown; node?: unknown },
+      { position?: string },
+    ];
     expect(pageId).toBe('p1');
-    expect(node).toEqual(NODE_OBJ);
+    expect(input).toEqual({ markdown: undefined, node: NODE_OBJ });
+    expect(opts.position).toBe('append');
   });
 
   it('insertNode throws the documented message on invalid JSON string', async () => {

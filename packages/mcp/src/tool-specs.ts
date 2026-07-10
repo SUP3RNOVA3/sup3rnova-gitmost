@@ -305,21 +305,40 @@ export const SHARED_TOOL_SPECS = {
     mcpName: 'getNode',
     inAppKey: 'getNode',
     description:
-      "Fetch a single node's full ProseMirror subtree (lossless) without " +
-      'pulling the whole document. `nodeId` is a block id from the page ' +
+      "Fetch a single block for editing. `nodeId` is a block id from the page " +
       'outline or page-JSON view (works for headings/paragraphs/callouts/images), OR ' +
       '`#<index>` to fetch a top-level block by its outline index — use the ' +
-      '`#<index>` form for tables/rows/cells, which carry no id.',
+      '`#<index>` form for tables/rows/cells, which carry no id. ' +
+      "`format` defaults to \"markdown\": the block is returned as a canonical " +
+      'markdown fragment (comment anchors are KEPT so a patchNode write-back does ' +
+      'not orphan a thread) — edit it and write it back with patchNode({markdown}). ' +
+      'Pass format:"json" for the raw lossless ProseMirror subtree (for precise ' +
+      'attr/mark work). A node that cannot be a document top-level block ' +
+      '(tableRow/tableCell/tableHeader via "#<index>") auto-falls back to JSON with ' +
+      'format:"json" in the response.',
     tier: 'core',
     catalogLine:
-      "getNode — fetch one block's ProseMirror subtree by block id or #index.",
+      "getNode — fetch one block (markdown by default; json for the raw subtree).",
     buildShape: (z) => ({
       pageId: z.string().min(1),
       nodeId: z.string().min(1),
+      format: z
+        .enum(['markdown', 'json'])
+        .optional()
+        .describe(
+          'Output format: "markdown" (default, for editing → patchNode) or ' +
+            '"json" (raw ProseMirror subtree). A non-top-level type auto-falls ' +
+            'back to json.',
+        ),
     }),
-    execute: (client, { pageId, nodeId }) =>
-      client.getNode(pageId as string, nodeId as string),
+    execute: (client, { pageId, nodeId, format }) =>
+      client.getNode(
+        pageId as string,
+        nodeId as string,
+        format as 'markdown' | 'json' | undefined,
+      ),
   },
+
 
   // --- in-page occurrence search (client-side, over ProseMirror plain text) ---
 
@@ -415,24 +434,30 @@ export const SHARED_TOOL_SPECS = {
     mcpName: 'patchNode',
     inAppKey: 'patchNode',
     description:
-      'Replace a single content block identified by its attrs.id with a new ' +
-      'ProseMirror node, WITHOUT resending the whole document; the replacement ' +
-      'keeps the same node id. Get the block id from the page outline (cheap) ' +
-      'or the page-JSON view, then ' +
-      'pass a ProseMirror node to put in its place. Example node: a paragraph ' +
-      '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
-      'heading {"type":"heading","attrs":{"level":2},"content":' +
+      'Replace a single content block identified by its attrs.id, WITHOUT ' +
+      'resending the whole document; the replacement keeps the same block id. ' +
+      'Get the block id from the page outline (cheap) or the page-JSON view. ' +
+      'Provide EXACTLY ONE of `markdown` or `node`. ' +
+      '`markdown` (RECOMMENDED for prose): a canonical markdown fragment — the ' +
+      'usual round trip is getNode (markdown) → edit the markdown → patchNode ' +
+      '(markdown). The fragment may be SEVERAL blocks (a "1 → N" splice: rewrite a ' +
+      'whole section in one call) — the first block inherits this block id, the ' +
+      'rest get fresh ids. `^[...]` footnotes are supported (their definitions ' +
+      "merge into the page's footnote list). REJECTED when the target is a table " +
+      'cell with attributes markdown cannot represent (merged/colored/fixed-width) ' +
+      '— use the table tools or `node`. ' +
+      '`node` (for precise attr/mark work): a raw ProseMirror node, e.g. a ' +
+      'paragraph {"type":"paragraph","content":[{"type":"text","text":"Hello"}]} ' +
+      'or a heading {"type":"heading","attrs":{"level":2},"content":' +
       '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
-      '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
-      'JSON object or a JSON string (both accepted). EVERY node, including ' +
-      'nested children, must carry a string `type` from the Docmost schema; ' +
-      'text leaves are {"type":"text","text":"..."} (a bare {"text":"..."} is ' +
-      'rejected up front). Cheaper and safer than ' +
-      'replacing the whole document for one-block structural edits. Reversible: ' +
+      '{"type":"text","text":"x","marks":[{"type":"bold"}]}. EVERY node, including ' +
+      'nested children, must carry a string `type` from the Docmost schema; text ' +
+      'leaves are {"type":"text","text":"..."} (a bare {"text":"..."} is rejected). ' +
+      'The node may be a JSON object or a JSON string (both accepted). Reversible: ' +
       'the previous version is kept in page history.',
     tier: 'deferred',
     catalogLine:
-      'patchNode — replace one block with a new ProseMirror node, keeping its id.',
+      'patchNode — rewrite one block from markdown (or a raw node), keeping its id.',
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('ID of the page containing the block'),
       nodeId: z
@@ -442,35 +467,53 @@ export const SHARED_TOOL_SPECS = {
           'attrs.id of the block to replace (from the page outline or ' +
             'page-JSON view)',
         ),
+      markdown: z
+        .string()
+        .optional()
+        .describe(
+          'RECOMMENDED. Canonical markdown to replace the block with; may be ' +
+            'several blocks (the first inherits the id, the rest get fresh ids). ' +
+            'Exactly one of markdown / node.',
+        ),
       node: z
         .any()
+        .optional()
         .describe(
-          'ProseMirror node to put in place of the node with this id, e.g. ' +
+          'For precise attr/mark work: a ProseMirror node to put in place of ' +
+            'the block, e.g. ' +
             '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
-            'JSON object or JSON string both accepted.',
+            'JSON object or JSON string both accepted. Exactly one of markdown / node.',
         ),
     }),
     // parseNodeArg normalizes a JSON-string node into an object (the model
     // sometimes serializes it as a string) before the client's typeof-object
-    // guard rejects it — identical on both hosts.
-    execute: (client, { pageId, nodeId, node }) =>
-      client.patchNode(pageId as string, nodeId as string, parseNodeArg(node)),
+    // guard rejects it — identical on both hosts. The XOR (markdown vs node) is
+    // enforced at runtime in the client (both schema-optional).
+    execute: (client, { pageId, nodeId, markdown, node }) =>
+      client.patchNode(pageId as string, nodeId as string, {
+        markdown: markdown as string | undefined,
+        node: node == null ? undefined : parseNodeArg(node),
+      }),
   },
+
 
   insertNode: {
     mcpName: 'insertNode',
     inAppKey: 'insertNode',
     description:
-      'Insert a block before/after another block (by attrs.id or anchor text) ' +
+      'Insert content before/after another block (by attrs.id or anchor text) ' +
       'or append it at the end (top level). For before/after you MUST provide ' +
       'EXACTLY ONE of anchorNodeId or anchorText. Get anchor block ids from the ' +
       'page outline or the page-JSON view. Avoids resending the whole document. ' +
-      'Can also insert ' +
-      'table structure: to add a tableRow, pass a tableRow node with position ' +
-      'before/after and anchor INSIDE the target table — anchorNodeId of any ' +
-      'block/cell in it, or anchorText matching the table; to add a ' +
-      'tableCell/tableHeader, use anchorNodeId of a block inside the target row ' +
-      '(anchorText only resolves top-level blocks, so it cannot target a row). ' +
+      'Provide EXACTLY ONE of `markdown` or `node`. ' +
+      '`markdown` (RECOMMENDED): a canonical markdown fragment — may be SEVERAL ' +
+      'blocks, inserted in order at the anchor; `^[...]` footnotes supported. ' +
+      '`node` (for precise attr/mark work OR table structure): a raw ProseMirror ' +
+      'node. Table structure is JSON-only (not expressible in markdown): to add a ' +
+      'tableRow, pass a tableRow node with position before/after and anchor INSIDE ' +
+      'the target table — anchorNodeId of any block/cell in it, or anchorText ' +
+      'matching the table; to add a tableCell/tableHeader, use anchorNodeId of a ' +
+      'block inside the target row (anchorText only resolves top-level blocks). ' +
       "`anchorText` is matched against the block's literal rendered plain text " +
       '(no markdown); markdown/emoji are tolerated as a fallback; prefer plain ' +
       'text or anchorNodeId. Note: append is top-level only and rejects ' +
@@ -485,15 +528,23 @@ export const SHARED_TOOL_SPECS = {
       'JSON object or a JSON string (both accepted). Reversible via page history.',
     tier: 'deferred',
     catalogLine:
-      'insertNode — insert a block before/after an anchor, or append at the end.',
+      'insertNode — insert markdown (or a raw node) before/after an anchor, or append.',
     buildShape: (z) => ({
       pageId: z.string().min(1),
+      markdown: z
+        .string()
+        .optional()
+        .describe(
+          'RECOMMENDED. Canonical markdown to insert; may be several blocks ' +
+            '(inserted in order). Exactly one of markdown / node.',
+        ),
       node: z
         .any()
+        .optional()
         .describe(
-          'ProseMirror node to insert, e.g. ' +
-            '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
-            'JSON object or JSON string both accepted.',
+          'For precise attr/mark work or table structure: a ProseMirror node, ' +
+            'e.g. {"type":"paragraph","content":[{"type":"text","text":"Hello"}]}. ' +
+            'JSON object or JSON string both accepted. Exactly one of markdown / node.',
         ),
       position: z
         .enum(['before', 'after', 'append'])
@@ -511,13 +562,26 @@ export const SHARED_TOOL_SPECS = {
             'are tolerated as a fallback; prefer plain text or anchorNodeId.',
         ),
     }),
-    execute: (client, { pageId, node, position, anchorNodeId, anchorText }) =>
-      client.insertNode(pageId as string, parseNodeArg(node), {
-        position: position as 'before' | 'after' | 'append',
-        anchorNodeId: anchorNodeId as string | undefined,
-        anchorText: anchorText as string | undefined,
-      }),
+    // The XOR (markdown vs node) is enforced at runtime in the client (both
+    // schema-optional). parseNodeArg only runs on the node path.
+    execute: (
+      client,
+      { pageId, markdown, node, position, anchorNodeId, anchorText },
+    ) =>
+      client.insertNode(
+        pageId as string,
+        {
+          markdown: markdown as string | undefined,
+          node: node == null ? undefined : parseNodeArg(node),
+        },
+        {
+          position: position as 'before' | 'after' | 'append',
+          anchorNodeId: anchorNodeId as string | undefined,
+          anchorText: anchorText as string | undefined,
+        },
+      ),
   },
+
 
   // --- share management ---
 

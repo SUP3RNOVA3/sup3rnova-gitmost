@@ -218,6 +218,54 @@ export function replaceNodeById(
 }
 
 /**
+ * Splice a SINGLE node whose `attrs.id === nodeId` with an ORDERED ARRAY of new
+ * nodes (a "1 -> N" replacement), anywhere in the tree. Used by the markdown
+ * patch path, where importing a markdown fragment can yield several blocks that
+ * must replace one existing block in place ("rewrite a section" in one call).
+ *
+ * Unlike `replaceNodeById` (which substitutes EVERY match), this walks to the
+ * FIRST match only and splices `newNodes` in its position, so ordering and the
+ * neighbouring blocks are preserved byte-for-byte. It deliberately does NOT
+ * touch further duplicates: the caller (#159 semantics) must have already
+ * verified the id is unambiguous via a `replaceNodeById` dry pass, so a single
+ * splice here is safe and every other block is untouched.
+ *
+ * Each entry of `newNodes` is deep-cloned so they never share references with
+ * each other or with the caller\'s array. Operates on a clone of `doc`; returns
+ * `{ doc, replaced }` where `replaced` is 1 when a match was spliced, else 0.
+ */
+export function replaceNodeByIdWithMany(
+  doc: any,
+  nodeId: string,
+  newNodes: any[],
+): { doc: any; replaced: number } {
+  const out = clone(doc);
+  const fresh = Array.isArray(newNodes) ? newNodes.map((n) => clone(n)) : [];
+  let replaced = 0;
+
+  // Walk to the FIRST match and splice the array in its place; stop afterwards.
+  const walkContent = (content: any[]): boolean => {
+    for (let i = 0; i < content.length; i++) {
+      const child = content[i];
+      if (matchesId(child, nodeId)) {
+        content.splice(i, 1, ...fresh);
+        replaced = 1;
+        return true;
+      }
+      if (isObject(child) && Array.isArray(child.content)) {
+        if (walkContent(child.content)) return true;
+      }
+    }
+    return false;
+  };
+
+  if (isObject(out) && Array.isArray(out.content)) {
+    walkContent(out.content);
+  }
+  return { doc: out, replaced };
+}
+
+/**
  * Remove EVERY node whose `attrs.id === nodeId` from its parent `content`
  * array, anywhere in the tree (recursive, including callouts and tables).
  *
@@ -718,6 +766,88 @@ export function insertNodeRelative(
     const i = findAnchorTextIndex(out.content, opts.anchorText);
     if (i !== -1) {
       out.content.splice(i + offset, 0, fresh);
+      return { doc: out, inserted: true };
+    }
+  }
+
+  return { doc: out, inserted: false };
+}
+
+/**
+ * Insert an ORDERED ARRAY of nodes relative to an anchor, preserving their
+ * order. This is the multi-node twin of `insertNodeRelative`, used by the
+ * markdown insert path where importing a markdown fragment can yield several
+ * blocks that must land, in order, at one anchor.
+ *
+ * Semantics mirror `insertNodeRelative` exactly:
+ *  - position "append": push every node onto the top-level `doc.content`.
+ *  - position "before"/"after": splice every node into the anchor\'s parent
+ *    `content` array immediately before / after it, keeping array order.
+ *
+ * The structural-table branch of `insertNodeRelative` is intentionally NOT
+ * duplicated here: a markdown fragment can never produce a bare tableRow/
+ * tableCell/tableHeader (those are not expressible in markdown), so the markdown
+ * insert path only ever hands whole top-level blocks. Structural inserts stay on
+ * the single-node JSON path. An empty `nodes` array is a no-op that still
+ * reports `inserted:false` (nothing to place).
+ *
+ * Operates on a clone of `doc`; returns `{ doc, inserted }`. `inserted` is false
+ * when the anchor could not be resolved (doc returned unchanged apart from the
+ * clone) or when `nodes` is empty.
+ */
+export function insertNodesRelative(
+  doc: any,
+  nodes: any[],
+  opts: InsertOptions,
+): { doc: any; inserted: boolean } {
+  const out = clone(doc);
+  const fresh = Array.isArray(nodes) ? nodes.map((n) => clone(n)) : [];
+
+  if (!isObject(opts) || fresh.length === 0) {
+    return { doc: out, inserted: false };
+  }
+
+  // "append": push every node at the top level, in order.
+  if (opts.position === "append") {
+    if (isObject(out)) {
+      if (!Array.isArray(out.content)) out.content = [];
+      out.content.push(...fresh);
+      return { doc: out, inserted: true };
+    }
+    return { doc: out, inserted: false };
+  }
+
+  const offset = opts.position === "after" ? 1 : 0;
+
+  // Resolve by id anywhere in the tree: splice the whole array into the parent.
+  if (opts.anchorNodeId != null) {
+    let inserted = false;
+    const walkContent = (content: any[]): void => {
+      for (let i = 0; i < content.length; i++) {
+        const child = content[i];
+        if (matchesId(child, opts.anchorNodeId as string)) {
+          content.splice(i + offset, 0, ...fresh);
+          inserted = true;
+          return;
+        }
+        if (isObject(child) && Array.isArray(child.content)) {
+          walkContent(child.content);
+          if (inserted) return;
+        }
+      }
+    };
+    if (isObject(out) && Array.isArray(out.content)) {
+      walkContent(out.content);
+    }
+    return { doc: out, inserted };
+  }
+
+  // Resolve by text: only top-level doc.content blocks are scanned. Exact match
+  // wins; a markdown-stripped fallback is tried only on a miss.
+  if (opts.anchorText != null && isObject(out) && Array.isArray(out.content)) {
+    const i = findAnchorTextIndex(out.content, opts.anchorText);
+    if (i !== -1) {
+      out.content.splice(i + offset, 0, ...fresh);
       return { doc: out, inserted: true };
     }
   }

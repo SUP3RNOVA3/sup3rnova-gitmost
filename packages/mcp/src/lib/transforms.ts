@@ -775,6 +775,37 @@ export function insertInlineFootnote(
 }
 
 /**
+ * Merge an ARRAY of footnote definitions (e.g. the definitions lifted from an
+ * imported markdown FRAGMENT) into `doc`\'s footnote list, then re-derive the
+ * canonical footnote topology — the SAME two-step machinery `insertInlineFootnote`
+ * uses (`appendDefinition` -> `normalizeAndMergeFootnotes` -> `canonicalizeFootnotes`).
+ *
+ * The fragment\'s `footnoteReference` nodes are assumed to ALREADY be spliced into
+ * `doc` (inside the just-inserted blocks) with ids matching these definitions, so
+ * after appending the definitions the canonicalizer orders/numbers everything by
+ * first-reference order, merges content-identical notes, and drops any orphan.
+ * Same documented caveat as every other write path: full canonicalization drops a
+ * definition no reference points at.
+ *
+ * A no-op returning `doc` unchanged when `definitions` is empty, so the
+ * non-footnote fast path stays untouched. When definitions exist the work runs
+ * through the pure passes (which clone), so the caller\'s `doc` is not mutated.
+ */
+export function mergeFootnoteDefinitions(doc: any, definitions: any[]): any {
+  if (!Array.isArray(definitions) || definitions.length === 0) return doc;
+  // Clone before appending: `appendDefinition` mutates in place, and the caller
+  // must not see a half-merged doc if a later pass throws.
+  let working = clone(doc);
+  for (const def of definitions) {
+    appendDefinition(working, def);
+  }
+  // #419: normalize + merge glyph-forked definitions before canonicalizing.
+  working = normalizeAndMergeFootnotes(working);
+  working = canonicalizeFootnotes(working);
+  return working;
+}
+
+/**
  * Append a definition node so the canonicalizer can order/place it: into the
  * first existing footnotesList, or a new trailing list when none exists.
  */
