@@ -33,6 +33,12 @@ interface MessageListProps {
    */
   showInput?: boolean;
   /**
+   * Forwarded to MessageItem -> ToolCallCard: whether a failed tool card renders
+   * its raw errorText. Defaults to true (internal chat). The public share passes
+   * false so internal detail in a tool error is never painted.
+   */
+  showErrors?: boolean;
+  /**
    * Forwarded to MessageItem: neutralize internal/relative markdown links in
    * the rendered answers (drop their href so they render as inert text).
    * Defaults to false (internal chat). The public share passes true so internal
@@ -127,6 +133,7 @@ export default function MessageList({
   emptyState,
   showCitations = true,
   showInput = true,
+  showErrors = true,
   neutralizeInternalLinks = false,
   assistantName,
 }: MessageListProps) {
@@ -217,6 +224,7 @@ export default function MessageList({
             signature={messageSignature(message)}
             showCitations={showCitations}
             showInput={showInput}
+            showErrors={showErrors}
             neutralizeInternalLinks={neutralizeInternalLinks}
             assistantName={assistantName}
             // Turn-level liveness, gated to the TAIL row: only the tail message

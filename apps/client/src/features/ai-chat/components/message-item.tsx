@@ -48,6 +48,13 @@ interface MessageItemProps {
    */
   showInput?: boolean;
   /**
+   * Forwarded to ToolCallCard: whether a failed tool card renders its raw
+   * errorText. Defaults to true (internal chat). The public share passes false so
+   * internal detail in a tool error is never painted (belt to the server-side
+   * byte sanitization).
+   */
+  showErrors?: boolean;
+  /**
    * Neutralize internal/relative markdown links in the rendered answer (drop
    * their href so they become inert text). Defaults to false (internal chat,
    * links stay clickable). The anonymous public share passes true so internal
@@ -125,6 +132,7 @@ function MessageItem({
   message,
   showCitations = true,
   showInput = true,
+  showErrors = true,
   neutralizeInternalLinks = false,
   assistantName,
   turnStreaming = false,
@@ -219,6 +227,7 @@ function MessageItem({
               part={part as unknown as ToolUiPart}
               showCitations={showCitations}
               showInput={showInput}
+              showErrors={showErrors}
             />
           );
         }
@@ -284,6 +293,7 @@ export function arePropsEqual(
     prev.signature === next.signature &&
     prev.showCitations === next.showCitations &&
     prev.showInput === next.showInput &&
+    prev.showErrors === next.showErrors &&
     prev.neutralizeInternalLinks === next.neutralizeInternalLinks &&
     prev.assistantName === next.assistantName &&
     // The turn-end flip re-renders every row once (cheap, terminal event) —
