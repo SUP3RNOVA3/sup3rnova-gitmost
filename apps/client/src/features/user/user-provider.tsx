@@ -13,6 +13,8 @@ import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import { Error404 } from "@/components/ui/error-404.tsx";
 import { queryClient } from "@/main.tsx";
 import { makeConnectHandler } from "@/features/user/connect-resync.ts";
+import { triggerGuardedReload } from "@/features/user/guarded-reload.tsx";
+import type { AppVersionSocketPayload } from "@/features/user/version-coherence.ts";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -45,6 +47,15 @@ export function UserProvider({ children }: React.PropsWithChildren) {
     newSocket.on("connect", () => {
       console.log("ws connected");
       handleConnect();
+    });
+
+    // Register the version-coherence listener SYNCHRONOUSLY, before the socket
+    // connects: the server emits `app-version` immediately in handleConnection,
+    // so a listener attached after connect would miss it on a fast localhost
+    // connect. On a version mismatch the client guard-reloads (banner on a
+    // visible tab, auto-reload on a hidden one) before it hits a stale chunk.
+    newSocket.on("app-version", (payload?: AppVersionSocketPayload) => {
+      triggerGuardedReload(payload?.version);
     });
 
     return () => {
