@@ -10,7 +10,7 @@
 // exactly mxGraph's convention for a child of a container, so they map across
 // directly. Container sizes are computed by ELK; leaf sizes are preserved.
 
-import ELK from "elkjs/lib/elk.bundled.js";
+import { Worker } from "node:worker_threads";
 import { JSDOM } from "jsdom";
 import { normalizeInput, parseCells, type DrawioCell } from "./drawio-xml.js";
 
@@ -18,22 +18,33 @@ import { normalizeInput, parseCells, type DrawioCell } from "./drawio-xml.js";
 const DEFAULT_W = 140;
 const DEFAULT_H = 60;
 
-// DoS bounds for the in-process ELK layout. The mxGraph XML is LLM-supplied
-// (layout:"elk" in drawioCreate/drawioUpdate) and elkjs runs synchronously on
-// the MCP server's event loop, so an unbounded graph would block it for
-// seconds-to-minutes. A ~1MB XML (well under the stage-1 16MB cap) can carry
-// thousands of nodes. We cap the graph size and race the layout against a
-// wall-clock timeout; on either bound we fall back to the ORIGINAL model, the
-// same best-effort contract the catch already honours.
+// DoS bounds for the ELK layout. The mxGraph XML is LLM-supplied (layout:"elk"
+// in drawioCreate/drawioUpdate). elkjs' layout() returns a Promise but runs the
+// crossing-minimisation SYNCHRONOUSLY — it blocks whatever thread it runs on for
+// the whole pass. A ~1MB XML (well under the stage-1 16MB cap) can carry
+// thousands of nodes. We (a) cap the graph size before ever calling ELK and
+// (b) run the layout in a WORKER THREAD so the main event loop stays free, with
+// the wall-clock timeout enforced by terminating that worker. On either bound we
+// fall back to the ORIGINAL model, the same best-effort contract the catch honours.
 //   - 500 nodes lays out in well under a second; beyond that ELK cost climbs
 //     steeply, so refuse and leave the (already-valid) model untouched.
 //   - Edges dominate the layered-crossing cost, so allow a bit more headroom
 //     (1000) than nodes but still bound them.
-//   - 5s is generous for any graph within the caps yet short enough that a
-//     pathological input can never wedge the server.
+//   - The timeout is a HARD kill of the worker thread — the only way to interrupt
+//     synchronous JS. The in-process setTimeout race we used before was an
+//     illusion: the timer could never fire while the SAME thread was blocked
+//     inside elkjs, so it "protected" nothing. Now the timer runs on the main
+//     thread while ELK runs on the worker, so it can actually fire and terminate.
 const ELK_MAX_NODES = 500;
 const ELK_MAX_EDGES = 1000;
-const ELK_TIMEOUT_MS = 5000;
+// Wall-clock ceiling for a single layout pass. Overridable for tests (a tiny
+// value forces the terminate-on-timeout path deterministically); a non-positive
+// or unparseable override falls back to the default.
+const ELK_TIMEOUT_DEFAULT_MS = 5000;
+function resolveElkTimeoutMs(): number {
+  const raw = Number(process.env.DRAWIO_ELK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : ELK_TIMEOUT_DEFAULT_MS;
+}
 
 // Spacing is set >=150px on purpose so an ELK layout never trips the linter's
 // "gap between adjacent shapes < 150px" quality warning (acceptance #3).
@@ -79,12 +90,56 @@ interface ElkGraph extends ElkNode {
 }
 
 /**
+ * Run one ELK layered layout on a worker thread and resolve with the laid-out
+ * graph. The timeout is enforced by `worker.terminate()` — a HARD kill, which is
+ * the only way to interrupt elkjs' synchronous crossing-minimisation once it has
+ * started. Rejects on timeout, worker error, or an early exit; the caller treats
+ * any rejection as "keep the original model" (best-effort layout).
+ */
+function layoutInWorker(graph: ElkGraph, timeoutMs: number): Promise<ElkGraph> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      new URL("./drawio-layout.worker.js", import.meta.url),
+      { workerData: { graph } },
+    );
+    let settled = false;
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      // Always tear the worker down: on the happy path so it does not linger,
+      // on timeout so the blocked synchronous ELK run is actually interrupted.
+      void worker.terminate();
+      fn();
+    };
+    const timer = setTimeout(
+      () => finish(() => reject(new Error("ELK layout timed out"))),
+      timeoutMs,
+    );
+    worker.once("message", (msg: { ok?: boolean; laid?: ElkGraph; error?: string }) => {
+      finish(() =>
+        msg?.ok
+          ? resolve(msg.laid as ElkGraph)
+          : reject(new Error(msg?.error ?? "ELK layout failed")),
+      );
+    });
+    worker.once("error", (err) => finish(() => reject(err)));
+    worker.once("exit", (code) => {
+      // A clean exit after we already settled is normal (terminate()); only an
+      // unexpected early exit while still pending is a failure.
+      if (settled) return;
+      finish(() => reject(new Error(`ELK worker exited early (code ${code})`)));
+    });
+  });
+}
+
+/**
  * Apply an ELK layered layout to a drawio input and return a full mxGraphModel
  * string with rewritten geometry. Accepts the same three input forms as
  * drawioCreate (a bare model, an <mxfile>, or a <mxCell> list). Async because
- * elkjs' layout() is promise-based. On any layout failure the ORIGINAL
- * (normalized) model is returned unchanged — layout is best-effort polish, never
- * a reason to fail the write.
+ * the layout runs on a worker thread. On any layout failure (including a
+ * terminate-on-timeout) the ORIGINAL (normalized) model is returned unchanged —
+ * layout is best-effort polish, never a reason to fail the write.
  */
 export async function applyElkLayout(inputXml: string): Promise<string> {
   const modelXml = normalizeInput(inputXml);
@@ -150,26 +205,14 @@ export async function applyElkLayout(inputXml: string): Promise<string> {
   };
 
   let laid: ElkGraph;
-  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    // elkjs ships a CJS default export whose interop shape varies across
-    // module systems; resolve the real constructor at runtime, then cast (the
-    // runtime call is verified — see the layout unit test).
-    const Ctor: any = (ELK as any).default ?? ELK;
-    const elk = new Ctor();
-    // Race the layout against a wall-clock timeout so a graph that is under the
-    // node/edge caps but still pathologically slow can never wedge the server.
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(
-        () => reject(new Error("ELK layout timed out")),
-        ELK_TIMEOUT_MS,
-      );
-    });
-    laid = (await Promise.race([elk.layout(graph as any), timeout])) as ElkGraph;
+    // Run the (synchronous-under-the-hood) ELK pass on a worker thread so the
+    // main event loop is never blocked, and enforce the wall-clock ceiling by
+    // terminating that worker on timeout. A graph under the node/edge caps but
+    // still pathologically slow is hard-killed instead of wedging anything.
+    laid = await layoutInWorker(graph, resolveElkTimeoutMs());
   } catch {
     return modelXml; // best-effort: keep the model as-is on timeout or ELK failure
-  } finally {
-    if (timer) clearTimeout(timer);
   }
 
   // Collect computed geometry per node id (coords are parent-relative already).
