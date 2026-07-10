@@ -1,6 +1,15 @@
 import { BadRequestException } from '@nestjs/common';
 import { CommentService } from './comment.service';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
+import { QueueJob } from '../../integrations/queue/constants';
+
+// #399: the inline comment-mark op (resolve flip / ephemeral-suggestion anchor
+// removal) is now enqueued as a COMMENT_MARK_UPDATE job instead of being awaited
+// against the collab gateway on the HTTP path. Find that job by action.
+const markJob = (generalQueue: any, action: string) =>
+  generalQueue.add.mock.calls.find(
+    (c: any[]) => c[0] === QueueJob.COMMENT_MARK_UPDATE && c[1]?.action === action,
+  );
 
 /**
  * Coverage for CommentService.dismissSuggestion (#329). Dismiss ("Не применять")
@@ -44,7 +53,14 @@ describe('CommentService — dismissSuggestion', () => {
       auditService,
     );
 
-    return { service, commentRepo, wsService, collaborationGateway, auditService };
+    return {
+      service,
+      commentRepo,
+      wsService,
+      collaborationGateway,
+      generalQueue,
+      auditService,
+    };
   }
 
   const suggestionComment = (over?: Partial<any>): any => ({
@@ -62,25 +78,30 @@ describe('CommentService — dismissSuggestion', () => {
   });
   const user = (over?: Partial<any>): any => ({ id: 'user-1', ...over });
 
-  it('no replies → hard-deletes, strips the anchor mark, does NOT touch page text, audits DISMISSED, outcome=deleted', async () => {
-    const { service, commentRepo, wsService, collaborationGateway, auditService } =
-      makeService(false);
+  it('no replies → hard-deletes, enqueues the anchor-mark removal, does NOT touch page text, audits DISMISSED, outcome=deleted', async () => {
+    const {
+      service,
+      commentRepo,
+      wsService,
+      collaborationGateway,
+      generalQueue,
+      auditService,
+    } = makeService(false);
 
     const result = await service.dismissSuggestion(suggestionComment(), user());
 
-    // Never applies the suggestion to the document.
-    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalledWith(
-      'applyCommentSuggestion',
-      expect.anything(),
-      expect.anything(),
-    );
-    // Hard-delete (atomic-conditional) + strip mark.
+    // Never applies the suggestion to the document (no sync gateway call at all
+    // now — the mark op is off the HTTP path, #399).
+    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalled();
+    // Hard-delete (atomic-conditional) + enqueue the anchor-mark strip.
     expect(commentRepo.deleteCommentIfChildless).toHaveBeenCalledWith('c-1');
-    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
-      'deleteCommentMark',
-      'page.page-1',
-      expect.objectContaining({ commentId: 'c-1', user: expect.any(Object) }),
-    );
+    const del = markJob(generalQueue, 'delete');
+    expect(del).toBeDefined();
+    expect(del[1]).toMatchObject({
+      documentName: 'page.page-1',
+      commentId: 'c-1',
+      userId: 'user-1',
+    });
     expect(wsService.emitCommentEvent).toHaveBeenCalledWith(
       'space-1',
       'page-1',
@@ -96,20 +117,20 @@ describe('CommentService — dismissSuggestion', () => {
     expect(result.outcome).toBe('deleted');
   });
 
-  it('no replies → if the anchor-mark removal FAILS, the row is NOT deleted and the error propagates (#329: no orphan anchor)', async () => {
-    const { service, commentRepo, wsService, collaborationGateway } =
-      makeService(false);
-    // Mark removal is FATAL and runs BEFORE the irreversible row delete: a collab
-    // failure (e.g. COLLAB_DISABLE_REDIS "no live instance") must abort the whole
-    // operation, leaving row + mark consistent — never a deleted row with an
-    // orphan anchor left in the document reporting success.
-    collaborationGateway.handleYjsEvent = jest.fn(async () => {
-      throw new Error('requires a live collaboration instance');
+  it('no replies → if the anchor-mark ENQUEUE FAILS, the row is NOT deleted and the error propagates (#329/#399: no orphan anchor)', async () => {
+    const { service, commentRepo, wsService, generalQueue } = makeService(false);
+    // #399: the mark removal now runs async in a worker, but the ENQUEUE is
+    // awaited BEFORE the irreversible row delete — so the anchor-removal job is
+    // durably scheduled before the row can vanish. If even the enqueue fails
+    // (e.g. Redis down), the whole operation aborts, leaving row + mark
+    // consistent — never a deleted row with an orphan anchor reporting success.
+    generalQueue.add = jest.fn(async () => {
+      throw new Error('queue add failed: no redis');
     });
 
     await expect(
       service.dismissSuggestion(suggestionComment(), user()),
-    ).rejects.toThrow(/live collaboration/);
+    ).rejects.toThrow(/queue add failed/);
 
     expect(commentRepo.deleteCommentIfChildless).not.toHaveBeenCalled();
     expect(wsService.emitCommentEvent).not.toHaveBeenCalledWith(
@@ -120,23 +141,29 @@ describe('CommentService — dismissSuggestion', () => {
   });
 
   it('WITH replies → resolves (not delete), does NOT apply, audits DISMISSED, outcome=resolved', async () => {
-    const { service, commentRepo, wsService, collaborationGateway, auditService } =
-      makeService(true);
+    const {
+      service,
+      commentRepo,
+      collaborationGateway,
+      generalQueue,
+      auditService,
+    } = makeService(true);
 
     const result = await service.dismissSuggestion(suggestionComment(), user());
 
-    // Resolved via resolveComment (resolve patch + resolve mark), NOT deleted.
+    // Resolved via resolveComment (resolve patch + enqueued resolve mark), NOT
+    // deleted.
     const resolvePatch = commentRepo.updateComment.mock.calls
       .map((c: any[]) => c[0])
       .find((p: any) => 'resolvedAt' in p);
     expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
     expect(resolvePatch.resolvedById).toBe('user-1');
     expect(commentRepo.deleteComment).not.toHaveBeenCalled();
-    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
-      'resolveCommentMark',
-      'page.page-1',
-      expect.objectContaining({ commentId: 'c-1', resolved: true }),
-    );
+    // No sync gateway call; the resolve mark is enqueued (#399).
+    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalled();
+    const res = markJob(generalQueue, 'resolve');
+    expect(res).toBeDefined();
+    expect(res[1]).toMatchObject({ documentName: 'page.page-1', commentId: 'c-1' });
     // No applied stamp — dismiss does not apply the edit.
     const appliedPatch = commentRepo.updateComment.mock.calls
       .map((c: any[]) => c[0])
@@ -156,8 +183,7 @@ describe('CommentService — dismissSuggestion', () => {
     // but the atomic delete matches 0 rows because a reply landed in the window
     // between that read and the delete. The parent must NOT be hard-deleted
     // (a cascade would destroy the just-added reply); the thread is resolved.
-    const { service, commentRepo, wsService, collaborationGateway } =
-      makeService(false, 0);
+    const { service, commentRepo, wsService, generalQueue } = makeService(false, 0);
 
     const result = await service.dismissSuggestion(suggestionComment(), user());
 
@@ -175,11 +201,9 @@ describe('CommentService — dismissSuggestion', () => {
       .find((p: any) => 'resolvedAt' in p);
     expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
     expect(resolvePatch.resolvedById).toBe('user-1');
-    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
-      'resolveCommentMark',
-      'page.page-1',
-      expect.objectContaining({ commentId: 'c-1', resolved: true }),
-    );
+    // A resolve mark job is enqueued (the anchor was already delete-marked; the
+    // resolve mirror is idempotent — #399).
+    expect(markJob(generalQueue, 'resolve')).toBeDefined();
     expect(result.outcome).toBe('resolved');
   });
 

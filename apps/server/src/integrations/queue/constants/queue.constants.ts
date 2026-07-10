@@ -61,6 +61,9 @@ export enum QueueJob {
 
   COMMENT_NOTIFICATION = 'comment-notification',
   COMMENT_RESOLVED_NOTIFICATION = 'comment-resolved-notification',
+  // #399: off-critical-path mirror of a comment's inline mark into the collab
+  // Y.Doc (resolve/unresolve flip, or ephemeral-suggestion anchor removal).
+  COMMENT_MARK_UPDATE = 'comment-mark-update',
   PAGE_MENTION_NOTIFICATION = 'page-mention-notification',
   PAGE_PERMISSION_GRANTED = 'page-permission-granted',
   PAGE_UPDATE_DIGEST = 'page-update-digest',
