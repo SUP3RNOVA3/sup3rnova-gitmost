@@ -70,6 +70,36 @@ const RECONNECT_MAX_ATTEMPTS = 5;
 // Backoff before attempt N (1-based): 1s, 2s, 4s, 8s, 16s.
 const RECONNECT_BASE_DELAY_MS = 1000;
 
+// #396: bounded retry for the "Interrupt and send now" re-send when it races the
+// authoritative server stop of the just-superseded detached run. The re-POST can
+// arrive before the old run has released the one-active-run slot, so the server
+// returns 409 A_RUN_ALREADY_ACTIVE. The server stop guarantees the slot frees, so
+// a few short backoffs converge. 4 total attempts: attempt 1 fires immediately,
+// then these are the waits BEFORE attempts 2, 3 and 4 (150ms, 300ms, 600ms). If
+// all 4 attempts 409, the last 409 surfaces (the banner) — acceptable per #396.
+const SUPERSEDE_RETRY_DELAYS_MS = [150, 300, 600];
+// The server error code that means "another run is already active for this chat".
+const A_RUN_ALREADY_ACTIVE = "A_RUN_ALREADY_ACTIVE";
+
+/**
+ * #396: defensively decide whether a 409 response is the one-active-run gate
+ * rejection (code A_RUN_ALREADY_ACTIVE) vs. some other 409. Reads a CLONE so the
+ * original response body stays intact for the caller when it is returned as-is.
+ * Any parse failure or unexpected shape => false (do NOT retry).
+ */
+async function isRunAlreadyActive(response: Response): Promise<boolean> {
+  try {
+    const body = (await response.clone().json()) as unknown;
+    return (
+      typeof body === "object" &&
+      body !== null &&
+      (body as { code?: unknown }).code === A_RUN_ALREADY_ACTIVE
+    );
+  } catch {
+    return false;
+  }
+}
+
 /** The page the user is currently viewing, sent as chat context. */
 export interface OpenPageContext {
   id: string;
@@ -326,6 +356,26 @@ export default function ChatThread({
   const flushOnAbortRef = useRef(false);
   const interruptNextSendRef = useRef(false);
 
+  // #396: one-shot arm for the bounded 409 A_RUN_ALREADY_ACTIVE retry on the
+  // "Interrupt and send now" re-send in autonomous mode. sendNow triggers the
+  // authoritative server stop of the detached run, but that stop and the
+  // onFinish->flushNext re-POST race: the new POST can hit the one-active-run
+  // gate before the old detached run has settled, yielding a spurious 409. When
+  // this ref is armed, the transport's send path retries that 409 with a short
+  // bounded backoff (the server stop guarantees convergence). A normal send (ref
+  // not armed) must STILL fail a 409 instantly (e.g. a genuine two-tab conflict).
+  //
+  // INVARIANT: sendNow arms this only to be consumed by the ONE re-POST that
+  // flushNext fires from onFinish. But that re-POST does not always happen (the
+  // promoted head may be gone, the finish may be a resumed turn, or the arm may
+  // race a stale finish). To keep the arm strictly one-shot it is disarmed on
+  // EVERY path where the paired interrupt one-shots (flushOnAbortRef /
+  // interruptNextSendRef) are cleared without a POST: the transport POST branch
+  // consumes it (read-and-clear), the onFinish `!flushNext()` no-send branch
+  // clears it, and the isStreaming-defuse effect clears it symmetrically. So it
+  // can never leak into a later, unrelated send and retry that send's genuine 409.
+  const supersedeRetryRef = useRef(false);
+
   // #234 F5: the user pressed Stop while streaming a BRAND-NEW chat whose server
   // chat id has not been adopted yet (the `start` chunk carrying it hadn't landed
   // when Stop was pressed). A local SSE abort alone does NOT stop the DETACHED
@@ -382,7 +432,43 @@ export default function ChatThread({
           }`,
         }),
         fetch: async (input: RequestInfo | URL, init: RequestInit = {}) => {
-          if ((init.method ?? "GET") !== "GET") return fetch(input, init); // send path untouched
+          if ((init.method ?? "GET") !== "GET") {
+            // Send path (POST). #396: read-and-clear the one-shot supersede arm
+            // here so it is strictly scoped to THIS send. When unarmed, behave
+            // exactly as before — a single fetch, a 409 surfaces instantly (a
+            // genuine two-tab conflict must NOT be retried).
+            const supersede = supersedeRetryRef.current;
+            supersedeRetryRef.current = false;
+            if (!supersede) return fetch(input, init);
+            // Buffer a ReadableStream body once so each retry can replay it.
+            // DefaultChatTransport sends the body as a JSON STRING (replayable as
+            // is), but guard defensively in case a future SDK streams it.
+            let sendInit = init;
+            if (init.body instanceof ReadableStream) {
+              const buffered = await new Response(init.body).arrayBuffer();
+              sendInit = { ...init, body: buffered };
+            }
+            // Bounded retry: attempt 1 fires immediately, then wait between
+            // attempts per SUPERSEDE_RETRY_DELAYS_MS. Retry ONLY on a real
+            // 409 A_RUN_ALREADY_ACTIVE; any other status/body is returned as-is.
+            for (let attempt = 0; ; attempt++) {
+              const response = await fetch(input, sendInit);
+              if (
+                response.status !== 409 ||
+                attempt >= SUPERSEDE_RETRY_DELAYS_MS.length ||
+                !(await isRunAlreadyActive(response))
+              ) {
+                return response;
+              }
+              // The old detached run has not released the one-active-run slot
+              // yet; the server stop we requested guarantees it will, so back off
+              // and re-POST (the 409 fired before the user message was persisted,
+              // so re-POSTing is safe — no duplicate rows).
+              await new Promise((r) =>
+                setTimeout(r, SUPERSEDE_RETRY_DELAYS_MS[attempt]),
+              );
+            }
+          }
           // Reconnect GET: the SDK passes no AbortSignal, so wire our own controller
           // for observer Stop / unmount abort.
           const controller = new AbortController();
@@ -562,9 +648,14 @@ export default function ChatThread({
         setStopNotice(null);
         // If the promoted head vanished (e.g. the user removed it before the
         // abort landed) flushNext sends nothing — clear the one-shot interrupt
-        // tag so it can't leak onto the next unrelated send. On a real send the
-        // tag is consumed by prepareSendMessagesRequest and stays untouched.
-        if (!flushNext()) interruptNextSendRef.current = false;
+        // tag AND the #396 supersede arm so neither can leak onto the next
+        // unrelated send (no re-POST will consume the arm here). On a real send
+        // the tag is consumed by prepareSendMessagesRequest and the arm by the
+        // transport POST branch, so both stay untouched then.
+        if (!flushNext()) {
+          interruptNextSendRef.current = false;
+          supersedeRetryRef.current = false;
+        }
         return;
       }
       if (isAbort || isDisconnect || isError) return;
@@ -873,6 +964,30 @@ export default function ChatThread({
         setQueue(promoteToHead(queuedRef.current, id));
         flushOnAbortRef.current = true;
         interruptNextSendRef.current = true;
+        // #396: in autonomous mode the turn is a DETACHED run — a local stop()
+        // is only a client disconnect the server ignores, so the run keeps going.
+        // The onFinish->flushNext re-POST would then hit the one-active-run gate
+        // and get a spurious 409 A_RUN_ALREADY_ACTIVE. Mirror handleStop: request
+        // the AUTHORITATIVE server stop so the detached run settles, and arm the
+        // one-shot bounded 409 retry BEFORE stop() so the re-send converges once
+        // the slot frees. Read chatId live from chatIdRef (adopted at the `start`
+        // chunk). If it is not known yet (brand-new chat, first moment of its
+        // first turn), defer the server stop via stopPendingRef exactly as
+        // handleStop does — the onServerChatId adoption effect fires it once the
+        // id lands; the retry stays armed so the re-send still converges then.
+        if (autonomousRunsEnabled) {
+          supersedeRetryRef.current = true; // arm the bounded 409 retry
+          if (chatIdRef.current) {
+            onServerStop?.(chatIdRef.current);
+          } else {
+            // Same #234-F5 sub-window limitation documented in handleStop: if the
+            // local abort below cancels the reader before the `start` chunk lands,
+            // the adoption effect never runs and the deferred stop never fires. Not
+            // a regression; at minimum we don't strand refs (the isStreaming effect
+            // defuses stopPendingRef on the next turn start).
+            stopPendingRef.current = true;
+          }
+        }
         stop(); // -> onFinish({ isAbort: true }) flushes the promoted head
       } else {
         // Nothing to interrupt: just send it now (no interrupt note).
@@ -884,7 +999,7 @@ export default function ChatThread({
         sendMessageRef.current?.({ text: msg.text });
       }
     },
-    [setQueue, stop, setResumedTurnPair],
+    [setQueue, stop, setResumedTurnPair, autonomousRunsEnabled, onServerStop],
   );
 
   // Stop the current turn. ALWAYS abort the local SSE (`stop()`) so the composer
@@ -944,6 +1059,13 @@ export default function ChatThread({
       setStopNotice(null);
       flushOnAbortRef.current = false;
       interruptNextSendRef.current = false;
+      // #396: symmetric with the other one-shot interrupt flags — defuse a stale
+      // supersede arm that was set but whose expected re-POST never fired (the
+      // turn finished in the same tick as the click, or the promoted head was
+      // gone), so it can never leak into this (or a later) turn's send and retry
+      // that send's genuine 409. A legit arm is consumed by the transport POST
+      // branch before this new turn streams, so this does not clobber it.
+      supersedeRetryRef.current = false;
       // #234 F5: a new turn is starting — drop any pending deferred-stop from a
       // previous turn that never adopted an id, so it can never fire against this
       // (or a later) unrelated turn's run. A deferred stop for the CURRENT turn is
