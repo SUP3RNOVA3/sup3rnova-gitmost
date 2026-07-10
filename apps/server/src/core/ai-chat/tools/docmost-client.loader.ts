@@ -2,266 +2,92 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import type { DocmostClient, SharedToolSpec } from '@docmost/mcp';
+
+// Re-export SharedToolSpec so downstream server modules keep a single import
+// path (they import it from this loader). The shape is DERIVED from the package
+// entry, not re-declared here — see the import above (issue #446).
+export type { SharedToolSpec } from '@docmost/mcp';
 
 /**
- * Minimal structural type for the `DocmostClient` class we consume from the
- * ESM-only `@docmost/mcp` package. We only need the constructor + the read/write
- * methods used by the per-user tool adapter; the full client surface lives in
- * `packages/mcp/src/client.ts`. Signatures here mirror that file exactly.
- *
- * DRIFT GUARD: the method NAMES below are runtime-checked against the real
- * `DocmostClient` by `packages/mcp/test/unit/client-host-contract.test.mjs`
- * (which can import the ESM class directly). If you rename/remove a method here
- * or in client.ts, that test fails — so a stale mirror cannot silently ship a
- * runtime "x is not a function" into an agent tool call. Keep the two in sync.
- *
- * STAGED PLAN — full derivation `DocmostClientLike = <real DocmostClient type>`
- * (issue #193, layer 3) is intentionally NOT done; it stays a hand-mirror for
- * now because of two verified blockers across the ESM(mcp)/CJS(server) boundary:
- *   1. `@docmost/mcp` emits NO declaration files (its tsconfig has no
- *      `declaration`, package.json has no `types`/types-export) and the server
- *      tsconfig has no path mapping for it — the server only loads it via the
- *      runtime `import()` trick below, so there is no type to import today.
- *   2. The real client methods have inferred, CONCRETE return types; the in-app
- *      tool adapter reads results through loose `Record<string,unknown>` returns
- *      + `as` casts (e.g. `(result?.data ?? {}) as { title?: string }`).
- *      Deriving the exact type would make those casts non-overlapping ("may be a
- *      mistake") and break the build, and `Partial<DocmostClientLike>` test stubs
- *      would have to satisfy the full concrete surface.
- * To do it safely later (incrementally): (a) turn on `declaration: true` in
- * packages/mcp/tsconfig.json + add a `types` export condition and commit the
- * emitted `.d.ts`; (b) `import type { DocmostClient } from '@docmost/mcp'` here
- * and replace this interface with a `Pick<DocmostClient, ...>` of the consumed
- * methods; (c) audit every `as` cast in ai-chat-tools.service.ts against the now
- * concrete return types (double-cast through `unknown` only where genuinely
- * needed); (d) keep the runtime guard test as a belt-and-braces check. Until
- * then the guard test above is the cheap, behaviour-neutral protection.
+ * The exact set of `DocmostClient` methods the per-user in-app tool adapter
+ * consumes. This is the AUTHORITATIVE list of the client surface the server
+ * depends on; the adapter calls these methods POSITIONALLY, so this set is what
+ * the derived type below type-checks against the real class (issue #446).
  */
-export interface DocmostClientLike {
+type DocmostClientMethod =
   // --- read ---
-  search(
-    query: string,
-    spaceId?: string,
-    limit?: number,
-  ): Promise<{ items: unknown[]; success: boolean }>;
-  getPage(
-    pageId: string,
-  ): Promise<{ data: Record<string, unknown>; success: boolean }>;
-  // Light raw page info (`/pages/info`): title + slugId + ProseMirror content,
-  // WITHOUT the Markdown render / subpage expansion getPage does. Used by the
-  // comment-signal probe to read just the page title on a hit.
-  getPageRaw(pageId: string): Promise<Record<string, unknown> | null>;
-  getWorkspace(): Promise<{ data: Record<string, unknown>; success: boolean }>;
-  getSpaces(): Promise<unknown[]>;
-  listPages(
-    spaceId?: string,
-    limit?: number,
-    tree?: boolean,
-  ): Promise<unknown[]>;
-  listSidebarPages(spaceId: string, pageId?: string): Promise<unknown[]>;
-  getOutline(pageId: string): Promise<Record<string, unknown>>;
-  getPageJson(pageId: string): Promise<Record<string, unknown>>;
-  getNode(pageId: string, nodeId: string): Promise<Record<string, unknown>>;
-  searchInPage(
-    pageId: string,
-    query: string,
-    opts?: { regex?: boolean; caseSensitive?: boolean; limit?: number },
-  ): Promise<Record<string, unknown>>;
-  getTable(pageId: string, tableRef: string): Promise<Record<string, unknown>>;
-  // Returns `{ items, resolvedThreadsHidden }`. DEFAULT (includeResolved unset/
-  // false) hides resolved threads wholesale; pass true for the full feed.
-  listComments(
-    pageId: string,
-    includeResolved?: boolean,
-  ): Promise<{ items: unknown[]; resolvedThreadsHidden: number }>;
-  getComment(
-    commentId: string,
-  ): Promise<{ data: Record<string, unknown>; success: boolean }>;
-  checkNewComments(
-    spaceId: string,
-    since: string,
-    parentPageId?: string,
-  ): Promise<unknown>;
-  listShares(): Promise<unknown[]>;
-  listPageHistory(
-    pageId: string,
-    cursor?: string,
-  ): Promise<{ items: unknown[]; nextCursor: string | null }>;
-  getPageHistory(historyId: string): Promise<Record<string, unknown>>;
-  diffPageVersions(
-    pageId: string,
-    from?: string,
-    to?: string,
-  ): Promise<Record<string, unknown>>;
-  exportPageMarkdown(pageId: string): Promise<string>;
+  | 'search'
+  | 'getPage'
+  | 'getPageRaw'
+  | 'getWorkspace'
+  | 'getSpaces'
+  | 'listPages'
+  | 'listSidebarPages'
+  | 'getOutline'
+  | 'getPageJson'
+  | 'getNode'
+  | 'searchInPage'
+  | 'getTable'
+  | 'listComments'
+  | 'getComment'
+  | 'checkNewComments'
+  | 'listShares'
+  | 'listPageHistory'
+  | 'getPageHistory'
+  | 'diffPageVersions'
+  | 'exportPageMarkdown'
   // --- write (page) ---
-  createPage(
-    title: string,
-    content: string,
-    spaceId: string,
-    parentPageId?: string,
-  ): Promise<{ data: Record<string, unknown>; success: boolean }>;
-  // Markdown content update via the collab path (carries provenance via the
-  // collab-token provider). Optionally also updates the title.
-  updatePage(
-    pageId: string,
-    content: string,
-    title?: string,
-  ): Promise<Record<string, unknown>>;
-  // Title-only rename via REST.
-  renamePage(
-    pageId: string,
-    title: string,
-  ): Promise<Record<string, unknown>>;
-  // Move via REST. parentPageId null => move to space root.
-  movePage(
-    pageId: string,
-    parentPageId: string | null,
-    position?: string,
-  ): Promise<unknown>;
-  // SOFT delete only (POST /pages/delete with { pageId }). NEVER permanent.
-  deletePage(pageId: string): Promise<unknown>;
-  editPageText(
-    pageId: string,
-    edits: Array<{ find: string; replace: string; replaceAll?: boolean }>,
-  ): Promise<Record<string, unknown>>;
-  patchNode(
-    pageId: string,
-    nodeId: string,
-    node: unknown,
-  ): Promise<Record<string, unknown>>;
-  insertNode(
-    pageId: string,
-    node: unknown,
-    opts: {
-      position: 'before' | 'after' | 'append';
-      anchorNodeId?: string;
-      anchorText?: string;
-    },
-  ): Promise<Record<string, unknown>>;
-  deleteNode(
-    pageId: string,
-    nodeId: string,
-  ): Promise<Record<string, unknown>>;
-  updatePageJson(
-    pageId: string,
-    doc?: unknown,
-    title?: string,
-  ): Promise<Record<string, unknown>>;
-  // Attach an author-inline footnote after the first occurrence of anchorText;
-  // numbering + the footnotes list are derived server-side.
-  insertFootnote(
-    pageId: string,
-    anchorText: string,
-    text: string,
-  ): Promise<Record<string, unknown>>;
-  // Download a web image and insert it into the page (append, or replace/after a
-  // text anchor). `url` is the image http(s) URL.
-  insertImage(
-    pageId: string,
-    url: string,
-    opts?: {
-      align?: 'left' | 'center' | 'right';
-      alt?: string;
-      replaceText?: string;
-      afterText?: string;
-    },
-  ): Promise<Record<string, unknown>>;
-  // Swap an existing image (by its attachmentId) for a new one fetched from a web
-  // URL, repointing every reference in the live document.
-  replaceImage(
-    pageId: string,
-    oldAttachmentId: string,
-    url: string,
-    opts?: { align?: 'left' | 'center' | 'right'; alt?: string },
-  ): Promise<Record<string, unknown>>;
+  | 'createPage'
+  | 'updatePage'
+  | 'renamePage'
+  | 'movePage'
+  | 'deletePage'
+  | 'editPageText'
+  | 'patchNode'
+  | 'insertNode'
+  | 'deleteNode'
+  | 'updatePageJson'
+  | 'tableInsertRow'
+  | 'tableDeleteRow'
+  | 'tableUpdateCell'
+  | 'copyPageContent'
+  | 'importPageMarkdown'
+  | 'sharePage'
+  | 'unsharePage'
+  | 'restorePageVersion'
+  | 'transformPage'
+  | 'stashPage'
+  // --- write (image / footnote), in-app since #410 ---
+  | 'insertImage'
+  | 'replaceImage'
+  | 'insertFootnote'
   // --- draw.io diagrams (#423, stage 1) ---
-  // Read a diagram as decoded mxGraph XML (default) or the raw .drawio.svg.
-  // meta.hash is the optimistic-lock key drawioUpdate expects as baseHash.
-  drawioGet(
-    pageId: string,
-    node: string,
-    format?: 'xml' | 'svg',
-  ): Promise<Record<string, unknown>>;
-  // Lint mxGraph XML, build the .drawio.svg attachment and insert a drawio node.
-  drawioCreate(
-    pageId: string,
-    where: {
-      position: 'before' | 'after' | 'append';
-      anchorNodeId?: string;
-      anchorText?: string;
-    },
-    xml: string,
-    title?: string,
-  ): Promise<Record<string, unknown>>;
-  // Optimistic-locked full replacement of a diagram (baseHash from drawioGet).
-  drawioUpdate(
-    pageId: string,
-    node: string,
-    xml: string,
-    baseHash: string,
-  ): Promise<Record<string, unknown>>;
-  tableInsertRow(
-    pageId: string,
-    tableRef: string,
-    cells: string[],
-    index?: number,
-  ): Promise<Record<string, unknown>>;
-  tableDeleteRow(
-    pageId: string,
-    tableRef: string,
-    index: number,
-  ): Promise<Record<string, unknown>>;
-  tableUpdateCell(
-    pageId: string,
-    tableRef: string,
-    row: number,
-    col: number,
-    text: string,
-  ): Promise<Record<string, unknown>>;
-  copyPageContent(
-    sourcePageId: string,
-    targetPageId: string,
-  ): Promise<Record<string, unknown>>;
-  importPageMarkdown(
-    pageId: string,
-    fullMarkdown: string,
-  ): Promise<Record<string, unknown>>;
-  sharePage(
-    pageId: string,
-    searchIndexing?: boolean,
-  ): Promise<Record<string, unknown>>;
-  unsharePage(pageId: string): Promise<Record<string, unknown>>;
-  restorePageVersion(historyId: string): Promise<Record<string, unknown>>;
-  // The opts type declares deleteComments? to match the real client signature,
-  // but the agent tool NEVER sets it (comment deletion stays unreachable).
-  transformPage(
-    pageId: string,
-    transformJs: string,
-    opts?: { dryRun?: boolean; deleteComments?: boolean },
-  ): Promise<Record<string, unknown>>;
+  | 'drawioGet'
+  | 'drawioCreate'
+  | 'drawioUpdate'
   // --- write (comment) ---
-  createComment(
-    pageId: string,
-    content: string,
-    type?: 'page' | 'inline',
-    selection?: string,
-    parentCommentId?: string,
-    suggestedText?: string,
-  ): Promise<{ data: Record<string, unknown>; success: boolean }>;
-  resolveComment(
-    commentId: string,
-    resolved: boolean,
-  ): Promise<Record<string, unknown>>;
-  // Serialize a page + mirror its internal images into the blob sandbox; returns
-  // ONLY a short anonymous URL (the body never enters the model context).
-  stashPage(pageId: string): Promise<{
-    uri: string;
-    sha256: string;
-    size: number;
-    images: { mirrored: number; failed: number };
-  }>;
-}
+  | 'createComment'
+  | 'resolveComment';
+
+/**
+ * The client surface the per-user tool adapter consumes, DERIVED from the real
+ * `DocmostClient` type in `@docmost/mcp` (issue #446, restored #294 debt). This
+ * replaces the former hand-mirror of ~45 method signatures.
+ *
+ * `import type` (above) is fully ERASED at compile time, so nothing is actually
+ * imported from the ESM-only package at runtime — the server still loads the
+ * class through the dynamic `import()` trick in `loadDocmostMcp` below; this is
+ * purely a compile-time type. Deriving via `Pick` means a parameter reorder or a
+ * type change to any of these methods in `client.ts` now becomes a SERVER
+ * COMPILE ERROR at the positional call sites in ai-chat-tools.service.ts,
+ * instead of a silent runtime "wrong argument" failure inside an agent tool.
+ *
+ * This made the old name-only drift-guard test
+ * (packages/mcp/test/unit/client-host-contract.test.mjs) redundant — tsc now
+ * enforces both names AND signatures — so that test was removed.
+ */
+export type DocmostClientLike = Pick<DocmostClient, DocmostClientMethod>;
 
 export type DocmostClientConfig = {
   apiUrl: string;
@@ -283,32 +109,7 @@ export type DocmostClientConfig = {
 };
 
 export interface DocmostClientCtor {
-  new (config: DocmostClientConfig): DocmostClientLike;
-}
-
-/**
- * Local hand-mirror of the `SharedToolSpec` shape exported from
- * `@docmost/mcp` (packages/mcp/src/tool-specs.ts). Same approach as
- * `DocmostClientLike`: we do not import the ESM package's types directly across
- * the CJS/ESM boundary. The registry itself has no runtime deps, but keeping the
- * type local avoids coupling the server build to the package's type surface.
- *
- * `buildShape` is intentionally zod-agnostic: it returns a plain ZodRawShape
- * built with whatever zod namespace the caller passes (the server passes its own
- * zod v4; the MCP package passes its zod v3). See the registry module comment.
- */
-export interface SharedToolSpec {
-  mcpName: string;
-  inAppKey: string;
-  description: string;
-  // Deferred-tool metadata (#332). Optional in this mirror so an older/stale
-  // @docmost/mcp build (pre-#332) still type-checks; the in-app catalog builder
-  // reads them defensively. The external /mcp server ignores both fields.
-  tier?: 'core' | 'deferred';
-  catalogLine?: string;
-  // Loose `z` on purpose: the registry is zod-agnostic so the server can pass
-  // its own zod (v4) and the MCP package its own (v3) into the same builder.
-  buildShape?: (z: any) => Record<string, unknown>;
+  new (config: DocmostClientConfig): DocmostClient;
 }
 
 /**

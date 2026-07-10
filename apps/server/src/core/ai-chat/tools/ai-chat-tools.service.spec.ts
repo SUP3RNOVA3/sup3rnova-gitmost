@@ -1,6 +1,17 @@
 import { AiChatToolsService } from './ai-chat-tools.service';
 import * as loader from './docmost-client.loader';
 import type { DocmostClientLike } from './docmost-client.loader';
+
+// Test-double type for the loopback client. `DocmostClientLike` is now DERIVED
+// from the real `DocmostClient` (issue #446), so its method RETURN types are the
+// concrete client shapes. These stubs deliberately return minimal recording
+// shapes (e.g. `{ ok: true }`), which no longer satisfy those concrete returns —
+// so the doubles are typed with the same method NAMES but loose async returns.
+// Each is still cast to `DocmostClientLike` at the (return-erased) mock site, so
+// the positional-call type-safety on the PRODUCTION client is unaffected.
+type FakeDocmostClient = Partial<
+  Record<keyof DocmostClientLike, (...args: any[]) => Promise<any>>
+>;
 // The real zod-agnostic shared tool-spec registry. It has no runtime deps, so
 // importing the TS source directly keeps these mocks honest: the service builds
 // the shared tools from exactly the specs the package ships, not a hand-stub.
@@ -31,7 +42,7 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
 
   // Minimal fake DocmostClient: only the write methods the tools touch need to
   // exist; deletePage records its args. No network, no ESM import.
-  const fakeClient: Partial<DocmostClientLike> = {
+  const fakeClient: FakeDocmostClient = {
     deletePage: (...args: unknown[]) => {
       deletePageCalls.push(args);
       return Promise.resolve({ success: true });
@@ -160,7 +171,7 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
 describe('AiChatToolsService expanded toolset guardrails', () => {
   // No client method is invoked here — every assertion is on tool presence /
   // input schema — so an empty fake client is sufficient.
-  const fakeClient: Partial<DocmostClientLike> = {};
+  const fakeClient: FakeDocmostClient = {};
 
   const tokenServiceStub = {
     generateAccessToken: jest.fn().mockResolvedValue('access-token'),
@@ -265,7 +276,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
   const insertNodeCalls: unknown[][] = [];
   const updatePageJsonCalls: unknown[][] = [];
 
-  const fakeClient: Partial<DocmostClientLike> = {
+  const fakeClient: FakeDocmostClient = {
     patchNode: (...args: unknown[]) => {
       patchNodeCalls.push(args);
       return Promise.resolve({ ok: true });
@@ -439,7 +450,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
  * getOutline) are exercised here end-to-end through forUser().
  */
 describe('AiChatToolsService model-friendly input validation (#190)', () => {
-  const fakeClient: Partial<DocmostClientLike> = {};
+  const fakeClient: FakeDocmostClient = {};
   const tokenServiceStub = {
     generateAccessToken: jest.fn().mockResolvedValue('access-token'),
     generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
@@ -557,7 +568,7 @@ describe('AiChatToolsService #294 changed execute wirings', () => {
     tableDeleteRow: [],
     tableUpdateCell: [],
   };
-  const fakeClient: Partial<DocmostClientLike> = {
+  const fakeClient: FakeDocmostClient = {
     movePage: (...args: unknown[]) => {
       calls.movePage.push(args);
       return Promise.resolve({ success: true });
@@ -666,7 +677,7 @@ describe('AiChatToolsService #410 footnote + image tools', () => {
     insertImage: [],
     replaceImage: [],
   };
-  const fakeClient: Partial<DocmostClientLike> = {
+  const fakeClient: FakeDocmostClient = {
     insertFootnote: (...args: unknown[]) => {
       calls.insertFootnote.push(args);
       return Promise.resolve({ success: true, footnoteId: 'fn1', reused: false });
