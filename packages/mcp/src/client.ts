@@ -879,6 +879,74 @@ export class DocmostClient {
   }
 
   /**
+   * "Where am I / what's around" for a single page — the #443 `getPageContext`
+   * tool. Metadata only (no page content), using exactly TWO server requests:
+   *
+   *   1. `POST /pages/breadcrumbs` — a recursive CTE that walks UP from the page.
+   *      The server returns the chain root->page order (it `.reverse()`s the
+   *      child-first walk before responding), INCLUDING the page itself as the
+   *      LAST element. So the last element is the page and everything before it
+   *      is the ancestor chain root->parent. This carries the page's own title
+   *      and spaceId, so no extra page-info fetch is needed for a UUID input.
+   *   2. `listSidebarPages(spaceId, pageId)` — the page's DIRECT children,
+   *      cursor-paginated (a page with >20 children returns ALL of them, no
+   *      dupes) and in sidebar `position` order, each carrying `hasChildren`.
+   *
+   * The input may be a slugId (agents copy them from URLs); it is run through
+   * `resolvePageId` first, exactly like the other page tools. A UUID input adds
+   * no request there (short-circuit), keeping the total at two; a slugId input
+   * adds one unavoidable resolve round-trip.
+   *
+   * INVARIANT: only the UUID `pageId` is exposed anywhere — server `id` is
+   * mapped to `pageId` and `slugId` is never leaked. A nonexistent/inaccessible
+   * pageId makes the server 404/403, which propagates as a clear tool error
+   * (never a hollow empty object).
+   */
+  async getPageContext(pageId: string) {
+    await this.ensureAuthenticated();
+
+    // Resolve a possibly-slugId input to the canonical UUID (no round-trip for a
+    // UUID). Errors here (bad/inaccessible id) propagate as a clear tool error.
+    const pageUuid = await this.resolvePageId(pageId);
+
+    // Request 1: the ancestor chain, root->page, page included as the LAST item.
+    const response = await this.client.post("/pages/breadcrumbs", {
+      pageId: pageUuid,
+    });
+    const chain: any[] = (response.data?.data ?? response.data) ?? [];
+    if (!Array.isArray(chain) || chain.length === 0) {
+      // The endpoint always includes the page itself, so an empty chain means
+      // the page is gone/inaccessible — surface a clear error, not {}.
+      throw new Error(`getPageContext: page "${pageId}" not found or inaccessible`);
+    }
+
+    // Split: the last element is the page, the rest (root->parent) are the
+    // breadcrumbs. A root page has no ancestors -> breadcrumbs is [].
+    const self = chain[chain.length - 1];
+    const ancestors = chain.slice(0, -1);
+
+    const page = {
+      pageId: self.id,
+      title: self.title,
+      spaceId: self.spaceId,
+    };
+    const breadcrumbs = ancestors.map((n: any) => ({
+      pageId: n.id,
+      title: n.title,
+    }));
+
+    // Request 2: direct children in sidebar order, each with hasChildren.
+    const childItems = await this.listSidebarPages(self.spaceId, pageUuid);
+    const children = childItems.map((c: any) => ({
+      pageId: c.id,
+      title: c.title,
+      hasChildren: Boolean(c.hasChildren),
+    }));
+
+    return { page, breadcrumbs, children };
+  }
+
+  /**
    * List sidebar pages for a space. With no pageId the request returns the
    * space ROOT pages; with a pageId it returns the direct CHILDREN of that
    * page. pageId is therefore optional and is only included in the POST body

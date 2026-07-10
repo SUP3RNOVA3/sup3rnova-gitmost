@@ -64,6 +64,7 @@ export type DocmostClientLike = Pick<
   | 'listShares'
   | 'listPages'
   | 'getTree'
+  | 'getPageContext'
   | 'getPage'
   | 'getPageJson'
   | 'getOutline'
@@ -999,6 +1000,35 @@ export const SHARED_TOOL_SPECS = {
         rootPageId as string | undefined,
         maxDepth as number | undefined,
       ),
+  },
+
+  getPageContext: {
+    mcpName: 'getPageContext',
+    inAppKey: 'getPageContext',
+    description:
+      'Given a pageId, get its LOCATION and immediate surroundings (metadata ' +
+      'only, no page content) in one call — answers "where am I / what is ' +
+      "around this page\". Returns `{ page: { pageId, title, spaceId }, " +
+      'breadcrumbs: [{ pageId, title }], children: [{ pageId, title, ' +
+      'hasChildren }] }`. `breadcrumbs` is the ancestor chain from the space ' +
+      'root down to the PARENT (the parent is its last element; a root page ' +
+      'has `breadcrumbs: []`). `children` are the direct children in sidebar ' +
+      'order, each flagged `hasChildren` so you know which can be expanded ' +
+      '(descend with getTree(rootPageId=that child) or another getPageContext). ' +
+      'Ids, titles and child order are consistent with getTree.',
+    tier: 'core',
+    catalogLine:
+      'getPageContext — a page’s breadcrumbs + direct children (where-am-I) in one call.',
+    buildShape: (z) => ({
+      pageId: z
+        .string()
+        .min(1)
+        .describe(
+          'The id of the page to locate (a pageId/UUID, or a slugId from a URL).',
+        ),
+    }),
+    execute: (client, { pageId }) =>
+      client.getPageContext(pageId as string),
   },
 
   createPage: {
