@@ -36,6 +36,7 @@ import {
 import { Page } from '@docmost/db/types/entity.types';
 import { CollabHistoryService } from '../services/collab-history.service';
 import {
+  EMBED_DEBOUNCE_MS,
   HISTORY_FAST_INTERVAL,
   HISTORY_FAST_THRESHOLD,
   HISTORY_INTERVAL,
@@ -45,6 +46,7 @@ import {
   observeCollabLoad,
   observeCollabStore,
 } from '../../integrations/metrics/metrics.registry';
+import { hasTransclusionFamilyNodes } from '../../core/page/transclusion/utils/transclusion-prosemirror.util';
 
 /**
  * #251 — wire format of the client→server stateless message that signals a
@@ -450,7 +452,18 @@ export class PersistenceExtension implements Extension {
       // Use the canonical page UUID (page.id), not the doc-name id, which may be
       // a slugId for a `page.<slugId>` doc (#260). The transclusion/reference
       // syncs write uuid-typed columns, so a slugId here threw Postgres 22P02.
-      await this.syncTransclusion(page.id, page.workspaceId, tiptapJson);
+      //
+      // #348 — skip the three sync SELECTs when neither the new content nor the
+      // previously-persisted content has any transclusion/reference/pageEmbed
+      // node: nothing to insert, and (the DB mirrors the old content) nothing to
+      // delete. Whenever either side has one, run the idempotent sync exactly as
+      // before so removals are still reconciled.
+      if (
+        hasTransclusionFamilyNodes(tiptapJson) ||
+        hasTransclusionFamilyNodes(page.content)
+      ) {
+        await this.syncTransclusion(page.id, page.workspaceId, tiptapJson);
+      }
     }
 
     if (page) {
@@ -466,7 +479,17 @@ export class PersistenceExtension implements Extension {
         (m) => m.entityId,
       );
 
-      if (userMentions.length > 0) {
+      // #348 — only enqueue when the mentioned-user set actually GAINED a member.
+      // The processor (processPageMention) already no-ops when every current
+      // mention was present before (newMentions.length === 0), so skipping the
+      // enqueue in that case is behavior-identical and avoids piling up no-op jobs
+      // on every save of a page that merely CONTAINS (unchanged) mentions.
+      const oldMentionedUserIdSet = new Set(oldMentionedUserIds);
+      const hasNewMentionedUser = userMentions.some(
+        (m) => !oldMentionedUserIdSet.has(m.entityId),
+      );
+
+      if (hasNewMentionedUser) {
         await this.notificationQueue.add(QueueJob.PAGE_MENTION_NOTIFICATION, {
           userMentions: userMentions.map((m) => ({
             userId: m.entityId,
@@ -481,12 +504,23 @@ export class PersistenceExtension implements Extension {
         } as IPageMentionNotificationJob);
       }
 
-      await this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
-        // Canonical UUID: the embedding reindex resolves pages by uuid, so a
-        // slugId here threw Postgres 22P02 invalid-uuid (#260).
-        pageIds: [page.id],
-        workspaceId: page.workspaceId,
-      });
+      await this.aiQueue.add(
+        QueueJob.PAGE_CONTENT_UPDATED,
+        {
+          // Canonical UUID: the embedding reindex resolves pages by uuid, so a
+          // slugId here threw Postgres 22P02 invalid-uuid (#260).
+          pageIds: [page.id],
+          workspaceId: page.workspaceId,
+        },
+        // #348 — coalesce re-embeds during active editing. A stable per-page
+        // jobId + delay means repeated saves within EMBED_DEBOUNCE_MS collapse
+        // to one delayed job instead of one expensive re-embed per save. The
+        // worker reads the current page state at run time, so last content wins.
+        // BullMQ forbids ':' in custom job ids (Redis key separator), so '-' is
+        // used; page.id is a UUID, so the id is unique per page. removeOnComplete
+        // (queue.module) frees the id after each run so the next window re-arms.
+        { jobId: `embed-${page.id}`, delay: EMBED_DEBOUNCE_MS },
+      );
 
       await this.enqueuePageHistory(page, lastUpdatedSource);
     }

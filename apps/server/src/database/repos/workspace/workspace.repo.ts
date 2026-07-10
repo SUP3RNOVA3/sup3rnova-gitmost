@@ -1,4 +1,6 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { Cache } from 'cache-manager';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB, KyselyTransaction } from '../../types/kysely.types';
 import { dbOrTx } from '../../utils';
@@ -9,6 +11,7 @@ import {
 } from '@docmost/db/types/entity.types';
 import { ExpressionBuilder, sql } from 'kysely';
 import { DB, Workspaces } from '@docmost/db/types/db';
+import { CacheKey } from '../../../common/helpers/cache-keys';
 
 /**
  * Writable `settings.ai.provider` keys, enforced at this generic SQL layer. This
@@ -61,7 +64,34 @@ export class WorkspaceRepo {
     'temporaryNoteHours',
     'isScimEnabled',
   ];
-  constructor(@InjectKysely() private readonly db: KyselyDB) {}
+  constructor(
+    @InjectKysely() private readonly db: KyselyDB,
+    @Inject(CACHE_MANAGER) private readonly cacheManager: Cache,
+  ) {}
+
+  /**
+   * #348 — bust the DomainMiddleware workspace caches after any workspace write.
+   * Deletes BOTH the self-hosted (constant) key and the cloud per-hostname key so
+   * a single implementation covers either deployment mode (the irrelevant key is a
+   * harmless no-op). Best-effort: a cache error must never fail the write, and a
+   * missed bust is bounded by WORKSPACE_CACHE_TTL_MS. Note: a hostname RENAME only
+   * busts the NEW hostname's key (the row returned here carries the new hostname);
+   * the old key expires via TTL.
+   */
+  private async bustWorkspaceCache(
+    workspace?: Pick<Workspace, 'hostname'> | undefined,
+  ): Promise<void> {
+    try {
+      await this.cacheManager.del(CacheKey.WORKSPACE_SELF_HOSTED);
+      if (workspace?.hostname) {
+        await this.cacheManager.del(
+          CacheKey.WORKSPACE_BY_HOST(workspace.hostname),
+        );
+      }
+    } catch {
+      // cache is best-effort; TTL is the backstop
+    }
+  }
 
   async findById(
     workspaceId: string,
@@ -144,12 +174,14 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ): Promise<Workspace> {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({ ...updatableWorkspace, updatedAt: new Date() })
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   async insertWorkspace(
@@ -157,11 +189,14 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ): Promise<Workspace> {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .insertInto('workspaces')
       .values(insertableWorkspace)
       .returning(this.baseFields)
       .executeTakeFirst();
+    // Bust the cached "not found" so a fresh install / new tenant is seen at once.
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   async count(): Promise<number> {
@@ -203,7 +238,7 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ) {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
@@ -214,6 +249,8 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   async updateAiSettings(
@@ -223,7 +260,7 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ) {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
@@ -234,6 +271,8 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   /**
@@ -272,7 +311,7 @@ export class WorkspaceRepo {
           entries.flatMap(([k, v]) => [sql.lit(k), sql`${v}::text`]),
         )})`
       : sql`'{}'::jsonb`;
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb) || jsonb_build_object(
@@ -287,6 +326,8 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   /**
@@ -303,7 +344,7 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ) {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
@@ -313,6 +354,8 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   async updateSharingSettings(
@@ -322,7 +365,7 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ) {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
@@ -333,6 +376,8 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
   async updateTemplateSettings(
@@ -342,7 +387,7 @@ export class WorkspaceRepo {
     trx?: KyselyTransaction,
   ) {
     const db = dbOrTx(this.db, trx);
-    return db
+    const workspace = await db
       .updateTable('workspaces')
       .set({
         settings: sql`COALESCE(settings, '{}'::jsonb)
@@ -353,6 +398,8 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace);
+    return workspace;
   }
 
 }
