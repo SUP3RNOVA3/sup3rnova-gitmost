@@ -45,6 +45,11 @@ COPY --from=builder /app/packages/editor-ext/dist /app/packages/editor-ext/dist
 COPY --from=builder /app/packages/editor-ext/package.json /app/packages/editor-ext/package.json
 COPY --from=builder /app/packages/mcp/build /app/packages/mcp/build
 COPY --from=builder /app/packages/mcp/package.json /app/packages/mcp/package.json
+# The mcp package reads its data files (drawio-presets.json, drawio-shape-index.json.gz)
+# at runtime via `new URL("../../data/…", import.meta.url)` relative to build/lib/*.js,
+# i.e. from packages/mcp/data/. tsc emits only build/, so ship data/ explicitly or
+# drawioFromGraph and the shape catalog die with ENOENT on packages/mcp/data/*.
+COPY --from=builder /app/packages/mcp/data /app/packages/mcp/data
 # mcp now depends on @docmost/prosemirror-markdown (workspace:*) and eager-imports
 # it at runtime (the in-app ai-chat DocmostClient loads build/index.js -> lib/
 # markdown-converter.js). Ship the built package + its manifest, or the prod
