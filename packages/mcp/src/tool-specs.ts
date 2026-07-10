@@ -877,11 +877,17 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'getPage',
     description:
       'Fetch a single page as Markdown by its id. Returns the page title and ' +
-      'its Markdown content. The Markdown conversion is LOSSY (block ids, exact ' +
-      'table/callout structure are approximated); for a lossless representation ' +
-      'use the lossless page-JSON read tool. Inline <span data-comment-id> tags in the markdown ' +
-      'are comment highlight anchors (also present for RESOLVED threads) — ' +
-      'treat them as markup, not page text.',
+      'its Markdown content. The converter is canonical (round-trips text and ' +
+      'block structure), so this is sufficient for text edits; use the ' +
+      'page-JSON read tool only when you need what Markdown cannot carry. The ' +
+      'Markdown drops exactly: (1) block ids (not visible in Markdown); ' +
+      '(2) resolved-comment anchors (hidden here; only active <span ' +
+      'data-comment-id> anchors remain); (3) a fixed set of attributes with no ' +
+      'Markdown representation — table-cell colspan/rowspan/colwidth/' +
+      'backgroundColor/backgroundColorName, heading/paragraph indent, ' +
+      'callout.icon, orderedList.type, and link internal/target/rel/class. ' +
+      'Inline <span data-comment-id> tags in the markdown are comment highlight ' +
+      'anchors — treat them as markup, not page text.',
     tier: 'core',
     catalogLine: 'getPage — fetch a page as Markdown by its id.',
     // Reconciled: MCP's stricter .min(1) kept; in-app's more-informative
@@ -1240,13 +1246,17 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'exportPageMarkdown',
     // CANONICAL: the MCP copy (a strict superset of the terse in-app wording).
     description:
-      'Export a page to a single self-contained, lossless Docmost-flavoured ' +
-      'Markdown file (custom extensions): YAML-free meta header, body with ' +
-      'inline comment anchors and diagrams, and a trailing comments-thread ' +
-      'block. Designed for a download -> edit body -> page-Markdown import ' +
-      'round-trip that preserves everything, including comment highlights. ' +
-      'Comment THREADS are preserved in the file but are not re-pushed to the ' +
-      'server on import.',
+      'Export a page to a single self-contained Docmost-flavoured Markdown ' +
+      'file (custom extensions): YAML-free meta header, body with inline ' +
+      'comment anchors (resolved ones kept) and diagrams, and a trailing ' +
+      'comments-thread block. Designed for a download -> edit body -> ' +
+      'page-Markdown import round-trip; block ids regenerate and comment ' +
+      'THREADS, though kept in the file, are not re-pushed to the server on ' +
+      'import. The round-trip SILENTLY DROPS a fixed set of attributes with no ' +
+      'Markdown representation — table-cell merge spans (colspan/rowspan), ' +
+      'colwidth, backgroundColor/backgroundColorName, heading/paragraph indent, ' +
+      'callout.icon, orderedList.type, and link internal/target/rel/class. Use ' +
+      'the page-JSON tools if those must survive.',
     tier: 'deferred',
     catalogLine:
       'exportPageMarkdown — export a page to self-contained Markdown (body + comments).',
