@@ -145,3 +145,36 @@ test("no-arg specs (getWorkspace/listSpaces/listShares) omit buildShape", () => 
     assert.equal(SHARED_TOOL_SPECS[key].buildShape, undefined, `${key} should be no-arg`);
   }
 });
+
+// #411: plain-Markdown full-body replace tool, paired with updatePageJson.
+test("updatePageMarkdown spec exists, pairs with updatePageJson, builds { pageId, content, title }", () => {
+  const spec = SHARED_TOOL_SPECS.updatePageMarkdown;
+  assert.ok(spec, "updatePageMarkdown spec missing");
+  assert.equal(spec.mcpName, "update_page_markdown");
+  assert.equal(spec.inAppKey, "updatePageMarkdown");
+  // Registered on BOTH hosts (a shared spec, no inAppOnly/mcpOnly flag).
+  assert.notEqual(spec.inAppOnly, true);
+  assert.notEqual(spec.mcpOnly, true);
+  // Same tier as its JSON sibling.
+  assert.equal(spec.tier, SHARED_TOOL_SPECS.updatePageJson.tier);
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["content", "pageId", "title"]);
+  // pageId + content required, title optional.
+  const schema = z.object(shape);
+  assert.doesNotThrow(() => schema.parse({ pageId: "p1", content: "# Hi" }));
+  assert.throws(() => schema.parse({ pageId: "p1" }));
+  // The description must flag the `^[...]` inline-footnote parse path so the
+  // markdown->footnote canonicalization guarantee stays documented (#411).
+  assert.match(spec.description, /\^\[/);
+});
+
+// #411: import_page_markdown is dropped from the EXTERNAL MCP surface but stays
+// available to the in-app agent — encoded as inAppOnly on the shared spec.
+test("importPageMarkdown spec is inAppOnly (removed from the external MCP surface, kept in-app)", () => {
+  const spec = SHARED_TOOL_SPECS.importPageMarkdown;
+  assert.ok(spec, "importPageMarkdown spec missing");
+  assert.equal(spec.inAppOnly, true);
+  // The spec + its client method are NOT deleted — only hidden from the MCP host.
+  assert.equal(spec.mcpName, "import_page_markdown");
+  assert.equal(spec.inAppKey, "importPageMarkdown");
+});

@@ -81,6 +81,7 @@ export type DocmostClientLike = Pick<
   | 'patchNode'
   | 'insertNode'
   | 'deleteNode'
+  | 'updatePage'
   | 'updatePageJson'
   | 'tableInsertRow'
   | 'tableDeleteRow'
@@ -642,6 +643,12 @@ export const SHARED_TOOL_SPECS = {
   importPageMarkdown: {
     mcpName: 'import_page_markdown',
     inAppKey: 'importPageMarkdown',
+    // IN-APP ONLY (issue #411): the external /mcp surface no longer exposes
+    // import_page_markdown — the registry loop in index.ts skips inAppOnly specs,
+    // so this stays available to the in-app agent (round-tripping an EXPORTED
+    // Docmost-Markdown file) but is removed from the public MCP tool set. Plain
+    // authoring-markdown body replace on the MCP surface is update_page_markdown.
+    inAppOnly: true,
     description:
       "Replace a page's content from a self-contained Docmost-flavoured " +
       'Markdown file produced by the page-Markdown export tool. Restores comment ' +
@@ -1117,6 +1124,51 @@ export const SHARED_TOOL_SPECS = {
       }
       return client.updatePageJson(pageId as string, doc, title as string | undefined);
     },
+  },
+
+  // Full-body replace from PLAIN Markdown (issue #411). Pairs with
+  // updatePageJson (which takes a ProseMirror document): this one takes a
+  // markdown string and re-imports the whole body. `client.updatePage` runs it
+  // through updatePageContentRealtime -> markdownToProseMirrorCanonical, so
+  // Docmost-flavoured markdown (incl. `^[...]` inline footnotes) is parsed and
+  // canonicalized. Distinct from importPageMarkdown, which re-imports a
+  // self-contained EXPORTED Docmost-Markdown file (with comment anchors +
+  // diagrams); this tool takes ordinary authoring markdown. Shared spec, so the
+  // registry loop registers it on BOTH hosts (external MCP + in-app agent) —
+  // #411 replaced the old inline in-app `updatePageContent` tool with this.
+  updatePageMarkdown: {
+    // snake_case for now; camelCase public MCP naming is the next issue (#412).
+    mcpName: 'update_page_markdown',
+    inAppKey: 'updatePageMarkdown',
+    description:
+      "Replace a page's body with new Markdown content (and optionally its " +
+      'title). The whole body is re-imported from the markdown (block ids ' +
+      'regenerate — for surgical or id-preserving edits use the find/replace, ' +
+      'node-patch or page-JSON tools instead). Docmost-flavoured markdown is ' +
+      'parsed, including `^[...]` inline footnotes. Reversible: the previous ' +
+      'version is kept in page history.',
+    tier: 'deferred',
+    catalogLine:
+      "updatePageMarkdown — replace a page's body (and optionally title) with new Markdown.",
+    buildShape: (z) => ({
+      pageId: z.string().min(1).describe('The id of the page to update.'),
+      content: z.string().describe('The new page body as Markdown.'),
+      title: z
+        .string()
+        .optional()
+        .describe('Optional new title for the page.'),
+    }),
+    // Single canonical execute on BOTH hosts (the tool was in-app only before,
+    // so there is no external-MCP behavior to preserve). NOTE (rename #411): the
+    // old inline in-app tool projected the client result to { pageId, updated };
+    // the registry now returns the raw client result { success, modified,
+    // message, pageId, verify? } instead. Deliberate: no code reads the removed
+    // `.updated` field, the raw result is strictly more informative to the model
+    // (it surfaces footnote/verify warnings), and it matches the on-both-hosts
+    // registry convention. The result-shape change is the ONLY behavior delta of
+    // this rename; the write path (updatePage -> markdown canonicalize) is identical.
+    execute: (client, { pageId, content, title }) =>
+      client.updatePage(pageId as string, content as string, title as string | undefined),
   },
 
   exportPageMarkdown: {

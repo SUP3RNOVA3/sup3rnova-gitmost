@@ -80,7 +80,7 @@ describe('SHARED_TOOL_SPECS contract parity', () => {
 
   // Type as the (optional-buildShape) SharedToolSpec; the `satisfies` literal
   // above otherwise narrows to a union where some members lack buildShape.
-  const specEntries = Object.entries(SHARED_TOOL_SPECS) as Array<
+  const specEntries = Object.entries(SHARED_TOOL_SPECS) as unknown as Array<
     [string, loader.SharedToolSpec]
   >;
 

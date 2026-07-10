@@ -307,8 +307,8 @@ export class AiChatToolsService {
 
     // The in-app toolset. It starts with the tools kept INLINE here for a
     // documented per-layer reason: an intentional behaviour/schema divergence from
-    // the standalone MCP surface (searchPages' hybrid RRF, updatePageContent's
-    // Markdown write, transformPage's guardrailed shorter schema), a
+    // the standalone MCP surface (searchPages' hybrid RRF,
+    // transformPage's guardrailed shorter schema), a
     // snake_case/camelCase naming clash the shared registry forbids (getTable vs
     // the MCP `table_get`), per-request state the registry loop cannot provide
     // (getCurrentPage reads the resolved openedPage; searchPages closes over the
@@ -451,28 +451,13 @@ export class AiChatToolsService {
       }),
 
       // --- WRITE tools (all reversible — history/trash; §6.5 / D3) ---
-
-      updatePageContent: tool({
-        description:
-          "Replace a page's body with new Markdown content (and optionally its " +
-          'title). Reversible: the previous version is kept in page history.',
-        inputSchema: modelFriendlyInput({
-          pageId: z.string().describe('The id of the page to update.'),
-          content: z.string().describe('The new page body as Markdown.'),
-          title: z
-            .string()
-            .optional()
-            .describe('Optional new title for the page.'),
-        }),
-        execute: async ({ pageId, content, title }) => {
-          // updatePage mutates the live collab doc -> provenance flows from the
-          // collab-token provider. Returns { success, modified, message, pageId }.
-          const result = (await client.updatePage(pageId, content, title)) as {
-            success?: boolean;
-          };
-          return { pageId, updated: result?.success ?? true };
-        },
-      }),
+      //
+      // NOTE (issue #411): the plain-Markdown full-body-replace tool is no longer
+      // inline here — it moved to @docmost/mcp's SHARED_TOOL_SPECS as
+      // `updatePageMarkdown` (was inline `updatePageContent`) so it registers on
+      // BOTH the external MCP and the in-app agent. The registry loop below adds
+      // it under its inAppKey. importPageMarkdown stays a shared spec too (now
+      // inAppOnly — dropped from the external MCP surface, kept in-app).
 
       listSidebarPages: tool({
         description:

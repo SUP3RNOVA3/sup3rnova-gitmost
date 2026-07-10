@@ -155,6 +155,10 @@ All 41 tools, grouped by what you'd reach for them.
 - **`update_page_json`** — Replace a page's entire content with a ProseMirror document
   (bulk rewrites, or when nodes lack ids). `content` is optional — omit it to update only
   the title. Keeps the block ids you pass in, so heading anchors and history stay stable.
+- **`update_page_markdown`** — Replace a page's body (and optionally its title) with new
+  **plain Markdown**. The whole body is re-imported (block ids regenerate — for surgical or
+  id-preserving edits prefer `edit_page_text` / `patch_node` / `update_page_json`).
+  Docmost-flavoured markdown is parsed, including `^[...]` inline footnotes.
 - **`docmost_transform`** — The agent-native editing interface: instead of retyping a
   document, the agent **writes a function that fixes it**. Edit a page by running an
   arbitrary **`(doc, ctx) => doc` JavaScript transform** against its *live* ProseMirror
@@ -184,13 +188,13 @@ All 41 tools, grouped by what you'd reach for them.
 
 - **`export_page_markdown`** — Export a page to a single self-contained, **lossless
   Docmost-flavoured Markdown** file: a meta header, the body with inline comment anchors
-  and diagrams, and a trailing comments-thread block. Built for a download → edit body →
-  `import_page_markdown` round-trip that preserves everything, including comment highlights.
-- **`import_page_markdown`** — Replace a page's content from a Docmost-flavoured Markdown
-  file produced by `export_page_markdown`, restoring comment-highlight anchors and diagrams
-  from their inline HTML. (Comment *threads* in the file are not re-created on the server —
-  only the page body and inline comment marks are written; manage threads via the comment
-  tools/UI.)
+  and diagrams, and a trailing comments-thread block. To replace a page's body from plain
+  authoring Markdown, use `update_page_markdown`.
+
+> **Removed in this release:** `import_page_markdown` (the round-trip parser for an
+> exported Docmost-Markdown file) is **no longer exposed on the external MCP surface**.
+> To replace a page's body from Markdown, use **`update_page_markdown`** (plain Markdown
+> body replace). See the CHANGELOG for the migration note.
 
 ### Images
 
@@ -256,7 +260,8 @@ so capable clients steer the model automatically.
   `delete_node`, addressing the node by its `attrs.id` from `get_page_json`.
 - **Images**: `insert_image` / `replace_image`.
 - **A new page**: `create_page`.
-- **Bulk rewrite, or nodes without ids**: `update_page_json`.
+- **Bulk rewrite, or nodes without ids**: `update_page_json` (ProseMirror) or
+  `update_page_markdown` (plain Markdown body replace).
 - **Multi-step / scripted rewrite** (renumbering, footnotes, coordinated edits):
   `docmost_transform` — preview with `dryRun`, then apply.
 - **Copy a whole page's content from another page** (server-side): `copy_page_content`.
@@ -269,8 +274,8 @@ so capable clients steer the model automatically.
   `get_node`.
 - **Tables** (add/remove a row, set a cell): `table_get` / `table_insert_row` /
   `table_delete_row` / `table_update_cell`.
-- **Round-trip a page as Markdown** (download, edit, re-upload losslessly with comments):
-  `export_page_markdown` / `import_page_markdown`.
+- **Export a page as self-contained Markdown** (with comment anchors): `export_page_markdown`.
+- **Replace a page's body from Markdown**: `update_page_markdown`.
 
 ---
 
