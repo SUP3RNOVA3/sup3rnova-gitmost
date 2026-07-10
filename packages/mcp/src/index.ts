@@ -435,30 +435,63 @@ server.registerTool(
 // Tool: search
 // INTENTIONAL per-transport divergence (not shared): the in-app `searchPages`
 // runs a semantic + keyword hybrid (RRF) with in-process access control and a
-// different schema (limit 1-20); this transport is a plain REST full-text search
-// (limit up to 100). Different behaviour AND schema, so kept per-layer.
+// different schema; this transport is the #443 agent-lookup search — a hybrid
+// substring + full-text search that also returns each hit's location (`path`)
+// and a windowed `snippet`, so one call answers "where is it and what's in it".
+// The in-app hybrid-RRF search is deliberately NOT touched. Different behaviour
+// AND schema, so kept per-layer.
+//
+// STANDALONE-vs-STOCK-UPSTREAM: the client sends the opt-in `substring`/
+// `parentPageId`/`titleOnly` DTO fields. A stock upstream server validates the
+// DTO with `whitelist: true` and silently strips these unknown fields, so the
+// request degrades gracefully to plain FTS (no path/snippet, current shape).
+//
+// EE/TYPESENSE DEGRADATION (#443): on an instance whose SEARCH_DRIVER is
+// `typesense`, the server routes this request to the Typesense backend, which
+// does NOT implement agent-lookup — the substring/path/snippet/tiering is
+// ignored and the response degrades to plain Typesense FTS. The rich lookup
+// shape is only produced by the native Postgres search driver.
 server.registerTool(
   "search",
   {
     description:
-      "Full-text search for pages and content across the whole workspace. " +
-      "Results are bounded by `limit` (1-100; when omitted the server applies " +
-      "its own default).",
+      "Find pages by a fragment of a technical string (hostnames, IPs, IDs " +
+      "like `srv.local`, `10.0.12`, `WB-MGE-30D86B`) — one call returns each " +
+      "hit's location (`path`: ancestor titles root→parent) and a `snippet` " +
+      "around the first match, so you rarely need a follow-up get_page. " +
+      "Matches substrings literally (dots/dashes/digits are not tokenized) as " +
+      "well as full-text. Returns `{ pageId, title, path, snippet, score }` " +
+      "sorted by `score` (a per-response relevance float).",
     inputSchema: {
       query: z.string().min(1).describe("Search query"),
+      spaceId: z
+        .string()
+        .optional()
+        .describe("Restrict the search to a single space"),
+      parentPageId: z
+        .string()
+        .optional()
+        .describe(
+          "Restrict to a page and all its descendants (the page itself included)",
+        ),
+      titleOnly: z
+        .boolean()
+        .optional()
+        .describe("Match page titles only; skip page text"),
       limit: z
         .number()
         .int()
         .min(1)
-        .max(100)
+        .max(50)
         .optional()
-        .describe("Max results to return (max 100)"),
+        .describe("Max results to return (1-50, default 10)"),
     },
   },
-  async ({ query, limit }) => {
-    // The tool exposes no spaceId filter, so pass undefined for the client's
-    // optional spaceId parameter and forward limit into its correct slot.
-    const result = await docmostClient.search(query, undefined, limit);
+  async ({ query, spaceId, parentPageId, titleOnly, limit }) => {
+    const result = await docmostClient.search(query, spaceId, limit, {
+      parentPageId,
+      titleOnly,
+    });
     return jsonContent(result);
   },
 );
