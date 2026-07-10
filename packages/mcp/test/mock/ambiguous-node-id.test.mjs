@@ -133,8 +133,10 @@ test("patchNode REFUSES an ambiguous (duplicate) id without writing to collab", 
   await assert.rejects(
     () =>
       client.patchNode("11111111-1111-4111-8111-111111111111", DUP_ID, {
-        type: "paragraph",
-        content: [{ type: "text", text: "replacement" }],
+        node: {
+          type: "paragraph",
+          content: [{ type: "text", text: "replacement" }],
+        },
       }),
     /ambiguous/i,
     "patchNode must reject a duplicate-id target with an 'ambiguous' error",

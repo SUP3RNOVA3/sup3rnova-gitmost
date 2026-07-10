@@ -135,7 +135,7 @@ test("patchNode fails fast on a nested typeless node — no collab connection", 
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
   await assert.rejects(
-    () => client.patchNode(PAGE, SEED_ID, nestedTypelessNode()),
+    () => client.patchNode(PAGE, SEED_ID, { node: nestedTypelessNode() }),
     (err) => {
       assert.match(err.message, /patchNode: invalid node/);
       assert.match(err.message, /missing "type"/);
@@ -158,9 +158,13 @@ test("insertNode fails fast on a nested UNKNOWN type — no collab connection", 
 
   await assert.rejects(
     () =>
-      client.insertNode(PAGE, nestedUnknownTypeNode(), {
-        position: "append",
-      }),
+      client.insertNode(
+        PAGE,
+        { node: nestedUnknownTypeNode() },
+        {
+          position: "append",
+        },
+      ),
     (err) => {
       assert.match(err.message, /insertNode: invalid node/);
       assert.match(err.message, /unknown node type "paragraf"/);
@@ -225,8 +229,10 @@ test("patchNode with a well-formed node proceeds to the collab write", async () 
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
   const result = await client.patchNode(PAGE, SEED_ID, {
-    type: "paragraph",
-    content: [{ type: "text", text: "replacement" }],
+    node: {
+      type: "paragraph",
+      content: [{ type: "text", text: "replacement" }],
+    },
   });
 
   assert.equal(result.success, true);

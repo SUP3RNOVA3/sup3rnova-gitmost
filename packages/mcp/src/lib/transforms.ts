@@ -775,6 +775,61 @@ export function insertInlineFootnote(
 }
 
 /**
+ * Merge an ARRAY of footnote definitions (e.g. the definitions lifted from an
+ * imported markdown FRAGMENT) into `doc`\'s footnote list, then re-derive the
+ * canonical footnote topology — the SAME two-step machinery `insertInlineFootnote`
+ * uses (`appendDefinition` -> `normalizeAndMergeFootnotes` -> `canonicalizeFootnotes`).
+ *
+ * The fragment\'s `footnoteReference` nodes are assumed to ALREADY be spliced into
+ * `doc` (inside the just-inserted blocks) with ids matching these definitions, so
+ * after appending the definitions the canonicalizer orders/numbers everything by
+ * first-reference order, merges content-identical notes, and drops any orphan.
+ * Same documented caveat as every other write path: full canonicalization drops a
+ * definition no reference points at.
+ *
+ * NOT merely a no-op when `definitions` is empty: it still canonicalizes when
+ * the (post-splice) `doc` carries footnote artifacts (a `footnotesList` or any
+ * `footnoteReference`), so a splice that removed the LAST referrer of a page
+ * footnote drops the now-orphaned definition — matching a full page re-import
+ * (which always canonicalizes) and preserving the "canonically identical to the
+ * same content imported whole" invariant. A truly footnote-free doc (no artifacts
+ * and no definitions) is returned untouched — the fast path, no clone. When the
+ * work runs it goes through the pure passes (which clone), so the caller\'s `doc`
+ * is not mutated.
+ */
+export function mergeFootnoteDefinitions(doc: any, definitions: any[]): any {
+  const defs = Array.isArray(definitions) ? definitions : [];
+  // True fast path ONLY when there is nothing to merge AND nothing to canonicalize
+  // away; otherwise fall through so an orphan left by a splice is still dropped.
+  if (defs.length === 0 && !hasFootnoteArtifacts(doc)) return doc;
+  // Clone before appending: `appendDefinition` mutates in place, and the caller
+  // must not see a half-merged doc if a later pass throws.
+  let working = clone(doc);
+  for (const def of defs) {
+    appendDefinition(working, def);
+  }
+  // #419: normalize + merge glyph-forked definitions before canonicalizing.
+  working = normalizeAndMergeFootnotes(working);
+  working = canonicalizeFootnotes(working);
+  return working;
+}
+
+/**
+ * True if `doc`'s tree contains any `footnotesList` node OR any
+ * `footnoteReference` node. Used to decide whether an empty-`definitions` merge
+ * must still canonicalize (to drop an orphan a splice left behind).
+ */
+function hasFootnoteArtifacts(doc: any): boolean {
+  let found = false;
+  walk(doc, (n) => {
+    if (isObject(n) && (n.type === "footnotesList" || n.type === "footnoteReference")) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+/**
  * Append a definition node so the canonicalizer can order/place it: into the
  * first existing footnotesList, or a new trailing list when none exists.
  */

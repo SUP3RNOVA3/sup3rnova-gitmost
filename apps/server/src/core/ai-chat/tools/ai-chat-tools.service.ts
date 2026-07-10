@@ -62,7 +62,7 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.listSidebarPages(s, s);
   void client.getOutline(s);
   void client.getPageJson(s);
-  void client.getNode(s, s);
+  void client.getNode(s, s, 'markdown');
   void client.searchInPage(s, s, {
     regex: true,
     caseSensitive: true,
@@ -84,12 +84,16 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.movePage(s, s, s);
   void client.deletePage(s);
   void client.editPageText(s, edits);
-  void client.patchNode(s, s, node);
-  void client.insertNode(s, node, {
-    position: 'append',
-    anchorNodeId: s,
-    anchorText: s,
-  });
+  void client.patchNode(s, s, { markdown: s, node });
+  void client.insertNode(
+    s,
+    { markdown: s, node },
+    {
+      position: 'append',
+      anchorNodeId: s,
+      anchorText: s,
+    },
+  );
   void client.deleteNode(s, s);
   void client.updatePageJson(s, node, s);
   void client.tableInsertRow(s, s, cells, n);

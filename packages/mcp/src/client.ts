@@ -32,9 +32,12 @@ import {
 } from "./lib/markdown-document.js";
 import {
   replaceNodeById,
+  replaceNodeByIdWithMany,
+  reassignCollidingBlockIds,
   deleteNodeById,
   assertUnambiguousMatch,
   insertNodeRelative,
+  insertNodesRelative,
   blockPlainText,
   buildOutline,
   getNodeByRef,
@@ -44,6 +47,11 @@ import {
   updateTableCell,
   findInvalidNode,
 } from "@docmost/prosemirror-markdown";
+import {
+  importMarkdownFragment,
+  canBeDocChild,
+  findUnrepresentableTableAttrs,
+} from "./lib/markdown-fragment.js";
 import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
 import {
@@ -83,6 +91,7 @@ import {
   commentsToFootnotes,
   canonicalizeFootnotes,
   insertInlineFootnote,
+  mergeFootnoteDefinitions,
 } from "./lib/transforms.js";
 import { normalizeAndMergeFootnotes } from "./lib/footnote-normalize-merge.js";
 import vm from "node:vm";
@@ -1298,12 +1307,31 @@ export class DocmostClient {
   }
 
   /**
-   * Fetch a single node's full ProseMirror subtree (lossless) by reference:
-   * a block id (headings/paragraphs/callouts/images), or `#<index>` to select
-   * a top-level block by its outline index (the only way to reach tables/rows/
-   * cells, which carry no id).
+   * Fetch a single block for editing by reference: a block id (headings/
+   * paragraphs/callouts/images), or `#<index>` to select a top-level block by its
+   * outline index (the only way to reach tables/rows/cells, which carry no id).
+   *
+   * `format` (#413):
+   *  - `"markdown"` (DEFAULT): serialize the block via the canonical converter
+   *    (`{type:"doc",content:[node]}` -> `convertProseMirrorToMarkdown`) — a read
+   *    "for editing": pair it with `patchNode({markdown})` to rewrite the block.
+   *    Comment anchors (`<span data-comment-id>`, INCLUDING resolved ones) are
+   *    NOT stripped here (unlike getPage): losing them on write-back would
+   *    orphan the thread. Returns `{ ..., format:"markdown", markdown }`.
+   *  - `"json"`: return the raw ProseMirror subtree as-is (lossless; the previous
+   *    default). Returns `{ ..., format:"json", node }`.
+   *
+   * AUTO fallback: a type that cannot be a document top-level child
+   * (tableRow/tableCell/tableHeader, addressed by `#<index>`) is NOT expressible
+   * as a standalone markdown document, so a `"markdown"` request for such a node
+   * transparently falls back to JSON with an explicit `format:"json"` field. The
+   * check derives from the schema's `doc` contentMatch, so it tracks the schema.
    */
-  async getNode(pageId: string, nodeId: string) {
+  async getNode(
+    pageId: string,
+    nodeId: string,
+    format: "markdown" | "json" = "markdown",
+  ) {
     await this.ensureAuthenticated();
     const data = await this.getPageRaw(pageId);
     const hit = getNodeByRef(
@@ -1315,12 +1343,35 @@ export class DocmostClient {
         `getNode: no node found for "${nodeId}" on page ${pageId} (use a block id from getOutline, or "#<index>" for a top-level block such as a table)`,
       );
     }
+
+    // JSON requested (or a non-top-level type that markdown cannot represent as a
+    // standalone document): return the subtree verbatim.
+    if (format === "json" || !canBeDocChild(hit.type)) {
+      return {
+        pageId,
+        ref: nodeId,
+        path: hit.path,
+        type: hit.type,
+        format: "json" as const,
+        node: hit.node,
+      };
+    }
+
+    // Markdown: wrap the node as a one-block doc and run the canonical converter.
+    // Comment anchors are DELIBERATELY preserved (converter default) so a
+    // getNode(markdown) -> edit -> patchNode(markdown) round trip does not orphan
+    // a comment thread; this differs from getPage, which strips them.
+    const markdown = convertProseMirrorToMarkdown({
+      type: "doc",
+      content: [hit.node],
+    });
     return {
       pageId,
       ref: nodeId,
       path: hit.path,
       type: hit.type,
-      node: hit.node,
+      format: "markdown" as const,
+      markdown,
     };
   }
 
@@ -2307,17 +2358,61 @@ export class DocmostClient {
   }
 
   /**
-   * Replace EVERY node whose attrs.id === nodeId (recursively, including nodes
-   * nested in callouts/tables) with the supplied node. Operates on the LIVE
-   * collab document so comments and concurrent edits are preserved.
+   * Replace the block whose attrs.id === nodeId. Operates on the LIVE collab
+   * document so comments and concurrent edits are preserved.
    *
-   * The replacement node's block id is preserved: if node.attrs is missing it
-   * is created, and if node.attrs.id is missing it is set to nodeId so the
-   * replacement keeps the same id it replaced. Throws if no node matches.
+   * Exactly one of `input.markdown` / `input.node` (#413):
+   *  - `markdown` (RECOMMENDED): the block is rewritten from a canonical markdown
+   *    fragment. The fragment may import to N blocks (a "1 -> N" splice: rewrite a
+   *    whole section in one call). The FIRST resulting block INHERITS the target's
+   *    `attrs.id` (so an existing comment anchoring the block by id survives); the
+   *    rest get FRESH ids. `^[...]` footnotes in the fragment are first-class:
+   *    their definitions merge into the page's TAIL footnote list (content-key
+   *    dedup + canonicalize), same machinery insertFootnote uses. REJECTED when
+   *    the TARGET block carries a table-cell attribute markdown cannot represent
+   *    (colspan/rowspan/colwidth/background) — use the table tools or `node`.
+   *  - `node`: a raw ProseMirror node for precise attr/mark work. The replacement
+   *    keeps the target id (if `node.attrs.id` is missing it is set to nodeId).
+   *
+   * #159 ambiguous-id semantics are unchanged: 0 matches -> "no node"; >1 matches
+   * -> "ambiguous, refused" (nothing written), on BOTH paths — the markdown path
+   * runs a dry `replaceNodeById` count first, so a duplicated id never splices.
    */
-  async patchNode(pageId: string, nodeId: string, node: any) {
+  async patchNode(
+    pageId: string,
+    nodeId: string,
+    input: { markdown?: string; node?: any },
+  ) {
     await this.ensureAuthenticated();
 
+    // XOR: exactly one of markdown / node. Both optional in the schema; the
+    // runtime enforces the recommendation ("markdown for prose, node for fine
+    // work") without letting an ambiguous both-or-neither call through.
+    const hasMd =
+      input != null &&
+      typeof input.markdown === "string" &&
+      input.markdown.trim() !== "";
+    const hasNode = input != null && input.node != null;
+    if (hasMd === hasNode) {
+      throw new Error(
+        "patchNode: provide exactly one of `markdown` (recommended, for prose) " +
+          "or `node` (a raw ProseMirror node, for precise attr/mark work)",
+      );
+    }
+
+    if (hasMd) {
+      return this.patchNodeMarkdown(pageId, nodeId, input.markdown as string);
+    }
+    return this.patchNodeJson(pageId, nodeId, input.node);
+  }
+
+  /**
+   * patchNode with a raw ProseMirror `node` (the pre-#413 behavior). Replaces
+   * EVERY node whose attrs.id === nodeId; the swapped-in node keeps the target
+   * id. #159 ambiguity refused. Split out so the markdown path can reuse the
+   * shared collab/guard plumbing without a giant branch.
+   */
+  private async patchNodeJson(pageId: string, nodeId: string, node: any) {
     if (!node || typeof node !== "object" || typeof node.type !== "string") {
       throw new Error(
         "patchNode: `node` must be an object with a string `type`",
@@ -2382,22 +2477,143 @@ export class DocmostClient {
   }
 
   /**
-   * Insert a node relative to an anchor (or append it at the top level).
+   * patchNode with a MARKDOWN fragment (#413). Imports the fragment through the
+   * canonical importer, then 1 -> N splices the resulting blocks in place of the
+   * target block on the LIVE collab doc:
+   *  - the FIRST block inherits the target's id; the rest get FRESH ids (minted
+   *    by the importer/id-remap, so neighbour blocks are untouched);
+   *  - `^[...]` footnote definitions merge into the page's tail list;
+   *  - REJECTED when the target block carries a markdown-unrepresentable table
+   *    attr (colspan/rowspan/colwidth/background) — guarding against silent loss;
+   *  - #159 ambiguity is enforced by a dry `replaceNodeById` count BEFORE the
+   *    splice, so a duplicated id never writes.
+   */
+  private async patchNodeMarkdown(
+    pageId: string,
+    nodeId: string,
+    markdown: string,
+  ) {
+    // Import the fragment up front (network-free, canonical) so a bad fragment
+    // fails before any collab connection or page lock.
+    const { blocks, definitions } = await importMarkdownFragment(markdown);
+
+    // The first imported block inherits the target id; the rest keep the fresh
+    // ids the importer assigned. Build the thread now so it is stable across a
+    // collab retry (the transform below is pure over its inputs).
+    const threaded = blocks.map((b, i) => {
+      if (i !== 0) return b;
+      return {
+        ...b,
+        attrs: {
+          ...(b && typeof b.attrs === "object" ? b.attrs : {}),
+          id: nodeId,
+        },
+      };
+    });
+
+    // Shape-validate every imported block up front (parity with the JSON path):
+    // the importer only emits schema nodes, but the check is cheap insurance and
+    // yields the same rich #409 diagnostics if the schema ever drifts.
+    for (const b of threaded) {
+      this.assertValidNodeShape("patchNode", b);
+    }
+
+    const collabToken = await this.getCollabTokenWithReauth();
+    // Open the collab doc by the canonical UUID, never the slugId (#260).
+    const pageUuid = await this.resolvePageId(pageId);
+
+    let replaced = 0;
+    let guardAttrs: string | null = null;
+    const mutation = await mutatePageContent(
+      pageUuid,
+      collabToken,
+      this.apiUrl,
+      (liveDoc) => {
+        replaced = 0;
+        guardAttrs = null;
+
+        // #159: count matches with the same recursive walk the JSON path uses;
+        // only an UNAMBIGUOUS single match may write. A dry count keeps the
+        // ambiguity semantics identical across both paths.
+        const { replaced: count } = replaceNodeById(liveDoc, nodeId, {
+          type: "paragraph",
+        });
+        replaced = count;
+        if (count !== 1) return null;
+
+        // Guard against SILENT LOSS: if the target block carries a table-cell
+        // attribute markdown cannot represent (colspan/rowspan/colwidth/
+        // background), refuse the markdown rewrite so those attrs are not
+        // dropped. Simple tables (no such attrs) rewrite fine.
+        const hit = getNodeByRef(liveDoc, nodeId);
+        guardAttrs = hit ? findUnrepresentableTableAttrs(hit.node) : null;
+        if (guardAttrs != null) return null;
+
+        // Re-mint any minted block id that collides with an existing page id
+        // (skip index 0: its id is intentionally the target nodeId, unique by
+        // the #159 dry-count above), so the 1 -> N splice stays page-wide unique.
+        reassignCollidingBlockIds(liveDoc, threaded, 0);
+
+        // 1 -> N splice, then merge any fragment footnote definitions into the
+        // page's tail list and re-derive canonical footnote numbering.
+        const { doc: spliced } = replaceNodeByIdWithMany(
+          liveDoc,
+          nodeId,
+          threaded,
+        );
+        return mergeFootnoteDefinitions(spliced, definitions);
+      },
+    );
+
+    // Surface the guard rejection with an actionable message (nothing written).
+    if (guardAttrs != null) {
+      throw new Error(
+        `patchNode: the target block has table-cell attributes markdown cannot ` +
+          `represent (${guardAttrs}) — a markdown rewrite would drop them. Use ` +
+          `the table tools (tableUpdateCell/tableInsertRow) or pass a raw ` +
+          `ProseMirror \`node\` instead of \`markdown\`.`,
+      );
+    }
+
+    // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform skipped the write
+    // for any count !== 1). Shared #159 guard, identical to the JSON path.
+    assertUnambiguousMatch("patchNode", "replace", replaced, nodeId, pageId);
+
+    return {
+      success: true,
+      replaced,
+      nodeId,
+      blocks: threaded.length,
+      verify: mutation.verify,
+    };
+  }
+
+  /**
+   * Insert content relative to an anchor (or append it at the top level).
    * Operates on the LIVE collab document so comments and concurrent edits are
    * preserved.
    *
+   * Exactly one of `input.markdown` / `input.node` (#413):
+   *  - `markdown` (RECOMMENDED): a canonical markdown fragment. It may import to
+   *    SEVERAL blocks — they are inserted IN ORDER at the anchor. `^[...]`
+   *    footnote definitions merge into the page's tail list (same machinery as
+   *    insertFootnote). Every inserted block gets a fresh id.
+   *  - `node`: a raw ProseMirror node for precise attr/mark work, or to insert
+   *    table structure (a bare tableRow/tableCell/tableHeader — NOT expressible in
+   *    markdown, so those stay JSON-only).
+   *
    * opts.position:
-   *  - "append": push the node at the end of the top-level content.
-   *  - "before"/"after": insert the node as a sibling of the anchor, just
-   *    before/after it. Exactly one of anchorNodeId / anchorText must be given;
-   *    anchorNodeId locates a node anywhere by attrs.id, anchorText matches the
-   *    first top-level block whose plain text includes it.
+   *  - "append": push the content at the end of the top-level content.
+   *  - "before"/"after": insert as a sibling of the anchor, just before/after it.
+   *    Exactly one of anchorNodeId / anchorText must be given; anchorNodeId
+   *    locates a node anywhere by attrs.id, anchorText matches the first top-level
+   *    block whose plain text includes it.
    *
    * Throws if the anchor cannot be found.
    */
   async insertNode(
     pageId: string,
-    node: any,
+    input: { markdown?: string; node?: any },
     opts: {
       position: "before" | "after" | "append";
       anchorNodeId?: string;
@@ -2406,11 +2622,19 @@ export class DocmostClient {
   ) {
     await this.ensureAuthenticated();
 
-    if (!node || typeof node !== "object" || typeof node.type !== "string") {
+    // XOR: exactly one of markdown / node (both optional in the schema).
+    const hasMd =
+      input != null &&
+      typeof input.markdown === "string" &&
+      input.markdown.trim() !== "";
+    const hasNode = input != null && input.node != null;
+    if (hasMd === hasNode) {
       throw new Error(
-        "insertNode: `node` must be an object with a string `type`",
+        "insertNode: provide exactly one of `markdown` (recommended, for prose) " +
+          "or `node` (a raw ProseMirror node, for precise attr/mark work or table structure)",
       );
     }
+
     if (
       !opts ||
       (opts.position !== "before" &&
@@ -2434,10 +2658,32 @@ export class DocmostClient {
       }
     }
 
+    // Resolve the ordered list of blocks to insert plus any footnote definitions
+    // to merge. The markdown path imports canonically (so an inserted block is
+    // byte-identical to the same content in a full-page import); the node path is
+    // a single block with no footnote merge (raw JSON `^[...]` is not touched).
+    let blocks: any[];
+    let definitions: any[] = [];
+    if (hasMd) {
+      const frag = await importMarkdownFragment(input.markdown as string);
+      blocks = frag.blocks;
+      definitions = frag.definitions;
+    } else {
+      const node = input.node;
+      if (!node || typeof node !== "object" || typeof node.type !== "string") {
+        throw new Error(
+          "insertNode: `node` must be an object with a string `type`",
+        );
+      }
+      blocks = [node];
+    }
+
     // #409: fail fast on a malformed node SHAPE (a nested child with an
     // absent/unknown `type`) BEFORE opening a collab session or taking the page
     // lock — the root-only check above never sees nested children.
-    this.assertValidNodeShape("insertNode", node);
+    for (const b of blocks) {
+      this.assertValidNodeShape("insertNode", b);
+    }
 
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
@@ -2452,14 +2698,20 @@ export class DocmostClient {
       this.apiUrl,
       (liveDoc) => {
         inserted = false;
-        const { doc: nd, inserted: ins } = insertNodeRelative(
-          liveDoc,
-          node,
-          opts,
-        );
-        inserted = ins;
+        // Re-mint any minted block id that collides with an existing page id
+        // (all inserted blocks are fresh, no skip) so the splice stays unique.
+        if (hasMd) reassignCollidingBlockIds(liveDoc, blocks);
+        // Single-block node path keeps `insertNodeRelative` (it owns the
+        // structural table-node splicing); the markdown path uses the array
+        // splice so N blocks land in order at one anchor.
+        const res = hasMd
+          ? insertNodesRelative(liveDoc, blocks, opts)
+          : insertNodeRelative(liveDoc, blocks[0], opts);
+        inserted = res.inserted;
         if (!inserted) return null; // anchor not found -> skip the write entirely
-        return nd;
+        // Merge any fragment footnote definitions into the page tail list and
+        // re-derive canonical numbering (no-op when there are none).
+        return mergeFootnoteDefinitions(res.doc, definitions);
       },
     );
 
@@ -2482,6 +2734,7 @@ export class DocmostClient {
       success: true,
       inserted: true,
       position: opts.position,
+      blocks: blocks.length,
       verify: mutation.verify,
     };
   }
