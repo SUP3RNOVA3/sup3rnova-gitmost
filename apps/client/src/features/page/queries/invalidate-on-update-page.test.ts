@@ -75,6 +75,65 @@ describe("invalidateOnUpdatePage — pointwise embed-cache patch", () => {
     expect(p1.title).toBe("Keep");
   });
 
+  // The sidebar-pages cache (InfiniteData) is patched on the same event. It must
+  // carry the SAME undefined-guard as the embed path above — otherwise a
+  // title-only event's icon:undefined would wipe the sidebar entry's icon.
+  const sidebarKey = ["sidebar-pages", { pageId: "parent-1", spaceId: "s1" }];
+  const seedSidebar = () =>
+    h.qc.setQueryData(sidebarKey, {
+      pageParams: [undefined],
+      pages: [
+        {
+          items: [
+            { id: "p1", title: "Old", icon: "📄", spaceId: "s1" } as IPage,
+            { id: "p2", title: "Other", icon: "📁", spaceId: "s1" } as IPage,
+          ],
+        },
+      ],
+    });
+  const sidebarItem = (id: string) => {
+    const data = h.qc.getQueryData(sidebarKey) as {
+      pages: { items: IPage[] }[];
+    };
+    return data.pages[0].items.find((p) => p.id === id)!;
+  };
+
+  it("sidebar cache: title-only event updates title but PRESERVES the icon", () => {
+    seedSidebar();
+
+    invalidateOnUpdatePage(
+      "s1",
+      "parent-1",
+      "p1",
+      "New Title",
+      undefined as unknown as string,
+    );
+
+    const p1 = sidebarItem("p1");
+    expect(p1.title).toBe("New Title");
+    expect(p1.icon).toBe("📄"); // preserved, not wiped
+    // Sibling untouched.
+    const p2 = sidebarItem("p2");
+    expect(p2.title).toBe("Other");
+    expect(p2.icon).toBe("📁");
+  });
+
+  it("sidebar cache: icon-only event updates icon but PRESERVES the title", () => {
+    seedSidebar();
+
+    invalidateOnUpdatePage(
+      "s1",
+      "parent-1",
+      "p1",
+      undefined as unknown as string,
+      "🚀",
+    );
+
+    const p1 = sidebarItem("p1");
+    expect(p1.icon).toBe("🚀");
+    expect(p1.title).toBe("Old"); // preserved, not wiped
+  });
+
   it("does not touch a subtree that lacks the updated node", () => {
     const otherKey = ["page-tree", "unrelated"];
     const before = [

@@ -636,7 +636,14 @@ export function invalidateOnUpdatePage(
           ...page,
           items: page.items.map((sidebarPage: IPage) =>
             sidebarPage.id === id
-              ? { ...sidebarPage, title: title, icon: icon }
+              ? {
+                  ...sidebarPage,
+                  // Guard undefined so a title-only event can't wipe the icon
+                  // (and vice versa) in the sidebar-pages cache — mirrors the
+                  // embed-cache patch above.
+                  ...(title !== undefined ? { title } : {}),
+                  ...(icon !== undefined ? { icon } : {}),
+                }
               : sidebarPage,
           ),
         })),
