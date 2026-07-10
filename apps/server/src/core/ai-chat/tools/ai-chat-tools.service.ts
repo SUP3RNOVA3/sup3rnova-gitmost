@@ -12,6 +12,7 @@ import {
   loadDocmostMcp,
   type DocmostClientLike,
   type SharedToolSpec,
+  type CommentSignalTrackerLike,
 } from './docmost-client.loader';
 import {
   resolveCurrentPageResult,
@@ -168,7 +169,8 @@ export class AiChatToolsService {
     // provenance tokens) and load the shared tool-spec registry. Client
     // construction is shared with the page-change detection path (#274) via
     // buildDocmostClient so both go over the exact same authenticated route.
-    const { sharedToolSpecs } = await loadDocmostMcp();
+    const { sharedToolSpecs, createCommentSignalTracker } =
+      await loadDocmostMcp();
     const client = await this.buildDocmostClient(
       user,
       sessionId,
@@ -196,7 +198,7 @@ export class AiChatToolsService {
         execute,
       });
 
-    return {
+    const tools: Record<string, Tool> = {
       // INTENTIONAL per-transport divergence (not in the shared registry): this
       // in-app search runs a semantic + keyword hybrid (RRF) with in-process
       // access control and a tuned schema (limit 1-20); the standalone MCP
@@ -838,7 +840,218 @@ export class AiChatToolsService {
           await client.transformPage(pageId, transformJs, { dryRun }),
       }),
     };
+
+    // Passive "new comments: N" signal (#417). PER-TURN state (forUser runs once
+    // per turn), so the watermark starts now and only comments a human leaves
+    // WHILE this turn runs are signalled — exactly the mid-turn loop; between-turn
+    // comments stay the job of the <page_changed> snapshot + explicit
+    // checkNewComments. The count SOURCE is the same CASL-scoped loopback client
+    // as the tools (option 2, symmetric with the standalone MCP): a rate-limited
+    // listComments over the working-set pages. Chosen over the DB-count (option 1)
+    // deliberately — a CommentRepo dependency would change this service's
+    // constructor arity and force edits to every existing spec, breaking the
+    // "existing tests stay green unchanged" contract; the REST probe needs no new
+    // dependency and reuses the CASL enforcement already on `client`. When the
+    // loaded package predates #417 (factory undefined) or the loader is mocked in
+    // a unit test, signalling is a pure no-op and results are byte-identical.
+    if (!createCommentSignalTracker) return tools;
+
+    const tracker = createCommentSignalTracker({
+      probe: async (pageId: string, sinceMs: number) => {
+        const { items } = await client.listComments(pageId, true);
+        const count = (items as Array<{ createdAt?: string }>).filter((c) => {
+          const created = c?.createdAt ? new Date(c.createdAt).getTime() : NaN;
+          return Number.isFinite(created) && created > sinceMs;
+        }).length;
+        let title: string | undefined;
+        if (count > 0) {
+          // Title labels the signal; untrusted, defanged by the shared builder.
+          // Fetched only on a hit so the no-signal path never pays for it. Uses
+          // the LIGHT raw page info (title only) — mirroring the standalone MCP
+          // probe's getPageRaw — instead of the heavy getPage (which also renders
+          // Markdown + subpages) just to read one field.
+          try {
+            const res = (await client.getPageRaw(pageId)) as {
+              title?: string;
+            } | null;
+            title = res?.title ?? undefined;
+          } catch {
+            // Title is optional — omit it when the page can't be fetched.
+          }
+        }
+        return { count, title };
+      },
+    });
+
+    return wrapToolsWithCommentSignal(tools, tracker);
   }
+}
+
+/**
+ * Wrap each in-app tool so a passive "new comments: N" line (#417) reaches the
+ * MODEL without ever reshaping the tool's own output. NON-DESTRUCTIVE by design:
+ *  - notes the call's `pageId` (if any) into the working set;
+ *  - for a comment tool (listComments/checkNewComments/createComment) the result
+ *    is tautological, so no signal is added and the watermark is advanced instead
+ *    (the agent just consumed the feed);
+ *  - `execute` ALWAYS returns the RAW original result. In AI SDK v6 that raw
+ *    value is what streams to the UI and is persisted as the tool part's
+ *    `output` (see apps/client `toolCitations`, which reads `output.id/title`
+ *    and the searchPages array DIRECTLY), so `output` stays byte-identical to
+ *    the no-signal path and citations are never lost.
+ *  - the signal instead rides a SEPARATE channel the model sees but `output`
+ *    consumers do not: `toModelOutput`, which the SDK invokes only when building
+ *    the model-facing tool message (createToolModelOutput), independently of the
+ *    streamed `output`. When a line exists we emit an MCP-style multi-part
+ *    `content` result — the raw result as one text element plus the signal as a
+ *    SECOND element — mirroring the standalone MCP surface's extra content
+ *    element. With no line, `toModelOutput` reproduces the SDK's exact default
+ *    (string -> text, else json), so the model sees the identical result too.
+ * A per-`toolCallId` map bridges `execute` -> `toModelOutput` (both receive the
+ * toolCallId), so parallel tool calls never cross-talk. Exported for unit
+ * testing without a live model/transport.
+ *
+ * NOTE for future tool authors: this wrapper OWNS `toModelOutput` on every
+ * wrapped tool, but it COMPOSES rather than discards a tool's OWN
+ * `toModelOutput`. If a tool defines one, it is used as the base model output
+ * (honored verbatim on the no-signal path; flattened and kept, with the signal
+ * appended, on the signal path). A custom `toModelOutput` is therefore never
+ * silently dropped.
+ */
+export function wrapToolsWithCommentSignal(
+  tools: Record<string, Tool>,
+  tracker: CommentSignalTrackerLike,
+): Record<string, Tool> {
+  const wrapped: Record<string, Tool> = {};
+  // Bridges the dynamic per-call signal line from `execute` (where the tracker
+  // runs) to `toModelOutput` (the model-only channel). Keyed by toolCallId so
+  // concurrent tool calls cannot read each other's line; the entry is consumed
+  // (deleted) the first time toModelOutput reads it.
+  const pendingSignals = new Map<string, string>();
+
+  // The SDK's DEFAULT model-output shape for a tool result, reproduced verbatim
+  // so the no-signal path is model-identical to an unwrapped tool: a string
+  // becomes text, anything else becomes json (undefined -> null, as toJSONValue).
+  const defaultModelOutput = (output: unknown) =>
+    typeof output === 'string'
+      ? { type: 'text' as const, value: output }
+      : { type: 'json' as const, value: (output ?? null) as unknown };
+
+  // Flatten a BASE model-output (the tool's OWN toModelOutput result, or the SDK
+  // default) into SDK `content` parts, so the passive signal can be appended as a
+  // trailing text element WITHOUT discarding the base. Covers the three real SDK
+  // shapes (text/json/content); falls back defensively for anything else. Every
+  // returned item is a valid SDK content item (text, or a file part spread from
+  // an existing `content` base).
+  const modelOutputToParts = (base: unknown, rawOutput: unknown): unknown[] => {
+    const b = base as { type?: string; value?: unknown };
+    if (b?.type === 'text') {
+      return [{ type: 'text' as const, text: b.value as string }];
+    }
+    if (b?.type === 'json') {
+      // `?? null` keeps this symmetric with the fallback branch below: a tool that
+      // (invalidly) returns {type:'json', value:undefined} would otherwise yield a
+      // non-string text. No current tool defines toModelOutput, so this is defensive.
+      return [{ type: 'text' as const, text: JSON.stringify(b.value ?? null) }];
+    }
+    if (b?.type === 'content' && Array.isArray(b.value)) {
+      return [...b.value];
+    }
+    return [
+      { type: 'text' as const, text: JSON.stringify(b?.value ?? rawOutput ?? null) },
+    ];
+  };
+
+  for (const [name, toolDef] of Object.entries(tools)) {
+    const originalExecute = toolDef.execute;
+    // Capture the tool's OWN toModelOutput (if any) BEFORE we install ours. The
+    // comment-signal wrapper OWNS `toModelOutput` on the wrapped tool, but it
+    // COMPOSES rather than discards a tool-defined one: the base model output is
+    // computed from `origToModelOutput` when present (see below), so a future
+    // tool that ships its own `toModelOutput` is honored, not silently dropped.
+    const origToModelOutput = toolDef.toModelOutput;
+    if (typeof originalExecute !== 'function') {
+      wrapped[name] = toolDef;
+      continue;
+    }
+    wrapped[name] = {
+      ...toolDef,
+      execute: (async (args: unknown, opts: unknown) => {
+        const pageId =
+          args && typeof args === 'object'
+            ? (args as { pageId?: unknown }).pageId
+            : undefined;
+        tracker.noteWorkingPage(
+          typeof pageId === 'string' ? pageId : undefined,
+        );
+
+        const result = await (
+          originalExecute as (a: unknown, o: unknown) => Promise<unknown>
+        )(args, opts);
+
+        // Excluded comment tool: consume the feed, never signal. Raw result.
+        if (tracker.isExcludedTool(name)) {
+          tracker.advanceWatermark();
+          return result;
+        }
+        let line: string | null = null;
+        try {
+          line = await tracker.maybeSignal(name);
+        } catch {
+          line = null;
+        }
+        // Stash the line for toModelOutput (keyed by this call's id). The RAW
+        // result is ALWAYS returned unchanged so `part.output` is byte-identical
+        // to the no-signal path.
+        const toolCallId =
+          opts && typeof opts === 'object'
+            ? (opts as { toolCallId?: unknown }).toolCallId
+            : undefined;
+        if (line && typeof toolCallId === 'string') {
+          pendingSignals.set(toolCallId, line);
+        }
+        return result;
+      }) as Tool['execute'],
+      // Model-only delivery: append the signal as a SEPARATE content element,
+      // leaving the streamed/persisted `output` untouched (mirrors MCP). This
+      // OWNS toModelOutput but COMPOSES the tool's own (origToModelOutput) into
+      // the base, so a custom toModelOutput is honored on BOTH paths.
+      toModelOutput: ((info: {
+        toolCallId?: string;
+        input?: unknown;
+        output?: unknown;
+      }) => {
+        const { toolCallId, output } = info;
+        const line =
+          typeof toolCallId === 'string'
+            ? pendingSignals.get(toolCallId)
+            : undefined;
+        if (typeof toolCallId === 'string' && line !== undefined) {
+          pendingSignals.delete(toolCallId);
+        }
+        // BASE = the authoritative model-facing representation of THIS tool's
+        // result: the tool's own toModelOutput when it defined one, else the
+        // reproduced SDK default (string -> text, else json).
+        const base = origToModelOutput
+          ? (origToModelOutput as (i: unknown) => unknown)(info)
+          : defaultModelOutput(output);
+        // No signal: return the BASE unchanged — byte-identical to what the SDK
+        // (or the tool's own toModelOutput) would have produced.
+        if (!line) return base;
+        // Signal present: flatten BASE into content parts, then append the
+        // signal as a trailing text element — the model sees BOTH the tool's own
+        // model output AND the signal, with no `.result` wrapper to dig under.
+        return {
+          type: 'content' as const,
+          value: [
+            ...modelOutputToParts(base, output),
+            { type: 'text' as const, text: line },
+          ],
+        };
+      }) as Tool['toModelOutput'],
+    } as Tool;
+  }
+  return wrapped;
 }
 
 /** A single hybrid-search hit: the minimal shape selectAccessibleHits needs. */
