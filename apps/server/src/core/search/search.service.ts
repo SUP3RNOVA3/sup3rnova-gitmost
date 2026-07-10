@@ -378,10 +378,20 @@ export class SearchService {
     // Match predicate: title substring OR (unless titleOnly) text substring OR
     // (unless titleOnly) FTS. The substring branch runs even when the tsquery is
     // empty — that is the dotted/numeric-token case the FTS path misses.
+    //
+    // #443 dead-index fix: these two LIKE predicates MUST match the GIN trgm
+    // index expressions EXACTLY for Postgres to use them. The indexes are on the
+    // coalesce-FREE expressions `LOWER(f_unaccent(title))` (#348's
+    // idx_pages_title_trgm) and `LOWER(f_unaccent(text_content))` (this PR's
+    // idx_pages_text_content_trgm). A `coalesce(col,'')` wrapper here would make
+    // the query expression differ from the index expression and force a Seq Scan
+    // on pages for every lookup. Dropping coalesce is SEMANTICALLY EQUIVALENT:
+    // `NULL LIKE '%q%'` is NULL (falsy), so a NULL title/text simply doesn't
+    // match — exactly as an empty string wouldn't match `%q%`.
     candidates = candidates.where((eb) => {
       const ors = [
         eb(
-          sql`LOWER(f_unaccent(coalesce(pages.title, '')))`,
+          sql`LOWER(f_unaccent(pages.title))`,
           'like',
           sql`${likePattern} ESCAPE '\\'`,
         ),
@@ -389,7 +399,7 @@ export class SearchService {
       if (!searchParams.titleOnly) {
         ors.push(
           eb(
-            sql`LOWER(f_unaccent(coalesce(pages.text_content, '')))`,
+            sql`LOWER(f_unaccent(pages.text_content))`,
             'like',
             sql`${likePattern} ESCAPE '\\'`,
           ),

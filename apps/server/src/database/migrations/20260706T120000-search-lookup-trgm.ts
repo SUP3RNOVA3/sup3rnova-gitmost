@@ -8,11 +8,12 @@ import { type Kysely, sql } from 'kysely';
  * pages.text_content. A leading wildcard cannot use a b-tree index, so without a
  * GIN trigram index each such predicate is a sequential scan.
  *
- *  - TITLE: the title predicate is IDENTICAL to the one added for /search/suggest
- *    (#348), which already created `idx_pages_title_trgm` on
- *    `(LOWER(f_unaccent(title))) gin_trgm_ops`. We re-assert it here with
- *    `IF NOT EXISTS` so a fresh DB that somehow lacks it still gets it, and so
- *    this migration is self-describing. On an existing DB it is a no-op.
+ *  - TITLE: the lookup-mode title predicate is `LOWER(f_unaccent(title)) LIKE
+ *    '%q%'` (coalesce-free, so it can use a functional index), which is IDENTICAL
+ *    to the one added for /search/suggest (#348). #348's perf-indexes migration
+ *    already created `idx_pages_title_trgm` on `(LOWER(f_unaccent(title)))
+ *    gin_trgm_ops`, so the title predicate is already covered — we do NOT
+ *    re-create that index here (it would be redundant).
  *
  *  - TEXT_CONTENT: NEW. The substring branch scans text_content when the query
  *    is not titleOnly. text_content is the large column, so a GIN trigram index
@@ -34,15 +35,13 @@ import { type Kysely, sql } from 'kysely';
  * here). Small/typical tenants are unaffected.
  */
 export async function up(db: Kysely<any>): Promise<void> {
-  // Title trigram index — matches the lookup-mode title predicate exactly.
-  // Already present from #348 on existing DBs; re-asserted for freshness.
-  await sql`
-    CREATE INDEX IF NOT EXISTS idx_pages_title_trgm
-      ON pages USING gin ((LOWER(f_unaccent(title))) gin_trgm_ops)
-  `.execute(db);
+  // The title predicate is served by #348's idx_pages_title_trgm — see header.
+  // Only the text_content index is introduced here.
 
-  // text_content trigram index — accelerates the lookup-mode text substring
-  // predicate. Expression matches the predicate in search.service.ts.
+  // text_content trigram index. Its expression is coalesce-free —
+  // `LOWER(f_unaccent(text_content))` — to EXACTLY match the coalesce-free
+  // lookup-mode text substring predicate in search.service.ts, so Postgres can
+  // use it (a `coalesce(...)` mismatch would silently fall back to a Seq Scan).
   await sql`
     CREATE INDEX IF NOT EXISTS idx_pages_text_content_trgm
       ON pages USING gin ((LOWER(f_unaccent(text_content))) gin_trgm_ops)
