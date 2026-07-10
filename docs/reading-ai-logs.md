@@ -13,12 +13,14 @@ Read the **Gotchas** section before you trust any error count.
 - Agent chats live in Postgres, DB `docmost`, tables `ai_chat_*`.
 - Each tool invocation is stored as **two** array elements (a `tool-call` part and
   a `tool-result` part), so naive counting double-counts.
-- **A tool that *throws* writes no result part at all.** Its error text is nowhere
-  in the DB — not in `tool_calls`, `content`, or `metadata`. It is shown live in
-  the UI only. So `isError` / `success=false` scans under-report by design.
-- To find where agents fail you need **three** sources: (1) soft-failure markers in
-  `tool_calls`, (2) the orphan-gap proxy for thrown errors, (3) server logs / the
-  live UI for the actual error text.
+- **A tool that *throws* writes no result part.** Since the #407 fix its error is
+  persisted as a dedicated `{toolName, error}` element in `tool_calls` (queryable +
+  replayed to the model). **Rows written before #407 still drop it** — the error is
+  nowhere in the DB and shows only in the live UI. So `isError` / `success=false`
+  scans under-report by design, and pre-#407 thrown errors are invisible.
+- To find where agents fail: (1) soft-failure markers in `tool_calls`, (2) the new
+  `error` field for thrown errors (new rows) / the orphan-gap proxy (old rows),
+  (3) server logs / the live UI for full stack traces beyond the truncated message.
 
 ## Where the data lives
 
@@ -61,13 +63,17 @@ index 0: { "toolName": "getPage",  "input":  { "pageId": "…" } }   ← tool-ca
 index 1: { "toolName": "getPage",  "output": { … } }                ← tool-result (has output, NO input)
 ```
 
-The **only** keys that ever appear on an element are `toolName`, `input`, `output`.
-There is no `state`, no `errorText`, no `type`. Consequences:
+The keys that appear on an element are `toolName`, `input`, `output`, and — for a
+**thrown** failure on rows written after the #407 fix — `error` (the tool's error
+message; see the "Hard failures" section below). There is no `state`, no `errorText`,
+no `type`. On pre-#407 rows a thrown failure has NO paired result element at all
+(silent orphan). Consequences:
 
-1. **Real invocation count = elements that have `output`.** Counting every element
-   double-counts (you get ~2× and a spurious "~50% of every tool has no output").
-2. **Pairing:** a successful call = a `tool-call` part followed by its `tool-result`
-   part. Both carry `toolName`, so you can group by tool on either.
+1. **Real invocation count = elements that have `output` or `error`.** Counting every
+   element double-counts (you get ~2× and a spurious "~50% of every tool has no output").
+2. **Pairing:** a call = a `tool-call` part followed by its result part. A success
+   carries `output`; a thrown failure (post-#407) carries `error` instead. Both carry
+   `toolName`, so you can group by tool on either.
 
 ## The two classes of failure (and which the DB can see)
 
@@ -85,25 +91,37 @@ These are visible in the `tool-result` `output`. The marker differs per tool:
 Note `editPageText` returns `failed: []` on success — filtering on the *presence*
 of the key gives false positives; filter on **non-empty**.
 
-### 2. Hard failures — tool THREW → NOT PERSISTED ❌ (the trap)
+### 2. Hard failures — tool THREW → NOW PERSISTED ✅ (since the #407 fix)
 
 When a tool throws (the classic one is `patchNode` / `insertNode` / `tableUpdateCell`
 → `Failed to encode document to Yjs (fromJSON): Unknown node type: undefined`), the
-runtime writes **no `tool-result` part**. The orphaned `tool-call` part stays, but
-the error text is **nowhere in the DB**. It is streamed to the UI live and (until
-rotation) to server logs — that is it.
+runtime still writes **no `tool-result` part** — the failure is an ai@6 `tool-error`
+content part instead. **Since the #407 fix, that error is persisted**: `serializeSteps`
+appends a dedicated element `{toolName, error: "<message>"}` right after the failed
+call, mirroring how a successful `{toolName, output}` element is appended. So a thrown
+error now leaves a queryable `error` field carrying its (truncated) reason, and the
+same real text is replayed to the model on the next turn (an `output-error` part with
+the real `errorText`, no longer the `'Tool call did not complete.'` placeholder).
 
-So any query like `count(*) FILTER (WHERE output.success = false)` will happily
-return **0** for `patchNode` even when the chat is visibly full of red failures.
-That is survivorship bias, not reliability.
+**Cutover caveat — old rows keep the old blind shape.** Rows written **before** this
+change have the two-part shape (`call` + `output` only) and simply **drop** thrown
+errors, leaving a silent **orphan** (a `call` with no `output` *and* no `error`). Rows
+written **after** the fix additionally carry the `error` element. So:
 
-The only DB-side proxy for a thrown error is an **orphan**: a `tool-call` part with
-no matching `tool-result`. Caveat: orphans also appear when a run is **aborted**
-mid-flight (server restart), so a high-volume tool (`createComment`, `searchInPage`,
-`Search_web_search`) shows orphans from aborts, not from real errors. Treat the
-orphan gap as an *upper bound* on hard errors, and cross-check the tool: a gap on a
-structural editor (`patchNode`, `insertNode`, `updatePageJson`, `transformPage`) is
-almost certainly a thrown Yjs-encode error; a gap on `createComment` is mostly aborts.
+- **New rows:** query the `error` field directly (see the hard-error query below) — no
+  orphan heuristic needed for thrown failures.
+- **Old rows (pre-#407):** the only DB-side proxy is still an **orphan**: a `tool-call`
+  part with no matching `tool-result` *and* no `error`. Orphans also appear when a run
+  is **aborted** mid-flight (server restart), so a high-volume tool (`createComment`,
+  `searchInPage`, `Search_web_search`) shows orphans from aborts, not real errors on
+  old rows. Treat the orphan gap as an *upper bound*, and cross-check the tool: a gap on
+  a structural editor (`patchNode`, `insertNode`, `updatePageJson`, `transformPage`) is
+  almost certainly a thrown Yjs-encode error; a gap on `createComment` is mostly aborts.
+
+A note on the aborted-call fallback: a call with **neither** a result **nor** a
+`tool-error` (genuinely interrupted mid-step) still replays with the
+`'Tool call did not complete.'` placeholder and persists as an orphan — that path is
+unchanged, and is distinct from a real thrown error, which now carries `error`.
 
 ### 3. Run-level failures → `ai_chat_runs`
 
@@ -164,14 +182,28 @@ WHERE jsonb_typeof(o->'failed') = 'array'
 GROUP BY 1 ORDER BY 2 DESC;
 ```
 
-**Hard-error proxy — orphan gap per tool, WITH a spread column** (call parts minus
-result parts, plus how many distinct chats the gap is spread across):
+**Hard errors — persisted `error` field per tool (NEW rows, since #407)** — thrown
+tool failures now carry their real reason, so query them directly:
+
+```sql
+SELECT elem->>'toolName' AS tool, count(*) AS thrown_errors,
+       min(elem->>'error') AS sample_error
+FROM ai_chat_messages m, jsonb_array_elements(m.tool_calls) elem
+WHERE jsonb_typeof(m.tool_calls) = 'array' AND elem ? 'error'
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+**Hard-error proxy for OLD rows (pre-#407) — orphan gap per tool, WITH a spread column**
+(call parts minus result parts, plus how many distinct chats the gap is spread across).
+This covers rows written before thrown errors were persisted; on new rows a thrown
+failure now has its own `error` element (use the query above) and an orphan means only
+a genuinely aborted mid-step call:
 
 ```sql
 WITH parts AS (
   SELECT m.chat_id, elem->>'toolName' AS tool,
          (elem ? 'input' AND NOT (elem ? 'output')) AS is_call,
-         (elem ? 'output')                          AS is_result
+         (elem ? 'output' OR elem ? 'error')        AS is_result
   FROM ai_chat_messages m, jsonb_array_elements(m.tool_calls) elem
   WHERE jsonb_typeof(m.tool_calls) = 'array' AND m.role = 'assistant'
 ),
@@ -188,8 +220,12 @@ HAVING sum(gap) FILTER (WHERE gap > 0) > 0
 ORDER BY missing_results DESC;
 ```
 
-**`missing_results` mixes thrown errors AND aborted/interrupted runs — you cannot
-split them from `output` alone** (a positional "what follows the orphan" heuristic
+The `is_result` predicate counts an `error` element as a paired result too, so on new
+rows a persisted thrown error no longer inflates the orphan gap; a remaining gap is an
+aborted/interrupted call.
+
+**On OLD rows, `missing_results` mixes thrown errors AND aborted/interrupted runs — you
+cannot split them from `output` alone** (a positional "what follows the orphan" heuristic
 breaks on parallel tool batches, which persist as `call,call,…,result,result`). Use
 `chats_spread` to disambiguate:
 
@@ -244,18 +280,20 @@ docker compose -p gitmost logs -f --tail=100 # whole stack
 ```
 
 Logging is `json-file`, `max-size=10m max-file=5` → ~50 MB retained, then rotated,
-and **wiped on container recreate**. So thrown-tool error text is only reliably
-caught **in real time** (or in the live chat UI, which renders the failed part with
-its message). There is no durable, queryable store of hard tool errors today — if you
-need one, that is a feature to add (persist `output-error` parts, or emit a
-`tool_calls_total{tool,status}` metric to VictoriaMetrics).
+and **wiped on container recreate**. Since the #407 fix, thrown-tool error text is
+**persisted in the `error` field** of `tool_calls` (see the hard-error query above), so
+you no longer depend on live logs for it. Logs/live UI remain useful for **pre-#407
+rows** (whose thrown errors were dropped) and for full stack traces beyond the
+truncated stored message. A per-tool `tool_calls_total{tool,status}` metric to
+VictoriaMetrics is still a possible future add for aggregate dashboards.
 
 ## Gotchas checklist
 
-- [ ] Counting every `tool_calls` element → **2× overcount**. Count elements with `output`.
-- [ ] `isError` / `success=false` ≈ 0 does **not** mean "no errors" — thrown errors aren't persisted.
+- [ ] Counting every `tool_calls` element → **overcount**. Count `output` elements; add `error` elements for thrown failures (new rows), but don't count both as invocations.
+- [ ] `isError` / `success=false` ≈ 0 does **not** mean "no errors" — thrown errors are a separate `error` element (new rows) or dropped entirely (pre-#407 rows).
+- [ ] Thrown errors persist only on rows written **after the #407 fix** — pre-#407 rows still drop them (orphan only). Mind the cutover when trending over time.
 - [ ] `editPageText.failed` is `[]` on success — test for **non-empty**, not presence.
-- [ ] Orphan gap mixes thrown errors **and** aborted runs — split by tool before concluding.
+- [ ] Orphan gap on OLD rows mixes thrown errors **and** aborted runs — split by tool. On NEW rows a thrown error is its own `error` element, so a gap ≈ aborted call.
 - [ ] `aborted` runs = server restarts, `failed` runs = provider overload — not agent mistakes.
 - [ ] Never dump a raw `tool_calls` cell — it can be hundreds of KB.
 - [ ] Logs are ephemeral (≤50 MB, wiped on recreate) — grab hard-error text live.
