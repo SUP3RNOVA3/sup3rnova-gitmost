@@ -14,7 +14,9 @@
  * `content`, non-object nodes, and absent `attrs` are tolerated.
  */
 
+import { getSchema } from "@tiptap/core";
 import { stripInlineMarkdown } from "./text-normalize.js";
+import { docmostExtensions } from "./docmost-schema.js";
 
 /** Deep-clone a JSON-serializable value without mutating the original. */
 function clone<T>(value: T): T {
@@ -381,6 +383,119 @@ export function findUnstorableAttr(doc: any): string | null {
     }
   }
   return null;
+}
+
+/**
+ * The Docmost schema's known node and mark NAME sets, derived ONCE from the very
+ * same `docmostExtensions` the Yjs encode path builds its schema from
+ * (`getSchema(docmostExtensions)` — mirrored in mcp's `docmostSchema`). Deriving
+ * both from the same extension list guarantees `findInvalidNode`'s "known type"
+ * set matches exactly what `PMNode.fromJSON`/`toYdoc` will actually accept, so
+ * the walker never flags a node the encoder would have stored (or vice versa).
+ * Lazy + cached: the schema is only built on first use.
+ */
+let schemaNames: { nodes: Set<string>; marks: Set<string> } | null = null;
+function getSchemaNames(): { nodes: Set<string>; marks: Set<string> } {
+  if (schemaNames == null) {
+    const schema = getSchema(docmostExtensions);
+    schemaNames = {
+      nodes: new Set(Object.keys(schema.nodes)),
+      marks: new Set(Object.keys(schema.marks)),
+    };
+  }
+  return schemaNames;
+}
+
+/**
+ * Depth-first walk of the JSON `content` tree looking for the FIRST node whose
+ * SHAPE the Yjs encode path will reject with an opaque
+ * `Unknown node type: undefined` (issue #409). Returns `{ path, summary }` for
+ * the offending node, or `null` when every node (and every mark) is a known
+ * Docmost schema type.
+ *
+ * Two failure modes are detected, in order, per node:
+ *   1. `type` is missing or not a string — the dominant `undefined` case, e.g.
+ *      a text leaf written as `{"text":"foo"}` with no `"type":"text"`.
+ *   2. `type` is a string but NOT a known Docmost node name (a typo / unknown
+ *      block), OR one of the node's marks carries an unknown mark name.
+ *
+ * The returned `summary` is a model-actionable, path-anchored message such as:
+ *   `node.content[2].content[0]: missing "type" (keys: text, marks) — did you
+ *    mean {"type": "text", ...}?`
+ * or for an unknown type:
+ *   `node.content[1]: unknown node type "paragraf" — not in the Docmost schema`
+ *
+ * `path` is the same dotted JSON path used in the summary (e.g.
+ * `node.content[2].content[0]`) so callers can surface it separately. Null-safe:
+ * a non-object doc returns `null`.
+ *
+ * NOTE: This is a SHAPE check, not a full ProseMirror content-model validation
+ * (it does not verify that a paragraph may legally contain a table, etc.). Its
+ * job is to turn the specific "unknown/absent node type" Yjs crash into a clear,
+ * pre-write diagnostic; the schema's own `.check()` still catches deeper
+ * content-model violations at encode time.
+ */
+export function findInvalidNode(
+  doc: any,
+): { path: string; summary: string } | null {
+  if (!isObject(doc)) return null;
+  const { nodes, marks } = getSchemaNames();
+
+  // Build the "did you mean" hint for a typeless node from its own keys, so the
+  // model sees WHICH object is malformed and the canonical text-leaf fix.
+  const keyHint = (node: Record<string, any>): string => {
+    const keys = Object.keys(node);
+    const looksLikeText =
+      typeof node.text === "string" && node.type === undefined;
+    const suffix = looksLikeText
+      ? ` — did you mean {"type": "text", ...}?`
+      : ` — every node needs a string "type" from the Docmost schema`;
+    return `missing "type" (keys: ${keys.join(", ") || "none"})${suffix}`;
+  };
+
+  const walk = (
+    node: any,
+    path: string,
+  ): { path: string; summary: string } | null => {
+    if (!isObject(node)) return null;
+
+    // (1) missing / non-string type.
+    if (typeof node.type !== "string") {
+      return { path, summary: `${path}: ${keyHint(node)}` };
+    }
+    // (2) string type that is not a known Docmost node.
+    if (!nodes.has(node.type)) {
+      return {
+        path,
+        summary: `${path}: unknown node type "${node.type}" — not in the Docmost schema`,
+      };
+    }
+    // (2b) unknown mark on an otherwise-valid node.
+    if (Array.isArray(node.marks)) {
+      for (let i = 0; i < node.marks.length; i++) {
+        const mark = node.marks[i];
+        if (isObject(mark) && typeof mark.type === "string" && !marks.has(mark.type)) {
+          return {
+            path: `${path}.marks[${i}]`,
+            summary: `${path}.marks[${i}]: unknown mark type "${mark.type}" — not in the Docmost schema`,
+          };
+        }
+      }
+    }
+
+    if (Array.isArray(node.content)) {
+      for (let i = 0; i < node.content.length; i++) {
+        const hit = walk(node.content[i], `${path}.content[${i}]`);
+        if (hit != null) return hit;
+      }
+    }
+    return null;
+  };
+
+  // The root doc node is addressed as "node" (matching the mcp arg name); its
+  // children are node.content[i]. The root itself is checked too so a typeless
+  // root is reported rather than silently skipped.
+  return walk(doc, "node");
 }
 
 /**

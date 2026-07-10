@@ -236,7 +236,10 @@ export const SHARED_TOOL_SPECS = {
       'heading {"type":"heading","attrs":{"level":2},"content":' +
       '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
       '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
-      'JSON object or a JSON string (both accepted). Cheaper and safer than ' +
+      'JSON object or a JSON string (both accepted). EVERY node, including ' +
+      'nested children, must carry a string `type` from the Docmost schema; ' +
+      'text leaves are {"type":"text","text":"..."} (a bare {"text":"..."} is ' +
+      'rejected up front). Cheaper and safer than ' +
       'replacing the whole document for one-block structural edits. Reversible: ' +
       'the previous version is kept in page history.',
     tier: 'deferred',
@@ -282,7 +285,10 @@ export const SHARED_TOOL_SPECS = {
       '{"type":"paragraph","content":[{"type":"text","text":"Hello"}]} or a ' +
       'heading {"type":"heading","attrs":{"level":2},"content":' +
       '[{"type":"text","text":"Title"}]}. Bold is a mark: ' +
-      '{"type":"text","text":"x","marks":[{"type":"bold"}]}. The node may be a ' +
+      '{"type":"text","text":"x","marks":[{"type":"bold"}]}. EVERY node, ' +
+      'including nested children, must carry a string `type` from the Docmost ' +
+      'schema; text leaves are {"type":"text","text":"..."} (a bare ' +
+      '{"text":"..."} is rejected up front). The node may be a ' +
       'JSON object or a JSON string (both accepted). Reversible via page history.',
     tier: 'deferred',
     catalogLine:
@@ -705,7 +711,10 @@ export const SHARED_TOOL_SPECS = {
       '"paragraph","content":[{"type":"text","text":"Hi"}]}]}. `content` may be ' +
       'a JSON object or a JSON string (both accepted), and is OPTIONAL: omit it ' +
       'to update only the title (though prefer the rename-page tool for a title-only ' +
-      'change). Supplying neither content nor title is an error. Reversible: ' +
+      'change). Supplying neither content nor title is an error. EVERY node, ' +
+      'including nested children, must carry a string `type` from the Docmost ' +
+      'schema; text leaves are {"type":"text","text":"..."} (a bare ' +
+      '{"text":"..."} is rejected up front). Reversible: ' +
       'the previous version is kept in page history.',
     tier: 'deferred',
     catalogLine:

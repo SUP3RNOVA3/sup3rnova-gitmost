@@ -13,7 +13,11 @@ import { JSDOM } from "jsdom";
 import { markdownToProseMirror } from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
-import { sanitizeForYjs, findUnstorableAttr } from "@docmost/prosemirror-markdown";
+import {
+  sanitizeForYjs,
+  findUnstorableAttr,
+  findInvalidNode,
+} from "@docmost/prosemirror-markdown";
 import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 import { normalizeAndMergeFootnotes } from "./footnote-normalize-merge.js";
 import { VerifyReport } from "./diff.js";
@@ -28,11 +32,25 @@ export { markdownToProseMirror };
  * place. `label` names the stage that failed (diagnostic). `sanitizeForYjs`
  * already stripped `undefined` attrs, so a remaining failure is pinpointed via
  * `findUnstorableAttr`.
+ *
+ * Diagnostics precedence (#409): the dominant crash here is
+ * `Unknown node type: undefined` — a nested node with an absent/unknown `type`
+ * (a SHAPE problem, e.g. `{"text":"foo"}` missing `"type":"text"`). That points
+ * at the node, not an attribute, so `findInvalidNode` is consulted FIRST and,
+ * on a hit, yields a path-anchored node-shape message. Only when the document
+ * shape is sound do we fall back to `findUnstorableAttr` (undefined/function/
+ * symbol/bigint attr values); the generic "attribute likely holds a value Yjs
+ * cannot store" sentence is the last resort.
  */
 function unstorableYjsError(safe: any, label: string, e: unknown): Error {
+  const base = `Failed to encode document to Yjs (${label}): ${e instanceof Error ? e.message : String(e)}.`;
+  const badNode = findInvalidNode(safe);
+  if (badNode) {
+    return new Error(`${base} Invalid node: ${badNode.summary}`);
+  }
   const bad = findUnstorableAttr(safe);
   return new Error(
-    `Failed to encode document to Yjs (${label}): ${e instanceof Error ? e.message : String(e)}.${bad ? ` Offending attribute: ${bad}.` : " A node/mark attribute likely holds a value Yjs cannot store (e.g. undefined)."}`,
+    `${base}${bad ? ` Offending attribute: ${bad}.` : " A node/mark attribute likely holds a value Yjs cannot store (e.g. undefined)."}`,
   );
 }
 
