@@ -167,6 +167,35 @@ function isUuid(value: string): boolean {
   return typeof value === "string" && UUID_RE.test(value);
 }
 
+/**
+ * Collab-token cache TTL in milliseconds (issue #435). Read fresh from the
+ * environment on every mint — like collab-session.ts readConfig — so tests and a
+ * live rollback can change it without reloading the module.
+ *
+ * Why a cache at all: the live CollabSession registry (#400/#431) keys sessions
+ * on (wsUrl, pageId, collabToken) for identity isolation (invariant 4). But BOTH
+ * collab-token sources mint a FRESH token per mutation — the in-app provider
+ * re-signs a JWT whose iat/exp (seconds) changes every second, and the external
+ * MCP POSTs /auth/collab-token each call — so the token in the key changed on
+ * every op and the session was almost never reused (connect-storms, 25s
+ * timeouts, zombie sessions). Caching the token per-client keeps the key stable
+ * across a burst of mutations so ONE session is reused.
+ *
+ * Default 5 min: well under the 24h collab-token lifetime AND <= the collab
+ * session max-age (10 min, MCP_COLLAB_SESSION_MAX_AGE_MS), so the
+ * permission-staleness window is not widened beyond what #431 already accepted.
+ * The rollback knob is an EXPLICIT 0 (or a negative number): that DISABLES the
+ * cache — an exact fetch-per-call legacy path, mirroring how idleMs<=0 disables
+ * the session cache. Unset OR unparseable (e.g. a typo like "5min", "abc") falls
+ * back to the 5-min default with the cache ON — parseInt yields NaN, which is
+ * treated as "not configured", not as "disabled". So to turn the cache off you
+ * must set the value to exactly 0, not to garbage.
+ */
+function readCollabTokenTtlMs(): number {
+  const raw = parseInt(process.env.MCP_COLLAB_TOKEN_TTL_MS ?? "", 10);
+  return Number.isFinite(raw) ? Math.max(0, raw) : 5 * 60 * 1000;
+}
+
 export class DocmostClient {
   private client: AxiosInstance;
   private token: string | null = null;
@@ -204,6 +233,15 @@ export class DocmostClient {
   // re-fetch /pages/info. A UUID input short-circuits before this cache (see
   // resolvePageId), so only slugId->uuid entries are stored/read here.
   private pageIdCache = new Map<string, string>();
+
+  // Collab-token cache (issue #435): the last minted collab token plus the
+  // wall-clock time it was minted, so a burst of content mutations reuses ONE
+  // token and therefore ONE live CollabSession (whose registry key includes the
+  // token — #400 invariant 4). Per-instance: a DocmostClient is built per
+  // user/per chat request, so a cached token can never leak across identities.
+  // Reset whenever the client's identity changes (login() / this.token cleared);
+  // bypassed on a forced refresh (the 401/403 reauth path). null = no token yet.
+  private collabTokenCache: { token: string; mintedAt: number } | null = null;
 
   // Two construction forms:
   //  - new DocmostClient(config)                  // discriminated union (current)
@@ -273,8 +311,11 @@ export class DocmostClient {
 
         if (config && isAuthError && !config._retry && !isLoginRequest) {
           config._retry = true;
-          // Drop the stale token + Authorization header before re-login.
+          // Drop the stale token + Authorization header before re-login. Also
+          // clear the collab-token cache (#435): a new identity/login must not
+          // keep serving a collab token minted under the old one.
           this.token = null;
+          this.collabTokenCache = null;
           delete this.client.defaults.headers.common["Authorization"];
           try {
             await this.login();
@@ -323,6 +364,9 @@ export class DocmostClient {
             throw new Error("getToken returned an empty token");
           }
           this.token = token;
+          // Identity (re)established: drop any collab token minted under a
+          // previous identity so the #435 cache can never outlive it.
+          this.collabTokenCache = null;
           this.client.defaults.headers.common["Authorization"] =
             `Bearer ${token}`;
         })
@@ -345,8 +389,34 @@ export class DocmostClient {
    * by this.client's response interceptor; this helper replicates that
    * behaviour for collab-token requests: ensure a token, try once, and on an
    * expired-token auth error perform a fresh login and retry exactly once.
+   *
+   * Collab-token cache (issue #435): both sources — the getCollabToken provider
+   * (in-app agent) AND the REST /auth/collab-token endpoint (external MCP) — mint
+   * a FRESH token per call, whose string therefore changes every op. Since the
+   * live CollabSession registry keys on the token string (#400/#431 invariant 4),
+   * that churned the key and defeated session reuse. So we cache the last minted
+   * token per-client for readCollabTokenTtlMs() and hand it back for a burst of
+   * mutations, keeping the session key stable. `forceRefresh` bypasses the cache
+   * (the 401/403 reauth retry uses it, so the retry cannot be handed the same
+   * stale token that just failed — otherwise reauth would be a no-op). TTL 0
+   * disables the cache: exact fetch-per-call legacy behaviour.
    */
-  private async getCollabTokenWithReauth(): Promise<string> {
+  private async getCollabTokenWithReauth(
+    forceRefresh = false,
+  ): Promise<string> {
+    const ttl = readCollabTokenTtlMs();
+    // Serve the cached collab token while it is still fresh (identity isolation
+    // is preserved: the cache is a per-instance field on a client built per
+    // user/per chat request, and it is cleared on every identity change).
+    if (
+      !forceRefresh &&
+      ttl > 0 &&
+      this.collabTokenCache &&
+      Date.now() - this.collabTokenCache.mintedAt < ttl
+    ) {
+      return this.collabTokenCache.token;
+    }
+
     // Collab-token PROVIDER path: when a getCollabToken provider was supplied
     // (the internal agent's provenance collab token), use it instead of the
     // REST /auth/collab-token endpoint. Re-invoke it once on a 401/403 (e.g. the
@@ -357,23 +427,13 @@ export class DocmostClient {
         if (typeof token !== "string" || token.length === 0) {
           throw new Error("getCollabToken returned an empty token");
         }
-        return token;
+        return this.rememberCollabToken(token, ttl);
       } catch (e) {
-        const axiosStatus = axios.isAxiosError(e)
-          ? e.response?.status
-          : undefined;
-        const attachedStatus = (e as any)?.status;
-        const isAuthError =
-          axiosStatus === 401 ||
-          axiosStatus === 403 ||
-          attachedStatus === 401 ||
-          attachedStatus === 403;
-        if (isAuthError) {
-          const token = await this.getCollabTokenFn();
-          if (typeof token !== "string" || token.length === 0) {
-            throw new Error("getCollabToken returned an empty token");
-          }
-          return token;
+        // On an auth error retry EXACTLY once, forcing a refresh so the retry
+        // re-invokes the provider (bypassing the cache) for a genuinely fresh
+        // token. `!forceRefresh` bounds it to a single retry (no loop).
+        if (this.isCollabAuthError(e) && !forceRefresh) {
+          return this.getCollabTokenWithReauth(true);
         }
         throw e;
       }
@@ -381,26 +441,49 @@ export class DocmostClient {
 
     await this.ensureAuthenticated();
     try {
-      return await getCollabToken(this.apiUrl, this.token!);
+      const token = await getCollabToken(this.apiUrl, this.token!);
+      return this.rememberCollabToken(token, ttl);
     } catch (e) {
       // getCollabToken wraps the AxiosError in a plain Error but attaches the
-      // HTTP status as `.status`, so detect an auth failure via either the raw
-      // AxiosError shape OR the attached status.
-      const axiosStatus = axios.isAxiosError(e)
-        ? e.response?.status
-        : undefined;
-      const attachedStatus = (e as any)?.status;
-      const isAuthError =
-        axiosStatus === 401 ||
-        axiosStatus === 403 ||
-        attachedStatus === 401 ||
-        attachedStatus === 403;
-      if (isAuthError) {
+      // HTTP status as `.status`, so isCollabAuthError detects an auth failure
+      // via either the raw AxiosError shape OR the attached status.
+      if (this.isCollabAuthError(e) && !forceRefresh) {
+        // Fresh login (which clears this.token AND the collab-token cache), then
+        // retry exactly once with the cache bypassed via forceRefresh.
         await this.login();
-        return await getCollabToken(this.apiUrl, this.token!);
+        return this.getCollabTokenWithReauth(true);
       }
       throw e;
     }
+  }
+
+  /**
+   * Store a freshly minted collab token in the per-client cache (issue #435) and
+   * return it unchanged. No-op write when the cache is disabled (ttl<=0) or the
+   * token is empty, so a disabled cache is exact fetch-per-call legacy behaviour
+   * and a bad token is never cached.
+   */
+  private rememberCollabToken(token: string, ttl: number): string {
+    if (ttl > 0 && typeof token === "string" && token.length > 0) {
+      this.collabTokenCache = { token, mintedAt: Date.now() };
+    }
+    return token;
+  }
+
+  /**
+   * True when an error carries a 401/403 — either as a raw AxiosError
+   * (`error.response.status`) or as the plain-Error `.status` that
+   * lib/auth-utils.getCollabToken attaches after wrapping the AxiosError.
+   */
+  private isCollabAuthError(e: unknown): boolean {
+    const axiosStatus = axios.isAxiosError(e) ? e.response?.status : undefined;
+    const attachedStatus = (e as any)?.status;
+    return (
+      axiosStatus === 401 ||
+      axiosStatus === 403 ||
+      attachedStatus === 401 ||
+      attachedStatus === 403
+    );
   }
 
   /**
