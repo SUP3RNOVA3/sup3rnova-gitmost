@@ -24,6 +24,21 @@ export function describeChatError(
 ): ChatErrorView {
   const msg = message ?? "";
 
+  // Our own "could not start the run" gate (A_RUN_BEGIN_FAILED, #486): a 503
+  // whose body carries this code is a TEMPORARY server-side failure while
+  // starting the run (e.g. a DB-pool blip), NOT an unconfigured provider. It MUST
+  // be matched STRICTLY BEFORE the generic 503 branch below, which would
+  // otherwise mislabel it "The AI provider is not configured" and tell the user
+  // to call an admin instead of just retrying.
+  if (/"code"\s*:\s*"A_RUN_BEGIN_FAILED"/.test(msg)) {
+    return {
+      title: t("Could not start the run"),
+      detail: t(
+        "The agent run could not be started. This is usually temporary — please try again.",
+      ),
+    };
+  }
+
   if (/"statusCode"\s*:\s*403\b/.test(msg)) {
     return {
       title: t("AI chat is disabled"),

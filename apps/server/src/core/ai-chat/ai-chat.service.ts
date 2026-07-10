@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   OnModuleInit,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { FastifyReply } from 'fastify';
 import {
@@ -797,12 +798,32 @@ export class AiChatService implements OnModuleInit {
             code: 'A_RUN_ALREADY_ACTIVE',
           });
         }
-        // Any OTHER run-start failure must not break the turn — fall back to the
-        // socket signal (legacy behavior) and stream anyway.
+        // Any OTHER run-start failure (e.g. a DB-pool blip) must FAIL THE TURN,
+        // not silently stream without a run-row. The old fallback let the turn
+        // continue untracked: in autonomous mode nobody could then abort it —
+        // /stop can't see a run that doesn't exist, a client disconnect doesn't
+        // abort it, and the one-run-per-chat gate would let a SECOND run in. That
+        // is an unstoppable, invisible run until process restart. Reject NOW,
+        // BEFORE the first byte (nothing is written yet, no user row inserted, no
+        // MCP lease taken), so the controller's post-hijack catch turns this
+        // HttpException into an honest 503 on the raw socket. Same policy for BOTH
+        // modes — #487 inherits it (no mode-branching here).
         this.logger.error(
-          `Failed to begin agent run (chat ${chatId}); streaming without run tracking`,
+          `Failed to begin agent run (chat ${chatId}); failing the turn`,
           err as Error,
         );
+        throw new ServiceUnavailableException({
+          message:
+            'Could not start the agent run. This is usually temporary — please try again.',
+          code: 'A_RUN_BEGIN_FAILED',
+          // Self-describe the status in the body: the controller's post-hijack
+          // catch writes getResponse() verbatim onto the raw socket, and an
+          // object-arg HttpException does NOT inject statusCode. Without it the
+          // client's 503 classifier (which reads the body JSON) could not see the
+          // status. With it present, the client's A_RUN_BEGIN_FAILED branch (which
+          // runs strictly before the generic-503 branch) shows "temporary, retry".
+          statusCode: 503,
+        });
       }
     }
 

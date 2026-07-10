@@ -23,6 +23,25 @@ describe("describeChatError", () => {
     });
   });
 
+  it("classifies an A_RUN_BEGIN_FAILED 503 as a temporary run-start failure, NOT provider-not-configured (#486)", () => {
+    // The FULL real body the server writes for a beginRun failure: a
+    // ServiceUnavailableException(object) whose response is serialized verbatim
+    // onto the raw socket, self-describing statusCode 503 + the run-start code.
+    const body =
+      '{"message":"Could not start the agent run. This is usually temporary — please try again.","code":"A_RUN_BEGIN_FAILED","statusCode":503}';
+    expect(describeChatError(body, t)).toEqual({
+      title: "Could not start the run",
+      detail:
+        "The agent run could not be started. This is usually temporary — please try again.",
+    });
+    // ORDER GUARD: even though the body ALSO carries statusCode 503 (which the
+    // generic branch matches), the A_RUN_BEGIN_FAILED branch runs first, so it is
+    // never mislabeled "AI provider not configured".
+    expect(describeChatError(body, t).title).not.toBe(
+      "AI provider not configured",
+    );
+  });
+
   it("classifies a dropped connection (ECONNRESET) as a lost-connection error", () => {
     expect(
       describeChatError("Cannot connect to API: read ECONNRESET", t).title,
