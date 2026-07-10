@@ -2830,14 +2830,28 @@ export class DocmostClient {
     return { success: true, removedShareId: share.shareId, pageId };
   }
 
-  async search(query: string, spaceId?: string, limit?: number) {
+  async search(
+    query: string,
+    spaceId?: string,
+    limit?: number,
+    opts: { parentPageId?: string; titleOnly?: boolean } = {},
+  ) {
     await this.ensureAuthenticated();
-    const payload: Record<string, any> = { query, spaceId };
-    // Clamp an optional caller-supplied limit into a sane 1..100 range before
-    // forwarding it to the server; omit it entirely when not provided so the
-    // server applies its own default.
+    // Opt into the #443 agent-lookup mode: `substring: true` turns on the hybrid
+    // substring + FTS branch that returns path + snippet + score. A stock
+    // upstream server strips these unknown DTO fields (whitelist:true) and
+    // silently degrades to plain FTS — see the tool-registration comment.
+    const payload: Record<string, any> = {
+      query,
+      spaceId,
+      substring: true,
+    };
+    if (opts.parentPageId) payload.parentPageId = opts.parentPageId;
+    if (opts.titleOnly) payload.titleOnly = true;
+    // Clamp an optional caller-supplied limit into the lookup range (1..50)
+    // before forwarding; omit it when not provided so the server default applies.
     if (limit !== undefined) {
-      payload.limit = Math.max(1, Math.min(100, limit));
+      payload.limit = Math.max(1, Math.min(50, limit));
     }
     const response = await this.client.post("/search", payload);
 
