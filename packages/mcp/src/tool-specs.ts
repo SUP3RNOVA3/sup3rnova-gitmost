@@ -771,9 +771,13 @@ export const SHARED_TOOL_SPECS = {
       'The comment is anchored inline to the given exact `selection` text ' +
       '(which gets highlighted); page-level comments are NOT supported. A ' +
       'new top-level comment REQUIRES a `selection`. Replies inherit the ' +
-      "parent's anchor and take no selection. If the call fails with a " +
-      '"selection not found" error, retry with a corrected EXACT selection ' +
-      'copied verbatim from a single paragraph/block. You may also attach a ' +
+      "parent's anchor and take no selection. Always COPY the `selection` " +
+      'VERBATIM from get_page / search_in_page output — do NOT quote it from ' +
+      'memory (stale-memory quoting is the top cause of anchor misses). If the ' +
+      'call fails with a "selection not found" error, the error quotes the ' +
+      "closest block text (or says the selection spans multiple blocks); retry " +
+      "with a corrected EXACT selection copied verbatim from a single " +
+      'paragraph/block. You may also attach a ' +
       '`suggestedText` proposing a replacement for the `selection` (a human ' +
       'applies it from the UI); when set, the `selection` must occur exactly ' +
       'once in the page. Reversible via the comment UI.',

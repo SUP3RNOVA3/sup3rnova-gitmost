@@ -17,7 +17,22 @@
  * comparing and match across maximal runs of consecutive text nodes within a
  * single block, while mapping every normalized character back to its raw index
  * so the mark lands on the exact original characters.
+ *
+ * MARKDOWN-STRIP FALLBACK: when the agent copies a selection that still carries
+ * inline markdown (`**bold**`, `` `code` ``, `[t](u)`), the raw locator will not
+ * match the document's plain text. Exactly like edit_page_text's json-edit
+ * fallback, we first try the verbatim selection and, ONLY if it anchors nowhere
+ * in the whole document, retry with `stripInlineMarkdown` applied. `canAnchorInDoc`,
+ * `getAnchoredText` and `applyAnchorInDoc` share this decision via
+ * `resolveAnchorSelection`. `countAnchorMatches` keeps its OWN parallel exact-wins
+ * implementation (it needs a raw match COUNT, not a single resolved locator), kept
+ * deliberately in sync with `resolveAnchorSelection`: raw match ⇒ use raw, else fall
+ * back to the stripped count. All four therefore agree on which locator matched —
+ * the suggestion-uniqueness gate depends on count and can/get never disagreeing, so
+ * these two exact-wins implementations MUST stay in sync if either is changed.
  */
+
+import { stripInlineMarkdown } from "./text-normalize.js";
 
 /** Typographic double-quote variants mapped to ASCII `"`. */
 const DOUBLE_QUOTES = "«»„“”‟〝〞＂";
@@ -214,15 +229,17 @@ function reconstructRawText(blockContent: any[], match: AnchorMatch): string {
  * un-appliable (spurious 409).
  */
 export function getAnchoredText(doc: any, selection: string): string | null {
+  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  if (!found) return null;
   const visit = (node: any, depth: number): string | null => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return null;
     if (!Array.isArray(node.content)) return null;
-    const match = findAnchorInBlock(node.content, selection);
+    const match = findAnchorInBlock(node.content, effective);
     if (match) return reconstructRawText(node.content, match);
     for (const child of node.content) {
       if (child && typeof child === "object" && Array.isArray(child.content)) {
-        const found = visit(child, depth + 1);
-        if (found !== null) return found;
+        const foundText = visit(child, depth + 1);
+        if (foundText !== null) return foundText;
       }
     }
     return null;
@@ -231,12 +248,11 @@ export function getAnchoredText(doc: any, selection: string): string | null {
 }
 
 /**
- * Depth-first, document-order check for whether `selection` can be anchored
- * anywhere in `doc`. At each node with an array `content`, first try to match
- * within that node's own content, then recurse into children that themselves
- * have a `content` array.
+ * RAW (no markdown-strip fallback) depth-first check that `selection` anchors
+ * somewhere in `doc`. This is the primitive `resolveAnchorSelection` builds on;
+ * public callers should use `canAnchorInDoc`, which adds the strip fallback.
  */
-export function canAnchorInDoc(doc: any, selection: string): boolean {
+function rawCanAnchorInDoc(doc: any, selection: string): boolean {
   const visit = (node: any, depth: number): boolean => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return false;
     if (!Array.isArray(node.content)) return false;
@@ -249,6 +265,43 @@ export function canAnchorInDoc(doc: any, selection: string): boolean {
     return false;
   };
   return visit(doc, 0);
+}
+
+/**
+ * Decide the locator that ACTUALLY anchors `selection` in `doc`, applying the
+ * markdown-strip fallback once (so every public entry point agrees):
+ *  - EXACT WINS: if the verbatim selection anchors anywhere, use it as-is.
+ *  - FALLBACK: only if the verbatim selection anchors nowhere, and the
+ *    markdown-stripped form differs and DOES anchor, use the stripped form and
+ *    flag `normalized` so callers can surface a soft warning.
+ *  - otherwise `found` is false and `selection` is returned unchanged.
+ *
+ * The stripped form is used ONLY to LOCATE the anchor; getAnchoredText still
+ * reconstructs and stores the RAW document substring, so the strip never leaks
+ * into what gets persisted.
+ */
+export function resolveAnchorSelection(
+  doc: any,
+  selection: string,
+): { selection: string; found: boolean; normalized: boolean } {
+  if (rawCanAnchorInDoc(doc, selection)) {
+    return { selection, found: true, normalized: false };
+  }
+  const stripped = stripInlineMarkdown(selection);
+  if (stripped !== selection && rawCanAnchorInDoc(doc, stripped)) {
+    return { selection: stripped, found: true, normalized: true };
+  }
+  return { selection, found: false, normalized: false };
+}
+
+/**
+ * Depth-first, document-order check for whether `selection` can be anchored
+ * anywhere in `doc` (with the markdown-strip fallback). At each node with an
+ * array `content`, first try to match within that node's own content, then
+ * recurse into children that themselves have a `content` array.
+ */
+export function canAnchorInDoc(doc: any, selection: string): boolean {
+  return resolveAnchorSelection(doc, selection).found;
 }
 
 /**
@@ -315,7 +368,7 @@ function spliceCommentMark(
  * not use this. (Note: counts OCCURRENCES, not just matching blocks, so two
  * occurrences inside one block are correctly reported as 2.)
  */
-export function countAnchorMatches(doc: any, selection: string): number {
+function rawCountAnchorMatches(doc: any, selection: string): number {
   const normSel = normalizeForMatch(selection).norm.trim();
   if (normSel.length === 0) return 0;
 
@@ -370,6 +423,25 @@ export function countAnchorMatches(doc: any, selection: string): number {
 }
 
 /**
+ * Uniqueness gate for suggestions, with the SAME markdown-strip fallback as the
+ * other entry points so count never disagrees with can/get/apply. EXACT WINS: if
+ * the verbatim selection occurs at all, return its raw occurrence count (so a
+ * selection that is unique raw stays unique — the fallback never runs and cannot
+ * introduce a spurious second match). Only when the verbatim selection is absent
+ * do we count occurrences of the markdown-stripped form.
+ */
+export function countAnchorMatches(doc: any, selection: string): number {
+  const raw = rawCountAnchorMatches(doc, selection);
+  if (raw > 0) return raw;
+  const stripped = stripInlineMarkdown(selection);
+  if (stripped !== selection) {
+    const strippedCount = rawCountAnchorMatches(doc, stripped);
+    if (strippedCount > 0) return strippedCount;
+  }
+  return 0;
+}
+
+/**
  * Depth-first (same order as canAnchorInDoc) over `doc`; on the FIRST block
  * whose content matches `selection`, splice the comment mark across the matched
  * range in place and return true. Returns false (and does NOT mutate) when no
@@ -380,10 +452,12 @@ export function applyAnchorInDoc(
   selection: string,
   commentId: string,
 ): boolean {
+  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  if (!found) return false;
   const visit = (node: any, depth: number): boolean => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return false;
     if (!Array.isArray(node.content)) return false;
-    const match = findAnchorInBlock(node.content, selection);
+    const match = findAnchorInBlock(node.content, effective);
     if (match) {
       spliceCommentMark(node.content, match, commentId);
       return true;

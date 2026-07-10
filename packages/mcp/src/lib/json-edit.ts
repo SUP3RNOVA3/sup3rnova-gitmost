@@ -12,7 +12,11 @@
  * re-import for small wording fixes.
  */
 
-import { stripInlineMarkdown, stripBalancedWrappers } from "./text-normalize.js";
+import {
+  stripInlineMarkdown,
+  stripBalancedWrappers,
+  closestBlockHint,
+} from "./text-normalize.js";
 
 export interface TextEdit {
   find: string;
@@ -381,29 +385,9 @@ export function applyTextEdits(
       } else {
         // Append a bounded "closest text" hint: find the FIRST block that
         // contains the longest whitespace-delimited token (>= 3 chars) of the
-        // (stripped, then raw) locator, and quote that block's plain text.
-        reason = "text not found in the document.";
-        const tokenSource = stripped.length > 0 ? stripped : edit.find;
-        const longestToken = tokenSource
-          .split(/\s+/)
-          .filter((t) => t.length >= 3)
-          .sort((a, b) => b.length - a.length)[0];
-        if (longestToken) {
-          const hitBlock = blockPlain.find((plain) =>
-            plain.includes(longestToken),
-          );
-          if (hitBlock) {
-            // Truncate by code point (spread iterates by code point) so a
-            // surrogate pair is never split; append the ellipsis only when the
-            // text was actually longer than the limit.
-            const points = [...hitBlock];
-            const snippet =
-              points.length > 120
-                ? points.slice(0, 120).join("") + "…"
-                : hitBlock;
-            reason += ` Closest block text: "${snippet}".`;
-          }
-        }
+        // (stripped, then raw) locator, and quote that block's plain text. Shared
+        // with create_comment via closestBlockHint so both give the same hint.
+        reason = "text not found in the document." + closestBlockHint(blockPlain, edit.find);
       }
       failed.push({ find: edit.find, reason });
       continue;
