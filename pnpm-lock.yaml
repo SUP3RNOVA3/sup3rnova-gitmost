@@ -1044,6 +1044,9 @@ importers:
       marked:
         specifier: ^17.0.1
         version: 17.0.5
+      pako:
+        specifier: ^2.0.3
+        version: 2.0.3
       re2:
         specifier: ^1.21.0
         version: 1.25.0
