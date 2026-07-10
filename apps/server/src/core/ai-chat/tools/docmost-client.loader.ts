@@ -23,6 +23,7 @@ type DocmostClientMethod =
   | 'getWorkspace'
   | 'getSpaces'
   | 'listPages'
+  | 'getTree'
   | 'listSidebarPages'
   | 'getOutline'
   | 'getPageJson'

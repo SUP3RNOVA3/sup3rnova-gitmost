@@ -165,6 +165,45 @@ test("insertNode spec exists, describes markdown+node XOR, builds the full ancho
   );
 });
 
+// #443: getTree — a space's page hierarchy (or a subtree) in one request.
+test("getTree spec exists on both hosts, builds { spaceId, rootPageId?, maxDepth? }", () => {
+  const spec = SHARED_TOOL_SPECS.getTree;
+  assert.ok(spec, "getTree spec missing");
+  assert.equal(spec.mcpName, "getTree");
+  assert.equal(spec.inAppKey, "getTree");
+  // Shared spec: registered on BOTH hosts.
+  assert.notEqual(spec.inAppOnly, true);
+  assert.notEqual(spec.mcpOnly, true);
+
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["maxDepth", "rootPageId", "spaceId"]);
+  const schema = z.object(shape);
+  // spaceId required; rootPageId + maxDepth optional.
+  assert.doesNotThrow(() => schema.parse({ spaceId: "sp1" }));
+  assert.throws(() => schema.parse({}));
+  assert.doesNotThrow(() =>
+    schema.parse({ spaceId: "sp1", rootPageId: "p1", maxDepth: 2 }),
+  );
+  // maxDepth is an integer >= 1.
+  assert.throws(() => schema.parse({ spaceId: "sp1", maxDepth: 0 }));
+  assert.throws(() => schema.parse({ spaceId: "sp1", maxDepth: 1.5 }));
+
+  // The description advertises the output node shape, rootPageId, maxDepth, and
+  // steers away from the deprecated listPages tree:true.
+  assert.match(spec.description, /pageId/);
+  assert.match(spec.description, /rootPageId/);
+  assert.match(spec.description, /maxDepth/);
+  assert.match(spec.description, /hasChildren/);
+  assert.match(spec.description, /listPages tree:true/);
+});
+
+// #443: listPages tree:true is deprecated in favour of getTree.
+test("listPages description deprecates tree:true and points at getTree", () => {
+  const spec = SHARED_TOOL_SPECS.listPages;
+  assert.match(spec.description, /DEPRECATED/i);
+  assert.match(spec.description, /getTree/);
+});
+
 test("no-arg specs (getWorkspace/listSpaces/listShares) omit buildShape", () => {
   for (const key of ["getWorkspace", "listSpaces", "listShares"]) {
     assert.equal(SHARED_TOOL_SPECS[key].buildShape, undefined, `${key} should be no-arg`);
