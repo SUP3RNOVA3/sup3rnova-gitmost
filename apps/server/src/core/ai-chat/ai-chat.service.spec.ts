@@ -15,6 +15,7 @@ import {
   serializeSteps,
   rowToUiMessage,
   prepareAgentStep,
+  stepBudgetWarning,
   flushAssistant,
   stripNulChars,
   chatStreamMetadata,
@@ -22,7 +23,9 @@ import {
   isInterruptResume,
   sameInstant,
   MAX_AGENT_STEPS,
+  STEP_BUDGET_WARNING_LEAD,
   FINAL_STEP_INSTRUCTION,
+  FINAL_STEP_NUDGE,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
@@ -311,43 +314,67 @@ describe('rowToUiMessage', () => {
 
 /**
  * Unit tests for prepareAgentStep: the pure helper that decides per-step
- * overrides for the agent loop. Early steps return undefined (default
- * behavior); the final allowed step (stepNumber === MAX_AGENT_STEPS - 1) forces
- * a text-only synthesis answer (toolChoice 'none') with the FINAL_STEP_INSTRUCTION
- * appended onto — not replacing — the original system prompt.
+ * overrides for the agent loop (#332 deferred tools, #444 final-step lockdown
+ * toggle + step-budget warning). Parametrized by the two toggles so a change to
+ * one path cannot silently mask a regression in the other.
+ *
+ * Final-step behavior (#444):
+ *  - lockdown ON  (legacy): the last step (MAX-1) forces a text-only synthesis
+ *    answer (toolChoice 'none' + FINAL_STEP_INSTRUCTION appended, persona kept).
+ *  - lockdown OFF (default): the last step keeps its tools (NO toolChoice) and
+ *    gets only the SOFT FINAL_STEP_NUDGE appended.
  */
 // Narrowing helpers for the prepareAgentStep union return type.
 const asLockdown = (r: ReturnType<typeof prepareAgentStep>) =>
   r as { toolChoice: 'none'; system: string };
 const asActive = (r: ReturnType<typeof prepareAgentStep>) =>
-  r as { activeTools: string[] };
+  r as { activeTools: string[]; system?: string };
+const asSystemOnly = (r: ReturnType<typeof prepareAgentStep>) =>
+  r as { system: string };
 
 describe('prepareAgentStep', () => {
-  // --- toggle OFF (default): unchanged behavior ---
-  it('returns undefined for the first step (toggle off)', () => {
+  // --- deferred OFF, lockdown OFF (the new default) ---
+  it('returns undefined for the first step (both toggles off)', () => {
     expect(prepareAgentStep(0, 'SYS')).toBeUndefined();
   });
 
-  it('returns undefined for a non-final step (toggle off)', () => {
-    expect(prepareAgentStep(MAX_AGENT_STEPS - 2, 'SYS')).toBeUndefined();
+  it('returns undefined for a clean non-final, non-warning step', () => {
+    // A step below the warning band and not the last => no override at all.
+    expect(prepareAgentStep(MAX_AGENT_STEPS - 10, 'SYS')).toBeUndefined();
   });
 
-  it('forces a text-only synthesis on the final allowed step (toggle off)', () => {
-    const result = asLockdown(prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS'));
+  it('final step (lockdown OFF) keeps tools and appends only the SOFT nudge', () => {
+    const result = asSystemOnly(prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS'));
     expect(result).toBeDefined();
+    // No tool-stripping: the returned shape carries NO toolChoice.
+    expect(
+      (result as unknown as { toolChoice?: string }).toolChoice,
+    ).toBeUndefined();
+    expect(result.system.startsWith('SYS')).toBe(true);
+    expect(result.system).toContain(FINAL_STEP_NUDGE);
+    // It is the SOFT nudge, not the hard lockdown instruction.
+    expect(result.system).not.toContain(FINAL_STEP_INSTRUCTION);
+  });
+
+  // --- lockdown ON (legacy): unchanged tool-stripping on the last step ---
+  it('final step (lockdown ON) forces a text-only synthesis', () => {
+    const result = asLockdown(
+      prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS', [], false, true),
+    );
     expect(result.toolChoice).toBe('none');
     // The original persona is preserved (prefix), not replaced.
     expect(result.system.startsWith('SYS')).toBe(true);
-    // The synthesis instruction is appended.
+    // The synthesis instruction is appended (NOT the soft nudge).
     expect(result.system).toContain(FINAL_STEP_INSTRUCTION);
+    expect(result.system).not.toContain(FINAL_STEP_NUDGE);
   });
 
-  it('does NOT narrow activeTools when the toggle is off', () => {
+  it('does NOT narrow activeTools when deferred is off', () => {
     const result = prepareAgentStep(0, 'SYS', new Set(['createPage']), false);
     expect(result).toBeUndefined();
   });
 
-  // --- toggle ON (#332): deferred tool visibility ---
+  // --- deferred ON (#332): deferred tool visibility ---
   it('a non-final step exposes CORE + loadTools + activatedTools', () => {
     const activated = new Set<string>();
     const result = asActive(prepareAgentStep(0, 'SYS', activated, true));
@@ -358,6 +385,8 @@ describe('prepareAgentStep', () => {
     // No deferred tool is active before it is loaded.
     expect(result.activeTools).not.toContain('createPage');
     expect(result.activeTools).not.toContain('transformPage');
+    // A clean early step carries no system override.
+    expect(result.system).toBeUndefined();
   });
 
   it('adding a name to activatedTools makes it appear on the next step', () => {
@@ -380,14 +409,90 @@ describe('prepareAgentStep', () => {
     expect(result.activeTools).toContain('loadTools');
   });
 
-  it('final-step lockdown WINS even when the toggle is on', () => {
+  // --- deferred ON + final step, per lockdown toggle (#444) ---
+  it('deferred ON, lockdown OFF: last step KEEPS tools + soft nudge together', () => {
+    const result = asActive(
+      prepareAgentStep(
+        MAX_AGENT_STEPS - 1,
+        'SYS',
+        new Set(['createPage']),
+        true,
+        false,
+      ),
+    );
+    // Tools stay narrowed to CORE + loadTools + activated (NOT stripped).
+    expect(result.activeTools).toContain('editPageText');
+    expect(result.activeTools).toContain('loadTools');
+    expect(result.activeTools).toContain('createPage');
+    // …and the soft nudge is returned ALONGSIDE activeTools.
+    expect(result.system).toContain(FINAL_STEP_NUDGE);
+    expect(
+      (result as unknown as { toolChoice?: string }).toolChoice,
+    ).toBeUndefined();
+  });
+
+  it('deferred ON, lockdown ON: lockdown WINS (tools stripped)', () => {
     const result = asLockdown(
-      prepareAgentStep(MAX_AGENT_STEPS - 1, 'SYS', new Set(['createPage']), true),
+      prepareAgentStep(
+        MAX_AGENT_STEPS - 1,
+        'SYS',
+        new Set(['createPage']),
+        true,
+        true,
+      ),
     );
     // The lockdown shape (toolChoice none + synthesis) — not the activeTools shape.
     expect(result.toolChoice).toBe('none');
     expect(result.system).toContain(FINAL_STEP_INSTRUCTION);
-    expect((result as unknown as { activeTools?: string[] }).activeTools).toBeUndefined();
+    expect(
+      (result as unknown as { activeTools?: string[] }).activeTools,
+    ).toBeUndefined();
+  });
+});
+
+/**
+ * Step-budget warning boundaries (#444). At MAX_AGENT_STEPS=50 the warning fires
+ * on steps MAX-6 .. MAX-2 (44..48) with a decreasing remaining-count, is CLEAN
+ * below the band (0..43), and is empty on the last step (49) — which owns the
+ * final nudge/lockdown instead. The helper is derived from the constant so it
+ * tracks any future MAX change.
+ */
+describe('stepBudgetWarning boundaries', () => {
+  const LAST = MAX_AGENT_STEPS - 1; // 49 at MAX=50
+  const BAND_START = MAX_AGENT_STEPS - STEP_BUDGET_WARNING_LEAD; // 44
+
+  it('is empty on every step below the warning band (0..BAND_START-1)', () => {
+    for (let s = 0; s < BAND_START; s++) {
+      expect(stepBudgetWarning(s)).toBe('');
+    }
+  });
+
+  it('fires on BAND_START..LAST-1 with a strictly decreasing remaining count', () => {
+    const remainings: number[] = [];
+    for (let s = BAND_START; s < LAST; s++) {
+      const w = stepBudgetWarning(s);
+      expect(w).toContain('tool-use steps remain');
+      const m = w.match(/Only (\d+) tool-use steps remain/);
+      expect(m).not.toBeNull();
+      remainings.push(Number(m![1]));
+    }
+    // Exactly STEP_BUDGET_WARNING_LEAD-1 warning steps (44..48).
+    expect(remainings).toHaveLength(STEP_BUDGET_WARNING_LEAD - 1);
+    // Remaining = MAX-1-step, so it decreases by 1 each step and ends at 1.
+    for (let i = 1; i < remainings.length; i++) {
+      expect(remainings[i]).toBe(remainings[i - 1] - 1);
+    }
+    expect(remainings[remainings.length - 1]).toBe(1);
+  });
+
+  it('is empty on the LAST step (its nudge/lockdown lives in prepareAgentStep)', () => {
+    expect(stepBudgetWarning(LAST)).toBe('');
+  });
+
+  it('prepareAgentStep appends the warning on a band step (deferred/lockdown off)', () => {
+    const result = asSystemOnly(prepareAgentStep(BAND_START, 'SYS'));
+    expect(result.system).toContain('Stop exploring and start acting now');
+    expect(result.system).not.toContain(FINAL_STEP_NUDGE);
   });
 });
 
@@ -1341,6 +1446,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
       {} as never, // pageAccess
       {
         isAiChatDeferredToolsEnabled: () => false,
+        isAiChatFinalStepLockdownEnabled: () => false,
         isAiChatResumableStreamEnabled: () => opts.resumable,
       } as never,
       streamRegistry as never,

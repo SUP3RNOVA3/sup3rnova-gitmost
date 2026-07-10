@@ -293,6 +293,24 @@ export class EnvironmentService {
   }
 
   /**
+   * Final-step lockdown for the in-app agent loop (#444). When ON (legacy), the
+   * LAST allowed step forces a text-only answer: tools are stripped
+   * (toolChoice:'none') and a synthesis instruction is appended. Defaults to OFF:
+   * stripping the tools mid-work triggered a token-loop degeneration incident
+   * (the model, robbed of its tools on the final step, emitted a 255KB block
+   * repeating a single token). With the toggle OFF the last step keeps its tools
+   * and gets only a SOFT nudge to finish with a text summary; the universal
+   * anti-babble guard is the token-degeneration detector instead. Enable this
+   * only for a model that does NOT reliably end its turns with a text answer.
+   */
+  isAiChatFinalStepLockdownEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('AI_CHAT_FINAL_STEP_LOCKDOWN', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
+  /**
    * Resumable SSE transport for durable agent runs (#184 phase 1.5). When
    * enabled, a run tees its SSE frames into the in-memory run-stream registry so
    * a late/reloaded tab can attach (replay + live tail) via

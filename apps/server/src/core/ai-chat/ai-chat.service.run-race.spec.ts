@@ -53,7 +53,7 @@ describe('AiChatService.stream — concurrent-run race rejection (#184)', () => 
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
     );
     const begin = jest.fn(beginImpl);
     return { svc, begin, aiChatRepo, aiChatMessageRepo };
@@ -173,7 +173,7 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo (openPage undefined -> never touched)
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
     );
     return { svc };
   }
@@ -199,7 +199,8 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
     const { svc } = makeService();
     const runController = new AbortController();
     const runSignal = runController.signal;
-    const socketSignal = new AbortController().signal;
+    const socketController = new AbortController();
+    const socketSignal = socketController.signal;
 
     const begin = jest.fn(async () => ({ runId: 'run-1', signal: runSignal }));
     await svc.stream({
@@ -223,13 +224,26 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
     expect(streamTextMock).toHaveBeenCalledTimes(1);
     // THE assertion: the agent loop's abort is wired to the RUN, so a browser
     // disconnect (which aborts only `socketSignal`) cannot end the turn.
-    expect(streamTextMock.mock.calls[0][0].abortSignal).toBe(runSignal);
-    expect(streamTextMock.mock.calls[0][0].abortSignal).not.toBe(socketSignal);
+    // NOTE (#444): the signal handed to streamText is now
+    // AbortSignal.any([effectiveSignal, degenerationController.signal]), so it is
+    // no longer identity-equal to `runSignal`. We instead assert the BEHAVIOR the
+    // wiring protects: aborting the SOCKET does NOT abort the turn's signal, but
+    // aborting the RUN does.
+    const passed = streamTextMock.mock.calls[0][0].abortSignal as AbortSignal;
+    expect(passed).not.toBe(socketSignal);
+    expect(passed.aborted).toBe(false);
+    socketController.abort?.();
+    // A socket abort must not reach a run-wrapped turn.
+    expect(passed.aborted).toBe(false);
+    // A run abort must.
+    runController.abort();
+    expect(passed.aborted).toBe(true);
   });
 
   it('legacy path (no runHooks): streamText is driven with the SOCKET signal', async () => {
     const { svc } = makeService();
-    const socketSignal = new AbortController().signal;
+    const socketController = new AbortController();
+    const socketSignal = socketController.signal;
 
     await svc.stream({
       user: { id: 'user-1' } as never,
@@ -244,7 +258,12 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
     });
 
     expect(streamTextMock).toHaveBeenCalledTimes(1);
-    expect(streamTextMock.mock.calls[0][0].abortSignal).toBe(socketSignal);
+    // #444: the passed signal is AbortSignal.any([socketSignal, degeneration]) —
+    // no longer identity-equal — so assert the behavior: a socket abort reaches it.
+    const passed = streamTextMock.mock.calls[0][0].abortSignal as AbortSignal;
+    expect(passed.aborted).toBe(false);
+    socketController.abort();
+    expect(passed.aborted).toBe(true);
   });
 
   /**
@@ -414,7 +433,7 @@ describe('AiChatService.stream — begin-failure resilience / legacy fallback (#
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
     );
     return { svc, aiChatMessageRepo };
   }
@@ -442,7 +461,8 @@ describe('AiChatService.stream — begin-failure resilience / legacy fallback (#
       .mockImplementation(() => undefined as never);
 
     const { svc, aiChatMessageRepo } = makeService();
-    const socketSignal = new AbortController().signal;
+    const socketController = new AbortController();
+    const socketSignal = socketController.signal;
 
     // A transient, NON-race begin failure (e.g. a non-unique DB error inserting
     // the run row). This is the `else` branch of the begin try/catch.
@@ -483,7 +503,12 @@ describe('AiChatService.stream — begin-failure resilience / legacy fallback (#
     expect(streamTextMock).toHaveBeenCalledTimes(1);
 
     // The decisive wiring: with no run handle, the fallback uses the SOCKET signal
-    // (effectiveSignal = signal, runId undefined) — not a run-bound signal.
-    expect(streamTextMock.mock.calls[0][0].abortSignal).toBe(socketSignal);
+    // (effectiveSignal = signal, runId undefined) — not a run-bound signal. #444:
+    // the signal is unioned with the degeneration controller via AbortSignal.any,
+    // so assert the socket abort still reaches the turn rather than identity.
+    const passed = streamTextMock.mock.calls[0][0].abortSignal as AbortSignal;
+    expect(passed.aborted).toBe(false);
+    socketController.abort();
+    expect(passed.aborted).toBe(true);
   });
 });

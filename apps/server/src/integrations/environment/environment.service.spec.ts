@@ -158,4 +158,27 @@ describe('EnvironmentService', () => {
       ).toBe('https://app.example.com');
     });
   });
+
+  describe('isAiChatFinalStepLockdownEnabled (#444)', () => {
+    const build = (val?: string) =>
+      new EnvironmentService({
+        get: (key: string, def?: string) =>
+          key === 'AI_CHAT_FINAL_STEP_LOCKDOWN' ? (val ?? def) : def,
+      } as any);
+
+    it('defaults to OFF (false) when unset — the new anti-degeneration default', () => {
+      expect(build(undefined).isAiChatFinalStepLockdownEnabled()).toBe(false);
+    });
+
+    it('is true only for the exact opt-in "true" (case-insensitive)', () => {
+      expect(build('true').isAiChatFinalStepLockdownEnabled()).toBe(true);
+      expect(build('TRUE').isAiChatFinalStepLockdownEnabled()).toBe(true);
+    });
+
+    it('stays OFF for any other value', () => {
+      expect(build('false').isAiChatFinalStepLockdownEnabled()).toBe(false);
+      expect(build('1').isAiChatFinalStepLockdownEnabled()).toBe(false);
+      expect(build('yes').isAiChatFinalStepLockdownEnabled()).toBe(false);
+    });
+  });
 });

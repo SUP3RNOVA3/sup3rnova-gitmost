@@ -52,11 +52,24 @@ import {
   startSseHeartbeat,
   stripStreamingHopByHopHeaders,
 } from './sse-resilience';
+import {
+  isDegenerateOutput,
+  truncateDegeneratedTail,
+} from './output-degeneration';
 
 // Max agent steps per turn. One step = one model generation; a step that calls
 // tools is followed by another step carrying the tool results. Raised from 8 so
-// multi-search research questions are not cut off mid-investigation.
-const MAX_AGENT_STEPS = 20;
+// multi-search research questions are not cut off mid-investigation, then from 20
+// to 50 (#444) so read-heavy turns (e.g. dozens of searchInPage sweeps) do not
+// exhaust the budget before acting.
+const MAX_AGENT_STEPS = 50;
+
+// How many steps before the LAST one the step-budget warning starts firing
+// (#444). At MAX-STEP_BUDGET_WARNING_LEAD .. MAX-2 the model is told to stop
+// exploring and start acting, with the remaining count decreasing each step; the
+// last step (MAX-1) has its own final nudge / lockdown instead (see
+// prepareAgentStep).
+const STEP_BUDGET_WARNING_LEAD = 6;
 
 // Wall-clock ceiling for building the external MCP toolset during the per-turn
 // setup phase (before streamText owns the lifecycle). Defense-in-depth ABOVE the
@@ -82,16 +95,69 @@ const FINAL_STEP_INSTRUCTION =
   'language. If the information is incomplete, say so explicitly: summarize ' +
   'what you found, what is still missing, and give your best partial conclusion.';
 
-// Pure, unit-testable: decide per-step overrides. Two responsibilities:
-//   1. Final-step lockdown (always): on the final allowed step force a text-only
-//      synthesis answer (toolChoice 'none' + FINAL_STEP_INSTRUCTION). This WINS —
-//      it takes precedence over the deferred-tool narrowing below.
-//   2. Deferred tool visibility (#332): when `deferredEnabled` and NOT the final
-//      step, expose only the CORE tools + loadTools + whatever loadTools has
-//      activated so far this turn (`activatedTools`), via `activeTools`. Deferred
-//      tools stay in the <tool_catalog> until the model loads them.
-// When `deferredEnabled` is false the behavior is unchanged: undefined on normal
-// steps (all tools active), lockdown on the final step.
+// SOFT final-step nudge (#444), used when the final-step lockdown toggle is OFF
+// (the new default). Unlike FINAL_STEP_INSTRUCTION it does NOT strip tools
+// (toolChoice stays untouched), so the model is never forced into a tool-less
+// state mid-work — that tool-stripping is what triggered the 255KB token-loop
+// degeneration incident. It only asks the model to finish with a text summary.
+const FINAL_STEP_NUDGE =
+  'This is the LAST step of this turn. Write your final answer to the user now.\n' +
+  'You may still call tools, but the turn ends after this step either way —\n' +
+  'prefer finishing with a clear text summary of what was done and what remains.';
+
+// Synthetic marker text appended in onFinish when a step-exhausted turn produced
+// NO text at all (#444, mitigates the "empty turn" the lockdown used to prevent
+// when the toggle is OFF). Makes the exhausted-without-answer state explicit to
+// the user and, on replay, to the model on the next turn.
+const STEP_LIMIT_NO_ANSWER_MARKER =
+  '(Достигнут лимит шагов — итоговый ответ не сформулирован; работа могла ' +
+  'остаться незавершённой. Напишите «продолжай», чтобы агент продолжил.)';
+
+// Reason recorded in ai_chat_runs.error / the assistant row when the token-
+// degeneration detector (#444) aborts a run. Distinct from a user Stop (no error)
+// and from a server restart ('streaming' -> swept to 'aborted' with no message).
+const OUTPUT_DEGENERATION_ERROR =
+  'Output degeneration detected (repeated token loop)';
+
+/**
+ * Compute the step-budget warning text (#444), or '' when this step is outside
+ * the warning band. The warning fires on steps
+ * MAX_AGENT_STEPS-STEP_BUDGET_WARNING_LEAD .. MAX_AGENT_STEPS-2 (NOT the last
+ * step, which has its own final nudge/lockdown), telling the model to stop
+ * exploring and start acting. `N` is the number of tool-use steps still
+ * remaining (`MAX_AGENT_STEPS - 1 - stepNumber`), so it decreases toward the
+ * end. Pure.
+ */
+export function stepBudgetWarning(stepNumber: number): string {
+  const isLastStep = stepNumber >= MAX_AGENT_STEPS - 1;
+  const inBand = stepNumber >= MAX_AGENT_STEPS - STEP_BUDGET_WARNING_LEAD;
+  if (isLastStep || !inBand) return '';
+  const remaining = MAX_AGENT_STEPS - 1 - stepNumber;
+  return (
+    `Only ${remaining} tool-use steps remain in this turn. Stop exploring and start acting now\n` +
+    '(make the edits / create the comments / produce results). Leave room to finish\n' +
+    'with a final text answer.'
+  );
+}
+
+// Pure, unit-testable: decide per-step overrides. Responsibilities:
+//   1. Final-step handling. Two modes, chosen by `finalStepLockdownEnabled`:
+//      - toggle ON (legacy): on the final allowed step force a text-only
+//        synthesis answer (toolChoice 'none' + FINAL_STEP_INSTRUCTION). This WINS
+//        — it takes precedence over the deferred-tool narrowing below.
+//      - toggle OFF (new default, #444): do NOT touch toolChoice — tools stay
+//        available on every step incl. the last, so the model is never stripped
+//        of its tools mid-work (the cause of the token-loop degeneration
+//        incident). A SOFT nudge (FINAL_STEP_NUDGE) is appended to `system`, and
+//        the deferred-tool `activeTools` narrowing still applies to the last step
+//        (both `activeTools` and `system` are returned together).
+//   2. Step-budget warning (#444): on steps in the warning band (but not the
+//      last, which has its own nudge/lockdown) append stepBudgetWarning(...) to
+//      `system` so the model starts acting before it runs out of steps.
+//   3. Deferred tool visibility (#332): when `deferredEnabled`, expose only the
+//      CORE tools + loadTools + whatever loadTools has activated so far this turn
+//      (`activatedTools`), via `activeTools`. Deferred tools stay in the
+//      <tool_catalog> until the model loads them.
 //
 // `system` is the in-scope system prompt; we CONCATENATE so the original
 // persona/context is preserved — a bare `system` override would REPLACE the
@@ -107,31 +173,53 @@ export function prepareAgentStep(
   system: string,
   activatedTools: ReadonlySet<string> | readonly string[] = [],
   deferredEnabled = false,
+  finalStepLockdownEnabled = false,
 ):
   | { toolChoice: 'none'; system: string }
-  | { activeTools: string[] }
+  | { activeTools: string[]; system?: string }
+  | { system: string }
   | undefined {
-  // Final-step lockdown WINS (applies regardless of the deferred toggle).
-  if (stepNumber >= MAX_AGENT_STEPS - 1) {
+  const isLastStep = stepNumber >= MAX_AGENT_STEPS - 1;
+
+  // Legacy final-step lockdown (toggle ON): text-only synthesis. WINS over the
+  // deferred narrowing AND drops tools for this step.
+  if (isLastStep && finalStepLockdownEnabled) {
     return {
       toolChoice: 'none',
       system: `${system}\n\n${FINAL_STEP_INSTRUCTION}`,
     };
   }
-  // Deferred tool loading: narrow this step's visible tools to CORE + loadTools
-  // + the tools already activated this turn.
+
+  // Compute the extra system text for this step: the soft final nudge on the last
+  // step (toggle OFF), or the step-budget warning in the warning band. At most one
+  // of these applies (stepBudgetWarning returns '' on the last step).
+  const extra = isLastStep ? FINAL_STEP_NUDGE : stepBudgetWarning(stepNumber);
+  const systemForStep = extra ? `${system}\n\n${extra}` : undefined;
+
+  // Deferred tool loading: narrow this step's visible tools to CORE + loadTools +
+  // the tools already activated this turn. Applies on EVERY step incl. the last
+  // (toggle OFF), so the model keeps its core tools available while being nudged
+  // to finish. Return `system` alongside `activeTools` when we have extra text.
   if (deferredEnabled) {
     const activated = Array.isArray(activatedTools)
       ? activatedTools
       : [...activatedTools];
-    return {
-      activeTools: [...CORE_TOOL_KEYS, LOAD_TOOLS_NAME, ...activated],
-    };
+    const activeTools = [...CORE_TOOL_KEYS, LOAD_TOOLS_NAME, ...activated];
+    return systemForStep ? { activeTools, system: systemForStep } : { activeTools };
   }
-  return undefined;
+
+  // Deferred OFF: all tools stay active; only append the extra system text (if any).
+  return systemForStep ? { system: systemForStep } : undefined;
 }
 
-export { MAX_AGENT_STEPS, FINAL_STEP_INSTRUCTION };
+export {
+  MAX_AGENT_STEPS,
+  STEP_BUDGET_WARNING_LEAD,
+  FINAL_STEP_INSTRUCTION,
+  FINAL_STEP_NUDGE,
+  STEP_LIMIT_NO_ANSWER_MARKER,
+  OUTPUT_DEGENERATION_ERROR,
+};
 
 // Pure, unit-testable post-processing for a model-generated title (#199): trim
 // whitespace, strip a single pair of surrounding quotes the model often adds,
@@ -890,6 +978,12 @@ export class AiChatService implements OnModuleInit {
       // tools (fat/rare in-app tools + ALL external MCP tools) load on demand. When
       // OFF, every tool is active and nothing below changes.
       const deferredEnabled = this.environment.isAiChatDeferredToolsEnabled();
+      // Final-step lockdown toggle (#444). Default OFF: the last step keeps its
+      // tools and gets only a soft nudge (prepareAgentStep), and the token-
+      // degeneration detector (onChunk below) is the anti-babble guard. ON =
+      // legacy tool-stripping lockdown on the last step.
+      const finalStepLockdownEnabled =
+        this.environment.isAiChatFinalStepLockdownEnabled();
 
       let system: string;
       let docmostTools: Awaited<ReturnType<AiChatToolsService['forUser']>>;
@@ -977,6 +1071,16 @@ export class AiChatService implements OnModuleInit {
       // the CURRENT, not-yet-finished step, reset whenever a step finishes.
       const capturedSteps: StepLike[] = [];
       let inProgressText = '';
+
+      // Token-degeneration guard (#444). When the final-step lockdown is OFF, a
+      // runaway repetition loop (the 255KB "loadTools." incident) is aborted via
+      // this internal controller, unioned with the run/socket signal below. The
+      // detector runs on `inProgressText` in onChunk, throttled by growth so the
+      // pure rules only fire every ~DEGENERATION_CHECK_STEP bytes.
+      const degenerationController = new AbortController();
+      let degenerationDetected = false;
+      let lastDegenerationCheckLen = 0;
+      const DEGENERATION_CHECK_STEP = 2000;
 
       // Step-granular durability (#183): create the assistant row UPFRONT in the
       // 'streaming' state (before any token), then UPDATE it as each step finishes
@@ -1118,11 +1222,21 @@ export class AiChatService implements OnModuleInit {
           // further tool calls and appends a synthesis instruction on that step,
           // concatenated onto the original `system` so the persona is preserved.
           prepareStep: ({ stepNumber }) =>
-            prepareAgentStep(stepNumber, system, activatedTools, deferredEnabled),
+            prepareAgentStep(
+              stepNumber,
+              system,
+              activatedTools,
+              deferredEnabled,
+              finalStepLockdownEnabled,
+            ),
           // #184: the RUN's signal (explicit-stop) when a run wraps this turn, else
           // the socket-bound signal (legacy). A browser disconnect aborts only in
-          // the legacy path.
-          abortSignal: effectiveSignal,
+          // the legacy path. #444: UNION it with the internal degeneration signal
+          // so a detected token-loop aborts the run too (AbortSignal.any — Node 20.3+).
+          abortSignal: AbortSignal.any([
+            effectiveSignal,
+            degenerationController.signal,
+          ]),
           onChunk: ({ chunk }) => {
             // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Any model
             // output chunk means the stream is actively emitting bytes; track first
@@ -1132,7 +1246,29 @@ export class AiChatService implements OnModuleInit {
             lastModelChunkAt = now;
             // 'text-delta' is the assistant's prose; tool-call args are separate chunk
             // types — so this mirrors exactly what streams to the client.
-            if (chunk.type === 'text-delta') inProgressText += chunk.text;
+            if (chunk.type === 'text-delta') {
+              inProgressText += chunk.text;
+              // Token-degeneration guard (#444). Throttled: only re-run the pure
+              // rules once the text has grown ~DEGENERATION_CHECK_STEP bytes since
+              // the last check, so the tail heuristics cost is amortized. On a
+              // trigger, abort the run ONCE with a distinguishable reason.
+              if (
+                !degenerationDetected &&
+                inProgressText.length - lastDegenerationCheckLen >=
+                  DEGENERATION_CHECK_STEP
+              ) {
+                lastDegenerationCheckLen = inProgressText.length;
+                if (isDegenerateOutput(inProgressText)) {
+                  degenerationDetected = true;
+                  this.logger.warn(
+                    `AI chat stream aborted (chat ${chatId}): ${OUTPUT_DEGENERATION_ERROR}`,
+                  );
+                  degenerationController.abort(
+                    new Error(OUTPUT_DEGENERATION_ERROR),
+                  );
+                }
+              }
+            }
           },
           onStepFinish: (step) => {
             // The finished step's full text is now in `step.text`; fold it in and reset
@@ -1174,8 +1310,22 @@ export class AiChatService implements OnModuleInit {
             // plain-text projection (full-text search / fallback). A multi-step
             // turn's `content` therefore now holds all steps' prose, not just the
             // last block.
+            // Empty-turn mitigation (#444, toggle OFF). If the turn burned all its
+            // steps WITHOUT ever producing text (every step's text is empty) and
+            // the model stopped because it hit the step cap, there is no answer to
+            // show — the lockdown used to force one. Append a synthetic marker as
+            // the trailing text so the exhausted-without-answer state is explicit
+            // to the user and, on replay, to the model next turn. `flushAssistant`
+            // takes this as the `inProgressText` trailing text arg (empty here
+            // otherwise). `stepCountIs(MAX_AGENT_STEPS)` surfaces as
+            // finishReason === 'tool-calls' (or a length/other cap), so we key off
+            // "no text produced" rather than a single finishReason string.
+            const producedText = (steps as StepLike[]).some((s) => s.text?.trim());
+            const stepExhausted = steps.length >= MAX_AGENT_STEPS;
+            const emptyTurnMarker =
+              !producedText && stepExhausted ? STEP_LIMIT_NO_ANSWER_MARKER : '';
             await finalizeAssistant(
-              flushAssistant(steps as StepLike[], '', 'completed', {
+              flushAssistant(steps as StepLike[], emptyTurnMarker, 'completed', {
                 finishReason: finishReason as string,
                 usage: totalUsage as StreamUsage,
                 contextTokens:
@@ -1252,6 +1402,30 @@ export class AiChatService implements OnModuleInit {
             await snapshotTurnEnd();
           },
           onAbort: async ({ steps }) => {
+            // #444: distinguish a degeneration abort (our internal controller) from
+            // a user Stop / disconnect. On degeneration we truncate the runaway tail
+            // before persist (so hundreds of KB of garbage never reach the DB /
+            // replay) and record it as an ERROR with a clear, distinguishable reason
+            // — NOT a bare 'aborted' (a user Stop) and NOT a swept 'streaming' (a
+            // server restart).
+            if (degenerationDetected) {
+              const truncated = truncateDegeneratedTail(inProgressText);
+              await finalizeAssistant(
+                flushAssistant(capturedSteps, truncated, 'error', {
+                  error: OUTPUT_DEGENERATION_ERROR,
+                  pageChanged,
+                }),
+              );
+              if (runId)
+                await runHooks?.onSettled?.(
+                  runId,
+                  'error',
+                  OUTPUT_DEGENERATION_ERROR,
+                );
+              await closeExternalClients();
+              await snapshotTurnEnd();
+              return;
+            }
             const partialChars =
               capturedSteps.reduce((n, s) => n + (s.text?.length ?? 0), 0) +
               inProgressText.length;
