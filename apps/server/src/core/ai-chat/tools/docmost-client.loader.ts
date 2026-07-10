@@ -24,6 +24,7 @@ type DocmostClientMethod =
   | 'getSpaces'
   | 'listPages'
   | 'getTree'
+  | 'getPageContext'
   | 'listSidebarPages'
   | 'getOutline'
   | 'getPageJson'

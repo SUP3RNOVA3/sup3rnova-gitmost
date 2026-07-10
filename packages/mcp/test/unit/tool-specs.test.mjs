@@ -197,6 +197,31 @@ test("getTree spec exists on both hosts, builds { spaceId, rootPageId?, maxDepth
   assert.match(spec.description, /listPages tree:true/);
 });
 
+// #443: getPageContext — a page's breadcrumbs + direct children in one call.
+test("getPageContext spec exists on both hosts, builds { pageId }", () => {
+  const spec = SHARED_TOOL_SPECS.getPageContext;
+  assert.ok(spec, "getPageContext spec missing");
+  assert.equal(spec.mcpName, "getPageContext");
+  assert.equal(spec.inAppKey, "getPageContext");
+  // Shared spec: registered on BOTH hosts.
+  assert.notEqual(spec.inAppOnly, true);
+  assert.notEqual(spec.mcpOnly, true);
+
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["pageId"]);
+  const schema = z.object(shape);
+  // pageId required.
+  assert.doesNotThrow(() => schema.parse({ pageId: "p1" }));
+  assert.throws(() => schema.parse({}));
+
+  // The description advertises the output shape (page/breadcrumbs/children) and
+  // the root-page empty-breadcrumbs contract.
+  assert.match(spec.description, /breadcrumbs/);
+  assert.match(spec.description, /children/);
+  assert.match(spec.description, /hasChildren/);
+  assert.match(spec.description, /getTree/);
+});
+
 // #443: listPages tree:true is deprecated in favour of getTree.
 test("listPages description deprecates tree:true and points at getTree", () => {
   const spec = SHARED_TOOL_SPECS.listPages;
