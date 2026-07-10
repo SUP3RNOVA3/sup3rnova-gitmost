@@ -1,5 +1,9 @@
+import { Logger } from '@nestjs/common';
 import { CommentService } from './comment.service';
 import { QueueJob } from '../../integrations/queue/constants';
+
+// Flush pending microtasks so a fire-and-forget `.catch(...)` runs before we assert.
+const flushMicrotasks = () => new Promise((r) => setImmediate(r));
 
 /**
  * #399: the comment inline-mark update is moved OFF the HTTP critical path.
@@ -149,5 +153,27 @@ describe('CommentService — async comment mark (#399)', () => {
       `enqueue:${QueueJob.COMMENT_MARK_UPDATE}`,
       'delete-row',
     ]);
+  });
+
+  it('resolve is fire-and-forget: a queue-add rejection does NOT fail the HTTP call (best-effort warn)', async () => {
+    const { service, generalQueue } = makeService();
+    // The queue is unavailable — the whole point of #399 is that this must NOT
+    // propagate out of resolveComment onto the HTTP request.
+    const queueErr = new Error('queue is down');
+    generalQueue.add.mockRejectedValue(queueErr);
+    const warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+
+    // Must resolve, never throw, even though the enqueue rejects.
+    await expect(service.resolveComment(comment(), true, user())).resolves.not.toThrow();
+
+    // The rejection is swallowed on a microtask AFTER the method returns; flush it.
+    await flushMicrotasks();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to enqueue comment mark update for comment c-1'),
+      queueErr,
+    );
+    warnSpy.mockRestore();
   });
 });
