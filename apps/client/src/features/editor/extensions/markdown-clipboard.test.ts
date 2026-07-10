@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { htmlToMarkdown } from "@docmost/editor-ext";
+// Markdown conversion now goes through the canonical package's BROWSER entry
+// (issue #347): the same converter the server import/export uses, resolved via
+// the `browser` exports condition so it runs on the native `DOMParser` (the
+// client jsdom vitest env provides one) with jsdom never bundled.
+import {
+  convertProseMirrorToMarkdown,
+  markdownToProseMirrorSync,
+} from "@docmost/prosemirror-markdown/browser";
 import {
   normalizeTableColumnWidths,
   classifyClipboardSelection,
@@ -175,10 +182,13 @@ describe("classifyClipboardSelection", () => {
 
 // Output-level tests for the table clipboard regression: copying a table must
 // yield a real GFM pipe table, NOT one-value-per-line concatenated cells.
-// These exercise the actual markdown produced by htmlToMarkdown (the same
-// serializer step the clipboardTextSerializer runs), so they pin the OUTPUT
-// shape that the classifier-flag tests above do not cover.
-describe("table clipboard markdown output (htmlToMarkdown)", () => {
+// These exercise the actual markdown produced by convertProseMirrorToMarkdown —
+// the same serializer step the clipboardTextSerializer now runs (issue #347) —
+// so they pin the OUTPUT shape that the classifier-flag tests above do not cover.
+// Input is ProseMirror JSON (what the copied slice serializes to), matching the
+// clipboardTextSerializer's new call: it wraps the slice content in a synthetic
+// `doc` (and the bare-rows case in a `table`) and calls the converter.
+describe("table clipboard markdown output (convertProseMirrorToMarkdown)", () => {
   // Trim each line and drop blanks so structural assertions are whitespace-robust.
   function lines(md: string): string[] {
     return md
@@ -188,10 +198,10 @@ describe("table clipboard markdown output (htmlToMarkdown)", () => {
   }
 
   // A GFM separator row like "| --- | --- |" (any number of columns), tolerant
-  // of the padding turndown emits.
+  // of the padding the serializer emits.
   function isSeparatorRow(line: string): boolean {
     const compact = line.replace(/\s+/g, "");
-    return /^\|(?:-{3,}\|)+$/.test(compact);
+    return /^\|(?::?-{2,}:?\|)+$/.test(compact);
   }
 
   // Split a pipe-delimited row into trimmed cell values.
@@ -203,42 +213,33 @@ describe("table clipboard markdown output (htmlToMarkdown)", () => {
       .map((c) => c.trim());
   }
 
-  it("serializes a header-less partial cell selection (bare rows) as a valid GFM pipe table", () => {
-    // Mirror the serializer's `wrapBareRows` branch exactly: bare <tr> nodes are
-    // wrapped in <table><tbody> and htmlToMarkdown(div.innerHTML) is called.
-    // See markdown-clipboard.ts clipboardTextSerializer:
-    //   const table = document.createElement("table");
-    //   const tbody = document.createElement("tbody");
-    //   tbody.appendChild(fragment); table.appendChild(tbody);
-    //   div.appendChild(table);
-    //   return htmlToMarkdown(div.innerHTML);
-    const div = document.createElement("div");
-    const table = document.createElement("table");
-    const tbody = document.createElement("tbody");
-    for (const [c1, c2] of [
-      ["a", "b"],
-      ["c", "d"],
-    ]) {
-      const tr = document.createElement("tr");
-      const td1 = document.createElement("td");
-      td1.textContent = c1;
-      const td2 = document.createElement("td");
-      td2.textContent = c2;
-      tr.appendChild(td1);
-      tr.appendChild(td2);
-      tbody.appendChild(tr);
-    }
-    table.appendChild(tbody);
-    div.appendChild(table);
+  const cell = (t: string) => ({
+    type: "tableCell",
+    content: [{ type: "paragraph", content: [{ type: "text", text: t }] }],
+  });
+  const headerCell = (t: string) => ({
+    type: "tableHeader",
+    content: [{ type: "paragraph", content: [{ type: "text", text: t }] }],
+  });
+  const row = (nodes: any[]) => ({ type: "tableRow", content: nodes });
 
-    const md = htmlToMarkdown(div.innerHTML);
+  it("serializes a header-less partial cell selection (bare rows) as a valid GFM pipe table", () => {
+    // Mirror the serializer's `wrapBareRows` branch: bare tableRow nodes are
+    // wrapped in a synthetic `table` and convertProseMirrorToMarkdown is called
+    // (see markdown-clipboard.ts clipboardTextSerializer).
+    const rows = [
+      row([cell("a"), cell("b")]),
+      row([cell("c"), cell("d")]),
+    ];
+    const md = convertProseMirrorToMarkdown({
+      type: "doc",
+      content: [{ type: "table", content: rows }],
+    });
     const ls = lines(md);
 
-    // Valid GFM: a header/data separator row is present (an empty header is
-    // synthesized by the GFM turndown plugin for a header-less table — fine).
+    // Valid GFM: a header/data separator row is present.
     expect(ls.some(isSeparatorRow)).toBe(true);
-    // NOT the old broken "one value per line" shape: every line is pipe-delimited
-    // and no line is a bare cell value on its own.
+    // NOT the old broken "one value per line" shape: every line is pipe-delimited.
     expect(ls.every((l) => l.includes("|"))).toBe(true);
     expect(md).not.toMatch(/^\s*(a|b|c|d)\s*$/m);
     // The cell values land in real pipe-delimited data rows.
@@ -248,39 +249,21 @@ describe("table clipboard markdown output (htmlToMarkdown)", () => {
   });
 
   it("serializes a whole table with a header row as a proper GFM table (headline regression)", () => {
-    // Mirror the serializer's non-wrap branch: the full <table> node is appended
-    // directly (div.appendChild(fragment)) and htmlToMarkdown(div.innerHTML) runs.
-    const div = document.createElement("div");
-    const table = document.createElement("table");
-
-    const thead = document.createElement("thead");
-    const headerRow = document.createElement("tr");
-    for (const h of ["Name", "Age"]) {
-      const th = document.createElement("th");
-      th.textContent = h;
-      headerRow.appendChild(th);
-    }
-    thead.appendChild(headerRow);
-    table.appendChild(thead);
-
-    const tbody = document.createElement("tbody");
-    for (const [name, age] of [
-      ["Alice", "30"],
-      ["Bob", "25"],
-    ]) {
-      const tr = document.createElement("tr");
-      const td1 = document.createElement("td");
-      td1.textContent = name;
-      const td2 = document.createElement("td");
-      td2.textContent = age;
-      tr.appendChild(td1);
-      tr.appendChild(td2);
-      tbody.appendChild(tr);
-    }
-    table.appendChild(tbody);
-    div.appendChild(table);
-
-    const md = htmlToMarkdown(div.innerHTML);
+    // Mirror the serializer's non-wrap branch: the full `table` node is the
+    // slice content and convertProseMirrorToMarkdown runs on it.
+    const md = convertProseMirrorToMarkdown({
+      type: "doc",
+      content: [
+        {
+          type: "table",
+          content: [
+            row([headerCell("Name"), headerCell("Age")]),
+            row([cell("Alice"), cell("30")]),
+            row([cell("Bob"), cell("25")]),
+          ],
+        },
+      ],
+    });
     const ls = lines(md);
 
     // Proper GFM structure: separator row + all rows pipe-delimited.
@@ -294,5 +277,148 @@ describe("table clipboard markdown output (htmlToMarkdown)", () => {
     expect(rows).toContainEqual(["Bob", "25"]);
     // Headline regression: the table is NOT concatenated one-value-per-line.
     expect(md).not.toMatch(/^\s*(Name|Age|Alice|Bob|30|25)\s*$/m);
+  });
+});
+
+// #347 acceptance: pasting CANONICAL markdown yields the SAME nodes the server
+// import produces for the same text. The paste path calls markdownToProseMirror
+// (the package browser entry) — the identical converter the server import uses —
+// so asserting the converter (via the browser entry, on the native DOMParser)
+// recognizes each canon form pins the paste-parity guarantee. These forms were
+// NOT recognized by the old editor-ext marked layer the paste used before.
+describe("canonical markdown paste recognition (browser entry parity)", () => {
+  // Collect every node type present in a doc (recursively).
+  const collectTypes = (n: any, set = new Set<string>()): Set<string> => {
+    if (!n || typeof n !== "object") return set;
+    if (n.type) set.add(n.type);
+    if (Array.isArray(n.content)) n.content.forEach((c) => collectTypes(c, set));
+    return set;
+  };
+  const findNode = (n: any, type: string): any => {
+    if (!n || typeof n !== "object") return undefined;
+    if (n.type === type) return n;
+    if (Array.isArray(n.content)) {
+      for (const c of n.content) {
+        const hit = findNode(c, type);
+        if (hit) return hit;
+      }
+    }
+    return undefined;
+  };
+  const allText = (n: any): string => {
+    if (!n || typeof n !== "object") return "";
+    if (typeof n.text === "string") return n.text;
+    if (Array.isArray(n.content)) return n.content.map(allText).join("");
+    return "";
+  };
+
+  it("^[…] inline footnote -> footnoteReference + footnotesList", () => {
+    const doc = markdownToProseMirrorSync("Body^[a note here].");
+    const types = collectTypes(doc);
+    expect(types.has("footnoteReference")).toBe(true);
+    expect(types.has("footnotesList")).toBe(true);
+    expect(types.has("footnoteDefinition")).toBe(true);
+  });
+
+  it('<!--img {…}--> attached image comment -> image with align', () => {
+    const doc = markdownToProseMirrorSync(
+      '![alt](/files/x.png) <!--img {"align":"left"}-->',
+    );
+    const img = findNode(doc, "image");
+    expect(img).toBeTruthy();
+    expect(img.attrs?.align).toBe("left");
+    expect(img.attrs?.src).toBe("/files/x.png");
+  });
+
+  it("> [!type] Obsidian callout -> callout node with type", () => {
+    const doc = markdownToProseMirrorSync("> [!warning]\n> be careful");
+    const callout = findNode(doc, "callout");
+    expect(callout).toBeTruthy();
+    expect(callout.attrs?.type).toBe("warning");
+    expect(allText(callout)).toContain("be careful");
+  });
+
+  it("$…$ inline math -> mathInline node", () => {
+    const doc = markdownToProseMirrorSync("Euler: $e^{i\\pi}+1=0$ done");
+    const math = findNode(doc, "mathInline");
+    expect(math).toBeTruthy();
+    expect(math.attrs?.text).toContain("e^{i\\pi}");
+  });
+
+  it("==…== highlight -> highlight mark", () => {
+    const doc = markdownToProseMirrorSync("A ==marked== word");
+    const marked = findNode(doc, "text");
+    // The highlighted run carries a `highlight` mark somewhere in the doc.
+    const hasHighlight = (n: any): boolean => {
+      if (!n || typeof n !== "object") return false;
+      if (
+        n.type === "text" &&
+        (n.marks || []).some((m: any) => m.type === "highlight")
+      )
+        return true;
+      return Array.isArray(n.content) ? n.content.some(hasHighlight) : false;
+    };
+    expect(marked).toBeTruthy();
+    expect(hasHighlight(doc)).toBe(true);
+  });
+
+  it("<!--subpages--> standalone comment -> subpages node", () => {
+    const doc = markdownToProseMirrorSync("intro\n\n<!--subpages-->\n\nafter");
+    expect(collectTypes(doc).has("subpages")).toBe(true);
+  });
+});
+
+// #347 negatives: plain text carrying markdown-LIKE punctuation must NOT be
+// silently converted/mangled (currency, bare `==`, a `[^1]` reference form).
+describe("plain-text paste negatives (no phantom conversion)", () => {
+  const findNode = (n: any, type: string): any => {
+    if (!n || typeof n !== "object") return undefined;
+    if (n.type === type) return n;
+    if (Array.isArray(n.content)) {
+      for (const c of n.content) {
+        const hit = findNode(c, type);
+        if (hit) return hit;
+      }
+    }
+    return undefined;
+  };
+  const collectTypes = (n: any, set = new Set<string>()): Set<string> => {
+    if (!n || typeof n !== "object") return set;
+    if (n.type) set.add(n.type);
+    if (Array.isArray(n.content)) n.content.forEach((c) => collectTypes(c, set));
+    return set;
+  };
+  const allText = (n: any): string => {
+    if (!n || typeof n !== "object") return "";
+    if (typeof n.text === "string") return n.text;
+    if (Array.isArray(n.content)) return n.content.map(allText).join("");
+    return "";
+  };
+
+  it("currency `$5 and $10` is NOT turned into math", () => {
+    const doc = markdownToProseMirrorSync("It costs $5 and $10 total");
+    expect(findNode(doc, "mathInline")).toBeFalsy();
+    expect(allText(doc)).toContain("$5 and $10");
+  });
+
+  it("a lone `==` is NOT turned into a highlight", () => {
+    const doc = markdownToProseMirrorSync("compare a == b in code");
+    const hasHighlight = (n: any): boolean => {
+      if (!n || typeof n !== "object") return false;
+      if (
+        n.type === "text" &&
+        (n.marks || []).some((m: any) => m.type === "highlight")
+      )
+        return true;
+      return Array.isArray(n.content) ? n.content.some(hasHighlight) : false;
+    };
+    expect(hasHighlight(doc)).toBe(false);
+    expect(allText(doc)).toContain("== b");
+  });
+
+  it("a `[^1]` reference form (no `^[`) is NOT turned into a footnote", () => {
+    const doc = markdownToProseMirrorSync("see note [^1] for details");
+    expect(collectTypes(doc).has("footnoteReference")).toBe(false);
+    expect(allText(doc)).toContain("[^1]");
   });
 });

@@ -1,15 +1,23 @@
 // adapted from: https://github.com/aguingand/tiptap-markdown/blob/main/src/extensions/tiptap/clipboard.js - MIT
 import { Extension } from "@tiptap/core";
 import { Plugin, PluginKey, TextSelection } from "@tiptap/pm/state";
-import { DOMParser, DOMSerializer, Fragment, Slice } from "@tiptap/pm/model";
+import { DOMParser, DOMSerializer, Fragment, Slice, Node as PMNode } from "@tiptap/pm/model";
 import { find } from "linkifyjs";
 import {
-  markdownToHtml,
-  htmlToMarkdown,
   canonicalizeFootnotes,
   FOOTNOTES_LIST_NAME,
   FOOTNOTE_REFERENCE_NAME,
 } from "@docmost/editor-ext";
+// Markdown <-> ProseMirror conversion now lives ONLY in the canonical
+// `@docmost/prosemirror-markdown` package (issue #347). The BROWSER entry uses
+// the native `DOMParser` for its HTML->DOM stage (jsdom stays out of the client
+// bundle) while producing the SAME nodes the server import does — so a paste of
+// canonical markdown (`^[…]`, `<!--img …-->`, `> [!type]`, `$…$`, `==…==`,
+// standalone comments) is recognized identically to import.
+import {
+  markdownToProseMirror,
+  convertProseMirrorToMarkdown,
+} from "@docmost/prosemirror-markdown/browser";
 import type { Schema } from "@tiptap/pm/model";
 
 export const MarkdownClipboard = Extension.create({
@@ -39,25 +47,24 @@ export const MarkdownClipboard = Extension.create({
               classifyClipboardSelection(topLevelNodes);
             if (!asMarkdown) return null;
 
-            const div = document.createElement("div");
-            const serializer = DOMSerializer.fromSchema(this.editor.schema);
-            const fragment = serializer.serializeFragment(slice.content);
-
+            // Convert the copied selection to Markdown through the canonical
+            // package (issue #347), the SAME serializer the server export uses,
+            // so a copied table/list matches the on-disk markdown form. The
+            // converter takes a ProseMirror `doc` JSON, so wrap the slice's
+            // top-level content in a synthetic doc.
+            const content = slice.content.toJSON() as any[];
             if (wrapBareRows) {
-              // A partial table cell-selection serializes to bare <tr> nodes
-              // (prosemirror-tables returns the whole `table` node only when the
-              // entire table is selected). Bare <tr> would be foster-parented
-              // away by the HTML parser inside htmlToMarkdown, so wrap them in
-              // <table><tbody> first for the GFM turndown rule to detect them.
-              const table = document.createElement("table");
-              const tbody = document.createElement("tbody");
-              tbody.appendChild(fragment);
-              table.appendChild(tbody);
-              div.appendChild(table);
-            } else {
-              div.appendChild(fragment);
+              // A partial table cell-selection serializes to bare `tableRow`
+              // nodes (prosemirror-tables yields the whole `table` node only for
+              // a full-table selection). The converter's table case expects a
+              // `table` wrapper, so wrap the bare rows in one — mirroring the old
+              // <table><tbody> wrap that the HTML->markdown step needed.
+              return convertProseMirrorToMarkdown({
+                type: "doc",
+                content: [{ type: "table", content }],
+              });
             }
-            return htmlToMarkdown(div.innerHTML);
+            return convertProseMirrorToMarkdown({ type: "doc", content });
           },
           handlePaste: (view, event, slice) => {
             if (!event.clipboardData) {
@@ -95,37 +102,103 @@ export const MarkdownClipboard = Extension.create({
               }
             }
 
-            const { tr } = view.state;
-            const { from, to } = view.state.selection;
+            const schema = this.editor.schema;
+            // Capture the target range NOW. markdownToProseMirror is async (its
+            // marked pipeline is declared async), so the actual replace happens
+            // on the next microtask. No user input can interleave a microtask, so
+            // the state is unchanged when we dispatch — but we still re-read the
+            // live state and map the captured range through any doc steps for
+            // safety before replacing.
+            const from = view.state.selection.from;
+            const to = view.state.selection.to;
+            const startDoc = view.state.doc;
+            const md = text.replace(/\n+$/, "");
 
-            const parsed = markdownToHtml(text.replace(/\n+$/, ""));
-            const body = elementFromString(parsed);
-            normalizeTableColumnWidths(body);
+            void markdownToProseMirror(md)
+              .then((doc) => {
+                if (view.isDestroyed) return;
+                // Canonical PM-JSON -> HTML via the LIVE editor schema, then
+                // reuse the UNCHANGED downstream seam (normalizeTableColumnWidths
+                // + parseSlice + canonicalizePastedFootnotes). The JSON->HTML->
+                // JSON hop is lossless (same schema both directions); it lets the
+                // existing paste-insertion logic stay byte-identical — only the
+                // SOURCE of the markdown conversion changed (issue #347 guardrail:
+                // no converter logic in the client, only a call into the package).
+                const node = PMNode.fromJSON(schema, doc);
+                const div = document.createElement("div");
+                DOMSerializer.fromSchema(schema).serializeFragment(
+                  node.content,
+                  { document },
+                  div,
+                );
 
-            const parsedSlice = DOMParser.fromSchema(
-              this.editor.schema,
-            ).parseSlice(body, {
-              preserveWhitespace: true,
-            });
+                const body = elementFromString(div.innerHTML);
+                normalizeTableColumnWidths(body);
 
-            // A markdown paste builds its ProseMirror fragment directly (DOM ->
-            // parseSlice), bypassing the editor's footnoteSyncPlugin, which never
-            // reorders an existing list. So a pasted markdown block whose footnote
-            // definitions are out of order (or contains orphan defs) would be
-            // stored out of order. Canonicalize the self-contained pasted block so
-            // its footnotes come out reference-ordered, deduped and orphan-free
-            // (issue #228). See canonicalizePastedFootnotes for why this is scoped
-            // to whole-block pastes that carry their own footnotesList.
-            const contentNodes = canonicalizePastedFootnotes(
-              parsedSlice,
-              this.editor.schema,
-            );
+                const parsedSlice = DOMParser.fromSchema(schema).parseSlice(
+                  body,
+                  { preserveWhitespace: true },
+                );
 
-            tr.replaceRange(from, to, contentNodes);
-            const insertEnd = tr.mapping.map(from, 1);
-            tr.setSelection(TextSelection.near(tr.doc.resolve(Math.max(from, insertEnd - 2)), -1));
-            tr.setMeta('paste', true)
-            view.dispatch(tr);
+                // A markdown paste builds its ProseMirror fragment directly (DOM
+                // -> parseSlice), bypassing the editor's footnoteSyncPlugin, which
+                // never reorders an existing list. So a pasted markdown block whose
+                // footnote definitions are out of order (or contains orphan defs)
+                // would be stored out of order. Canonicalize the self-contained
+                // pasted block so its footnotes come out reference-ordered, deduped
+                // and orphan-free (issue #228). See canonicalizePastedFootnotes for
+                // why this is scoped to whole-block pastes that carry their own
+                // footnotesList.
+                const contentNodes = canonicalizePastedFootnotes(
+                  parsedSlice,
+                  schema,
+                );
+
+                // Map the captured range through any doc changes since capture
+                // (normally none — same microtask) so the replace targets the
+                // right span even if the document moved.
+                const tr = view.state.tr;
+                let mappedFrom = from;
+                let mappedTo = to;
+                if (view.state.doc !== startDoc) {
+                  // Defensive: if the doc changed under us, fall back to the
+                  // current selection rather than a stale absolute range.
+                  mappedFrom = view.state.selection.from;
+                  mappedTo = view.state.selection.to;
+                }
+                tr.replaceRange(mappedFrom, mappedTo, contentNodes);
+                const insertEnd = tr.mapping.map(mappedFrom, 1);
+                tr.setSelection(
+                  TextSelection.near(
+                    tr.doc.resolve(Math.max(mappedFrom, insertEnd - 2)),
+                    -1,
+                  ),
+                );
+                tr.setMeta("paste", true);
+                view.dispatch(tr);
+              })
+              .catch(() => {
+                // Fail-open: a conversion error must not swallow the paste
+                // silently in a way that loses the text. We already claimed the
+                // event (returned true), so re-insert the raw text as a plain
+                // paragraph so the user never loses their clipboard content.
+                if (view.isDestroyed) return;
+                const tr = view.state.tr;
+                // Same guard the success path uses: if the doc changed under us
+                // since the range was captured (normally never — same microtask),
+                // the captured absolute from/to are stale and would throw a
+                // RangeError here (an unhandled rejection on a hot paste path).
+                // Fall back to the live selection instead of a stale range.
+                if (view.state.doc !== startDoc) {
+                  const sel = view.state.selection;
+                  tr.insertText(md, sel.from, sel.to);
+                } else {
+                  tr.insertText(md, from, to);
+                }
+                tr.setMeta("paste", true);
+                view.dispatch(tr);
+              });
+            // Claim the paste: we insert asynchronously above.
             return true;
           },
           // Strip trailing whitespace-only paragraphs from pasted content.

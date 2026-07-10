@@ -7,9 +7,8 @@
  * natively through the collab gateway, so no websocket/Yjs write-path lives
  * here.
  */
-import { generateJSON } from "@tiptap/html";
-import { JSDOM } from "jsdom";
 import { Marked } from "marked";
+import { parseHtmlDocument, generateJsonWith } from "./dom-parser.js";
 import type { TokenizerExtension, RendererExtension } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
 import { parseAttachedComment } from "./attached-comment.js";
@@ -245,12 +244,13 @@ const markedInstance = new Marked().use({
   ],
 });
 
-// Setup DOM environment for Tiptap HTML parsing in Node.js
-const dom = new JSDOM("<!DOCTYPE html><html><body></body></html>");
-global.window = dom.window as any;
-global.document = dom.window.document;
-// @ts-ignore
-global.Element = dom.window.Element;
+// NOTE: this module no longer installs a module-level `global.window`/`document`
+// jsdom shim. The HTML->DOM passes below (bridgeTaskLists / applyCommentDirectives
+// / assembleFootnotes) parse via the INJECTED `parseHtmlDocument` (jsdom on the
+// Node entry, native `DOMParser` on the browser entry), and `@tiptap/html`'s v3
+// `generateJSON` supplies its OWN DOM per environment (happy-dom in Node, native
+// `DOMParser` in the browser) — so no ambient global DOM is needed here, and
+// nothing on the browser code path statically imports jsdom.
 
 /**
  * Hard ceiling above which we skip callout preprocessing entirely. The linear
@@ -295,7 +295,13 @@ const CODE_FENCE_RE = /^(\s*)(`{3,}|~{3,})/;
  *   - emits the same `<div data-type="callout" data-callout-type="TYPE">` output
  *     (inner rendered through marked) as the previous regex implementation.
  */
-async function preprocessCallouts(markdown: string): Promise<string> {
+// SYNCHRONOUS by construction: the only formerly-awaited call is
+// `markedInstance.parse`, which returns a string synchronously for this
+// instance (no async marked extensions are registered), so the whole callout
+// preprocess is sync. Keeping it sync lets a sync converter entry
+// (`markdownToProseMirrorSync`, used by the client's chat renderer which must
+// stay synchronous) share this exact logic with the async entry.
+function preprocessCallouts(markdown: string): string {
   // Defensive cap: skip preprocessing for pathologically large inputs.
   if (markdown.length > MAX_CALLOUT_PREPROCESS_BYTES) {
     return markdown;
@@ -304,7 +310,7 @@ async function preprocessCallouts(markdown: string): Promise<string> {
   // Recursively transform a slice of lines, converting top-level callouts in
   // that slice into <div> blocks and rendering their inner content (which may
   // itself contain nested callouts) through this same function.
-  const transform = async (lines: string[]): Promise<string> => {
+  const transform = (lines: string[]): string => {
     const out: string[] = [];
     let inCodeFence = false;
     let codeFenceMarker = ""; // the exact run of backticks/tildes that opened it
@@ -383,8 +389,8 @@ async function preprocessCallouts(markdown: string): Promise<string> {
         if (j < lines.length) {
           // Found the matching closing fence: render the body (recursively, so
           // nested callouts are handled) and emit the callout div.
-          const inner = await transform(bodyLines);
-          const renderedInner = await markedInstance.parse(inner);
+          const inner = transform(bodyLines);
+          const renderedInner = markedInstance.parse(inner) as string;
           out.push(
             `\n<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>\n`,
           );
@@ -423,8 +429,8 @@ async function preprocessCallouts(markdown: string): Promise<string> {
           // Drop the prefix + `>` + one optional space, leaving the body content.
           bodyLines.push(lines[j].slice(prefix.length).replace(/^>\s?/, ""));
         }
-        const inner = await transform(bodyLines);
-        const renderedInner = await markedInstance.parse(inner);
+        const inner = transform(bodyLines);
+        const renderedInner = markedInstance.parse(inner) as string;
         const block = `<div data-type="callout" data-callout-type="${type}">${renderedInner}</div>`;
         if (prefix.length === 0) {
           // Top-level callout: blank lines isolate the HTML block.
@@ -491,8 +497,7 @@ function bridgeTaskLists(html: string): string {
   if (html.length > MAX_CALLOUT_PREPROCESS_BYTES) {
     return html;
   }
-  const dom = new JSDOM(html);
-  const document = dom.window.document;
+  const document = parseHtmlDocument(html);
   // Collect the checkbox(es) that belong to THIS <li> directly: either direct
   // child <input type="checkbox"> elements or ones inside the <li>'s direct <p>
   // child (the shape marked emits: `<li><p><input type="checkbox"> text</p></li>`).
@@ -662,15 +667,23 @@ function placeStandalone(
 function applyCommentDirectives(html: string): string {
   // Cheap early-out: no comments at all -> nothing to intercept.
   if (!html.includes("<!--")) return html;
-  const dom = new JSDOM(html);
-  const document = dom.window.document;
-  const nodeFilter = dom.window.NodeFilter;
+  const document = parseHtmlDocument(html);
+  // `SHOW_COMMENT` (128) is a stable DOM constant. Read it from whichever holder
+  // exists — the document's window (jsdom: `defaultView`), the ambient global
+  // `NodeFilter` (browsers / test envs), else the literal — because a document
+  // produced by `DOMParser.parseFromString` has NO browsing context, so its
+  // `defaultView` is `null` (unlike a jsdom `new JSDOM(html).window.document`).
+  // `createTreeWalker` takes the numeric `whatToShow` mask directly.
+  const SHOW_COMMENT =
+    (document.defaultView as any)?.NodeFilter?.SHOW_COMMENT ??
+    (globalThis as any).NodeFilter?.SHOW_COMMENT ??
+    0x80;
   // Walk the WHOLE document, not just <body>: when a standalone machinery
   // comment is the FIRST thing in the output (before any body content), the
   // HTML parser places it at document level (a child of `#document`, before
   // `<html>`), where it is outside `document.body` and would be lost. Attached
   // attrs comments always live inside body, so this wider walk still finds them.
-  const walker = document.createTreeWalker(document, nodeFilter.SHOW_COMMENT);
+  const walker = document.createTreeWalker(document, SHOW_COMMENT);
   const comments: any[] = [];
   let current: any;
   while ((current = walker.nextNode())) comments.push(current);
@@ -945,8 +958,7 @@ const MAX_FOOTNOTE_ROUNDS = 10000;
 function assembleFootnotes(html: string): string {
   // Cheap early-out: nothing carries a footnote body -> nothing to assemble.
   if (!html.includes("data-fn-text")) return html;
-  const dom = new JSDOM(html);
-  const document = dom.window.document;
+  const document = parseHtmlDocument(html);
   if (document.querySelector("sup[data-footnote-ref][data-fn-text]") == null) {
     return html;
   }
@@ -1060,12 +1072,18 @@ function stripEmptyParagraphs(node: any): any {
   return { ...node, content: cleaned };
 }
 
-/** Convert markdown to a ProseMirror doc using the full Docmost schema. */
-export async function markdownToProseMirror(
-  markdownContent: string,
-): Promise<any> {
-  const withCallouts = await preprocessCallouts(markdownContent);
-  const html = await markedInstance.parse(withCallouts);
+/**
+ * Convert markdown to a ProseMirror doc using the full Docmost schema
+ * (SYNCHRONOUS core). Every stage — callout preprocess, `marked` parse, the
+ * three DOM passes, and generateJSON — is synchronous for this configuration
+ * (no async marked extensions), so the conversion needs no `await`. The async
+ * `markdownToProseMirror` below delegates here (its Promise return is preserved
+ * for every existing Node consumer). A sync entry is REQUIRED by the client's
+ * chat renderer, which runs inside a React render/useMemo and cannot await.
+ */
+export function markdownToProseMirrorSync(markdownContent: string): any {
+  const withCallouts = preprocessCallouts(markdownContent);
+  const html = markedInstance.parse(withCallouts) as string;
   // Materialize comment directives (#293 #9 attached textAlign; #5 standalone
   // subpages/pageBreak) while the comment nodes still exist, before generateJSON
   // drops them.
@@ -1075,6 +1093,17 @@ export async function markdownToProseMirror(
   // generateJSON, so references + definitions materialize into the schema model.
   const withFootnotes = assembleFootnotes(withAttrs);
   const bridged = bridgeTaskLists(withFootnotes);
-  const doc = generateJSON(bridged, docmostExtensions);
+  const doc = generateJsonWith(bridged, docmostExtensions);
   return stripEmptyParagraphs(doc);
+}
+
+/**
+ * Convert markdown to a ProseMirror doc (async entry, unchanged contract). Kept
+ * async so every existing Node consumer (server, mcp, git-sync) that `await`s
+ * it is untouched; it simply delegates to the synchronous core.
+ */
+export async function markdownToProseMirror(
+  markdownContent: string,
+): Promise<any> {
+  return markdownToProseMirrorSync(markdownContent);
 }

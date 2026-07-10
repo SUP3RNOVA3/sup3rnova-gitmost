@@ -284,6 +284,9 @@ importers:
       '@docmost/editor-ext':
         specifier: workspace:*
         version: link:../../packages/editor-ext
+      '@docmost/prosemirror-markdown':
+        specifier: workspace:*
+        version: link:../../packages/prosemirror-markdown
       '@excalidraw/excalidraw':
         specifier: 0.18.0-3a5ef40
         version: 0.18.0-3a5ef40(@types/react-dom@18.3.1)(@types/react@18.3.12)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -912,10 +915,6 @@ importers:
         version: 8.57.1(eslint@9.39.4(jiti@2.4.2))(typescript@5.9.3)
 
   packages/editor-ext:
-    dependencies:
-      marked:
-        specifier: 17.0.5
-        version: 17.0.5
     devDependencies:
       '@vitest/coverage-v8':
         specifier: 4.1.6
@@ -1117,6 +1116,9 @@ importers:
       '@tiptap/starter-kit':
         specifier: 3.20.4
         version: 3.20.4
+      happy-dom:
+        specifier: 20.8.9
+        version: 20.8.9
       jsdom:
         specifier: 25.0.0
         version: 25.0.0
@@ -18490,7 +18492,7 @@ snapshots:
 
   happy-dom@20.8.9:
     dependencies:
-      '@types/node': 22.19.1
+      '@types/node': 25.5.0
       '@types/whatwg-mimetype': 3.0.2
       '@types/ws': 8.18.1
       entities: 7.0.1

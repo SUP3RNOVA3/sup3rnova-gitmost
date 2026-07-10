@@ -3,7 +3,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useAtomValue } from "jotai";
 import { notifications } from "@mantine/notifications";
 import { useTranslation } from "react-i18next";
-import { htmlToMarkdown } from "@docmost/editor-ext";
+import { convertProseMirrorToMarkdown } from "@docmost/prosemirror-markdown/browser";
 import {
   pageEditorAtom,
   titleEditorAtom,
@@ -49,7 +49,9 @@ export function useGeneratePageTitle(pageId: string) {
     mutationFn: async () => {
       if (!pageEditor || pageEditor.isDestroyed) return;
 
-      const markdown = htmlToMarkdown(pageEditor.getHTML()).trim();
+      // Serialize the live editor content to markdown through the canonical
+      // converter (issue #347), matching the on-disk/export markdown form.
+      const markdown = convertProseMirrorToMarkdown(pageEditor.getJSON()).trim();
       if (!markdown) {
         notifications.show({ message: t("The note is empty"), color: "yellow" });
         return;
