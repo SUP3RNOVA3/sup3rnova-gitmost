@@ -81,34 +81,34 @@
 .definition {
   display: flex;
   align-items: flex-start;
-  /* Tight number→text spacing (~one space) so it reads like "1. text"
-     instead of leaving a wide gap after the period. */
-  gap: 0.4em;
+  /* Tight spacing between the content and the trailing ↩ back-link. */
+  gap: 0.3em;
   padding: 2px 0;
+  /* Footnotes read smaller than body text (16px). Matches .listHeading. */
+  font-size: var(--mantine-font-size-sm);
 }
 
-.definitionMarker {
-  order: -1; /* keep the "N." marker on the LEFT though it follows content in DOM (#146) */
-  flex: 0 0 auto;
-  min-width: 1.5em;
-  /* Right-align within the narrow column so the period sits next to the text
-     and multi-digit numbers (10, 11, …) stay aligned on their right edge. */
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-  color: var(--mantine-color-dimmed);
-  user-select: none;
-}
-
+/* The "N." number is decorative (from the --footnote-number CSS var on the
+   wrapper, never in the document model) and is rendered inline at the start of
+   the first content line via ::before. This keeps text and wrapped lines flush
+   to the left margin — no hanging indent — while the editable contentDOM stays
+   the FIRST DOM child (#146). */
 .definitionContent {
   flex: 1 1 auto;
   min-width: 0;
 }
 
-/* The inner editable paragraph inherits `.ProseMirror p { margin: 0.5em 0 }`,
-   which pushes the first text line ~0.5em below the "N." marker (aligned to
-   flex-start), making the number float above the text. Drop the outer margins
-   so the marker and the first line share the same top edge — same approach
-   used for callouts in core.css. */
+.definitionContent > :first-child::before {
+  content: var(--footnote-number, "?") ". ";
+  color: var(--mantine-color-dimmed);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* The inner editable paragraph inherits `.ProseMirror p { margin: 0.5em 0 }`.
+   Drop the outer margins so the definition sits tight to the heading above and
+   the ::before number aligns with the top of the row — same approach used for
+   callouts in core.css. */
 .definitionContent > :first-child {
   margin-top: 0;
 }
