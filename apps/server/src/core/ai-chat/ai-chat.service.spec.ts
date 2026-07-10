@@ -26,6 +26,8 @@ import {
   STEP_BUDGET_WARNING_LEAD,
   FINAL_STEP_INSTRUCTION,
   FINAL_STEP_NUDGE,
+  STEP_LIMIT_NO_ANSWER_MARKER,
+  OUTPUT_DEGENERATION_ERROR,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
@@ -1533,5 +1535,350 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
     });
     await expect(drive(svc, makeRunHooks())).rejects.toThrow('boom');
     expect(streamRegistry.abortEntry).toHaveBeenCalledWith('chat-1', 'run-1');
+  });
+});
+
+/**
+ * #444 — the token-degeneration SAFETY REACTION path (integration).
+ *
+ * output-degeneration.spec.ts proves the detector DETECTS; this proves the wired
+ * REACTION: a degenerate stream must (1) trip the detector in onChunk, (2) abort
+ * the turn via the INTERNAL degeneration controller (distinct from a user Stop),
+ * (3) truncate the runaway tail before persist in onAbort, (4) persist status
+ * 'error' with the OUTPUT_DEGENERATION_ERROR message (not a bare 'aborted' and not
+ * a swept 'streaming'), and (5) still release the leased external MCP clients.
+ *
+ * Harness: streamText is the SAME jest.fn mocked at the top of this file. Unlike
+ * the pipe-options suite above (which only inspects the pipe call), this mock
+ * CAPTURES the streamText options (onChunk/onAbort/onFinish + abortSignal) so the
+ * test can drive the callbacks exactly as the AI SDK would — feeding degenerate
+ * text-delta chunks through onChunk until the service's own AbortController fires,
+ * then invoking onAbort (which the SDK does on an aborted signal). No new mocking
+ * style is invented; it reuses the makeRes / service-construction shape above.
+ */
+describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
+  const streamTextMock = streamText as unknown as jest.Mock;
+
+  beforeEach(() => {
+    streamTextMock.mockReset();
+    jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined as never);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  function makeRes() {
+    return {
+      raw: {
+        writeHead: jest.fn(),
+        write: jest.fn(),
+        once: jest.fn(),
+        on: jest.fn(),
+        flushHeaders: jest.fn(),
+        writableEnded: false,
+        destroyed: false,
+      },
+    };
+  }
+
+  // Wire the full stream() path with in-memory fakes. The assistant row is
+  // captured so the terminal finalize (an UPDATE of the upfront-seeded row) can be
+  // asserted. One external MCP client with a close() spy lets us assert leases are
+  // released on the terminal path. lockdown OFF (default) so the detector is the
+  // active guard.
+  function makeService() {
+    // The upfront insert seeds the assistant row; findById/insert stamp a stable
+    // id so planFinalizeAssistant picks the UPDATE path.
+    let seq = 0;
+    const inserted: Array<Record<string, unknown>> = [];
+    const updated: Array<{
+      id: string;
+      workspaceId: string;
+      patch: Record<string, unknown>;
+    }> = [];
+    const aiChatRepo = {
+      findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
+      insert: jest.fn(),
+    };
+    const aiChatMessageRepo = {
+      insert: jest.fn(async (row: Record<string, unknown>) => {
+        inserted.push(row);
+        return { id: row.role === 'assistant' ? 'assistant-1' : `user-${++seq}` };
+      }),
+      findAllByChat: jest.fn(async () => []),
+      update: jest.fn(
+        async (
+          id: string,
+          workspaceId: string,
+          patch: Record<string, unknown>,
+        ) => {
+          updated.push({ id, workspaceId, patch });
+          return { id };
+        },
+      ),
+    };
+    const aiSettings = { resolve: jest.fn(async () => ({})) };
+    const tools = { forUser: jest.fn(async () => ({})) };
+    const mcpClose = jest.fn(async () => undefined);
+    const mcpClients = {
+      toolsFor: jest.fn(async () => ({
+        tools: {},
+        clients: [{ close: mcpClose }],
+        outcomes: [],
+        instructions: [],
+      })),
+    };
+    const streamRegistry = { open: jest.fn(), bind: jest.fn(), abortEntry: jest.fn() };
+    const svc = new AiChatService(
+      {} as never,
+      aiChatRepo as never,
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo (no open page -> never touched)
+      aiSettings as never,
+      tools as never,
+      mcpClients as never,
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo (no open page)
+      {} as never, // pageAccess
+      {
+        isAiChatDeferredToolsEnabled: () => false,
+        // lockdown OFF => the degeneration detector is the anti-babble guard.
+        isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatResumableStreamEnabled: () => false,
+      } as never,
+      streamRegistry as never,
+    );
+    return { svc, inserted, updated, mcpClose };
+  }
+
+  const body = {
+    chatId: 'chat-1',
+    messages: [
+      { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+    ],
+  };
+
+  // Capture the streamText options so the test can drive the SDK callbacks. The
+  // returned result stub is enough for the post-streamText wiring (consumeStream +
+  // pipeUIMessageStreamToResponse are no-ops here).
+  function captureStreamText(): { opts: () => Record<string, any> } {
+    let captured: Record<string, any> | undefined;
+    streamTextMock.mockImplementation((options: Record<string, any>) => {
+      captured = options;
+      return {
+        consumeStream: jest.fn(),
+        pipeUIMessageStreamToResponse: jest.fn(),
+      };
+    });
+    return {
+      opts: () => {
+        if (!captured) throw new Error('streamText was not called');
+        return captured;
+      },
+    };
+  }
+
+  async function drive(svc: AiChatService): Promise<void> {
+    await svc.stream({
+      user: { id: 'u1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 's1',
+      body: body as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      runHooks: undefined as never,
+    });
+  }
+
+  it('degenerate stream: detects → internal abort → onAbort truncates + records OUTPUT_DEGENERATION_ERROR; leases released', async () => {
+    const { svc, updated, mcpClose } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+
+    const opts = cap.opts();
+    // The turn's abort signal is the UNION of the socket/run signal and the
+    // internal degeneration controller — untripped before any output.
+    expect(opts.abortSignal.aborted).toBe(false);
+
+    // Feed a runaway "loadTools.\n" loop the way the SDK streams it: many small
+    // text-delta chunks. The onChunk throttle only re-checks every ~2000 chars, so
+    // deliver well past that so the detector's identical-line rule (>=25 lines)
+    // and the ~2000-char throttle both fire.
+    const line = 'loadTools.\n';
+    let delivered = 0;
+    for (let i = 0; i < 400 && !opts.abortSignal.aborted; i++) {
+      opts.onChunk({ chunk: { type: 'text-delta', text: line } });
+      delivered += line.length;
+    }
+
+    // The detector must have tripped and aborted via the INTERNAL controller — the
+    // reason carries the degeneration message, distinguishing it from a user Stop
+    // (which aborts with no such reason) or a socket disconnect.
+    expect(opts.abortSignal.aborted).toBe(true);
+    expect(delivered).toBeGreaterThan(2000);
+    expect(String(opts.abortSignal.reason)).toContain(
+      'Output degeneration detected',
+    );
+
+    // The SDK reacts to the aborted signal by invoking onAbort. `steps` is empty
+    // (the runaway never finished a step); the in-progress runaway text is what
+    // gets truncated + persisted.
+    await opts.onAbort({ steps: [] });
+
+    // Terminal finalize = an UPDATE of the upfront-seeded assistant row (assistant
+    // row was inserted upfront, so planFinalizeAssistant -> UPDATE).
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as {
+      status: string;
+      content: string;
+      metadata: Record<string, unknown>;
+    };
+    // (4) status 'error' with the degeneration message — NOT 'aborted' and NOT a
+    // swept 'streaming'. This distinguishes it from a user Stop / server restart.
+    expect(patch.status).toBe('error');
+    expect(patch.metadata.error).toBe(OUTPUT_DEGENERATION_ERROR);
+    expect(patch.metadata.finishReason).toBe('error');
+    // (3) the runaway tail is TRUNCATED, not the full multi-KB babble: the marker
+    // is present and the persisted content is far shorter than what was streamed.
+    expect(patch.content).toContain('output truncated');
+    expect(patch.content.length).toBeLessThan(delivered);
+    // Only a few loop reps survive (truncateDegeneratedTail keeps a handful).
+    expect((patch.content.match(/loadTools\./g) ?? []).length).toBeLessThan(10);
+
+    // (5) the leased external MCP client is still released on this terminal path.
+    expect(mcpClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('degeneration onAbort differs from a NORMAL/user abort (no truncation, no error)', async () => {
+    // Same harness, but the stream is NOT degenerate: a clean short answer, then a
+    // user Stop reaches onAbort WITHOUT the degeneration controller having fired.
+    const { svc, updated, mcpClose } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    opts.onChunk({ chunk: { type: 'text-delta', text: 'A normal partial answer.' } });
+    // The detector never tripped -> the union signal is NOT aborted by us.
+    expect(opts.abortSignal.aborted).toBe(false);
+
+    // A user Stop / disconnect drives onAbort with the partial (clean) text.
+    await opts.onAbort({ steps: [] });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as {
+      status: string;
+      content: string;
+      metadata: Record<string, unknown>;
+    };
+    // A normal abort persists status 'aborted' with NO error and NO truncation
+    // marker — the branch is genuinely distinguished from the degeneration path.
+    expect(patch.status).toBe('aborted');
+    expect('error' in patch.metadata).toBe(false);
+    expect(patch.content).toBe('A normal partial answer.');
+    expect(patch.content).not.toContain('output truncated');
+    // Cleanup still runs on the normal abort path too.
+    expect(mcpClose).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * Empty-turn marker (#444): onFinish appends STEP_LIMIT_NO_ANSWER_MARKER only
+   * when the turn burned ALL its steps (steps.length >= MAX_AGENT_STEPS) AND never
+   * produced any text. The negative: a normal turn ending WITH text is left alone.
+   */
+  it('empty turn (no text + steps exhausted) persists the STEP_LIMIT_NO_ANSWER_MARKER', async () => {
+    const { svc, updated } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    // MAX_AGENT_STEPS text-less steps (only tool calls) => step-exhausted, no text.
+    const steps = Array.from({ length: MAX_AGENT_STEPS }, () => ({
+      text: '',
+      toolCalls: [{ toolCallId: 'c1', toolName: 'searchPages', input: {} }],
+      toolResults: [
+        { toolCallId: 'c1', toolName: 'searchPages', output: { hits: [] } },
+      ],
+    }));
+    await opts.onFinish({
+      text: '',
+      finishReason: 'tool-calls',
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
+      steps,
+    });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as { status: string; content: string };
+    expect(patch.status).toBe('completed');
+    // The synthetic marker is the trailing text of the persisted content.
+    expect(patch.content).toContain(STEP_LIMIT_NO_ANSWER_MARKER);
+  });
+
+  it('normal turn ending WITH text does NOT get the empty-turn marker', async () => {
+    const { svc, updated } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    // A single step that produced a real answer, well under the step cap.
+    const steps = [
+      { text: 'Here is the finished answer.', toolCalls: [], toolResults: [] },
+    ];
+    await opts.onFinish({
+      text: 'Here is the finished answer.',
+      finishReason: 'stop',
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
+      steps,
+    });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as { status: string; content: string };
+    expect(patch.status).toBe('completed');
+    expect(patch.content).toBe('Here is the finished answer.');
+    expect(patch.content).not.toContain(STEP_LIMIT_NO_ANSWER_MARKER);
+  });
+
+  it('step-exhausted turn that DID produce text keeps the text, no marker (guards the AND)', async () => {
+    // Exhausting the step budget alone must NOT append the marker when SOME step
+    // produced text — the marker keys off "no text" too. Drive the real onFinish
+    // with MAX_AGENT_STEPS steps where the last one carries the answer.
+    const { svc, updated } = makeService();
+    const cap = captureStreamText();
+    await drive(svc);
+    const opts = cap.opts();
+
+    const steps = Array.from({ length: MAX_AGENT_STEPS }, (_, i) => ({
+      text: i === MAX_AGENT_STEPS - 1 ? 'Final synthesized answer.' : '',
+      toolCalls:
+        i === MAX_AGENT_STEPS - 1
+          ? []
+          : [{ toolCallId: `c${i}`, toolName: 'searchPages', input: {} }],
+      toolResults:
+        i === MAX_AGENT_STEPS - 1
+          ? []
+          : [{ toolCallId: `c${i}`, toolName: 'searchPages', output: {} }],
+    }));
+    await opts.onFinish({
+      text: 'Final synthesized answer.',
+      finishReason: 'stop',
+      totalUsage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      usage: { inputTokens: 1, outputTokens: 1 },
+      steps,
+    });
+
+    expect(updated).toHaveLength(1);
+    const patch = updated[0].patch as { content: string };
+    expect(patch.content).toContain('Final synthesized answer.');
+    expect(patch.content).not.toContain(STEP_LIMIT_NO_ANSWER_MARKER);
   });
 });

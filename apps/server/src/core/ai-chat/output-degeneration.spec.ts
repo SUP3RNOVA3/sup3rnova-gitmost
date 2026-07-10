@@ -124,6 +124,23 @@ const config = { retries: 3, timeout: 5000, backoff: 'exp' };
     expect(isDegenerateOutput(text)).toBe(false);
   });
 
+  // TRIVIAL_MIN_REPEATS boundary (#444 review). The monochar-tail branch fires at
+  // EXACTLY 60 identical trailing chars (`run >= TRIVIAL_MIN_REPEATS`), so 59 is
+  // clean and 60 trips. These pin the `>=` and MUST fail if the comparison is
+  // flipped to `>` (the surviving mutation). The value 60 is HARD-CODED here on
+  // purpose: TRIVIAL_MIN_REPEATS is a private constant and the assert must lock
+  // the literal boundary the reviewer named, not track a constant edit.
+  it('NEGATIVE: 59 identical trailing chars is one below the monochar threshold', () => {
+    expect(hasPeriodicTail('x'.repeat(59))).toBe(false);
+    expect(isDegenerateOutput('x'.repeat(59))).toBe(false);
+  });
+
+  it('POSITIVE: 60 identical trailing chars hits the monochar threshold exactly', () => {
+    // Fails if `run >= TRIVIAL_MIN_REPEATS` is mutated to `run > …`.
+    expect(hasPeriodicTail('x'.repeat(60))).toBe(true);
+    expect(isDegenerateOutput('x'.repeat(60))).toBe(true);
+  });
+
   // Positive counterparts: a GENUINE single-char runaway (hundreds+ of repeats)
   // and the real incident (period>=2, "loadTools." ×N) must still fire.
   it('POSITIVE: a genuine single-char runaway is still flagged', () => {
