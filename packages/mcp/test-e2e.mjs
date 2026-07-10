@@ -316,7 +316,8 @@ async function main() {
         const [idA, idB, idC] = seedIds;
 
         // patchNode: replace the middle paragraph; siblings' ids must be unchanged.
-        await client.patchNode(nid, idB, mkPara(idB, "Bravo PATCHED."));
+        // #413 XOR input: the raw ProseMirror node goes under the `node` key.
+        await client.patchNode(nid, idB, { node: mkPara(idB, "Bravo PATCHED.") });
         await new Promise((r) => setTimeout(r, 16000));
         const afterPatch = (await client.getPageJson(nid)).content;
         const patchText = JSON.stringify(afterPatch);
@@ -327,7 +328,7 @@ async function main() {
         // insertNode: place a new block after the first paragraph.
         await client.insertNode(
           nid,
-          mkPara("nodeops-ins", "Inserted paragraph."),
+          { node: mkPara("nodeops-ins", "Inserted paragraph.") },
           { position: "after", anchorNodeId: idA },
         );
         await new Promise((r) => setTimeout(r, 16000));
