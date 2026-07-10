@@ -37,13 +37,6 @@ type ZodLike = any;
 // putting it in a shared execute here keeps that single normalization in one
 // place instead of hand-mirrored per host. Pure — safe across the zod boundary.
 import { parseNodeArg } from '@docmost/prosemirror-markdown';
-// PURE draw.io helpers (issue #424): drawio_shapes / drawio_guide are NOT client
-// methods — they read a bundled shape catalog / authoring guide with no network.
-// Imported here (same-package runtime import, precedent: parseNodeArg above) so
-// their canonical `execute` lives in the registry like every other shared tool
-// and BOTH hosts wire them through the loop — no per-host inline duplication.
-import { searchShapes } from './lib/drawio-shapes.js';
-import { getGuideSection } from './lib/drawio-guide.js';
 // Type-only import (erased at compile) of the real client so `DocmostClientLike`
 // is DERIVED from it (issue #446), not hand-mirrored. The loosest correct client
 // surface both hosts satisfy: the in-app host passes its own DERIVED
@@ -179,6 +172,18 @@ export interface SharedToolSpec {
   mcpOnly?: boolean;
   /** Registered only on the in-app host (skipped by the MCP registry loop). */
   inAppOnly?: boolean;
+  /**
+   * The spec stays in the registry (so the shared contract still pins its name /
+   * description / schema across both hosts) but carries NO `execute`/override and
+   * is registered INLINE by BOTH hosts instead of through the registry loop. Used
+   * for tools whose implementation cannot cross into this zod-agnostic file — the
+   * drawio_shapes / drawio_guide pure helpers, whose backing module resolves a
+   * bundled data file via `import.meta` and so cannot be value-imported here
+   * without breaking the in-app server's commonjs type-check of this source. Both
+   * registry loops SKIP a spec with this flag; the per-host inline registrations
+   * own it (index.ts on MCP, ai-chat-tools.service.ts in-app).
+   */
+  inlineBothHosts?: boolean;
 }
 
 // --- Shared execute helpers -------------------------------------------------
@@ -1838,18 +1843,17 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Max results (default 12, capped at 50).'),
     }),
-    // PURE helper — searchShapes reads the bundled catalog, no client method and
-    // no network. The `client` arg is ignored. The raw `{ query, count, results }`
-    // is identical on both hosts (MCP wraps it as jsonContent via the loop, the
-    // in-app host returns it as-is), so a single canonical execute serves both —
-    // no per-host override needed.
-    execute: async (_client, { query, category, limit }) => {
-      const results = searchShapes(query as string, {
-        category: category as string | undefined,
-        limit: limit as number | undefined,
-      });
-      return { query, count: results.length, results };
-    },
+    // INLINE on both hosts (no `execute`): drawio_shapes calls the PURE helper
+    // searchShapes, which is NOT a client method — it reads the bundled shape
+    // catalog via `import.meta.url` (drawio-shapes.ts). tool-specs.ts is
+    // type-checked FROM SOURCE by the in-app server under module:commonjs, where a
+    // static value-import of that `import.meta` module is a compile error
+    // (TS1343), so its execute CANNOT live here. `inlineBothHosts` tells BOTH
+    // registry loops to skip it; index.ts (MCP) and ai-chat-tools.service.ts
+    // (in-app) each register it directly, calling searchShapes from the loaded
+    // module. It STAYS in this registry so the shared-tool-specs contract still
+    // pins its name/description/schema across both hosts.
+    inlineBothHosts: true,
   },
 
   drawioGuide: {
@@ -1874,11 +1878,13 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Which section to read; omit for the section index.'),
     }),
-    // PURE helper — getGuideSection returns a bundled authoring chapter, no client
-    // method and no network. The `client` arg is ignored. The raw guide object is
-    // identical on both hosts (MCP wraps it as jsonContent via the loop, the
-    // in-app host returns it as-is), so a single canonical execute serves both.
-    execute: async (_client, { section }) =>
-      getGuideSection(section as string | undefined),
+    // INLINE on both hosts (no `execute`) — same reason as drawio_shapes above:
+    // drawio_guide calls the PURE helper getGuideSection (drawio-guide.ts, no
+    // client, no network). getGuideSection itself has no `import.meta`, but it is
+    // kept inline for SYMMETRY with drawio_shapes (both drawio helper tools wired
+    // the same way in one place) and to avoid pulling any drawio lib source into
+    // the in-app server's commonjs type-check. `inlineBothHosts` makes both loops
+    // skip it; index.ts and ai-chat-tools.service.ts register it directly.
+    inlineBothHosts: true,
   },
 } satisfies Record<string, SharedToolSpec>;

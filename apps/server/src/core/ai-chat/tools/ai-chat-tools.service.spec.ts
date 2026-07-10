@@ -866,7 +866,12 @@ describe('AiChatToolsService drawio layout passthrough (#440)', () => {
   const createCalls: unknown[][] = [];
   const updateCalls: unknown[][] = [];
 
-  const fakeClient: Partial<DocmostClientLike> = {
+  // FakeDocmostClient (not Partial<DocmostClientLike>): since #446 derived
+  // DocmostClientLike from the real client, its drawioCreate/drawioUpdate return
+  // the concrete result shape, so a minimal stub object would not be assignable.
+  // FakeDocmostClient types every method as (...args) => Promise<any>, which is
+  // exactly what these arg-capturing doubles need.
+  const fakeClient: FakeDocmostClient = {
     drawioCreate: (...args: unknown[]) => {
       createCalls.push(args);
       return Promise.resolve({ success: true, nodeId: '#0' });

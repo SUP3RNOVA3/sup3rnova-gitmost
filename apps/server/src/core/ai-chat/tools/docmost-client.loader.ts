@@ -169,12 +169,13 @@ interface DocmostMcpModule {
   // the mocked loader in unit tests) — the stale-check below is a NO-OP when it
   // is missing, so an older build never wrongly fails startup.
   REGISTRY_STAMP?: string;
-  // Pure, no-network draw.io helpers (#424). Still exposed off the loaded module
-  // so unit-test loader mocks can stub them, but the in-app tool wiring no longer
-  // calls them directly: drawio_shapes / drawio_guide are ordinary
-  // SHARED_TOOL_SPECS entries whose canonical execute (in the mcp package) invokes
-  // searchShapes / getGuideSection, so parity with the MCP host comes from the
-  // shared registry loop, not a hand-mirrored in-app handler.
+  // Pure, no-network draw.io helpers (#424) backing drawio_shapes / drawio_guide.
+  // Those two specs are `inlineBothHosts` (they stay in SHARED_TOOL_SPECS for the
+  // shared contract but carry no execute — their catalog loader uses import.meta
+  // and can't be value-imported into the zod-agnostic tool-specs.ts), so the
+  // in-app service wires them INLINE off these helpers, mirroring the standalone
+  // MCP host. Exposed off the loaded module so the service and its test mocks can
+  // reach them.
   searchShapes: SearchShapesFn;
   getGuideSection: GetGuideSectionFn;
 }
