@@ -80,6 +80,12 @@ const VERSION = packageJson.version;
 // (SHARED_TOOL_SPECS + INLINE_MCP_INVENTORY), so it can no longer drift out of
 // sync with the registered tools. Re-exported here (its old home) so existing
 // importers are unaffected; the composition lives in server-instructions.ts.
+// The drawio_shapes / drawio_guide tools (#424) are ordinary SHARED_TOOL_SPECS
+// entries (their canonical execute calls the pure searchShapes/getGuideSection
+// helpers, ignoring the client), so the registry loop registers them and the
+// generated <tool_inventory> picks them up from their catalogLine automatically;
+// only the hand-written routing prose in server-instructions.ts is updated to
+// mention them.
 export { SERVER_INSTRUCTIONS };
 
 // Helper to format JSON responses
