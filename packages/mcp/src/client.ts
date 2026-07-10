@@ -33,6 +33,7 @@ import {
 import {
   replaceNodeById,
   replaceNodeByIdWithMany,
+  reassignCollidingBlockIds,
   deleteNodeById,
   assertUnambiguousMatch,
   insertNodeRelative,
@@ -2548,6 +2549,11 @@ export class DocmostClient {
         guardAttrs = hit ? findUnrepresentableTableAttrs(hit.node) : null;
         if (guardAttrs != null) return null;
 
+        // Re-mint any minted block id that collides with an existing page id
+        // (skip index 0: its id is intentionally the target nodeId, unique by
+        // the #159 dry-count above), so the 1 -> N splice stays page-wide unique.
+        reassignCollidingBlockIds(liveDoc, threaded, 0);
+
         // 1 -> N splice, then merge any fragment footnote definitions into the
         // page's tail list and re-derive canonical footnote numbering.
         const { doc: spliced } = replaceNodeByIdWithMany(
@@ -2692,6 +2698,9 @@ export class DocmostClient {
       this.apiUrl,
       (liveDoc) => {
         inserted = false;
+        // Re-mint any minted block id that collides with an existing page id
+        // (all inserted blocks are fresh, no skip) so the splice stays unique.
+        if (hasMd) reassignCollidingBlockIds(liveDoc, blocks);
         // Single-block node path keeps `insertNodeRelative` (it owns the
         // structural table-node splicing); the markdown path uses the array
         // splice so N blocks land in order at one anchor.

@@ -54,6 +54,7 @@ export {
   getNodeByRef,
   replaceNodeById,
   replaceNodeByIdWithMany,
+  reassignCollidingBlockIds,
   deleteNodeById,
   sanitizeForYjs,
   findUnstorableAttr,

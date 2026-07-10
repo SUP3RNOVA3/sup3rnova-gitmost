@@ -384,3 +384,155 @@ test("insertNode(markdown): XOR — both markdown and node is rejected", async (
     /exactly one of/i,
   );
 });
+
+// A seed page whose ONLY footnote reference lives in the target paragraph p1,
+// with a matching definition in a trailing footnotesList. Rewriting p1 with a
+// footnote-free fragment removes the last referrer -> the definition is orphaned.
+function seedOrphanFootnote() {
+  return {
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        attrs: { id: "p1" },
+        content: [
+          { type: "text", text: "a claim" },
+          { type: "footnoteReference", attrs: { id: "fn-1", referenceNumber: 1 } },
+        ],
+      },
+      {
+        type: "footnotesList",
+        content: [
+          {
+            type: "footnoteDefinition",
+            attrs: { id: "fn-1" },
+            content: [
+              {
+                type: "paragraph",
+                attrs: { id: "def-para" },
+                content: [{ type: "text", text: "the supporting note" }],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+test("patchNode(markdown): removing the LAST footnote referrer drops the now-orphan definition (canonical convergence)", async () => {
+  const { state, baseURL } = await spawnCollabStack(seedOrphanFootnote());
+  const client = new DocmostClient(baseURL, "e@x.com", "pw");
+
+  // The fragment has NO footnotes -> definitions=[]; the splice removes the only
+  // footnoteReference, leaving the tail definition orphaned. The canonicalization
+  // pass (which mergeFootnoteDefinitions must still run) has to drop it.
+  await client.patchNode(PAGE, "p1", { markdown: "just text" });
+
+  const doc = state.lastDoc;
+  assert.equal(
+    findAll(doc, "footnoteDefinition").length,
+    0,
+    "the orphaned definition is dropped",
+  );
+  assert.equal(
+    findAll(doc, "footnotesList").length,
+    0,
+    "the emptied footnotesList is removed",
+  );
+  assert.equal(findAll(doc, "footnoteReference").length, 0, "no references remain");
+
+  // Convergence: the persisted result equals the SAME content imported whole.
+  const full = await markdownToProseMirror("just text");
+  const target = doc.content.find((p) => p.attrs?.id === "p1");
+  assert.ok(
+    docsCanonicallyEqual(
+      { type: "doc", content: [target] },
+      { type: "doc", content: [full.content[0]] },
+    ),
+    "the post-splice doc is canonically identical to a full re-import",
+  );
+});
+
+test("patchNode(markdown): a pure-text patch on a footnote-FREE page leaves footnote topology untouched (fast path)", async () => {
+  const before = seed3();
+  const { state, baseURL } = await spawnCollabStack(before);
+  const client = new DocmostClient(baseURL, "e@x.com", "pw");
+
+  await client.patchNode(PAGE, "target-id", { markdown: "plain replacement" });
+
+  const doc = state.lastDoc;
+  assert.equal(findAll(doc, "footnotesList").length, 0, "no footnotesList appears");
+  assert.equal(findAll(doc, "footnoteDefinition").length, 0, "no definition appears");
+  assert.equal(findAll(doc, "footnoteReference").length, 0, "no reference appears");
+  // Neighbours byte-identical (the fast path does not clone/reshape the tree).
+  assert.deepEqual(
+    doc.content.find((p) => p.attrs?.id === "before-id"),
+    before.content[0],
+  );
+  assert.deepEqual(
+    doc.content.find((p) => p.attrs?.id === "after-id"),
+    before.content[2],
+  );
+});
+
+test("insertNode(markdown): a footnote-free insert on a page carrying a footnote still canonicalizes (definitions empty)", async () => {
+  // The page has an existing footnote (ref + tail def). Inserting a footnote-free
+  // fragment keeps the reference alive, so the definition stays — but the write
+  // path must still run canonicalization (definitions=[]), producing exactly one
+  // tail list with the reference/definition ids in sync.
+  const { state, baseURL } = await spawnCollabStack(seedOrphanFootnote());
+  const client = new DocmostClient(baseURL, "e@x.com", "pw");
+
+  const res = await client.insertNode(
+    PAGE,
+    { markdown: "unrelated one\n\nunrelated two" },
+    { position: "after", anchorNodeId: "p1" },
+  );
+  assert.equal(res.success, true);
+
+  const doc = state.lastDoc;
+  assert.equal(findAll(doc, "footnoteReference").length, 1, "the existing reference survives");
+  assert.equal(findAll(doc, "footnotesList").length, 1, "exactly one tail list");
+  const defs = findAll(doc, "footnoteDefinition");
+  assert.equal(defs.length, 1, "the definition is kept (still referenced)");
+  assert.equal(findAll(doc, "footnoteReference")[0].attrs.id, defs[0].attrs.id);
+});
+
+// Collect every TOP-LEVEL block id in a doc (the invariant the splice dedup
+// guarantees is page-wide top-level uniqueness).
+function topLevelIds(doc) {
+  return doc.content
+    .map((b) => b?.attrs?.id)
+    .filter((id) => id != null);
+}
+
+test("patchNode(markdown): a 1->N splice yields page-wide UNIQUE top-level block ids", async () => {
+  const before = seed3();
+  const { state, baseURL } = await spawnCollabStack(before);
+  const client = new DocmostClient(baseURL, "e@x.com", "pw");
+
+  await client.patchNode(PAGE, "target-id", {
+    markdown: "one\n\ntwo\n\nthree",
+  });
+
+  const ids = topLevelIds(state.lastDoc);
+  assert.equal(new Set(ids).size, ids.length, "all top-level block ids are unique");
+  // The target id is still present (threaded onto the first block).
+  assert.ok(ids.includes("target-id"), "the first block still inherits target-id");
+});
+
+test("insertNode(markdown): inserting multiple blocks yields page-wide UNIQUE top-level block ids", async () => {
+  const before = seed3();
+  const { state, baseURL } = await spawnCollabStack(before);
+  const client = new DocmostClient(baseURL, "e@x.com", "pw");
+
+  await client.insertNode(
+    PAGE,
+    { markdown: "alpha\n\nbeta\n\ngamma" },
+    { position: "after", anchorNodeId: "before-id" },
+  );
+
+  const ids = topLevelIds(state.lastDoc);
+  assert.equal(new Set(ids).size, ids.length, "all top-level block ids are unique");
+});

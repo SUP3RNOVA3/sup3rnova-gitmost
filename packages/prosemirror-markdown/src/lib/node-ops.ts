@@ -904,6 +904,27 @@ function makeFreshId(used: Set<string>): string {
 }
 
 /**
+ * Re-mint any top-level block id in `blocks` that already exists in `liveDoc`,
+ * so a 1 -> N splice cannot introduce a duplicate id. `skipIndex` (optional) is a
+ * block whose id is intentionally set (the patch path's first block inherits the
+ * target node's id) and must not be re-minted. Mutates `blocks` in place.
+ */
+export function reassignCollidingBlockIds(
+  liveDoc: any,
+  blocks: any[],
+  skipIndex?: number,
+): void {
+  const used = new Set<string>();
+  collectIds(liveDoc, used);
+  blocks.forEach((b, i) => {
+    if (i === skipIndex || !isObject(b)) return;
+    if (!isObject(b.attrs)) b.attrs = {};
+    if (b.attrs.id != null && used.has(b.attrs.id)) b.attrs.id = makeFreshId(used);
+    if (b.attrs.id != null) used.add(b.attrs.id);
+  });
+}
+
+/**
  * Resolve a table reference against an ALREADY-CLONED doc and return the LIVE
  * table node (a reference inside `rootClone`, so the caller may mutate it) plus
  * its index path. Returns null when no table matches.
