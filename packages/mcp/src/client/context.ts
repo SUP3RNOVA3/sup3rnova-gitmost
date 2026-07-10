@@ -23,6 +23,7 @@ import { acquireCollabSession } from "../lib/collab-session.js";
 import { withPageLock, isUuid } from "../lib/page-lock.js";
 import { getCollabToken, performLogin } from "../lib/auth-utils.js";
 import { formatDocmostAxiosError } from "./errors.js";
+import { GetPageConversionCache } from "./getpage-cache.js";
 
 // A generic mixin base constructor (issue #450). Each domain mixin is a factory
 // `<T extends GConstructor<DocmostClientContext>>(Base: T) => class extends Base`
@@ -158,6 +159,13 @@ export abstract class DocmostClientContext {
   // Reset whenever the client's identity changes (login() / this.token cleared);
   // bypassed on a forced refresh (the 401/403 reauth path). null = no token yet.
   protected collabTokenCache: { token: string; mintedAt: number } | null = null;
+
+  // Content-addressed conversion cache for getPage (issue #479). Keyed on
+  // (canonical pageId, updatedAt, optionsHash) -> the converted Markdown, so a
+  // re-read of an UNCHANGED page skips the expensive convertProseMirrorToMarkdown
+  // tree walk. Per-instance (a DocmostClient is built per user / per chat), so a
+  // cached conversion can never leak across identities. See getpage-cache.ts.
+  protected getPageCache = new GetPageConversionCache();
 
   // Two construction forms:
   //  - new DocmostClient(config)                  // discriminated union (current)
