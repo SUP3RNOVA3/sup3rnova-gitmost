@@ -28,7 +28,10 @@ const h = vi.hoisted(() => ({
         body: Record<string, unknown>;
       }) => { body: Record<string, unknown> };
       prepareReconnectToStreamRequest?: () => { api?: string };
-      fetch?: (input: unknown, init?: { method?: string }) => Promise<unknown>;
+      fetch?: (
+        input: unknown,
+        init?: { method?: string; body?: unknown },
+      ) => Promise<unknown>;
     },
   },
 }));
@@ -197,6 +200,244 @@ describe("ChatThread — send now (#198)", () => {
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
     const prep = h.state.transport!.prepareSendMessagesRequest!;
     expect(prep({ messages: [], body: {} }).body.interrupted).toBe(false);
+  });
+});
+
+// #396: in autonomous mode a live sendNow must additionally request the
+// AUTHORITATIVE server stop of the detached run (a local abort is only a client
+// disconnect the server ignores) and arm a bounded 409 retry so the re-POST
+// converges once the one-active-run slot frees. Legacy mode is unchanged.
+describe("ChatThread — send now server-stop + supersede retry (#396)", () => {
+  beforeEach(resetState);
+  afterEach(cleanup);
+
+  // A settled assistant tail => no mount resume (attemptResumeRef false), so the
+  // "Send now" button is visible for the NEW local streaming turn while
+  // autonomous runs are enabled.
+  const settledTail = () => [
+    row("u1", "user", undefined, "hi"),
+    row("a1", "assistant", "succeeded", "done"),
+  ];
+
+  it("autonomous: sendNow during a live stream calls onServerStop with the chat id", () => {
+    const { onServerStop } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: settledTail(),
+    });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+
+    expect(h.state.stop).toHaveBeenCalledTimes(1);
+    expect(onServerStop).toHaveBeenCalledWith("c1");
+  });
+
+  it("legacy (autonomous off): sendNow does NOT call onServerStop and does NOT retry the send", async () => {
+    const { onServerStop } = renderThread({
+      autonomousRunsEnabled: false,
+      initialRows: settledTail(),
+    });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+    expect(onServerStop).not.toHaveBeenCalled();
+
+    // The supersede retry must NOT be armed: a POST that 409s is returned as-is
+    // (single fetch, no retry).
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+          status: 409,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(409);
+  });
+
+  it("armed supersede send retries 409 A_RUN_ALREADY_ACTIVE and succeeds once the slot frees", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    // Arm the retry by performing a live sendNow (autonomous branch sets the ref).
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+
+    const fetchMock = vi
+      .fn()
+      // First POST: the old detached run still holds the slot -> 409.
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+          status: 409,
+        }),
+      )
+      // Retry: the server stop settled the old run -> 200.
+      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(res.status).toBe(200);
+  });
+
+  it("supersede retry is one-shot: a later send (ref cleared) does NOT retry a 409", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now")); // arms the one-shot
+
+    // First armed send: immediately succeeds, consuming the arm.
+    let fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response("ok", { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // A subsequent send is NOT armed -> a 409 is returned as-is (no retry).
+    fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+        status: 409,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(409);
+  });
+
+  it("supersede retry is bounded: exhaustion surfaces the 409 error", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+
+    // Every attempt 409s -> after 4 attempts the last 409 surfaces.
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+        status: 409,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    // 4 attempts total (1 immediate + 3 backoff retries), then give up.
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(res.status).toBe(409);
+  });
+
+  it("armed supersede send does NOT retry a non-409 status", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response("boom", { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(500);
+  });
+
+  // Strand-path regression: sendNow arms the supersede retry, but if the promoted
+  // head is removed before the abort's onFinish lands, flushNext() sends nothing
+  // (returns false) and NO re-POST consumes the arm. The arm must be disarmed on
+  // that no-send branch so the NEXT unrelated NORMAL send does not inherit it and
+  // silently retry a genuine 409 (e.g. a legitimate two-tab conflict) 4x instead
+  // of surfacing it immediately.
+  it("strand-path: a stranded supersede arm (flushNext no-send) does NOT retry a later normal 409", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    // Arm the retry via a live autonomous sendNow (promotes the head + arms).
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+
+    // Remove the promoted head BEFORE the abort lands, so flushNext() returns
+    // false (no POST) and the arm would strand without the disarm fix.
+    fireEvent.click(screen.getByLabelText("Remove queued message"));
+
+    // The abort's onFinish now takes the flushOnAbortRef branch, calls flushNext()
+    // which finds an empty queue and returns false -> the no-send disarm must run.
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: true,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    // No re-POST was sent (nothing to flush).
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+
+    // A subsequent NORMAL send that 409s must be returned as-is (exactly 1 fetch):
+    // the stranded arm must NOT cause the genuine 409 to be retried.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+          status: 409,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(409);
+  });
+
+  it("armed supersede send does NOT retry a 409 with a different (non-A_RUN_ALREADY_ACTIVE) body", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "SOMETHING_ELSE" }), {
+        status: 409,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    let res!: Response;
+    await act(async () => {
+      res = (await h.state.transport!.fetch!("http://x", {
+        method: "POST",
+        body: "{}",
+      })) as Response;
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe(409);
   });
 });
 
