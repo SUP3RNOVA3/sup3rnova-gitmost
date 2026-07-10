@@ -56,6 +56,7 @@ export {
   deleteNodeById,
   sanitizeForYjs,
   findUnstorableAttr,
+  findInvalidNode,
   insertNodeRelative,
   readTable,
   insertTableRow,

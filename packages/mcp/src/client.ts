@@ -42,6 +42,7 @@ import {
   insertTableRow,
   deleteTableRow,
   updateTableCell,
+  findInvalidNode,
 } from "@docmost/prosemirror-markdown";
 import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
@@ -1661,6 +1662,27 @@ export class DocmostClient {
   }
 
   /**
+   * Pre-write SHAPE gate (#409). Walk the WHOLE node tree with the shared
+   * `findInvalidNode` and throw a rich, path-anchored error the instant a nested
+   * node has an absent/unknown `type` (or an unknown mark) — the exact shape that
+   * otherwise surfaces DEEP in the Yjs encode as the cryptic
+   * `Unknown node type: undefined`, but only AFTER a collab session was opened
+   * and a page lock taken. Calling this BEFORE `getCollabTokenWithReauth` /
+   * `mutatePageContent` fails fast: no collab connection, no lock, deterministic
+   * message. `op` names the tool for the message prefix (e.g. "patch_node").
+   *
+   * `findInvalidNode` derives its "known type" set from the very same
+   * `docmostExtensions` the encode path uses, so a node this gate accepts is one
+   * the encoder will accept too.
+   */
+  private assertValidNodeShape(op: string, node: any): void {
+    const bad = findInvalidNode(node);
+    if (bad) {
+      throw new Error(`${op}: invalid node — ${bad.summary}`);
+    }
+  }
+
+  /**
    * Replace page content with a raw ProseMirror JSON document (lossless) and/or
    * update its title. Both `doc` and `title` are optional, but at least one must
    * be supplied:
@@ -1710,6 +1732,12 @@ export class DocmostClient {
     // string text) is rejected up front rather than silently corrupting the
     // page on overwrite.
     this.validateDocStructure(doc);
+
+    // #409: beyond the string-`type` check above, reject a nested node whose
+    // `type` is a string but NOT a known Docmost schema node (a typo/unknown
+    // block) — the same `Unknown node type` the encoder throws — with a rich,
+    // path-anchored message, still BEFORE any collab connection.
+    this.assertValidNodeShape("update_page_json", doc);
 
     // Sanitize URLs before writing. This closes the JSON-path bypass: unlike
     // the markdown link path (which TipTap sanitizes), raw JSON could otherwise
@@ -2131,6 +2159,14 @@ export class DocmostClient {
       target.attrs.id = nodeId;
     }
 
+    // #409: fail fast on a malformed node SHAPE (a nested child with an
+    // absent/unknown `type`, e.g. a text leaf written as `{"text":"foo"}` with
+    // no `"type":"text"`) BEFORE opening a collab session or taking the page
+    // lock — the root-only `typeof node.type === "string"` check above never
+    // sees nested children, and the encoder's `Unknown node type: undefined`
+    // would otherwise only surface after the connection.
+    this.assertValidNodeShape("patch_node", target);
+
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
     const pageUuid = await this.resolvePageId(pageId);
@@ -2220,6 +2256,11 @@ export class DocmostClient {
         );
       }
     }
+
+    // #409: fail fast on a malformed node SHAPE (a nested child with an
+    // absent/unknown `type`) BEFORE opening a collab session or taking the page
+    // lock — the root-only check above never sees nested children.
+    this.assertValidNodeShape("insert_node", node);
 
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
