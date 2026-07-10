@@ -136,8 +136,8 @@ const TOOL_FAMILY: Record<string, Family> = {
  * in index.ts (not via SHARED_TOOL_SPECS) because they diverge per transport or
  * exist only on this standalone surface. They carry no `catalogLine`, so their
  * one-line purpose is hand-written here. This is the ONLY hand-maintained tool
- * list left, and it is tiny; a new inline tool without an entry here still
- * surfaces via the completeness guard in tool-specs.test.mjs's sibling test.
+ * list left, and it is tiny; a new inline tool without an entry here is caught
+ * by the completeness guard in `tool-inventory.test.mjs`.
  */
 export const INLINE_MCP_INVENTORY: ToolInventoryLine[] = [
   {
