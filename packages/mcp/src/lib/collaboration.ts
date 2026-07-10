@@ -15,6 +15,7 @@ import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
 import { sanitizeForYjs, findUnstorableAttr } from "@docmost/prosemirror-markdown";
 import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
+import { normalizeAndMergeFootnotes } from "./footnote-normalize-merge.js";
 import { VerifyReport } from "./diff.js";
 import { acquireCollabSession } from "./collab-session.js";
 
@@ -82,7 +83,12 @@ global.WebSocket = WebSocket;
 export async function markdownToProseMirrorCanonical(
   markdownContent: string,
 ): Promise<any> {
-  return canonicalizeFootnotes(await markdownToProseMirror(markdownContent));
+  // #419: normalize + merge glyph-forked footnote definitions BEFORE
+  // canonicalizing, so the canonicalizer re-hangs references and drops the
+  // now-orphaned duplicate definitions.
+  return canonicalizeFootnotes(
+    normalizeAndMergeFootnotes(await markdownToProseMirror(markdownContent)),
+  );
 }
 
 /**

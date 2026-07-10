@@ -82,6 +82,7 @@ import {
   canonicalizeFootnotes,
   insertInlineFootnote,
 } from "./lib/transforms.js";
+import { normalizeAndMergeFootnotes } from "./lib/footnote-normalize-merge.js";
 import vm from "node:vm";
 
 // Supported image types, kept as two lookup tables so both a local file
@@ -1639,6 +1640,8 @@ export class DocmostClient {
     // leave footnotes out of order, orphaned, or in multiple lists — the bottom
     // list + numbering are always derived from reference order. No-op when the
     // footnotes are already canonical.
+    // #419: normalize + merge glyph-forked definitions before canonicalizing.
+    doc = normalizeAndMergeFootnotes(doc);
     doc = canonicalizeFootnotes(doc);
 
     // Write the BODY first, then the title (#159 split-brain): a failed body
@@ -1903,7 +1906,8 @@ export class DocmostClient {
     // footnotes before copying — a no-op on already-canonical source content, but
     // it guarantees a copy can never propagate a non-canonical footnote topology
     // to the target (parity with the other full-doc write paths).
-    const canonical = canonicalizeFootnotes(content);
+    // #419: normalize + merge glyph-forked definitions before canonicalizing.
+    const canonical = canonicalizeFootnotes(normalizeAndMergeFootnotes(content));
 
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the TARGET collab doc by its canonical UUID, never the slugId (#260).
@@ -4158,7 +4162,8 @@ export class DocmostClient {
       // path can leave footnotes out of order / orphaned / in a raw `[^id]`
       // block. In a dryRun preview this may surface footnote edits the script
       // author did not write (the canonicalizer tidied them) — that is expected.
-      const result = canonicalizeFootnotes(raw);
+      // #419: normalize + merge glyph-forked definitions before canonicalizing.
+      const result = canonicalizeFootnotes(normalizeAndMergeFootnotes(raw));
       newDoc = result;
       return result;
     };
