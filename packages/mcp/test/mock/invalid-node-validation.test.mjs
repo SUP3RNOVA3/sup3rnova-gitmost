@@ -1,6 +1,6 @@
 // Mock regression for the FAIL-FAST invalid-node validation (#409).
 //
-// A structural editor (patch_node / insert_node / update_page_json) given a doc
+// A structural editor (patchNode / insertNode / updatePageJson) given a doc
 // whose NESTED child has an absent/unknown `type` (the exact shape the Yjs
 // encoder rejects with `Unknown node type: undefined`) must throw a RICH,
 // path-anchored error BEFORE it ever opens a collab session or takes a page
@@ -23,7 +23,7 @@ import { Hocuspocus } from "@hocuspocus/server";
 import { DocmostClient } from "../../build/client.js";
 import { buildYDoc } from "../../build/lib/collaboration.js";
 
-// A minimal valid seed doc with a real block id, so the happy-path patch_node
+// A minimal valid seed doc with a real block id, so the happy-path patchNode
 // finds its target.
 const SEED_ID = "seed-para-id";
 function seedDoc() {
@@ -130,14 +130,14 @@ const nestedUnknownTypeNode = () => ({
   content: [{ type: "paragraf", content: [{ type: "text", text: "x" }] }],
 });
 
-test("patch_node fails fast on a nested typeless node — no collab connection", async () => {
+test("patchNode fails fast on a nested typeless node — no collab connection", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
   await assert.rejects(
     () => client.patchNode(PAGE, SEED_ID, nestedTypelessNode()),
     (err) => {
-      assert.match(err.message, /patch_node: invalid node/);
+      assert.match(err.message, /patchNode: invalid node/);
       assert.match(err.message, /missing "type"/);
       assert.match(err.message, /content\[0\]/); // path-anchored
       return true;
@@ -152,7 +152,7 @@ test("patch_node fails fast on a nested typeless node — no collab connection",
   assert.equal(state.changed, false, "the collab doc must never be written");
 });
 
-test("insert_node fails fast on a nested UNKNOWN type — no collab connection", async () => {
+test("insertNode fails fast on a nested UNKNOWN type — no collab connection", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
@@ -162,7 +162,7 @@ test("insert_node fails fast on a nested UNKNOWN type — no collab connection",
         position: "append",
       }),
     (err) => {
-      assert.match(err.message, /insert_node: invalid node/);
+      assert.match(err.message, /insertNode: invalid node/);
       assert.match(err.message, /unknown node type "paragraf"/);
       return true;
     },
@@ -172,7 +172,7 @@ test("insert_node fails fast on a nested UNKNOWN type — no collab connection",
   assert.equal(state.changed, false);
 });
 
-test("update_page_json fails fast on a nested typeless node — no collab connection", async () => {
+test("updatePageJson fails fast on a nested typeless node — no collab connection", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
@@ -184,7 +184,7 @@ test("update_page_json fails fast on a nested typeless node — no collab connec
   await assert.rejects(
     () => client.updatePageJson(PAGE, badDoc),
     (err) => {
-      // update_page_json runs validateDocStructure first (string-type check),
+      // updatePageJson runs validateDocStructure first (string-type check),
       // which already rejects a typeless node — so the message may come from
       // either guard, but the write must not happen.
       assert.match(err.message, /type/i);
@@ -196,7 +196,7 @@ test("update_page_json fails fast on a nested typeless node — no collab connec
   assert.equal(state.changed, false);
 });
 
-test("update_page_json fails fast on a nested UNKNOWN type name — rich #409 message", async () => {
+test("updatePageJson fails fast on a nested UNKNOWN type name — rich #409 message", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
@@ -210,7 +210,7 @@ test("update_page_json fails fast on a nested UNKNOWN type name — rich #409 me
   await assert.rejects(
     () => client.updatePageJson(PAGE, badDoc),
     (err) => {
-      assert.match(err.message, /update_page_json: invalid node/);
+      assert.match(err.message, /updatePageJson: invalid node/);
       assert.match(err.message, /unknown node type "paragraf"/);
       return true;
     },
@@ -220,7 +220,7 @@ test("update_page_json fails fast on a nested UNKNOWN type name — rich #409 me
   assert.equal(state.changed, false);
 });
 
-test("patch_node with a well-formed node proceeds to the collab write", async () => {
+test("patchNode with a well-formed node proceeds to the collab write", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 

@@ -1,5 +1,5 @@
 // Footnote-canonicalization binding tests for the MCP FULL-document write tools
-// (issue #228, review #4): update_page_json and copy_page_content must persist a
+// (issue #228, review #4): updatePageJson and copyPageContent must persist a
 // footnote-canonical doc. These override the `replacePage` seam (symmetric to the
 // `mutatePage` seam used by the insert-footnote-wrapper test) to capture the
 // persisted doc WITHOUT a live Hocuspocus collab socket. Symmetric to the
@@ -44,7 +44,7 @@ function makeClient(sourceDoc) {
   return { client, calls };
 }
 
-test("update_page_json canonicalizes the persisted full doc (out-of-order -> reference order)", async () => {
+test("updatePageJson canonicalizes the persisted full doc (out-of-order -> reference order)", async () => {
   const { client, calls } = makeClient();
   const outOfOrder = {
     type: "doc",
@@ -60,7 +60,7 @@ test("update_page_json canonicalizes the persisted full doc (out-of-order -> ref
   assert.equal(findAll(calls.replaced[0].doc, "footnotesList").length, 1);
 });
 
-test("copy_page_content canonicalizes the persisted copy (orphan definition dropped)", async () => {
+test("copyPageContent canonicalizes the persisted copy (orphan definition dropped)", async () => {
   const sourceDoc = {
     type: "doc",
     content: [

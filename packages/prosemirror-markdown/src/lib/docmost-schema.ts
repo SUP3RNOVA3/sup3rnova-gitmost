@@ -334,7 +334,7 @@ const DocmostAttributes = Extension.create({
  * Docmost inline comment mark. Anchors a comment thread to a text range via
  * `commentId`. Without it, any document containing comment highlights fails to
  * round-trip through the schema ("There is no mark type comment in this schema"),
- * which breaks update_page_json and edit_page_text on every commented page.
+ * which breaks updatePageJson and editPageText on every commented page.
  * Mirrors Docmost's @docmost/editor-ext comment mark (commentId / resolved).
  */
 const Comment = Mark.create({

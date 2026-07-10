@@ -9,7 +9,7 @@ import {
 
 // Pins the footnoteWarnings PLUMBING contract (#169 review; reduced in #414): the
 // field is present only when legacy reference-style `[^id]:` syntax is used and
-// omitted otherwise, AND `import_page_markdown` analyzes the BODY (after the
+// omitted otherwise, AND `importPageMarkdown` analyzes the BODY (after the
 // docmost:meta / docmost:comments blocks) — so a footnote-like token inside those
 // JSON blocks never warns, while a real definition in the body does.
 // importPageMarkdown does exactly `footnoteWarningsField(parseDocmostMarkdown(full).body)`

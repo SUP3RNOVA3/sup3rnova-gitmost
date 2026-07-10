@@ -12,7 +12,7 @@ license.
 > better at *writing a small function that fixes the text* than at re-reading and
 > re-emitting a whole document. So this server is built around the way a model actually
 > wants to edit: address a block by id, run a find/replace, or hand it a
-> `(doc, ctx) => doc` transform and let it *program* the change. `docmost_transform` is
+> `(doc, ctx) => doc` transform and let it *program* the change. `docmostTransform` is
 > that interface. Other Docmost MCPs are human-shaped — they expose "open the page" and
 > "replace the page"; this one exposes the editing primitives a model is good at.
 
@@ -69,9 +69,9 @@ There are several Docmost MCPs. Here is a capability-by-capability comparison.
 - **Token-efficient editing.** Most Docmost MCPs (and the official one) only offer
   "replace the whole page" writes — the agent must download the entire document, mutate
   it, and upload it back, paying for the full document **twice** on every tiny fix.
-  This server lets the agent change exactly one block (`patch_node` / `insert_node` /
-  `delete_node`), do a structure-preserving find/replace (`edit_page_text`), or copy a
-  whole page server-side (`copy_page_content`) — **without the document ever passing
+  This server lets the agent change exactly one block (`patchNode` / `insertNode` /
+  `deleteNode`), do a structure-preserving find/replace (`editPageText`), or copy a
+  whole page server-side (`copyPageContent`) — **without the document ever passing
   through the model**.
 
 - **Writes that don't fight the editor.** Naive REST writes race with whatever a human
@@ -85,12 +85,12 @@ There are several Docmost MCPs. Here is a capability-by-capability comparison.
 - **Agent-native editing model.** Human-facing servers expose "open the page" and "replace
   the page", because that mirrors how a person works. A model edits better by *programming*
   the change — addressing blocks by id, running a find/replace, or supplying a
-  `(doc, ctx) => doc` transform (`docmost_transform`, with a dry-run diff before it
+  `(doc, ctx) => doc` transform (`docmostTransform`, with a dry-run diff before it
   commits). This server is shaped around that, which is why it has editing primitives the
   others simply don't.
 
-- **An editing safety net the others lack.** `list_page_history` → `diff_page_versions`
-  → `restore_page_version` give an agent (and you) a full view-and-undo loop. The diff
+- **An editing safety net the others lack.** `listPageHistory` → `diffPageVersions`
+  → `restorePageVersion` give an agent (and you) a full view-and-undo loop. The diff
   uses the *same* `recreateTransform → ChangeSet → simplifyChanges` pipeline Docmost's
   own history viewer uses, so what you see matches the product.
 
@@ -110,56 +110,56 @@ All 41 tools, grouped by what you'd reach for them.
 
 ### Exploration & retrieval
 
-- **`get_workspace`** — Information about the current Docmost workspace.
-- **`list_spaces`** — All spaces in the workspace.
-- **`list_pages`** — Recent pages in a space, ordered by `updatedAt` desc (default 50,
+- **`getWorkspace`** — Information about the current Docmost workspace.
+- **`listSpaces`** — All spaces in the workspace.
+- **`listPages`** — Recent pages in a space, ordered by `updatedAt` desc (default 50,
   max 100). Use `search` for lookups in large spaces.
 - **`search`** — Full-text search across pages and content (bounded by `limit`, max 100).
-- **`get_page`** — A page's content as clean **Markdown** (convenient, but a *lossy*
+- **`getPage`** — A page's content as clean **Markdown** (convenient, but a *lossy*
   view — block ids and exact table/callout structure are approximated).
-- **`get_page_json`** — A page's **lossless ProseMirror/TipTap JSON**, including every
+- **`getPageJson`** — A page's **lossless ProseMirror/TipTap JSON**, including every
   block's `attrs.id` and the `slugId` used in URLs. This is what the per-block editing
   tools consume.
-- **`get_outline`** — A compact outline of a page's top-level blocks (`{index, type, id,
+- **`getOutline`** — A compact outline of a page's top-level blocks (`{index, type, id,
   level, firstText}`; tables add row/column counts and their header-cell texts, lists add
   item counts) **without** the document body. The cheap way to locate a section or table
   and grab its block id before
-  `get_node` / `patch_node` / `insert_node`.
-- **`get_node`** — Fetch a single block's full ProseMirror subtree (lossless) without
-  pulling the whole page. Address it by a block id (from `get_outline` / `get_page_json`),
+  `getNode` / `patchNode` / `insertNode`.
+- **`getNode`** — Fetch a single block's full ProseMirror subtree (lossless) without
+  pulling the whole page. Address it by a block id (from `getOutline` / `getPageJson`),
   or by `#<index>` for a top-level block — use the `#<index>` form for tables/rows/cells,
   which carry no id.
 
 ### Page lifecycle
 
-- **`create_page`** — Create a page from Markdown and place it in the hierarchy (optional
+- **`createPage`** — Create a page from Markdown and place it in the hierarchy (optional
   `parentPageId`) in one call. Uses Docmost's import API for clean Markdown→ProseMirror.
-- **`rename_page`** — Change a page's title only, without touching or resending content.
-- **`move_page`** — Re-parent a page (nest it, or move to root); supports fractional-index
+- **`renamePage`** — Change a page's title only, without touching or resending content.
+- **`movePage`** — Re-parent a page (nest it, or move to root); supports fractional-index
   positioning. Returns only on a *positively confirmed* success.
-- **`delete_page`** — Delete a single page.
-- **`copy_page_content`** — Replace one page's body with a copy of another's, **entirely
+- **`deletePage`** — Delete a single page.
+- **`copyPageContent`** — Replace one page's body with a copy of another's, **entirely
   server-side** — the document never passes through the model. The target keeps its own
   title and slug (so its URL is preserved).
 
 ### Editing
 
-- **`edit_page_text`** — Surgical find/replace inside a page's text. Preserves **all**
+- **`editPageText`** — Surgical find/replace inside a page's text. Preserves **all**
   structure: block ids, marks, links, callouts, tables. The preferred tool for fixing
   wording, typos, numbers and names.
-- **`patch_node`** — Replace a single block addressed by its `attrs.id` (from
-  `get_page_json`), without resending the document.
-- **`insert_node`** — Insert a block before/after another (by `attrs.id` or anchor text),
+- **`patchNode`** — Replace a single block addressed by its `attrs.id` (from
+  `getPageJson`), without resending the document.
+- **`insertNode`** — Insert a block before/after another (by `attrs.id` or anchor text),
   or append at the end.
-- **`delete_node`** — Remove a single block by its `attrs.id`.
-- **`update_page_json`** — Replace a page's entire content with a ProseMirror document
+- **`deleteNode`** — Remove a single block by its `attrs.id`.
+- **`updatePageJson`** — Replace a page's entire content with a ProseMirror document
   (bulk rewrites, or when nodes lack ids). `content` is optional — omit it to update only
   the title. Keeps the block ids you pass in, so heading anchors and history stay stable.
-- **`update_page_markdown`** — Replace a page's body (and optionally its title) with new
+- **`updatePageMarkdown`** — Replace a page's body (and optionally its title) with new
   **plain Markdown**. The whole body is re-imported (block ids regenerate — for surgical or
-  id-preserving edits prefer `edit_page_text` / `patch_node` / `update_page_json`).
+  id-preserving edits prefer `editPageText` / `patchNode` / `updatePageJson`).
   Docmost-flavoured markdown is parsed, including `^[...]` inline footnotes.
-- **`docmost_transform`** — The agent-native editing interface: instead of retyping a
+- **`docmostTransform`** — The agent-native editing interface: instead of retyping a
   document, the agent **writes a function that fixes it**. Edit a page by running an
   arbitrary **`(doc, ctx) => doc` JavaScript transform** against its *live* ProseMirror
   document. Runs **sandboxed**
@@ -172,42 +172,42 @@ All 41 tools, grouped by what you'd reach for them.
 
 ### Tables
 
-- **`table_get`** — Read a table as a matrix: `{rows, cols, cells (text[][]), cellIds}`
+- **`tableGet`** — Read a table as a matrix: `{rows, cols, cells (text[][]), cellIds}`
   (a paragraph id per cell, or `null`). Address the table by `#<index>` (from
-  `get_outline`) or any block id inside it. Use `cellIds` with `patch_node` for
+  `getOutline`) or any block id inside it. Use `cellIds` with `patchNode` for
   rich-formatted cell edits.
-- **`table_insert_row`** — Insert a row of plain-text cells, padded to the table's column
+- **`tableInsertRow`** — Insert a row of plain-text cells, padded to the table's column
   count (passing more cells than columns is an error). `index` is the 0-based insert
   position (0 inserts before the header); omit it to append at the end.
-- **`table_delete_row`** — Delete the row at a 0-based `index`. Refuses to delete a table's
+- **`tableDeleteRow`** — Delete the row at a 0-based `index`. Refuses to delete a table's
   only row; deleting row 0 promotes the next row to header.
-- **`table_update_cell`** — Set the plain-text content of cell `[row, col]` (0-based). For
-  rich formatting, `patch_node` the cell's paragraph id from `table_get`.
+- **`tableUpdateCell`** — Set the plain-text content of cell `[row, col]` (0-based). For
+  rich formatting, `patchNode` the cell's paragraph id from `tableGet`.
 
 ### Markdown round-trip
 
-- **`export_page_markdown`** — Export a page to a single self-contained, **lossless
+- **`exportPageMarkdown`** — Export a page to a single self-contained, **lossless
   Docmost-flavoured Markdown** file: a meta header, the body with inline comment anchors
   and diagrams, and a trailing comments-thread block. To replace a page's body from plain
-  authoring Markdown, use `update_page_markdown`.
+  authoring Markdown, use `updatePageMarkdown`.
 
-> **Removed in this release:** `import_page_markdown` (the round-trip parser for an
+> **Removed in this release:** `importPageMarkdown` (the round-trip parser for an
 > exported Docmost-Markdown file) is **no longer exposed on the external MCP surface**.
-> To replace a page's body from Markdown, use **`update_page_markdown`** (plain Markdown
+> To replace a page's body from Markdown, use **`updatePageMarkdown`** (plain Markdown
 > body replace). See the CHANGELOG for the migration note.
 
 ### Images
 
-- **`insert_image`** — Download an image from a web (http/https) URL and insert it in one
+- **`insertImage`** — Download an image from a web (http/https) URL and insert it in one
   step: append it, drop it in place of a text placeholder (`replaceText`), or put it after
   a given block (`afterText`). Preserves all other block ids.
-- **`replace_image`** — Swap an existing image for one fetched from a web (http/https) URL.
+- **`replaceImage`** — Swap an existing image for one fetched from a web (http/https) URL.
   Uploads the new file as a **fresh
   attachment** (clean URL that renders and busts browser caches), then re-points every
   node referencing the old attachment (recursively, including callouts/tables) via the
   live document, preserving comments, alignment and alt text. (In-place overwrite is
   deliberately avoided — some Docmost versions corrupt the attachment on overwrite.)
-- **`stash_page`** — Serialize a whole page (its full ProseMirror JSON) into an ephemeral
+- **`stashPage`** — Serialize a whole page (its full ProseMirror JSON) into an ephemeral
   in-RAM blob and return ONLY a short anonymous URL — the body never enters the model
   context, so it is the way to hand a large page (and its images) to an external consumer
   without truncation. Every internal file/image attachment is mirrored into the same
@@ -218,35 +218,35 @@ All 41 tools, grouped by what you'd reach for them.
 
 ### Comments
 
-- **`create_comment`** — Add a page comment, optionally **anchored inline** to an exact
+- **`createComment`** — Add a page comment, optionally **anchored inline** to an exact
   span of text (the first occurrence is wrapped in a comment mark).
-- **`list_comments`** — List a page's comments (content returned as Markdown).
-- **`update_comment`** — Edit an existing comment.
-- **`delete_comment`** — Delete a comment.
-- **`resolve_comment`** — Resolve (close) or reopen a comment thread (reversible). Only top-level
-  comments can be resolved; the thread and its replies are kept, unlike `delete_comment`.
-- **`check_new_comments`** — Find comments created after a given ISO-8601 timestamp across
+- **`listComments`** — List a page's comments (content returned as Markdown).
+- **`updateComment`** — Edit an existing comment.
+- **`deleteComment`** — Delete a comment.
+- **`resolveComment`** — Resolve (close) or reopen a comment thread (reversible). Only top-level
+  comments can be resolved; the thread and its replies are kept, unlike `deleteComment`.
+- **`checkNewComments`** — Find comments created after a given ISO-8601 timestamp across
   a space, optionally scoped to a page subtree — ideal for an agent that watches a doc for
   feedback.
 
 ### Versioning & history
 
-- **`list_page_history`** — A page's saved versions (Docmost auto-snapshots on save),
+- **`listPageHistory`** — A page's saved versions (Docmost auto-snapshots on save),
   newest first, cursor-paginated. Each item's id is the `historyId`.
-- **`diff_page_versions`** — Diff two versions (or a version against the live page).
+- **`diffPageVersions`** — Diff two versions (or a version against the live page).
   Returns inserted/deleted text, integrity counts (images, links, tables, callouts,
   footnote markers), and a human-readable Markdown summary — computed with the same
   pipeline Docmost's own history viewer uses.
-- **`restore_page_version`** — Write a saved version back as the current content. Docmost
+- **`restorePageVersion`** — Write a saved version back as the current content. Docmost
   has no restore endpoint, so this creates a **new** snapshot — the restore is itself
   revertible.
 
 ### Sharing
 
-- **`share_page`** — Make a page publicly accessible (idempotent) and return its public
+- **`sharePage`** — Make a page publicly accessible (idempotent) and return its public
   URL (`<app>/share/<key>/p/<slugId>`); optional search-engine indexing.
-- **`unshare_page`** — Revoke a page's public share.
-- **`list_shares`** — All public shares in the workspace, with titles and public URLs.
+- **`unsharePage`** — Revoke a page's public share.
+- **`listShares`** — All public shares in the workspace, with titles and public URLs.
 
 ---
 
@@ -255,27 +255,27 @@ All 41 tools, grouped by what you'd reach for them.
 This same guidance is also delivered at runtime via the MCP server `instructions` field,
 so capable clients steer the model automatically.
 
-- **Text fixes** (wording, typos, numbers): `edit_page_text`.
-- **One block** (paragraph/heading/callout/table cell): `patch_node` / `insert_node` /
-  `delete_node`, addressing the node by its `attrs.id` from `get_page_json`.
-- **Images**: `insert_image` / `replace_image`.
-- **A new page**: `create_page`.
-- **Bulk rewrite, or nodes without ids**: `update_page_json` (ProseMirror) or
-  `update_page_markdown` (plain Markdown body replace).
+- **Text fixes** (wording, typos, numbers): `editPageText`.
+- **One block** (paragraph/heading/callout/table cell): `patchNode` / `insertNode` /
+  `deleteNode`, addressing the node by its `attrs.id` from `getPageJson`.
+- **Images**: `insertImage` / `replaceImage`.
+- **A new page**: `createPage`.
+- **Bulk rewrite, or nodes without ids**: `updatePageJson` (ProseMirror) or
+  `updatePageMarkdown` (plain Markdown body replace).
 - **Multi-step / scripted rewrite** (renumbering, footnotes, coordinated edits):
-  `docmost_transform` — preview with `dryRun`, then apply.
-- **Copy a whole page's content from another page** (server-side): `copy_page_content`.
-- **Rename a page** (title only): `rename_page`.
-- **Reads**: `get_page` (Markdown) / `get_page_json` (lossless ProseMirror with ids).
-- **Review changes**: `list_page_history` → `diff_page_versions` → `restore_page_version`.
-- **Comments**: `create_comment` (with optional inline anchoring) / `list_comments` /
-  `update_comment` / `resolve_comment` / `delete_comment` / `check_new_comments`.
-- **Navigate a page cheaply** (find a section/table, grab a block id): `get_outline` →
-  `get_node`.
-- **Tables** (add/remove a row, set a cell): `table_get` / `table_insert_row` /
-  `table_delete_row` / `table_update_cell`.
-- **Export a page as self-contained Markdown** (with comment anchors): `export_page_markdown`.
-- **Replace a page's body from Markdown**: `update_page_markdown`.
+  `docmostTransform` — preview with `dryRun`, then apply.
+- **Copy a whole page's content from another page** (server-side): `copyPageContent`.
+- **Rename a page** (title only): `renamePage`.
+- **Reads**: `getPage` (Markdown) / `getPageJson` (lossless ProseMirror with ids).
+- **Review changes**: `listPageHistory` → `diffPageVersions` → `restorePageVersion`.
+- **Comments**: `createComment` (with optional inline anchoring) / `listComments` /
+  `updateComment` / `resolveComment` / `deleteComment` / `checkNewComments`.
+- **Navigate a page cheaply** (find a section/table, grab a block id): `getOutline` →
+  `getNode`.
+- **Tables** (add/remove a row, set a cell): `tableGet` / `tableInsertRow` /
+  `tableDeleteRow` / `tableUpdateCell`.
+- **Export a page as self-contained Markdown** (with comment anchors): `exportPageMarkdown`.
+- **Replace a page's body from Markdown**: `updatePageMarkdown`.
 
 ---
 
@@ -293,8 +293,8 @@ so capable clients steer the model automatically.
   refreshed automatically on the first 401/403 (covering JSON, multipart upload, and the
   collaboration-token path), with in-flight login de-duplication so a burst of calls
   triggers a single re-login.
-- **Lossless and lossy reads.** `get_page_json` returns the exact ProseMirror tree with
-  block ids; `get_page` returns clean Markdown for convenience.
+- **Lossless and lossy reads.** `getPageJson` returns the exact ProseMirror tree with
+  block ids; `getPage` returns clean Markdown for convenience.
 - **Full Docmost schema.** Markdown↔ProseMirror conversion supports callouts (including
   nested), task lists (bullet *and* numbered checklists), tables, math blocks, embeds,
   highlights, sub/superscript and more, with defensive caps against pathological input.
@@ -305,7 +305,7 @@ so capable clients steer the model automatically.
 - **Token-optimized responses.** API responses are filtered down to the fields agents
   actually need, and large collections (spaces, pages, comments, history) are paginated.
 - **Hardened runtime.** Global handlers keep a stray socket error from tearing down the
-  stdio server; `move_page` requires a positively confirmed success; the diff engine
+  stdio server; `movePage` requires a positively confirmed success; the diff engine
   falls back to a coarse block diff rather than hard-failing on a pathological document.
 
 ---
@@ -363,7 +363,7 @@ npm run test:e2e
 
 This project began as a fork of [MrMartiniMo/docmost-mcp](https://github.com/MrMartiniMo/docmost-mcp)
 (by Moritz Krause) and extends it substantially — adding per-block node editing,
-surgical text edits, the sandboxed `docmost_transform`, version history / diff / restore,
+surgical text edits, the sandboxed `docmostTransform`, version history / diff / restore,
 comments, image insert/replace, public sharing, server-side page copy, dual
 JSON/Markdown reads, transparent re-authentication and significant hardening. The comment
 tools were ported from upstream PR #3 by Max Nikitin. Thanks to both.

@@ -12,20 +12,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **External MCP tool names are now camelCase (all renamed).** Every tool on the
+  external `/mcp` surface was renamed from `snake_case` to `camelCase`, so the
+  external MCP name now matches the in-app tool name exactly (one logical tool,
+  one name everywhere). For example `get_node` → `getNode`, `edit_page_text` →
+  `editPageText`, `patch_node` → `patchNode`. The tools' behaviour, inputs and
+  outputs are unchanged — only the names change. The single-word `search`
+  keeps its name.
+
+  *Migration (external MCP clients only — the in-app AI agent already used these
+  names and is unaffected):* update anything that refers to a tool by its
+  string name — permission allowlists (`mcp__gitmost-*__get_node` →
+  `mcp__gitmost-*__getNode`), saved prompts/skills, `.mcp.json` tool filters,
+  and metrics dashboards that group by the `tool` label — and roll it out in
+  lockstep with this deploy, because the old snake_case names stop resolving.
+  Released together with the `import_page_markdown`/`update_page_markdown`
+  change below so external configs break exactly once.
+
+  Full mapping (old → new):
+
+  | Old (snake_case) | New (camelCase) |
+  | --- | --- |
+  | `check_new_comments` | `checkNewComments` |
+  | `copy_page_content` | `copyPageContent` |
+  | `create_comment` | `createComment` |
+  | `create_page` | `createPage` |
+  | `delete_comment` | `deleteComment` |
+  | `delete_node` | `deleteNode` |
+  | `delete_page` | `deletePage` |
+  | `diff_page_versions` | `diffPageVersions` |
+  | `docmost_transform` | `docmostTransform` |
+  | `drawio_create` | `drawioCreate` |
+  | `drawio_get` | `drawioGet` |
+  | `drawio_guide` | `drawioGuide` |
+  | `drawio_shapes` | `drawioShapes` |
+  | `drawio_update` | `drawioUpdate` |
+  | `edit_page_text` | `editPageText` |
+  | `export_page_markdown` | `exportPageMarkdown` |
+  | `get_node` | `getNode` |
+  | `get_outline` | `getOutline` |
+  | `get_page` | `getPage` |
+  | `get_page_json` | `getPageJson` |
+  | `get_workspace` | `getWorkspace` |
+  | `insert_footnote` | `insertFootnote` |
+  | `insert_image` | `insertImage` |
+  | `insert_node` | `insertNode` |
+  | `list_comments` | `listComments` |
+  | `list_page_history` | `listPageHistory` |
+  | `list_pages` | `listPages` |
+  | `list_shares` | `listShares` |
+  | `list_spaces` | `listSpaces` |
+  | `move_page` | `movePage` |
+  | `patch_node` | `patchNode` |
+  | `rename_page` | `renamePage` |
+  | `replace_image` | `replaceImage` |
+  | `resolve_comment` | `resolveComment` |
+  | `restore_page_version` | `restorePageVersion` |
+  | `search` | `search` (unchanged) |
+  | `search_in_page` | `searchInPage` |
+  | `share_page` | `sharePage` |
+  | `stash_page` | `stashPage` |
+  | `table_delete_row` | `tableDeleteRow` |
+  | `table_get` | `tableGet` |
+  | `table_insert_row` | `tableInsertRow` |
+  | `table_update_cell` | `tableUpdateCell` |
+  | `unshare_page` | `unsharePage` |
+  | `update_comment` | `updateComment` |
+  | `update_page_json` | `updatePageJson` |
+  | `update_page_markdown` | `updatePageMarkdown` |
+
+  (#412)
+
 - **External MCP: `import_page_markdown` removed, `update_page_markdown` added.**
-  The external `/mcp` surface no longer exposes `import_page_markdown` (the
+  The external `/mcp` surface no longer exposes `importPageMarkdown` (the
   round-trip parser for a self-contained *exported* Docmost-Markdown file). In
-  its place it now exposes **`update_page_markdown`** — a plain-Markdown
+  its place it now exposes **`updatePageMarkdown`** — a plain-Markdown
   full-body replace (`{pageId, content, title?}`) that pairs with
-  `update_page_json`, re-imports the whole body (block ids regenerate) and
+  `updatePageJson`, re-imports the whole body (block ids regenerate) and
   parses Docmost-flavoured markdown including `^[...]` inline footnotes.
-  *Migration:* MCP clients that called `import_page_markdown` to overwrite a
-  page's body from Markdown should call `update_page_markdown` instead (pass the
+  *Migration:* MCP clients that called `importPageMarkdown` to overwrite a
+  page's body from Markdown should call `updatePageMarkdown` instead (pass the
   markdown as `content`). Round-tripping an exported Docmost-Markdown file with
   comment anchors/diagrams is no longer available on the external MCP surface;
-  export remains via `export_page_markdown`. The in-app AI agent is unaffected —
+  export remains via `exportPageMarkdown`. The in-app AI agent is unaffected —
   it keeps both `importPageMarkdown` and the renamed `updatePageMarkdown` (was
-  `updatePageContent`). The total MCP tool count is unchanged (−1 / +1). (#411)
+  `updatePageContent`). The total MCP tool count is unchanged (−1 / +1). The
+  external names shown here are the post-#412 camelCase names. (#411)
 
 ### Added
 

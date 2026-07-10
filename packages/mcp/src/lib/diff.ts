@@ -380,7 +380,7 @@ export interface VerifyReport {
   /**
    * ONLY structural integrity types whose count changed, as [before, after]
    * (images/links/tables/callouts). Surfaces structural mutations that touch
-   * neither text nor marks (e.g. insert_image, deleting a table) which diffDocs
+   * neither text nor marks (e.g. insertImage, deleting a table) which diffDocs
    * — being TEXT-only — would otherwise report as "no content change".
    */
   structure?: Record<string, [number, number]>;
@@ -400,7 +400,7 @@ export interface VerifyReport {
  *
  * The structural integrity delta (from diffDocs's `integrity` tuples) is what
  * makes `changed` true for an image/table/callout/link count change that diffs
- * to zero text — closing a verify blind spot for insert_image, delete_node on a
+ * to zero text — closing a verify blind spot for insertImage, deleteNode on a
  * table, etc.
  */
 export function summarizeChange(before: any, after: any): VerifyReport {

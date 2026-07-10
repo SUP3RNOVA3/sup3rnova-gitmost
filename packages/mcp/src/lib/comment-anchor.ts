@@ -20,7 +20,7 @@
  *
  * MARKDOWN-STRIP FALLBACK: when the agent copies a selection that still carries
  * inline markdown (`**bold**`, `` `code` ``, `[t](u)`), the raw locator will not
- * match the document's plain text. Exactly like edit_page_text's json-edit
+ * match the document's plain text. Exactly like editPageText's json-edit
  * fallback, we first try the verbatim selection and, ONLY if it anchors nowhere
  * in the whole document, retry with `stripInlineMarkdown` applied. `canAnchorInDoc`,
  * `getAnchoredText` and `applyAnchorInDoc` share this decision via

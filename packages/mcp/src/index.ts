@@ -58,7 +58,7 @@ export type {
   CommentSignalTrackerOptions,
 } from "./comment-signal.js";
 // Re-export the pure, no-network draw.io helpers (#424) so the in-app AI-SDK
-// service can wire drawio_shapes / drawio_guide off the loaded module. These are
+// service can wire drawioShapes / drawioGuide off the loaded module. These are
 // NOT client methods (no page/backend hit) — the in-app handler calls them
 // directly, mirroring how the standalone MCP server wires them here.
 export { searchShapes } from "./lib/drawio-shapes.js";
@@ -89,7 +89,7 @@ const VERSION = packageJson.version;
 // (SHARED_TOOL_SPECS + INLINE_MCP_INVENTORY), so it can no longer drift out of
 // sync with the registered tools. Re-exported here (its old home) so existing
 // importers are unaffected; the composition lives in server-instructions.ts.
-// The drawio_shapes / drawio_guide tools (#424) stay in SHARED_TOOL_SPECS (so the
+// The drawioShapes / drawioGuide tools (#424) stay in SHARED_TOOL_SPECS (so the
 // generated <tool_inventory> picks them up from their catalogLine automatically)
 // but are flagged `inlineBothHosts` and registered inline below (their pure
 // helpers can't cross into tool-specs.ts); only the hand-written routing prose in
@@ -286,7 +286,7 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   // the wrapping is typed loosely and cast — runtime behaviour is unchanged.
   const registerSharedFromSpec = (spec: SharedToolSpec) => {
     if (spec.inAppOnly) return;
-    // `inlineBothHosts` specs (drawio_shapes / drawio_guide) carry no execute —
+    // `inlineBothHosts` specs (drawioShapes / drawioGuide) carry no execute —
     // their pure helper cannot cross into the zod-agnostic tool-specs.ts, so they
     // are registered INLINE below (searchShapes / getGuideSection). Skip them here
     // so the loop never dereferences a missing `execute`.
@@ -316,7 +316,7 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   }
 
   // --- INLINE drawio helper tools (IN the shared registry, but inlineBothHosts) ---
-  // drawio_shapes / drawio_guide (#424) live in SHARED_TOOL_SPECS (so the shared
+  // drawioShapes / drawioGuide (#424) live in SHARED_TOOL_SPECS (so the shared
   // contract pins their name/description/schema across both hosts) but carry the
   // `inlineBothHosts` flag and NO execute: their pure backing helpers
   // (searchShapes / getGuideSection) cannot be value-imported into the
@@ -356,25 +356,25 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
 
   // --- INLINE tools kept per-transport (NOT in the shared registry) ---
   // Each stays inline for a documented reason: a snake_case/camelCase naming
-  // clash the registry convention forbids (table_get), an intentional
-  // per-transport behaviour/schema divergence (search, docmost_transform), or a
-  // tool that exists ONLY on this standalone MCP surface (update_comment,
-  // delete_comment — the in-app agent deliberately exposes no hard comment
+  // clash the registry convention forbids (tableGet), an intentional
+  // per-transport behaviour/schema divergence (search, docmostTransform), or a
+  // tool that exists ONLY on this standalone MCP surface (updateComment,
+  // deleteComment — the in-app agent deliberately exposes no hard comment
   // edit/delete tool).
 
-  // Tool: table_get
-// NOT in the shared registry: the MCP tool name `table_get` is noun-first while
+  // Tool: tableGet
+// NOT in the shared registry: the MCP tool name `tableGet` is noun-first while
 // the in-app key is `getTable` (verb-first), breaking the snake_case(inAppKey)
 // convention the shared registry enforces (shared-tool-specs.contract.spec.ts).
 // Renaming the public MCP tool would break external clients, so it stays inline.
 server.registerTool(
-  "table_get",
+  "tableGet",
   {
     description:
       "Read a table as a matrix. Returns {rows, cols, cells (text[][]), " +
       "cellIds (paragraph id per cell, or null)}. `table` = `#<index>` from " +
-      "get_outline, or any block id inside the table. Use cellIds with " +
-      "patch_node for rich-formatted cell edits. `cols` is the FIRST row's " +
+      "getOutline, or any block id inside the table. Use cellIds with " +
+      "patchNode for rich-formatted cell edits. `cols` is the FIRST row's " +
       "width; ragged tables may vary per row, so use the per-row length of " +
       "`cells` for each row.",
     inputSchema: {
@@ -388,9 +388,9 @@ server.registerTool(
   },
 );
 
-// Tool: update_comment
+// Tool: updateComment
 server.registerTool(
-  "update_comment",
+  "updateComment",
   {
     description:
       "Update an existing comment's content. Only the comment creator can " +
@@ -409,9 +409,9 @@ server.registerTool(
   },
 );
 
-// Tool: delete_comment
+// Tool: deleteComment
 server.registerTool(
-  "delete_comment",
+  "deleteComment",
   {
     description:
       "Delete a comment. Only the comment creator or space admin can delete it.",
@@ -463,13 +463,13 @@ server.registerTool(
   },
 );
 
-// Tool: docmost_transform
+// Tool: docmostTransform
 // INTENTIONAL per-transport divergence (not shared): the in-app `transformPage`
 // deliberately omits the `deleteComments` schema field (comment-deletion
 // guardrail) and carries a much shorter description; this transport exposes the
 // full helper catalogue. Different schema, so kept per-layer.
 server.registerTool(
-  "docmost_transform",
+  "docmostTransform",
   {
     description:
       "Edit a page by running an arbitrary JS transform `(doc, ctx) => doc` " +

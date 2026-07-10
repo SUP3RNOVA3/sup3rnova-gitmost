@@ -266,7 +266,7 @@ export class AiChatToolsService {
     // construction is shared with the page-change detection path (#274) via
     // buildDocmostClient so both go over the exact same authenticated route.
     // searchShapes / getGuideSection (#424) are the PURE, no-network helpers
-    // backing drawio_shapes / drawio_guide. They are `inlineBothHosts` specs (no
+    // backing drawioShapes / drawioGuide. They are `inlineBothHosts` specs (no
     // canonical execute — their catalog loader uses import.meta and can't be
     // value-imported into the zod-agnostic tool-specs.ts under the server's
     // commonjs type-check), so the shared registry loop below SKIPS them and this
@@ -308,9 +308,10 @@ export class AiChatToolsService {
     // The in-app toolset. It starts with the tools kept INLINE here for a
     // documented per-layer reason: an intentional behaviour/schema divergence from
     // the standalone MCP surface (searchPages' hybrid RRF,
-    // transformPage's guardrailed shorter schema), a
-    // snake_case/camelCase naming clash the shared registry forbids (getTable vs
-    // the MCP `table_get`), per-request state the registry loop cannot provide
+    // transformPage's guardrailed shorter schema), a name clash the shared
+    // registry forbids (in-app `getTable` verb-first vs the MCP noun-first
+    // `tableGet` — the registry requires mcpName === inAppKey), per-request
+    // state the registry loop cannot provide
     // (getCurrentPage reads the resolved openedPage; searchPages closes over the
     // per-request user/embedding deps), or a tool with no MCP twin
     // (listSidebarPages/getComment/getPageHistory). Every SHARED tool is then added
@@ -477,9 +478,9 @@ export class AiChatToolsService {
           await client.listSidebarPages(spaceId, pageId),
       }),
 
-      // NOT shared (kept inline): the MCP tool name `table_get` is noun-first
-      // while this key is `getTable` (verb-first), breaking the
-      // snake_case(inAppKey) convention the shared registry enforces. Its
+      // NOT shared (kept inline): the MCP tool name `tableGet` is noun-first
+      // while this key is `getTable` (verb-first), so it cannot satisfy the
+      // shared registry's `mcpName === inAppKey` convention (#412). Its
       // reference parameter is still named `table` (was `tableRef`) so it matches
       // the migrated table row/cell tools below.
       getTable: tool({
@@ -522,7 +523,7 @@ export class AiChatToolsService {
 
       // INTENTIONAL per-transport divergence (not shared): deliberately omits the
       // `deleteComments` schema field (comment-deletion guardrail) and carries a
-      // much shorter description; the standalone MCP `docmost_transform` exposes
+      // much shorter description; the standalone MCP `docmostTransform` exposes
       // the full helper catalogue. Different schema, so kept per-layer.
       transformPage: tool({
         description:
@@ -553,7 +554,7 @@ export class AiChatToolsService {
     // WHICH mapping to run and returns its value directly (no envelope). For each
     // spec:
     //   - skip `mcpOnly` specs (they belong to the standalone MCP host only);
-    //   - skip `inlineBothHosts` specs (drawio_shapes / drawio_guide): they carry
+    //   - skip `inlineBothHosts` specs (drawioShapes / drawioGuide): they carry
     //     no execute and are wired INLINE just below, calling the pure helpers;
     //   - use `inAppExecute` when the spec declares a DELIBERATE per-layer
     //     difference (a projected result shape, a different guardrail message);
@@ -574,7 +575,7 @@ export class AiChatToolsService {
       );
     }
 
-    // drawio_shapes / drawio_guide (#424): `inlineBothHosts` registry specs wired
+    // drawioShapes / drawioGuide (#424): `inlineBothHosts` registry specs wired
     // here with the SAME schema+description the shared spec pins, but calling the
     // pure searchShapes / getGuideSection helpers off the loaded @docmost/mcp
     // module — they are not client methods and their catalog loader uses

@@ -155,7 +155,7 @@ test("listSidebarPages terminates (no dups) when the server ignores the cursor",
 // -----------------------------------------------------------------------------
 // 3a) enumerateSpacePages happy path: a SINGLE /pages/tree request.
 // -----------------------------------------------------------------------------
-test("enumerateSpacePages (via list_pages tree) uses one /pages/tree request", async () => {
+test("enumerateSpacePages (via listPages tree) uses one /pages/tree request", async () => {
   let treeRequests = 0;
   let sidebarRequests = 0;
   let treeBody = null;
@@ -184,7 +184,7 @@ test("enumerateSpacePages (via list_pages tree) uses one /pages/tree request", a
   });
 
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
-  // list_pages tree:true -> enumerateSpacePages(spaceId) -> buildPageTree.
+  // listPages tree:true -> enumerateSpacePages(spaceId) -> buildPageTree.
   const tree = await client.listPages("space-1", 50, true);
 
   assert.equal(treeRequests, 1, "exactly one /pages/tree request for the space");
@@ -375,7 +375,7 @@ test("listComments terminates (no dups) when the server ignores the cursor", asy
 });
 
 // -----------------------------------------------------------------------------
-// 4) check_new_comments subtree: the root is included in scope WITHOUT a
+// 4) checkNewComments subtree: the root is included in scope WITHOUT a
 //    separate getPageRaw (/pages/info) request for the parent.
 // -----------------------------------------------------------------------------
 test("checkNewComments subtree includes the root without a separate getPageRaw", async () => {

@@ -60,10 +60,10 @@ export const CORE_TOOL_KEYS = [
   'listComments',
   'resolveComment',
   'editPageText',
-  // #330 search_in_page — frequent for editorial sweeps; core despite predating
+  // #330 searchInPage — frequent for editorial sweeps; core despite predating
   // the issue's tier list.
   'searchInPage',
-  // #410 insert_footnote — core so pinpoint citations to already-written text
+  // #410 insertFootnote — core so pinpoint citations to already-written text
   // don't degrade into literal `^[...]`; kept symmetric with editPageText.
   'insertFootnote',
 ] as const;
@@ -138,7 +138,7 @@ export const INLINE_TOOL_TIERS: Record<
   },
   // NOTE: tableInsertRow, tableDeleteRow and tableUpdateCell moved to
   // @docmost/mcp's SHARED_TOOL_SPECS (#294); they carry their own deferred tier +
-  // catalogLine there. getTable stays inline (its MCP name table_get breaks the
+  // catalogLine there. getTable stays inline (its MCP name tableGet breaks the
   // snake_case(inAppKey) convention, so it has no shared spec).
   // NOTE: checkNewComments moved to @docmost/mcp's SHARED_TOOL_SPECS (#294);
   // it carries its own deferred tier + catalogLine there.
@@ -150,7 +150,7 @@ export const INLINE_TOOL_TIERS: Record<
   // NOTE: sharePage moved to @docmost/mcp's SHARED_TOOL_SPECS (#294); it carries
   // its own deferred tier + catalogLine there. transformPage stays inline (its
   // schema deliberately diverges — it omits the deleteComments field the MCP
-  // docmost_transform exposes, a comment-deletion guardrail).
+  // docmostTransform exposes, a comment-deletion guardrail).
   transformPage: {
     tier: 'deferred',
     catalogLine: "transformPage — run a sandboxed JS transform over a page's document.",

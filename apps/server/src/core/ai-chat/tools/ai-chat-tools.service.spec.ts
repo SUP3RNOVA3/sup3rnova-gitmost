@@ -25,7 +25,7 @@ const mockLoaded = (DocmostClient: loader.DocmostClientCtor) => ({
   DocmostClient,
   sharedToolSpecs: SHARED_TOOL_SPECS as unknown as Record<string, loader.SharedToolSpec>,
   // Pure no-network draw.io helpers (#424). Type-correct stubs: these tests
-  // never execute the drawio_shapes / drawio_guide tool bodies.
+  // never execute the drawioShapes / drawioGuide tool bodies.
   searchShapes: (() => []) as unknown as loader.SearchShapesFn,
   getGuideSection: (() => ({
     section: 'index',
@@ -912,7 +912,7 @@ describe('AiChatToolsService getCurrentPage selection (#388)', () => {
 });
 
 /**
- * #440 review: the in-app drawio_create / drawio_update handlers must forward
+ * #440 review: the in-app drawioCreate / drawioUpdate handlers must forward
  * the optional `layout:"elk"` param to the client (5th positional arg), exactly
  * like the MCP host. It was silently dropped, so ELK auto-layout worked only via
  * the standalone MCP server, not in-app. These tests pin per-host parity.

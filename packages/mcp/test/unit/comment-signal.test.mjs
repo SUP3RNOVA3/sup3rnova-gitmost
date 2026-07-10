@@ -152,7 +152,7 @@ test("tautological comment tools are excluded and never probe", async () => {
   const { comments, probeCalls, tracker } = makeWorld();
   tracker.noteWorkingPage("p1");
   comments.push({ createdAt: 9_999_999 });
-  for (const name of ["listComments", "list_comments", "checkNewComments", "createComment"]) {
+  for (const name of ["listComments", "listComments", "checkNewComments", "createComment"]) {
     assert.equal(await tracker.maybeSignal(name), null);
   }
   assert.equal(probeCalls.length, 0);
@@ -188,7 +188,7 @@ function fakeTracker({ line }) {
     noteWorkingPage: (p) => events.push(["note", p]),
     advanceWatermark: () => events.push(["advance"]),
     isExcludedTool: (n) =>
-      new Set(["listComments", "list_comments"]).has(n),
+      new Set(["listComments", "listComments"]).has(n),
     maybeSignal: async () => line,
   };
 }
@@ -221,7 +221,7 @@ test("withCommentSignal: appends ONE extra text element when signalled", async (
 test("withCommentSignal: excluded tool advances the watermark and does not append", async () => {
   const tracker = fakeTracker({ line: "SHOULD-NOT-APPEAR" });
   const original = { content: [{ type: "text", text: "comments" }] };
-  const wrapped = withCommentSignal("list_comments", async () => original, tracker);
+  const wrapped = withCommentSignal("listComments", async () => original, tracker);
   const result = await wrapped({ pageId: "p1" });
   assert.equal(result, original); // unchanged
   assert.ok(tracker.events.some((e) => e[0] === "advance"));

@@ -17,8 +17,10 @@ import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs
  * This test fails the build if a spec is added to the registry but never wired
  * in-app, if an `inAppKey` is renamed without updating the service, if the
  * description drifts between the registry and the exposed tool, if the
- * snake_case `mcpName` <-> camelCase `inAppKey` convention is broken, or if the
- * exposed tool's input-schema keys diverge from the spec's `buildShape`.
+ * `mcpName === inAppKey` convention is broken (issue #412 unified the external
+ * MCP tool name with the in-app key — both are the same camelCase identifier),
+ * or if the exposed tool's input-schema keys diverge from the spec's
+ * `buildShape`.
  *
  * It does NOT need @docmost/mcp built: the registry is imported from TS source,
  * and the ESM loader is mocked so `forUser()` never dynamically imports the
@@ -74,10 +76,6 @@ describe('SHARED_TOOL_SPECS contract parity', () => {
 
   afterAll(() => jest.restoreAllMocks());
 
-  // camelCase -> snake_case, matching the registry's mcpName convention.
-  const toSnake = (s: string) =>
-    s.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-
   // Type as the (optional-buildShape) SharedToolSpec; the `satisfies` literal
   // above otherwise narrows to a union where some members lack buildShape.
   const specEntries = Object.entries(SHARED_TOOL_SPECS) as unknown as Array<
@@ -96,8 +94,8 @@ describe('SHARED_TOOL_SPECS contract parity', () => {
       expect(spec.inAppKey).toBe(registryKey);
     });
 
-    it('mcpName is the snake_case form of inAppKey', () => {
-      expect(spec.mcpName).toBe(toSnake(spec.inAppKey));
+    it('mcpName equals inAppKey (unified camelCase name, #412)', () => {
+      expect(spec.mcpName).toBe(spec.inAppKey);
     });
 
     it('is exposed in-app under its inAppKey', () => {

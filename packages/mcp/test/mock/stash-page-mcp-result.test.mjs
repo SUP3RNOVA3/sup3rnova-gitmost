@@ -1,4 +1,4 @@
-// Server round-trip test for the stash_page MCP tool result shape. The in-app
+// Server round-trip test for the stashPage MCP tool result shape. The in-app
 // path returns the full documented `{ uri, size, sha256, images }` object, but
 // the MCP transport must deliver the SAME shape: a resource_link (primary
 // payload) PLUS a `structuredContent` mirror carrying sha256 + image counts.
@@ -107,7 +107,7 @@ async function buildBaseURL() {
   });
 }
 
-test("stash_page MCP tool returns a resource_link AND a structuredContent mirror", async () => {
+test("stashPage MCP tool returns a resource_link AND a structuredContent mirror", async () => {
   const baseURL = await buildBaseURL();
   const sandbox = makeSandbox();
   const server = createDocmostMcpServer({
@@ -124,7 +124,7 @@ test("stash_page MCP tool returns a resource_link AND a structuredContent mirror
 
   try {
     const res = await client.callTool({
-      name: "stash_page",
+      name: "stashPage",
       arguments: { pageId: "page-1" },
     });
 

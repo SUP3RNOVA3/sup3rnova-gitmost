@@ -1,4 +1,4 @@
-// Progressive-disclosure authoring reference for the `drawio_guide` tool
+// Progressive-disclosure authoring reference for the `drawioGuide` tool
 // (issue #424, stage 2). The FULL draw.io authoring guide would bloat every
 // context window, so it is split into small sections the model reads on demand:
 //   skeleton | layout | containers | icons-aws | icons-azure
@@ -22,7 +22,7 @@ export const GUIDE_SECTIONS: GuideSection[] = [
   "icons-azure",
 ];
 
-const SKELETON = `# drawio_guide: skeleton
+const SKELETON = `# drawioGuide: skeleton
 
 Canonical mxGraph skeleton. id="0" and id="1" are MANDATORY sentinels; every
 real cell has parent="1" (or a container id). Set adaptiveColors="auto" on the
@@ -50,7 +50,7 @@ model so Docmost's dark theme adapts strokeColor/fillColor/fontColor="default".
 </mxGraphModel>
 \`\`\`
 
-Three accepted inputs to drawio_create/drawio_update: a bare <mxGraphModel>, a
+Three accepted inputs to drawioCreate/drawioUpdate: a bare <mxGraphModel>, a
 full <mxfile> (decoded to its first page), or a raw list of <mxCell> (the server
 wraps it and adds the id=0/id=1 sentinels).
 
@@ -58,12 +58,12 @@ Hard rules: a cell is vertex="1" XOR edge="1" (a container/group is neither);
 every edge has a child <mxGeometry relative="1" as="geometry"/>; ids are unique;
 no XML comments; put html=1 in styles and XML-escape value (& -> &amp;,
 < -> &lt;); a newline in a label is &#xa;, never a literal \\n. Don't guess
-shape=mxgraph.* names — call drawio_shapes first (a wrong name renders empty).`;
+shape=mxgraph.* names — call drawioShapes first (a wrong name renders empty).`;
 
-const LAYOUT = `# drawio_guide: layout
+const LAYOUT = `# drawioGuide: layout
 
 Turn "make it look good" into checkable numbers. Or pass layout:"elk" to
-drawio_create/drawio_update and the server computes coordinates for you (ELK
+drawioCreate/drawioUpdate and the server computes coordinates for you (ELK
 layered layout, honouring nested containers) — you declare structure, it places
 pixels.
 
@@ -96,7 +96,7 @@ The linter returns quality WARNINGS (bbox overlap, edge through a shape,
 edge-on-edge, gap <150px, label wider than its shape, negative/off-page coords).
 They do not block the write — fix them and retry, max 2 iterations.`;
 
-const CONTAINERS = `# drawio_guide: containers
+const CONTAINERS = `# drawioGuide: containers
 
 Groups/zones are TRANSPARENT containers. A coloured group fill is an instant
 "AI-generated" tell — never fill a group.
@@ -133,10 +133,10 @@ Example (transparent zone with two children and an internal edge):
 </mxCell>
 \`\`\``;
 
-const ICONS_AWS = `# drawio_guide: icons-aws
+const ICONS_AWS = `# drawioGuide: icons-aws
 
 Two mutually-exclusive AWS icon patterns — mixing them is the #1 cause of empty
-boxes. Always call drawio_shapes for the exact resIcon name; do not guess.
+boxes. Always call drawioShapes for the exact resIcon name; do not guess.
 
 | Level | style | strokeColor |
 |---|---|---|
@@ -168,7 +168,7 @@ Group stencils (transparent containers): AWS Cloud group_aws_cloud_alt, VPC
 group_vpc2, Subnet group_security_group, Account group_account; subnets use
 shape=mxgraph.aws4.group;grIcon=mxgraph.aws4.group_public_subnet;.`;
 
-const ICONS_AZURE = `# drawio_guide: icons-azure
+const ICONS_AZURE = `# drawioGuide: icons-azure
 
 shape=mxgraph.azure2.* does NOT render in every host. Use the portable
 image-style instead:
@@ -190,7 +190,7 @@ an absolute URL fallback for the image:
 https://raw.githubusercontent.com/jgraph/drawio/dev/src/main/webapp/img/lib/azure2/<category>/<Icon>.svg
 \`\`\`
 
-Call drawio_shapes with the service name (e.g. "cosmos", "api management",
+Call drawioShapes with the service name (e.g. "cosmos", "api management",
 "front door") to get the exact image-style string and default 68x68 size.`;
 
 const CONTENT: Record<GuideSection, string> = {
@@ -216,13 +216,13 @@ export function getGuideSection(section?: string): {
     return { section: key, content: CONTENT[key], sections: GUIDE_SECTIONS };
   }
   const index =
-    "# drawio_guide\n\nProgressive-disclosure draw.io authoring reference. " +
-    "Call drawio_guide(section) with one of:\n" +
+    "# drawioGuide\n\nProgressive-disclosure draw.io authoring reference. " +
+    "Call drawioGuide(section) with one of:\n" +
     "- skeleton — canonical mxGraph XML, sentinels, the three accepted inputs, hard rules\n" +
     "- layout — spacing heuristics, edge routing, the layout:\"elk\" option, quality warnings\n" +
     "- containers — transparent groups, relative child coords, cross-container edges, swimlanes\n" +
     "- icons-aws — the service/resource icon patterns, category colors, rebrandings, blocklist\n" +
     "- icons-azure — the portable image-style paths\n\n" +
-    "Also call drawio_shapes(query) for verified stencil style-strings.";
+    "Also call drawioShapes(query) for verified stencil style-strings.";
   return { section: "index", content: index, sections: GUIDE_SECTIONS };
 }
