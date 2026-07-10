@@ -86,4 +86,14 @@ VOLUME ["/app/data/storage"]
 
 EXPOSE 3000
 
+# DEPLOY REQUIREMENT — SINGLE INSTANCE or STICKY SESSIONS (#449).
+# MCP content writes are serialized per page by an IN-PROCESS mutex, and the
+# stash_page blob store + cached collab sessions are RAM-only and process-local.
+# Running MULTIPLE replicas of this image behind a load balancer WITHOUT sticky
+# sessions silently breaks per-page write serialization (two replicas can lock
+# the same page at once) and makes stash_page blobs unreachable across replicas.
+# Run a SINGLE instance, or pin each page's traffic to one replica (sticky
+# sessions / consistent hashing on page id). There is deliberately no
+# cross-process lock yet — a conscious constraint. See .env.example (the "MCP
+# collaboration write path" block) and packages/mcp/README.md for details.
 CMD ["pnpm", "start"]

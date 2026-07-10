@@ -372,7 +372,11 @@ test("replaceImage opens by the resolved UUID AND keys its page lock by that UUI
   // single flush. This proves the flush actually executes queued callbacks, so
   // probeRan === false above means "blocked", not "the flush never ran anyone".
   let freeRan = false;
-  const freeDone = withPageLock(`page.free-${UUID}`, async () => {
+  // A DIFFERENT canonical UUID (unrelated to the page under test). withPageLock
+  // now asserts its key is a canonical UUID (#449), so the "free" probe key must
+  // also be a valid — but distinct — UUID, not a synthetic label.
+  const FREE_UUID = "99999999-9999-4999-8999-999999999999";
+  const freeDone = withPageLock(FREE_UUID, async () => {
     freeRan = true;
   });
   await new Promise((r) => setImmediate(r));
