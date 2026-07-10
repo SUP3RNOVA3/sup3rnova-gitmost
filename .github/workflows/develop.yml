@@ -157,6 +157,12 @@ jobs:
       - name: Build prosemirror-markdown
         run: pnpm --filter @docmost/prosemirror-markdown build
 
+      # docmost-client.loader.ts type-imports from @docmost/mcp (issue #446); its
+      # build/ is gitignored and `test:e2e` type-checks, so build it here or tsc
+      # fails with TS2307 (mirrors the e2e-mcp / mcp-server-parity jobs).
+      - name: Build mcp
+        run: pnpm --filter @docmost/mcp build
+
       - name: Run migrations
         run: pnpm --filter ./apps/server migration:latest
 

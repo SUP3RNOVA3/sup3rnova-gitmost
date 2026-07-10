@@ -150,7 +150,7 @@ describe('AiChatService.stream [integration]', () => {
       {} as any, // pageAccess (idem)
       // environment (#332): keep deferred tool loading OFF for this lifecycle
       // harness so the toolset/behavior is exactly as before.
-      { isAiChatDeferredToolsEnabled: () => false } as any,
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as any,
     );
   }
 
@@ -378,7 +378,7 @@ describe('AiChatService.stream [integration]', () => {
         {} as any,
         {} as any,
         // #332: deferred tool loading ON — the property under test.
-        { isAiChatDeferredToolsEnabled: () => true } as any,
+        { isAiChatDeferredToolsEnabled: () => true, isAiChatFinalStepLockdownEnabled: () => false } as any,
       );
     }
 
