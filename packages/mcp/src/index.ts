@@ -55,6 +55,13 @@ export type {
   CommentSignalProbeResult,
   CommentSignalTrackerOptions,
 } from "./comment-signal.js";
+// Re-export the pure, no-network draw.io helpers (#424) so the in-app AI-SDK
+// service can wire drawio_shapes / drawio_guide off the loaded module. These are
+// NOT client methods (no page/backend hit) — the in-app handler calls them
+// directly, mirroring how the standalone MCP server wires them here.
+export { searchShapes } from "./lib/drawio-shapes.js";
+export type { SearchShapesOptions } from "./lib/drawio-shapes.js";
+export { getGuideSection } from "./lib/drawio-guide.js";
 
 // Read version from package.json
 const __filename = fileURLToPath(import.meta.url);

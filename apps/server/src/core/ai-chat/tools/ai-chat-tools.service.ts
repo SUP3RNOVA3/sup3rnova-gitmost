@@ -111,10 +111,12 @@ function __assertClientCallContract(client: DocmostClientLike): void {
     afterText: s,
   });
   void client.replaceImage(s, s, s, { align, alt: s });
-  // --- draw.io diagrams (#423) ---
+  // --- draw.io diagrams (#423 stage 1, #424 stage 2) ---
+  // The 5th `layout` arg (#424) is exercised so this parity assertion fails if the
+  // client signature drops it — it must reach the client from the shared execute.
   void client.drawioGet(s, s, 'xml');
-  void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s);
-  void client.drawioUpdate(s, s, s, s);
+  void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s, 'elk');
+  void client.drawioUpdate(s, s, s, s, 'elk');
   // --- write (comment) ---
   void client.createComment(s, s, 'inline', s, s, s);
   void client.resolveComment(s, true);
@@ -263,6 +265,11 @@ export class AiChatToolsService {
     // provenance tokens) and load the shared tool-spec registry. Client
     // construction is shared with the page-change detection path (#274) via
     // buildDocmostClient so both go over the exact same authenticated route.
+    // drawio_shapes / drawio_guide (#424) are NOT destructured here anymore: they
+    // are ordinary SHARED_TOOL_SPECS entries whose canonical execute (in the mcp
+    // package) calls the pure searchShapes / getGuideSection helpers directly, so
+    // the registry loop below wires them for the in-app host too — no hand-mirrored
+    // handler and no direct helper import in this service.
     const { sharedToolSpecs, createCommentSignalTracker } =
       await loadDocmostMcp();
     const client = await this.buildDocmostClient(

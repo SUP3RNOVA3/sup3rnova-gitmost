@@ -24,6 +24,14 @@ import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs
 const mockLoaded = (DocmostClient: loader.DocmostClientCtor) => ({
   DocmostClient,
   sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+  // Pure no-network draw.io helpers (#424). Type-correct stubs: these tests
+  // never execute the drawio_shapes / drawio_guide tool bodies.
+  searchShapes: (() => []) as unknown as loader.SearchShapesFn,
+  getGuideSection: (() => ({
+    section: 'index',
+    content: '',
+    sections: [],
+  })) as unknown as loader.GetGuideSectionFn,
 });
 
 /**
