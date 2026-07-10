@@ -1,5 +1,13 @@
 name: Test
 
+# NO `paths:` filter on purpose (issue #447). The tool-spec REGISTRY is split
+# across two packages that MUST stay in sync: the specs live in `packages/mcp`
+# but the parity/tier guard tests that read them live in the `apps/server` jest
+# suite. A PR touching only `packages/mcp/**` must therefore still run the SERVER
+# suite (and vice-versa), or an in-app wiring break slips through green and only
+# surfaces on develop after merge. The `test` job below runs BOTH suites via
+# `pnpm -r test` on every PR; the dedicated `mcp-server-parity` job makes that
+# cross-package gate explicit and fast. Do not add a `paths:` filter here.
 on:
   pull_request:
   workflow_call:
@@ -132,3 +140,53 @@ jobs:
       # isolated `docmost_test` DB and migrates it to latest.
       - name: Run server integration tests
         run: pnpm --filter server test:int
+
+  # Cross-package tool-spec parity gate (issue #447). The tool-spec registry lives
+  # in `packages/mcp` but its parity/tier guard tests live in the `apps/server`
+  # jest suite, so a PR touching ONLY one of the two packages must still run BOTH
+  # sides — otherwise an in-app wiring break (e.g. PR #434 drawio) passes the mcp
+  # suite green and only surfaces on develop after merge. The `test` job already
+  # runs everything via `pnpm -r test`; this job is a fast, explicitly-named guard
+  # that runs the mcp `node --test` suite AND the server tool-guard jest specs
+  # together, so the coupling is visible and can never be accidentally split by a
+  # path filter. No Postgres/Redis needed: these specs mock the DB/loader.
+  mcp-server-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Shared deps first (build/ dirs are gitignored; see test.yml build order).
+      - name: Build editor-ext
+        run: pnpm --filter @docmost/editor-ext build
+
+      - name: Build prosemirror-markdown
+        run: pnpm --filter @docmost/prosemirror-markdown build
+
+      # Build the mcp package so build/ carries a FRESH REGISTRY_STAMP (#447): the
+      # build runs gen-registry-stamp.mjs before tsc, so a build/ vs src/ skew
+      # cannot slip into the tests that exercise the loader's stale-check.
+      - name: Build mcp (regenerates REGISTRY_STAMP)
+        run: pnpm --filter @docmost/mcp build
+
+      # mcp side: the standalone MCP server's own tool-spec / instructions guards.
+      - name: Run mcp tool-spec suite
+        run: pnpm --filter @docmost/mcp test
+
+      # server side: the parity + tier guards that read packages/mcp/src/tool-specs
+      # and assert the in-app AI-chat wiring matches it.
+      - name: Run server tool-spec guard specs
+        run: pnpm --filter server exec jest shared-tool-specs.contract tool-tiers ai-chat-tools.service --runInBand

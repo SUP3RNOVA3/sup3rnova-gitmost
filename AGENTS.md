@@ -248,6 +248,22 @@ pnpm collab:dev              # run the collaboration server process standalone (
 > that order). Reach for it whenever you run a consumer package's checks on their
 > own rather than through the full `pnpm build`.
 
+> **Editing an MCP tool spec requires a rebuild (issue #447).** The running
+> server loads the **compiled** `packages/mcp/build/` of `@docmost/mcp` (via the
+> runtime loader in `apps/server/src/core/ai-chat/tools/docmost-client.loader.ts`),
+> but the parity/tier guard tests read `packages/mcp/src/tool-specs.ts`. So if you
+> edit `tool-specs.ts` (any tool name, description, tier, catalog line, or input
+> schema) **without rebuilding**, `build/` and `src/` silently diverge — the tests
+> stay green while the server serves the OLD tools. To close that gap, the build
+> emits a `REGISTRY_STAMP` (a deterministic hash of the tool-specs content, via
+> `scripts/gen-registry-stamp.mjs` before `tsc`); on dev/test startup the loader
+> recomputes it from `src/` and **refuses to start with a "@docmost/mcp build is
+> stale …" error** on a mismatch (a pure no-op in prod, where only `build/` ships).
+> After editing tool specs, rebuild:
+> ```bash
+> pnpm --filter @docmost/mcp build     # or: pnpm --filter @docmost/mcp watch
+> ```
+
 **Lint** (per package — there is no root lint script):
 ```bash
 pnpm --filter server lint    # eslint --fix on server .ts
