@@ -1115,4 +1115,112 @@ export const SHARED_TOOL_SPECS = {
       alt: z.string().optional(),
     }),
   },
+
+  // --- draw.io diagrams (issue #423, stage 1) ---
+
+  drawioGet: {
+    mcpName: 'drawio_get',
+    inAppKey: 'drawioGet',
+    description:
+      'Read a draw.io diagram on a page as mxGraph XML (default) or as its raw ' +
+      '`.drawio.svg`. `node` is the drawio node\'s attrs.id (from get_outline / ' +
+      'get_page_json) or "#<index>" for a top-level block. Returns the decoded ' +
+      'mxGraphModel XML plus meta { attachmentId, title, width, height, ' +
+      'cellCount, hash }. `hash` is the optimistic-lock key you MUST pass back ' +
+      'as baseHash to drawio_update. Diagrams a human saved from the editor ' +
+      '(including draw.io\'s compressed format) decode losslessly.',
+    tier: 'deferred',
+    catalogLine:
+      'drawioGet — read a draw.io diagram as mxGraph XML (+ hash for updates).',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      node: z
+        .string()
+        .min(1)
+        .describe('The drawio node attrs.id, or "#<index>" for a top-level block.'),
+      format: z
+        .enum(['xml', 'svg'])
+        .optional()
+        .describe('"xml" (default) for mxGraph XML, or "svg" for the raw .drawio.svg.'),
+    }),
+  },
+
+  drawioCreate: {
+    mcpName: 'drawio_create',
+    inAppKey: 'drawioCreate',
+    description:
+      'Create a draw.io diagram from mxGraph XML and insert it as a diagram ' +
+      'block. `xml` is a bare `<mxGraphModel>` OR a list of `<mxCell>` elements ' +
+      '(the server wraps it and adds the id=0 / id=1 sentinel cells). The XML is ' +
+      'LINTED first (well-formedness, sentinel cells, unique ids, vertex XOR ' +
+      'edge, every edge has a child <mxGeometry as="geometry"/>, edge ' +
+      'source/target and every parent resolve, style parses, no XML comments, ' +
+      'value escaping) — a violation returns a structured error naming the rule ' +
+      'and cellId so you can fix and retry. `where` positions the block like ' +
+      'insert_node: position before/after (with exactly one of anchorNodeId or ' +
+      'anchorText) or append. Returns { nodeId, attachmentId, warnings }. The ' +
+      'returned `nodeId` is an index-based "#<index>" handle (drawio nodes carry ' +
+      'no attrs.id): it addresses the new top-level block and can be fed straight ' +
+      'back into drawio_get / drawio_update for THIS document. It is positional, ' +
+      'so if you add or remove blocks before it, re-resolve via get_outline. The ' +
+      'diagram is editable in the draw.io editor and can be re-read with ' +
+      'drawio_get.',
+    tier: 'deferred',
+    catalogLine:
+      'drawioCreate — create a draw.io diagram from mxGraph XML and insert it.',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      xml: z
+        .string()
+        .min(1)
+        .describe(
+          'mxGraph XML: a bare <mxGraphModel> or a list of <mxCell> elements.',
+        ),
+      position: z
+        .enum(['before', 'after', 'append'])
+        .describe('Where to insert relative to the anchor.'),
+      anchorNodeId: z
+        .string()
+        .optional()
+        .describe('Anchor block id (for before/after).'),
+      anchorText: z
+        .string()
+        .optional()
+        .describe('Anchor text fragment (for before/after).'),
+      title: z.string().optional().describe('Optional diagram title.'),
+    }),
+  },
+
+  drawioUpdate: {
+    mcpName: 'drawio_update',
+    inAppKey: 'drawioUpdate',
+    description:
+      'Replace a draw.io diagram\'s content with new mxGraph XML (same lint ' +
+      'pipeline as drawio_create). `baseHash` is MANDATORY: pass the hash from ' +
+      'the drawio_get you based the edit on. If the diagram changed since ' +
+      '(a human or another agent edited it) the hash mismatches and the update ' +
+      'is refused with a conflict error — re-read with drawio_get and retry. On ' +
+      'success it overwrites the diagram attachment and updates the node ' +
+      'width/height. `node` is the drawio node attrs.id or "#<index>".',
+    tier: 'deferred',
+    catalogLine:
+      'drawioUpdate — replace a draw.io diagram (optimistic-locked by baseHash).',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+      node: z
+        .string()
+        .min(1)
+        .describe('The drawio node attrs.id, or "#<index>" for a top-level block.'),
+      xml: z
+        .string()
+        .min(1)
+        .describe(
+          'New mxGraph XML: a bare <mxGraphModel> or a list of <mxCell> elements.',
+        ),
+      baseHash: z
+        .string()
+        .min(1)
+        .describe('The meta.hash from the drawio_get this edit is based on.'),
+    }),
+  },
 } satisfies Record<string, SharedToolSpec>;

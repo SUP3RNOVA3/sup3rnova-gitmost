@@ -50,6 +50,15 @@ import {
 import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
 import {
+  prepareModel,
+  decodeDrawioSvg,
+  buildDrawioSvg,
+  mxHash,
+  normalizeXml,
+  countUserCells,
+} from "./lib/drawio-xml.js";
+import { renderDiagramShapes } from "./lib/drawio-preview.js";
+import {
   applyTextEdits,
   TextEdit,
   TextEditResult,
@@ -3430,6 +3439,461 @@ export class DocmostClient {
         verify: mutation.verify,
       };
     });
+  }
+
+  // --- draw.io diagrams (issue #423) ---
+
+  /**
+   * Upload a ready-made byte buffer as a page attachment via the same
+   * multipart /files/upload endpoint uploadImage uses. Split out as its own
+   * (overridable) seam so drawio_create/update can upload the generated
+   * `.drawio.svg` without going through the URL-fetch path, and so tests can
+   * stub the network. Mirrors uploadImage's fresh-FormData + one-shot 401/403
+   * re-auth handling (a FormData body is single-use, so it must be rebuilt per
+   * attempt).
+   */
+  protected async uploadAttachmentBuffer(
+    pageId: string,
+    buffer: Buffer,
+    fileName: string,
+    mime: string,
+  ): Promise<{ id: string; fileName: string; fileSize: number }> {
+    await this.ensureAuthenticated();
+    const buildForm = () => {
+      const form = new FormData();
+      form.append("pageId", pageId);
+      form.append("file", buffer, { filename: fileName, contentType: mime });
+      return form;
+    };
+    const uploadUrl = `${this.apiUrl}/files/upload`;
+    let response;
+    try {
+      const form = buildForm();
+      response = await axios.post(uploadUrl, form, {
+        headers: {
+          ...form.getHeaders(),
+          Authorization: this.client.defaults.headers.common["Authorization"],
+        },
+        timeout: 60000,
+      });
+    } catch (error) {
+      if (
+        axios.isAxiosError(error) &&
+        (error.response?.status === 401 || error.response?.status === 403)
+      ) {
+        await this.login();
+        const form2 = buildForm();
+        response = await axios.post(uploadUrl, form2, {
+          headers: {
+            ...form2.getHeaders(),
+            Authorization: this.client.defaults.headers.common["Authorization"],
+          },
+          timeout: 60000,
+        });
+      } else if (axios.isAxiosError(error)) {
+        if (process.env.DEBUG) {
+          console.error(
+            "Attachment upload failed; response body:",
+            JSON.stringify(error.response?.data),
+          );
+        }
+        throw new Error(
+          `Attachment upload failed: ${error.response?.status} ${error.response?.statusText}`,
+        );
+      } else {
+        throw error;
+      }
+    }
+    const att = response.data?.data ?? response.data;
+    if (!att?.id || !att?.fileName) {
+      throw new Error(
+        "Unexpected /files/upload response: " + JSON.stringify(response.data),
+      );
+    }
+    return {
+      id: att.id,
+      fileName: att.fileName,
+      fileSize: att.fileSize ?? buffer.length,
+    };
+  }
+
+  /**
+   * Fetch a stored `.drawio.svg` attachment as text. Overridable seam over
+   * fetchInternalFile (the authed loopback fetch, which also rejects any
+   * traversal/SSRF src) so drawio_get/update can read the current diagram and
+   * tests can stub the bytes.
+   */
+  protected async fetchAttachmentText(src: string): Promise<string> {
+    const { buffer } = await this.fetchInternalFile(src);
+    return buffer.toString("utf-8");
+  }
+
+  /** Short random block id for a freshly inserted drawio node (nanoid-ish). */
+  private freshBlockId(): string {
+    return (
+      Math.random().toString(36).slice(2, 12) +
+      Math.random().toString(36).slice(2, 6)
+    );
+  }
+
+  /**
+   * Resolve a drawio node on a page by `attrs.id` or `#<index>` and return the
+   * node plus its ref. Throws a clear error if the ref does not resolve to a
+   * drawio node.
+   */
+  private async resolveDrawioNode(
+    pageId: string,
+    node: string,
+  ): Promise<{ node: any; ref: string }> {
+    const data = await this.getPageRaw(pageId);
+    const hit = getNodeByRef(
+      data.content ?? { type: "doc", content: [] },
+      node,
+    );
+    if (!hit) {
+      throw new Error(
+        `drawio: no node found for "${node}" on page ${pageId} (use the drawio node's attrs.id or "#<index>" from get_outline)`,
+      );
+    }
+    if (hit.type !== "drawio") {
+      throw new Error(
+        `drawio: node "${node}" on page ${pageId} is a ${hit.type}, not a drawio diagram`,
+      );
+    }
+    return { node: hit.node, ref: node };
+  }
+
+  /**
+   * Read a drawio diagram as mxGraph XML (default) or as the raw `.drawio.svg`.
+   * Runs the decode chain (base64/entity content= → drawio file → nested XML or
+   * pako-inflated compressed <diagram>). The returned `hash` is the
+   * optimistic-lock key for drawio_update.
+   */
+  async drawioGet(
+    pageId: string,
+    node: string,
+    format: "xml" | "svg" = "xml",
+  ): Promise<{
+    pageId: string;
+    nodeId: string;
+    format: "xml" | "svg";
+    content: string;
+    meta: {
+      attachmentId: string | null;
+      title: string | null;
+      width: number | null;
+      height: number | null;
+      cellCount: number;
+      hash: string;
+    };
+  }> {
+    await this.ensureAuthenticated();
+    const { node: drawio } = await this.resolveDrawioNode(pageId, node);
+    const attrs = drawio.attrs || {};
+    const src = attrs.src;
+    if (!src) {
+      throw new Error(
+        `drawio: node "${node}" on page ${pageId} has no src to read`,
+      );
+    }
+    const svg = await this.fetchAttachmentText(src);
+    const modelXml = decodeDrawioSvg(svg);
+    const meta = {
+      attachmentId: attrs.attachmentId ?? null,
+      title: attrs.title ?? null,
+      width: attrs.width != null ? Number(attrs.width) : null,
+      height: attrs.height != null ? Number(attrs.height) : null,
+      cellCount: countUserCells(modelXml),
+      hash: mxHash(modelXml),
+    };
+    return {
+      pageId,
+      nodeId: attrs.id ?? node,
+      format,
+      content: format === "svg" ? svg : normalizeXml(modelXml),
+      meta,
+    };
+  }
+
+  /**
+   * Create a drawio diagram from mxGraph XML: lint → schematic SVG preview
+   * (pure TS) → build the `.drawio.svg` (createDrawioSvg contract) → create the
+   * attachment → insert a `drawio` node before/after an anchor or appended.
+   * `xml` is a bare `<mxGraphModel>` or a list of `<mxCell>` (the server wraps
+   * it and adds the id=0/id=1 sentinels).
+   */
+  async drawioCreate(
+    pageId: string,
+    where: {
+      position: "before" | "after" | "append";
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+    xml: string,
+    title?: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    if (
+      !where ||
+      (where.position !== "before" &&
+        where.position !== "after" &&
+        where.position !== "append")
+    ) {
+      throw new Error(
+        'drawio_create: `where.position` must be one of "before", "after", "append"',
+      );
+    }
+    if (where.position === "before" || where.position === "after") {
+      const hasId =
+        typeof where.anchorNodeId === "string" && where.anchorNodeId.length > 0;
+      const hasText =
+        typeof where.anchorText === "string" && where.anchorText.length > 0;
+      if (hasId === hasText) {
+        throw new Error(
+          `drawio_create: position "${where.position}" requires exactly one of anchorNodeId or anchorText`,
+        );
+      }
+    }
+
+    // Pre-write pipeline (throws a structured DrawioLintError on any violation).
+    const prepared = prepareModel(xml);
+    const inner = renderDiagramShapes(prepared.cells, prepared.bbox);
+    const diagramTitle = title || "Page-1";
+    const svg = buildDrawioSvg(prepared.modelXml, inner, prepared.bbox, diagramTitle);
+
+    const att = await this.uploadAttachmentBuffer(
+      pageId,
+      Buffer.from(svg, "utf-8"),
+      "diagram.drawio.svg",
+      "image/svg+xml",
+    );
+
+    // NOTE: no `id` attribute is set here. The vendored `drawio` node schema
+    // (diagramAttributes) declares no `id`, so any block id would be silently
+    // dropped by PMNode.fromJSON on save and the returned handle would fail to
+    // resolve. The addressable handle is the node's "#<index>" (like image/table
+    // nodes), computed after the insert below.
+    const drawioNode: any = {
+      type: "drawio",
+      attrs: {
+        src: `/api/files/${att.id}/${att.fileName}`,
+        attachmentId: att.id,
+        width: prepared.bbox.width,
+        height: prepared.bbox.height,
+        align: "center",
+      },
+    };
+    if (title) drawioNode.attrs.title = title;
+    // Reuse the existing URL trust boundary (rejects unsafe src schemes).
+    this.validateDocUrls(drawioNode);
+
+    const collabToken = await this.getCollabTokenWithReauth();
+    const pageUuid = await this.resolvePageId(pageId);
+
+    let inserted = false;
+    let insertedIndex = -1;
+    const mutation = await this.mutatePage(
+      pageUuid,
+      collabToken,
+      this.apiUrl,
+      (liveDoc) => {
+        inserted = false;
+        insertedIndex = -1;
+        const { doc: nd, inserted: ins } = insertNodeRelative(
+          liveDoc,
+          drawioNode,
+          where,
+        );
+        inserted = ins;
+        if (!inserted) return null; // anchor not found -> skip the write
+        // Locate the freshly-inserted node to derive its "#<index>" handle. The
+        // just-uploaded attachmentId is unique, so it identifies our node.
+        if (Array.isArray(nd.content)) {
+          insertedIndex = nd.content.findIndex(
+            (b: any) =>
+              b &&
+              b.type === "drawio" &&
+              b.attrs &&
+              b.attrs.attachmentId === att.id,
+          );
+        }
+        return nd;
+      },
+    );
+
+    if (!inserted) {
+      const anchorDesc = where.anchorNodeId
+        ? `anchorNodeId "${where.anchorNodeId}"`
+        : `anchorText "${where.anchorText}"`;
+      throw new Error(
+        `drawio_create: anchor not found (${anchorDesc}) on page ${pageId}. The diagram attachment ${att.id} is now an unreferenced orphan.`,
+      );
+    }
+
+    if (insertedIndex < 0) {
+      // The node was inserted nested (e.g. inside a callout/table cell via an
+      // anchor), where "#<index>" — which addresses only top-level blocks —
+      // cannot reference it. drawio nodes carry no persisted id, so there is no
+      // stable handle for a nested diagram.
+      throw new Error(
+        `drawio_create: the diagram was inserted on page ${pageId} but not as a ` +
+          `top-level block, so it has no addressable "#<index>" handle. Anchor ` +
+          `on a top-level block (or append) so the diagram can be re-read.`,
+      );
+    }
+
+    // The returned handle is POSITIONAL ("#<index>"): valid for the immediate
+    // create -> get/update flow, but re-resolve via get_outline if the document
+    // structure changes (blocks added/removed before it shift the index).
+    const nodeId = `#${insertedIndex}`;
+
+    return {
+      success: true,
+      nodeId,
+      attachmentId: att.id,
+      warnings: prepared.warnings,
+      verify: mutation.verify,
+    };
+  }
+
+  /**
+   * Full-replacement update of a drawio diagram. `baseHash` is MANDATORY: it is
+   * compared against the hash of the diagram's CURRENT XML (from drawio_get);
+   * any mismatch means a human or another agent edited the diagram after the
+   * read, so the write is refused with a conflict error. On success the new
+   * `.drawio.svg` is uploaded as a FRESH attachment (in-place byte overwrite is
+   * avoided — some Docmost versions corrupt an attachment on overwrite, exactly
+   * as replaceImage documents) and the node is repointed with new dimensions.
+   */
+  async drawioUpdate(
+    pageId: string,
+    node: string,
+    xml: string,
+    baseHash: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    if (typeof baseHash !== "string" || baseHash.length === 0) {
+      throw new Error(
+        "drawio_update: baseHash is mandatory — read the diagram with drawio_get first and pass back its meta.hash",
+      );
+    }
+
+    // Resolve the node and read the CURRENT diagram to enforce the optimistic
+    // lock before doing any write or upload.
+    const { node: drawio, ref } = await this.resolveDrawioNode(pageId, node);
+    const oldAttrs = drawio.attrs || {};
+    const oldSrc = oldAttrs.src;
+    // The returned handle is the caller-supplied reference. drawio nodes carry
+    // no persisted id, so `ref` (an "#<index>" or a rare legacy attrs.id) is the
+    // honest identifier to hand back.
+    const nodeId = oldAttrs.id ?? ref;
+    if (!oldSrc) {
+      throw new Error(
+        `drawio_update: node "${node}" on page ${pageId} has no src to compare against`,
+      );
+    }
+    const currentSvg = await this.fetchAttachmentText(oldSrc);
+    const currentHash = mxHash(decodeDrawioSvg(currentSvg));
+    if (currentHash !== baseHash) {
+      throw new Error(
+        `drawio_update: conflict — the diagram changed since it was read ` +
+          `(baseHash ${baseHash} != current ${currentHash}). Re-read it with drawio_get and retry.`,
+      );
+    }
+
+    // Pipeline for the new content (throws a structured DrawioLintError).
+    const prepared = prepareModel(xml);
+    const inner = renderDiagramShapes(prepared.cells, prepared.bbox);
+    const diagramTitle = oldAttrs.title || "Page-1";
+    const svg = buildDrawioSvg(prepared.modelXml, inner, prepared.bbox, diagramTitle);
+
+    const att = await this.uploadAttachmentBuffer(
+      pageId,
+      Buffer.from(svg, "utf-8"),
+      "diagram.drawio.svg",
+      "image/svg+xml",
+    );
+    const newSrc = `/api/files/${att.id}/${att.fileName}`;
+
+    const collabToken = await this.getCollabTokenWithReauth();
+    const pageUuid = await this.resolvePageId(pageId);
+
+    let repointed = 0;
+    const repoint = (n: any) => {
+      n.attrs = {
+        ...n.attrs,
+        src: newSrc,
+        attachmentId: att.id,
+        width: prepared.bbox.width,
+        height: prepared.bbox.height,
+      };
+      repointed++;
+    };
+
+    const mutation = await this.mutatePage(
+      pageUuid,
+      collabToken,
+      this.apiUrl,
+      (liveDoc) => {
+        repointed = 0;
+        const doc =
+          liveDoc && liveDoc.type === "doc"
+            ? liveDoc
+            : { type: "doc", content: [] };
+        if (!Array.isArray(doc.content)) doc.content = [];
+        // Repoint ONLY the resolved node — never every node that happens to
+        // share this attachmentId (a copied diagram is two nodes with one
+        // attachmentId; keying on it would clobber both). Re-resolve the same
+        // handle against the live doc and walk to its exact position.
+        const hit = getNodeByRef(doc, ref);
+        if (!hit || hit.type !== "drawio") return null; // vanished/changed -> skip
+        let target: any = doc;
+        for (const idx of hit.path) {
+          if (!target || !Array.isArray(target.content)) {
+            target = null;
+            break;
+          }
+          target = target.content[idx];
+        }
+        if (!target || target.type !== "drawio") return null;
+        repoint(target);
+        if (repointed === 0) return null; // node vanished concurrently -> skip
+        return doc;
+      },
+    );
+
+    if (repointed === 0) {
+      return {
+        success: true,
+        nodeId,
+        attachmentId: att.id,
+        warnings: [
+          ...prepared.warnings,
+          "target drawio node was removed concurrently; uploaded attachment is unreferenced",
+        ],
+        verify: mutation.verify,
+      };
+    }
+
+    return {
+      success: true,
+      nodeId,
+      attachmentId: att.id,
+      warnings: prepared.warnings,
+      verify: mutation.verify,
+    };
   }
 
   // --- Page history / diff / transform ---
