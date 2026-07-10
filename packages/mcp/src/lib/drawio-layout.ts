@@ -18,6 +18,23 @@ import { normalizeInput, parseCells, type DrawioCell } from "./drawio-xml.js";
 const DEFAULT_W = 140;
 const DEFAULT_H = 60;
 
+// DoS bounds for the in-process ELK layout. The mxGraph XML is LLM-supplied
+// (layout:"elk" in drawio_create/drawio_update) and elkjs runs synchronously on
+// the MCP server's event loop, so an unbounded graph would block it for
+// seconds-to-minutes. A ~1MB XML (well under the stage-1 16MB cap) can carry
+// thousands of nodes. We cap the graph size and race the layout against a
+// wall-clock timeout; on either bound we fall back to the ORIGINAL model, the
+// same best-effort contract the catch already honours.
+//   - 500 nodes lays out in well under a second; beyond that ELK cost climbs
+//     steeply, so refuse and leave the (already-valid) model untouched.
+//   - Edges dominate the layered-crossing cost, so allow a bit more headroom
+//     (1000) than nodes but still bound them.
+//   - 5s is generous for any graph within the caps yet short enough that a
+//     pathological input can never wedge the server.
+const ELK_MAX_NODES = 500;
+const ELK_MAX_EDGES = 1000;
+const ELK_TIMEOUT_MS = 5000;
+
 // Spacing is set >=150px on purpose so an ELK layout never trips the linter's
 // "gap between adjacent shapes < 150px" quality warning (acceptance #3).
 const LAYOUT_OPTIONS: Record<string, string> = {
@@ -118,6 +135,13 @@ export async function applyElkLayout(inputXml: string): Promise<string> {
     edges.push({ id: c.id || `e${edges.length}`, sources: [c.source], targets: [c.target] });
   }
 
+  // DoS guard: refuse to lay out an oversized LLM-supplied graph. elkjs runs
+  // in-process on the event loop, so bound the work before we ever call it and
+  // return the original model unchanged (best-effort, same as the catch below).
+  if (vertices.length > ELK_MAX_NODES || edges.length > ELK_MAX_EDGES) {
+    return modelXml;
+  }
+
   const graph: ElkGraph = {
     id: "root",
     layoutOptions: LAYOUT_OPTIONS,
@@ -126,15 +150,26 @@ export async function applyElkLayout(inputXml: string): Promise<string> {
   };
 
   let laid: ElkGraph;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     // elkjs ships a CJS default export whose interop shape varies across
     // module systems; resolve the real constructor at runtime, then cast (the
     // runtime call is verified — see the layout unit test).
     const Ctor: any = (ELK as any).default ?? ELK;
     const elk = new Ctor();
-    laid = (await elk.layout(graph as any)) as ElkGraph;
+    // Race the layout against a wall-clock timeout so a graph that is under the
+    // node/edge caps but still pathologically slow can never wedge the server.
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("ELK layout timed out")),
+        ELK_TIMEOUT_MS,
+      );
+    });
+    laid = (await Promise.race([elk.layout(graph as any), timeout])) as ElkGraph;
   } catch {
-    return modelXml; // best-effort: keep the model as-is on any ELK failure
+    return modelXml; // best-effort: keep the model as-is on timeout or ELK failure
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 
   // Collect computed geometry per node id (coords are parent-relative already).

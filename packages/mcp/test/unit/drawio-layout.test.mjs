@@ -78,6 +78,29 @@ test("edges and cell count are preserved by layout", async () => {
   assert.equal(cells.filter((c) => c.vertex).length, 4);
 });
 
+test("DoS guard: a graph over the node cap is returned unchanged, quickly", async () => {
+  // 600 vertices > ELK_MAX_NODES (500): the layout must be SKIPPED and the
+  // input returned verbatim, without ever handing the graph to elkjs. This
+  // exercises the cap path that bounds the in-process, event-loop-blocking
+  // layout on LLM-supplied XML.
+  const model = stackedGraph(600, []);
+  const t0 = Date.now();
+  const laid = await applyElkLayout(model);
+  const dt = Date.now() - t0;
+  // normalizeInput may reserialize, but geometry must be untouched: every
+  // vertex is still stacked at (10,10), i.e. no ELK coordinates were applied.
+  const cells = parseCells(laid);
+  const verts = cells.filter((c) => c.vertex);
+  assert.equal(verts.length, 600, "all vertices survived");
+  for (const v of verts) {
+    assert.equal(v.geometry.x, 10, "x untouched -> layout was skipped");
+    assert.equal(v.geometry.y, 10, "y untouched -> layout was skipped");
+  }
+  // Returning the input without an ELK pass is essentially instant; assert it
+  // did not hang. Generous bound to stay non-flaky on a loaded CI box.
+  assert.ok(dt < 2000, `cap path should be fast, took ${dt}ms`);
+});
+
 test("layout is best-effort: an empty/degenerate model is returned intact", async () => {
   const model =
     '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>';
