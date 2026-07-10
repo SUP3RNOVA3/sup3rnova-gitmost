@@ -202,10 +202,10 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
     { instructions: SERVER_INSTRUCTIONS },
   );
 
-  // Single choke point for MCP tool timing. Both `registerShared` (below) and
-  // the inline `server.registerTool(...)` calls funnel through this one method,
-  // so monkeypatching it HERE — before any tool is registered and before
-  // `registerShared` captures a reference to it — times every tool with no
+  // Single choke point for MCP tool timing. Both `registerSharedFromSpec` (below)
+  // and the inline `server.registerTool(...)` calls funnel through this one
+  // method, so monkeypatching it HERE — before any tool is registered and before
+  // the registry loop captures a reference to it — times every tool with no
   // per-tool boilerplate. The wrapped handler records wall-clock duration and,
   // in a `finally`, feeds the host's dependency-neutral sink
   // `config.onMetric("mcp_tool_duration_seconds", seconds, { tool })`. The tool
@@ -261,92 +261,56 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
     return originalRegisterTool(...args.slice(0, -1), signalledHandler);
   };
 
-  // Register a tool from the shared, zod-agnostic spec registry. The spec owns
-  // the canonical name + model-facing description + (optional) schema builder;
-  // only the execute body is supplied per call. buildShape is invoked with THIS
-  // package's zod (v3); the in-app layer passes its own zod (v4).
-  //
-  // The spec's schema builder returns a plain ZodRawShape (Record<string,
-  // unknown> in the shared module since it must stay zod-agnostic), so the
-  // McpServer.registerTool overloads cannot infer the execute arg's shape from
-  // it. We type `execute` loosely and cast the call through `any`; runtime
-  // behaviour is unchanged — each execute body destructures the same fields the
-  // builder declares.
-  const registerShared = (
-    spec: SharedToolSpec,
-    execute: (args: any) => Promise<{ content: { type: "text"; text: string }[] }>,
-  ) =>
-    (server.registerTool as any)(
+  // Register EVERY shared tool from the zod-agnostic registry in one loop (#445).
+  // The spec owns the canonical name + description + (optional) schema builder AND
+  // the canonical execute mapping; the host only supplies the RESULT ENVELOPE. For
+  // each spec:
+  //   - skip `inAppOnly` specs (they belong to the in-app host only);
+  //   - if the spec has an `mcpExecute` override (a deliberate per-layer
+  //     difference — a guardrail, an omitted param, or a non-JSON envelope like a
+  //     resource_link/bare success line), the override OWNS the full MCP content
+  //     result and is used VERBATIM;
+  //   - otherwise the canonical `execute` returns RAW data and this host wraps it
+  //     in the standard JSON text envelope (jsonContent), exactly as the old inline
+  //     bodies did.
+  // buildShape is invoked with THIS package's zod (v3); the in-app layer passes its
+  // own zod (v4). The registry's execute returns `unknown` (it is zod-agnostic), so
+  // the wrapping is typed loosely and cast — runtime behaviour is unchanged.
+  const registerSharedFromSpec = (spec: SharedToolSpec) => {
+    if (spec.inAppOnly) return;
+    const handler = async (args: any) => {
+      if (spec.mcpExecute) {
+        // The override owns the full MCP result envelope (not re-wrapped).
+        return (await spec.mcpExecute(docmostClient, args)) as {
+          content: { type: "text"; text: string }[];
+        };
+      }
+      // Canonical execute returns raw data; wrap it as JSON text content.
+      const raw = await spec.execute!(docmostClient, args);
+      return jsonContent(raw);
+    };
+    return (server.registerTool as any)(
       spec.mcpName,
       spec.buildShape
         ? { description: spec.description, inputSchema: spec.buildShape(z) }
         : { description: spec.description },
-      execute,
+      handler,
     );
+  };
 
-  // Tool: get_workspace
-  registerShared(SHARED_TOOL_SPECS.getWorkspace, async () => {
-    const workspace = await docmostClient.getWorkspace();
-    return jsonContent(workspace);
-  });
+  for (const spec of Object.values(SHARED_TOOL_SPECS)) {
+    registerSharedFromSpec(spec as SharedToolSpec);
+  }
 
-  // Tool: list_spaces
-  registerShared(SHARED_TOOL_SPECS.listSpaces, async () => {
-    const spaces = await docmostClient.getSpaces();
-    return jsonContent(spaces);
-  });
+  // --- INLINE tools kept per-transport (NOT in the shared registry) ---
+  // Each stays inline for a documented reason: a snake_case/camelCase naming
+  // clash the registry convention forbids (table_get), an intentional
+  // per-transport behaviour/schema divergence (search, docmost_transform), or a
+  // tool that exists ONLY on this standalone MCP surface (update_comment,
+  // delete_comment — the in-app agent deliberately exposes no hard comment
+  // edit/delete tool).
 
-// Tool: list_pages
-// INTENTIONAL per-transport divergence (not in the shared registry): this
-// transport exposes a `tree:true` mode that returns the full nested hierarchy;
-// the in-app copy keeps the same tree option but is worded for the in-app agent.
-// Kept per-layer so each side can tune its own guidance.
-// Schema + description now live in @docmost/mcp's SHARED_TOOL_SPECS (#294). This
-// transport keeps applying its own defaults (limit=50, tree=false) in execute.
-registerShared(SHARED_TOOL_SPECS.listPages, async ({ spaceId, limit, tree }) => {
-  const result = await docmostClient.listPages(spaceId, limit ?? 50, tree ?? false);
-  return jsonContent(result);
-});
-
-// Tool: get_page
-// Schema + description now live in the shared registry (#294).
-registerShared(SHARED_TOOL_SPECS.getPage, async ({ pageId }) => {
-  const page = await docmostClient.getPage(pageId);
-  return jsonContent(page);
-});
-
-// Tool: get_page_json
-registerShared(SHARED_TOOL_SPECS.getPageJson, async ({ pageId }) => {
-  const page = await docmostClient.getPageJson(pageId);
-  return jsonContent(page);
-});
-
-// Tool: get_outline
-registerShared(SHARED_TOOL_SPECS.getOutline, async ({ pageId }) => {
-  const result = await docmostClient.getOutline(pageId);
-  return jsonContent(result);
-});
-
-// Tool: get_node
-registerShared(SHARED_TOOL_SPECS.getNode, async ({ pageId, nodeId }) => {
-  const result = await docmostClient.getNode(pageId, nodeId);
-  return jsonContent(result);
-});
-
-// Tool: search_in_page
-registerShared(
-  SHARED_TOOL_SPECS.searchInPage,
-  async ({ pageId, query, regex, caseSensitive, limit }) => {
-    const result = await docmostClient.searchInPage(pageId, query, {
-      regex,
-      caseSensitive,
-      limit,
-    });
-    return jsonContent(result);
-  },
-);
-
-// Tool: table_get
+  // Tool: table_get
 // NOT in the shared registry: the MCP tool name `table_get` is noun-first while
 // the in-app key is `getTable` (verb-first), breaking the snake_case(inAppKey)
 // convention the shared registry enforces (shared-tool-specs.contract.spec.ts).
@@ -368,383 +332,6 @@ server.registerTool(
   },
   async ({ pageId, table }) => {
     const result = await docmostClient.getTable(pageId, table);
-    return jsonContent(result);
-  },
-);
-
-// Tool: table_insert_row
-// Schema + description now live in the shared registry (#294); the `table`
-// parameter name is the canonical one (the in-app layer was unified to it).
-registerShared(
-  SHARED_TOOL_SPECS.tableInsertRow,
-  async ({ pageId, table, cells, index }) => {
-    const result = await docmostClient.tableInsertRow(
-      pageId,
-      table,
-      cells,
-      index,
-    );
-    return jsonContent(result);
-  },
-);
-
-// Tool: table_delete_row
-// Schema + description now live in the shared registry (#294).
-registerShared(
-  SHARED_TOOL_SPECS.tableDeleteRow,
-  async ({ pageId, table, index }) => {
-    const result = await docmostClient.tableDeleteRow(pageId, table, index);
-    return jsonContent(result);
-  },
-);
-
-// Tool: table_update_cell
-// Schema + description now live in the shared registry (#294).
-registerShared(
-  SHARED_TOOL_SPECS.tableUpdateCell,
-  async ({ pageId, table, row, col, text }) => {
-    const result = await docmostClient.tableUpdateCell(
-      pageId,
-      table,
-      row,
-      col,
-      text,
-    );
-    return jsonContent(result);
-  },
-);
-
-// Tool: create_page
-// Schema + description now live in the shared registry (#294).
-registerShared(
-  SHARED_TOOL_SPECS.createPage,
-  async ({ title, content, spaceId, parentPageId }) => {
-    const result = await docmostClient.createPage(
-      title,
-      content,
-      spaceId,
-      parentPageId,
-    );
-    return jsonContent(result);
-  },
-);
-
-// Tool: update_page_json
-// Schema + description now live in the shared registry (#294). The execute body
-// keeps this transport's content normalization (parse a JSON-string content,
-// pass undefined/null through for a title-only/no-op update).
-registerShared(
-  SHARED_TOOL_SPECS.updatePageJson,
-  async ({ pageId, content, title }) => {
-    // Only parse/validate the document when it was actually supplied; when it
-    // is omitted, pass it straight through so the client performs a title-only
-    // (or no-op) update.
-    let doc;
-    if (content === undefined || content === null) {
-      doc = undefined;
-    } else {
-      // String -> JSON.parse (throwing on invalid); object passes through.
-      doc = parseNodeArg(content, "content was a string but not valid JSON");
-    }
-    const result = await docmostClient.updatePageJson(pageId, doc, title);
-    return jsonContent(result);
-  },
-);
-
-// Tool: export_page_markdown
-// Schema + description now live in the shared registry (#294).
-registerShared(SHARED_TOOL_SPECS.exportPageMarkdown, async ({ pageId }) => {
-  const md = await docmostClient.exportPageMarkdown(pageId);
-  return { content: [{ type: "text" as const, text: md }] };
-});
-
-// Tool: import_page_markdown
-registerShared(
-  SHARED_TOOL_SPECS.importPageMarkdown,
-  async ({ pageId, markdown }) => {
-    const res = await docmostClient.importPageMarkdown(pageId, markdown);
-    return jsonContent(res);
-  },
-);
-
-// Tool: copy_page_content
-registerShared(
-  SHARED_TOOL_SPECS.copyPageContent,
-  async ({ sourcePageId, targetPageId }) => {
-    const result = await docmostClient.copyPageContent(
-      sourcePageId,
-      targetPageId,
-    );
-    return jsonContent(result);
-  },
-);
-
-// Tool: rename_page
-// Schema + description now live in the shared registry (#294).
-registerShared(SHARED_TOOL_SPECS.renamePage, async ({ pageId, title }) => {
-  const result = await docmostClient.renamePage(pageId, title);
-  return jsonContent(result);
-});
-
-// Tool: edit_page_text
-registerShared(SHARED_TOOL_SPECS.editPageText, async ({ pageId, edits }) => {
-  const result = await docmostClient.editPageText(pageId, edits);
-  return jsonContent(result);
-});
-
-// Tool: stash_page — returns a resource_link (NOT embedded text) so the doc
-// body never enters the model context. Registered directly (not via
-// registerShared) because that helper only emits text content. Also returns
-// `structuredContent` carrying the full documented `{uri, sha256, size, images}`
-// shape alongside the resource_link, so MCP clients receive the blob's sha256
-// (its ETag, for integrity) and mirror counts, not just the link.
-server.registerTool(
-  SHARED_TOOL_SPECS.stashPage.mcpName,
-  {
-    description: SHARED_TOOL_SPECS.stashPage.description,
-    inputSchema: SHARED_TOOL_SPECS.stashPage.buildShape!(z),
-  },
-  async ({ pageId }: { pageId: string }) => {
-    const result = await docmostClient.stashPage(pageId);
-    return {
-      content: [
-        {
-          type: "resource_link" as const,
-          uri: result.uri,
-          name: "page.json",
-          mimeType: "application/json",
-          size: result.size,
-        },
-      ],
-      // Mirror the full documented result shape ({ uri, size, sha256, images })
-      // as structuredContent so MCP clients get the blob's sha256 (its ETag, for
-      // integrity) and the mirror counts, not just the resource_link.
-      structuredContent: {
-        uri: result.uri,
-        sha256: result.sha256,
-        size: result.size,
-        images: result.images,
-      },
-    };
-  },
-);
-
-// Tool: patch_node — schema + description from the shared registry (identical
-// across both transports). The execute body keeps its own parseNodeArg
-// normalization (the model sometimes serializes `node` as a JSON string).
-registerShared(
-  SHARED_TOOL_SPECS.patchNode,
-  async ({ pageId, nodeId, node }) => {
-    const parsedNode = parseNodeArg(node);
-    const result = await docmostClient.patchNode(pageId, nodeId, parsedNode);
-    return jsonContent(result);
-  },
-);
-
-// Tool: insert_node — schema + description from the shared registry. As with
-// patch_node, the execute body retains parseNodeArg on the incoming node.
-registerShared(
-  SHARED_TOOL_SPECS.insertNode,
-  async ({ pageId, node, position, anchorNodeId, anchorText }) => {
-    const parsedNode = parseNodeArg(node);
-    const result = await docmostClient.insertNode(pageId, parsedNode, {
-      position,
-      anchorNodeId,
-      anchorText,
-    });
-    return jsonContent(result);
-  },
-);
-
-// Tool: delete_node
-registerShared(SHARED_TOOL_SPECS.deleteNode, async ({ pageId, nodeId }) => {
-  const result = await docmostClient.deleteNode(pageId, nodeId);
-  return jsonContent(result);
-});
-
-// Tool: insert_image
-// Schema + description now live in the shared registry (#410) so BOTH this MCP
-// server and the in-app AI-chat agent expose it. The execute body is unchanged.
-registerShared(
-  SHARED_TOOL_SPECS.insertImage,
-  async ({ pageId, imageUrl, align, alt, replaceText, afterText }) => {
-    const result = await docmostClient.insertImage(pageId, imageUrl, {
-      align,
-      alt,
-      replaceText,
-      afterText,
-    });
-    return jsonContent(result);
-  },
-);
-
-// Tool: replace_image
-// Schema + description now live in the shared registry (#410).
-registerShared(
-  SHARED_TOOL_SPECS.replaceImage,
-  async ({ pageId, attachmentId, imageUrl, align, alt }) => {
-    const result = await docmostClient.replaceImage(
-      pageId,
-      attachmentId,
-      imageUrl,
-      {
-        align,
-        alt,
-      },
-    );
-    return jsonContent(result);
-  },
-);
-
-// Tool: drawio_get — read a draw.io diagram as mxGraph XML (or the raw SVG).
-registerShared(
-  SHARED_TOOL_SPECS.drawioGet,
-  async ({ pageId, node, format }) => {
-    const result = await docmostClient.drawioGet(pageId, node, format ?? "xml");
-    return jsonContent(result);
-  },
-);
-
-// Tool: drawio_create — lint mxGraph XML, build the .drawio.svg, insert a node.
-registerShared(
-  SHARED_TOOL_SPECS.drawioCreate,
-  async ({ pageId, xml, position, anchorNodeId, anchorText, title }) => {
-    const result = await docmostClient.drawioCreate(
-      pageId,
-      { position, anchorNodeId, anchorText },
-      xml,
-      title,
-    );
-    return jsonContent(result);
-  },
-);
-
-// Tool: drawio_update — optimistic-locked full replacement of a diagram.
-registerShared(
-  SHARED_TOOL_SPECS.drawioUpdate,
-  async ({ pageId, node, xml, baseHash }) => {
-    const result = await docmostClient.drawioUpdate(pageId, node, xml, baseHash);
-    return jsonContent(result);
-  },
-);
-
-// Tool: share_page
-// Schema + description now live in the shared registry (#294). The execute body
-// keeps this transport's own `searchIndexing ?? true` default.
-registerShared(
-  SHARED_TOOL_SPECS.sharePage,
-  async ({ pageId, searchIndexing }) => {
-    const result = await docmostClient.sharePage(pageId, searchIndexing ?? true);
-    return jsonContent(result);
-  },
-);
-
-// Tool: unshare_page
-registerShared(SHARED_TOOL_SPECS.unsharePage, async ({ pageId }) => {
-  const result = await docmostClient.unsharePage(pageId);
-  return jsonContent(result);
-});
-
-// Tool: list_shares
-registerShared(SHARED_TOOL_SPECS.listShares, async () => {
-  const result = await docmostClient.listShares();
-  return jsonContent(result);
-});
-
-// Tool: move_page
-// Schema + description now live in the shared registry (#294). The execute body
-// keeps this transport's cycle guard, its 'null'/'' -> null string coercion, and
-// its positive-confirmation check on the move response.
-registerShared(
-  SHARED_TOOL_SPECS.movePage,
-  async ({ pageId, parentPageId, position }) => {
-    const finalParentId =
-      parentPageId === "" || parentPageId === "null" ? null : parentPageId;
-
-    // Cheap cycle guard: a page cannot be moved directly under itself.
-    // (Deeper descendant-cycle detection is intentionally out of scope.)
-    if (finalParentId !== null && finalParentId === pageId) {
-      throw new Error("cannot move a page under itself");
-    }
-
-    const result = await docmostClient.movePage(
-      pageId,
-      finalParentId || null,
-      position,
-    );
-
-    // Require POSITIVE confirmation: the live /pages/move success shape is
-    // exactly { success: true, status: 200 }. An empty body, a 204, or any odd
-    // shape lacking success === true must NOT be reported as a successful move,
-    // so we surface the raw API result instead of declaring success.
-    if (!(result && typeof result === "object" && result.success === true)) {
-      throw new Error(
-        `Failed to move page ${pageId}: ${JSON.stringify(result)}`,
-      );
-    }
-
-    return jsonContent({
-      message: `Successfully moved page ${pageId} to parent ${finalParentId || "root"}`,
-      result,
-    });
-  },
-);
-
-// Tool: delete_page
-// Schema + description now live in the shared registry (#294). The shared schema
-// exposes ONLY pageId, so no permanent/force-delete flag can reach the client.
-registerShared(SHARED_TOOL_SPECS.deletePage, async ({ pageId }) => {
-  await docmostClient.deletePage(pageId);
-  return {
-    content: [
-      { type: "text" as const, text: `Successfully deleted page ${pageId}` },
-    ],
-  };
-});
-
-// --- Comment tools (ported from upstream PR #3 by Max Nikitin) ---
-
-// Tool: list_comments
-registerShared(
-  SHARED_TOOL_SPECS.listComments,
-  async ({ pageId, includeResolved }) => {
-    const comments = await docmostClient.listComments(pageId, includeResolved);
-    return jsonContent(comments);
-  },
-);
-
-// Tool: create_comment
-// Schema + description now live in the shared registry (#294). The execute body
-// keeps this transport's own guards (require a selection for a top-level
-// comment; reject suggestedText on a reply / without a selection).
-registerShared(
-  SHARED_TOOL_SPECS.createComment,
-  async ({ pageId, content, selection, parentCommentId, suggestedText }) => {
-    if (!parentCommentId && (!selection || !selection.trim())) {
-      throw new Error(
-        "create_comment: a 'selection' (exact text to anchor on) is required for a top-level comment; omit it only when replying via parentCommentId.",
-      );
-    }
-    if (suggestedText !== undefined) {
-      if (parentCommentId) {
-        throw new Error(
-          "create_comment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
-        );
-      }
-      if (!selection || !selection.trim()) {
-        throw new Error(
-          "create_comment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
-        );
-      }
-    }
-    const result = await docmostClient.createComment(
-      pageId,
-      content,
-      "inline",
-      selection,
-      parentCommentId,
-      suggestedText,
-    );
     return jsonContent(result);
   },
 );
@@ -790,39 +377,6 @@ server.registerTool(
         },
       ],
     };
-  },
-);
-
-// Tool: resolve_comment
-// Schema + description now live in the shared registry (#294).
-registerShared(
-  SHARED_TOOL_SPECS.resolveComment,
-  async ({ commentId, resolved }) => {
-    const result = await docmostClient.resolveComment(commentId, resolved);
-    return jsonContent(result);
-  },
-);
-
-// Tool: check_new_comments
-// Schema + description now live in the shared registry (#294). The execute body
-// keeps this transport's own guard rejecting an unparseable `since` timestamp.
-registerShared(
-  SHARED_TOOL_SPECS.checkNewComments,
-  async ({ spaceId, since, parentPageId }) => {
-    // Reject an unparseable timestamp up front: otherwise the comparison
-    // against NaN silently treats every comment as "not new" and the tool
-    // returns zero results without signalling the bad input.
-    if (Number.isNaN(Date.parse(since))) {
-      throw new Error(
-        `Invalid 'since' timestamp: ${JSON.stringify(since)} — expected an ISO 8601 date (e.g. '2026-03-10T00:00:00Z')`,
-      );
-    }
-    const result = await docmostClient.checkNewComments(
-      spaceId,
-      since,
-      parentPageId,
-    );
-    return jsonContent(result);
   },
 );
 
@@ -931,44 +485,6 @@ server.registerTool(
       dryRun,
       deleteComments,
     });
-    return jsonContent(result);
-  },
-);
-
-// Tool: insert_footnote
-// Schema + description now live in the shared registry (#410) so the in-app
-// AI-chat agent exposes it too. The execute body is unchanged.
-registerShared(
-  SHARED_TOOL_SPECS.insertFootnote,
-  async ({ pageId, anchorText, text }) => {
-    const result = await docmostClient.insertFootnote(pageId, anchorText, text);
-    return jsonContent(result);
-  },
-);
-
-// Tool: diff_page_versions
-registerShared(
-  SHARED_TOOL_SPECS.diffPageVersions,
-  async ({ pageId, from, to }) => {
-    const result = await docmostClient.diffPageVersions(pageId, from, to);
-    return jsonContent(result);
-  },
-);
-
-// Tool: list_page_history
-registerShared(
-  SHARED_TOOL_SPECS.listPageHistory,
-  async ({ pageId, cursor }) => {
-    const result = await docmostClient.listPageHistory(pageId, cursor);
-    return jsonContent(result);
-  },
-);
-
-// Tool: restore_page_version
-registerShared(
-  SHARED_TOOL_SPECS.restorePageVersion,
-  async ({ historyId }) => {
-    const result = await docmostClient.restorePageVersion(historyId);
     return jsonContent(result);
   },
 );
