@@ -171,15 +171,21 @@ export class PersistenceExtension implements Extension {
       return;
     }
 
+    // #401 fix 2 — apply the DB state DIRECTLY into the hook's target document
+    // (`document` === `data.document`) and return undefined. When onLoadDocument
+    // returns undefined, hocuspocus keeps the mutated hook document as-is; only
+    // when the hook RETURNS a Y.Doc does hocuspocus re-`applyUpdate(document,
+    // encodeStateAsUpdate(returned))` — a second full encode+apply of the whole
+    // (e.g. 315KB) state on every cold load. Mutating in place performs a single
+    // apply and avoids the throwaway `new Y.Doc()` allocation.
     if (page.ydoc) {
       this.logger.debug(`ydoc loaded from db: ${pageId}`);
 
-      const doc = new Y.Doc();
       const dbState = new Uint8Array(page.ydoc);
 
-      Y.applyUpdate(doc, dbState);
+      Y.applyUpdate(document, dbState);
       observeCollabLoad(dbState.length, (performance.now() - startedAt) / 1000);
-      return doc;
+      return;
     }
 
     // if no ydoc state in db convert json in page.content to Ydoc.
@@ -192,18 +198,23 @@ export class PersistenceExtension implements Extension {
         tiptapExtensions,
       );
 
-      // Reuse this single encode for the size label (do NOT add a second one).
+      // Encode the converted doc ONCE, reuse the bytes for both the size label
+      // and the single apply into the hook document (previously this encode's
+      // result was returned and hocuspocus re-encoded+applied it a second time).
       const encoded = Y.encodeStateAsUpdate(ydoc);
+      Y.applyUpdate(document, encoded);
       observeCollabLoad(
         encoded.byteLength,
         (performance.now() - startedAt) / 1000,
       );
-      return ydoc;
+      return;
     }
 
+    // No persisted state: the hook document is already a fresh empty Y.Doc, so
+    // leave it untouched and return undefined (no re-encode of an empty doc).
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
     observeCollabLoad(0, (performance.now() - startedAt) / 1000);
-    return new Y.Doc();
+    return;
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
