@@ -336,8 +336,17 @@ export function formatDocmostAxiosError(error: any): void {
     }
   } else {
     // No response at all (ECONNREFUSED / ETIMEDOUT / ECONNRESET / DNS / timeout).
-    const reason = error.code ?? error.message ?? "network error";
+    // Use ONLY error.code, never the raw error.message: axios network messages
+    // embed host:port ("connect ECONNREFUSED 127.0.0.1:3000", "getaddrinfo
+    // ENOTFOUND host") and #437's invariant is that the host never reaches the
+    // model-visible message. code is set for essentially every real no-response
+    // error (ECONNREFUSED/ETIMEDOUT/ECONNRESET/ENOTFOUND/ECONNABORTED); the full
+    // native message still goes to stderr under DEBUG.
+    const reason = error.code ?? "network error";
     message = `${methodPath} failed: ${reason} (no response from server)`;
+    if (process.env.DEBUG) {
+      console.error("Docmost request failed; no response:", error.message);
+    }
   }
 
   if (message.length > ERROR_MESSAGE_CAP) {

@@ -180,18 +180,22 @@ test("no response uses error.code + path + 'no response from server'", () => {
   );
 });
 
-test("no response falls back to error.message when code is absent", () => {
+test("no response with no code falls back to a neutral reason (raw message not leaked — it may embed host:port)", () => {
   const err = makeAxiosError({
     method: "post",
     url: "/comments/create",
     status: undefined,
-    message: "timeout of 30000ms exceeded",
+    // A raw axios network message like "connect ECONNREFUSED 127.0.0.1:3000"
+    // embeds the host; #437's invariant is that it never reaches the message.
+    message: "connect ECONNREFUSED 10.0.0.5:3000",
   });
   formatDocmostAxiosError(err);
   assert.equal(
     err.message,
-    "POST /comments/create failed: timeout of 30000ms exceeded (no response from server)",
+    "POST /comments/create failed: network error (no response from server)",
   );
+  // And the host must NOT appear anywhere in the model-visible message.
+  assert.ok(!err.message.includes("10.0.0.5"));
 });
 
 test("path drops the host and the query string", () => {
