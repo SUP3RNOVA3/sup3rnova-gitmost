@@ -13,7 +13,7 @@ test("times a tool and preserves the handler's return value", async () => {
   const onMetric = (name, value, labels) => calls.push({ name, value, labels });
 
   const handler = async (arg) => ({ ok: true, echo: arg });
-  const wrapped = timeToolHandler("get_page", handler, onMetric);
+  const wrapped = timeToolHandler("getPage", handler, onMetric);
 
   const result = await wrapped("hello");
   // Return value passes through untouched.
@@ -22,7 +22,7 @@ test("times a tool and preserves the handler's return value", async () => {
   // Exactly one sample, correct name/labels, numeric non-negative duration.
   assert.equal(calls.length, 1);
   assert.equal(calls[0].name, "mcp_tool_duration_seconds");
-  assert.deepEqual(calls[0].labels, { tool: "get_page" });
+  assert.deepEqual(calls[0].labels, { tool: "getPage" });
   assert.equal(typeof calls[0].value, "number");
   assert.ok(calls[0].value >= 0, "duration must be non-negative seconds");
 });

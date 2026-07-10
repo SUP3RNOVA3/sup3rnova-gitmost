@@ -3,7 +3,7 @@
  *
  * `searchInDoc(doc, query, opts)` finds every occurrence of a literal substring
  * (default) or a regular expression across the page's TEXT CONTAINERS and
- * reports WHERE each match is — the container's ref (for get_node/patch_node;
+ * reports WHERE each match is — the container's ref (for getNode/patchNode;
  * see the SearchMatch.nodeId note for the `#<index>` caveat), the top-level
  * block index, and a short context window around the hit. It never touches the
  * network, the DB, or the schema mirror; like `comment-anchor.ts` it is
@@ -69,24 +69,24 @@ export interface SearchOptions {
 /** One located occurrence. */
 export interface SearchMatch {
   /**
-   * The container's ref, for addressing the block with get_node/patch_node: its
+   * The container's ref, for addressing the block with getNode/patchNode: its
    * `attrs.id` when it has one, otherwise `#<topLevelIndex>` of the nearest
    * top-level block. Table-cell/list-item paragraphs that carry no id fall back
    * to the `#<index>` form.
    *
-   * CAVEAT: the `#<index>` form is accepted by get_node (getNodeByRef resolves
-   * it by top-level index) but NOT by patch_node (replaceNodeById resolves only
+   * CAVEAT: the `#<index>` form is accepted by getNode (getNodeByRef resolves
+   * it by top-level index) but NOT by patchNode (replaceNodeById resolves only
    * by `attrs.id`), so id-less table/cell content can be READ by this ref but
    * not PATCHED by it.
    *
-   * To anchor a comment, do NOT pass this ref to create_comment — it has no
+   * To anchor a comment, do NOT pass this ref to createComment — it has no
    * nodeId parameter. A top-level comment needs an exact-text `selection` that
    * occurs once on the page (it fails if the text isn't found), so build a
-   * UNIQUE `selection` from before+match+after and pass THAT as create_comment's
+   * UNIQUE `selection` from before+match+after and pass THAT as createComment's
    * `selection`.
    */
   nodeId: string;
-  /** The top-level block index (as in get_outline). */
+  /** The top-level block index (as in getOutline). */
   blockIndex: number;
   /** The container node's type (paragraph/heading/...). */
   type: string | undefined;
@@ -188,12 +188,12 @@ export function searchInDoc(
   // --- edge-case guards (fail loudly so the agent can correct the call) ---
   if (typeof query !== "string" || query.trim().length === 0) {
     throw new Error(
-      "search_in_page: query is empty — pass the text (or regex) to look for.",
+      "searchInPage: query is empty — pass the text (or regex) to look for.",
     );
   }
   if (query.length > MAX_PATTERN_LENGTH) {
     throw new Error(
-      `search_in_page: query is too long (${query.length} chars; max ${MAX_PATTERN_LENGTH}). Shorten the search text/pattern.`,
+      `searchInPage: query is too long (${query.length} chars; max ${MAX_PATTERN_LENGTH}). Shorten the search text/pattern.`,
     );
   }
 
@@ -212,7 +212,7 @@ export function searchInDoc(
       re = new RE2(query, caseSensitive ? "g" : "gi");
     } catch (e) {
       throw new Error(
-        `search_in_page: invalid or unsupported regular expression: ${
+        `searchInPage: invalid or unsupported regular expression: ${
           e instanceof Error ? e.message : String(e)
         } — RE2 does not support lookaround ((?=…)/(?<=…)) or backreferences (\\1); rewrite the pattern without them.`,
       );
@@ -237,9 +237,9 @@ export function searchInDoc(
       // in a very long container.
       const text = blockPlainText(node);
 
-      // The container's own id addresses it verbatim in get_node/patch_node; a
+      // The container's own id addresses it verbatim in getNode/patchNode; a
       // container with no id (e.g. a table-cell paragraph) falls back to the
-      // top-level block's #<index> (readable via get_node, but not patchable —
+      // top-level block's #<index> (readable via getNode, but not patchable —
       // see the SearchMatch.nodeId note).
       const id =
         isObject(node.attrs) && typeof node.attrs.id === "string" && node.attrs.id.length > 0

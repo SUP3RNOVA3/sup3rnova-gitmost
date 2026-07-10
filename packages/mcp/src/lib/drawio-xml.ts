@@ -1070,7 +1070,7 @@ export function prepareModel(inputXml: string): PreparedModel {
   };
 }
 
-/** Cell count of a decoded model (user cells only) — used by drawio_get meta. */
+/** Cell count of a decoded model (user cells only) — used by drawioGet meta. */
 export function countUserCells(modelXml: string): number {
   return parseCells(modelXml).filter((c) => c.id !== "0" && c.id !== "1").length;
 }

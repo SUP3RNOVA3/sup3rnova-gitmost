@@ -7,16 +7,16 @@ import assert from "node:assert/strict";
 import { SERVER_INSTRUCTIONS } from "../../build/index.js";
 import { SHARED_TOOL_SPECS } from "../../build/tool-specs.js";
 
-test("drawio_shapes and drawio_guide are in the shared registry", () => {
-  assert.equal(SHARED_TOOL_SPECS.drawioShapes.mcpName, "drawio_shapes");
-  assert.equal(SHARED_TOOL_SPECS.drawioGuide.mcpName, "drawio_guide");
+test("drawioShapes and drawioGuide are in the shared registry", () => {
+  assert.equal(SHARED_TOOL_SPECS.drawioShapes.mcpName, "drawioShapes");
+  assert.equal(SHARED_TOOL_SPECS.drawioGuide.mcpName, "drawioGuide");
   // Deferred tier, matching the stage-1 drawio tools.
   assert.equal(SHARED_TOOL_SPECS.drawioShapes.tier, "deferred");
   assert.equal(SHARED_TOOL_SPECS.drawioGuide.tier, "deferred");
 });
 
 test("the new tools are routed in SERVER_INSTRUCTIONS", () => {
-  for (const name of ["drawio_shapes", "drawio_guide"]) {
+  for (const name of ["drawioShapes", "drawioGuide"]) {
     assert.match(SERVER_INSTRUCTIONS, new RegExp(`\\b${name}\\b`), `${name} missing from guide`);
   }
 });
@@ -26,7 +26,7 @@ test("the hard-rules block is injected into create/update descriptions", () => {
     const d = SHARED_TOOL_SPECS[key].description;
     assert.match(d, /sentinels are MANDATORY/);
     assert.match(d, /vertex="1" XOR edge="1"/);
-    assert.match(d, /call drawio_shapes first/);
+    assert.match(d, /call drawioShapes first/);
     assert.match(d, /adaptiveColors="auto"/);
     assert.match(d, /&#xa;/);
   }

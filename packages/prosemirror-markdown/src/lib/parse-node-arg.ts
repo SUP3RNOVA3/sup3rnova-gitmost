@@ -1,7 +1,7 @@
 // The model sometimes serializes a ProseMirror node arg as a JSON string
 // instead of an object. Normalize: parse a string to an object (throwing on
-// invalid JSON), pass an object through unchanged. Shared by patch_node /
-// insert_node (and the analogous update_page_json content parsing).
+// invalid JSON), pass an object through unchanged. Shared by patchNode /
+// insertNode (and the analogous updatePageJson content parsing).
 //
 // This lives in the converter package (#414) so BOTH consumers import the ONE
 // copy: `@docmost/mcp` (ESM) and the CommonJS server app. The server cannot

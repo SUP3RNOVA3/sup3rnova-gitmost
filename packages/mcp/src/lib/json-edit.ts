@@ -283,7 +283,7 @@ export function applyTextEdits(
   for (const edit of edits) {
     if (!edit.find) throw new Error("edit.find must be a non-empty string");
 
-    // HARD-REFUSE formatting changes. edit_page_text edits PLAIN TEXT only and
+    // HARD-REFUSE formatting changes. editPageText edits PLAIN TEXT only and
     // writes the replacement verbatim, so it cannot add/remove marks. We refuse
     // only a pure formatting TOGGLE: find and replace differ ONLY by balanced
     // markdown markers (e.g. find:"~~$69~~" / replace:"$69", or find:"M5Stack" /
@@ -304,22 +304,22 @@ export function applyTextEdits(
       failed.push({
         find: edit.find,
         reason:
-          "edit_page_text edits plain text only and cannot add or remove formatting marks (bold/italic/strike/code/link); it writes the replacement as LITERAL text. This edit looks like a formatting change (markdown markers in find/replace). To change marks, read the block with get_page_json and use patch_node (or update_page_json) to set the node's marks array.",
+          "editPageText edits plain text only and cannot add or remove formatting marks (bold/italic/strike/code/link); it writes the replacement as LITERAL text. This edit looks like a formatting change (markdown markers in find/replace). To change marks, read the block with getPageJson and use patchNode (or updatePageJson) to set the node's marks array.",
       });
       continue;
     }
 
     // HARD-REFUSE inline footnote tokens (#410). `^[...]` in a `replace` is
     // markdown that only becomes a real footnote when a whole markdown body is
-    // written (create_page / update_page_content / import_page_markdown). Written
-    // through edit_page_text it stays a LITERAL string in the text — the exact
+    // written (createPage / update_page_content / importPageMarkdown). Written
+    // through editPageText it stays a LITERAL string in the text — the exact
     // failure mode #410 fixes — so refuse it here (defense-in-depth) and point the
-    // caller at insert_footnote, mirroring the formatting-marker refusal above.
+    // caller at insertFootnote, mirroring the formatting-marker refusal above.
     if (/\^\[[\s\S]*?\]/.test(edit.replace)) {
       failed.push({
         find: edit.find,
         reason:
-          "edit_page_text writes the replacement as LITERAL text, so a `^[...]` footnote token does not parse into a real footnote (it would appear verbatim in the page). To add a footnote to existing text, use insert_footnote (anchorText = where, text = the note).",
+          "editPageText writes the replacement as LITERAL text, so a `^[...]` footnote token does not parse into a real footnote (it would appear verbatim in the page). To add a footnote to existing text, use insertFootnote (anchorText = where, text = the note).",
       });
       continue;
     }
@@ -381,12 +381,12 @@ export function applyTextEdits(
       let reason: string;
       if (existsAcrossAtom) {
         reason =
-          "match crosses a non-text inline node (image/break/mention); use update_page_json for structural changes.";
+          "match crosses a non-text inline node (image/break/mention); use updatePageJson for structural changes.";
       } else {
         // Append a bounded "closest text" hint: find the FIRST block that
         // contains the longest whitespace-delimited token (>= 3 chars) of the
         // (stripped, then raw) locator, and quote that block's plain text. Shared
-        // with create_comment via closestBlockHint so both give the same hint.
+        // with createComment via closestBlockHint so both give the same hint.
         reason = "text not found in the document." + closestBlockHint(blockPlain, edit.find);
       }
       failed.push({ find: edit.find, reason });

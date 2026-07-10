@@ -22,10 +22,13 @@ test("every spec exposes mcpName + inAppKey, and the key matches inAppKey", () =
   }
 });
 
-test("mcpName uses snake_case and inAppKey uses camelCase", () => {
+// Since issue #412 the external MCP name equals the in-app key: both are the
+// same camelCase identifier (mcpName === inAppKey).
+test("mcpName and inAppKey are the same camelCase identifier", () => {
   for (const [key, spec] of Object.entries(SHARED_TOOL_SPECS)) {
-    assert.match(spec.mcpName, /^[a-z0-9]+(_[a-z0-9]+)*$/, `${key}: mcpName not snake_case`);
+    assert.match(spec.mcpName, /^[a-z][a-zA-Z0-9]*$/, `${key}: mcpName not camelCase`);
     assert.match(spec.inAppKey, /^[a-z][a-zA-Z0-9]*$/, `${key}: inAppKey not camelCase`);
+    assert.equal(spec.mcpName, spec.inAppKey, `${key}: mcpName must equal inAppKey`);
   }
 });
 
@@ -59,7 +62,7 @@ test("buildShape (when present) returns a usable ZodRawShape with a real zod", (
 
 test("editPageText builder produces { pageId, edits } and drops the stale strip-and-retry claim", () => {
   const spec = SHARED_TOOL_SPECS.editPageText;
-  assert.equal(spec.mcpName, "edit_page_text");
+  assert.equal(spec.mcpName, "editPageText");
   const shape = spec.buildShape(z);
   assert.deepEqual(Object.keys(shape).sort(), ["edits", "pageId"]);
   // A valid edits batch parses.
@@ -86,7 +89,7 @@ test("getNode builder produces exactly { pageId, nodeId }", () => {
 test("patchNode spec exists, merges BOTH descriptions, builds { pageId, nodeId, node }", () => {
   const spec = SHARED_TOOL_SPECS.patchNode;
   assert.ok(spec, "patchNode spec missing");
-  assert.equal(spec.mcpName, "patch_node");
+  assert.equal(spec.mcpName, "patchNode");
   assert.equal(spec.inAppKey, "patchNode");
 
   // The canonical description must carry the key guidance from BOTH originals:
@@ -114,7 +117,7 @@ test("patchNode spec exists, merges BOTH descriptions, builds { pageId, nodeId, 
 test("insertNode spec exists, merges BOTH descriptions, builds the full anchor shape", () => {
   const spec = SHARED_TOOL_SPECS.insertNode;
   assert.ok(spec, "insertNode spec missing");
-  assert.equal(spec.mcpName, "insert_node");
+  assert.equal(spec.mcpName, "insertNode");
   assert.equal(spec.inAppKey, "insertNode");
 
   // Canonical description must keep BOTH sides' nuance:
@@ -150,7 +153,7 @@ test("no-arg specs (getWorkspace/listSpaces/listShares) omit buildShape", () => 
 test("updatePageMarkdown spec exists, pairs with updatePageJson, builds { pageId, content, title }", () => {
   const spec = SHARED_TOOL_SPECS.updatePageMarkdown;
   assert.ok(spec, "updatePageMarkdown spec missing");
-  assert.equal(spec.mcpName, "update_page_markdown");
+  assert.equal(spec.mcpName, "updatePageMarkdown");
   assert.equal(spec.inAppKey, "updatePageMarkdown");
   // Registered on BOTH hosts (a shared spec, no inAppOnly/mcpOnly flag).
   assert.notEqual(spec.inAppOnly, true);
@@ -168,13 +171,13 @@ test("updatePageMarkdown spec exists, pairs with updatePageJson, builds { pageId
   assert.match(spec.description, /\^\[/);
 });
 
-// #411: import_page_markdown is dropped from the EXTERNAL MCP surface but stays
+// #411: importPageMarkdown is dropped from the EXTERNAL MCP surface but stays
 // available to the in-app agent — encoded as inAppOnly on the shared spec.
 test("importPageMarkdown spec is inAppOnly (removed from the external MCP surface, kept in-app)", () => {
   const spec = SHARED_TOOL_SPECS.importPageMarkdown;
   assert.ok(spec, "importPageMarkdown spec missing");
   assert.equal(spec.inAppOnly, true);
   // The spec + its client method are NOT deleted — only hidden from the MCP host.
-  assert.equal(spec.mcpName, "import_page_markdown");
+  assert.equal(spec.mcpName, "importPageMarkdown");
   assert.equal(spec.inAppKey, "importPageMarkdown");
 });

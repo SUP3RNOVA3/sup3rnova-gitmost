@@ -117,7 +117,7 @@ export function stripInlineMarkdown(s: string): string {
 
 /**
  * Build a bounded "closest text" hint for an anchor/find MISS, shared by
- * edit_page_text (json-edit) and create_comment (client) so both surface the
+ * editPageText (json-edit) and createComment (client) so both surface the
  * same self-correction affordance.
  *
  * Take the longest whitespace-delimited token (>= 3 chars) of the locator

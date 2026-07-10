@@ -332,7 +332,7 @@ export class McpService implements OnModuleDestroy {
               // Should never happen: handle() always stashes before delegating.
               throw new UnauthorizedException('MCP authentication missing.');
             }
-            // Inject the blob-sandbox sink after the auth decision so stash_page
+            // Inject the blob-sandbox sink after the auth decision so stashPage
             // can store blobs in the shared in-RAM store regardless of which
             // credential variant resolved. The sink (put/has/evict + uri↔id
             // mapping) is owned by SandboxStore.asSink().

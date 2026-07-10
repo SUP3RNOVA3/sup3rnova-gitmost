@@ -25,7 +25,7 @@ test("formatting-only edit (strip-toggle) is refused, not applied", () => {
   assert.equal(failed.length, 1, "one refused edit");
   assert.equal(failed[0].find, "~~x~~");
   assert.match(failed[0].reason, /cannot add or remove formatting marks/);
-  assert.match(failed[0].reason, /patch_node/);
+  assert.match(failed[0].reason, /patchNode/);
   // The document is untouched (the strike mark is preserved).
   assert.deepEqual(out, snapshot);
 });
@@ -143,7 +143,7 @@ test("typo fix wrapped in markdown still applies (not refused)", () => {
 // ---------------------------------------------------------------------------
 // (iv) #410 footnote token: a `replace` containing `^[...]` is refused into
 // failed[] (it would be written as a LITERAL string, never a real footnote).
-// Nothing is applied; the reason points at insert_footnote.
+// Nothing is applied; the reason points at insertFootnote.
 // ---------------------------------------------------------------------------
 test("replace containing a `^[...]` footnote token is refused, not applied", () => {
   const input = doc(paragraph(textNode("The claim stands.")));
@@ -156,7 +156,7 @@ test("replace containing a `^[...]` footnote token is refused, not applied", () 
   assert.equal(results.length, 0, "nothing applied");
   assert.equal(failed.length, 1, "one refused edit");
   assert.equal(failed[0].find, "The claim stands.");
-  assert.match(failed[0].reason, /insert_footnote/);
+  assert.match(failed[0].reason, /insertFootnote/);
   // The document is byte-for-byte untouched — no literal `^[` was written.
   assert.deepEqual(out, snapshot);
 });

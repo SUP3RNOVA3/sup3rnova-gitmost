@@ -87,8 +87,8 @@ global.WebSocket = WebSocket;
  *     bodies merged. So the import output is ALREADY in canonical footnote
  *     topology.
  *   - `canonicalizeFootnotes` runs AFTER as the mcp write-path invariant shared
- *     with every other full-document persist path (`update_page_json`,
- *     `docmost_transform`, `insert_footnote`, …). Because the package output is
+ *     with every other full-document persist path (`updatePageJson`,
+ *     `docmostTransform`, `insertFootnote`, …). Because the package output is
  *     already canonical, this layer is a no-op here (idempotent) — it exists so
  *     the page-write contract is enforced uniformly regardless of how the PM doc
  *     was produced, not because the import needs fixing.
@@ -282,7 +282,7 @@ export async function mutatePageContent(
  * it was produced from markdown (ids regenerate) or edited in place
  * (existing block ids preserved).
  *
- * This is an intentional full replace (used by update_page / update_page_json),
+ * This is an intentional full replace (used by update_page / updatePageJson),
  * but now runs under the per-page lock and waits for server persistence via
  * mutatePageContent.
  */

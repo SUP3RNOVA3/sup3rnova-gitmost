@@ -36,7 +36,7 @@ describe('tool tier metadata (#332)', () => {
   });
 
   it('#410 image tools are DEFERRED, footnote tool is CORE', () => {
-    // insert_footnote is core (symmetric with editPageText); the image tools stay
+    // insertFootnote is core (symmetric with editPageText); the image tools stay
     // deferred (rare, fat — loaded on demand). Assert both the spec tier and the
     // CORE_TOOL_SET membership so a future tier edit that desyncs them fails here.
     expect(SHARED_TOOL_SPECS.insertFootnote.tier).toBe('core');

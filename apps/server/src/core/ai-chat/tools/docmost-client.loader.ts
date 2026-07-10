@@ -146,7 +146,7 @@ export type CommentSignalTrackerFactory = (options: {
 
 // Pure, no-network draw.io helpers (#424). These are plain functions on the
 // module (NOT DocmostClient methods) — the in-app AI-SDK service calls them
-// directly to wire drawio_shapes / drawio_guide, mirroring the MCP server.
+// directly to wire drawioShapes / drawioGuide, mirroring the MCP server.
 export type SearchShapesFn = (
   query: string,
   opts?: { category?: string; limit?: number },
@@ -169,7 +169,7 @@ interface DocmostMcpModule {
   // the mocked loader in unit tests) — the stale-check below is a NO-OP when it
   // is missing, so an older build never wrongly fails startup.
   REGISTRY_STAMP?: string;
-  // Pure, no-network draw.io helpers (#424) backing drawio_shapes / drawio_guide.
+  // Pure, no-network draw.io helpers (#424) backing drawioShapes / drawioGuide.
   // Those two specs are `inlineBothHosts` (they stay in SHARED_TOOL_SPECS for the
   // shared contract but carry no execute — their catalog loader uses import.meta
   // and can't be value-imported into the zod-agnostic tool-specs.ts), so the

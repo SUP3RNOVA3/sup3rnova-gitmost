@@ -1,4 +1,4 @@
-// Contract tests for the drawio_get / drawio_create / drawio_update client
+// Contract tests for the drawioGet / drawioCreate / drawioUpdate client
 // methods (issue #423). Follows the repo's seam-override pattern (see
 // full-doc-write-canonicalize.test.mjs): a DocmostClient subclass stubs the I/O
 // seams (auth, collab token, page read, attachment upload/fetch, the mutatePage
@@ -114,9 +114,9 @@ function findDrawio(node, acc = []) {
   return acc;
 }
 
-// --- drawio_create ---------------------------------------------------------
+// --- drawioCreate ---------------------------------------------------------
 
-test("drawio_create: lints, builds the .drawio.svg, uploads and inserts a node", async () => {
+test("drawioCreate: lints, builds the .drawio.svg, uploads and inserts a node", async () => {
   const pageDoc = {
     type: "doc",
     content: [{ type: "paragraph", attrs: { id: "p1" }, content: [] }],
@@ -148,7 +148,7 @@ test("drawio_create: lints, builds the .drawio.svg, uploads and inserts a node",
   assert.equal(n.attrs.title, "My diagram");
 });
 
-test("drawio_create: a lint violation throws before any upload", async () => {
+test("drawioCreate: a lint violation throws before any upload", async () => {
   const { client, calls } = makeClient({ pageDoc: { type: "doc", content: [] } });
   // Edge with no child geometry -> edge-geometry rule.
   const bad =
@@ -162,7 +162,7 @@ test("drawio_create: a lint violation throws before any upload", async () => {
   assert.equal(calls.uploads.length, 0, "no attachment uploaded on lint failure");
 });
 
-test("drawio_create: before/after requires exactly one anchor", async () => {
+test("drawioCreate: before/after requires exactly one anchor", async () => {
   const { client } = makeClient({ pageDoc: { type: "doc", content: [] } });
   await assert.rejects(
     () => client.drawioCreate("page1", { position: "before" }, MODEL),
@@ -170,9 +170,9 @@ test("drawio_create: before/after requires exactly one anchor", async () => {
   );
 });
 
-// --- drawio_get ------------------------------------------------------------
+// --- drawioGet ------------------------------------------------------------
 
-test("drawio_get: decodes the model and returns meta with a hash", async () => {
+test("drawioGet: decodes the model and returns meta with a hash", async () => {
   const pageDoc = {
     type: "doc",
     content: [
@@ -198,7 +198,7 @@ test("drawio_get: decodes the model and returns meta with a hash", async () => {
   assert.equal(res.meta.hash, mxHash(normalizeXml(MODEL)));
 });
 
-test("drawio_get: format=svg returns the raw .drawio.svg", async () => {
+test("drawioGet: format=svg returns the raw .drawio.svg", async () => {
   const svg = svgFor(MODEL);
   const pageDoc = {
     type: "doc",
@@ -211,7 +211,7 @@ test("drawio_get: format=svg returns the raw .drawio.svg", async () => {
   assert.equal(res.content, svg);
 });
 
-test("drawio_get: reads a HUMAN-saved compressed diagram losslessly (pako)", async () => {
+test("drawioGet: reads a HUMAN-saved compressed diagram losslessly (pako)", async () => {
   const pageDoc = {
     type: "doc",
     content: [
@@ -223,7 +223,7 @@ test("drawio_get: reads a HUMAN-saved compressed diagram losslessly (pako)", asy
   assert.equal(res.content, normalizeXml(MODEL));
 });
 
-// --- drawio_update ---------------------------------------------------------
+// --- drawioUpdate ---------------------------------------------------------
 
 const UPDATED_MODEL =
   '<mxGraphModel><root>' +
@@ -250,7 +250,7 @@ function updatePageDoc() {
   };
 }
 
-test("drawio_update: stale baseHash -> conflict, no upload", async () => {
+test("drawioUpdate: stale baseHash -> conflict, no upload", async () => {
   const { client, calls } = makeClient({
     pageDoc: updatePageDoc(),
     attachmentSvg: svgFor(MODEL),
@@ -262,7 +262,7 @@ test("drawio_update: stale baseHash -> conflict, no upload", async () => {
   assert.equal(calls.uploads.length, 0, "no upload on conflict");
 });
 
-test("drawio_update: current baseHash -> uploads new attachment and repoints node dims", async () => {
+test("drawioUpdate: current baseHash -> uploads new attachment and repoints node dims", async () => {
   const currentHash = mxHash(normalizeXml(MODEL));
   const { client, calls } = makeClient({
     pageDoc: updatePageDoc(),
@@ -285,7 +285,7 @@ test("drawio_update: current baseHash -> uploads new attachment and repoints nod
   assert.equal(n.attrs.id, undefined);
 });
 
-test("drawio_update: baseHash is mandatory", async () => {
+test("drawioUpdate: baseHash is mandatory", async () => {
   const { client } = makeClient({ pageDoc: updatePageDoc(), attachmentSvg: svgFor(MODEL) });
   await assert.rejects(
     () => client.drawioUpdate("page1", "d1", UPDATED_MODEL, ""),
@@ -295,7 +295,7 @@ test("drawio_update: baseHash is mandatory", async () => {
 
 // --- Fix 1: the create handle must resolve on the SAVED doc (no id) ---------
 
-test("drawio_create -> get/update: returned #<index> handle resolves on the saved doc (id dropped)", async () => {
+test("drawioCreate -> get/update: returned #<index> handle resolves on the saved doc (id dropped)", async () => {
   // Create appends a drawio node after the existing paragraph.
   const createDoc = {
     type: "doc",
@@ -316,13 +316,13 @@ test("drawio_create -> get/update: returned #<index> handle resolves on the save
   const savedDoc = create.calls.mutations[0].doc;
   assert.equal(findDrawio(savedDoc)[0].attrs.id, undefined);
 
-  // drawio_get with the returned handle resolves the just-created node.
+  // drawioGet with the returned handle resolves the just-created node.
   const getClient = makeClient({ pageDoc: savedDoc, attachmentSvg: svgFor(MODEL) });
   const got = await getClient.client.drawioGet("page1", res.nodeId, "xml");
   assert.equal(got.nodeId, res.nodeId);
   assert.equal(got.content, normalizeXml(MODEL));
 
-  // drawio_update with the same handle + the hash from get repoints that node.
+  // drawioUpdate with the same handle + the hash from get repoints that node.
   const upClient = makeClient({ pageDoc: savedDoc, attachmentSvg: svgFor(MODEL) });
   const upd = await upClient.client.drawioUpdate(
     "page1",
@@ -342,7 +342,7 @@ test("drawio_create -> get/update: returned #<index> handle resolves on the save
 
 // --- error paths: the LLM must get a clean error, not a crash --------------
 
-test("drawio_get: a bad node ref -> clean 'no node found' error", async () => {
+test("drawioGet: a bad node ref -> clean 'no node found' error", async () => {
   // Page has one paragraph; the requested ref resolves to nothing.
   const pageDoc = {
     type: "doc",
@@ -355,7 +355,7 @@ test("drawio_get: a bad node ref -> clean 'no node found' error", async () => {
   );
 });
 
-test("drawio_get: a drawio node with no src -> clean 'has no src to read' error", async () => {
+test("drawioGet: a drawio node with no src -> clean 'has no src to read' error", async () => {
   const pageDoc = {
     type: "doc",
     content: [
@@ -370,7 +370,7 @@ test("drawio_get: a drawio node with no src -> clean 'has no src to read' error"
   );
 });
 
-test("drawio_update: the resolved node is NOT a drawio node -> clean error, no upload", async () => {
+test("drawioUpdate: the resolved node is NOT a drawio node -> clean error, no upload", async () => {
   // "#0" resolves to a paragraph. The update must refuse cleanly rather than
   // crash or repoint the wrong node.
   const pageDoc = {
@@ -386,7 +386,7 @@ test("drawio_update: the resolved node is NOT a drawio node -> clean error, no u
   assert.equal(calls.mutations.length, 0, "no write when the node is not a diagram");
 });
 
-test("drawio_create: anchor not found -> clean error that reports the orphan attachment", async () => {
+test("drawioCreate: anchor not found -> clean error that reports the orphan attachment", async () => {
   // The upload happens before the mutate transform; when the anchor cannot be
   // found the write is skipped and the (now unreferenced) attachment is named
   // in the error, exactly as the code documents.
@@ -416,7 +416,7 @@ test("drawio_create: anchor not found -> clean error that reports the orphan att
 
 // --- Fix 2: update targets ONLY the resolved node --------------------------
 
-test("drawio_update: repoints ONLY the addressed node, not siblings sharing an attachmentId", async () => {
+test("drawioUpdate: repoints ONLY the addressed node, not siblings sharing an attachmentId", async () => {
   // A copied diagram: two drawio nodes share one attachmentId. Updating via the
   // "#0" handle must touch node #0 only, never the sibling copy.
   const shared = {

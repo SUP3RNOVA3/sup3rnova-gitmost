@@ -2,7 +2,7 @@
 // (issue #228):
 //  - insertFootnote (#11): the required-argument guards reject BEFORE any write,
 //    and never touch the collab/mutate path.
-//  - transformPage / docmost_transform (#13): the auto-canonicalize step
+//  - transformPage / docmostTransform (#13): the auto-canonicalize step
 //    (`result = canonicalizeFootnotes(raw)`) runs after every transform, so a
 //    transform that introduces an orphan footnote definition is silently tidied
 //    away — observable as an EMPTY diff in a dryRun preview.
@@ -10,7 +10,7 @@
 // These stand a local http.createServer in for Docmost and only exercise plain
 // HTTP routes (login / comments / pages.info), deliberately avoiding the live
 // Hocuspocus collab WebSocket: the insertFootnote guards short-circuit before it,
-// and docmost_transform's dryRun preview never opens it. The collab mutate path
+// and docmostTransform's dryRun preview never opens it. The collab mutate path
 // itself — abort-via-throw on a missing anchor with NO persisted write, and the
 // reused-vs-new response shaping — is covered in
 // test/mock/insert-footnote-wrapper.test.mjs (which overrides the mutatePage
@@ -101,7 +101,7 @@ test("insertFootnote rejects an empty text before any write", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// #13 docmost_transform auto-canonicalization: a transform that adds an orphan
+// #13 docmostTransform auto-canonicalization: a transform that adds an orphan
 // footnote definition produces NO net change (the canonicalizer drops it), so a
 // dryRun preview reports an empty diff. Without the auto-canonicalize step the
 // orphan would survive and the diff would be non-empty.

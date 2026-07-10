@@ -114,7 +114,7 @@ test("summarizeChange treats a key-order-only difference as no change", () => {
 // (v) CRITICAL: a structural change that touches no text/marks — adding an
 // image node (images 0 -> 1) — must report changed:true and surface the
 // integrity delta in structure + summary, closing the verify blind spot for
-// insert_image / delete_node on structural nodes.
+// insertImage / deleteNode on structural nodes.
 // ---------------------------------------------------------------------------
 test("summarizeChange surfaces an image-count change (0->1)", () => {
   const before = doc(para(t("caption")));

@@ -8,7 +8,7 @@
 // z.array() and z.object() — API identical across v3 and v4 — so a single
 // builder works with either namespace.
 //
-// Only tools whose snake_case/camelCase name, input schema AND model-facing
+// Only tools whose camelCase name, input schema AND model-facing
 // description are genuinely identical across both layers live here. Tools that
 // diverge on purpose (security guardrails, tuned UX, "Reversible" framing on
 // some write tools, different limits, hybrid-RRF search, etc.) stay defined
@@ -29,8 +29,8 @@
 // one of them. Each builder uses only the common, stable subset of the API.
 type ZodLike = any;
 
-// The `node` normalizer shared by BOTH hosts (patch_node / insert_node /
-// update_page_json): the model sometimes serializes a ProseMirror node arg as a
+// The `node` normalizer shared by BOTH hosts (patchNode / insertNode /
+// updatePageJson): the model sometimes serializes a ProseMirror node arg as a
 // JSON string, so we parse a string to an object (throwing a documented message
 // on invalid JSON) and pass an object through. It lives in the converter package
 // (#414) so it is the ONE copy both the MCP server and the in-app server import;
@@ -117,7 +117,8 @@ export type SharedToolExecute = (
 ) => Promise<unknown>;
 
 export interface SharedToolSpec {
-  /** snake_case tool name passed to McpServer.registerTool. */
+  /** camelCase tool name passed to McpServer.registerTool. Since issue #412 the
+   *  external MCP name equals the in-app key (mcpName === inAppKey). */
   mcpName: string;
   /** camelCase key in the ai-SDK tools object (the in-app layer). */
   inAppKey: string;
@@ -178,7 +179,7 @@ export interface SharedToolSpec {
    * description / schema across both hosts) but carries NO `execute`/override and
    * is registered INLINE by BOTH hosts instead of through the registry loop. Used
    * for tools whose implementation cannot cross into this zod-agnostic file — the
-   * drawio_shapes / drawio_guide pure helpers, whose backing module resolves a
+   * drawioShapes / drawioGuide pure helpers, whose backing module resolves a
    * bundled data file via `import.meta` and so cannot be value-imported here
    * without breaking the in-app server's commonjs type-check of this source. Both
    * registry loops SKIP a spec with this flag; the per-host inline registrations
@@ -206,10 +207,10 @@ const mcpJson = (data: unknown) => ({
 });
 
 /**
- * Compact HARD-RULES block injected into the drawio_create / drawio_update
+ * Compact HARD-RULES block injected into the drawioCreate / drawioUpdate
  * descriptions (issue #424 — the jgraph/drawio-mcp pattern of putting the
  * must-follow rules right where the model reads them at call time). Deliberately
- * terse; the long-form authoring guidance lives in drawio_guide.
+ * terse; the long-form authoring guidance lives in drawioGuide.
  */
 export const DRAWIO_HARD_RULES =
   ' RULES: id="0" and id="1"(parent="0") sentinels are MANDATORY; each cell is ' +
@@ -221,8 +222,8 @@ export const DRAWIO_HARD_RULES =
   'and RELATIVE coords, and an edge between different containers is parent="1"; set ' +
   'adaptiveColors="auto" on <mxGraphModel> (free dark-theme adaptation for ' +
   'strokeColor/fillColor/fontColor="default"); do NOT guess shape=mxgraph.* names ' +
-  "(a wrong name renders as an empty box) — call drawio_shapes first; call " +
-  "drawio_guide(section) for authoring help. Pass layout:\"elk\" to let the server " +
+  "(a wrong name renders as an empty box) — call drawioShapes first; call " +
+  "drawioGuide(section) for authoring help. Pass layout:\"elk\" to let the server " +
   "compute coordinates from your rough placement. The result carries geometry " +
   "WARNINGS (overlaps, an edge through a shape, edge-on-edge, gaps <150px, a label " +
   "wider than its shape, negative coords) — they do NOT block the write; fix them " +
@@ -232,7 +233,7 @@ export const SHARED_TOOL_SPECS = {
   // --- no-argument read tools ---
 
   getWorkspace: {
-    mcpName: 'get_workspace',
+    mcpName: 'getWorkspace',
     inAppKey: 'getWorkspace',
     description: 'Fetch metadata about the current workspace (name, settings).',
     tier: 'core',
@@ -241,7 +242,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   listSpaces: {
-    mcpName: 'list_spaces',
+    mcpName: 'listSpaces',
     inAppKey: 'listSpaces',
     description:
       'List the spaces the current user can access. Returns the array of ' +
@@ -252,7 +253,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   listShares: {
-    mcpName: 'list_shares',
+    mcpName: 'listShares',
     inAppKey: 'listShares',
     description:
       'List all public shares in the workspace with page titles and public URLs.',
@@ -264,7 +265,7 @@ export const SHARED_TOOL_SPECS = {
   // --- single-pageId read tools ---
 
   getPageJson: {
-    mcpName: 'get_page_json',
+    mcpName: 'getPageJson',
     inAppKey: 'getPageJson',
     description:
       'Get page details with the raw ProseMirror JSON content (lossless: ' +
@@ -281,7 +282,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   getOutline: {
-    mcpName: 'get_outline',
+    mcpName: 'getOutline',
     inAppKey: 'getOutline',
     description:
       "Return a COMPACT outline of a page's top-level blocks ({index, type, " +
@@ -301,7 +302,7 @@ export const SHARED_TOOL_SPECS = {
   // --- two-id read tool ---
 
   getNode: {
-    mcpName: 'get_node',
+    mcpName: 'getNode',
     inAppKey: 'getNode',
     description:
       "Fetch a single node's full ProseMirror subtree (lossless) without " +
@@ -323,21 +324,21 @@ export const SHARED_TOOL_SPECS = {
   // --- in-page occurrence search (client-side, over ProseMirror plain text) ---
 
   searchInPage: {
-    mcpName: 'search_in_page',
+    mcpName: 'searchInPage',
     inAppKey: 'searchInPage',
     description:
       'Find every occurrence of a string (or regex) INSIDE one page and get ' +
-      'WHERE each is — instead of pulling blocks one-by-one with get_node. ' +
+      'WHERE each is — instead of pulling blocks one-by-one with getNode. ' +
       'Searches the plain text of each text block/cell (marks glued, so a match ' +
       'survives bold/italic/link splits; comment anchors do not interfere). ' +
       'Returns { total, truncated, matches:[{ nodeId, blockIndex, type, before, ' +
       'match, after }] }: `nodeId` is the block id (or "#<index>" for ' +
-      'table/cell content) — pass it to get_node/patch_node (the "#<index>" ' +
-      'form resolves with get_node but NOT patch_node, which only accepts a real ' +
-      'block id). To anchor a comment, do NOT pass nodeId to create_comment (it ' +
+      'table/cell content) — pass it to getNode/patchNode (the "#<index>" ' +
+      'form resolves with getNode but NOT patchNode, which only accepts a real ' +
+      'block id). To anchor a comment, do NOT pass nodeId to createComment (it ' +
       'has no nodeId param); build a UNIQUE text selection from before+match+' +
-      'after and pass it as create_comment\'s `selection`. `blockIndex` is the ' +
-      'get_outline index; `before`/`after` give ~40 chars of context to build ' +
+      'after and pass it as createComment\'s `selection`. `blockIndex` is the ' +
+      'getOutline index; `before`/`after` give ~40 chars of context to build ' +
       'that unique selection. `total` counts all ' +
       'hits and `truncated` is true when more than `limit` were found (nothing ' +
       'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
@@ -386,7 +387,7 @@ export const SHARED_TOOL_SPECS = {
   // --- node delete ---
 
   deleteNode: {
-    mcpName: 'delete_node',
+    mcpName: 'deleteNode',
     inAppKey: 'deleteNode',
     description:
       'Remove a single block by its attrs.id (from the page outline or ' +
@@ -408,10 +409,10 @@ export const SHARED_TOOL_SPECS = {
   // AND the in-app copy's "keeps the same node id" + "Reversible via page
   // history" framing — nothing either side conveyed is dropped. Sibling tools are
   // named in transport-neutral prose ("the page-JSON view", "a full-document
-  // replace") to match the rest of the registry, since the two layers expose
-  // those siblings under different (snake_case vs camelCase) identifiers.
+  // replace") to match the rest of the registry, so a description reads the same
+  // on both layers.
   patchNode: {
-    mcpName: 'patch_node',
+    mcpName: 'patchNode',
     inAppKey: 'patchNode',
     description:
       'Replace a single content block identified by its attrs.id with a new ' +
@@ -457,7 +458,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   insertNode: {
-    mcpName: 'insert_node',
+    mcpName: 'insertNode',
     inAppKey: 'insertNode',
     description:
       'Insert a block before/after another block (by attrs.id or anchor text) ' +
@@ -525,7 +526,7 @@ export const SHARED_TOOL_SPECS = {
   // "per-transport divergence" note on the old inline copies was stale), so
   // there was no real behavioral divergence to preserve — only wording drift.
   sharePage: {
-    mcpName: 'share_page',
+    mcpName: 'sharePage',
     inAppKey: 'sharePage',
     // CANONICAL: merges the MCP copy's URL-format + idempotency detail with the
     // in-app copy's reversibility note; keeps the security framing both had.
@@ -554,7 +555,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   unsharePage: {
-    mcpName: 'unshare_page',
+    mcpName: 'unsharePage',
     inAppKey: 'unsharePage',
     description: 'Remove the public share of a page (revokes the public URL).',
     tier: 'deferred',
@@ -568,7 +569,7 @@ export const SHARED_TOOL_SPECS = {
   // --- version history ---
 
   diffPageVersions: {
-    mcpName: 'diff_page_versions',
+    mcpName: 'diffPageVersions',
     inAppKey: 'diffPageVersions',
     description:
       'Diff two versions of a page and return a Docmost-equivalent change set ' +
@@ -600,7 +601,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   listPageHistory: {
-    mcpName: 'list_page_history',
+    mcpName: 'listPageHistory',
     inAppKey: 'listPageHistory',
     description:
       "List a page's saved versions (Docmost auto-snapshots on every save), " +
@@ -621,7 +622,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   restorePageVersion: {
-    mcpName: 'restore_page_version',
+    mcpName: 'restorePageVersion',
     inAppKey: 'restorePageVersion',
     description:
       'Restore a page to a saved version: writes that version\'s content back ' +
@@ -641,13 +642,13 @@ export const SHARED_TOOL_SPECS = {
   // --- markdown round-trip ---
 
   importPageMarkdown: {
-    mcpName: 'import_page_markdown',
+    mcpName: 'importPageMarkdown',
     inAppKey: 'importPageMarkdown',
     // IN-APP ONLY (issue #411): the external /mcp surface no longer exposes
-    // import_page_markdown — the registry loop in index.ts skips inAppOnly specs,
+    // importPageMarkdown — the registry loop in index.ts skips inAppOnly specs,
     // so this stays available to the in-app agent (round-tripping an EXPORTED
     // Docmost-Markdown file) but is removed from the public MCP tool set. Plain
-    // authoring-markdown body replace on the MCP surface is update_page_markdown.
+    // authoring-markdown body replace on the MCP surface is updatePageMarkdown.
     inAppOnly: true,
     description:
       "Replace a page's content from a self-contained Docmost-flavoured " +
@@ -670,7 +671,7 @@ export const SHARED_TOOL_SPECS = {
   // --- server-side content copy ---
 
   copyPageContent: {
-    mcpName: 'copy_page_content',
+    mcpName: 'copyPageContent',
     inAppKey: 'copyPageContent',
     description:
       "Replace targetPageId's content with a copy of sourcePageId's content, " +
@@ -698,7 +699,7 @@ export const SHARED_TOOL_SPECS = {
   // stale MCP claim that "Markdown wrappers are tolerated via a strip-and-retry
   // fallback" is intentionally absent here.
   editPageText: {
-    mcpName: 'edit_page_text',
+    mcpName: 'editPageText',
     inAppKey: 'editPageText',
     description:
       "Surgical find/replace inside a page's text, preserving all block " +
@@ -747,10 +748,10 @@ export const SHARED_TOOL_SPECS = {
 
   // --- hand a large page to an external consumer without bloating context ---
   stashPage: {
-    mcpName: 'stash_page',
+    mcpName: 'stashPage',
     inAppKey: 'stashPage',
     description:
-      'Serialize a whole page (the full ProseMirror JSON, as get_page_json ' +
+      'Serialize a whole page (the full ProseMirror JSON, as getPageJson ' +
       'returns) into an ephemeral in-memory blob and return ONLY a short ' +
       'anonymous URL to it — the body NEVER enters the model context, so this ' +
       'is the way to hand a large page (or its images) to an external consumer ' +
@@ -808,7 +809,7 @@ export const SHARED_TOOL_SPECS = {
   // in-app layer deliberately allowed a looser value (documented per field).
 
   getPage: {
-    mcpName: 'get_page',
+    mcpName: 'getPage',
     inAppKey: 'getPage',
     description:
       'Fetch a single page as Markdown by its id. Returns the page title and ' +
@@ -841,7 +842,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   listPages: {
-    mcpName: 'list_pages',
+    mcpName: 'listPages',
     inAppKey: 'listPages',
     description:
       'List the most recent pages (ordered by updatedAt, descending), ' +
@@ -884,7 +885,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   createPage: {
-    mcpName: 'create_page',
+    mcpName: 'createPage',
     inAppKey: 'createPage',
     description:
       'Create a new page with a Markdown body in a space, optionally under a ' +
@@ -896,7 +897,7 @@ export const SHARED_TOOL_SPECS = {
     // Reconciled schema DRIFT: the MCP copy pinned `content` to .min(1) while
     // the in-app copy left it unbounded and DOCUMENTS an empty body as valid
     // ("may be empty") — creating an empty page to fill in later is a real use
-    // case. The looser (no-min) form is kept, so create_page now also accepts an
+    // case. The looser (no-min) form is kept, so createPage now also accepts an
     // empty body (harmless — it creates an empty page) and no previously-valid
     // in-app input is ever rejected. `title`/`spaceId` keep the MCP .min(1)
     // (an empty title or space is never valid).
@@ -934,7 +935,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   movePage: {
-    mcpName: 'move_page',
+    mcpName: 'movePage',
     inAppKey: 'movePage',
     description:
       'Move a page under a new parent page, or to the space root when no ' +
@@ -1027,7 +1028,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   renamePage: {
-    mcpName: 'rename_page',
+    mcpName: 'renamePage',
     inAppKey: 'renamePage',
     description:
       'Rename a page (change its title only; the body is untouched, never ' +
@@ -1048,7 +1049,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   deletePage: {
-    mcpName: 'delete_page',
+    mcpName: 'deletePage',
     inAppKey: 'deletePage',
     description:
       'Move a page to the trash — SOFT delete only: the page can be restored ' +
@@ -1081,7 +1082,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   updatePageJson: {
-    mcpName: 'update_page_json',
+    mcpName: 'updatePageJson',
     inAppKey: 'updatePageJson',
     description:
       "Replace a page's content with a raw ProseMirror JSON document (lossless " +
@@ -1137,8 +1138,7 @@ export const SHARED_TOOL_SPECS = {
   // registry loop registers it on BOTH hosts (external MCP + in-app agent) —
   // #411 replaced the old inline in-app `updatePageContent` tool with this.
   updatePageMarkdown: {
-    // snake_case for now; camelCase public MCP naming is the next issue (#412).
-    mcpName: 'update_page_markdown',
+    mcpName: 'updatePageMarkdown',
     inAppKey: 'updatePageMarkdown',
     description:
       "Replace a page's body with new Markdown content (and optionally its " +
@@ -1172,7 +1172,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   exportPageMarkdown: {
-    mcpName: 'export_page_markdown',
+    mcpName: 'exportPageMarkdown',
     inAppKey: 'exportPageMarkdown',
     // CANONICAL: the MCP copy (a strict superset of the terse in-app wording).
     description:
@@ -1204,19 +1204,19 @@ export const SHARED_TOOL_SPECS = {
 
   // --- comment tools (unified from the per-layer inline definitions, #294) ---
   //
-  // create_comment and resolve_comment previously carried a "per-transport
+  // createComment and resolveComment previously carried a "per-transport
   // divergence" note in BOTH layers; #294 unifies their schema + description
   // here. Only the four tools that genuinely exist in BOTH layers live in the
-  // registry: create/list/resolve comment and check_new_comments.
+  // registry: create/list/resolve comment and checkNewComments.
   //
-  // update_comment and delete_comment are intentionally NOT here: they exist
+  // updateComment and deleteComment are intentionally NOT here: they exist
   // ONLY on the standalone MCP server. The in-app agent deliberately exposes no
   // hard comment edit/delete tool (comment edits are irreversible / not
   // version-tracked; see the guardrail tests in ai-chat-tools.service.spec.ts),
   // so there is nothing to unify — they stay inline in index.ts.
 
   createComment: {
-    mcpName: 'create_comment',
+    mcpName: 'createComment',
     inAppKey: 'createComment',
     // CANONICAL: the in-app copy (the more-maintained one). It keeps the same
     // rules as the MCP copy — inline-only, top-level requires a `selection`, no
@@ -1231,7 +1231,7 @@ export const SHARED_TOOL_SPECS = {
       '(which gets highlighted); page-level comments are NOT supported. A ' +
       'new top-level comment REQUIRES a `selection`. Replies inherit the ' +
       "parent's anchor and take no selection. Always COPY the `selection` " +
-      'VERBATIM from get_page / search_in_page output — do NOT quote it from ' +
+      'VERBATIM from getPage / searchInPage output — do NOT quote it from ' +
       'memory (stale-memory quoting is the top cause of anchor misses). If the ' +
       'call fails with a "selection not found" error, the error quotes the ' +
       "closest block text (or says the selection spans multiple blocks); retry " +
@@ -1284,25 +1284,25 @@ export const SHARED_TOOL_SPECS = {
     }),
     // Both hosts enforce the SAME guardrails (a top-level comment requires a
     // selection; suggestedText is forbidden on a reply / without a selection) but
-    // with per-layer error wording (snake_case 'create_comment:' on the MCP
-    // surface, camelCase 'createComment' in-app) and different result shapes (MCP
-    // jsonContent, in-app projects `{ commentId, pageId }`). Preserved byte-for-
-    // byte via the two overrides.
+    // with per-layer error wording (both now prefixed 'createComment', the MCP
+    // and in-app messages differing only in their trailing guidance) and different
+    // result shapes (MCP jsonContent, in-app projects `{ commentId, pageId }`).
+    // Preserved byte-for-byte via the two overrides.
     mcpExecute: async (client, { pageId, content, selection, parentCommentId, suggestedText }) => {
       if (!parentCommentId && (!selection || !(selection as string).trim())) {
         throw new Error(
-          "create_comment: a 'selection' (exact text to anchor on) is required for a top-level comment; omit it only when replying via parentCommentId.",
+          "createComment: a 'selection' (exact text to anchor on) is required for a top-level comment; omit it only when replying via parentCommentId.",
         );
       }
       if (suggestedText !== undefined) {
         if (parentCommentId) {
           throw new Error(
-            "create_comment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
+            "createComment: 'suggestedText' cannot be attached to a reply; it applies only to a top-level inline comment.",
           );
         }
         if (!selection || !(selection as string).trim()) {
           throw new Error(
-            "create_comment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
+            "createComment: 'suggestedText' requires a 'selection' to anchor and rewrite.",
           );
         }
       }
@@ -1348,7 +1348,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   listComments: {
-    mcpName: 'list_comments',
+    mcpName: 'listComments',
     inAppKey: 'listComments',
     // CANONICAL: the two copies are near-identical; the MCP copy is the
     // superset (it keeps the "(pagination is handled internally)" note the
@@ -1375,10 +1375,10 @@ export const SHARED_TOOL_SPECS = {
   },
 
   resolveComment: {
-    mcpName: 'resolve_comment',
+    mcpName: 'resolveComment',
     inAppKey: 'resolveComment',
-    // CANONICAL: the MCP copy's richer wording, minus its snake_case reference
-    // to `delete_comment` (a sibling tool that does NOT exist in the in-app
+    // CANONICAL: the MCP copy's richer wording, minus its reference
+    // to `deleteComment` (a sibling tool that does NOT exist in the in-app
     // layer) — rephrased transport-neutrally per the registry convention.
     description:
       'Resolve (close) or reopen a top-level comment thread (reversible — ' +
@@ -1415,7 +1415,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   checkNewComments: {
-    mcpName: 'check_new_comments',
+    mcpName: 'checkNewComments',
     inAppKey: 'checkNewComments',
     // CANONICAL: the MCP copy (the more detailed of the two). The MCP layer's
     // execute-side guard that rejects an unparseable `since` timestamp stays in
@@ -1486,15 +1486,15 @@ export const SHARED_TOOL_SPECS = {
   // behavior) plus the in-app copy's "Reversible via page history" note; sibling
   // tool references are phrased transport-neutrally.
   //
-  // NOT here (kept inline in index.ts): table_get / getTable. Its MCP tool name
-  // is noun-first (`table_get`) while the in-app key is verb-first (`getTable`),
-  // so it breaks the snake_case(inAppKey) naming convention the registry enforces
-  // (shared-tool-specs.contract.spec.ts). Renaming the public MCP tool would
-  // break external clients, so it stays per-transport (its in-app param was still
-  // aligned to `table` for consistency with the migrated trio below).
+  // NOT here (kept inline in index.ts): tableGet / getTable. Its MCP tool name
+  // is noun-first (`tableGet`) while the in-app key is verb-first (`getTable`),
+  // so it breaks the mcpName === inAppKey naming convention the registry enforces
+  // (shared-tool-specs.contract.spec.ts). Renaming either public name would break
+  // external clients or the in-app tool key, so it stays per-transport (its in-app
+  // param was still aligned to `table` for consistency with the migrated trio below).
 
   tableInsertRow: {
-    mcpName: 'table_insert_row',
+    mcpName: 'tableInsertRow',
     inAppKey: 'tableInsertRow',
     description:
       'Insert a row of plain-text cells into a table. `table` is `#<index>` ' +
@@ -1527,7 +1527,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   tableDeleteRow: {
-    mcpName: 'table_delete_row',
+    mcpName: 'tableDeleteRow',
     inAppKey: 'tableDeleteRow',
     description:
       'Delete the row at 0-based `index` from a table (`table` is `#<index>` ' +
@@ -1550,7 +1550,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   tableUpdateCell: {
-    mcpName: 'table_update_cell',
+    mcpName: 'tableUpdateCell',
     inAppKey: 'tableUpdateCell',
     description:
       'Set the plain-text content of cell [row, col] (0-based) in a table ' +
@@ -1590,7 +1590,7 @@ export const SHARED_TOOL_SPECS = {
   // external MCP clients see identical tool names, fields and text.
 
   insertFootnote: {
-    mcpName: 'insert_footnote',
+    mcpName: 'insertFootnote',
     inAppKey: 'insertFootnote',
     description:
       'Insert an AUTHOR-INLINE footnote: you specify only WHERE (anchorText) ' +
@@ -1627,7 +1627,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   insertImage: {
-    mcpName: 'insert_image',
+    mcpName: 'insertImage',
     inAppKey: 'insertImage',
     description:
       'Download an image from a web (http/https) URL and insert it into ' +
@@ -1671,7 +1671,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   replaceImage: {
-    mcpName: 'replace_image',
+    mcpName: 'replaceImage',
     inAppKey: 'replaceImage',
     description:
       'Replace an existing image on a page with a new image fetched from a web ' +
@@ -1709,15 +1709,15 @@ export const SHARED_TOOL_SPECS = {
   // --- draw.io diagrams (issue #423 stage 1, #424 stage 2) ---
 
   drawioGet: {
-    mcpName: 'drawio_get',
+    mcpName: 'drawioGet',
     inAppKey: 'drawioGet',
     description:
       'Read a draw.io diagram on a page as mxGraph XML (default) or as its raw ' +
-      '`.drawio.svg`. `node` is the drawio node\'s attrs.id (from get_outline / ' +
-      'get_page_json) or "#<index>" for a top-level block. Returns the decoded ' +
+      '`.drawio.svg`. `node` is the drawio node\'s attrs.id (from getOutline / ' +
+      'getPageJson) or "#<index>" for a top-level block. Returns the decoded ' +
       'mxGraphModel XML plus meta { attachmentId, title, width, height, ' +
       'cellCount, hash }. `hash` is the optimistic-lock key you MUST pass back ' +
-      'as baseHash to drawio_update. Diagrams a human saved from the editor ' +
+      'as baseHash to drawioUpdate. Diagrams a human saved from the editor ' +
       '(including draw.io\'s compressed format) decode losslessly.',
     tier: 'deferred',
     catalogLine:
@@ -1742,7 +1742,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   drawioCreate: {
-    mcpName: 'drawio_create',
+    mcpName: 'drawioCreate',
     inAppKey: 'drawioCreate',
     description:
       'Create a draw.io diagram from mxGraph XML and insert it as a diagram ' +
@@ -1753,14 +1753,14 @@ export const SHARED_TOOL_SPECS = {
       'source/target and every parent resolve, style parses, no XML comments, ' +
       'value escaping) — a violation returns a structured error naming the rule ' +
       'and cellId so you can fix and retry. `where` positions the block like ' +
-      'insert_node: position before/after (with exactly one of anchorNodeId or ' +
+      'insertNode: position before/after (with exactly one of anchorNodeId or ' +
       'anchorText) or append. Returns { nodeId, attachmentId, warnings }. The ' +
       'returned `nodeId` is an index-based "#<index>" handle (drawio nodes carry ' +
       'no attrs.id): it addresses the new top-level block and can be fed straight ' +
-      'back into drawio_get / drawio_update for THIS document. It is positional, ' +
-      'so if you add or remove blocks before it, re-resolve via get_outline. The ' +
+      'back into drawioGet / drawioUpdate for THIS document. It is positional, ' +
+      'so if you add or remove blocks before it, re-resolve via getOutline. The ' +
       'diagram is editable in the draw.io editor and can be re-read with ' +
-      'drawio_get.' +
+      'drawioGet.' +
       DRAWIO_HARD_RULES,
     tier: 'deferred',
     catalogLine:
@@ -1812,14 +1812,14 @@ export const SHARED_TOOL_SPECS = {
   },
 
   drawioUpdate: {
-    mcpName: 'drawio_update',
+    mcpName: 'drawioUpdate',
     inAppKey: 'drawioUpdate',
     description:
       'Replace a draw.io diagram\'s content with new mxGraph XML (same lint ' +
-      'pipeline as drawio_create). `baseHash` is MANDATORY: pass the hash from ' +
-      'the drawio_get you based the edit on. If the diagram changed since ' +
+      'pipeline as drawioCreate). `baseHash` is MANDATORY: pass the hash from ' +
+      'the drawioGet you based the edit on. If the diagram changed since ' +
       '(a human or another agent edited it) the hash mismatches and the update ' +
-      'is refused with a conflict error — re-read with drawio_get and retry. On ' +
+      'is refused with a conflict error — re-read with drawioGet and retry. On ' +
       'success it overwrites the diagram attachment and updates the node ' +
       'width/height. `node` is the drawio node attrs.id or "#<index>".' +
       DRAWIO_HARD_RULES,
@@ -1841,7 +1841,7 @@ export const SHARED_TOOL_SPECS = {
       baseHash: z
         .string()
         .min(1)
-        .describe('The meta.hash from the drawio_get this edit is based on.'),
+        .describe('The meta.hash from the drawioGet this edit is based on.'),
       layout: z
         .enum(['elk'])
         .optional()
@@ -1863,7 +1863,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   drawioShapes: {
-    mcpName: 'drawio_shapes',
+    mcpName: 'drawioShapes',
     inAppKey: 'drawioShapes',
     description:
       'Look up VERIFIED draw.io stencil style-strings so you never guess a ' +
@@ -1876,7 +1876,7 @@ export const SHARED_TOOL_SPECS = {
       'stencils to working replacements (e.g. dynamodb_table -> dynamodb) with a ' +
       'note. Each hit is { style, w, h, title, type, category?, note? } — copy ' +
       '`style` verbatim onto the cell and use w/h as the default size. Call this ' +
-      'BEFORE drawio_create/drawio_update whenever you need a specific icon ' +
+      'BEFORE drawioCreate/drawioUpdate whenever you need a specific icon ' +
       '(AWS/Azure/GCP/network/UML/flowchart).',
     tier: 'deferred',
     catalogLine:
@@ -1895,7 +1895,7 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Max results (default 12, capped at 50).'),
     }),
-    // INLINE on both hosts (no `execute`): drawio_shapes calls the PURE helper
+    // INLINE on both hosts (no `execute`): drawioShapes calls the PURE helper
     // searchShapes, which is NOT a client method — it reads the bundled shape
     // catalog via `import.meta.url` (drawio-shapes.ts). tool-specs.ts is
     // type-checked FROM SOURCE by the in-app server under module:commonjs, where a
@@ -1909,7 +1909,7 @@ export const SHARED_TOOL_SPECS = {
   },
 
   drawioGuide: {
-    mcpName: 'drawio_guide',
+    mcpName: 'drawioGuide',
     inAppKey: 'drawioGuide',
     description:
       'Progressive-disclosure draw.io authoring reference. Call with a `section` ' +
@@ -1920,7 +1920,7 @@ export const SHARED_TOOL_SPECS = {
       'child coords, cross-container edges, swimlanes), "icons-aws" (the ' +
       'service/resource icon patterns, category colors, rebrandings, blocklist), ' +
       '"icons-azure" (portable image-style paths). Omit `section` to get the ' +
-      'index of sections. Pair with drawio_shapes for exact stencil styles.',
+      'index of sections. Pair with drawioShapes for exact stencil styles.',
     tier: 'deferred',
     catalogLine:
       'drawioGuide — on-demand draw.io authoring reference (skeleton/layout/containers/icons).',
@@ -1930,10 +1930,10 @@ export const SHARED_TOOL_SPECS = {
         .optional()
         .describe('Which section to read; omit for the section index.'),
     }),
-    // INLINE on both hosts (no `execute`) — same reason as drawio_shapes above:
-    // drawio_guide calls the PURE helper getGuideSection (drawio-guide.ts, no
+    // INLINE on both hosts (no `execute`) — same reason as drawioShapes above:
+    // drawioGuide calls the PURE helper getGuideSection (drawio-guide.ts, no
     // client, no network). getGuideSection itself has no `import.meta`, but it is
-    // kept inline for SYMMETRY with drawio_shapes (both drawio helper tools wired
+    // kept inline for SYMMETRY with drawioShapes (both drawio helper tools wired
     // the same way in one place) and to avoid pulling any drawio lib source into
     // the in-app server's commonjs type-check. `inlineBothHosts` makes both loops
     // skip it; index.ts and ai-chat-tools.service.ts register it directly.

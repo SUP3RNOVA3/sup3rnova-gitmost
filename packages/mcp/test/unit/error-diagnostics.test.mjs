@@ -258,7 +258,7 @@ test("a non-axios error is passed through untouched", () => {
 const GOOD_UUID = "019f499a-9f8c-7d68-b7be-ce100d7c6c56";
 
 test("assertFullUuid accepts a full canonical UUID (any version nibble)", () => {
-  assert.doesNotThrow(() => assertFullUuid("resolve_comment", "commentId", GOOD_UUID));
+  assert.doesNotThrow(() => assertFullUuid("resolveComment", "commentId", GOOD_UUID));
   // A v4 id also passes (version/variant-agnostic).
   assert.doesNotThrow(() =>
     assertFullUuid("get_comment", "commentId", "3d5b7c1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e"),
@@ -267,10 +267,10 @@ test("assertFullUuid accepts a full canonical UUID (any version nibble)", () => 
 
 test("assertFullUuid rejects a truncated prefix", () => {
   assert.throws(
-    () => assertFullUuid("resolve_comment", "commentId", "019f499a"),
+    () => assertFullUuid("resolveComment", "commentId", "019f499a"),
     (e) =>
       e.message.startsWith(
-        "resolve_comment: 'commentId' must be the FULL comment UUID",
+        "resolveComment: 'commentId' must be the FULL comment UUID",
       ) &&
       e.message.includes("got '019f499a'") &&
       e.message.includes("Copy the id verbatim"),
@@ -279,11 +279,11 @@ test("assertFullUuid rejects a truncated prefix", () => {
 
 test("assertFullUuid rejects garbage and empty string", () => {
   assert.throws(
-    () => assertFullUuid("delete_comment", "commentId", "not-a-uuid"),
+    () => assertFullUuid("deleteComment", "commentId", "not-a-uuid"),
     /must be the FULL comment UUID.*got 'not-a-uuid'/s,
   );
   assert.throws(
-    () => assertFullUuid("update_comment", "commentId", ""),
+    () => assertFullUuid("updateComment", "commentId", ""),
     /must be the FULL comment UUID.*got ''/s,
   );
 });
@@ -436,14 +436,14 @@ test("all 5 comment-id call sites reject a bad id with ZERO network traffic", as
   const client = new DocmostClient(baseURL, "u@example.com", "pw");
   const bad = "019f499a"; // truncated
 
-  await assert.rejects(() => client.resolveComment(bad, true), /resolve_comment: 'commentId'/);
-  await assert.rejects(() => client.updateComment(bad, "hi"), /update_comment: 'commentId'/);
-  await assert.rejects(() => client.deleteComment(bad), /delete_comment: 'commentId'/);
+  await assert.rejects(() => client.resolveComment(bad, true), /resolveComment: 'commentId'/);
+  await assert.rejects(() => client.updateComment(bad, "hi"), /updateComment: 'commentId'/);
+  await assert.rejects(() => client.deleteComment(bad), /deleteComment: 'commentId'/);
   await assert.rejects(() => client.getComment(bad), /get_comment: 'commentId'/);
   // createComment validates parentCommentId only when provided.
   await assert.rejects(
     () => client.createComment("page-1", "body", "inline", "sel", bad),
-    /create_comment: 'parentCommentId'/,
+    /createComment: 'parentCommentId'/,
   );
 
   assert.equal(requests, 0, "no request (not even /auth/login) may be issued for a bad id");

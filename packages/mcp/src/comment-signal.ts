@@ -57,17 +57,14 @@ export const DEFAULT_COMMENT_SIGNAL_DEBOUNCE_MS = 20_000;
 
 /**
  * Tools whose OWN result must NOT carry the signal — it would be tautological
- * (the agent is already looking at comments) and noisy. Listed in BOTH the
- * standalone MCP snake_case names AND the in-app camelCase keys so a single set
- * covers both surfaces (the signal text itself uses the camelCase `listComments`
- * per roadmap #412). `getComment` (single fetch) is intentionally NOT excluded.
+ * (the agent is already looking at comments) and noisy. Since issue #412 both
+ * the standalone MCP surface and the in-app agent use the same camelCase tool
+ * names, so a single set of camelCase names covers both surfaces. `getComment`
+ * (single fetch) is intentionally NOT excluded.
  */
 export const COMMENT_SIGNAL_EXCLUDED_TOOLS: ReadonlySet<string> = new Set([
-  "list_comments",
   "listComments",
-  "check_new_comments",
   "checkNewComments",
-  "create_comment",
   "createComment",
 ]);
 

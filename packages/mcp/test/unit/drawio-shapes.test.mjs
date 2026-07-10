@@ -1,4 +1,4 @@
-// Unit tests for the drawio_shapes verified-stencil catalog (issue #424).
+// Unit tests for the drawioShapes verified-stencil catalog (issue #424).
 // Covers acceptance #1: a "lambda" query returns a valid mxgraph.aws4 icon with
 // the right service/resource pattern + sizes; a blocklisted stencil query
 // returns its working replacement.
@@ -22,7 +22,7 @@ test("the bundled index loads and is the real ~10k-shape catalog", () => {
   }
 });
 
-test('drawio_shapes("lambda") returns a valid mxgraph.aws4 service icon', () => {
+test('drawioShapes("lambda") returns a valid mxgraph.aws4 service icon', () => {
   const results = searchShapes("lambda", { limit: 5 });
   assert.ok(results.length > 0);
   // Acceptance #1: a valid aws4 service-level icon (resourceIcon + resIcon)

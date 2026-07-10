@@ -1,4 +1,4 @@
-// Verified draw.io shape catalog for the `drawio_shapes` tool (issue #424,
+// Verified draw.io shape catalog for the `drawioShapes` tool (issue #424,
 // stage 2). This is the fix for AI-generated diagrams' #1 defect: guessed
 // `shape=mxgraph.*` names that render as EMPTY BOXES because the stencil does
 // not exist. Instead of guessing, the model queries this catalog and gets back

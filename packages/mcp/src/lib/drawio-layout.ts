@@ -19,7 +19,7 @@ const DEFAULT_W = 140;
 const DEFAULT_H = 60;
 
 // DoS bounds for the in-process ELK layout. The mxGraph XML is LLM-supplied
-// (layout:"elk" in drawio_create/drawio_update) and elkjs runs synchronously on
+// (layout:"elk" in drawioCreate/drawioUpdate) and elkjs runs synchronously on
 // the MCP server's event loop, so an unbounded graph would block it for
 // seconds-to-minutes. A ~1MB XML (well under the stage-1 16MB cap) can carry
 // thousands of nodes. We cap the graph size and race the layout against a
@@ -81,7 +81,7 @@ interface ElkGraph extends ElkNode {
 /**
  * Apply an ELK layered layout to a drawio input and return a full mxGraphModel
  * string with rewritten geometry. Accepts the same three input forms as
- * drawio_create (a bare model, an <mxfile>, or a <mxCell> list). Async because
+ * drawioCreate (a bare model, an <mxfile>, or a <mxCell> list). Async because
  * elkjs' layout() is promise-based. On any layout failure the ORIGINAL
  * (normalized) model is returned unchanged — layout is best-effort polish, never
  * a reason to fail the write.

@@ -139,7 +139,7 @@ export type DocmostMcpConfig = { apiUrl: string } & (
     // both branches; see the type doc above.
     getCollabToken?: () => Promise<string>;
     // Optional blob sandbox sink. Present only where the stash tool is wired;
-    // when absent, stash_page throws a clear "not configured" error. The
+    // when absent, stashPage throws a clear "not configured" error. The
     // optional `has`/`evict` probes let stashPage keep its mirror counts honest
     // under the store's FIFO eviction (see stashPage); older sinks omit them.
     sandbox?: {
@@ -236,7 +236,7 @@ export function assertFullUuid(
     throw new Error(
       `${tool}: '${param}' must be the FULL comment UUID (36 chars, e.g. ` +
         `019f499a-9f8c-7d68-b7be-ce100d7c6c56), got '${value}'. Copy the id ` +
-        `verbatim from list_comments / create_comment output.`,
+        `verbatim from listComments / createComment output.`,
     );
   }
 }
@@ -816,7 +816,7 @@ export class DocmostClient {
     if (tree) {
       if (!spaceId) {
         throw new Error(
-          "list_pages: tree mode requires a spaceId (a page tree is scoped to one space). Pass spaceId, or omit tree to get the recent-pages list.",
+          "listPages: tree mode requires a spaceId (a page tree is scoped to one space). Pass spaceId, or omit tree to get the recent-pages list.",
         );
       }
       const { pages } = await this.enumerateSpacePages(spaceId);
@@ -946,7 +946,7 @@ export class DocmostClient {
     // listSidebarPages(spaceId, rootPageId) returns only the root's CHILDREN.
     // The `visited` set below prevents a double-add if the root also appears
     // among the children. getPageRaw returns a page whose id/title/spaceId are
-    // exactly what buildPageTree and check_new_comments consume.
+    // exactly what buildPageTree and checkNewComments consume.
     if (rootPageId) {
       try {
         const root = await this.getPageRaw(rootPageId);
@@ -1033,7 +1033,7 @@ export class DocmostClient {
     const resultData = await this.getPageRaw(pageId);
 
     // Agent read: hide resolved-comment anchors so the agent sees only active
-    // discussions. Active anchors are kept. (The lossless export_page_markdown
+    // discussions. Active anchors are kept. (The lossless exportPageMarkdown
     // round-trip deliberately does NOT pass this flag — resolved anchors there
     // must be preserved.)
     let content = resultData.content
@@ -1146,12 +1146,12 @@ export class DocmostClient {
   }> {
     if (!this.sandboxPut) {
       throw new Error(
-        "stash_page is unavailable: the blob sandbox is not configured on this server",
+        "stashPage is unavailable: the blob sandbox is not configured on this server",
       );
     }
     await this.ensureAuthenticated();
 
-    // Stash the SAME shape get_page_json returns (id/title/.../content), with a
+    // Stash the SAME shape getPageJson returns (id/title/.../content), with a
     // deep clone so the rewrite never mutates anything shared.
     const pageJson = await this.getPageJson(pageId);
     const cloned: any = structuredClone(pageJson);
@@ -1200,7 +1200,7 @@ export class DocmostClient {
             // matching the package's ungated console.warn convention.
             failed++;
             console.warn(
-              `stash_page: failed to mirror "${src}": ${
+              `stashPage: failed to mirror "${src}": ${
                 err instanceof Error ? err.message : String(err)
               }`,
             );
@@ -1220,7 +1220,7 @@ export class DocmostClient {
       mirrored--;
       failed++;
       console.warn(
-        `stash_page: mirrored blob ${mirror.uri} was evicted before the doc ` +
+        `stashPage: mirrored blob ${mirror.uri} was evicted before the doc ` +
           `could safely reference it; reverted its src and counted it as failed`,
       );
     };
@@ -1284,7 +1284,7 @@ export class DocmostClient {
   /**
    * Compact outline of a page's top-level blocks (no full document body).
    * Cheap way to locate sections/tables and grab block ids before drilling in
-   * with get_node / patch_node / insert_node.
+   * with getNode / patchNode / insertNode.
    */
   async getOutline(pageId: string) {
     await this.ensureAuthenticated();
@@ -1312,7 +1312,7 @@ export class DocmostClient {
     );
     if (!hit) {
       throw new Error(
-        `get_node: no node found for "${nodeId}" on page ${pageId} (use a block id from get_outline, or "#<index>" for a top-level block such as a table)`,
+        `getNode: no node found for "${nodeId}" on page ${pageId} (use a block id from getOutline, or "#<index>" for a top-level block such as a table)`,
       );
     }
     return {
@@ -1329,10 +1329,10 @@ export class DocmostClient {
    * each text container (reusing the same `getPageRaw` fetch as the other read
    * tools) — no server search endpoint, no whole-document round-trip through the
    * model. Returns `{ total, truncated, matches }`; each match carries a ref for
-   * get_node/patch_node (the `#<index>` form resolves with get_node but NOT
-   * patch_node — see SearchMatch.nodeId), plus the top-level block index and a
+   * getNode/patchNode (the `#<index>` form resolves with getNode but NOT
+   * patchNode — see SearchMatch.nodeId), plus the top-level block index and a
    * short context window used to build a unique text `selection` for
-   * create_comment (create_comment has no nodeId param). The pure engine
+   * createComment (createComment has no nodeId param). The pure engine
    * (`searchInDoc`) owns the traversal, glue, the RE2 ReDoS-safe regex engine
    * and the empty-query / invalid-or-unsupported-regex errors.
    */
@@ -1348,10 +1348,10 @@ export class DocmostClient {
   }
 
   /**
-   * Read a table as a matrix. `tableRef` is `#<index>` (from get_outline) or a
+   * Read a table as a matrix. `tableRef` is `#<index>` (from getOutline) or a
    * block id of any node inside the table. Returns the cell texts plus a
    * parallel cellIds matrix (each cell's first paragraph id, or null) so a
-   * caller can patch_node a cell for rich-formatted edits. Throws when no table
+   * caller can patchNode a cell for rich-formatted edits. Throws when no table
    * resolves for the reference.
    */
   async getTable(pageId: string, tableRef: string) {
@@ -1360,7 +1360,7 @@ export class DocmostClient {
     const t = readTable(data.content ?? { type: "doc", content: [] }, tableRef);
     if (!t) {
       throw new Error(
-        `table_get: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
+        `tableGet: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from getOutline, or a block id inside the table)`,
       );
     }
     return {
@@ -1415,7 +1415,7 @@ export class DocmostClient {
 
     if (!inserted) {
       throw new Error(
-        `table_insert_row: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
+        `tableInsertRow: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from getOutline, or a block id inside the table)`,
       );
     }
     return {
@@ -1457,7 +1457,7 @@ export class DocmostClient {
 
     if (!deleted) {
       throw new Error(
-        `table_delete_row: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
+        `tableDeleteRow: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from getOutline, or a block id inside the table)`,
       );
     }
     return {
@@ -1509,7 +1509,7 @@ export class DocmostClient {
 
     if (!updated) {
       throw new Error(
-        `table_update_cell: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from get_outline, or a block id inside the table)`,
+        `tableUpdateCell: no table found for "${tableRef}" on page ${pageId} (use "#<index>" from getOutline, or a block id inside the table)`,
       );
     }
     return {
@@ -1846,7 +1846,7 @@ export class DocmostClient {
    * `Unknown node type: undefined`, but only AFTER a collab session was opened
    * and a page lock taken. Calling this BEFORE `getCollabTokenWithReauth` /
    * `mutatePageContent` fails fast: no collab connection, no lock, deterministic
-   * message. `op` names the tool for the message prefix (e.g. "patch_node").
+   * message. `op` names the tool for the message prefix (e.g. "patchNode").
    *
    * `findInvalidNode` derives its "known type" set from the very same
    * `docmostExtensions` the encode path uses, so a node this gate accepts is one
@@ -1878,7 +1878,7 @@ export class DocmostClient {
     if (doc == null) {
       if (!title) {
         throw new Error(
-          "update_page_json: nothing to update (provide content and/or title)",
+          "updatePageJson: nothing to update (provide content and/or title)",
         );
       }
       await this.client.post("/pages/update", { pageId, title });
@@ -1914,7 +1914,7 @@ export class DocmostClient {
     // `type` is a string but NOT a known Docmost schema node (a typo/unknown
     // block) — the same `Unknown node type` the encoder throws — with a rich,
     // path-anchored message, still BEFORE any collab connection.
-    this.assertValidNodeShape("update_page_json", doc);
+    this.assertValidNodeShape("updatePageJson", doc);
 
     // Sanitize URLs before writing. This closes the JSON-path bypass: unlike
     // the markdown link path (which TipTap sanitizes), raw JSON could otherwise
@@ -1971,10 +1971,10 @@ export class DocmostClient {
   async insertFootnote(pageId: string, anchorText: string, text: string) {
     await this.ensureAuthenticated();
     if (!anchorText || !anchorText.trim()) {
-      throw new Error("insert_footnote: anchorText is required");
+      throw new Error("insertFootnote: anchorText is required");
     }
     if (text == null || `${text}`.trim() === "") {
-      throw new Error("insert_footnote: text is required");
+      throw new Error("insertFootnote: text is required");
     }
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
@@ -1991,7 +1991,7 @@ export class DocmostClient {
           // persist when the transform throws, so a missing anchor leaves the
           // page untouched (no partial write).
           throw new Error(
-            `insert_footnote: anchor text not found: ${JSON.stringify(
+            `insertFootnote: anchor text not found: ${JSON.stringify(
               anchorText.slice(0, 80),
             )}`,
           );
@@ -2018,7 +2018,7 @@ export class DocmostClient {
 
   /**
    * Page-locked write seam over collaboration.mutatePageContent. Production just
-   * delegates; it exists as an overridable method so the insert_footnote wrapper
+   * delegates; it exists as an overridable method so the insertFootnote wrapper
    * (transform abort-on-not-found + response shaping) can be unit-tested without
    * standing up a live Hocuspocus collab socket.
    */
@@ -2034,7 +2034,7 @@ export class DocmostClient {
   /**
    * Full-document write seam over collaboration.replacePageContent. Production
    * just delegates; it exists as an overridable method so the full-doc write
-   * tools (update_page_json, copy_page_content) can have their footnote-
+   * tools (updatePageJson, copyPageContent) can have their footnote-
    * canonicalization binding unit-tested without a live Hocuspocus collab socket.
    */
   protected replacePage(
@@ -2165,7 +2165,7 @@ export class DocmostClient {
     // mistake surfaces as a clear error rather than a silent round-trip.
     if (sourcePageId === targetPageId) {
       throw new Error(
-        "copy_page_content: sourcePageId and targetPageId are the same page (no-op copy)",
+        "copyPageContent: sourcePageId and targetPageId are the same page (no-op copy)",
       );
     }
 
@@ -2178,7 +2178,7 @@ export class DocmostClient {
       !Array.isArray(content.content)
     ) {
       throw new Error(
-        `copy_page_content: source page ${sourcePageId} has no usable ProseMirror content to copy`,
+        `copyPageContent: source page ${sourcePageId} has no usable ProseMirror content to copy`,
       );
     }
 
@@ -2262,7 +2262,7 @@ export class DocmostClient {
       // No edit applied: surface an aggregated, actionable error so the caller
       // does not mistake a no-op for a partial success.
       throw new Error(
-        "edit_page_text: no edits were applied (nothing written). " +
+        "editPageText: no edits were applied (nothing written). " +
           failed!.map((f) => `"${f.find}": ${f.reason}`).join("; "),
       );
     }
@@ -2293,14 +2293,14 @@ export class DocmostClient {
     };
 
     // If any applied edit matched only after stripping markdown (the
-    // normalized fallback), warn that edit_page_text preserved existing marks
+    // normalized fallback), warn that editPageText preserved existing marks
     // and did NOT change formatting — so a caller who intended a formatting
-    // change is pointed at patch_node.
+    // change is pointed at patchNode.
     if (results?.some((r) => r.normalized === true)) {
       result.warning =
         "Some edits matched only after stripping markdown from your find string; " +
-        "edit_page_text preserved existing marks (it did not change bold/strike/etc.). " +
-        "If you intended a formatting change, use patch_node.";
+        "editPageText preserved existing marks (it did not change bold/strike/etc.). " +
+        "If you intended a formatting change, use patchNode.";
     }
 
     return result;
@@ -2320,7 +2320,7 @@ export class DocmostClient {
 
     if (!node || typeof node !== "object" || typeof node.type !== "string") {
       throw new Error(
-        "patch_node: `node` must be an object with a string `type`",
+        "patchNode: `node` must be an object with a string `type`",
       );
     }
     // Preserve the block id WITHOUT mutating the caller's object: build a local
@@ -2342,7 +2342,7 @@ export class DocmostClient {
     // lock — the root-only `typeof node.type === "string"` check above never
     // sees nested children, and the encoder's `Unknown node type: undefined`
     // would otherwise only surface after the connection.
-    this.assertValidNodeShape("patch_node", target);
+    this.assertValidNodeShape("patchNode", target);
 
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
@@ -2376,7 +2376,7 @@ export class DocmostClient {
 
     // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
     // the write for any count !== 1). Single shared guard (#159, #185 review).
-    assertUnambiguousMatch("patch_node", "replace", replaced, nodeId, pageId);
+    assertUnambiguousMatch("patchNode", "replace", replaced, nodeId, pageId);
 
     return { success: true, replaced, nodeId, verify: mutation.verify };
   }
@@ -2408,7 +2408,7 @@ export class DocmostClient {
 
     if (!node || typeof node !== "object" || typeof node.type !== "string") {
       throw new Error(
-        "insert_node: `node` must be an object with a string `type`",
+        "insertNode: `node` must be an object with a string `type`",
       );
     }
     if (
@@ -2418,7 +2418,7 @@ export class DocmostClient {
         opts.position !== "append")
     ) {
       throw new Error(
-        'insert_node: `position` must be one of "before", "after", "append"',
+        'insertNode: `position` must be one of "before", "after", "append"',
       );
     }
     if (opts.position === "before" || opts.position === "after") {
@@ -2429,7 +2429,7 @@ export class DocmostClient {
         typeof opts.anchorText === "string" && opts.anchorText.length > 0;
       if (hasId === hasText) {
         throw new Error(
-          `insert_node: position "${opts.position}" requires exactly one of anchorNodeId or anchorText`,
+          `insertNode: position "${opts.position}" requires exactly one of anchorNodeId or anchorText`,
         );
       }
     }
@@ -2437,7 +2437,7 @@ export class DocmostClient {
     // #409: fail fast on a malformed node SHAPE (a nested child with an
     // absent/unknown `type`) BEFORE opening a collab session or taking the page
     // lock — the root-only check above never sees nested children.
-    this.assertValidNodeShape("insert_node", node);
+    this.assertValidNodeShape("insertNode", node);
 
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
@@ -2471,10 +2471,10 @@ export class DocmostClient {
       // markdown/emoji are tolerated only as a strip-and-retry fallback, so a
       // miss usually means the text differs from what's on the page.
       const hint = opts.anchorText
-        ? " anchorText must be the block's literal rendered plain text (no markdown wrappers or emoji); anchorNodeId from get_page_json is more reliable."
+        ? " anchorText must be the block's literal rendered plain text (no markdown wrappers or emoji); anchorNodeId from getPageJson is more reliable."
         : "";
       throw new Error(
-        `insert_node: anchor not found (${anchorDesc}) on page ${pageId}.${hint}`,
+        `insertNode: anchor not found (${anchorDesc}) on page ${pageId}.${hint}`,
       );
     }
 
@@ -2522,7 +2522,7 @@ export class DocmostClient {
 
     // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
     // the write for any count !== 1). Single shared guard (#159, #185 review).
-    assertUnambiguousMatch("delete_node", "delete", deleted, nodeId, pageId);
+    assertUnambiguousMatch("deleteNode", "delete", deleted, nodeId, pageId);
 
     return { success: true, deleted, nodeId, verify: mutation.verify };
   }
@@ -2771,8 +2771,8 @@ export class DocmostClient {
   }
 
   /**
-   * Build the actionable error for a create_comment anchor MISS, porting
-   * edit_page_text's self-correction affordances: an explicit "spans multiple
+   * Build the actionable error for a createComment anchor MISS, porting
+   * editPageText's self-correction affordances: an explicit "spans multiple
    * blocks" message when the selection straddles a block boundary, otherwise a
    * "closest block text" hint quoting the block that holds the selection's
    * longest token. `live` switches the wording between the pre-check (reading the
@@ -2787,14 +2787,14 @@ export class DocmostClient {
     const rolled = live ? " The comment was rolled back." : "";
     if (this.selectionSpansMultipleBlocks(blockTexts, selection)) {
       return new Error(
-        "create_comment: the selection spans multiple blocks; anchor on a " +
+        "createComment: the selection spans multiple blocks; anchor on a " +
           "contiguous fragment within a SINGLE paragraph/block (<=250 chars)." +
           rolled,
       );
     }
     const where = live ? "in the live document" : "in the page";
     return new Error(
-      `create_comment: could not find the selection text ${where} to anchor ` +
+      `createComment: could not find the selection text ${where} to anchor ` +
         "the comment. Provide the EXACT contiguous text from a single " +
         "paragraph/block (<=250 chars)." +
         closestBlockHint(blockTexts, selection) +
@@ -2825,7 +2825,7 @@ export class DocmostClient {
     // network call. Validate only when truthy — a falsy parentCommentId means
     // "top-level comment" (mirrors the isReply computation below), not a reply.
     if (parentCommentId) {
-      assertFullUuid("create_comment", "parentCommentId", parentCommentId);
+      assertFullUuid("createComment", "parentCommentId", parentCommentId);
     }
     await this.ensureAuthenticated();
 
@@ -2838,12 +2838,12 @@ export class DocmostClient {
     if (hasSuggestion) {
       if (isReply) {
         throw new Error(
-          "create_comment: a suggested edit (suggestedText) cannot be attached to a reply; it applies only to a top-level inline comment.",
+          "createComment: a suggested edit (suggestedText) cannot be attached to a reply; it applies only to a top-level inline comment.",
         );
       }
       if (!selection || !selection.trim()) {
         throw new Error(
-          "create_comment: a suggested edit (suggestedText) requires a 'selection' to anchor and rewrite.",
+          "createComment: a suggested edit (suggestedText) requires a 'selection' to anchor and rewrite.",
         );
       }
     }
@@ -2855,7 +2855,7 @@ export class DocmostClient {
     const effectiveType: "page" | "inline" = isReply ? "page" : "inline";
     if (!isReply && (!selection || !selection.trim())) {
       throw new Error(
-        "create_comment: an inline 'selection' (exact text to anchor on) is required for a top-level comment",
+        "createComment: an inline 'selection' (exact text to anchor on) is required for a top-level comment",
       );
     }
 
@@ -2871,7 +2871,7 @@ export class DocmostClient {
     let anchoredSelection: string | null = null;
     // Set when the anchor matched only after stripping markdown from the
     // selection (the strip fallback); surfaced as a soft warning like
-    // edit_page_text does, so a stale-markdown selection is flagged.
+    // editPageText does, so a stale-markdown selection is flagged.
     let anchorNormalized = false;
 
     // For a top-level comment, fail BEFORE creating anything when the selection
@@ -2892,7 +2892,7 @@ export class DocmostClient {
           }
           if (matches >= 2) {
             throw new Error(
-              `create_comment: the suggestion's selection is ambiguous — it occurs ${matches} times in the page. ` +
+              `createComment: the suggestion's selection is ambiguous — it occurs ${matches} times in the page. ` +
                 "A suggested edit must anchor to a UNIQUE location; expand the selection with surrounding context " +
                 "(still <=250 chars) so it appears exactly once.",
             );
@@ -2919,12 +2919,12 @@ export class DocmostClient {
         // enforce) anchoring.
         if (
           e instanceof Error &&
-          (e.message.startsWith("create_comment: could not find the selection") ||
+          (e.message.startsWith("createComment: could not find the selection") ||
             e.message.startsWith(
-              "create_comment: the selection spans multiple blocks",
+              "createComment: the selection spans multiple blocks",
             ) ||
             e.message.startsWith(
-              "create_comment: the suggestion's selection is ambiguous",
+              "createComment: the suggestion's selection is ambiguous",
             ))
         ) {
           throw e;
@@ -2987,7 +2987,7 @@ export class DocmostClient {
     // to roll back here (nothing was created with an id), so just fail loudly.
     if (!newCommentId) {
       throw new Error(
-        "create_comment: the server returned no comment id, so the comment could not be anchored",
+        "createComment: the server returned no comment id, so the comment could not be anchored",
       );
     }
     let anchored = false;
@@ -3064,24 +3064,24 @@ export class DocmostClient {
       await this.safeDeleteComment(newCommentId);
       if (ambiguousInLiveDoc) {
         throw new Error(
-          "create_comment: the suggestion's selection is ambiguous in the live document (multiple occurrences); the comment was rolled back. Expand the selection with surrounding context so it is unique.",
+          "createComment: the suggestion's selection is ambiguous in the live document (multiple occurrences); the comment was rolled back. Expand the selection with surrounding context so it is unique.",
         );
       }
       throw (
         liveNotFoundError ??
         new Error(
-          "create_comment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
+          "createComment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
         )
       );
     }
 
-    // Soft warning (like edit_page_text): the selection only matched after
+    // Soft warning (like editPageText): the selection only matched after
     // stripping markdown, so the caller likely quoted a styled fragment.
     if (anchorNormalized) {
       result.warning =
         "The selection matched only after stripping markdown syntax; the comment " +
         "was anchored on the document's plain text. Copy the selection verbatim " +
-        "from get_page / search_in_page output to avoid this.";
+        "from getPage / searchInPage output to avoid this.";
     }
 
     result.anchored = true;
@@ -3110,7 +3110,7 @@ export class DocmostClient {
 
   async updateComment(commentId: string, content: string) {
     // Fail fast (#436): reject a truncated id before any network call.
-    assertFullUuid("update_comment", "commentId", commentId);
+    assertFullUuid("updateComment", "commentId", commentId);
     await this.ensureAuthenticated();
     // NON-canonicalizing on purpose (comment body — see createComment).
     const jsonContent = await markdownToProseMirror(content);
@@ -3127,7 +3127,7 @@ export class DocmostClient {
 
   async deleteComment(commentId: string) {
     // Fail fast (#436): reject a truncated id before any network call.
-    assertFullUuid("delete_comment", "commentId", commentId);
+    assertFullUuid("deleteComment", "commentId", commentId);
     await this.ensureAuthenticated();
     return this.client
       .post("/comments/delete", { commentId })
@@ -3141,7 +3141,7 @@ export class DocmostClient {
    */
   async resolveComment(commentId: string, resolved: boolean) {
     // Fail fast (#436): reject a truncated id before any network call.
-    assertFullUuid("resolve_comment", "commentId", commentId);
+    assertFullUuid("resolveComment", "commentId", commentId);
     await this.ensureAuthenticated();
     const response = await this.client.post("/comments/resolve", {
       commentId,
@@ -3206,7 +3206,7 @@ export class DocmostClient {
     for (const page of pagesInScope) {
       try {
         // Full feed (incl. resolved): a "new comments since" scan reports all
-        // recent activity; the active-only filter is scoped to list_comments.
+        // recent activity; the active-only filter is scoped to listComments.
         const comments = (await this.listComments(page.id, true)).items;
         const newComments = comments.filter(
           (c: any) => new Date(c.createdAt) > sinceDate,
@@ -3539,7 +3539,7 @@ export class DocmostClient {
     };
 
     // Insert into the LIVE synced document, not the debounced REST snapshot, so
-    // concurrent edits/comments/images are preserved and parallel insert_image
+    // concurrent edits/comments/images are preserved and parallel insertImage
     // calls (serialized by the per-page lock) each see the previous insertion.
     let placement: "replaced" | "after" | "appended" | undefined;
     const mutation = await mutatePageContent(
@@ -3588,7 +3588,7 @@ export class DocmostClient {
           if (matchedBlock && CONTAINER_TYPES.has(matchedBlock.type)) {
             throw new Error(
               `replaceText matched a ${matchedBlock.type} container block; replacing it would destroy the whole structure. ` +
-                `Use afterText to insert near it, or update_page_json for surgical edits.`,
+                `Use afterText to insert near it, or updatePageJson for surgical edits.`,
             );
           }
           doc.content.splice(idx, 1, node);
@@ -3705,7 +3705,7 @@ export class DocmostClient {
 
       if (!matchFound) {
         throw new Error(
-          `replace_image: no image with attachmentId "${oldAttachmentId}" found on page ${pageId}`,
+          `replaceImage: no image with attachmentId "${oldAttachmentId}" found on page ${pageId}`,
         );
       }
 
@@ -3808,7 +3808,7 @@ export class DocmostClient {
   /**
    * Upload a ready-made byte buffer as a page attachment via the same
    * multipart /files/upload endpoint uploadImage uses. Split out as its own
-   * (overridable) seam so drawio_create/update can upload the generated
+   * (overridable) seam so drawioCreate/update can upload the generated
    * `.drawio.svg` without going through the URL-fetch path, and so tests can
    * stub the network. Mirrors uploadImage's fresh-FormData + one-shot 401/403
    * re-auth handling (a FormData body is single-use, so it must be rebuilt per
@@ -3882,7 +3882,7 @@ export class DocmostClient {
   /**
    * Fetch a stored `.drawio.svg` attachment as text. Overridable seam over
    * fetchInternalFile (the authed loopback fetch, which also rejects any
-   * traversal/SSRF src) so drawio_get/update can read the current diagram and
+   * traversal/SSRF src) so drawioGet/update can read the current diagram and
    * tests can stub the bytes.
    */
   protected async fetchAttachmentText(src: string): Promise<string> {
@@ -3906,7 +3906,7 @@ export class DocmostClient {
     );
     if (!hit) {
       throw new Error(
-        `drawio: no node found for "${node}" on page ${pageId} (use the drawio node's attrs.id or "#<index>" from get_outline)`,
+        `drawio: no node found for "${node}" on page ${pageId} (use the drawio node's attrs.id or "#<index>" from getOutline)`,
       );
     }
     if (hit.type !== "drawio") {
@@ -3921,7 +3921,7 @@ export class DocmostClient {
    * Read a drawio diagram as mxGraph XML (default) or as the raw `.drawio.svg`.
    * Runs the decode chain (base64/entity content= → drawio file → nested XML or
    * pako-inflated compressed <diagram>). The returned `hash` is the
-   * optimistic-lock key for drawio_update.
+   * optimistic-lock key for drawioUpdate.
    */
   async drawioGet(
     pageId: string,
@@ -4001,7 +4001,7 @@ export class DocmostClient {
         where.position !== "append")
     ) {
       throw new Error(
-        'drawio_create: `where.position` must be one of "before", "after", "append"',
+        'drawioCreate: `where.position` must be one of "before", "after", "append"',
       );
     }
     if (where.position === "before" || where.position === "after") {
@@ -4011,7 +4011,7 @@ export class DocmostClient {
         typeof where.anchorText === "string" && where.anchorText.length > 0;
       if (hasId === hasText) {
         throw new Error(
-          `drawio_create: position "${where.position}" requires exactly one of anchorNodeId or anchorText`,
+          `drawioCreate: position "${where.position}" requires exactly one of anchorNodeId or anchorText`,
         );
       }
     }
@@ -4091,7 +4091,7 @@ export class DocmostClient {
         ? `anchorNodeId "${where.anchorNodeId}"`
         : `anchorText "${where.anchorText}"`;
       throw new Error(
-        `drawio_create: anchor not found (${anchorDesc}) on page ${pageId}. The diagram attachment ${att.id} is now an unreferenced orphan.`,
+        `drawioCreate: anchor not found (${anchorDesc}) on page ${pageId}. The diagram attachment ${att.id} is now an unreferenced orphan.`,
       );
     }
 
@@ -4101,14 +4101,14 @@ export class DocmostClient {
       // cannot reference it. drawio nodes carry no persisted id, so there is no
       // stable handle for a nested diagram.
       throw new Error(
-        `drawio_create: the diagram was inserted on page ${pageId} but not as a ` +
+        `drawioCreate: the diagram was inserted on page ${pageId} but not as a ` +
           `top-level block, so it has no addressable "#<index>" handle. Anchor ` +
           `on a top-level block (or append) so the diagram can be re-read.`,
       );
     }
 
     // The returned handle is POSITIONAL ("#<index>"): valid for the immediate
-    // create -> get/update flow, but re-resolve via get_outline if the document
+    // create -> get/update flow, but re-resolve via getOutline if the document
     // structure changes (blocks added/removed before it shift the index).
     const nodeId = `#${insertedIndex}`;
 
@@ -4123,7 +4123,7 @@ export class DocmostClient {
 
   /**
    * Full-replacement update of a drawio diagram. `baseHash` is MANDATORY: it is
-   * compared against the hash of the diagram's CURRENT XML (from drawio_get);
+   * compared against the hash of the diagram's CURRENT XML (from drawioGet);
    * any mismatch means a human or another agent edited the diagram after the
    * read, so the write is refused with a conflict error. On success the new
    * `.drawio.svg` is uploaded as a FRESH attachment (in-place byte overwrite is
@@ -4146,7 +4146,7 @@ export class DocmostClient {
     await this.ensureAuthenticated();
     if (typeof baseHash !== "string" || baseHash.length === 0) {
       throw new Error(
-        "drawio_update: baseHash is mandatory — read the diagram with drawio_get first and pass back its meta.hash",
+        "drawioUpdate: baseHash is mandatory — read the diagram with drawioGet first and pass back its meta.hash",
       );
     }
 
@@ -4161,15 +4161,15 @@ export class DocmostClient {
     const nodeId = oldAttrs.id ?? ref;
     if (!oldSrc) {
       throw new Error(
-        `drawio_update: node "${node}" on page ${pageId} has no src to compare against`,
+        `drawioUpdate: node "${node}" on page ${pageId} has no src to compare against`,
       );
     }
     const currentSvg = await this.fetchAttachmentText(oldSrc);
     const currentHash = mxHash(decodeDrawioSvg(currentSvg));
     if (currentHash !== baseHash) {
       throw new Error(
-        `drawio_update: conflict — the diagram changed since it was read ` +
-          `(baseHash ${baseHash} != current ${currentHash}). Re-read it with drawio_get and retry.`,
+        `drawioUpdate: conflict — the diagram changed since it was read ` +
+          `(baseHash ${baseHash} != current ${currentHash}). Re-read it with drawioGet and retry.`,
       );
     }
 
@@ -4305,7 +4305,7 @@ export class DocmostClient {
       typeof version.content !== "object"
     ) {
       throw new Error(
-        `restore_page_version: history ${historyId} has no usable content`,
+        `restorePageVersion: history ${historyId} has no usable content`,
       );
     }
     // Defense-in-depth: sanitize URLs in the restored content (parity with the

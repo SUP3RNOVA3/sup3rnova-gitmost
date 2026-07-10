@@ -244,7 +244,7 @@ test("tableInsertRow with a slugId opens the collab doc by the resolved UUID (#2
   );
 });
 
-test("the generic mutate (insert_footnote) with a slugId opens by the resolved UUID (#260)", async () => {
+test("the generic mutate (insertFootnote) with a slugId opens by the resolved UUID (#260)", async () => {
   const { state, baseURL } = await spawnCollabStack();
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
 
@@ -254,7 +254,7 @@ test("the generic mutate (insert_footnote) with a slugId opens by the resolved U
   assert.deepEqual(
     state.docNames,
     [`page.${UUID}`],
-    "insert_footnote (via the mutatePage seam) must open the collab doc by UUID",
+    "insertFootnote (via the mutatePage seam) must open the collab doc by UUID",
   );
 });
 

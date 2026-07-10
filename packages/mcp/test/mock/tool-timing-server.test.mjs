@@ -20,11 +20,11 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { createDocmostMcpServer } from "../../build/index.js";
 
-// The tool we drive. get_workspace has NO input schema, so protocol-level input
+// The tool we drive. getWorkspace has NO input schema, so protocol-level input
 // validation cannot short-circuit before the handler runs — the wrapped handler
 // is guaranteed to execute (and then fail on the unreachable backend, which is
 // exactly what we want: the wrapper times in a finally on throw too).
-const TOOL_NAME = "get_workspace";
+const TOOL_NAME = "getWorkspace";
 
 test("the factory's registerTool monkeypatch times a live tool call and labels it with the registration name", async () => {
   const calls = [];

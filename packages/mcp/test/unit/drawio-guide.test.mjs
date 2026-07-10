@@ -1,4 +1,4 @@
-// Unit tests for the drawio_guide progressive-disclosure reference (issue #424).
+// Unit tests for the drawioGuide progressive-disclosure reference (issue #424).
 // Acceptance #2: every section is returned and each is <= ~4KB so pulling one
 // does not bloat the model's context.
 import { test } from "node:test";

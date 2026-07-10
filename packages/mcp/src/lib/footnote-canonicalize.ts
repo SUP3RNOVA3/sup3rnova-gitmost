@@ -16,8 +16,8 @@
  * `insertInlineFootnote` live in `@docmost/prosemirror-markdown` (next to the
  * importer's `assembleFootnotes`, #414), so this file stays a pure mirror.
  *
- * Why it exists: every NON-editor write path (markdown import, update_page_json,
- * docmost_transform, insert_footnote) builds ProseMirror JSON directly, so the
+ * Why it exists: every NON-editor write path (markdown import, updatePageJson,
+ * docmostTransform, insertFootnote) builds ProseMirror JSON directly, so the
  * editor's footnote plugins never run and the canonical topology (sequential
  * numbering by first reference, one trailing list, no orphans, no raw `[^id]`)
  * was never enforced. Running this at the end of every write path closes that
@@ -28,8 +28,8 @@
  * `canonicalizeFootnotes(doc)` before writing — the current callers are
  * `markdownToProseMirrorCanonical` (page markdown import/update; the plain
  * `markdownToProseMirror` used for COMMENT bodies must NOT, or it would drop a
- * reference-less definition), `update_page_json`, `docmost_transform`,
- * `insert_footnote`, and `copy_page_content`. Append/prepend FRAGMENT writes MUST
+ * reference-less definition), `updatePageJson`, `docmostTransform`,
+ * `insertFootnote`, and `copyPageContent`. Append/prepend FRAGMENT writes MUST
  * NOT canonicalize. This is deliberately per-call-site (the replace-vs-fragment
  * and comment-vs-page nuances make a single naive wrapper unsafe).
  */

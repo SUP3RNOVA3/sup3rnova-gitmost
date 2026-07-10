@@ -40,11 +40,11 @@ import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
  */
 export const ROUTING_PROSE =
   "Docmost editing guide — choose the tool by intent. The <tool_inventory> at the end lists every tool with a one-line purpose; the notes below are the routing hints for WHEN to reach for each.\n" +
-  "READ: find a page -> search (workspace-wide full-text); list -> list_pages / list_spaces. Locate blocks and their ids CHEAPLY -> get_outline (compact top-level map; start here, not get_page_json). One block's subtree -> get_node (by attrs.id, or \"#<index>\" for tables, which carry no id). Find every occurrence of a string/regex ON a page (and where each is) -> search_in_page, NOT block-by-block get_node — it returns each hit's node ref + block index + context for a targeted comment. Whole page -> get_page (Markdown, lossy; inline <span data-comment-id> tags are comment anchors — markup, not text) or get_page_json (lossless ProseMirror with block ids). Hand a huge page (with images) to an external consumer without pulling it through the model context -> stash_page (returns a short-lived anonymous URL).\n" +
-  "EDIT: fix wording/typos/numbers -> edit_page_text (find/replace inside blocks, no node id needed). Change ONE block (paragraph/heading/callout/etc.) structurally -> patch_node (by attrs.id from get_outline). Add a block -> insert_node (before/after a block by attrs.id or by anchor text, or append). Remove a block -> delete_node (by attrs.id). Tables -> table_get / table_update_cell / table_insert_row / table_delete_row (address by \"#<index>\" from get_outline; table nodes have no attrs.id). Images -> insert_image (add from a web URL) / replace_image (swap an existing image). Draw.io diagrams -> drawio_create (create from mxGraph XML and insert), drawio_get (read a diagram as mxGraph XML + a hash), drawio_update (replace a diagram; pass the hash from drawio_get as baseHash for optimistic locking); before authoring a diagram, drawio_shapes (look up verified stencil style-strings so a shape name never renders as an empty box) and drawio_guide (on-demand authoring reference: skeleton/layout/containers/icons-aws/icons-azure), and pass layout:\"elk\" to drawio_create/drawio_update to auto-place nodes. Footnotes -> insert_footnote. Bulk/structural rewrite -> update_page_json (full ProseMirror replace) or update_page_markdown (full plain-Markdown body replace, re-imported — block ids regenerate); prefer the granular tools above to avoid resending the whole ~100KB+ document. Complex/scripted rewrite (multiple coordinated edits, renumbering) -> docmost_transform: write a JS `(doc, ctx) => doc` transform, preview the diff with dryRun (default), then apply with dryRun:false; ctx.helpers includes commentsToFootnotes for turning inline comments into numbered footnotes.\n" +
-  "PAGES: new -> create_page (Markdown). Rename (title only) -> rename_page. Move -> move_page. Delete -> delete_page (SOFT delete — the page goes to trash and is restorable; nothing is permanent). Copy/replace a page's whole content from another page (server-side, no document through the model) -> copy_page_content. Sharing -> share_page / unshare_page / list_shares; share_page makes the page PUBLICLY accessible — do it only when explicitly asked.\n" +
-  "COMMENTS: create_comment is always inline and requires an EXACT selection — contiguous text from a single block, <=250 chars (fails rather than leaving an unanchored comment); reply to a thread via parentCommentId. Propose a concrete text fix for one-click human approval -> create_comment with suggestedText (the exact plain-text replacement for the selection; the selection must then be UNIQUE in the page — extend it with context if needed); prefer this over editing directly when the change is subjective or needs the author's sign-off. Manage -> list_comments, update_comment, resolve_comment (resolve/reopen, reversible — prefer over delete to close), delete_comment, check_new_comments.\n" +
-  "HISTORY: review what changed -> diff_page_versions (a historyId vs current, or two versions). List saved versions -> list_page_history. Undo a bad edit -> restore_page_version (writes a past version back as current; itself revertible). Export a page to self-contained Docmost Markdown (with comment anchors) -> export_page_markdown.";
+  "READ: find a page -> search (workspace-wide full-text); list -> listPages / listSpaces. Locate blocks and their ids CHEAPLY -> getOutline (compact top-level map; start here, not getPageJson). One block's subtree -> getNode (by attrs.id, or \"#<index>\" for tables, which carry no id). Find every occurrence of a string/regex ON a page (and where each is) -> searchInPage, NOT block-by-block getNode — it returns each hit's node ref + block index + context for a targeted comment. Whole page -> getPage (Markdown, lossy; inline <span data-comment-id> tags are comment anchors — markup, not text) or getPageJson (lossless ProseMirror with block ids). Hand a huge page (with images) to an external consumer without pulling it through the model context -> stashPage (returns a short-lived anonymous URL).\n" +
+  "EDIT: fix wording/typos/numbers -> editPageText (find/replace inside blocks, no node id needed). Change ONE block (paragraph/heading/callout/etc.) structurally -> patchNode (by attrs.id from getOutline). Add a block -> insertNode (before/after a block by attrs.id or by anchor text, or append). Remove a block -> deleteNode (by attrs.id). Tables -> tableGet / tableUpdateCell / tableInsertRow / tableDeleteRow (address by \"#<index>\" from getOutline; table nodes have no attrs.id). Images -> insertImage (add from a web URL) / replaceImage (swap an existing image). Draw.io diagrams -> drawioCreate (create from mxGraph XML and insert), drawioGet (read a diagram as mxGraph XML + a hash), drawioUpdate (replace a diagram; pass the hash from drawioGet as baseHash for optimistic locking); before authoring a diagram, drawioShapes (look up verified stencil style-strings so a shape name never renders as an empty box) and drawioGuide (on-demand authoring reference: skeleton/layout/containers/icons-aws/icons-azure), and pass layout:\"elk\" to drawioCreate/drawioUpdate to auto-place nodes. Footnotes -> insertFootnote. Bulk/structural rewrite -> updatePageJson (full ProseMirror replace) or updatePageMarkdown (full plain-Markdown body replace, re-imported — block ids regenerate); prefer the granular tools above to avoid resending the whole ~100KB+ document. Complex/scripted rewrite (multiple coordinated edits, renumbering) -> docmostTransform: write a JS `(doc, ctx) => doc` transform, preview the diff with dryRun (default), then apply with dryRun:false; ctx.helpers includes commentsToFootnotes for turning inline comments into numbered footnotes.\n" +
+  "PAGES: new -> createPage (Markdown). Rename (title only) -> renamePage. Move -> movePage. Delete -> deletePage (SOFT delete — the page goes to trash and is restorable; nothing is permanent). Copy/replace a page's whole content from another page (server-side, no document through the model) -> copyPageContent. Sharing -> sharePage / unsharePage / listShares; sharePage makes the page PUBLICLY accessible — do it only when explicitly asked.\n" +
+  "COMMENTS: createComment is always inline and requires an EXACT selection — contiguous text from a single block, <=250 chars (fails rather than leaving an unanchored comment); reply to a thread via parentCommentId. Propose a concrete text fix for one-click human approval -> createComment with suggestedText (the exact plain-text replacement for the selection; the selection must then be UNIQUE in the page — extend it with context if needed); prefer this over editing directly when the change is subjective or needs the author's sign-off. Manage -> listComments, updateComment, resolveComment (resolve/reopen, reversible — prefer over delete to close), deleteComment, checkNewComments.\n" +
+  "HISTORY: review what changed -> diffPageVersions (a historyId vs current, or two versions). List saved versions -> listPageHistory. Undo a bad edit -> restorePageVersion (writes a past version back as current; itself revertible). Export a page to self-contained Docmost Markdown (with comment anchors) -> exportPageMarkdown.";
 
 /**
  * A single generated inventory line: the tool's registered NAME + a one-line
@@ -81,57 +81,57 @@ type Family = (typeof FAMILY_ORDER)[number];
 const TOOL_FAMILY: Record<string, Family> = {
   // READ
   search: "READ",
-  list_pages: "READ",
-  list_spaces: "READ",
-  get_outline: "READ",
-  get_node: "READ",
-  search_in_page: "READ",
-  get_page: "READ",
-  get_page_json: "READ",
-  get_workspace: "READ",
-  stash_page: "READ",
+  listPages: "READ",
+  listSpaces: "READ",
+  getOutline: "READ",
+  getNode: "READ",
+  searchInPage: "READ",
+  getPage: "READ",
+  getPageJson: "READ",
+  getWorkspace: "READ",
+  stashPage: "READ",
   // EDIT
-  edit_page_text: "EDIT",
-  patch_node: "EDIT",
-  insert_node: "EDIT",
-  delete_node: "EDIT",
-  update_page_json: "EDIT",
-  update_page_markdown: "EDIT",
-  table_get: "EDIT",
-  table_update_cell: "EDIT",
-  table_insert_row: "EDIT",
-  table_delete_row: "EDIT",
-  insert_image: "EDIT",
-  replace_image: "EDIT",
-  insert_footnote: "EDIT",
-  drawio_get: "EDIT",
-  drawio_create: "EDIT",
-  drawio_update: "EDIT",
-  drawio_shapes: "EDIT",
-  drawio_guide: "EDIT",
-  docmost_transform: "EDIT",
+  editPageText: "EDIT",
+  patchNode: "EDIT",
+  insertNode: "EDIT",
+  deleteNode: "EDIT",
+  updatePageJson: "EDIT",
+  updatePageMarkdown: "EDIT",
+  tableGet: "EDIT",
+  tableUpdateCell: "EDIT",
+  tableInsertRow: "EDIT",
+  tableDeleteRow: "EDIT",
+  insertImage: "EDIT",
+  replaceImage: "EDIT",
+  insertFootnote: "EDIT",
+  drawioGet: "EDIT",
+  drawioCreate: "EDIT",
+  drawioUpdate: "EDIT",
+  drawioShapes: "EDIT",
+  drawioGuide: "EDIT",
+  docmostTransform: "EDIT",
   // PAGES
-  create_page: "PAGES",
-  rename_page: "PAGES",
-  move_page: "PAGES",
-  delete_page: "PAGES",
-  copy_page_content: "PAGES",
-  share_page: "PAGES",
-  unshare_page: "PAGES",
-  list_shares: "PAGES",
+  createPage: "PAGES",
+  renamePage: "PAGES",
+  movePage: "PAGES",
+  deletePage: "PAGES",
+  copyPageContent: "PAGES",
+  sharePage: "PAGES",
+  unsharePage: "PAGES",
+  listShares: "PAGES",
   // COMMENTS
-  create_comment: "COMMENTS",
-  list_comments: "COMMENTS",
-  update_comment: "COMMENTS",
-  resolve_comment: "COMMENTS",
-  delete_comment: "COMMENTS",
-  check_new_comments: "COMMENTS",
+  createComment: "COMMENTS",
+  listComments: "COMMENTS",
+  updateComment: "COMMENTS",
+  resolveComment: "COMMENTS",
+  deleteComment: "COMMENTS",
+  checkNewComments: "COMMENTS",
   // HISTORY
-  diff_page_versions: "HISTORY",
-  list_page_history: "HISTORY",
-  restore_page_version: "HISTORY",
-  export_page_markdown: "HISTORY",
-  // import_page_markdown is now inAppOnly (#411) — it is not registered on the
+  diffPageVersions: "HISTORY",
+  listPageHistory: "HISTORY",
+  restorePageVersion: "HISTORY",
+  exportPageMarkdown: "HISTORY",
+  // importPageMarkdown is now inAppOnly (#411) — it is not registered on the
   // external MCP host, so it no longer appears in the generated inventory.
 };
 
@@ -145,7 +145,7 @@ const TOOL_FAMILY: Record<string, Family> = {
  */
 export const INLINE_MCP_INVENTORY: ToolInventoryLine[] = [
   {
-    name: "table_get",
+    name: "tableGet",
     purpose:
       "read a table as a matrix of cell texts + per-cell paragraph ids.",
   },
@@ -155,16 +155,16 @@ export const INLINE_MCP_INVENTORY: ToolInventoryLine[] = [
       "full-text search for pages and content across the whole workspace.",
   },
   {
-    name: "docmost_transform",
+    name: "docmostTransform",
     purpose:
       "edit a page by running a sandboxed JS `(doc, ctx) => doc` transform, with a dryRun diff preview.",
   },
   {
-    name: "update_comment",
+    name: "updateComment",
     purpose: "update an existing comment's content (creator only).",
   },
   {
-    name: "delete_comment",
+    name: "deleteComment",
     purpose: "delete a comment (creator or space admin only).",
   },
 ];

@@ -740,7 +740,7 @@ export function insertInlineFootnote(
   //    subtree, so a reference is never glued inside an existing definition (which
   //    the canonicalizer would then drop as an orphan, losing that definition's
   //    prose); and forbidBlockTypes refuses codeBlocks (an inline atom there is a
-  //    schema-invalid doc; insert_footnote skips validateDocStructure).
+  //    schema-invalid doc; insertFootnote skips validateDocStructure).
   // When the only anchor match is in such a place, the insert is refused and the
   // write aborts cleanly (inserted:false) instead of destroying content.
   const boundaryIdx = Array.isArray(doc?.content)

@@ -263,7 +263,7 @@ export function deleteNodeById(
  * changed. No-op for the unambiguous single-match case.
  */
 export function assertUnambiguousMatch(
-  op: "patch_node" | "delete_node",
+  op: "patchNode" | "deleteNode",
   verb: "replace" | "delete",
   count: number,
   nodeId: string,
@@ -631,7 +631,7 @@ export function insertNodeRelative(
     // top level — appending one would produce invalid nesting.
     if (isStructural) {
       throw new Error(
-        `insert_node: cannot append a ${node.type} at the top level; use ` +
+        `insertNode: cannot append a ${node.type} at the top level; use ` +
           `position before/after with an anchor inside the target table`,
       );
     }
@@ -666,7 +666,7 @@ export function insertNodeRelative(
 
     if (containerIdx === -1) {
       throw new Error(
-        `insert_node: cannot insert a ${node.type} here — the anchor is not ` +
+        `insertNode: cannot insert a ${node.type} here — the anchor is not ` +
           `inside a ${containerType}. Anchor on a cell's text or a block id ` +
           `that lives inside the target table.`,
       );
@@ -854,7 +854,7 @@ function makeCellParagraph(id: string, text: string): any {
  *   width.
  * - `cells`: `string[][]` of each cell's `blockPlainText`.
  * - `cellIds`: `(string|null)[][]` of each cell's FIRST paragraph id (or null),
- *   so callers can `patch_node` a cell for rich-formatted edits.
+ *   so callers can `patchNode` a cell for rich-formatted edits.
  * - `path`: index path of the table within the doc.
  */
 export function readTable(
@@ -884,7 +884,7 @@ export function readTable(
     const rowIds: (string | null)[] = [];
     for (const cellNode of cellNodes) {
       rowText.push(blockPlainText(cellNode));
-      // The cell's first paragraph carries the id used for patch_node.
+      // The cell's first paragraph carries the id used for patchNode.
       const firstPara = Array.isArray(cellNode?.content)
         ? cellNode.content[0]
         : undefined;
@@ -940,7 +940,7 @@ export function insertTableRow(
 
   if (Array.isArray(cells) && cells.length > colCount) {
     throw new Error(
-      `table_insert_row: got ${cells.length} cell(s) but the table has ${colCount} column(s)`,
+      `tableInsertRow: got ${cells.length} cell(s) but the table has ${colCount} column(s)`,
     );
   }
 
@@ -1006,12 +1006,12 @@ export function deleteTableRow(
 
   if (!Number.isInteger(index) || index < 0 || index >= rows) {
     throw new Error(
-      `table_delete_row: row index ${index} out of range (table has ${rows} row(s))`,
+      `tableDeleteRow: row index ${index} out of range (table has ${rows} row(s))`,
     );
   }
   if (rows <= 1) {
     throw new Error(
-      "table_delete_row: refusing to delete the only row of the table",
+      "tableDeleteRow: refusing to delete the only row of the table",
     );
   }
 
@@ -1055,7 +1055,7 @@ export function updateTableCell(
     col < 0 ||
     col >= cols
   ) {
-    throw new Error(`table_update_cell: cell [${row},${col}] out of range`);
+    throw new Error(`tableUpdateCell: cell [${row},${col}] out of range`);
   }
 
   const cellNode = rowNode.content[col];
