@@ -65,6 +65,14 @@ import {
 import { renderDiagramShapes } from "./lib/drawio-preview.js";
 import { applyElkLayout } from "./lib/drawio-layout.js";
 import {
+  buildFromGraph,
+  type Graph,
+  type LayoutMode as GraphLayoutMode,
+} from "./lib/drawio-graph.js";
+import { applyCellOps, type CellOp } from "./lib/drawio-cell-ops.js";
+import { mermaidToGraph } from "./lib/drawio-mermaid.js";
+import { parseCells as parseDrawioCells } from "./lib/drawio-xml.js";
+import {
   applyTextEdits,
   TextEdit,
   TextEditResult,
@@ -4628,6 +4636,255 @@ export class DocmostClient {
       warnings: prepared.warnings,
       verify: mutation.verify,
     };
+  }
+
+  // --- draw.io high-level semantic tools (issue #425) ---
+
+  /**
+   * ID-based targeted edits of an existing drawio diagram (add / update / delete
+   * cells) instead of resending the whole XML. Reads the CURRENT diagram, checks
+   * the optimistic lock (`baseHash` is MANDATORY, exactly as drawioUpdate), applies
+   * the operations to the parsed model (a `delete` CASCADES to container children
+   * and to every edge whose source/target is deleted), then runs the SAME #423
+   * pipeline as drawioUpdate (lint + quality warnings -> preview -> attachment ->
+   * repoint the node). Ids are stable so diffs stay meaningful across edits.
+   */
+  async drawioEditCells(
+    pageId: string,
+    node: string,
+    operations: CellOp[],
+    baseHash: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    if (typeof baseHash !== "string" || baseHash.length === 0) {
+      throw new Error(
+        "drawioEditCells: baseHash is mandatory — read the diagram with drawioGet first and pass back its meta.hash",
+      );
+    }
+    if (!Array.isArray(operations) || operations.length === 0) {
+      throw new Error(
+        "drawioEditCells: operations must be a non-empty array of { op, ... }",
+      );
+    }
+
+    const { node: drawio, ref } = await this.resolveDrawioNode(pageId, node);
+    const oldAttrs = drawio.attrs || {};
+    const oldSrc = oldAttrs.src;
+    const nodeId = oldAttrs.id ?? ref;
+    if (!oldSrc) {
+      throw new Error(
+        `drawioEditCells: node "${node}" on page ${pageId} has no src to edit`,
+      );
+    }
+    const currentSvg = await this.fetchAttachmentText(oldSrc);
+    const currentModel = decodeDrawioSvg(currentSvg);
+    const currentHash = mxHash(currentModel);
+    if (currentHash !== baseHash) {
+      throw new Error(
+        `drawioEditCells: conflict — the diagram changed since it was read ` +
+          `(baseHash ${baseHash} != current ${currentHash}). Re-read it with drawioGet and retry.`,
+      );
+    }
+
+    // Apply the operations to the parsed model, then run the standard pipeline.
+    const editedModel = applyCellOps(currentModel, operations);
+    const prepared = prepareModel(editedModel);
+    const inner = renderDiagramShapes(prepared.cells, prepared.bbox);
+    const diagramTitle = oldAttrs.title || "Page-1";
+    const svg = buildDrawioSvg(prepared.modelXml, inner, prepared.bbox, diagramTitle);
+
+    const att = await this.uploadAttachmentBuffer(
+      pageId,
+      Buffer.from(svg, "utf-8"),
+      "diagram.drawio.svg",
+      "image/svg+xml",
+    );
+    const newSrc = `/api/files/${att.id}/${att.fileName}`;
+
+    const collabToken = await this.getCollabTokenWithReauth();
+    const pageUuid = await this.resolvePageId(pageId);
+
+    let repointed = 0;
+    const mutation = await this.mutatePage(
+      pageUuid,
+      collabToken,
+      this.apiUrl,
+      (liveDoc) => {
+        repointed = 0;
+        const doc =
+          liveDoc && liveDoc.type === "doc" ? liveDoc : { type: "doc", content: [] };
+        if (!Array.isArray(doc.content)) doc.content = [];
+        const hit = getNodeByRef(doc, ref);
+        if (!hit || hit.type !== "drawio") return null;
+        let target: any = doc;
+        for (const idx of hit.path) {
+          if (!target || !Array.isArray(target.content)) {
+            target = null;
+            break;
+          }
+          target = target.content[idx];
+        }
+        if (!target || target.type !== "drawio") return null;
+        target.attrs = {
+          ...target.attrs,
+          src: newSrc,
+          attachmentId: att.id,
+          width: prepared.bbox.width,
+          height: prepared.bbox.height,
+        };
+        repointed++;
+        return doc;
+      },
+    );
+
+    if (repointed === 0) {
+      return {
+        success: true,
+        nodeId,
+        attachmentId: att.id,
+        warnings: [
+          ...prepared.warnings,
+          "target drawio node was removed concurrently; uploaded attachment is unreferenced",
+        ],
+        verify: mutation.verify,
+      };
+    }
+    return {
+      success: true,
+      nodeId,
+      attachmentId: att.id,
+      warnings: prepared.warnings,
+      verify: mutation.verify,
+    };
+  }
+
+  /**
+   * The main high-level tool: build a diagram from a SEMANTIC graph (nodes with
+   * a `kind`/`icon`, groups, edges) — the model never supplies coordinates or
+   * style strings. The server resolves icons via the shape catalog (#424),
+   * assigns palette colors from the preset, runs ELK layered layout (honouring
+   * `direction` and the `layer`/`sameLayerAs`/`pinned` hints and compound groups),
+   * and assembles linter-clean XML, then inserts it through the SAME create
+   * pipeline as drawioCreate. `layout:"incremental"` is only meaningful when a
+   * target `node` is given (it preserves that diagram's existing coordinates and
+   * places only new cells); on a fresh insert it behaves like "full".
+   */
+  async drawioFromGraph(
+    pageId: string,
+    where: {
+      position: "before" | "after" | "append";
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+    graph: Graph,
+    direction?: "LR" | "RL" | "TB" | "BT",
+    preset?: string,
+    layout?: GraphLayoutMode,
+    node?: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    iconsResolved: number;
+    iconsMissing: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    // Direction/preset supplied as separate params override the graph fields so
+    // both the flat tool schema and an inline graph can set them.
+    const merged: Graph = {
+      ...graph,
+      direction: direction ?? graph.direction,
+      preset: preset ?? graph.preset,
+    };
+    const mode: GraphLayoutMode = layout ?? "full";
+
+    // Incremental into an EXISTING node: read its coords so ELK preserves them,
+    // and keep the full existing model so incremental MERGES (never drops) any
+    // cell the new graph doesn't re-list.
+    let existingCoords: Map<string, { x: number; y: number }> | undefined;
+    let existingModelXml: string | undefined;
+    let editExisting = false;
+    let baseHash: string | undefined;
+    if (node && (mode === "incremental" || mode === "none")) {
+      const { node: drawio } = await this.resolveDrawioNode(pageId, node);
+      const src = (drawio.attrs || {}).src;
+      if (src) {
+        const svg = await this.fetchAttachmentText(src);
+        const model = decodeDrawioSvg(svg);
+        baseHash = mxHash(model);
+        existingModelXml = model;
+        existingCoords = new Map();
+        for (const c of parseDrawioCells(model)) {
+          if (c.vertex && c.geometry.x != null && c.geometry.y != null) {
+            existingCoords.set(c.id, { x: c.geometry.x, y: c.geometry.y });
+          }
+        }
+        editExisting = true;
+      }
+    }
+
+    const built = await buildFromGraph(
+      merged,
+      mode,
+      existingCoords,
+      existingModelXml,
+    );
+
+    if (editExisting && node && baseHash) {
+      // Re-target the existing diagram: replace it with the assembled model.
+      const res = await this.drawioUpdate(pageId, node, built.modelXml, baseHash);
+      return {
+        ...res,
+        iconsResolved: built.iconsResolved,
+        iconsMissing: built.iconsMissing,
+      };
+    }
+
+    const res = await this.drawioCreate(pageId, where, built.modelXml);
+    return {
+      ...res,
+      iconsResolved: built.iconsResolved,
+      iconsMissing: built.iconsMissing,
+    };
+  }
+
+  /**
+   * Convert a Mermaid `flowchart` to a redactable draw.io diagram via a PURE
+   * parser (no Electron / draw.io CLI): mermaid text -> graph-JSON -> the
+   * drawioFromGraph pipeline. Only `flowchart`/`graph` is supported (the most
+   * common wiki case); other diagram types throw a clear error so the model can
+   * fall back to drawioFromGraph.
+   */
+  async drawioFromMermaid(
+    pageId: string,
+    where: {
+      position: "before" | "after" | "append";
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+    mermaid: string,
+    preset?: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    iconsResolved: number;
+    iconsMissing: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    const graph = mermaidToGraph(mermaid);
+    if (preset) graph.preset = preset;
+    return this.drawioFromGraph(pageId, where, graph, graph.direction, graph.preset);
   }
 
   // --- Page history / diff / transform ---
