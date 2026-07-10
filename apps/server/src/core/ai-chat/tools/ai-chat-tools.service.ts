@@ -59,6 +59,7 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.getWorkspace();
   void client.getSpaces();
   void client.listPages(s, n, true);
+  void client.getTree(s, s, n);
   void client.listSidebarPages(s, s);
   void client.getOutline(s);
   void client.getPageJson(s);

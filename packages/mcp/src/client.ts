@@ -811,13 +811,17 @@ export class DocmostClient {
    * large instances, so a single bounded page of results is returned (default
    * 50, max 100) via the `/pages/recent` feed.
    *
-   * Tree (`tree` true): the space's FULL page hierarchy as a nested tree (each
-   * node has a `children` array). This mode REQUIRES `spaceId` (a page tree is
+   * Tree (`tree` true): DEPRECATED — prefer `getTree`, which shares this exact
+   * code path (a single `/pages/tree` request via `enumerateSpacePages` +
+   * `buildPageTree`) but returns the compact `{pageId, title, children?,
+   * hasChildren?}` shape and supports `rootPageId`/`maxDepth`. This tree mode is
+   * kept for backward compatibility; it REQUIRES `spaceId` (a page tree is
    * scoped to one space) and IGNORES `limit` — the whole hierarchy is returned.
    * It fetches the tree via `enumerateSpacePages`, which on the fork server
    * resolves to a single `/pages/tree` request returning the whole
    * permission-filtered flat page set (soft-deleted pages excluded
-   * server-side).
+   * server-side); the cursor-BFS in `enumerateSpacePages` is only a fallback for
+   * stock upstream servers that lack `/pages/tree`.
    */
   async listPages(spaceId?: string, limit: number = 50, tree: boolean = false) {
     await this.ensureAuthenticated();
@@ -839,6 +843,39 @@ export class DocmostClient {
     const data = response.data;
     const items = data.data?.items || data.items || [];
     return items.map((page: any) => filterPage(page));
+  }
+
+  /**
+   * Fetch a space's page hierarchy (or one subtree) as a nested tree in a SINGLE
+   * request — the #443 `getTree` tool. Shares its whole code path with
+   * `listPages(tree:true)`: `enumerateSpacePages` issues one `POST /pages/tree`
+   * (with the cursor-BFS only as a fallback for stock upstream servers that lack
+   * the endpoint), then `buildPageTree` nests the flat, permission-filtered,
+   * position-ordered list. No second tree fetch, no per-node BFS.
+   *
+   *  - `rootPageId` — restrict to that page's subtree; the server seeds the CTE
+   *    with the page itself, so the result is exactly ONE root (the page and its
+   *    descendants). Omit it for the whole space.
+   *  - `maxDepth` — trim the response to that many levels (roots = depth 1) to
+   *    save tokens; the server still returns everything in one request, the cut
+   *    is applied in `buildPageTree` AFTER the full tree is built. A node whose
+   *    children were cut carries `hasChildren: true` (source of truth = the flat
+   *    item's server `hasChildren`) so the caller can descend with a follow-up
+   *    `getTree(spaceId, rootPageId=that node)` call.
+   *
+   * Output nodes are `{pageId, title, children?, hasChildren?}` — only the UUID
+   * `pageId` is exposed (never `slugId`/`icon`/`position`). Requires `spaceId`
+   * (a page tree is scoped to one space).
+   */
+  async getTree(spaceId: string, rootPageId?: string, maxDepth?: number) {
+    await this.ensureAuthenticated();
+    if (!spaceId) {
+      throw new Error(
+        "getTree: spaceId is required (a page tree is scoped to one space).",
+      );
+    }
+    const { pages } = await this.enumerateSpacePages(spaceId, rootPageId);
+    return buildPageTree(pages, { shape: "getTree", maxDepth });
   }
 
   /**
