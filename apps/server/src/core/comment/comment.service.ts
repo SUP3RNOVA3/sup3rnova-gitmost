@@ -21,6 +21,7 @@ import { CursorPaginationResult } from '@docmost/db/pagination/cursor-pagination
 import { QueueJob, QueueName } from '../../integrations/queue/constants';
 import { extractUserMentionIdsFromJson } from '../../common/helpers/prosemirror/utils';
 import {
+  ICommentMarkUpdateJob,
   ICommentNotificationJob,
   ICommentResolvedNotificationJob,
 } from '../../integrations/queue/constants/queue.interface';
@@ -298,7 +299,11 @@ export class CommentService {
     // source is cleared alongside resolvedAt/resolvedById.
     provenance?: AuthProvenanceData,
   ): Promise<Comment> {
-    const resolvedAt = resolved ? new Date() : null;
+    // One shared timestamp: it stamps resolvedAt AND updatedAt on the row and is
+    // carried as the mark job's `ts`, so the worker's race-guard can order this
+    // event against the row's authoritative resolve-state mutation time (#399).
+    const now = new Date();
+    const resolvedAt = resolved ? now : null;
     const resolvedById = resolved ? authUser.id : null;
     const isAgent = provenance?.actor === 'agent';
     // Set the agent marker only when resolving; on unresolve clear it back to
@@ -307,25 +312,33 @@ export class CommentService {
     const resolvedSource = resolved && isAgent ? 'agent' : null;
 
     await this.commentRepo.updateComment(
-      { resolvedAt, resolvedById, resolvedSource },
+      // Bump updatedAt (not editedAt — that drives the "edited" badge) so the
+      // row records WHEN the resolve state last changed; the async mark worker
+      // compares its job ts against this to skip a superseded out-of-order event.
+      { resolvedAt, resolvedById, resolvedSource, updatedAt: now },
       comment.id,
     );
 
-    // Reflect the resolved state on the inline comment mark in the
-    // collaborative document so all connected clients stay in sync.
+    // #399: mirror the resolved state onto the inline comment mark OFF the HTTP
+    // critical path. The DB row above is the source of truth (updated in ms); the
+    // mark is an eventual mirror for connected clients, and its failure was
+    // ALREADY swallowed (best-effort warn) — so instead of awaiting the whole
+    // Y.Doc load + immediate store pipeline (~4.5s p95), enqueue an idempotent,
+    // retryable COMMENT_MARK_UPDATE job. (Store-pipeline cost itself is #348's
+    // scope, not duplicated here.)
     const documentName = `page.${comment.pageId}`;
-    try {
-      await this.collaborationGateway.handleYjsEvent(
-        'resolveCommentMark',
-        documentName,
-        { commentId: comment.id, resolved, user: authUser },
-      );
-    } catch (error) {
+    void this.enqueueCommentMarkUpdate(
+      documentName,
+      comment.id,
+      resolved ? 'resolve' : 'unresolve',
+      now.getTime(),
+      authUser.id,
+    ).catch((error) =>
       this.logger.warn(
-        `Failed to update comment mark for comment ${comment.id}`,
+        `Failed to enqueue comment mark update for comment ${comment.id}`,
         error,
-      );
-    }
+      ),
+    );
 
     // Notify the comment author when someone else resolves their comment.
     if (resolved && comment.creatorId !== authUser.id) {
@@ -671,21 +684,52 @@ export class CommentService {
   }
 
   /**
-   * Remove the inline `comment` mark for a comment from the collaborative
-   * document. FATAL, NOT best-effort: unlike resolveComment (which keeps the row,
-   * so a failed mark update is recoverable), this is used before an irreversible
-   * hard-delete, so the mark removal MUST succeed or throw. Under
-   * COLLAB_DISABLE_REDIS the gateway invokes the deleteCommentMark handler
-   * directly (never a silent no-op) and a missing live instance surfaces as a
-   * thrown error, which we let propagate so the caller aborts before deleting.
+   * Schedule removal of the inline `comment` anchor mark from the collaborative
+   * document (ephemeral suggestion #329), OFF the HTTP critical path (#399).
+   *
+   * ORDERING PRESERVED: we `await` the ENQUEUE (a fast Redis add), not the mark
+   * op, and the caller only proceeds to the irreversible row hard-delete after
+   * this resolves. So the anchor-removal job is DURABLY queued before the row
+   * vanishes — a queue-add failure throws here and aborts the delete (row + mark
+   * stay consistent), preserving the invariant the old FATAL sync call gave. The
+   * mark op itself now runs async in the worker: it is idempotent and retried
+   * (3 attempts), so a transient collab failure self-heals; only an exhausted-
+   * retries job leaves a DB↔mark divergence, now VISIBLE via BullMQ failed-job
+   * metrics (was a hard 5xx before). Delete carries no state guard — the row is
+   * being removed, and stripping an absent mark is a no-op.
    */
   private async deleteCommentMark(comment: Comment, user: User): Promise<void> {
     const documentName = `page.${comment.pageId}`;
-    await this.collaborationGateway.handleYjsEvent(
-      'deleteCommentMark',
+    await this.enqueueCommentMarkUpdate(
       documentName,
-      { commentId: comment.id, user },
+      comment.id,
+      'delete',
+      Date.now(),
+      user.id,
     );
+  }
+
+  /**
+   * Enqueue an idempotent COMMENT_MARK_UPDATE job (#399) — the single path that
+   * mirrors a comment's inline-mark state into the collab Y.Doc off the HTTP
+   * response. The worker (GeneralQueueProcessor) runs the SAME handleYjsEvent
+   * the sync code used, so the mark op is byte-identical.
+   */
+  private enqueueCommentMarkUpdate(
+    documentName: string,
+    commentId: string,
+    action: 'resolve' | 'unresolve' | 'delete',
+    ts: number,
+    userId: string,
+  ): Promise<unknown> {
+    const jobData: ICommentMarkUpdateJob = {
+      documentName,
+      commentId,
+      action,
+      ts,
+      userId,
+    };
+    return this.generalQueue.add(QueueJob.COMMENT_MARK_UPDATE, jobData);
   }
 
   private async queueCommentNotification(

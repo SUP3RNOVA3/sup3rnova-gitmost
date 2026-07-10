@@ -81,8 +81,8 @@ import {
   createResizeHandle,
   buildResizeClasses,
 } from "@/features/editor/components/common/node-resize-handles.ts";
-import MathInlineView from "@/features/editor/components/math/math-inline.tsx";
-import MathBlockView from "@/features/editor/components/math/math-block.tsx";
+import MathInlineView from "@/features/editor/components/math/math-inline-lazy.tsx";
+import MathBlockView from "@/features/editor/components/math/math-block-lazy.tsx";
 import ImageView from "@/features/editor/components/image/image-view.tsx";
 import CalloutView from "@/features/editor/components/callout/callout-view.tsx";
 import StatusView from "@/features/editor/components/status/status-view.tsx";
@@ -90,7 +90,7 @@ import VideoView from "@/features/editor/components/video/video-view.tsx";
 import AudioView from "@/features/editor/components/audio/audio-view.tsx";
 import AttachmentView from "@/features/editor/components/attachment/attachment-view.tsx";
 import CodeBlockView from "@/features/editor/components/code-block/code-block-view.tsx";
-import DrawioView from "../components/drawio/drawio-view";
+import DrawioView from "../components/drawio/drawio-view-lazy.tsx";
 import ExcalidrawView from "@/features/editor/components/excalidraw/excalidraw-view-lazy.tsx";
 import EmbedView from "@/features/editor/components/embed/embed-view.tsx";
 import HtmlEmbedView from "@/features/editor/components/html-embed/html-embed-view.tsx";

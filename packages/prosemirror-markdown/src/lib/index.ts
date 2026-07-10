@@ -44,3 +44,35 @@ export {
   docsCanonicallyEqual,
 } from "./canonicalize.js";
 export { parsePageFile, serializePageFile } from "./page-file.js";
+
+// Pure, network-free helpers for manipulating a ProseMirror/TipTap document
+// tree by node id (#414: the single canonical copy, formerly forked into mcp).
+// Consumed by `@docmost/mcp` (patch/insert/delete node, table tools, outline).
+export {
+  blockPlainText,
+  buildOutline,
+  getNodeByRef,
+  replaceNodeById,
+  deleteNodeById,
+  sanitizeForYjs,
+  findUnstorableAttr,
+  insertNodeRelative,
+  readTable,
+  insertTableRow,
+  deleteTableRow,
+  updateTableCell,
+  assertUnambiguousMatch,
+} from "./node-ops.js";
+export type { OutlineEntry } from "./node-ops.js";
+
+// Normalize a ProseMirror node arg that the model may have serialized as a JSON
+// string (#414: single copy shared by mcp and the CommonJS server app).
+export { parseNodeArg } from "./parse-node-arg.js";
+
+// Inline-footnote authoring convention (#414: single copy, formerly the mcp
+// `footnote-authoring.ts` fork), shared with the importer's `assembleFootnotes`.
+export {
+  footnoteContentKey,
+  makeFootnoteDefinition,
+  generateFootnoteId,
+} from "./footnote.js";

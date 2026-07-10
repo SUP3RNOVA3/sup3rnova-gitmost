@@ -10,7 +10,7 @@ import { IconClockHour4, IconTrash } from "@tabler/icons-react";
 import { useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { useTimeAgo } from "@/hooks/use-time-ago.tsx";
-import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import { useTreeMutation } from "@/features/page/tree/hooks/use-tree-mutation.ts";
 import {
   useToggleTemporaryMutation,
@@ -35,7 +35,7 @@ type TemporaryNoteBannerProps = {
  */
 export function TemporaryNoteBanner({ slugId }: TemporaryNoteBannerProps) {
   const { t } = useTranslation();
-  const { data: page } = usePageQuery({ pageId: slugId });
+  const { data: page } = usePageMetaQuery({ pageId: slugId });
   const { data: space } = useGetSpaceBySlugQuery(page?.space?.slug);
   const spaceAbility = useSpaceAbility(space?.membership?.permissions);
   const expiresTimeAgo = useTimeAgo(page?.temporaryExpiresAt);

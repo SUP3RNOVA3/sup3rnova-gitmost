@@ -1,5 +1,8 @@
 import { atom } from "jotai";
-import { Editor } from "@tiptap/core";
+// Type-only: these atoms only hold an Editor reference for typing. A value
+// import would drag the whole @tiptap/core engine into the eager graph of every
+// shell component that reads one of these atoms.
+import type { Editor } from "@tiptap/core";
 import { PageEditMode } from "@/features/user/types/user.types.ts";
 import type { DictationUnavailableReason } from "@/features/dictation/dictation-status";
 

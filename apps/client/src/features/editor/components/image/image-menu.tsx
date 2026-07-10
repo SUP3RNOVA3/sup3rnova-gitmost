@@ -38,6 +38,14 @@ export function ImageMenu({ editor }: EditorMenuProps) {
         return null;
       }
 
+      // #343 PART 1: skip the expensive per-keystroke work (getAttributes + the
+      // alignment isActive() probes) unless an image is actually active. The
+      // menu is only shown when an image is active (see shouldShow), so a null
+      // state while inactive is never rendered — behavior is unchanged.
+      if (!ctx.editor.isActive("image")) {
+        return null;
+      }
+
       const imageAttrs = ctx.editor.getAttributes("image");
 
       return {

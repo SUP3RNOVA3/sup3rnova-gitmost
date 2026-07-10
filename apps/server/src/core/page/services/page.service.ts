@@ -1165,6 +1165,7 @@ export class PageService {
   async getRecentPages(
     userId: string,
     pagination: PaginationOptions,
+    workspaceId?: string | null,
   ): Promise<CursorPaginationResult<Page>> {
     const result = await this.pageRepo.getRecentPages(userId, pagination);
 
@@ -1174,6 +1175,8 @@ export class PageService {
         await this.pagePermissionRepo.filterAccessiblePageIds({
           pageIds,
           userId,
+          // #348 — cross-space "recent"; enable the workspace short-circuit.
+          workspaceId,
         });
       const accessibleSet = new Set(accessibleIds);
       result.items = result.items.filter((p) => accessibleSet.has(p.id));
@@ -1187,6 +1190,7 @@ export class PageService {
     requestingUserId: string,
     pagination: PaginationOptions,
     spaceId?: string,
+    workspaceId?: string | null,
   ): Promise<CursorPaginationResult<Page>> {
     const result = await this.pageRepo.getCreatedByPages(
       creatorId,
@@ -1201,6 +1205,9 @@ export class PageService {
         await this.pagePermissionRepo.filterAccessiblePageIds({
           pageIds,
           userId: requestingUserId,
+          spaceId,
+          // #348 — enable the workspace short-circuit when not space-scoped.
+          workspaceId,
         });
       const accessibleSet = new Set(accessibleIds);
       result.items = result.items.filter((p) => accessibleSet.has(p.id));

@@ -4,6 +4,7 @@ import React, { FC, useEffect, useRef, useState } from "react";
 import classes from "./table-of-contents.module.css";
 import clsx from "clsx";
 import { Box, Text, Title } from "@mantine/core";
+import { useDebouncedCallback } from "@mantine/hooks";
 import { useTranslation } from "react-i18next";
 
 type TableOfContentsProps = {
@@ -79,13 +80,21 @@ export const TableOfContents: FC<TableOfContentsProps> = (props) => {
     setHeadingDOMNodes(result.nodes);
   };
 
+  // Debounce the update-driven rescan: `$nodes("heading")` scans every heading
+  // in the document, and it previously ran on EVERY keystroke while the TOC
+  // panel was open. The panel is derived UI, so recomputing ~300ms after typing
+  // settles keeps it correct without doing an all-headings scan per keystroke
+  // (#343, PART 7). `useDebouncedCallback` returns a stable reference and always
+  // invokes the latest `handleUpdate`.
+  const debouncedHandleUpdate = useDebouncedCallback(handleUpdate, 300);
+
   useEffect(() => {
-    props.editor?.on("update", handleUpdate);
+    props.editor?.on("update", debouncedHandleUpdate);
 
     return () => {
-      props.editor?.off("update", handleUpdate);
+      props.editor?.off("update", debouncedHandleUpdate);
     };
-  }, [props.editor]);
+  }, [props.editor, debouncedHandleUpdate]);
 
   useEffect(
     () => {

@@ -431,7 +431,17 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
   it('uses the canonical page.id (not the slugId doc name) for post-store side effects (#260)', async () => {
     const SLUG = 'slug-1'; // persistedHumanPage.slugId; findById resolves it
     const document = ydocFor(doc('NEW AGENT CONTENT'));
-    pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW AGENT CONTENT'));
+    // #348 — the transclusion sync now runs only when the new OR the previously
+    // persisted content carries a transclusion-family node. Give the persisted
+    // (old) content a pageEmbed so the sync path is exercised and the #260
+    // UUID-vs-slugId contract asserted below is still verified.
+    pageRepo.findById.mockResolvedValue({
+      ...persistedHumanPage('NEW AGENT CONTENT'),
+      content: {
+        type: 'doc',
+        content: [{ type: 'pageEmbed', attrs: { sourcePageId: 'src-1' } }],
+      },
+    });
     pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
 
     // A `page.<slugId>` document name (the bug's smoking gun), agent store over

@@ -28,6 +28,7 @@ vi.mock("@/features/share/queries/share-query.ts", () => ({
 
 vi.mock("@/features/page/queries/page-query.ts", () => ({
   usePageQuery: () => ({ data: { id: "page-1", title: "Doc" } }),
+  usePageMetaQuery: () => ({ data: { id: "page-1", title: "Doc" } }),
 }));
 
 vi.mock("@/features/space/queries/space-query.ts", () => ({

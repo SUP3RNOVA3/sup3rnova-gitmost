@@ -220,6 +220,13 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
   };
 
   async maintainLock(documentName: string) {
+    // #348 — clear any existing timer for this document before installing a new
+    // one. Without this, a second maintainLock for the same document (a
+    // reload-without-unload) overwrites this.locks[documentName] and leaks the
+    // previous interval, which keeps firing SET forever with no way to clear it.
+    if (this.locks[documentName]) {
+      clearInterval(this.locks[documentName]);
+    }
     this.locks[documentName] = setInterval(() => {
       this.pub.set(
         this.getKey(documentName),

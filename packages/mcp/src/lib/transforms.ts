@@ -14,13 +14,13 @@
  *  - `marks` arrays are preserved verbatim when fragments are split/reordered.
  */
 
-import { blockPlainText } from "./node-ops.js";
-import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 import {
+  blockPlainText,
   footnoteContentKey,
   makeFootnoteDefinition,
   generateFootnoteId,
-} from "./footnote-authoring.js";
+} from "@docmost/prosemirror-markdown";
+import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 
 export { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 
@@ -365,7 +365,7 @@ export function noteItem(inlineNodes: any[]): any {
  *   { type:"footnoteDefinition", attrs:{id}, content:[{ type:"paragraph", content }] }
  * (mirrors the editor-ext / docmost-schema FootnoteDefinition node).
  *
- * Built on the shared `makeFootnoteDefinition` factory (footnote-authoring.ts);
+ * Built on the shared `makeFootnoteDefinition` factory (`@docmost/prosemirror-markdown`);
  * the only extra is a fresh block id on the inner paragraph (Docmost stamps one,
  * and the canonicalizer preserves attrs as-is). Single factory, one place to
  * change the definition shape.

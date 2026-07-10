@@ -24,7 +24,7 @@ import { historyAtoms } from "@/features/page-history/atoms/history-atoms.ts";
 import { useDisclosure, useHotkeys } from "@mantine/hooks";
 import { useClipboard } from "@/hooks/use-clipboard";
 import { useParams } from "react-router-dom";
-import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import {
   useToggleTemporaryMutation,
   syncTemporaryExpiresInCache,
@@ -67,7 +67,7 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
   const commentsTriggerProps = useAsideTriggerProps("comments");
   const tocTriggerProps = useAsideTriggerProps("toc");
   const { pageSlug } = useParams();
-  const { data: page } = usePageQuery({
+  const { data: page } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
   const isDeleted = !!page?.deletedAt;
@@ -146,7 +146,7 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
   const [, setHistoryModalOpen] = useAtom(historyAtoms);
   const clipboard = useClipboard({ timeout: 500 });
   const { pageSlug, spaceSlug } = useParams();
-  const { data: page, isLoading } = usePageQuery({
+  const { data: page, isLoading } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
   const { handleDelete } = useTreeMutation(page?.spaceId ?? "");

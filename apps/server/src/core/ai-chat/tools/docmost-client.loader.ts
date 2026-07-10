@@ -44,6 +44,10 @@ export interface DocmostClientLike {
   getPage(
     pageId: string,
   ): Promise<{ data: Record<string, unknown>; success: boolean }>;
+  // Light raw page info (`/pages/info`): title + slugId + ProseMirror content,
+  // WITHOUT the Markdown render / subpage expansion getPage does. Used by the
+  // comment-signal probe to read just the page title on a hit.
+  getPageRaw(pageId: string): Promise<Record<string, unknown> | null>;
   getWorkspace(): Promise<{ data: Record<string, unknown>; success: boolean }>;
   getSpaces(): Promise<unknown[]>;
   listPages(
@@ -304,9 +308,42 @@ export interface SharedToolSpec {
   buildShape?: (z: any) => Record<string, unknown>;
 }
 
+/**
+ * Local hand-mirror of the "new comments: N" signal helper (#417) exported from
+ * `@docmost/mcp` (packages/mcp/src/comment-signal.ts). Same cross-boundary
+ * approach as `SharedToolSpec`: we do not import the ESM package's types. The
+ * factory owns the transport-neutral watermark/debounce/injection-safe line
+ * builder; the in-app layer supplies its own `probe` (REST `listComments`) and
+ * result shaping.
+ */
+export interface CommentSignalProbeResultLike {
+  count: number;
+  title?: string | null;
+}
+
+export interface CommentSignalTrackerLike {
+  noteWorkingPage(pageId: string | undefined | null): void;
+  advanceWatermark(nowMs?: number): void;
+  isExcludedTool(toolName: string): boolean;
+  maybeSignal(toolName: string): Promise<string | null>;
+}
+
+export type CommentSignalTrackerFactory = (options: {
+  probe: (
+    pageId: string,
+    sinceMs: number,
+  ) => Promise<CommentSignalProbeResultLike>;
+  now?: () => number;
+  debounceMs?: number;
+}) => CommentSignalTrackerLike;
+
 interface DocmostMcpModule {
   DocmostClient: DocmostClientCtor;
   SHARED_TOOL_SPECS: Record<string, SharedToolSpec>;
+  // Optional (#417): absent on a pre-#417 @docmost/mcp build and on the mocked
+  // loader in unit tests. The in-app layer treats an absent factory as "signal
+  // disabled" — a pure no-op that leaves tool results byte-identical.
+  createCommentSignalTracker?: CommentSignalTrackerFactory;
 }
 
 // TS with module:commonjs downlevels a literal `import()` to `require()`, which
@@ -330,6 +367,7 @@ let modulePromise: Promise<DocmostMcpModule> | null = null;
 export async function loadDocmostMcp(): Promise<{
   DocmostClient: DocmostClientCtor;
   sharedToolSpecs: Record<string, SharedToolSpec>;
+  createCommentSignalTracker?: CommentSignalTrackerFactory;
 }> {
   if (!modulePromise) {
     modulePromise = (async () => {
@@ -355,5 +393,8 @@ export async function loadDocmostMcp(): Promise<{
   return {
     DocmostClient: mod.DocmostClient,
     sharedToolSpecs: mod.SHARED_TOOL_SPECS,
+    // Optional: forwarded when present so the in-app layer can build the passive
+    // comment signal (#417); undefined on a stale build => signal disabled.
+    createCommentSignalTracker: mod.createCommentSignalTracker,
   };
 }

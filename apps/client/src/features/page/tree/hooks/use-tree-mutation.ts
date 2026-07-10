@@ -1,5 +1,5 @@
 import { useCallback } from "react";
-import { useAtom, useSetAtom, useStore } from "jotai";
+import { useSetAtom, useStore } from "jotai";
 import { notifications } from "@mantine/notifications";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
@@ -34,7 +34,10 @@ export type UseTreeMutation = {
 
 export function useTreeMutation(spaceId: string): UseTreeMutation {
   const { t } = useTranslation();
-  const [, setData] = useAtom(treeDataAtom);
+  // Setter-only: this hook never reads the tree reactively (handlers read the
+  // live value imperatively via `store` below), so useSetAtom avoids
+  // re-rendering SpaceSidebar on every tree event.
+  const setData = useSetAtom(treeDataAtom);
   // `store` reads the *current* treeDataAtom imperatively in handlers — avoids
   // stale-closure issues when the caller updates the tree (e.g. lazy-load
   // children) and then immediately invokes a handler.

@@ -22,7 +22,7 @@ import CommentEditor from "@/features/comment/components/comment-editor";
 import CommentActions from "@/features/comment/components/comment-actions";
 import { useFocusWithin } from "@mantine/hooks";
 import { IComment } from "@/features/comment/types/comment.types.ts";
-import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import { extractPageSlugId } from "@/lib";
 import { useTranslation } from "react-i18next";
 import { useGetSpaceBySlugQuery } from "@/features/space/queries/space-query.ts";
@@ -56,7 +56,7 @@ export function buildChildrenByParent(
 function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const { t } = useTranslation();
   const { pageSlug } = useParams();
-  const { data: page } = usePageQuery({ pageId: extractPageSlugId(pageSlug) });
+  const { data: page } = usePageMetaQuery({ pageId: extractPageSlugId(pageSlug) });
   const {
     data: comments,
     isLoading: isCommentsLoading,

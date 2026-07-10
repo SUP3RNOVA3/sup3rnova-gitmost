@@ -59,3 +59,89 @@ export function splitFootnoteParagraphs(encoded: string): string[] {
   paragraphs.push(current);
   return paragraphs;
 }
+
+// ---------------------------------------------------------------------------
+// Inline-authoring helpers (#414: moved here from the mcp `footnote-authoring.ts`
+// fork so the dedup convention — content-key + definition factory + id gen —
+// has ONE home next to the importer that shares the convention). Used by the
+// mcp author-inline tool (`insertInlineFootnote` in transforms.ts).
+// ---------------------------------------------------------------------------
+
+const FOOTNOTE_DEFINITION_NAME = "footnoteDefinition";
+
+function cloneJson<T>(v: T): T {
+  if (typeof structuredClone === "function") return structuredClone(v);
+  return JSON.parse(JSON.stringify(v)) as T;
+}
+
+/**
+ * Normalized content key for de-duplicating footnote DEFINITIONS by their text.
+ *
+ * Two definitions with the same key are the SAME footnote — so the inline
+ * authoring tool reuses one id (one number, one definition, several references)
+ * instead of minting a second definition. Key = plaintext (whitespace-collapsed,
+ * trimmed) PLUS a signature of the inline mark types in order, so two notes that
+ * read the same but differ in formatting (one bold, one plain) are NOT merged.
+ * Conservative: only an exact match merges.
+ */
+export function footnoteContentKey(defNode: any): string {
+  const parts: string[] = [];
+  const visit = (n: any): void => {
+    if (!n || typeof n !== "object") return;
+    if (n.type === "text" && typeof n.text === "string") {
+      const marks = Array.isArray(n.marks)
+        ? n.marks.map((m: any) => m?.type).filter(Boolean).sort().join(",")
+        : "";
+      parts.push(`${n.text}${marks}`);
+    }
+    if (Array.isArray(n.content)) for (const c of n.content) visit(c);
+  };
+  visit(defNode);
+  // Collapse the assembled text's whitespace and trim, keeping the mark
+  // signature attached so formatting differences still distinguish notes.
+  return parts
+    .join("")
+    .replace(/[ \t\r\n]+/g, " ")
+    .trim();
+}
+
+/**
+ * Build a footnoteDefinition node from inline ProseMirror nodes, keyed by id.
+ */
+export function makeFootnoteDefinition(id: string, inlineNodes: any[]): any {
+  const content = Array.isArray(inlineNodes) ? cloneJson(inlineNodes) : [];
+  return {
+    type: FOOTNOTE_DEFINITION_NAME,
+    attrs: { id },
+    content: [{ type: "paragraph", content }],
+  };
+}
+
+/**
+ * Generate a uuidv7-style id (time-ordered), matching editor-ext's
+ * `generateFootnoteId`. Used for a genuinely-new inline footnote id.
+ */
+export function generateFootnoteId(): string {
+  const now = Date.now();
+  const timeHex = now.toString(16).padStart(12, "0");
+  const rand = (length: number) => {
+    let s = "";
+    for (let i = 0; i < length; i++)
+      s += Math.floor(Math.random() * 16).toString(16);
+    return s;
+  };
+  const versioned = "7" + rand(3);
+  const variantNibble = (8 + Math.floor(Math.random() * 4)).toString(16);
+  const variant = variantNibble + rand(3);
+  return (
+    timeHex.slice(0, 8) +
+    "-" +
+    timeHex.slice(8, 12) +
+    "-" +
+    versioned +
+    "-" +
+    variant +
+    "-" +
+    rand(12)
+  );
+}

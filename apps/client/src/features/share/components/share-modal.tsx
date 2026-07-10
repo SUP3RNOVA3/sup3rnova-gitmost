@@ -20,7 +20,7 @@ import {
 import { Link, useParams } from "react-router-dom";
 import { extractPageSlugId, getPageIcon } from "@/lib";
 import { useTranslation } from "react-i18next";
-import { usePageQuery } from "@/features/page/queries/page-query.ts";
+import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import CopyTextButton from "@/components/common/copy.tsx";
 import { getAppUrl } from "@/lib/config.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
@@ -37,7 +37,7 @@ export default function ShareModal({ readOnly }: ShareModalProps) {
   const { t } = useTranslation();
   const { pageSlug } = useParams();
   const pageSlugId = extractPageSlugId(pageSlug);
-  const { data: page } = usePageQuery({ pageId: pageSlugId });
+  const { data: page } = usePageMetaQuery({ pageId: pageSlugId });
   const pageId = page?.id;
   const { data: share } = useShareForPageQuery(pageId);
   const { spaceSlug } = useParams();

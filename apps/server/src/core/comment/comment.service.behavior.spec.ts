@@ -313,11 +313,15 @@ describe('CommentService — behavior', () => {
       });
 
       const [patch] = commentRepo.updateComment.mock.calls[0];
-      expect(patch).toEqual({
+      // #399: resolve/unresolve now also stamps updatedAt (the async mark
+      // worker's race-guard reads it to order out-of-order events). The
+      // resolve-state fields are still cleared to null on unresolve.
+      expect(patch).toMatchObject({
         resolvedAt: null,
         resolvedById: null,
         resolvedSource: null,
       });
+      expect(patch.updatedAt).toBeInstanceOf(Date);
     });
 
     it("notifies the author when SOMEONE ELSE resolves their comment", async () => {
