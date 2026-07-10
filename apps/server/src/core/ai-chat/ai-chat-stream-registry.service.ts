@@ -17,10 +17,24 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 /** How long a finished entry is retained for late attach (replay + immediate end). */
 export const RUN_STREAM_RETAIN_FINISHED_MS = 30_000;
 
-/** Per-run replay buffer cap. Past this the buffer is dropped (attach -> 204). */
-export const RUN_STREAM_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+/**
+ * Per-run replay buffer cap. Past this the buffer is dropped (attach -> 204, and
+ * the client falls back to its restore + degraded-poll path, #430).
+ *
+ * Raised from 4MB to 32MB (#430): marathon autonomous runs (11-25 min observed)
+ * stream far more than 4MB of SSE frames, so a live disconnect mid-run would find
+ * an already-overflowed buffer and could only degrade-poll instead of re-attaching
+ * to the live tail. 32MB comfortably covers those runs while staying bounded.
+ *
+ * Memory cost: this is the WORST-CASE retained size PER ACTIVE run (the buffer is
+ * freed on finish + retention, or dropped immediately on overflow). With the small
+ * number of concurrent autonomous runs a single workspace realistically has, 32MB
+ * each is an acceptable ceiling; the overflow->204->degraded-poll fallback remains
+ * the backstop for anything larger, so correctness never depends on this bound.
+ */
+export const RUN_STREAM_MAX_BUFFER_BYTES = 32 * 1024 * 1024;
 
-// 2x the replay cap: a just-written 4MB replay burst alone can never trip the
+// 2x the replay cap: a just-written full-replay burst alone can never trip the
 // per-subscriber cap (see controller); only a genuinely stalled socket can.
 export const SUBSCRIBER_MAX_BUFFERED_BYTES = 2 * RUN_STREAM_MAX_BUFFER_BYTES;
 

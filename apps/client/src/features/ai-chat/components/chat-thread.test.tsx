@@ -739,3 +739,170 @@ function renderResumable(initialRows: IAiChatMessageRow[]) {
     act(() => view.rerender(<Wrapper rows={rows} />));
   return { rerender, onResumeFallback };
 }
+
+// #430: auto-reconnect to a DETACHED run after a LIVE SSE disconnect. The mount
+// path only resumes on mount/reload; these cover the missing trigger — a live
+// `isDisconnect` on onFinish must (backoff-)re-attach WITHOUT a reload, pin+strip
+// the live row to avoid duplicates, fall back to the degraded poll on a 204, and
+// exhaust to a manual Retry.
+describe("ChatThread — live reconnect after isDisconnect (#430)", () => {
+  // A LIVE local turn that just dropped: the settled tail existed before, and the
+  // partial assistant row lives only in `messages` (not persisted as a tail).
+  const settledTail = () => [
+    row("u1", "user", undefined, "hi"),
+    row("a1", "assistant", "succeeded", "done"),
+  ];
+  // The partial assistant message onFinish hands us for the dropped LIVE turn.
+  const liveMsg = {
+    id: "a2",
+    role: "assistant",
+    parts: [{ type: "text", text: "partial live answer" }],
+  };
+
+  beforeEach(() => {
+    resetState();
+    // status "ready": with a live disconnect the mock is not streaming, so the
+    // status==="streaming" auto-clear effect stays out of the way.
+    h.state.status = "ready";
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    cleanup();
+  });
+
+  // Render a NON-resuming mount (settled tail -> no mount resume) with autonomous
+  // runs on, then simulate a live disconnect via onFinish.
+  function renderLiveThenDisconnect() {
+    const view = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: settledTail(),
+    });
+    // The settled tail must NOT have triggered a mount resume.
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+    act(() => {
+      h.state.onFinish?.({
+        message: liveMsg,
+        isAbort: false,
+        isDisconnect: true,
+        isError: false,
+      });
+    });
+    return view;
+  }
+
+  // Fire the pending (scheduled) attempt for `attempt` (backoff = 1s,2s,4s,...).
+  function advanceToAttempt(attempt: number) {
+    act(() => {
+      vi.advanceTimersByTime(1000 * 2 ** (attempt - 1));
+    });
+  }
+
+  // Simulate the reconnect GET returning 204 (nothing live) so the transport's
+  // no-active-stream recovery runs.
+  async function reconnect204() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ status: 204, ok: false }),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+  }
+
+  // Simulate the reconnect GET returning a live 2xx stream.
+  async function reconnect200() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ status: 200, ok: true }),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "GET" });
+    });
+  }
+
+  it("calls resumeStream POST-mount (a live disconnect triggers a backoff reconnect)", () => {
+    renderLiveThenDisconnect();
+    // The banner shows immediately; the attach itself fires after the first backoff.
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+    advanceToAttempt(1);
+    // resumeStream is now called AFTER mount — the bug was it only ever fired once
+    // on mount. The reconnect URL pins expect=live&anchor to OUR run.
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream?expect=live&anchor=a2",
+    );
+  });
+
+  it("strips the pinned live row before replay so content is NOT duplicated", () => {
+    renderLiveThenDisconnect();
+    advanceToAttempt(1);
+    // The attempt strips the anchor row from the store (the live replay rebuilds
+    // it). Apply the setMessages updater to prove it removes exactly the anchor.
+    const updater = h.state.setMessages.mock.calls.at(-1)![0] as (
+      prev: { id: string }[],
+    ) => { id: string }[];
+    expect(updater([{ id: "u1" }, { id: "a2" }])).toEqual([{ id: "u1" }]);
+  });
+
+  it("a live re-attach (2xx) clears the reconnect banner", async () => {
+    renderLiveThenDisconnect();
+    advanceToAttempt(1);
+    await reconnect200();
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+  });
+
+  it("a 204 arms the degraded poll and backs off to the next attempt", async () => {
+    const { onResumeFallback } = renderLiveThenDisconnect();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    await reconnect204();
+    // Fallback engaged: the degraded poll is armed (204 -> onNoActiveStream).
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+    // Still reconnecting — the banner advanced to attempt 2/5.
+    expect(screen.getByText(/reconnecting.*2\/5/i)).toBeTruthy();
+    // The next backoff fires attempt 2 (another resumeStream).
+    advanceToAttempt(2);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(2);
+  });
+
+  it("exhausts the attempt limit into a manual Retry, which restarts the sequence", async () => {
+    renderLiveThenDisconnect();
+    // Drive all 5 attempts, each failing with a 204.
+    for (let n = 1; n <= 5; n++) {
+      advanceToAttempt(n);
+      expect(h.state.resumeStream).toHaveBeenCalledTimes(n);
+      await reconnect204();
+    }
+    // The 5th 204 exhausted the cap -> the manual Retry replaces the banner.
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    const retry = screen.getByText("Retry");
+    expect(retry).toBeTruthy();
+    // Retry fires attempt 1 immediately (no backoff) — a 6th resumeStream.
+    act(() => {
+      fireEvent.click(retry);
+    });
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(6);
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+  });
+
+  it("does NOT reconnect when autonomous runs are disabled", () => {
+    renderThread({ autonomousRunsEnabled: false, initialRows: settledTail() });
+    act(() => {
+      h.state.onFinish?.({
+        message: liveMsg,
+        isAbort: false,
+        isDisconnect: true,
+        isError: false,
+      });
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    // The terminal "connection lost" notice is shown instead (unchanged behavior).
+    expect(
+      screen.getByText("Connection lost — the answer was interrupted."),
+    ).toBeTruthy();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+  });
+});

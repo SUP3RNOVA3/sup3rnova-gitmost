@@ -86,11 +86,19 @@ const MIN_HEIGHT = 400;
 // Margin kept between the window and the viewport edges while dragging.
 const EDGE_MARGIN = 8;
 
-// #184 phase 1.5: hard cap on the degraded-poll fallback. The poll is armed when
-// a resume attempt could not attach to the live run and disarmed by the thread on
-// settle / local stream; this cap is the ONLY backstop against an endless tick
-// (a stuck 'streaming' row before the boot-sweep, or a user-tail 204 with no run).
-const DEGRADED_POLL_MAX_MS = 10 * 60_000;
+// #184 phase 1.5 / #430: backstop for the degraded-poll fallback. The poll is
+// armed when a resume attempt could not attach to the live run and disarmed by the
+// thread on settle / local stream; this cap is the ONLY backstop against an endless
+// tick (a stuck 'streaming' row before the boot-sweep, or a user-tail 204 with no
+// run).
+//
+// #430: measured from RUN ACTIVITY, not from arm-time. A real autonomous run takes
+// 11-25 min — longer than a fixed 10-min-from-start cap, which used to cut the poll
+// off mid-run. Instead we cap on INACTIVITY: keep polling as long as the run is
+// still making progress (its persisted rows keep changing), and only give up after
+// this long with NO new activity. A genuinely stuck run produces no row changes, so
+// the idle cap still bounds it; a long-but-progressing run polls to completion.
+const DEGRADED_POLL_IDLE_MAX_MS = 10 * 60_000;
 
 /** Compact token formatter: 1.2M / 3.4k / 950. */
 function formatTokens(n: number): string {
@@ -254,9 +262,12 @@ export default function AiChatWindow() {
   // onResumeFallback(true); the thread disarms it on settle / local stream. The
   // window only OWNS the timer (armedAtRef stamps when it was armed for the cap).
   const [degradedPoll, setDegradedPoll] = useState(false);
-  const armedAtRef = useRef(0);
+  // #430: timestamp of the LAST run activity while the poll is armed — stamped on
+  // arm and re-stamped whenever the polled rows change (see the effect below). The
+  // idle cap is measured from this, so a long-but-progressing run keeps polling.
+  const lastActivityAtRef = useRef(0);
   const onResumeFallback = useCallback((active: boolean): void => {
-    if (active) armedAtRef.current = Date.now();
+    if (active) lastActivityAtRef.current = Date.now();
     setDegradedPoll(active);
   }, []);
   // Reset the degraded poll whenever the open chat changes: it is scoped to the
@@ -269,17 +280,27 @@ export default function AiChatWindow() {
     useAiChatMessagesQuery(
       activeChatId ?? undefined,
       // DELIBERATELY DUMB (invariant 8 / task 2.4): poll every 2.5s while armed
-      // and under the 10-min cap; otherwise off. NO error checks (TanStack v5
-      // resets fetchFailureCount each fetch, so consecutive errors are not
-      // expressible — and the poll must survive a server restart) and NO tail
-      // checks (the settled/local-stream semantics live in ChatThread, which
-      // disarms via onResumeFallback(false)). The time cap is the only backstop.
+      // and while the run is still active (#430: under the INACTIVITY cap, not a
+      // fixed-from-start cap); otherwise off. NO error checks (TanStack v5 resets
+      // fetchFailureCount each fetch, so consecutive errors are not expressible —
+      // and the poll must survive a server restart) and NO tail checks (the
+      // settled/local-stream semantics live in ChatThread, which disarms via
+      // onResumeFallback(false)). The idle cap is the only backstop.
       () =>
         degradedPoll === true &&
-        Date.now() - armedAtRef.current < DEGRADED_POLL_MAX_MS
+        Date.now() - lastActivityAtRef.current < DEGRADED_POLL_IDLE_MAX_MS
           ? 2500
           : false,
     );
+
+  // #430: re-stamp the activity clock whenever the polled rows change while the
+  // poll is armed. TanStack keeps the same `messageRows` reference across refetches
+  // that return deep-equal data (structural sharing), so a new reference means the
+  // run genuinely progressed — which extends the inactivity cap above. A stuck run
+  // yields no reference change, so the cap eventually fires and stops the poll.
+  useEffect(() => {
+    if (degradedPoll) lastActivityAtRef.current = Date.now();
+  }, [degradedPoll, messageRows]);
 
   // #184 reconnect-and-live-follow. Whether detached agent runs are enabled for
   // this workspace. When the feature is off no runs are ever created, so the

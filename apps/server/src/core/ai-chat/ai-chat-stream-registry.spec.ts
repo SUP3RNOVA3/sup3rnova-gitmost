@@ -2,6 +2,7 @@ import {
   AiChatStreamRegistryService,
   RUN_STREAM_MAX_BUFFER_BYTES,
   RUN_STREAM_RETAIN_FINISHED_MS,
+  SUBSCRIBER_MAX_BUFFERED_BYTES,
   RunStreamCallbacks,
 } from './ai-chat-stream-registry.service';
 
@@ -210,9 +211,10 @@ describe('AiChatStreamRegistryService', () => {
     const att = (await registry.attach(CHAT, false, undefined, c.cb))!;
     att.start();
 
-    const oneMb = 'x'.repeat(1024 * 1024);
-    // 5 x 1MB = 5MB > 4MB cap; the 5th frame is the one that crosses.
-    for (let i = 0; i < 5; i++) src.push(oneMb + i);
+    // Cap-relative so it survives a buffer-cap change (#430): a quarter-cap frame
+    // means 5 frames comfortably exceed the replay cap; the last one crosses.
+    const chunk = 'x'.repeat(Math.floor(RUN_STREAM_MAX_BUFFER_BYTES / 4));
+    for (let i = 0; i < 5; i++) src.push(chunk + i);
     await flush();
 
     const entry = (registry as any).entries.get(CHAT);
@@ -220,7 +222,7 @@ describe('AiChatStreamRegistryService', () => {
     expect(entry.bytes).toBeGreaterThan(RUN_STREAM_MAX_BUFFER_BYTES);
     // The live subscriber received ALL 5 frames, including the crossing one.
     expect(c.frames).toHaveLength(5);
-    expect(c.frames[4]).toBe(oneMb + 4);
+    expect(c.frames[4]).toBe(chunk + 4);
 
     // A NEW attach after overflow gets null (replay buffer is gone).
     const c2 = collector();
@@ -240,9 +242,11 @@ describe('AiChatStreamRegistryService', () => {
     const attB = (await registry.attach(CHAT, false, undefined, b.cb))!;
     attB.start();
 
-    const oneMb = 'x'.repeat(1024 * 1024);
-    // 9 x 1MB = 9MB > 8MB per-subscriber cap; A's pending overflows, B streams live.
-    for (let i = 0; i < 9; i++) src.push(oneMb + i);
+    // Cap-relative so it survives a buffer-cap change (#430): a quarter-of-the-
+    // per-subscriber-cap frame means 5 frames exceed A's paused-pending cap while
+    // B streams every frame live.
+    const chunk = 'x'.repeat(Math.floor(SUBSCRIBER_MAX_BUFFERED_BYTES / 4));
+    for (let i = 0; i < 5; i++) src.push(chunk + i);
     await flush();
 
     const entry = (registry as any).entries.get(CHAT);
@@ -250,7 +254,7 @@ describe('AiChatStreamRegistryService', () => {
     expect(entry.subscribers.size).toBe(1);
     expect(a.frames).toEqual([]); // paused + overflowed: nothing was delivered
     // B received every frame live (delivery unaffected by A's overflow).
-    expect(b.frames).toHaveLength(9);
+    expect(b.frames).toHaveLength(5);
 
     // A's start() (arriving late) degrades to an immediate end, not a partial replay.
     attA.start();

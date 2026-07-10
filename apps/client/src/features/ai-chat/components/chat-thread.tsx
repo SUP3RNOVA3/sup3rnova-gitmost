@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { generateId } from "ai";
-import { ActionIcon, Box, Group, Stack, Text, Tooltip } from "@mantine/core";
+import {
+  ActionIcon,
+  Alert,
+  Box,
+  Button,
+  Group,
+  Loader,
+  Stack,
+  Text,
+  Tooltip,
+} from "@mantine/core";
 import {
   IconClockHour4,
   IconPlayerPlayFilled,
@@ -50,6 +60,15 @@ import classes from "@/features/ai-chat/components/ai-chat.module.css";
 // ~50ms (20 Hz) keeps streaming visually smooth while decoupling re-render cost
 // from the token rate.
 const STREAM_THROTTLE_MS = 50;
+
+// #430: auto-reconnect after a LIVE SSE disconnect of a DETACHED (autonomous) run.
+// The run keeps executing server-side, so instead of a dead "Lost connection"
+// banner we re-attach to the live tail through the SAME resumable machinery the
+// mount path uses. Attempts back off exponentially and are capped; on exhaustion
+// the user gets a manual Retry (the degraded poll keeps catching up underneath).
+const RECONNECT_MAX_ATTEMPTS = 5;
+// Backoff before attempt N (1-based): 1s, 2s, 4s, 8s, 16s.
+const RECONNECT_BASE_DELAY_MS = 1000;
 
 /** The page the user is currently viewing, sent as chat context. */
 export interface OpenPageContext {
@@ -175,6 +194,10 @@ export default function ChatThread({
   const reconcileTailRef = useRef(false);
   const noStreamHandledRef = useRef(false);
   const onNoActiveStreamRef = useRef<(() => void) | null>(null);
+  // #430: called from the transport's reconnect-GET success branch when a live
+  // stream re-attached (2xx, not 204) — clears the reconnect banner. Kept in a ref
+  // because the transport's fetch closure (useMemo([])) reads it live.
+  const onReconnectAttachedRef = useRef<(() => void) | null>(null);
   // Live mount flag. The attach GET and the resumed `onFinish` are async and can
   // land AFTER this thread unmounts (the parent remounts per chat via `key`); with
   // chatIdRef then pointing at the NEW chat, an ungated late callback would arm a
@@ -378,6 +401,10 @@ export default function ChatThread({
             // NOT drop the in-progress row or stop tracking the durable run.
             if (response.status === 204 || !response.ok)
               onNoActiveStreamRef.current?.();
+            // #430: a 2xx stream re-attached (live tail or finished-replay). Signal
+            // the reconnect controller to clear its banner. No-op outside an active
+            // reconnect sequence (e.g. the mount attach), so it is safe here.
+            else onReconnectAttachedRef.current?.();
             return response;
           } catch (err) {
             // Network throw: same no-onFinish recovery, then rethrow so the SDK
@@ -481,6 +508,31 @@ export default function ChatThread({
           );
         }
       }
+      // (2b) #430: a LIVE (non-resumed) detached run whose SSE just dropped. The
+      // server run keeps executing, so instead of a dead "Lost connection" banner
+      // start a reconnect sequence: pin the CURRENT streaming assistant row as the
+      // strip/anchor (the live tail is the already-shown partial in `messages`, not
+      // a persistent row) and re-attach to the live tail via the resumable machinery.
+      const startedReconnect =
+        isDisconnect &&
+        !wasResumed &&
+        autonomousRunsEnabled === true &&
+        mountedRef.current &&
+        message?.role === "assistant" &&
+        typeof message.id === "string";
+      if (startedReconnect) {
+        beginReconnect({
+          id: message.id,
+          role: "assistant",
+          content: "",
+          status: "streaming",
+          createdAt: new Date().toISOString(),
+          // Preserve the partial parts so a 204 restore (onNoActiveStream) re-shows
+          // what was on screen while the degraded poll catches the run up to
+          // terminal (rowToUiMessage prefers metadata.parts).
+          metadata: { parts: message.parts },
+        });
+      }
       // (3) Standard branches.
       // Forward the authoritative server chatId (streamed on the assistant
       // message metadata) so the parent adopts the REAL created chat id for a new
@@ -490,9 +542,11 @@ export default function ChatThread({
       onTurnFinished(extractServerChatId(message), threadKey);
       // Show a neutral "stopped" marker for an aborted turn; the red error banner
       // (via `error`) already covers isError, and a clean finish clears any marker.
+      // On a live disconnect that STARTED a reconnect, suppress the terminal
+      // "connection lost" notice — the reconnect banner takes over (#430).
       if (isError) setStopNotice(null);
       else if (isAbort) setStopNotice("manual");
-      else if (isDisconnect) setStopNotice("disconnect");
+      else if (isDisconnect) setStopNotice(startedReconnect ? null : "disconnect");
       else setStopNotice(null);
       // A resumed turn NEVER flushes the queue (invariant 7): skip BOTH the
       // flush-on-abort branch and the plain flush. The local streamer is the only
@@ -579,6 +633,106 @@ export default function ChatThread({
 
   const isStreaming = status === "submitted" || status === "streaming";
 
+  // #430: live-disconnect reconnect controller. `null` = idle; `{ trying, attempt }`
+  // = a backoff sequence is running (drives the "reconnecting… (N/max)" banner);
+  // `{ failed }` = attempts exhausted (drives the manual Retry). Mirrored into a ref
+  // so the transport/onNoActiveStream closures branch on the LIVE value.
+  type ReconnectState =
+    | null
+    | { phase: "trying"; attempt: number }
+    | { phase: "failed" };
+  const [reconnectState, setReconnectState] = useState<ReconnectState>(null);
+  const reconnectStateRef = useRef<ReconnectState>(null);
+  const setReconnectStatePair = useCallback((s: ReconnectState) => {
+    reconnectStateRef.current = s;
+    setReconnectState(s);
+  }, []);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
+  // One reconnect attempt — MIRRORS the mount strip/anchor path for the LIVE case.
+  // beginReconnect pinned strippedRowRef/stripRef to the run's assistant row, so:
+  //  - remove that row from the store (the mount path strips it from the SEED; here
+  //    it is already shown, so filter it out) — the live replay's `text-start` then
+  //    rebuilds it without DUPLICATING parts (the main dedup risk, #430);
+  //  - reset the one-shot 204 guard so onNoActiveStream can fire for THIS attempt;
+  //  - mark the turn resumed (invariant 7/8) so onFinish runs the recovery block and
+  //    never flushes the queue;
+  //  - resumeStream() -> prepareReconnectToStreamRequest builds
+  //    ?expect=live&anchor=<pinned id>, pinning the replay to OUR run (invariant 6).
+  const attemptReconnectOnce = useCallback(
+    (attempt: number) => {
+      if (!mountedRef.current) return;
+      const anchor = strippedRowRef.current;
+      if (anchor) {
+        setMessages((prev) => prev.filter((m) => m.id !== anchor.id));
+      }
+      noStreamHandledRef.current = false;
+      setResumedTurnPair(true);
+      setReconnectStatePair({ phase: "trying", attempt });
+      void resumeStream();
+    },
+    [setMessages, setResumedTurnPair, setReconnectStatePair, resumeStream],
+  );
+
+  // Schedule attempt `attempt` after an exponential backoff.
+  const scheduleReconnectAttempt = useCallback(
+    (attempt: number) => {
+      clearReconnectTimer();
+      setReconnectStatePair({ phase: "trying", attempt });
+      reconnectTimerRef.current = setTimeout(
+        () => attemptReconnectOnce(attempt),
+        RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1),
+      );
+    },
+    [clearReconnectTimer, setReconnectStatePair, attemptReconnectOnce],
+  );
+
+  // Start a fresh reconnect sequence, pinning `anchorRow` (the live run's assistant
+  // row) as the strip/anchor reused by every attempt.
+  const beginReconnect = useCallback(
+    (anchorRow: IAiChatMessageRow) => {
+      if (!autonomousRunsEnabled || !mountedRef.current) return;
+      strippedRowRef.current = anchorRow;
+      stripRef.current = true;
+      scheduleReconnectAttempt(1);
+    },
+    [autonomousRunsEnabled, scheduleReconnectAttempt],
+  );
+
+  // Manual Retry (shown once attempts are exhausted): restart at attempt 1 and fire
+  // immediately (the user asked for it now — no backoff).
+  const retryReconnect = useCallback(() => {
+    clearReconnectTimer();
+    attemptReconnectOnce(1);
+  }, [clearReconnectTimer, attemptReconnectOnce]);
+
+  // Live SSE re-attached (the reconnect GET returned a 2xx stream): clear the
+  // banner + any pending backoff. No-op outside a sequence (e.g. the mount attach).
+  const onReconnectAttached = useCallback(() => {
+    if (!mountedRef.current || !reconnectStateRef.current) return;
+    clearReconnectTimer();
+    setReconnectStatePair(null);
+  }, [clearReconnectTimer, setReconnectStatePair]);
+  onReconnectAttachedRef.current = onReconnectAttached;
+
+  // The reconnect GET could not attach (204 / error). onNoActiveStream has already
+  // armed the degraded poll (the robust fallback that drives the row to terminal
+  // from the DB), so this only decides the LIVE-attach retry: back off and try
+  // again up to the cap, else surface the manual Retry.
+  const onReconnectNoStream = useCallback(() => {
+    const s = reconnectStateRef.current;
+    if (s?.phase !== "trying") return;
+    if (s.attempt < RECONNECT_MAX_ATTEMPTS)
+      scheduleReconnectAttempt(s.attempt + 1);
+    else setReconnectStatePair({ phase: "failed" });
+  }, [scheduleReconnectAttempt, setReconnectStatePair]);
+
   // 204-handler (`onNoActiveStream`): the attach returned 204 — nothing live to
   // resume (overflow / begin-failure / after retention / anchor-mismatch). One-
   // shot via noStreamHandledRef (we do NOT null onNoActiveStreamRef). Exactly four
@@ -610,7 +764,17 @@ export default function ChatThread({
     // (d) 204 means onFinish will NOT fire — clear the suppression flag so it
     // cannot swallow the NEXT local turn's queue flush.
     setResumedTurnPair(false);
-  }, [setMessages, queryClient, onResumeFallback, setResumedTurnPair]);
+    // (e) #430: if this 204/error landed during a live-disconnect reconnect
+    // sequence, back off and retry the live attach (or give up to the manual
+    // Retry). The degraded poll armed in (c) is the fallback either way.
+    onReconnectNoStream();
+  }, [
+    setMessages,
+    queryClient,
+    onResumeFallback,
+    setResumedTurnPair,
+    onReconnectNoStream,
+  ]);
   onNoActiveStreamRef.current = onNoActiveStream;
 
   // Mount effect: kick off the resume attempt for a non-settled tail. Marking the
@@ -628,6 +792,9 @@ export default function ChatThread({
     return () => {
       mountedRef.current = false;
       attachAbortRef.current?.abort();
+      // #430: drop any pending reconnect backoff so it can't fire against the next
+      // chat this thread's refs are reused for.
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     };
     // Mount-only by design; the parent remounts per chat via `key`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -666,11 +833,26 @@ export default function ChatThread({
     if (tail.status !== "streaming") {
       reconcileTailRef.current = false;
       onResumeFallback?.(false);
+      // #430: the run reached its terminal state via the degraded poll — there is
+      // no live tail left to reconnect to, so drop any reconnect banner / Retry.
+      clearReconnectTimer();
+      setReconnectStatePair(null);
     }
     // onResumeFallback intentionally omitted (parent-stable callback); deps are
     // fixed by the resume design.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialRows, isStreaming, setMessages]);
+
+  // #430: a real stream is live again — the reconnect re-attached to the live tail
+  // (status -> "streaming") OR the user started a new local turn. Either way clear
+  // the reconnect banner + any pending backoff. Gated on "streaming" (not the
+  // broader "submitted") so a still-pending attach GET does not clear prematurely.
+  useEffect(() => {
+    if (status === "streaming") {
+      clearReconnectTimer();
+      setReconnectStatePair(null);
+    }
+  }, [status, clearReconnectTimer, setReconnectStatePair]);
 
   // "Send now" on a queued message: interrupt the current turn and immediately
   // send THIS message, keeping the agent's partial output. Other queued messages
@@ -719,6 +901,9 @@ export default function ChatThread({
     // observer's Stop would otherwise leave the attach fetch running.
     attachAbortRef.current?.abort();
     stop();
+    // #430: pressing Stop also cancels an in-progress reconnect sequence.
+    clearReconnectTimer();
+    setReconnectStatePair(null);
     if (!autonomousRunsEnabled) return;
     if (chatIdRef.current) {
       onServerStop?.(chatIdRef.current);
@@ -740,7 +925,13 @@ export default function ChatThread({
       // for this fix. Documented so a future change can address the abort-ordering.
       stopPendingRef.current = true;
     }
-  }, [stop, autonomousRunsEnabled, onServerStop]);
+  }, [
+    stop,
+    autonomousRunsEnabled,
+    onServerStop,
+    clearReconnectTimer,
+    setReconnectStatePair,
+  ]);
 
   // Clear the stopped marker as soon as a new turn begins streaming, and drop any
   // stale "Send now" interrupt flags. On the legit interrupt path both refs are
@@ -825,6 +1016,43 @@ export default function ChatThread({
           detail={errorView.detail}
           mb="xs"
         />
+      ) : reconnectState ? (
+        // #430: while auto-reconnecting to a detached run's live tail, show progress
+        // instead of a dead "Lost connection" banner; once attempts are exhausted,
+        // offer a manual Retry (the degraded poll keeps catching up underneath).
+        <Alert
+          variant="light"
+          color="gray"
+          p="xs"
+          mb="xs"
+          style={{ flexShrink: 0 }}
+        >
+          <Group gap={8} wrap="nowrap" align="center">
+            {reconnectState.phase === "trying" ? (
+              <>
+                <Loader size={14} color="gray" style={{ flex: "none" }} />
+                <Text size="sm" lh={1.3} c="dimmed">
+                  {t("Connection lost — reconnecting…")}
+                  {` (${reconnectState.attempt}/${RECONNECT_MAX_ATTEMPTS})`}
+                </Text>
+              </>
+            ) : (
+              <>
+                <Text size="sm" lh={1.3} c="dimmed" style={{ flex: 1 }}>
+                  {t("Couldn't reconnect to the answer.")}
+                </Text>
+                <Button
+                  size="compact-xs"
+                  variant="light"
+                  color="gray"
+                  onClick={retryReconnect}
+                >
+                  {t("Retry")}
+                </Button>
+              </>
+            )}
+          </Group>
+        </Alert>
       ) : stopNotice ? (
         <ChatStoppedNotice
           text={
