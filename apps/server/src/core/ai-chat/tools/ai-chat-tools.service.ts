@@ -59,10 +59,12 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.getWorkspace();
   void client.getSpaces();
   void client.listPages(s, n, true);
+  void client.getTree(s, s, n);
+  void client.getPageContext(s);
   void client.listSidebarPages(s, s);
   void client.getOutline(s);
   void client.getPageJson(s);
-  void client.getNode(s, s);
+  void client.getNode(s, s, 'markdown');
   void client.searchInPage(s, s, {
     regex: true,
     caseSensitive: true,
@@ -84,12 +86,16 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.movePage(s, s, s);
   void client.deletePage(s);
   void client.editPageText(s, edits);
-  void client.patchNode(s, s, node);
-  void client.insertNode(s, node, {
-    position: 'append',
-    anchorNodeId: s,
-    anchorText: s,
-  });
+  void client.patchNode(s, s, { markdown: s, node });
+  void client.insertNode(
+    s,
+    { markdown: s, node },
+    {
+      position: 'append',
+      anchorNodeId: s,
+      anchorText: s,
+    },
+  );
   void client.deleteNode(s, s);
   void client.updatePageJson(s, node, s);
   void client.tableInsertRow(s, s, cells, n);
@@ -117,6 +123,23 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.drawioGet(s, s, 'xml');
   void client.drawioCreate(s, { position: 'append', anchorNodeId: s }, s, s, 'elk');
   void client.drawioUpdate(s, s, s, s, 'elk');
+  // --- draw.io high-level semantic tools (#425 stage 3) ---
+  void client.drawioEditCells(s, s, [{ op: 'delete', cellId: s }], s);
+  void client.drawioFromGraph(
+    s,
+    { position: 'append', anchorNodeId: s },
+    { nodes: [{ id: s, label: s }] },
+    'LR',
+    s,
+    'full',
+    s,
+  );
+  void client.drawioFromMermaid(
+    s,
+    { position: 'append', anchorNodeId: s },
+    s,
+    s,
+  );
   // --- write (comment) ---
   void client.createComment(s, s, 'inline', s, s, s);
   void client.resolveComment(s, true);

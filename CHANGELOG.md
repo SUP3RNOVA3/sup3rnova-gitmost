@@ -99,6 +99,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `updatePageContent`). The total MCP tool count is unchanged (−1 / +1). The
   external names shown here are the post-#412 camelCase names. (#411)
 
+- **`getNode` now returns Markdown by default (was ProseMirror JSON).** The
+  block-level read/write tools default to Markdown so a block round trip is
+  `getNode` (markdown) → edit → `patchNode` (markdown). `getNode` now returns
+  `{ …, format: "markdown", markdown }` unless you pass `format: "json"` (which
+  restores the previous `{ …, node }` ProseMirror subtree); comment anchors —
+  including resolved ones — are preserved in the markdown so a write-back never
+  orphans a thread, and a node that cannot be a document top-level block
+  (`tableRow`/`tableCell`/`tableHeader` addressed via `#<index>`) auto-falls back
+  to JSON with `format: "json"` in the response. `patchNode`/`insertNode` gain a
+  `markdown` input alongside `node` (provide exactly one): the markdown fragment
+  may rewrite/insert several blocks at once and supports `^[...]` footnotes.
+  *Migration (external MCP clients only):* a client that consumed `getNode`'s
+  `node` field must now either read `markdown`, or pass `format: "json"` to keep
+  the old ProseMirror-JSON output. Released together with the `#411`/`#412`
+  breaking window so external configs break exactly once. (#413)
+
 ### Added
 
 - **Place several images side by side in a row.** A new "Inline (side by
@@ -235,6 +251,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by physical key position and matched against the commands; genuine Cyrillic
   search terms keep priority over remapped candidates, and short wrong-layout
   prefixes match by command title. (#283, #285, #287)
+- **Opt-in substring "lookup" search mode for agents.** `/api/search` gains an
+  additive, opt-in mode (guarded by a new `substring` flag) that matches literal
+  substrings of page titles and body text — so technical tokens the full-text
+  tokenizer mangles (`backup-srv.local`, `10.0.12.5`, `WB-MGE-30D86B`) are found
+  even when the FTS query is empty. It returns a location `path`, a windowed
+  `snippet` and a per-response relevance `score`, supports `titleOnly` and a
+  `parentPageId` subtree scope, and applies the page-level permission filter
+  before the limit. The web UI never sets `substring`, so its full-text search
+  behaviour is byte-for-byte unchanged. The leading-wildcard `LIKE` predicates
+  are backed by GIN trigram indexes on `LOWER(f_unaccent(title))` and
+  `LOWER(f_unaccent(text_content))` so lookups use a bitmap index scan instead of
+  a sequential scan. (#443)
+- **MCP `search` tool returns richer, agent-oriented results.** The external MCP
+  `search` response shape changes for the agent surface: each hit now carries
+  `pageId` (renamed from `id`), plus `path`, `snippet` and `score`; the
+  UI-oriented `spaceId`, `rank` and `highlight` fields are dropped. (#443)
 
 ### Changed
 

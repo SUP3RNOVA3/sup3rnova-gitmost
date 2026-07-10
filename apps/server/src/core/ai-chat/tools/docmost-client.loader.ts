@@ -23,6 +23,8 @@ type DocmostClientMethod =
   | 'getWorkspace'
   | 'getSpaces'
   | 'listPages'
+  | 'getTree'
+  | 'getPageContext'
   | 'listSidebarPages'
   | 'getOutline'
   | 'getPageJson'
@@ -69,6 +71,10 @@ type DocmostClientMethod =
   | 'drawioGet'
   | 'drawioCreate'
   | 'drawioUpdate'
+  // --- draw.io high-level semantic tools (#425 stage 3) ---
+  | 'drawioEditCells'
+  | 'drawioFromGraph'
+  | 'drawioFromMermaid'
   // --- write (comment) ---
   | 'createComment'
   | 'resolveComment';

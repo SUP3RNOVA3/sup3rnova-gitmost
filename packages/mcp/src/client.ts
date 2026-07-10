@@ -32,9 +32,12 @@ import {
 } from "./lib/markdown-document.js";
 import {
   replaceNodeById,
+  replaceNodeByIdWithMany,
+  reassignCollidingBlockIds,
   deleteNodeById,
   assertUnambiguousMatch,
   insertNodeRelative,
+  insertNodesRelative,
   blockPlainText,
   buildOutline,
   getNodeByRef,
@@ -44,6 +47,11 @@ import {
   updateTableCell,
   findInvalidNode,
 } from "@docmost/prosemirror-markdown";
+import {
+  importMarkdownFragment,
+  canBeDocChild,
+  findUnrepresentableTableAttrs,
+} from "./lib/markdown-fragment.js";
 import { searchInDoc, SearchOptions } from "./lib/page-search.js";
 import { withPageLock } from "./lib/page-lock.js";
 import {
@@ -56,6 +64,14 @@ import {
 } from "./lib/drawio-xml.js";
 import { renderDiagramShapes } from "./lib/drawio-preview.js";
 import { applyElkLayout } from "./lib/drawio-layout.js";
+import {
+  buildFromGraph,
+  type Graph,
+  type LayoutMode as GraphLayoutMode,
+} from "./lib/drawio-graph.js";
+import { applyCellOps, type CellOp } from "./lib/drawio-cell-ops.js";
+import { mermaidToGraph } from "./lib/drawio-mermaid.js";
+import { parseCells as parseDrawioCells } from "./lib/drawio-xml.js";
 import {
   applyTextEdits,
   TextEdit,
@@ -83,6 +99,7 @@ import {
   commentsToFootnotes,
   canonicalizeFootnotes,
   insertInlineFootnote,
+  mergeFootnoteDefinitions,
 } from "./lib/transforms.js";
 import { normalizeAndMergeFootnotes } from "./lib/footnote-normalize-merge.js";
 import vm from "node:vm";
@@ -802,13 +819,17 @@ export class DocmostClient {
    * large instances, so a single bounded page of results is returned (default
    * 50, max 100) via the `/pages/recent` feed.
    *
-   * Tree (`tree` true): the space's FULL page hierarchy as a nested tree (each
-   * node has a `children` array). This mode REQUIRES `spaceId` (a page tree is
+   * Tree (`tree` true): DEPRECATED — prefer `getTree`, which shares this exact
+   * code path (a single `/pages/tree` request via `enumerateSpacePages` +
+   * `buildPageTree`) but returns the compact `{pageId, title, children?,
+   * hasChildren?}` shape and supports `rootPageId`/`maxDepth`. This tree mode is
+   * kept for backward compatibility; it REQUIRES `spaceId` (a page tree is
    * scoped to one space) and IGNORES `limit` — the whole hierarchy is returned.
    * It fetches the tree via `enumerateSpacePages`, which on the fork server
    * resolves to a single `/pages/tree` request returning the whole
    * permission-filtered flat page set (soft-deleted pages excluded
-   * server-side).
+   * server-side); the cursor-BFS in `enumerateSpacePages` is only a fallback for
+   * stock upstream servers that lack `/pages/tree`.
    */
   async listPages(spaceId?: string, limit: number = 50, tree: boolean = false) {
     await this.ensureAuthenticated();
@@ -830,6 +851,107 @@ export class DocmostClient {
     const data = response.data;
     const items = data.data?.items || data.items || [];
     return items.map((page: any) => filterPage(page));
+  }
+
+  /**
+   * Fetch a space's page hierarchy (or one subtree) as a nested tree in a SINGLE
+   * request — the #443 `getTree` tool. Shares its whole code path with
+   * `listPages(tree:true)`: `enumerateSpacePages` issues one `POST /pages/tree`
+   * (with the cursor-BFS only as a fallback for stock upstream servers that lack
+   * the endpoint), then `buildPageTree` nests the flat, permission-filtered,
+   * position-ordered list. No second tree fetch, no per-node BFS.
+   *
+   *  - `rootPageId` — restrict to that page's subtree; the server seeds the CTE
+   *    with the page itself, so the result is exactly ONE root (the page and its
+   *    descendants). Omit it for the whole space.
+   *  - `maxDepth` — trim the response to that many levels (roots = depth 1) to
+   *    save tokens; the server still returns everything in one request, the cut
+   *    is applied in `buildPageTree` AFTER the full tree is built. A node whose
+   *    children were cut carries `hasChildren: true` (source of truth = the flat
+   *    item's server `hasChildren`) so the caller can descend with a follow-up
+   *    `getTree(spaceId, rootPageId=that node)` call.
+   *
+   * Output nodes are `{pageId, title, children?, hasChildren?}` — only the UUID
+   * `pageId` is exposed (never `slugId`/`icon`/`position`). Requires `spaceId`
+   * (a page tree is scoped to one space).
+   */
+  async getTree(spaceId: string, rootPageId?: string, maxDepth?: number) {
+    await this.ensureAuthenticated();
+    if (!spaceId) {
+      throw new Error(
+        "getTree: spaceId is required (a page tree is scoped to one space).",
+      );
+    }
+    const { pages } = await this.enumerateSpacePages(spaceId, rootPageId);
+    return buildPageTree(pages, { shape: "getTree", maxDepth });
+  }
+
+  /**
+   * "Where am I / what's around" for a single page — the #443 `getPageContext`
+   * tool. Metadata only (no page content), using exactly TWO server requests:
+   *
+   *   1. `POST /pages/breadcrumbs` — a recursive CTE that walks UP from the page.
+   *      The server returns the chain root->page order (it `.reverse()`s the
+   *      child-first walk before responding), INCLUDING the page itself as the
+   *      LAST element. So the last element is the page and everything before it
+   *      is the ancestor chain root->parent. This carries the page's own title
+   *      and spaceId, so no extra page-info fetch is needed for a UUID input.
+   *   2. `listSidebarPages(spaceId, pageId)` — the page's DIRECT children,
+   *      cursor-paginated (a page with >20 children returns ALL of them, no
+   *      dupes) and in sidebar `position` order, each carrying `hasChildren`.
+   *
+   * The input may be a slugId (agents copy them from URLs); it is run through
+   * `resolvePageId` first, exactly like the other page tools. A UUID input adds
+   * no request there (short-circuit), keeping the total at two; a slugId input
+   * adds one unavoidable resolve round-trip.
+   *
+   * INVARIANT: only the UUID `pageId` is exposed anywhere — server `id` is
+   * mapped to `pageId` and `slugId` is never leaked. A nonexistent/inaccessible
+   * pageId makes the server 404/403, which propagates as a clear tool error
+   * (never a hollow empty object).
+   */
+  async getPageContext(pageId: string) {
+    await this.ensureAuthenticated();
+
+    // Resolve a possibly-slugId input to the canonical UUID (no round-trip for a
+    // UUID). Errors here (bad/inaccessible id) propagate as a clear tool error.
+    const pageUuid = await this.resolvePageId(pageId);
+
+    // Request 1: the ancestor chain, root->page, page included as the LAST item.
+    const response = await this.client.post("/pages/breadcrumbs", {
+      pageId: pageUuid,
+    });
+    const chain: any[] = (response.data?.data ?? response.data) ?? [];
+    if (!Array.isArray(chain) || chain.length === 0) {
+      // The endpoint always includes the page itself, so an empty chain means
+      // the page is gone/inaccessible — surface a clear error, not {}.
+      throw new Error(`getPageContext: page "${pageId}" not found or inaccessible`);
+    }
+
+    // Split: the last element is the page, the rest (root->parent) are the
+    // breadcrumbs. A root page has no ancestors -> breadcrumbs is [].
+    const self = chain[chain.length - 1];
+    const ancestors = chain.slice(0, -1);
+
+    const page = {
+      pageId: self.id,
+      title: self.title,
+      spaceId: self.spaceId,
+    };
+    const breadcrumbs = ancestors.map((n: any) => ({
+      pageId: n.id,
+      title: n.title,
+    }));
+
+    // Request 2: direct children in sidebar order, each with hasChildren.
+    const childItems = await this.listSidebarPages(self.spaceId, pageUuid);
+    const children = childItems.map((c: any) => ({
+      pageId: c.id,
+      title: c.title,
+      hasChildren: Boolean(c.hasChildren),
+    }));
+
+    return { page, breadcrumbs, children };
   }
 
   /**
@@ -1298,12 +1420,31 @@ export class DocmostClient {
   }
 
   /**
-   * Fetch a single node's full ProseMirror subtree (lossless) by reference:
-   * a block id (headings/paragraphs/callouts/images), or `#<index>` to select
-   * a top-level block by its outline index (the only way to reach tables/rows/
-   * cells, which carry no id).
+   * Fetch a single block for editing by reference: a block id (headings/
+   * paragraphs/callouts/images), or `#<index>` to select a top-level block by its
+   * outline index (the only way to reach tables/rows/cells, which carry no id).
+   *
+   * `format` (#413):
+   *  - `"markdown"` (DEFAULT): serialize the block via the canonical converter
+   *    (`{type:"doc",content:[node]}` -> `convertProseMirrorToMarkdown`) — a read
+   *    "for editing": pair it with `patchNode({markdown})` to rewrite the block.
+   *    Comment anchors (`<span data-comment-id>`, INCLUDING resolved ones) are
+   *    NOT stripped here (unlike getPage): losing them on write-back would
+   *    orphan the thread. Returns `{ ..., format:"markdown", markdown }`.
+   *  - `"json"`: return the raw ProseMirror subtree as-is (lossless; the previous
+   *    default). Returns `{ ..., format:"json", node }`.
+   *
+   * AUTO fallback: a type that cannot be a document top-level child
+   * (tableRow/tableCell/tableHeader, addressed by `#<index>`) is NOT expressible
+   * as a standalone markdown document, so a `"markdown"` request for such a node
+   * transparently falls back to JSON with an explicit `format:"json"` field. The
+   * check derives from the schema's `doc` contentMatch, so it tracks the schema.
    */
-  async getNode(pageId: string, nodeId: string) {
+  async getNode(
+    pageId: string,
+    nodeId: string,
+    format: "markdown" | "json" = "markdown",
+  ) {
     await this.ensureAuthenticated();
     const data = await this.getPageRaw(pageId);
     const hit = getNodeByRef(
@@ -1315,12 +1456,35 @@ export class DocmostClient {
         `getNode: no node found for "${nodeId}" on page ${pageId} (use a block id from getOutline, or "#<index>" for a top-level block such as a table)`,
       );
     }
+
+    // JSON requested (or a non-top-level type that markdown cannot represent as a
+    // standalone document): return the subtree verbatim.
+    if (format === "json" || !canBeDocChild(hit.type)) {
+      return {
+        pageId,
+        ref: nodeId,
+        path: hit.path,
+        type: hit.type,
+        format: "json" as const,
+        node: hit.node,
+      };
+    }
+
+    // Markdown: wrap the node as a one-block doc and run the canonical converter.
+    // Comment anchors are DELIBERATELY preserved (converter default) so a
+    // getNode(markdown) -> edit -> patchNode(markdown) round trip does not orphan
+    // a comment thread; this differs from getPage, which strips them.
+    const markdown = convertProseMirrorToMarkdown({
+      type: "doc",
+      content: [hit.node],
+    });
     return {
       pageId,
       ref: nodeId,
       path: hit.path,
       type: hit.type,
-      node: hit.node,
+      format: "markdown" as const,
+      markdown,
     };
   }
 
@@ -2307,17 +2471,61 @@ export class DocmostClient {
   }
 
   /**
-   * Replace EVERY node whose attrs.id === nodeId (recursively, including nodes
-   * nested in callouts/tables) with the supplied node. Operates on the LIVE
-   * collab document so comments and concurrent edits are preserved.
+   * Replace the block whose attrs.id === nodeId. Operates on the LIVE collab
+   * document so comments and concurrent edits are preserved.
    *
-   * The replacement node's block id is preserved: if node.attrs is missing it
-   * is created, and if node.attrs.id is missing it is set to nodeId so the
-   * replacement keeps the same id it replaced. Throws if no node matches.
+   * Exactly one of `input.markdown` / `input.node` (#413):
+   *  - `markdown` (RECOMMENDED): the block is rewritten from a canonical markdown
+   *    fragment. The fragment may import to N blocks (a "1 -> N" splice: rewrite a
+   *    whole section in one call). The FIRST resulting block INHERITS the target's
+   *    `attrs.id` (so an existing comment anchoring the block by id survives); the
+   *    rest get FRESH ids. `^[...]` footnotes in the fragment are first-class:
+   *    their definitions merge into the page's TAIL footnote list (content-key
+   *    dedup + canonicalize), same machinery insertFootnote uses. REJECTED when
+   *    the TARGET block carries a table-cell attribute markdown cannot represent
+   *    (colspan/rowspan/colwidth/background) — use the table tools or `node`.
+   *  - `node`: a raw ProseMirror node for precise attr/mark work. The replacement
+   *    keeps the target id (if `node.attrs.id` is missing it is set to nodeId).
+   *
+   * #159 ambiguous-id semantics are unchanged: 0 matches -> "no node"; >1 matches
+   * -> "ambiguous, refused" (nothing written), on BOTH paths — the markdown path
+   * runs a dry `replaceNodeById` count first, so a duplicated id never splices.
    */
-  async patchNode(pageId: string, nodeId: string, node: any) {
+  async patchNode(
+    pageId: string,
+    nodeId: string,
+    input: { markdown?: string; node?: any },
+  ) {
     await this.ensureAuthenticated();
 
+    // XOR: exactly one of markdown / node. Both optional in the schema; the
+    // runtime enforces the recommendation ("markdown for prose, node for fine
+    // work") without letting an ambiguous both-or-neither call through.
+    const hasMd =
+      input != null &&
+      typeof input.markdown === "string" &&
+      input.markdown.trim() !== "";
+    const hasNode = input != null && input.node != null;
+    if (hasMd === hasNode) {
+      throw new Error(
+        "patchNode: provide exactly one of `markdown` (recommended, for prose) " +
+          "or `node` (a raw ProseMirror node, for precise attr/mark work)",
+      );
+    }
+
+    if (hasMd) {
+      return this.patchNodeMarkdown(pageId, nodeId, input.markdown as string);
+    }
+    return this.patchNodeJson(pageId, nodeId, input.node);
+  }
+
+  /**
+   * patchNode with a raw ProseMirror `node` (the pre-#413 behavior). Replaces
+   * EVERY node whose attrs.id === nodeId; the swapped-in node keeps the target
+   * id. #159 ambiguity refused. Split out so the markdown path can reuse the
+   * shared collab/guard plumbing without a giant branch.
+   */
+  private async patchNodeJson(pageId: string, nodeId: string, node: any) {
     if (!node || typeof node !== "object" || typeof node.type !== "string") {
       throw new Error(
         "patchNode: `node` must be an object with a string `type`",
@@ -2382,22 +2590,143 @@ export class DocmostClient {
   }
 
   /**
-   * Insert a node relative to an anchor (or append it at the top level).
+   * patchNode with a MARKDOWN fragment (#413). Imports the fragment through the
+   * canonical importer, then 1 -> N splices the resulting blocks in place of the
+   * target block on the LIVE collab doc:
+   *  - the FIRST block inherits the target's id; the rest get FRESH ids (minted
+   *    by the importer/id-remap, so neighbour blocks are untouched);
+   *  - `^[...]` footnote definitions merge into the page's tail list;
+   *  - REJECTED when the target block carries a markdown-unrepresentable table
+   *    attr (colspan/rowspan/colwidth/background) — guarding against silent loss;
+   *  - #159 ambiguity is enforced by a dry `replaceNodeById` count BEFORE the
+   *    splice, so a duplicated id never writes.
+   */
+  private async patchNodeMarkdown(
+    pageId: string,
+    nodeId: string,
+    markdown: string,
+  ) {
+    // Import the fragment up front (network-free, canonical) so a bad fragment
+    // fails before any collab connection or page lock.
+    const { blocks, definitions } = await importMarkdownFragment(markdown);
+
+    // The first imported block inherits the target id; the rest keep the fresh
+    // ids the importer assigned. Build the thread now so it is stable across a
+    // collab retry (the transform below is pure over its inputs).
+    const threaded = blocks.map((b, i) => {
+      if (i !== 0) return b;
+      return {
+        ...b,
+        attrs: {
+          ...(b && typeof b.attrs === "object" ? b.attrs : {}),
+          id: nodeId,
+        },
+      };
+    });
+
+    // Shape-validate every imported block up front (parity with the JSON path):
+    // the importer only emits schema nodes, but the check is cheap insurance and
+    // yields the same rich #409 diagnostics if the schema ever drifts.
+    for (const b of threaded) {
+      this.assertValidNodeShape("patchNode", b);
+    }
+
+    const collabToken = await this.getCollabTokenWithReauth();
+    // Open the collab doc by the canonical UUID, never the slugId (#260).
+    const pageUuid = await this.resolvePageId(pageId);
+
+    let replaced = 0;
+    let guardAttrs: string | null = null;
+    const mutation = await mutatePageContent(
+      pageUuid,
+      collabToken,
+      this.apiUrl,
+      (liveDoc) => {
+        replaced = 0;
+        guardAttrs = null;
+
+        // #159: count matches with the same recursive walk the JSON path uses;
+        // only an UNAMBIGUOUS single match may write. A dry count keeps the
+        // ambiguity semantics identical across both paths.
+        const { replaced: count } = replaceNodeById(liveDoc, nodeId, {
+          type: "paragraph",
+        });
+        replaced = count;
+        if (count !== 1) return null;
+
+        // Guard against SILENT LOSS: if the target block carries a table-cell
+        // attribute markdown cannot represent (colspan/rowspan/colwidth/
+        // background), refuse the markdown rewrite so those attrs are not
+        // dropped. Simple tables (no such attrs) rewrite fine.
+        const hit = getNodeByRef(liveDoc, nodeId);
+        guardAttrs = hit ? findUnrepresentableTableAttrs(hit.node) : null;
+        if (guardAttrs != null) return null;
+
+        // Re-mint any minted block id that collides with an existing page id
+        // (skip index 0: its id is intentionally the target nodeId, unique by
+        // the #159 dry-count above), so the 1 -> N splice stays page-wide unique.
+        reassignCollidingBlockIds(liveDoc, threaded, 0);
+
+        // 1 -> N splice, then merge any fragment footnote definitions into the
+        // page's tail list and re-derive canonical footnote numbering.
+        const { doc: spliced } = replaceNodeByIdWithMany(
+          liveDoc,
+          nodeId,
+          threaded,
+        );
+        return mergeFootnoteDefinitions(spliced, definitions);
+      },
+    );
+
+    // Surface the guard rejection with an actionable message (nothing written).
+    if (guardAttrs != null) {
+      throw new Error(
+        `patchNode: the target block has table-cell attributes markdown cannot ` +
+          `represent (${guardAttrs}) — a markdown rewrite would drop them. Use ` +
+          `the table tools (tableUpdateCell/tableInsertRow) or pass a raw ` +
+          `ProseMirror \`node\` instead of \`markdown\`.`,
+      );
+    }
+
+    // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform skipped the write
+    // for any count !== 1). Shared #159 guard, identical to the JSON path.
+    assertUnambiguousMatch("patchNode", "replace", replaced, nodeId, pageId);
+
+    return {
+      success: true,
+      replaced,
+      nodeId,
+      blocks: threaded.length,
+      verify: mutation.verify,
+    };
+  }
+
+  /**
+   * Insert content relative to an anchor (or append it at the top level).
    * Operates on the LIVE collab document so comments and concurrent edits are
    * preserved.
    *
+   * Exactly one of `input.markdown` / `input.node` (#413):
+   *  - `markdown` (RECOMMENDED): a canonical markdown fragment. It may import to
+   *    SEVERAL blocks — they are inserted IN ORDER at the anchor. `^[...]`
+   *    footnote definitions merge into the page's tail list (same machinery as
+   *    insertFootnote). Every inserted block gets a fresh id.
+   *  - `node`: a raw ProseMirror node for precise attr/mark work, or to insert
+   *    table structure (a bare tableRow/tableCell/tableHeader — NOT expressible in
+   *    markdown, so those stay JSON-only).
+   *
    * opts.position:
-   *  - "append": push the node at the end of the top-level content.
-   *  - "before"/"after": insert the node as a sibling of the anchor, just
-   *    before/after it. Exactly one of anchorNodeId / anchorText must be given;
-   *    anchorNodeId locates a node anywhere by attrs.id, anchorText matches the
-   *    first top-level block whose plain text includes it.
+   *  - "append": push the content at the end of the top-level content.
+   *  - "before"/"after": insert as a sibling of the anchor, just before/after it.
+   *    Exactly one of anchorNodeId / anchorText must be given; anchorNodeId
+   *    locates a node anywhere by attrs.id, anchorText matches the first top-level
+   *    block whose plain text includes it.
    *
    * Throws if the anchor cannot be found.
    */
   async insertNode(
     pageId: string,
-    node: any,
+    input: { markdown?: string; node?: any },
     opts: {
       position: "before" | "after" | "append";
       anchorNodeId?: string;
@@ -2406,11 +2735,19 @@ export class DocmostClient {
   ) {
     await this.ensureAuthenticated();
 
-    if (!node || typeof node !== "object" || typeof node.type !== "string") {
+    // XOR: exactly one of markdown / node (both optional in the schema).
+    const hasMd =
+      input != null &&
+      typeof input.markdown === "string" &&
+      input.markdown.trim() !== "";
+    const hasNode = input != null && input.node != null;
+    if (hasMd === hasNode) {
       throw new Error(
-        "insertNode: `node` must be an object with a string `type`",
+        "insertNode: provide exactly one of `markdown` (recommended, for prose) " +
+          "or `node` (a raw ProseMirror node, for precise attr/mark work or table structure)",
       );
     }
+
     if (
       !opts ||
       (opts.position !== "before" &&
@@ -2434,10 +2771,32 @@ export class DocmostClient {
       }
     }
 
+    // Resolve the ordered list of blocks to insert plus any footnote definitions
+    // to merge. The markdown path imports canonically (so an inserted block is
+    // byte-identical to the same content in a full-page import); the node path is
+    // a single block with no footnote merge (raw JSON `^[...]` is not touched).
+    let blocks: any[];
+    let definitions: any[] = [];
+    if (hasMd) {
+      const frag = await importMarkdownFragment(input.markdown as string);
+      blocks = frag.blocks;
+      definitions = frag.definitions;
+    } else {
+      const node = input.node;
+      if (!node || typeof node !== "object" || typeof node.type !== "string") {
+        throw new Error(
+          "insertNode: `node` must be an object with a string `type`",
+        );
+      }
+      blocks = [node];
+    }
+
     // #409: fail fast on a malformed node SHAPE (a nested child with an
     // absent/unknown `type`) BEFORE opening a collab session or taking the page
     // lock — the root-only check above never sees nested children.
-    this.assertValidNodeShape("insertNode", node);
+    for (const b of blocks) {
+      this.assertValidNodeShape("insertNode", b);
+    }
 
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
@@ -2452,14 +2811,20 @@ export class DocmostClient {
       this.apiUrl,
       (liveDoc) => {
         inserted = false;
-        const { doc: nd, inserted: ins } = insertNodeRelative(
-          liveDoc,
-          node,
-          opts,
-        );
-        inserted = ins;
+        // Re-mint any minted block id that collides with an existing page id
+        // (all inserted blocks are fresh, no skip) so the splice stays unique.
+        if (hasMd) reassignCollidingBlockIds(liveDoc, blocks);
+        // Single-block node path keeps `insertNodeRelative` (it owns the
+        // structural table-node splicing); the markdown path uses the array
+        // splice so N blocks land in order at one anchor.
+        const res = hasMd
+          ? insertNodesRelative(liveDoc, blocks, opts)
+          : insertNodeRelative(liveDoc, blocks[0], opts);
+        inserted = res.inserted;
         if (!inserted) return null; // anchor not found -> skip the write entirely
-        return nd;
+        // Merge any fragment footnote definitions into the page tail list and
+        // re-derive canonical numbering (no-op when there are none).
+        return mergeFootnoteDefinitions(res.doc, definitions);
       },
     );
 
@@ -2482,6 +2847,7 @@ export class DocmostClient {
       success: true,
       inserted: true,
       position: opts.position,
+      blocks: blocks.length,
       verify: mutation.verify,
     };
   }
@@ -2577,14 +2943,28 @@ export class DocmostClient {
     return { success: true, removedShareId: share.shareId, pageId };
   }
 
-  async search(query: string, spaceId?: string, limit?: number) {
+  async search(
+    query: string,
+    spaceId?: string,
+    limit?: number,
+    opts: { parentPageId?: string; titleOnly?: boolean } = {},
+  ) {
     await this.ensureAuthenticated();
-    const payload: Record<string, any> = { query, spaceId };
-    // Clamp an optional caller-supplied limit into a sane 1..100 range before
-    // forwarding it to the server; omit it entirely when not provided so the
-    // server applies its own default.
+    // Opt into the #443 agent-lookup mode: `substring: true` turns on the hybrid
+    // substring + FTS branch that returns path + snippet + score. A stock
+    // upstream server strips these unknown DTO fields (whitelist:true) and
+    // silently degrades to plain FTS — see the tool-registration comment.
+    const payload: Record<string, any> = {
+      query,
+      spaceId,
+      substring: true,
+    };
+    if (opts.parentPageId) payload.parentPageId = opts.parentPageId;
+    if (opts.titleOnly) payload.titleOnly = true;
+    // Clamp an optional caller-supplied limit into the lookup range (1..50)
+    // before forwarding; omit it when not provided so the server default applies.
     if (limit !== undefined) {
-      payload.limit = Math.max(1, Math.min(100, limit));
+      payload.limit = Math.max(1, Math.min(50, limit));
     }
     const response = await this.client.post("/search", payload);
 
@@ -4256,6 +4636,255 @@ export class DocmostClient {
       warnings: prepared.warnings,
       verify: mutation.verify,
     };
+  }
+
+  // --- draw.io high-level semantic tools (issue #425) ---
+
+  /**
+   * ID-based targeted edits of an existing drawio diagram (add / update / delete
+   * cells) instead of resending the whole XML. Reads the CURRENT diagram, checks
+   * the optimistic lock (`baseHash` is MANDATORY, exactly as drawioUpdate), applies
+   * the operations to the parsed model (a `delete` CASCADES to container children
+   * and to every edge whose source/target is deleted), then runs the SAME #423
+   * pipeline as drawioUpdate (lint + quality warnings -> preview -> attachment ->
+   * repoint the node). Ids are stable so diffs stay meaningful across edits.
+   */
+  async drawioEditCells(
+    pageId: string,
+    node: string,
+    operations: CellOp[],
+    baseHash: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    if (typeof baseHash !== "string" || baseHash.length === 0) {
+      throw new Error(
+        "drawioEditCells: baseHash is mandatory — read the diagram with drawioGet first and pass back its meta.hash",
+      );
+    }
+    if (!Array.isArray(operations) || operations.length === 0) {
+      throw new Error(
+        "drawioEditCells: operations must be a non-empty array of { op, ... }",
+      );
+    }
+
+    const { node: drawio, ref } = await this.resolveDrawioNode(pageId, node);
+    const oldAttrs = drawio.attrs || {};
+    const oldSrc = oldAttrs.src;
+    const nodeId = oldAttrs.id ?? ref;
+    if (!oldSrc) {
+      throw new Error(
+        `drawioEditCells: node "${node}" on page ${pageId} has no src to edit`,
+      );
+    }
+    const currentSvg = await this.fetchAttachmentText(oldSrc);
+    const currentModel = decodeDrawioSvg(currentSvg);
+    const currentHash = mxHash(currentModel);
+    if (currentHash !== baseHash) {
+      throw new Error(
+        `drawioEditCells: conflict — the diagram changed since it was read ` +
+          `(baseHash ${baseHash} != current ${currentHash}). Re-read it with drawioGet and retry.`,
+      );
+    }
+
+    // Apply the operations to the parsed model, then run the standard pipeline.
+    const editedModel = applyCellOps(currentModel, operations);
+    const prepared = prepareModel(editedModel);
+    const inner = renderDiagramShapes(prepared.cells, prepared.bbox);
+    const diagramTitle = oldAttrs.title || "Page-1";
+    const svg = buildDrawioSvg(prepared.modelXml, inner, prepared.bbox, diagramTitle);
+
+    const att = await this.uploadAttachmentBuffer(
+      pageId,
+      Buffer.from(svg, "utf-8"),
+      "diagram.drawio.svg",
+      "image/svg+xml",
+    );
+    const newSrc = `/api/files/${att.id}/${att.fileName}`;
+
+    const collabToken = await this.getCollabTokenWithReauth();
+    const pageUuid = await this.resolvePageId(pageId);
+
+    let repointed = 0;
+    const mutation = await this.mutatePage(
+      pageUuid,
+      collabToken,
+      this.apiUrl,
+      (liveDoc) => {
+        repointed = 0;
+        const doc =
+          liveDoc && liveDoc.type === "doc" ? liveDoc : { type: "doc", content: [] };
+        if (!Array.isArray(doc.content)) doc.content = [];
+        const hit = getNodeByRef(doc, ref);
+        if (!hit || hit.type !== "drawio") return null;
+        let target: any = doc;
+        for (const idx of hit.path) {
+          if (!target || !Array.isArray(target.content)) {
+            target = null;
+            break;
+          }
+          target = target.content[idx];
+        }
+        if (!target || target.type !== "drawio") return null;
+        target.attrs = {
+          ...target.attrs,
+          src: newSrc,
+          attachmentId: att.id,
+          width: prepared.bbox.width,
+          height: prepared.bbox.height,
+        };
+        repointed++;
+        return doc;
+      },
+    );
+
+    if (repointed === 0) {
+      return {
+        success: true,
+        nodeId,
+        attachmentId: att.id,
+        warnings: [
+          ...prepared.warnings,
+          "target drawio node was removed concurrently; uploaded attachment is unreferenced",
+        ],
+        verify: mutation.verify,
+      };
+    }
+    return {
+      success: true,
+      nodeId,
+      attachmentId: att.id,
+      warnings: prepared.warnings,
+      verify: mutation.verify,
+    };
+  }
+
+  /**
+   * The main high-level tool: build a diagram from a SEMANTIC graph (nodes with
+   * a `kind`/`icon`, groups, edges) — the model never supplies coordinates or
+   * style strings. The server resolves icons via the shape catalog (#424),
+   * assigns palette colors from the preset, runs ELK layered layout (honouring
+   * `direction` and the `layer`/`sameLayerAs`/`pinned` hints and compound groups),
+   * and assembles linter-clean XML, then inserts it through the SAME create
+   * pipeline as drawioCreate. `layout:"incremental"` is only meaningful when a
+   * target `node` is given (it preserves that diagram's existing coordinates and
+   * places only new cells); on a fresh insert it behaves like "full".
+   */
+  async drawioFromGraph(
+    pageId: string,
+    where: {
+      position: "before" | "after" | "append";
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+    graph: Graph,
+    direction?: "LR" | "RL" | "TB" | "BT",
+    preset?: string,
+    layout?: GraphLayoutMode,
+    node?: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    iconsResolved: number;
+    iconsMissing: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    // Direction/preset supplied as separate params override the graph fields so
+    // both the flat tool schema and an inline graph can set them.
+    const merged: Graph = {
+      ...graph,
+      direction: direction ?? graph.direction,
+      preset: preset ?? graph.preset,
+    };
+    const mode: GraphLayoutMode = layout ?? "full";
+
+    // Incremental into an EXISTING node: read its coords so ELK preserves them,
+    // and keep the full existing model so incremental MERGES (never drops) any
+    // cell the new graph doesn't re-list.
+    let existingCoords: Map<string, { x: number; y: number }> | undefined;
+    let existingModelXml: string | undefined;
+    let editExisting = false;
+    let baseHash: string | undefined;
+    if (node && (mode === "incremental" || mode === "none")) {
+      const { node: drawio } = await this.resolveDrawioNode(pageId, node);
+      const src = (drawio.attrs || {}).src;
+      if (src) {
+        const svg = await this.fetchAttachmentText(src);
+        const model = decodeDrawioSvg(svg);
+        baseHash = mxHash(model);
+        existingModelXml = model;
+        existingCoords = new Map();
+        for (const c of parseDrawioCells(model)) {
+          if (c.vertex && c.geometry.x != null && c.geometry.y != null) {
+            existingCoords.set(c.id, { x: c.geometry.x, y: c.geometry.y });
+          }
+        }
+        editExisting = true;
+      }
+    }
+
+    const built = await buildFromGraph(
+      merged,
+      mode,
+      existingCoords,
+      existingModelXml,
+    );
+
+    if (editExisting && node && baseHash) {
+      // Re-target the existing diagram: replace it with the assembled model.
+      const res = await this.drawioUpdate(pageId, node, built.modelXml, baseHash);
+      return {
+        ...res,
+        iconsResolved: built.iconsResolved,
+        iconsMissing: built.iconsMissing,
+      };
+    }
+
+    const res = await this.drawioCreate(pageId, where, built.modelXml);
+    return {
+      ...res,
+      iconsResolved: built.iconsResolved,
+      iconsMissing: built.iconsMissing,
+    };
+  }
+
+  /**
+   * Convert a Mermaid `flowchart` to a redactable draw.io diagram via a PURE
+   * parser (no Electron / draw.io CLI): mermaid text -> graph-JSON -> the
+   * drawioFromGraph pipeline. Only `flowchart`/`graph` is supported (the most
+   * common wiki case); other diagram types throw a clear error so the model can
+   * fall back to drawioFromGraph.
+   */
+  async drawioFromMermaid(
+    pageId: string,
+    where: {
+      position: "before" | "after" | "append";
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+    mermaid: string,
+    preset?: string,
+  ): Promise<{
+    success: boolean;
+    nodeId: string;
+    attachmentId: string;
+    warnings: string[];
+    iconsResolved: number;
+    iconsMissing: string[];
+    verify?: any;
+  }> {
+    await this.ensureAuthenticated();
+    const graph = mermaidToGraph(mermaid);
+    if (preset) graph.preset = preset;
+    return this.drawioFromGraph(pageId, where, graph, graph.direction, graph.preset);
   }
 
   // --- Page history / diff / transform ---

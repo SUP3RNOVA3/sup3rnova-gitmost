@@ -40,7 +40,7 @@ There are several Docmost MCPs. Here is a capability-by-capability comparison.
 | **Enterprise license required** | **No** | **Yes** | No | No | No |
 | Authentication | email + password, **auto re-auth** | API key | email + password | cookie `authToken` (copy from DevTools) | Docmost API / **direct PostgreSQL** |
 | Read page as Markdown | ✅ | ✅ | ✅ | ✅ | ✅ (read-only) |
-| **Lossless Markdown round-trip** (export / import, keeps comment anchors) | ✅ | — | — | — | — |
+| **Markdown round-trip** (export / import, keeps comment anchors) | ✅ | — | — | — | — |
 | Read **lossless ProseMirror JSON** (with block ids) | ✅ | — | — | — | — |
 | **Compact page outline** (cheap block-id lookup) | ✅ | — | — | — | — |
 | **Fetch a single block** (by id or index) | ✅ | — | — | — | — |
@@ -115,8 +115,10 @@ All 41 tools, grouped by what you'd reach for them.
 - **`listPages`** — Recent pages in a space, ordered by `updatedAt` desc (default 50,
   max 100). Use `search` for lookups in large spaces.
 - **`search`** — Full-text search across pages and content (bounded by `limit`, max 100).
-- **`getPage`** — A page's content as clean **Markdown** (convenient, but a *lossy*
-  view — block ids and exact table/callout structure are approximated).
+- **`getPage`** — A page's content as clean **Markdown** (canonical for text; drops only
+  block ids, resolved-comment anchors, and a fixed no-Markdown-representation attr set —
+  table spans/colwidth/background, indent, `callout.icon`, `orderedList.type`, and link
+  `internal`/`target`/`rel`/`class`; use `getPageJson` when you need those).
 - **`getPageJson`** — A page's **lossless ProseMirror/TipTap JSON**, including every
   block's `attrs.id` and the `slugId` used in URLs. This is what the per-block editing
   tools consume.
@@ -186,10 +188,14 @@ All 41 tools, grouped by what you'd reach for them.
 
 ### Markdown round-trip
 
-- **`exportPageMarkdown`** — Export a page to a single self-contained, **lossless
-  Docmost-flavoured Markdown** file: a meta header, the body with inline comment anchors
-  and diagrams, and a trailing comments-thread block. To replace a page's body from plain
-  authoring Markdown, use `updatePageMarkdown`.
+- **`exportPageMarkdown`** — Export a page to a single self-contained
+  **Docmost-flavoured Markdown** file: a meta header, the body with inline comment anchors
+  and diagrams, and a trailing comments-thread block. The download → edit → import
+  round-trip regenerates block ids and **silently drops** the no-Markdown-representation
+  attr set (table merge spans/colwidth/background, indent, `callout.icon`,
+  `orderedList.type`, link `internal`/`target`/`rel`/`class`); keep those in ProseMirror
+  JSON if they must survive. To replace a page's body from plain authoring Markdown, use
+  `updatePageMarkdown`.
 
 > **Removed in this release:** `importPageMarkdown` (the round-trip parser for an
 > exported Docmost-Markdown file) is **no longer exposed on the external MCP surface**.
@@ -293,15 +299,16 @@ so capable clients steer the model automatically.
   refreshed automatically on the first 401/403 (covering JSON, multipart upload, and the
   collaboration-token path), with in-flight login de-duplication so a burst of calls
   triggers a single re-login.
-- **Lossless and lossy reads.** `getPageJson` returns the exact ProseMirror tree with
-  block ids; `getPage` returns clean Markdown for convenience.
+- **Precise reads.** `getPageJson` returns the exact ProseMirror tree with block ids;
+  `getPage` returns canonical Markdown that drops only a fixed, documented attr set.
 - **Full Docmost schema.** Markdown↔ProseMirror conversion supports callouts (including
   nested), task lists (bullet *and* numbered checklists), tables, math blocks, embeds,
   highlights, sub/superscript and more, with defensive caps against pathological input.
-- **Structured tables & lossless Markdown round-trip.** Tables can be edited as a matrix
+- **Structured tables & Markdown round-trip.** Tables can be edited as a matrix
   (read, insert/delete rows, set cells by `[row,col]`) without resending the document, and
   a page can be exported to and re-imported from a self-contained Docmost-flavoured
-  Markdown file that preserves inline comment anchors and diagrams.
+  Markdown file that preserves inline comment anchors and diagrams (block ids regenerate
+  and a fixed no-Markdown-representation attr set is dropped — see `exportPageMarkdown`).
 - **Token-optimized responses.** API responses are filtered down to the fields agents
   actually need, and large collections (spaces, pages, comments, history) are paginated.
 - **Hardened runtime.** Global handlers keep a stray socket error from tearing down the

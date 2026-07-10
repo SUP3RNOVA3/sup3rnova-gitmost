@@ -81,49 +81,68 @@ test("editPageText builder produces { pageId, edits } and drops the stale strip-
   assert.match(spec.description, /REFUSED into\s+failed\[\]/);
 });
 
-test("getNode builder produces exactly { pageId, nodeId }", () => {
-  const shape = SHARED_TOOL_SPECS.getNode.buildShape(z);
-  assert.deepEqual(Object.keys(shape).sort(), ["nodeId", "pageId"]);
+// #413: getNode gained an optional `format` (markdown default / json opt-in).
+test("getNode builder produces { pageId, nodeId, format? } with format optional", () => {
+  const spec = SHARED_TOOL_SPECS.getNode;
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["format", "nodeId", "pageId"]);
+  const schema = z.object(shape);
+  // format is optional (markdown default lives in the client).
+  assert.doesNotThrow(() => schema.parse({ pageId: "p1", nodeId: "n1" }));
+  assert.doesNotThrow(() =>
+    schema.parse({ pageId: "p1", nodeId: "n1", format: "json" }),
+  );
+  assert.throws(() =>
+    schema.parse({ pageId: "p1", nodeId: "n1", format: "yaml" }),
+  );
+  // The description advertises the markdown default and the json opt-in.
+  assert.match(spec.description, /markdown/i);
+  assert.match(spec.description, /json/i);
 });
 
-test("patchNode spec exists, merges BOTH descriptions, builds { pageId, nodeId, node }", () => {
+// #413: patchNode takes XOR { markdown | node } (both schema-optional).
+test("patchNode spec exists, describes markdown+node XOR, builds { pageId, nodeId, markdown?, node? }", () => {
   const spec = SHARED_TOOL_SPECS.patchNode;
   assert.ok(spec, "patchNode spec missing");
   assert.equal(spec.mcpName, "patchNode");
   assert.equal(spec.inAppKey, "patchNode");
 
-  // The canonical description must carry the key guidance from BOTH originals:
-  //  - MCP-only: "WITHOUT resending the whole document" + the cheaper/safer note.
-  //  - in-app-only: "keeps the same node id" + the "Reversible ... page history"
-  //    framing the MCP copy lacked.
-  assert.match(spec.description, /WITHOUT resending the whole document/);
-  assert.match(spec.description, /Cheaper and safer/);
-  assert.match(spec.description, /keeps the same node id/i);
+  // The canonical description must carry the #413 guidance.
+  assert.match(spec.description, /WITHOUT/i);
+  assert.match(spec.description, /EXACTLY ONE of `markdown` or `node`/);
+  assert.match(spec.description, /RECOMMENDED/);
+  assert.match(spec.description, /keeps the same block id/i);
   assert.match(spec.description, /Reversible/i);
   assert.match(spec.description, /page history/i);
 
   const shape = spec.buildShape(z);
-  assert.deepEqual(Object.keys(shape).sort(), ["node", "nodeId", "pageId"]);
-  // A minimal valid input parses (node accepts an arbitrary object via z.any()).
-  const parsed = z.object(shape).parse({
+  assert.deepEqual(
+    Object.keys(shape).sort(),
+    ["markdown", "node", "nodeId", "pageId"],
+  );
+  // markdown and node are BOTH optional in the schema (XOR enforced at runtime).
+  const schema = z.object(shape);
+  const parsedMd = schema.parse({ pageId: "p1", nodeId: "n1", markdown: "hi" });
+  assert.equal(parsedMd.markdown, "hi");
+  const parsedNode = schema.parse({
     pageId: "p1",
     nodeId: "n1",
     node: { type: "paragraph" },
   });
-  assert.equal(parsed.pageId, "p1");
-  assert.equal(parsed.nodeId, "n1");
+  assert.equal(parsedNode.pageId, "p1");
+  // Neither given parses at the schema level (the client throws the XOR error).
+  assert.doesNotThrow(() => schema.parse({ pageId: "p1", nodeId: "n1" }));
 });
 
-test("insertNode spec exists, merges BOTH descriptions, builds the full anchor shape", () => {
+// #413: insertNode also takes XOR { markdown | node } plus the anchor shape.
+test("insertNode spec exists, describes markdown+node XOR, builds the full anchor+content shape", () => {
   const spec = SHARED_TOOL_SPECS.insertNode;
   assert.ok(spec, "insertNode spec missing");
   assert.equal(spec.mcpName, "insertNode");
   assert.equal(spec.inAppKey, "insertNode");
 
-  // Canonical description must keep BOTH sides' nuance:
-  //  - in-app-only: "EXACTLY ONE of anchorNodeId or anchorText" + "Reversible".
-  //  - MCP-only: the table-structure (tableRow/tableCell) insertion guidance.
   assert.match(spec.description, /EXACTLY ONE of anchorNodeId or anchorText/);
+  assert.match(spec.description, /EXACTLY ONE of `markdown` or `node`/);
   assert.match(spec.description, /tableRow/);
   assert.match(spec.description, /append is top-level only/);
   assert.match(spec.description, /Reversible via page history/);
@@ -131,16 +150,83 @@ test("insertNode spec exists, merges BOTH descriptions, builds the full anchor s
   const shape = spec.buildShape(z);
   assert.deepEqual(
     Object.keys(shape).sort(),
-    ["anchorNodeId", "anchorText", "node", "pageId", "position"],
+    ["anchorNodeId", "anchorText", "markdown", "node", "pageId", "position"],
   );
-  // before/after/append are the only accepted positions; anchors are optional.
+  // before/after/append are the only accepted positions; markdown/node/anchors optional.
   const schema = z.object(shape);
+  assert.doesNotThrow(() =>
+    schema.parse({ pageId: "p1", markdown: "hi", position: "append" }),
+  );
   assert.doesNotThrow(() =>
     schema.parse({ pageId: "p1", node: { type: "paragraph" }, position: "append" }),
   );
   assert.throws(() =>
-    schema.parse({ pageId: "p1", node: {}, position: "sideways" }),
+    schema.parse({ pageId: "p1", markdown: "x", position: "sideways" }),
   );
+});
+
+// #443: getTree — a space's page hierarchy (or a subtree) in one request.
+test("getTree spec exists on both hosts, builds { spaceId, rootPageId?, maxDepth? }", () => {
+  const spec = SHARED_TOOL_SPECS.getTree;
+  assert.ok(spec, "getTree spec missing");
+  assert.equal(spec.mcpName, "getTree");
+  assert.equal(spec.inAppKey, "getTree");
+  // Shared spec: registered on BOTH hosts.
+  assert.notEqual(spec.inAppOnly, true);
+  assert.notEqual(spec.mcpOnly, true);
+
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["maxDepth", "rootPageId", "spaceId"]);
+  const schema = z.object(shape);
+  // spaceId required; rootPageId + maxDepth optional.
+  assert.doesNotThrow(() => schema.parse({ spaceId: "sp1" }));
+  assert.throws(() => schema.parse({}));
+  assert.doesNotThrow(() =>
+    schema.parse({ spaceId: "sp1", rootPageId: "p1", maxDepth: 2 }),
+  );
+  // maxDepth is an integer >= 1.
+  assert.throws(() => schema.parse({ spaceId: "sp1", maxDepth: 0 }));
+  assert.throws(() => schema.parse({ spaceId: "sp1", maxDepth: 1.5 }));
+
+  // The description advertises the output node shape, rootPageId, maxDepth, and
+  // steers away from the deprecated listPages tree:true.
+  assert.match(spec.description, /pageId/);
+  assert.match(spec.description, /rootPageId/);
+  assert.match(spec.description, /maxDepth/);
+  assert.match(spec.description, /hasChildren/);
+  assert.match(spec.description, /listPages tree:true/);
+});
+
+// #443: getPageContext — a page's breadcrumbs + direct children in one call.
+test("getPageContext spec exists on both hosts, builds { pageId }", () => {
+  const spec = SHARED_TOOL_SPECS.getPageContext;
+  assert.ok(spec, "getPageContext spec missing");
+  assert.equal(spec.mcpName, "getPageContext");
+  assert.equal(spec.inAppKey, "getPageContext");
+  // Shared spec: registered on BOTH hosts.
+  assert.notEqual(spec.inAppOnly, true);
+  assert.notEqual(spec.mcpOnly, true);
+
+  const shape = spec.buildShape(z);
+  assert.deepEqual(Object.keys(shape).sort(), ["pageId"]);
+  const schema = z.object(shape);
+  // pageId required.
+  assert.doesNotThrow(() => schema.parse({ pageId: "p1" }));
+  assert.throws(() => schema.parse({}));
+
+  // The description advertises the output shape (page/breadcrumbs/children) and
+  // the root-page empty-breadcrumbs contract.
+  assert.match(spec.description, /breadcrumbs/);
+  assert.match(spec.description, /children/);
+  assert.match(spec.description, /hasChildren/);
+  assert.match(spec.description, /getTree/);
+});
+
+// #443: listPages tree:true is deprecated in favour of getTree.
+test("listPages description deprecates tree:true and points at getTree", () => {
+  const spec = SHARED_TOOL_SPECS.listPages;
+  assert.match(spec.description, /DEPRECATED/i);
+  assert.match(spec.description, /getTree/);
 });
 
 test("no-arg specs (getWorkspace/listSpaces/listShares) omit buildShape", () => {
