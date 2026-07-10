@@ -22,6 +22,12 @@ export default function CodeBlockView(props: NodeViewProps) {
   const [isSelected, setIsSelected] = useState(false);
 
   useEffect(() => {
+    // #343 PART 6: `isSelected` only drives the mermaid source's visibility (the
+    // `hidden` prop below). For every non-mermaid code block it is never read,
+    // so skip the per-block `selectionUpdate` listener entirely — otherwise N
+    // code blocks each add a global listener + a setState on every caret move.
+    if (language !== "mermaid") return;
+
     const updateSelection = () => {
       const { state } = editor;
       const { from, to } = state.selection;
@@ -32,11 +38,14 @@ export default function CodeBlockView(props: NodeViewProps) {
       setIsSelected(isNodeSelected);
     };
 
+    // Initialize on attach so switching a block's language to "mermaid" reflects
+    // the current selection immediately (the listener was not running before).
+    updateSelection();
     editor.on("selectionUpdate", updateSelection);
     return () => {
       editor.off("selectionUpdate", updateSelection);
     };
-  }, [editor, getPos(), node.nodeSize]);
+  }, [editor, getPos(), node.nodeSize, language]);
 
   function changeLanguage(language: string) {
     setLanguageValue(language);

@@ -1,5 +1,7 @@
 import type { Editor } from "@tiptap/react";
 import { useEditorState } from "@tiptap/react";
+import { undoDepth, redoDepth } from "@tiptap/pm/history";
+import { yUndoPluginKey } from "@tiptap/y-tiptap";
 
 export interface ToolbarState {
   isBold: boolean;
@@ -16,14 +18,45 @@ export interface ToolbarState {
   canRedo: boolean;
 }
 
-// Undo/redo come from either StarterKit's history or the Yjs collaboration
-// history extension. During the brief moment a page is rendered with the
-// static editor (mainExtensions only, undoRedo disabled), neither is loaded
-// and editor.can().undo/redo is undefined.
-function safeCan(editor: Editor, command: "undo" | "redo"): boolean {
-  const can = editor.can() as Record<string, unknown>;
-  const fn = can[command];
-  return typeof fn === "function" ? (fn as () => boolean)() : false;
+// Undo/redo availability, computed WITHOUT `editor.can().undo()/.redo()`.
+//
+// `editor.can()` runs the command as a dry-run (building a throwaway state +
+// transaction) — the most expensive work in this selector, and it ran on every
+// keystroke (and every REMOTE keystroke under collaboration). Instead we read
+// the history stack depth directly, which is a cheap plugin-state lookup and
+// mirrors exactly what the undo/redo commands themselves check:
+//
+//  - Collaboration (Yjs): the yjs UndoManager's undo/redo stack lengths — the
+//    same `undoStack.length === 0` / `redoStack.length === 0` guard the
+//    Collaboration extension's undo/redo commands use.
+//  - Plain history (templates / non-collab): prosemirror-history's undoDepth /
+//    redoDepth, which back the UndoRedo extension.
+//
+// When neither history backend is installed (the pre-sync static editor —
+// mainExtensions only, undoRedo disabled), both fall through to 0 -> false,
+// matching the previous `safeCan` behavior.
+function historyAvailability(editor: Editor): {
+  canUndo: boolean;
+  canRedo: boolean;
+} {
+  const state = editor.state;
+
+  // Collaboration history (Yjs) takes precedence when present.
+  const yState = yUndoPluginKey.getState(state) as
+    | { undoManager?: { undoStack: unknown[]; redoStack: unknown[] } }
+    | undefined;
+  if (yState?.undoManager) {
+    return {
+      canUndo: yState.undoManager.undoStack.length > 0,
+      canRedo: yState.undoManager.redoStack.length > 0,
+    };
+  }
+
+  // Plain prosemirror-history (returns 0 when the history plugin is absent).
+  return {
+    canUndo: undoDepth(state) > 0,
+    canRedo: redoDepth(state) > 0,
+  };
 }
 
 export function useToolbarState(editor: Editor | null): ToolbarState | null {
@@ -31,6 +64,7 @@ export function useToolbarState(editor: Editor | null): ToolbarState | null {
     editor,
     selector: (ctx) => {
       if (!ctx.editor) return null;
+      const { canUndo, canRedo } = historyAvailability(ctx.editor);
       return {
         isBold: ctx.editor.isActive("bold"),
         isItalic: ctx.editor.isActive("italic"),
@@ -42,8 +76,8 @@ export function useToolbarState(editor: Editor | null): ToolbarState | null {
         isBulletList: ctx.editor.isActive("bulletList"),
         isOrderedList: ctx.editor.isActive("orderedList"),
         isTaskList: ctx.editor.isActive("taskList"),
-        canUndo: safeCan(ctx.editor, "undo"),
-        canRedo: safeCan(ctx.editor, "redo"),
+        canUndo,
+        canRedo,
       };
     },
   });
