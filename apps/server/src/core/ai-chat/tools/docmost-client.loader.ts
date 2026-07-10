@@ -62,7 +62,10 @@ type DocmostClientMethod =
   | 'insertImage'
   | 'replaceImage'
   | 'insertFootnote'
-  // --- draw.io diagrams (#423, stage 1) ---
+  // --- draw.io diagrams (#423 stage 1, #424 stage 2) ---
+  // DERIVED from the real DocmostClient (#446): drawioCreate/drawioUpdate carry
+  // the optional layout:"elk" 5th arg in the real signature, so the layout parity
+  // (#440) is inherited automatically — no hand-written mirror to keep in sync.
   | 'drawioGet'
   | 'drawioCreate'
   | 'drawioUpdate'
