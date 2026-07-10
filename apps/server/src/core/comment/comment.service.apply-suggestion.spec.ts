@@ -5,6 +5,16 @@ import {
 } from '@nestjs/common';
 import { CommentService } from './comment.service';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
+import { QueueJob } from '../../integrations/queue/constants';
+
+// #399: the resolve/unresolve flip and the ephemeral anchor removal are enqueued
+// as COMMENT_MARK_UPDATE jobs (off the HTTP path), NOT awaited against the collab
+// gateway. applyCommentSuggestion (the document TEXT edit) is untouched — it
+// still runs synchronously via the gateway.
+const markJob = (generalQueue: any, action: string) =>
+  generalQueue.add.mock.calls.find(
+    (c: any[]) => c[0] === QueueJob.COMMENT_MARK_UPDATE && c[1]?.action === action,
+  );
 
 /**
  * Focused coverage for CommentService.applySuggestion (comment.service.ts).
@@ -59,6 +69,7 @@ describe('CommentService — applySuggestion', () => {
       commentRepo,
       wsService,
       collaborationGateway,
+      generalQueue,
       auditService,
     };
   }
@@ -86,9 +97,15 @@ describe('CommentService — applySuggestion', () => {
 
   // --- no replies → ephemeral delete branch -------------------------------
 
-  it('applied=true, no replies → replaces text, hard-deletes, strips the anchor mark, audits APPLIED, outcome=deleted', async () => {
-    const { service, commentRepo, wsService, collaborationGateway, auditService } =
-      makeService({ applied: true, currentText: 'new text' });
+  it('applied=true, no replies → replaces text, hard-deletes, enqueues the anchor-mark removal, audits APPLIED, outcome=deleted', async () => {
+    const {
+      service,
+      commentRepo,
+      wsService,
+      collaborationGateway,
+      generalQueue,
+      auditService,
+    } = makeService({ applied: true, currentText: 'new text' });
 
     const result = await service.applySuggestion(suggestionComment(), user());
 
@@ -105,12 +122,20 @@ describe('CommentService — applySuggestion', () => {
     );
 
     // Ephemeral: the redundant comment is hard-deleted (atomic-conditional) and
-    // its inline anchor mark removed via the deleteCommentMark collab event.
+    // its inline anchor mark removal is ENQUEUED (#399), no longer a sync gateway
+    // call. The gateway was only touched for the applyCommentSuggestion text edit.
     expect(commentRepo.deleteCommentIfChildless).toHaveBeenCalledWith('c-1');
-    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
+    const del = markJob(generalQueue, 'delete');
+    expect(del).toBeDefined();
+    expect(del[1]).toMatchObject({
+      documentName: 'page.page-1',
+      commentId: 'c-1',
+      userId: 'user-1',
+    });
+    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalledWith(
       'deleteCommentMark',
-      'page.page-1',
-      expect.objectContaining({ commentId: 'c-1', user: expect.any(Object) }),
+      expect.anything(),
+      expect.anything(),
     );
     // No applied stamps are written for a row about to be deleted.
     expect(appliedPatch(commentRepo)).toBeUndefined();
@@ -258,7 +283,7 @@ describe('CommentService — applySuggestion', () => {
     // The suggested text is already applied to the document, but between the
     // hasChildren read and the atomic delete a reply landed. The parent must NOT
     // be hard-deleted (cascade would destroy the reply); resolve the thread.
-    const { service, commentRepo, wsService, collaborationGateway } =
+    const { service, commentRepo, wsService, generalQueue } =
       makeService({ applied: true, currentText: 'new text' }, false, 0);
 
     const result = await service.applySuggestion(suggestionComment(), user());
@@ -275,11 +300,8 @@ describe('CommentService — applySuggestion', () => {
       .map((c: any[]) => c[0])
       .find((p: any) => 'resolvedAt' in p);
     expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
-    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
-      'resolveCommentMark',
-      'page.page-1',
-      expect.objectContaining({ commentId: 'c-1', resolved: true }),
-    );
+    // The resolve mark is enqueued (#399), not a sync gateway call.
+    expect(markJob(generalQueue, 'resolve')).toBeDefined();
     expect(result.outcome).toBe('resolved');
   });
 
