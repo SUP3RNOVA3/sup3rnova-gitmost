@@ -14,7 +14,19 @@
  * signature.
  *
  * If recreateTransform / the changeset throws on a pathological document pair,
- * we fall back to a coarse block-level text diff so the tool never hard-fails.
+ * OR the pair is too large to diff cheaply (see the size guard below), we fall
+ * back to a coarse block-level text diff so the tool never hard-fails and never
+ * pins the event loop.
+ *
+ * SIZE GUARD (issue #464 — prod CPU-DoS). recreateTransform computes its diff via
+ * rfc6902.createPatch, whose array diff is O(n·m) Levenshtein per array pair and
+ * whose per-run word diff is O(w²); on a large/heavily-changed doc this runs for
+ * seconds-to-hours and starves the whole process (BullMQ, Redis lock renewals,
+ * embeddings). It never THROWS — it just never finishes — so the try/catch below
+ * cannot save us. Because diffDocs runs on EVERY in-app/MCP content edit's verify
+ * report, we PRE-FLIGHT the doc size and route anything above a cheap cap straight
+ * to the coarse fallback (the same shape the catch produces). Same cap+fallback
+ * pattern as the ELK-layout DoS fix (#440 / c917dcc3).
  */
 
 import { Node } from "@tiptap/pm/model";
@@ -70,6 +82,56 @@ function countNodes(doc: any, pred: (node: any) => boolean): number {
   };
   visit(doc);
   return n;
+}
+
+// --- Issue #464: pre-flight size guard for the precise diff ------------------
+// Defaults are BENCHMARK-derived on the recreateTransform(complexSteps:false,
+// wordDiffs:true, simplifyDiff:true) pipeline, chosen so the WORST case (a fully
+// re-written doc — the adversarial shape that drove the incident) keeps the
+// synchronous block under ~200ms REGARDLESS of input:
+//   - 150 total nodes: worst-case pair ~176ms; the O(node²) array diff crosses
+//     200ms at ~170 nodes and then explodes super-linearly (400 nodes ~1.3s,
+//     800 ~5.5s), so cap just below the crossover.
+//   - 12 KiB serialized JSON: an independent axis, because the per-run word diff
+//     is O(words²) — a FEW nodes with very long text runs is dangerous even at a
+//     low node count (17 nodes / ~11 KiB ~176ms, / ~14 KiB ~290ms). A node-light
+//     but byte-heavy doc is still refused.
+// Either metric over its cap routes to the coarse fallback. Both are env-tunable
+// for operators who accept more CPU in exchange for exact diffs on larger docs.
+const DEFAULT_MAX_NODES = 150;
+const DEFAULT_MAX_BYTES = 12 * 1024;
+
+/**
+ * Read a positive-integer env override, falling back to `dflt`. Garbage / unset /
+ * non-finite / non-positive all fall back (so the guard can never be accidentally
+ * disabled by a malformed value). Read fresh on every call so a test / operator
+ * can flip the knob without a restart.
+ */
+function readPositiveIntEnv(name: string, dflt: number): number {
+  const raw = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : dflt;
+}
+
+/**
+ * True when the pair is too large for the precise (recreateTransform) diff and
+ * must degrade to the coarse fallback. Takes the MAX of the two docs on each
+ * metric so an ASYMMETRIC pair (a small new doc vs a huge old doc, or vice
+ * versa) — which still explodes rfc6902 — is caught. Cheap: one node walk +
+ * one JSON.stringify per doc, both O(size).
+ */
+function exceedsDiffSizeGuard(oldDoc: any, newDoc: any): boolean {
+  const maxNodes = readPositiveIntEnv("MCP_DIFF_MAX_NODES", DEFAULT_MAX_NODES);
+  const maxBytes = readPositiveIntEnv("MCP_DIFF_MAX_BYTES", DEFAULT_MAX_BYTES);
+  const nodes = Math.max(
+    countNodes(oldDoc, () => true),
+    countNodes(newDoc, () => true),
+  );
+  if (nodes > maxNodes) return true;
+  const bytes = Math.max(
+    JSON.stringify(oldDoc)?.length ?? 0,
+    JSON.stringify(newDoc)?.length ?? 0,
+  );
+  return bytes > maxBytes;
 }
 
 /**
@@ -226,6 +288,81 @@ function coarseDiff(oldDoc: any, newDoc: any): DiffChange[] {
   return changes;
 }
 
+/** Accumulated textual changes plus their derived char/block tallies. */
+interface DiffTally {
+  changes: DiffChange[];
+  inserted: number;
+  deleted: number;
+  changedBlocks: Set<string>;
+}
+
+/**
+ * Produce the coarse-fallback tally for a pair. This is the SINGLE source of the
+ * `fellBack:true` result shape, shared by BOTH degrade paths in diffDocs (the
+ * pre-flight size guard and the recreateTransform catch) so they behave and
+ * report identically.
+ */
+function coarseDiffTally(oldDoc: any, newDoc: any): DiffTally {
+  const changes = coarseDiff(oldDoc, newDoc);
+  let inserted = 0;
+  let deleted = 0;
+  const changedBlocks = new Set<string>();
+  for (const c of changes) {
+    if (c.op === "insert") inserted += c.text.length;
+    else deleted += c.text.length;
+    if (c.block) changedBlocks.add(c.op[0] + ":" + c.block);
+  }
+  return { changes, inserted, deleted, changedBlocks };
+}
+
+/**
+ * Compute the PRECISE tally via the recreateTransform pipeline. Callers MUST
+ * gate this behind the size guard (it can block the event loop for a large pair)
+ * and wrap it in try/catch (a pathological pair can throw); on either the guard
+ * or a throw, use `coarseDiffTally` instead. Kept as a sibling of
+ * `coarseDiffTally` so both produce the same `DiffTally` shape.
+ */
+function preciseDiffTally(oldDocJson: any, newDocJson: any): DiffTally {
+  const oldNode = Node.fromJSON(docmostSchema, oldDocJson);
+  const newNode = Node.fromJSON(docmostSchema, newDocJson);
+  const tr = recreateTransform(oldNode, newNode, {
+    complexSteps: false,
+    wordDiffs: true,
+    simplifyDiff: true,
+  });
+  const changeSet = ChangeSet.create(oldNode).addSteps(tr.doc, tr.mapping.maps, []);
+  const simplified = simplifyChanges(changeSet.changes, newNode);
+
+  const changes: DiffChange[] = [];
+  let inserted = 0;
+  let deleted = 0;
+  const changedBlocks = new Set<string>();
+
+  for (const change of simplified) {
+    // Deleted text lives in the OLD doc coordinate range [fromA, toA).
+    if (change.toA > change.fromA) {
+      const text = oldNode.textBetween(change.fromA, change.toA, "\n", " ");
+      if (text.length > 0) {
+        deleted += text.length;
+        const block = blockContextAt(oldNode, change.fromA);
+        changes.push({ op: "delete", block, text });
+        if (block) changedBlocks.add("d:" + block);
+      }
+    }
+    // Inserted text lives in the NEW doc coordinate range [fromB, toB).
+    if (change.toB > change.fromB) {
+      const text = newNode.textBetween(change.fromB, change.toB, "\n", " ");
+      if (text.length > 0) {
+        inserted += text.length;
+        const block = blockContextAt(newNode, change.fromB);
+        changes.push({ op: "insert", block, text });
+        if (block) changedBlocks.add("i:" + block);
+      }
+    }
+  }
+  return { changes, inserted, deleted, changedBlocks };
+}
+
 /** Build the human-readable unified-ish markdown summary. */
 function renderMarkdown(
   result: Omit<DiffResult, "markdown">,
@@ -276,66 +413,39 @@ export function diffDocs(
   newDocJson: any,
   notesHeading: string = "Примечания переводчика",
 ): DiffResult {
+  // computeIntegrity is cheap (linear node walks) and its counts are needed in
+  // BOTH the precise and coarse paths, so it always runs first.
   const integrity = computeIntegrity(oldDocJson, newDocJson, notesHeading);
 
-  let changes: DiffChange[] = [];
-  let inserted = 0;
-  let deleted = 0;
   let fellBack = false;
-  const changedBlocks = new Set<string>();
+  let tally: DiffTally;
 
-  try {
-    const oldNode = Node.fromJSON(docmostSchema, oldDocJson);
-    const newNode = Node.fromJSON(docmostSchema, newDocJson);
-    const tr = recreateTransform(oldNode, newNode, {
-      complexSteps: false,
-      wordDiffs: true,
-      simplifyDiff: true,
-    });
-    const changeSet = ChangeSet.create(oldNode).addSteps(
-      tr.doc,
-      tr.mapping.maps,
-      [],
-    );
-    const simplified = simplifyChanges(changeSet.changes, newNode);
-
-    for (const change of simplified) {
-      // Deleted text lives in the OLD doc coordinate range [fromA, toA).
-      if (change.toA > change.fromA) {
-        const text = oldNode.textBetween(change.fromA, change.toA, "\n", " ");
-        if (text.length > 0) {
-          deleted += text.length;
-          const block = blockContextAt(oldNode, change.fromA);
-          changes.push({ op: "delete", block, text });
-          if (block) changedBlocks.add("d:" + block);
-        }
-      }
-      // Inserted text lives in the NEW doc coordinate range [fromB, toB).
-      if (change.toB > change.fromB) {
-        const text = newNode.textBetween(change.fromB, change.toB, "\n", " ");
-        if (text.length > 0) {
-          inserted += text.length;
-          const block = blockContextAt(newNode, change.fromB);
-          changes.push({ op: "insert", block, text });
-          if (block) changedBlocks.add("i:" + block);
-        }
-      }
-    }
-  } catch {
-    // Pathological pair: degrade to a coarse block-level diff so we never throw.
+  // Pre-flight size guard (#464): a too-large pair would make recreateTransform
+  // block the event loop for seconds-to-hours WITHOUT throwing, so route it to
+  // the coarse fallback BEFORE calling recreateTransform at all. Both this path
+  // and the catch below go through coarseDiffTally for an identical `fellBack`
+  // result shape.
+  if (exceedsDiffSizeGuard(oldDocJson, newDocJson)) {
     fellBack = true;
-    changes = coarseDiff(oldDocJson, newDocJson);
-    for (const c of changes) {
-      if (c.op === "insert") inserted += c.text.length;
-      else deleted += c.text.length;
-      if (c.block) changedBlocks.add(c.op[0] + ":" + c.block);
+    tally = coarseDiffTally(oldDocJson, newDocJson);
+  } else {
+    try {
+      tally = preciseDiffTally(oldDocJson, newDocJson);
+    } catch {
+      // Pathological pair: degrade to a coarse block-level diff so we never throw.
+      fellBack = true;
+      tally = coarseDiffTally(oldDocJson, newDocJson);
     }
   }
 
   const partial: Omit<DiffResult, "markdown"> = {
-    summary: { inserted, deleted, blocksChanged: changedBlocks.size },
+    summary: {
+      inserted: tally.inserted,
+      deleted: tally.deleted,
+      blocksChanged: tally.changedBlocks.size,
+    },
     integrity,
-    changes,
+    changes: tally.changes,
   };
   return { ...partial, markdown: renderMarkdown(partial, fellBack) };
 }
