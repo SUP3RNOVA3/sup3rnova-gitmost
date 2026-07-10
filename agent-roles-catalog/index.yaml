@@ -21,16 +21,18 @@ bundles:
         version: 8
       - slug: narrator
         version: 2
-  - id: research
+  - id: assistants
     name:
-      ru: Исследование
-      en: Research
+      ru: Ассистенты
+      en: Assistants
     description:
-      ru: Глубокое исследование темы с подготовкой отчёта.
-      en: Deep research on a topic with a prepared report.
+      ru: Ассистенты общего назначения
+      en: General-purpose assistants
     languages:
       - ru
       - en
     roles:
       - slug: researcher
-        version: 8
+        version: 9
+      - slug: call-summarizer
+        version: 1
