@@ -130,6 +130,12 @@ const DEFAULT_MCP_STREAM_TIMEOUT_MS = 60_000;
 const DEFAULT_MCP_CALL_TIMEOUT_MS = 120_000;
 
 /**
+ * Default `bodyTimeout` for the EXTERNAL-MCP SSE transport (10 min) — #489.
+ * Deliberately much LARGER than {@link DEFAULT_MCP_STREAM_TIMEOUT_MS}.
+ */
+const DEFAULT_MCP_SSE_BODY_TIMEOUT_MS = 600_000;
+
+/**
  * SILENCE timeout (ms) for EXTERNAL-MCP transport ONLY. Override with
  * `AI_MCP_STREAM_TIMEOUT_MS`; a missing/invalid/non-positive value falls back to
  * {@link DEFAULT_MCP_STREAM_TIMEOUT_MS} (1 min).
@@ -162,6 +168,26 @@ export function mcpStreamTimeoutMs(): number {
  */
 export function mcpCallTimeoutMs(): number {
   return positiveEnv('AI_MCP_CALL_TIMEOUT_MS', DEFAULT_MCP_CALL_TIMEOUT_MS);
+}
+
+/**
+ * `bodyTimeout` (ms) for the EXTERNAL-MCP **SSE** transport ONLY — #489. Override
+ * with `AI_MCP_SSE_BODY_TIMEOUT_MS`; a missing/invalid/non-positive value falls
+ * back to {@link DEFAULT_MCP_SSE_BODY_TIMEOUT_MS} (10 min).
+ *
+ * The SSE transport holds ONE long-lived response body open across many tool
+ * calls, so undici's `bodyTimeout` (time between body bytes) counts the LEGITIMATE
+ * silence BETWEEN calls, not just a hung single call. At the tight HTTP silence
+ * timeout ({@link mcpStreamTimeoutMs}, 1 min) a normal >1-min gap between the
+ * model's tool calls would break the SSE socket, and the cache would then serve a
+ * dead client until TTL. So the SSE transport gets its OWN, RAISED bodyTimeout;
+ * the per-call total cap ({@link mcpCallTimeoutMs}) still bounds a single stuck
+ * call, and the app-level transport-error retry heals a socket that does break.
+ * The HTTP (streamable) transport keeps the tight timeout — it opens a fresh
+ * request per call, so idle-between-calls does not apply there.
+ */
+export function mcpSseBodyTimeoutMs(): number {
+  return positiveEnv('AI_MCP_SSE_BODY_TIMEOUT_MS', DEFAULT_MCP_SSE_BODY_TIMEOUT_MS);
 }
 
 /**

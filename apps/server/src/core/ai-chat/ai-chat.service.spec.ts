@@ -1315,8 +1315,12 @@ describe('AiChatService page-change lifecycle (#274)', () => {
 describe('isInterruptResume', () => {
   // history tail is the just-inserted user row; [len-2] is the previous turn.
   const withPrev = (
-    prev: { role: string; status?: string | null } | null,
-  ): Array<{ role: string; status?: string | null }> =>
+    prev: {
+      role: string;
+      status?: string | null;
+      metadata?: unknown;
+    } | null,
+  ): Array<{ role: string; status?: string | null; metadata?: unknown }> =>
     prev
       ? [prev, { role: 'user', status: null }]
       : [{ role: 'user', status: null }];
@@ -1356,6 +1360,33 @@ describe('isInterruptResume', () => {
 
   it('false when there is no preceding turn (only the new user row)', () => {
     expect(isInterruptResume(withPrev(null), true)).toBe(false);
+  });
+
+  it('#487 EXCLUDES a reconcile stamp (finalizeFailed) — not a genuine interruption', () => {
+    // A row a reconcile settled to 'aborted' carries metadata.finalizeFailed. It
+    // must NOT be treated as an interrupt-resume (that would inject a false
+    // "you were interrupted" note), even though its status is 'aborted'.
+    expect(
+      isInterruptResume(
+        withPrev({
+          role: 'assistant',
+          status: 'aborted',
+          metadata: { finalizeFailed: true },
+        }),
+        true,
+      ),
+    ).toBe(false);
+    // A genuine abort (no finalizeFailed) still counts.
+    expect(
+      isInterruptResume(
+        withPrev({
+          role: 'assistant',
+          status: 'aborted',
+          metadata: { parts: [] },
+        }),
+        true,
+      ),
+    ).toBe(true);
   });
 });
 
@@ -1409,7 +1440,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
   }
 
   // Wire only the deps reached on the way to the pipe call, plus a spy registry.
-  function makeService(opts: { resumable: boolean }) {
+  function makeService(opts: { resumable: boolean; history?: unknown[] }) {
     const aiChatRepo = {
       findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
       insert: jest.fn(),
@@ -1417,8 +1448,11 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
     const aiChatMessageRepo = {
       // Both the user insert and the assistant seed return the same row id.
       insert: jest.fn(async () => ({ id: 'msg-1' })),
-      findAllByChat: jest.fn(async () => []),
+      findAllByChat: jest.fn(async () => opts.history ?? []),
       update: jest.fn(async () => ({ id: 'msg-1' })),
+      // #487: the terminal owner-write + the opportunistic reconcile query.
+      finalizeOwner: jest.fn(async () => ({ id: 'msg-1' })),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
     };
     const aiSettings = { resolve: jest.fn(async () => ({})) };
     const tools = { forUser: jest.fn(async () => ({})) };
@@ -1453,7 +1487,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
       } as never,
       streamRegistry as never,
     );
-    return { svc, streamRegistry };
+    return { svc, streamRegistry, aiChatMessageRepo };
   }
 
   const body = {
@@ -1535,6 +1569,86 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
     });
     await expect(drive(svc, makeRunHooks())).rejects.toThrow('boom');
     expect(streamRegistry.abortEntry).toHaveBeenCalledWith('chat-1', 'run-1');
+  });
+
+  // #489 REGRESSION (against the REAL convertToModelMessages — not mocked here):
+  // a persisted history row whose parts contain a `null` element makes the real
+  // convertToModelMessages THROW ("Cannot read properties of null"). Pre-fix that
+  // 500-ed every turn forever and each retry appended a duplicate user row. The
+  // fix converts BEFORE the insert and isolates the poisoned row per-row, degrading
+  // it to text with a "[tool context omitted]" marker. Assert the turn still runs,
+  // the marker reaches the model, and exactly ONE user row is inserted.
+  it('#489: a poisoned OLD-history row keeps the chat working; the marker reaches the model; one user insert', async () => {
+    const { svc, aiChatMessageRepo } = makeService({
+      resumable: false,
+      history: [
+        {
+          id: 'old-1',
+          role: 'assistant',
+          content: 'earlier answer',
+          // A null part is the poison: rowToUiMessage keeps it (the array is
+          // non-empty) and the real convertToModelMessages throws on it.
+          metadata: { parts: [{ type: 'text', text: 'earlier answer' }, null] },
+          status: 'completed',
+        },
+      ],
+    });
+    // Must NOT throw — the poisoned row is degraded, not fatal.
+    await drive(svc, makeRunHooks());
+    expect(streamTextMock).toHaveBeenCalledTimes(1);
+    const passedMessages = streamTextMock.mock.calls[0][0].messages;
+    const serialized = JSON.stringify(passedMessages);
+    // The model sees the truncation marker (silent tool-context loss is not ok)
+    // AND the row's readable text is preserved alongside it.
+    expect(serialized).toContain('[tool context omitted]');
+    expect(serialized).toContain('earlier answer');
+    // Exactly ONE user row inserted (no duplicate), inserted AFTER conversion.
+    const userInserts = aiChatMessageRepo.insert.mock.calls
+      .map((c: unknown[]) => c[0] as { role?: string })
+      .filter((r) => r.role === 'user');
+    expect(userInserts).toHaveLength(1);
+  });
+
+  // #489: client-supplied non-text parts (a tool-part in `input-available`, the
+  // exact "bricking" payload) are dropped ON RECEIPT — never persisted — so they
+  // can never poison future turns. Only the text survives into metadata.parts.
+  it('#489: a non-text client part is stripped before persist (only text survives)', async () => {
+    const { svc, aiChatMessageRepo } = makeService({ resumable: false });
+    await svc.stream({
+      user: { id: 'u1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 's1',
+      body: {
+        chatId: 'chat-1',
+        messages: [
+          {
+            id: 'm1',
+            role: 'user',
+            parts: [
+              { type: 'text', text: 'hello' },
+              // untrusted tool-part — must be dropped, never persisted
+              {
+                type: 'tool-getPage',
+                toolCallId: 't1',
+                state: 'input-available',
+                input: { pageId: 'p' },
+              },
+            ],
+          },
+        ],
+      } as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      runHooks: makeRunHooks() as never,
+    });
+    const userInsert = aiChatMessageRepo.insert.mock.calls
+      .map((c: unknown[]) => c[0] as { role?: string; metadata?: unknown })
+      .find((r) => r.role === 'user');
+    const parts = (userInsert?.metadata as { parts?: Array<{ type: string }> })
+      ?.parts;
+    expect(parts).toEqual([{ type: 'text', text: 'hello' }]);
   });
 });
 
@@ -1623,6 +1737,19 @@ describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
           return { id };
         },
       ),
+      // #487: the terminal owner-write records into the SAME `updated` recorder so
+      // assertions on the terminal 'completed'/'error'/'aborted' write still hold.
+      finalizeOwner: jest.fn(
+        async (
+          id: string,
+          workspaceId: string,
+          patch: Record<string, unknown>,
+        ) => {
+          updated.push({ id, workspaceId, patch });
+          return { id };
+        },
+      ),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
     };
     const aiSettings = { resolve: jest.fn(async () => ({})) };
     const tools = { forUser: jest.fn(async () => ({})) };
@@ -1880,5 +2007,150 @@ describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
     const patch = updated[0].patch as { content: string };
     expect(patch.content).toContain('Final synthesized answer.');
     expect(patch.content).not.toContain(STEP_LIMIT_NO_ANSWER_MARKER);
+  });
+});
+
+// #487 F3 — the reconcile() / reconcileChat() ORCHESTRATORS. The individual
+// clauses are exercised elsewhere; these pin the production orchestration the
+// per-clause specs do not: the clause ORDER, the per-clause try/catch ISOLATION
+// (one clause throwing must NOT abort the others), and reconcileChat() (which runs
+// at the start of every turn and was entirely uncovered).
+describe('AiChatService.reconcile / reconcileChat orchestrators (#487 F3)', () => {
+  let warnSpy: jest.SpyInstance;
+  beforeEach(() => {
+    // Silence the intentional clause-failure warnings (kept out of test output).
+    warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  function makeService(opts: {
+    messageRepo?: Record<string, jest.Mock>;
+    runService?: Record<string, jest.Mock>;
+  }) {
+    const aiChatMessageRepo = {
+      findStreamingWithTerminalRun: jest.fn(async () => []),
+      stampTerminalIfStreaming: jest.fn(async () => undefined),
+      sweepStreamingWithoutActiveRun: jest.fn(async () => 0),
+      ...(opts.messageRepo ?? {}),
+    };
+    const aiChatRunService = opts.runService
+      ? {
+          zombieRunIds: jest.fn(() => []),
+          settleZombie: jest.fn(async () => true),
+          reconcileStaleRuns: jest.fn(async () => 0),
+          ...opts.runService,
+        }
+      : undefined;
+    const svc = new AiChatService(
+      {} as never, // ai
+      {} as never, // aiChatRepo
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo
+      {} as never, // aiSettings
+      {} as never, // tools
+      {} as never, // mcpClients
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo
+      {} as never, // pageAccess
+      {} as never, // environment
+      {} as never, // streamRegistry
+      aiChatRunService as never, // aiChatRunService (#487)
+    );
+    return { svc, aiChatMessageRepo, aiChatRunService };
+  }
+
+  it('reconcile() fires all four clauses IN ORDER (a -> b -> c -> d)', async () => {
+    const order: string[] = [];
+    const { svc } = makeService({
+      messageRepo: {
+        findStreamingWithTerminalRun: jest.fn(async () => {
+          order.push('b:find');
+          return [
+            { messageId: 'm1', workspaceId: 'ws1', runStatus: 'succeeded' },
+          ];
+        }),
+        stampTerminalIfStreaming: jest.fn(async () => {
+          order.push('b:stamp');
+        }),
+        sweepStreamingWithoutActiveRun: jest.fn(async () => {
+          order.push('d');
+          return 0;
+        }),
+      },
+      runService: {
+        zombieRunIds: jest.fn(() => ['z1']),
+        settleZombie: jest.fn(async () => {
+          order.push('a');
+          return true;
+        }),
+        reconcileStaleRuns: jest.fn(async () => {
+          order.push('c');
+          return 0;
+        }),
+      },
+    });
+
+    await svc.reconcile();
+
+    expect(order).toEqual(['a', 'b:find', 'b:stamp', 'c', 'd']);
+  });
+
+  it('a clause that THROWS does not abort the remaining clauses (per-clause try/catch isolation)', async () => {
+    const { svc, aiChatMessageRepo, aiChatRunService } = makeService({
+      messageRepo: {
+        // Clause (b) blows up mid-reconcile.
+        findStreamingWithTerminalRun: jest.fn(async () => {
+          throw new Error('clause b DB blip');
+        }),
+      },
+      runService: {
+        zombieRunIds: jest.fn(() => ['z1']),
+      },
+    });
+
+    // reconcile() must SETTLE (the clause-b failure is swallowed), not reject.
+    await expect(svc.reconcile()).resolves.toBeUndefined();
+
+    // (a) ran before (b); crucially (c) and (d) STILL ran despite (b) throwing —
+    // the property a missing try/catch would break. MUTATION-VERIFY: drop clause
+    // (b)'s try/catch and this reddens (the throw propagates, skipping c + d).
+    expect(aiChatRunService!.settleZombie).toHaveBeenCalled(); // (a)
+    expect(aiChatRunService!.reconcileStaleRuns).toHaveBeenCalled(); // (c)
+    expect(
+      aiChatMessageRepo.sweepStreamingWithoutActiveRun,
+    ).toHaveBeenCalled(); // (d)
+  });
+
+  it('reconcileChat() settles THIS chat\'s stuck streaming rows by their run status', async () => {
+    const { svc, aiChatMessageRepo } = makeService({
+      messageRepo: {
+        findStreamingWithTerminalRun: jest.fn(async () => [
+          { messageId: 'm1', workspaceId: 'ws1', runStatus: 'failed' },
+          { messageId: 'm2', workspaceId: 'ws1', runStatus: 'succeeded' },
+        ]),
+      },
+    });
+
+    await svc.reconcileChat('chat-1', 'ws1');
+
+    // Scoped to THIS chat and bounded at 50 (the user-facing opportunistic path).
+    expect(
+      aiChatMessageRepo.findStreamingWithTerminalRun,
+    ).toHaveBeenCalledWith(50, { chatId: 'chat-1', workspaceId: 'ws1' });
+    // failed-run -> 'error'; every other terminal status -> 'aborted'.
+    expect(aiChatMessageRepo.stampTerminalIfStreaming).toHaveBeenCalledWith(
+      'm1',
+      'ws1',
+      'error',
+    );
+    expect(aiChatMessageRepo.stampTerminalIfStreaming).toHaveBeenCalledWith(
+      'm2',
+      'ws1',
+      'aborted',
+    );
   });
 });

@@ -58,6 +58,25 @@ export async function stopRun(
 }
 
 /**
+ * #488: the run-fact — "is a run active on this chat?" — first-class from the
+ * server (POST /ai-chat/run). Called on mount to seed the client FSM's run-fact
+ * and to VERIFY after a supersede mismatch (an observer following a superseded
+ * run asks for the latest run and follows it). Returns the latest run row (with
+ * its `id` and `status`) and its projected assistant message, or `run: null` when
+ * the chat has never had a run. Owner-gated server-side.
+ */
+export async function getRun(chatId: string): Promise<{
+  run: { id: string; status: string } | null;
+  message: IAiChatMessageRow | null;
+}> {
+  const req = await api.post<{
+    run: { id: string; status: string } | null;
+    message: IAiChatMessageRow | null;
+  }>("/ai-chat/run", { chatId });
+  return req.data;
+}
+
+/**
  * Resolve the chat bound to a document (the current user's most-recent chat
  * created on that page), or null when there is none. Drives auto-open-on-page.
  */

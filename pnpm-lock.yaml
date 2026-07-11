@@ -48,7 +48,7 @@ patchedDependencies:
     hash: d8dc66e5ec3b9d23a876b979f493b6aa901fd2d965be54729495da5136296a42
     path: patches/@hocuspocus__server@3.4.4.patch
   ai@6.0.134:
-    hash: f60bfc3357e01e1f3978c6c40fdd65aeb33fefaad7179cde8676465b6c5ff4d9
+    hash: e8c599b3963eb01b9ed1481683b7b795ce94137aa1a0c951917c20c8b870299b
     path: patches/ai@6.0.134.patch
   scimmy@1.3.5:
     hash: 775d80f86830b2c5dd1a250c9802c10f8fc3da3c7898373de5aa0c23993d1673
@@ -644,10 +644,10 @@ importers:
         version: 8.3.0(socket.io-adapter@2.5.4)
       ai:
         specifier: ^6.0.134
-        version: 6.0.134(patch_hash=f60bfc3357e01e1f3978c6c40fdd65aeb33fefaad7179cde8676465b6c5ff4d9)(zod@4.3.6)
+        version: 6.0.134(patch_hash=e8c599b3963eb01b9ed1481683b7b795ce94137aa1a0c951917c20c8b870299b)(zod@4.3.6)
       ai-sdk-ollama:
         specifier: ^3.8.1
-        version: 3.8.1(ai@6.0.134(patch_hash=f60bfc3357e01e1f3978c6c40fdd65aeb33fefaad7179cde8676465b6c5ff4d9)(zod@4.3.6))(zod@4.3.6)
+        version: 3.8.1(ai@6.0.134(patch_hash=e8c599b3963eb01b9ed1481683b7b795ce94137aa1a0c951917c20c8b870299b)(zod@4.3.6))(zod@4.3.6)
       bcrypt:
         specifier: ^6.0.0
         version: 6.0.0
@@ -16455,17 +16455,17 @@ snapshots:
 
   agent-base@7.1.4: {}
 
-  ai-sdk-ollama@3.8.1(ai@6.0.134(patch_hash=f60bfc3357e01e1f3978c6c40fdd65aeb33fefaad7179cde8676465b6c5ff4d9)(zod@4.3.6))(zod@4.3.6):
+  ai-sdk-ollama@3.8.1(ai@6.0.134(patch_hash=e8c599b3963eb01b9ed1481683b7b795ce94137aa1a0c951917c20c8b870299b)(zod@4.3.6))(zod@4.3.6):
     dependencies:
       '@ai-sdk/provider': 3.0.8
       '@ai-sdk/provider-utils': 4.0.21(zod@4.3.6)
-      ai: 6.0.134(patch_hash=f60bfc3357e01e1f3978c6c40fdd65aeb33fefaad7179cde8676465b6c5ff4d9)(zod@4.3.6)
+      ai: 6.0.134(patch_hash=e8c599b3963eb01b9ed1481683b7b795ce94137aa1a0c951917c20c8b870299b)(zod@4.3.6)
       jsonrepair: 3.13.3
       ollama: 0.6.3
     transitivePeerDependencies:
       - zod
 
-  ai@6.0.134(patch_hash=f60bfc3357e01e1f3978c6c40fdd65aeb33fefaad7179cde8676465b6c5ff4d9)(zod@4.3.6):
+  ai@6.0.134(patch_hash=e8c599b3963eb01b9ed1481683b7b795ce94137aa1a0c951917c20c8b870299b)(zod@4.3.6):
     dependencies:
       '@ai-sdk/gateway': 3.0.77(zod@4.3.6)
       '@ai-sdk/provider': 3.0.8

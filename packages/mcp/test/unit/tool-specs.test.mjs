@@ -2,7 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { z } from "zod";
 
-import { SHARED_TOOL_SPECS } from "../../build/tool-specs.js";
+import {
+  SHARED_TOOL_SPECS,
+  SHARED_TOOL_WRITE_CLASS,
+  isRetryableWriteClass,
+  assertEverySpecDeclaresWriteClass,
+} from "../../build/tool-specs.js";
 
 // The shared registry is consumed by BOTH the zod-v3 MCP server and the zod-v4
 // in-app AI-SDK service, so every spec must carry the cross-layer wiring
@@ -40,6 +45,41 @@ test("mcpName and inAppKey are each unique across the registry", () => {
     assert.ok(!inAppKeys.has(spec.inAppKey), `duplicate inAppKey: ${spec.inAppKey}`);
     mcpNames.add(spec.mcpName);
     inAppKeys.add(spec.inAppKey);
+  }
+});
+
+// #489 — every spec must declare its write-class so the external-MCP retry path
+// can gate a single auto-retry ONLY on a pure read (a blind retry of a write =
+// double-apply). The declaration is enforced at registration time.
+test("#489: every spec declares a valid writeClass ('readOnly' | 'write')", () => {
+  for (const [key, spec] of Object.entries(SHARED_TOOL_SPECS)) {
+    assert.ok(
+      spec.writeClass === "readOnly" || spec.writeClass === "write",
+      `${key}: missing/invalid writeClass: ${JSON.stringify(spec.writeClass)}`,
+    );
+  }
+  // The registration-time assert must not throw for the shipped registry.
+  assert.doesNotThrow(() => assertEverySpecDeclaresWriteClass());
+});
+
+test("#489: SHARED_TOOL_WRITE_CLASS maps every mcpName to its class; helper gates on readOnly", () => {
+  const specs = Object.values(SHARED_TOOL_SPECS);
+  assert.equal(Object.keys(SHARED_TOOL_WRITE_CLASS).length, specs.length);
+  for (const spec of specs) {
+    assert.equal(SHARED_TOOL_WRITE_CLASS[spec.mcpName], spec.writeClass);
+  }
+  // Only a readOnly tool is retry-eligible; a write tool and an unknown tool are not.
+  assert.equal(isRetryableWriteClass("readOnly"), true);
+  assert.equal(isRetryableWriteClass("write"), false);
+  assert.equal(isRetryableWriteClass(undefined), false);
+});
+
+test("#489: representative reads are readOnly and representative writes are write", () => {
+  for (const name of ["getPage", "getTree", "searchInPage", "listComments"]) {
+    assert.equal(SHARED_TOOL_SPECS[name].writeClass, "readOnly", `${name} should be readOnly`);
+  }
+  for (const name of ["patchNode", "createPage", "deletePage", "createComment", "drawioCreate"]) {
+    assert.equal(SHARED_TOOL_SPECS[name].writeClass, "write", `${name} should be write`);
   }
 });
 

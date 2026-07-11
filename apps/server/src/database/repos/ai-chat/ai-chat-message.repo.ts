@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
+import { sql } from 'kysely';
 import { KyselyDB, KyselyTransaction } from '../../types/kysely.types';
 import { dbOrTx } from '../../utils';
 import {
@@ -189,6 +190,144 @@ export class AiChatMessageRepo {
   }
 
   /**
+   * #487 OWNER terminal write — the streamText terminal callback's finalize. Like
+   * `update` but CONDITIONAL on `status='streaming' OR metadata.finalizeFailed`:
+   * the owner writes its real content EITHER when the row is still streaming (the
+   * normal case) OR when a reconcile stamp already flipped it to a terminal status
+   * but marked `finalizeFailed:true` — the owner's real content OVERWRITES that
+   * placeholder stamp (owner-write priority, #487). A row that is properly terminal
+   * (no finalizeFailed) is left untouched (undefined) — idempotent. The `patch`
+   * carries the real metadata WITHOUT finalizeFailed, so a successful write CLEARS
+   * the flag. Returns the updated row, or undefined when nothing matched.
+   */
+  async finalizeOwner(
+    id: string,
+    workspaceId: string,
+    patch: Partial<{
+      content: string | null;
+      toolCalls: unknown;
+      metadata: unknown;
+      status: string | null;
+    }>,
+    trx?: KyselyTransaction,
+  ): Promise<AiChatMessage | undefined> {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('aiChatMessages')
+      .set({ ...(patch as Record<string, unknown>), updatedAt: new Date() })
+      .where('id', '=', id)
+      .where('workspaceId', '=', workspaceId)
+      .where((eb) =>
+        eb.or([
+          eb('status', '=', 'streaming'),
+          eb(sql<string>`(metadata->>'finalizeFailed')`, '=', 'true'),
+        ]),
+      )
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  /**
+   * #487 RECONCILE status-only stamp — settle a stuck 'streaming' row to a
+   * terminal status WITHOUT the owner's real content (which lived only in the
+   * dead process's memory — a documented loss). CONDITIONAL on `status='streaming'`
+   * (never touches an already-terminal row) AND it MERGES `finalizeFailed:true`
+   * into metadata (preserving the partial `parts` already persisted) so a LATER
+   * owner-write (finalizeOwner) can still OVERWRITE this placeholder with real
+   * content, and so `isInterruptResume` can EXCLUDE this row (a reconcile stamp is
+   * not a genuine user interruption). Returns the updated row, or undefined.
+   */
+  async stampTerminalIfStreaming(
+    id: string,
+    workspaceId: string,
+    status: 'aborted' | 'error' | 'completed',
+    trx?: KyselyTransaction,
+  ): Promise<AiChatMessage | undefined> {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .updateTable('aiChatMessages')
+      .set({
+        status,
+        metadata: sql`coalesce(metadata, '{}'::jsonb) || jsonb_build_object('finalizeFailed', true)`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', id)
+      .where('workspaceId', '=', workspaceId)
+      .where('status', '=', 'streaming')
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  /**
+   * #487 reconcile clause (b): streaming assistant rows whose linked RUN has
+   * already reached a terminal status — an asymmetry ("run settled / message
+   * streaming forever") the periodic reconcile heals by stamping the message.
+   * Returns the message id + its run's terminal status, bounded.
+   */
+  async findStreamingWithTerminalRun(
+    limit = 200,
+    // #487: scope to ONE chat for the opportunistic per-turn reconcile (removes
+    // reconcile latency from the user-visible path); omit for the periodic sweep.
+    chat?: { chatId: string; workspaceId: string },
+  ): Promise<
+    Array<{ messageId: string; workspaceId: string; runStatus: string }>
+  > {
+    let query = this.db
+      .selectFrom('aiChatMessages as m')
+      .innerJoin('aiChatRuns as r', 'r.assistantMessageId', 'm.id')
+      .select([
+        'm.id as messageId',
+        'm.workspaceId as workspaceId',
+        'r.status as runStatus',
+      ])
+      .where('m.status', '=', 'streaming')
+      .where('r.status', 'in', ['succeeded', 'failed', 'aborted']);
+    if (chat) {
+      query = query
+        .where('m.chatId', '=', chat.chatId)
+        .where('m.workspaceId', '=', chat.workspaceId);
+    }
+    return query.limit(limit).execute();
+  }
+
+  /**
+   * #487 reconcile clause (d) — historical-row safety: streaming rows older than
+   * `staleMs` whose chat has NO active run row (double-gated). Settle them to
+   * 'aborted' + finalizeFailed (so a late owner-write could still overwrite).
+   * Returns the count. Used ONLY by the periodic reconcile, never at boot.
+   */
+  async sweepStreamingWithoutActiveRun(
+    staleMs: number,
+    trx?: KyselyTransaction,
+  ): Promise<number> {
+    const db = dbOrTx(this.db, trx);
+    const staleBefore = new Date(Date.now() - staleMs);
+    const rows = await db
+      .updateTable('aiChatMessages as m')
+      .set({
+        status: 'aborted',
+        metadata: sql`coalesce(m.metadata, '{}'::jsonb) || jsonb_build_object('finalizeFailed', true)`,
+        updatedAt: new Date(),
+      })
+      .where('m.status', '=', 'streaming')
+      .where('m.updatedAt', '<', staleBefore)
+      .where((eb) =>
+        eb.not(
+          eb.exists(
+            eb
+              .selectFrom('aiChatRuns as r')
+              .select('r.id')
+              .whereRef('r.chatId', '=', 'm.chatId')
+              .where('r.status', 'in', ['pending', 'running']),
+          ),
+        ),
+      )
+      .returning('m.id')
+      .execute();
+    return rows.length;
+  }
+
+  /**
    * Crash-recovery sweep (#183): flip every assistant row still left in the
    * 'streaming' state (a turn that died mid-write before reaching a terminal
    * status) to 'aborted'. Run once on server start. Returns the number of rows
@@ -200,13 +339,20 @@ export class AiChatMessageRepo {
    * step, so an actively-streaming row never matches; this prevents a fresh
    * replica's boot-sweep from aborting a turn another replica is still streaming
    * in a multi-instance deploy.
+   *
+   * #487: the sweep now ALSO marks `finalizeFailed:true` so a late owner-write can
+   * overwrite this placeholder with real content (owner-write priority).
    */
   async sweepStreaming(trx?: KyselyTransaction): Promise<number> {
     const db = dbOrTx(this.db, trx);
     const staleBefore = new Date(Date.now() - SWEEP_STREAMING_STALE_MS);
     const rows = await db
       .updateTable('aiChatMessages')
-      .set({ status: 'aborted', updatedAt: new Date() })
+      .set({
+        status: 'aborted',
+        metadata: sql`coalesce(metadata, '{}'::jsonb) || jsonb_build_object('finalizeFailed', true)`,
+        updatedAt: new Date(),
+      })
       .where('status', '=', 'streaming')
       .where('updatedAt', '<', staleBefore)
       .returning('id')

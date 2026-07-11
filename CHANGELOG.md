@@ -115,6 +115,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old ProseMirror-JSON output. Released together with the `#411`/`#412`
   breaking window so external configs break exactly once. (#413)
 
+- **The Prometheus `/metrics` listener now binds to `127.0.0.1` (loopback) by
+  default instead of `0.0.0.0` (all interfaces).** This closes an unauthenticated
+  endpoint that was previously reachable on every interface. **DEPLOY MIGRATION —
+  cross-container scraping breaks silently otherwise:** if your scraper runs in a
+  SEPARATE container and reaches the app as `docmost:9464` (the exact topology the
+  old `0.0.0.0` hardcode served), you MUST now set `METRICS_BIND=0.0.0.0` — and,
+  because that re-exposes the endpoint, also set `METRICS_TOKEN=<secret>` and
+  configure the scraper with a matching Bearer token. Without `METRICS_BIND`, the
+  scraper can no longer connect and metrics go dark with no error. See the
+  `METRICS_BIND` / `METRICS_TOKEN` block in `.env.example` for the migration.
+  Same-host (loopback) scrapers need no change. (#486)
+
 ### Added
 
 - **Place several images side by side in a row.** A new "Inline (side by
@@ -190,6 +202,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dangling by a restart. Phase 1 is single-instance-only (cross-instance Stop is
   not yet reliable); the server warns at startup on a horizontally-scaled
   deployment. (#184)
+- **Server-side "interrupt and send now" (supersede) for AI chat.** `POST
+  /ai-chat/stream` now accepts a `supersede: { runId }` field: when the user sends
+  a new message while a run is active, the server atomically stops that run and
+  waits for it to settle before the new turn claims the chat's single run slot,
+  instead of the send being rejected as concurrent. The compare-and-set surfaces
+  three codes on its non-proceed branches — `SUPERSEDE_INVALID` (the targeted run
+  is malformed / belongs to another chat), `SUPERSEDE_TARGET_MISMATCH` (a
+  different run is now active; carries the current `activeRunId`), and
+  `SUPERSEDE_TIMEOUT` (the previous run did not stop within the settle window, so
+  nothing was sent and the composer keeps the text). Tunable via
+  `AI_CHAT_SUPERSEDE_TIMEOUT_MS` (default 10s). (#487)
 - **Out-of-band page transfer via an in-RAM blob sandbox (`stash_page`).** A
   new MCP tool serializes a whole page (its full ProseMirror JSON, with every
   internal image/file mirrored) into an ephemeral in-RAM blob and returns only
@@ -270,6 +293,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every AI-chat turn is now a first-class server-side run, and one run per chat
+  is enforced in both modes.** The run machinery from `#184` was universalized: a
+  turn is tracked in `ai_chat_runs` and gated by the single-active-run-per-chat
+  index regardless of the `settings.ai.autonomousRuns` flag. **Behavior change:**
+  a second tab (or a double-submit) that starts a turn while one is already active
+  on the chat is now rejected up front with `409 A_RUN_ALREADY_ACTIVE` (carrying
+  the `activeRunId`); previously, on the legacy path, it opened a second parallel
+  stream on the same chat that interleaved history. The `autonomousRuns` flag no
+  longer controls whether a turn is a run — it now governs **only** the
+  browser-disconnect semantics (ON = detached/survives a disconnect; OFF = a
+  disconnect stops the run). (#487)
 - **Client markdown paste/copy and AI-chat rendering now go through the canonical
   converter.** Pasting markdown into the editor, "Copy as markdown", the AI title
   generator, and the AI-chat markdown renderer all now use
@@ -302,6 +336,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A chat with one malformed message part no longer 500s on every turn, and a
+  failed send no longer duplicates the user's message.** Incoming client parts
+  are now whitelisted to `text` (a forged tool-result part can no longer reach
+  the persisted history or the model context), and the turn is converted BEFORE
+  the user row is inserted, so a mid-flight failure cannot leave a duplicate
+  user row that a retry then compounds. A single part that still fails to convert
+  degrades to a `[tool context omitted]` marker on that one row instead of
+  bricking the whole chat. (#489)
+- **A transport drop to an external MCP server now heals within the same turn.**
+  On an undici transport error, a read-only MCP tool reconnects its server and
+  retries once within the run; a write is never auto-retried (it may already have
+  applied). One flapping server no longer nulls the shared client cache, so other
+  servers' cached clients are untouched. The SSE transport also gets a raised
+  body-timeout so a legitimate >1-min idle between the model's tool calls no
+  longer breaks a long-lived SSE socket (new `AI_MCP_SSE_BODY_TIMEOUT_MS`, default
+  10 min; see `.env.example`). (#489)
+
 - **The server no longer runs out of heap during long autonomous agent runs.** A
   new pnpm patch on `ai@6.0.134` stops the SDK from building a cumulative
   snapshot of the ENTIRE turn text on every streamed text-delta when no output
@@ -310,6 +361,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tee()` branch of the stream result — a ~20-step, ~28k-chunk agent run
   retained ~1.7 GB and OOM'd the 2 GB JS heap. Streaming granularity is
   unchanged; the patch must be re-created if `ai` is ever bumped. (#184)
+
+- **The server no longer leaks a hung stream pipe on every mid-run client
+  disconnect.** The same `ai@6.0.134` pnpm patch now also fixes the SDK's
+  `writeToServerResponse`, which awaited only a `"drain"` event under
+  backpressure: when a client disconnected mid-write the socket never drained, so
+  the write loop parked forever, `response.end()` was unreachable, and the stream
+  reader plus buffered chunks were pinned until process restart (every mid-run
+  disconnect in autonomous mode leaked one). The patch races `"drain"` against
+  `"close"`/`"error"`, cancels the reader and ends the response on disconnect, and
+  swallows the fire-and-forget read rejection instead of crashing on an
+  unhandledRejection. (#486)
+
+- **A failed autonomous agent-run start no longer becomes an unstoppable ghost
+  run.** When `beginRun` failed for a transient reason (e.g. a DB-pool blip),
+  the turn previously continued with NO run row — invisible to `/stop`, not
+  aborted on disconnect, and able to slip a second run past the one-run-per-chat
+  gate, leaving an unstoppable run until restart. The turn now fails fast with an
+  honest `503 A_RUN_BEGIN_FAILED` before the first byte (no orphan state), and the
+  client shows a "temporary — please try again" message instead of a misleading
+  "provider not configured". (#486)
+
+- **A pathological draw.io graph can no longer wedge the whole server.** The ELK
+  auto-layout (`layout:"elk"`) ran elkjs synchronously on the main event loop, so
+  a graph at the node/edge cap blocked ALL HTTP/SSE/loopback traffic while it
+  churned — and the old `setTimeout` "timeout" could never fire because the same
+  thread was blocked. Layout now runs in a worker thread with the timeout enforced
+  by `worker.terminate()`; the main loop stays responsive. (#486)
+
+- **The `/health` Redis probe no longer leaks a client on every tick while Redis
+  is down.** It built a new `ioredis` client per probe and disconnected it only on
+  success, so during an outage each health tick added another forever-reconnecting
+  client (an unbounded handle leak). A single long-lived probe client is now
+  reused and closed on shutdown. (#486)
 - **Internal links in exported Markdown no longer lose their visible text.** A
   link whose target page name had no file extension (e.g. a bare title) was
   collapsed to empty text during export, producing an unclickable, label-less
@@ -385,6 +469,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through that exact share (its own share or an ancestor `includeSubPages`
   share); any other value now returns the generic "not found" instead of
   serving the page. (#218)
+
+- **Tool and provider error text no longer leaks to anonymous readers in the
+  public-share AI chat.** A failing tool's raw error (which could carry an
+  internal page title or a stack fragment) and a provider error (which bundles the
+  provider `statusCode` and response body — potentially the internal baseUrl or
+  model name) were streamed verbatim to the anonymous reader over SSE. Errors are
+  now sanitized at the source: the share toolset collapses any unclassified tool
+  error to a safe generic string (safe, classified tool messages still pass
+  through for the model's self-correction), and the anonymous stream `onError`
+  maps provider failures to a fixed set of neutral strings — the full detail goes
+  only to the server log. A UI render gate is layered on top. (closes #394)
+
+- **The Prometheus `/metrics` endpoint can now require Bearer authentication and
+  is loopback-bound by default.** Previously it listened on all interfaces with no
+  auth. Setting `METRICS_TOKEN` requires every scrape to present
+  `Authorization: Bearer <token>` (compared in constant time), and the listener
+  defaults to `127.0.0.1` (see the Breaking Changes entry for the cross-container
+  migration). (#486)
 
 ## [0.94.0] - 2026-06-26
 

@@ -119,9 +119,41 @@ export class McpService implements OnModuleDestroy {
     this.sweepTimer.unref?.();
   }
 
-  onModuleDestroy(): void {
+  async onModuleDestroy(): Promise<void> {
     clearInterval(this.sweepTimer);
+    // Tear down any live loopback CollabSession providers at shutdown (#486). The
+    // embedded MCP (and the in-app AI agent) open Hocuspocus collab sockets against
+    // THIS process; without an explicit teardown those sessions keep their docs
+    // "open" on the collab server and hold providers/buffers until they idle out,
+    // so a restart can race a doc still pinned by the dying worker. Best-effort:
+    // any failure is logged, never allowed to break shutdown.
+    try {
+      await this.destroyAllMcpSessions();
+    } catch (err) {
+      this.logger.error(
+        'MCP CollabSession teardown on shutdown failed',
+        err as Error,
+      );
+    }
   }
+
+  /**
+   * Resolve @docmost/mcp's `destroyAllSessions` and invoke it (#486). The live
+   * CollabSession registry is a module-level singleton in the ESM package, shared
+   * by every entry (`.`/`./http`), so this tears down ALL sessions regardless of
+   * which surface opened them. The module is already loaded whenever MCP was used;
+   * if it was never loaded (or is absent) the import + no-op is harmless.
+   *
+   * Held as an overridable field so a unit test can spy the teardown without
+   * loading the ESM-only package or standing up the DI graph.
+   */
+  private destroyAllMcpSessions: () => Promise<void> = async () => {
+    const entry = require.resolve('@docmost/mcp');
+    const mod = (await esmImport(pathToFileURL(entry).href)) as {
+      destroyAllSessions?: () => void;
+    };
+    mod.destroyAllSessions?.();
+  };
 
   // Service account the embedded MCP uses to talk back to this Docmost
   // instance over loopback REST + the collaboration WebSocket. Now OPTIONAL:

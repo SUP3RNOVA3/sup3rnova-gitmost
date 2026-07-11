@@ -144,6 +144,41 @@ export class AiChatRunRepo {
   }
 
   /**
+   * #487: CONDITIONAL terminal finalize — flip a run to a terminal status and
+   * stamp `finished_at` ONLY while it is still active (pending|running), mirroring
+   * the assistant message's `onlyIfStreaming` guard. A double-settle (a late or
+   * second writer, a supersede applying a zombie's intended, a reconcile stamp)
+   * matches NOTHING once the row is terminal and is a benign no-op — so a terminal
+   * status can never be clobbered by a later writer (last-writer-wins is gone).
+   *
+   * Returns the updated row when it WAS active (this call wrote it), else
+   * undefined (the row was already terminal — another writer won). The caller
+   * distinguishes the two to resolve the correct settle outcome.
+   */
+  async finalizeIfActive(
+    id: string,
+    workspaceId: string,
+    patch: { status: string; error: string | null },
+    trx?: KyselyTransaction,
+  ): Promise<AiChatRun | undefined> {
+    const db = dbOrTx(this.db, trx);
+    const now = new Date();
+    return db
+      .updateTable('aiChatRuns')
+      .set({
+        status: patch.status,
+        error: patch.error,
+        finishedAt: now,
+        updatedAt: now,
+      })
+      .where('id', '=', id)
+      .where('workspaceId', '=', workspaceId)
+      .where('status', 'in', ACTIVE_RUN_STATUSES as unknown as string[])
+      .returning(this.baseFields)
+      .executeTakeFirst();
+  }
+
+  /**
    * Mark an EXPLICIT stop request on an active run (distinct from a browser
    * disconnect, which never stops a run). Stamps `stop_requested_at` ONLY while
    * the run is still active, so a late stop on an already-settled run is a no-op.
@@ -184,6 +219,31 @@ export class AiChatRunRepo {
    * sweeps only runs UNTOUCHED past the window. Phase 1 is single-process, so the
    * boot path supplies no window.
    */
+  /**
+   * #487 reconcile clause (c): active (pending|running) runs UNTOUCHED past
+   * `staleMs` — candidates for "no live runner" abort. Staleness is measured from
+   * `updated_at` (the LAST-PROGRESS timestamp — recordStep bumps it), NOT
+   * `started_at`, so a legitimate long-running marathon (11–25 min of steady
+   * progress) is never a candidate. The caller filters these against its in-memory
+   * `active` / zombie maps ("no entry" is the PRIMARY gate — a live entry is never
+   * aborted) before settling any of them. Bounded.
+   */
+  async findStaleActive(
+    staleMs: number,
+    limit = 200,
+    trx?: KyselyTransaction,
+  ): Promise<Array<{ id: string; workspaceId: string; chatId: string }>> {
+    const db = dbOrTx(this.db, trx);
+    const staleBefore = new Date(Date.now() - staleMs);
+    return db
+      .selectFrom('aiChatRuns')
+      .select(['id', 'workspaceId', 'chatId'])
+      .where('status', 'in', ACTIVE_RUN_STATUSES as unknown as string[])
+      .where('updatedAt', '<', staleBefore)
+      .limit(limit)
+      .execute();
+  }
+
   async sweepRunning(
     opts: { staleMs?: number } = {},
     trx?: KyselyTransaction,

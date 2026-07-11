@@ -101,6 +101,88 @@ test("DoS guard: a graph over the node cap is returned unchanged, quickly", asyn
   assert.ok(dt < 2000, `cap path should be fast, took ${dt}ms`);
 });
 
+/** Build a layered DAG near the caps: `n` vertices, up to ~2 edges each into the
+ * next layer of `layerSize`. Used as a real worst-case graph for the benchmark. */
+function layeredGraph(n, layerSize) {
+  let cells = "";
+  for (let i = 2; i < 2 + n; i++) {
+    cells +=
+      `<mxCell id="${i}" value="N${i}" style="rounded=1;html=1;" vertex="1" parent="1">` +
+      `<mxGeometry x="10" y="10" width="120" height="60" as="geometry"/></mxCell>`;
+  }
+  let ei = 0;
+  for (let i = 2; i < 2 + n; i++) {
+    for (const off of [layerSize, layerSize + 1]) {
+      const t = i + off;
+      if (t < 2 + n) cells += `<mxCell id="e${ei++}" edge="1" parent="1" source="${i}" target="${t}"><mxGeometry relative="1" as="geometry"/></mxCell>`;
+    }
+  }
+  return (
+    '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>' +
+    cells +
+    "</root></mxGraphModel>"
+  );
+}
+
+test("terminate-on-timeout: a layout that exceeds the wall-clock ceiling is hard-killed and the original model is returned (#486)", async () => {
+  // A 1ms ceiling fires before the worker can even finish loading elkjs, so the
+  // parent must terminate() the worker and fall back to the ORIGINAL model. On
+  // the OLD in-process race this timer could never fire while the SAME thread was
+  // blocked inside elkjs — the fallback path was unreachable; here it works.
+  const prev = process.env.DRAWIO_ELK_TIMEOUT_MS;
+  process.env.DRAWIO_ELK_TIMEOUT_MS = "1";
+  try {
+    const model = layeredGraph(400, 20);
+    const t0 = Date.now();
+    const laid = await applyElkLayout(model);
+    const dt = Date.now() - t0;
+    // Original geometry is preserved verbatim: every vertex is still stacked at
+    // (10,10), proving NO ELK coordinates were applied (the pass was killed).
+    const verts = parseCells(laid).filter((c) => c.vertex);
+    assert.equal(verts.length, 400, "all vertices survived the fallback");
+    for (const v of verts) {
+      assert.equal(v.geometry.x, 10, "x untouched -> layout was terminated");
+      assert.equal(v.geometry.y, 10, "y untouched -> layout was terminated");
+    }
+    // The kill is prompt: terminate() returns the call well under the natural
+    // layout time for a 400-node graph.
+    assert.ok(dt < 2000, `terminate path should be prompt, took ${dt}ms`);
+  } finally {
+    if (prev === undefined) delete process.env.DRAWIO_ELK_TIMEOUT_MS;
+    else process.env.DRAWIO_ELK_TIMEOUT_MS = prev;
+  }
+});
+
+test("benchmark guard: a worst-case graph AT the cap lays out without wedging the main event loop (#486)", async () => {
+  // ~500 nodes / ~1000 edges — a real worst case at the node/edge caps. The
+  // layout runs on a WORKER thread, so the MAIN event loop must stay responsive
+  // throughout: a timer scheduled on the main thread keeps firing while ELK
+  // churns. On the OLD synchronous-on-main-thread code this counter would be
+  // pinned at 0 for the whole layout (event loop wedged) — exactly the prod fire.
+  const model = layeredGraph(500, 20);
+  let mainLoopTicks = 0;
+  const iv = setInterval(() => {
+    mainLoopTicks++;
+  }, 2);
+  const t0 = Date.now();
+  const laid = await applyElkLayout(model);
+  const dt = Date.now() - t0;
+  clearInterval(iv);
+
+  assert.ok(
+    mainLoopTicks > 0,
+    "main event loop must stay responsive while ELK runs on the worker",
+  );
+  // Benchmark guard: the worst-case graph actually LAYS OUT within the default
+  // ceiling (it did not fall back). At least one vertex moved off the stack.
+  const verts = parseCells(laid).filter((c) => c.vertex);
+  assert.equal(verts.length, 500, "all vertices survived");
+  const moved = verts.some((v) => v.geometry.x !== 10 || v.geometry.y !== 10);
+  assert.ok(moved, "layout was applied (did not time out / fall back)");
+  // Sanity ceiling well under the 5s wall-clock timeout.
+  assert.ok(dt < 5000, `worst-case layout should be under the ceiling, took ${dt}ms`);
+});
+
 test("layout is best-effort: an empty/degenerate model is returned intact", async () => {
   const model =
     '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>';

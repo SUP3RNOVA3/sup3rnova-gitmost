@@ -30,6 +30,16 @@ interface ToolCallCardProps {
    * the extra summary line, leaving the card (the action log) intact.
    */
   showInput?: boolean;
+  /**
+   * Whether to render the tool's raw errorText on a failed call. Defaults to true
+   * (the internal chat, where the operator may debug). The public share passes
+   * false: a tool error string can carry internal detail (an internal page title,
+   * a stack fragment, a provider message). This is the RENDER gate only — the
+   * authoritative fix also sanitizes the bytes server-side (see
+   * PublicShareChatToolsService.forShare), so a share reader never receives raw
+   * error text over the wire, not just never sees it painted (#394).
+   */
+  showErrors?: boolean;
 }
 
 /**
@@ -41,6 +51,7 @@ export default function ToolCallCard({
   part,
   showCitations = true,
   showInput = true,
+  showErrors = true,
 }: ToolCallCardProps) {
   const { t } = useTranslation();
   const toolName = getToolName(part);
@@ -74,7 +85,7 @@ export default function ToolCallCard({
         </Text>
       )}
 
-      {state === "error" && part.errorText && (
+      {state === "error" && showErrors && part.errorText && (
         <Text size="xs" c="red" mt={2}>
           {part.errorText}
         </Text>

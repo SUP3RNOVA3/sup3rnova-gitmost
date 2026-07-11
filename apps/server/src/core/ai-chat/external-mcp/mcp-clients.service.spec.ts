@@ -106,8 +106,11 @@ describe('McpClientsService.decryptHeaders', () => {
 
 describe('McpClientsService.guardedFetch (SSRF per-request guard)', () => {
   // The bound guardedFetch closure lives on the instance as a private field.
+  // #489 split it into per-transport HTTP/SSE bindings (they differ only in the
+  // dispatcher's bodyTimeout); the SSRF guard is identical, so testing the HTTP
+  // one is sufficient.
   const guardedFetchOf = (service: McpClientsService) =>
-    (service as unknown as { guardedFetch: typeof fetch }).guardedFetch;
+    (service as unknown as { guardedFetchHttp: typeof fetch }).guardedFetchHttp;
 
   let fetchSpy: jest.SpiedFunction<typeof fetch>;
 
