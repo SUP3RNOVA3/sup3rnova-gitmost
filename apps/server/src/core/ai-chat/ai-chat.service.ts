@@ -1131,14 +1131,13 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         );
       } catch (err) {
         // An explicit Stop reached the RUN's signal DURING setup: re-throw so the
-        // outer catch finalizes the run as aborted — never swallow a Stop. Gated on
-        // `runId`: the re-throw exists ONLY to finalize the run, which exists only
-        // in autonomous mode. On the legacy path (no runId) `effectiveSignal` is the
-        // SOCKET signal (it aborts on a client disconnect); re-throwing there would
-        // change prior behavior and make the controller write JSON to an already-
-        // closed socket (it only attaches res.raw.on('error') in autonomous mode).
-        // So legacy keeps its prior behavior — warn + proceed, and streamText then
-        // observes the aborted socket signal.
+        // outer catch finalizes the run as aborted — never swallow a Stop. #487: the
+        // turn is ALWAYS run-wrapped now (both modes), so `effectiveSignal` is the
+        // RUN signal and `runId` is set in BOTH — a Stop (from /ai-chat/stop or a
+        // legacy disconnect's requestStop) aborts it identically. The `runId` guard
+        // now only defends the theoretical no-handle fallback (`begin` returned
+        // nothing, leaving `effectiveSignal` as the bare socket signal): there we
+        // keep the old warn-and-proceed rather than re-throw.
         if (runId && effectiveSignal.aborted) {
           throw err;
         }

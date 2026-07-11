@@ -202,6 +202,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dangling by a restart. Phase 1 is single-instance-only (cross-instance Stop is
   not yet reliable); the server warns at startup on a horizontally-scaled
   deployment. (#184)
+- **Server-side "interrupt and send now" (supersede) for AI chat.** `POST
+  /ai-chat/stream` now accepts a `supersede: { runId }` field: when the user sends
+  a new message while a run is active, the server atomically stops that run and
+  waits for it to settle before the new turn claims the chat's single run slot,
+  instead of the send being rejected as concurrent. The compare-and-set surfaces
+  three codes on its non-proceed branches — `SUPERSEDE_INVALID` (the targeted run
+  is malformed / belongs to another chat), `SUPERSEDE_TARGET_MISMATCH` (a
+  different run is now active; carries the current `activeRunId`), and
+  `SUPERSEDE_TIMEOUT` (the previous run did not stop within the settle window, so
+  nothing was sent and the composer keeps the text). Tunable via
+  `AI_CHAT_SUPERSEDE_TIMEOUT_MS` (default 10s). (#487)
 - **Out-of-band page transfer via an in-RAM blob sandbox (`stash_page`).** A
   new MCP tool serializes a whole page (its full ProseMirror JSON, with every
   internal image/file mirrored) into an ephemeral in-RAM blob and returns only
@@ -282,6 +293,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Every AI-chat turn is now a first-class server-side run, and one run per chat
+  is enforced in both modes.** The run machinery from `#184` was universalized: a
+  turn is tracked in `ai_chat_runs` and gated by the single-active-run-per-chat
+  index regardless of the `settings.ai.autonomousRuns` flag. **Behavior change:**
+  a second tab (or a double-submit) that starts a turn while one is already active
+  on the chat is now rejected up front with `409 A_RUN_ALREADY_ACTIVE` (carrying
+  the `activeRunId`); previously, on the legacy path, it opened a second parallel
+  stream on the same chat that interleaved history. The `autonomousRuns` flag no
+  longer controls whether a turn is a run — it now governs **only** the
+  browser-disconnect semantics (ON = detached/survives a disconnect; OFF = a
+  disconnect stops the run). (#487)
 - **Client markdown paste/copy and AI-chat rendering now go through the canonical
   converter.** Pasting markdown into the editor, "Copy as markdown", the AI title
   generator, and the AI-chat markdown renderer all now use
