@@ -97,8 +97,14 @@ describe('AiChatService.stream run-lifecycle safety net (#184)', () => {
     };
     const runService = new AiChatRunService(runRepo as never, { isCloud: () => false } as never);
 
-    // The user-message insert (the first bare await after beginRun) throws.
+    // The user-message insert throws. #489 runs the history load + convert BEFORE
+    // the insert (convert-before-insert, so a retry cannot duplicate the user row),
+    // so `findAllByChat` (a real repo method) is now called first — stub it to an
+    // empty history so the flow reaches the insert. Both awaits are AFTER beginRun,
+    // so the "exception after beginRun -> settled to error" invariant is unchanged;
+    // the throw point simply moved from insert to a later insert after a no-op load.
     const aiChatMessageRepo = {
+      findAllByChat: jest.fn().mockResolvedValue([]),
       insert: jest.fn().mockRejectedValue(new Error('insert boom')),
     };
     const aiChatRepo = {
