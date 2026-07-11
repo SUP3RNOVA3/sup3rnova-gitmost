@@ -61,6 +61,12 @@ export class TokenService {
     // token carries no actor/aiChatId and is treated as 'user' downstream.
     // aiChatId is nullable for an external agent with no internal ai_chats row.
     provenance?: { actor: 'agent'; aiChatId: string | null },
+    // Optional api-key origin (#501). When the collab token is minted by an
+    // api-key principal (an external MCP agent), the caller passes the key id so
+    // the token carries principal='api_key' + apiKeyId and the collab seam can
+    // re-check the key on connect. Absent -> principal='session' (a normal
+    // user/session, including the internal session-backed AI agent).
+    apiKey?: { apiKeyId: string },
   ): Promise<string> {
     if (isUserDisabled(user)) {
       throw new ForbiddenException();
@@ -70,6 +76,10 @@ export class TokenService {
       sub: user.id,
       workspaceId,
       type: JwtType.COLLAB,
+      // Fail-closed discriminator on EVERY minted token: 'api_key' when minted by
+      // an api-key principal, else 'session'.
+      principal: apiKey ? 'api_key' : 'session',
+      ...(apiKey ? { apiKeyId: apiKey.apiKeyId } : {}),
       ...(provenance
         ? { actor: provenance.actor, aiChatId: provenance.aiChatId }
         : {}),

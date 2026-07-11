@@ -214,6 +214,41 @@ describe('TokenService.generateCollabToken', () => {
       aiChatId: 'chat-456',
     });
   });
+
+  // #501 fail-closed discriminator: EVERY collab token carries a principal.
+  it("defaults principal to 'session' with NO apiKeyId (normal/internal-agent path)", async () => {
+    const { service, jwtService } = makeTokenService();
+    await service.generateCollabToken(makeUser() as never, 'ws-1');
+    const [payload] = jwtService.sign.mock.calls[0];
+    expect(payload.principal).toBe('session');
+    expect(payload).not.toHaveProperty('apiKeyId');
+  });
+
+  it("the internal agent (provenance, NO apiKey) still gets principal='session'", async () => {
+    const { service, jwtService } = makeTokenService();
+    await service.generateCollabToken(
+      makeUser() as never,
+      'ws-1',
+      { actor: 'agent', aiChatId: 'chat-1' },
+    );
+    const [payload] = jwtService.sign.mock.calls[0];
+    // Keyed on api-key ORIGIN, not actor: an is_agent session token is 'session'.
+    expect(payload.principal).toBe('session');
+    expect(payload).not.toHaveProperty('apiKeyId');
+  });
+
+  it("stamps principal='api_key' + apiKeyId when minted by an api-key principal", async () => {
+    const { service, jwtService } = makeTokenService();
+    await service.generateCollabToken(
+      makeUser() as never,
+      'ws-1',
+      undefined,
+      { apiKeyId: 'key-9' },
+    );
+    const [payload] = jwtService.sign.mock.calls[0];
+    expect(payload.principal).toBe('api_key');
+    expect(payload.apiKeyId).toBe('key-9');
+  });
 });
 
 /**
