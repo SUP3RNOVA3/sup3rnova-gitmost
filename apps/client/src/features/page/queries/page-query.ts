@@ -665,6 +665,13 @@ export function updateCacheOnMovePage(
   pageData: Partial<IPage>,
 ) {
   invalidatePageTree();
+  // Invalidate the moved page's breadcrumbs (#523). The tree-side child-loss
+  // guard removes the moved node from the local tree when its new parent is an
+  // unloaded branch, so `findBreadcrumbPath` misses it and the breadcrumb bar
+  // falls back to the server `["breadcrumbs", pageId]` query — which this move
+  // must invalidate, otherwise the crumbs keep showing the OLD parent until a
+  // refocus/navigation.
+  queryClient.invalidateQueries({ queryKey: ["breadcrumbs", pageId] });
   // Remove page from old parent's cache
   const oldQueryKey =
     oldParentId === null
