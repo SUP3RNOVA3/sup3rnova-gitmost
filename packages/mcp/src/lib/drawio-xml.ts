@@ -178,10 +178,11 @@ function sliceModel(xml: string): string | null {
 // --- decode chain ----------------------------------------------------------
 
 /**
- * Read the `content=` attribute out of a `.drawio.svg` string. Docmost stores a
- * base64 payload there (createDrawioSvg); draw.io's own SVG export may store the
- * XML entity-encoded instead. The DOM decodes entities for us, so the caller
- * only has to distinguish "starts with '<'" (raw XML) from base64.
+ * Read the `content=` attribute out of a `.drawio.svg` string. Docmost writes
+ * the mxfile XML entity-encoded there (buildDrawioSvg / createDrawioSvg), which
+ * is also how draw.io's own SVG export stores it; older attachments stored a
+ * base64 payload instead. The DOM decodes entities for us, so the caller only
+ * has to distinguish "starts with '<'" (raw XML) from base64.
  */
 export function extractContentAttr(svg: string): string {
   const { doc, error } = parseXml(svg);
@@ -307,9 +308,16 @@ export function encodeDrawioFile(modelXml: string, title = "Page-1"): string {
 /**
  * Build the `diagram.drawio.svg` attachment. Mirrors the import service's
  * createDrawioSvg contract exactly:
- *   <svg xmlns=… xmlns:xlink=… content="${base64(drawioFile)}">${inner}</svg>
+ *   <svg xmlns=… xmlns:xlink=… content="${xmlEscape(drawioFile)}">${inner}</svg>
  * plus width/height/viewBox from the diagram bounding box and the schematic
  * preview as the visible children (`inner`).
+ *
+ * The `content=` value is the mxfile XML XML-entity-escaped (draw.io's own
+ * native form), NOT base64. draw.io's editor decodes a base64 content= via
+ * Latin-1 atob (no UTF-8 step), turning every non-ASCII char (e.g. Cyrillic,
+ * ё, —) into mojibake; the entity-encoded form is decoded by the DOM as UTF-8
+ * and opens intact. Our decoder (decodeDrawioSvg) reads both forms, so old
+ * base64 attachments still round-trip.
  */
 export function buildDrawioSvg(
   modelXml: string,
@@ -318,14 +326,14 @@ export function buildDrawioSvg(
   title = "Page-1",
 ): string {
   const file = encodeDrawioFile(modelXml, title);
-  const base64 = Buffer.from(file, "utf-8").toString("base64");
+  const content = xmlEscape(file);
   const w = Math.max(1, Math.round(bbox.width));
   const h = Math.max(1, Math.round(bbox.height));
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" ` +
     `xmlns:xlink="http://www.w3.org/1999/xlink" ` +
     `width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" ` +
-    `content="${base64}">${inner}</svg>`
+    `content="${content}">${inner}</svg>`
   );
 }
 

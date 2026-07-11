@@ -849,7 +849,12 @@ export class ImportAttachmentService {
   ): Promise<Buffer> {
     try {
       const drawioContent = await fs.readFile(drawioPath, 'utf-8');
-      const drawioBase64 = Buffer.from(drawioContent).toString('base64');
+      // Write the mxfile XML XML-entity-escaped (draw.io's native content= form),
+      // NOT base64. draw.io's editor decodes a base64 content= via Latin-1 atob
+      // (no UTF-8 step), turning every non-ASCII char (Cyrillic, ё, —) into
+      // mojibake; the entity-encoded form is decoded by the DOM as UTF-8 and
+      // opens intact. Docmost's own decoder reads both forms.
+      const drawioEscaped = this.xmlEscapeAttr(drawioContent);
 
       let imageElement = '';
       // If we have a PNG, include it in the SVG
@@ -875,13 +880,25 @@ export class ImportAttachmentService {
       width="600"
       height="400"
       viewBox="0 0 600 400"
-      content="${drawioBase64}">${imageElement}</svg>`;
+      content="${drawioEscaped}">${imageElement}</svg>`;
 
       return Buffer.from(svgContent, 'utf-8');
     } catch (error) {
       this.logger.error(`Failed to create Draw.io SVG: ${error}`);
       throw error;
     }
+  }
+
+  /**
+   * Escape a string so it is safe as the value of a double-quoted XML attribute
+   * (the `content=` payload of a `.drawio.svg`). Order matters: `&` first.
+   */
+  private xmlEscapeAttr(s: string): string {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
 
   private async uploadWithRetry(opts: {
