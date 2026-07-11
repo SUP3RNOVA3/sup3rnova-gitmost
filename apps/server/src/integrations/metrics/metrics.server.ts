@@ -1,6 +1,26 @@
 import { createServer, Server } from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import { Logger } from '@nestjs/common';
 import { getMetricsRegistry, isMetricsEnabled } from './metrics.registry';
+
+/**
+ * Constant-time compare of the presented Authorization header against the
+ * expected `Bearer <token>`. This is the ONLY auth layer for the metrics
+ * endpoint, so a naive `!==` would leak the token byte-by-byte via timing.
+ * timingSafeEqual requires equal-length buffers, so a length mismatch short-
+ * circuits to "not equal" (its own length is not itself a useful oracle: the
+ * expected string length is fixed by config, not secret-derived).
+ */
+function bearerMatches(
+  presented: string | undefined,
+  expected: string,
+): boolean {
+  if (typeof presented !== 'string') return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
 
 /**
  * Start the Prometheus scrape endpoint on a SEPARATE port, taken from
@@ -64,7 +84,7 @@ export function startMetricsServer(): Server | null {
       // configured. This is the auth layer the old all-interfaces bind lacked.
       if (token) {
         const auth = req.headers['authorization'];
-        if (auth !== `Bearer ${token}`) {
+        if (!bearerMatches(auth, `Bearer ${token}`)) {
           res.statusCode = 401;
           res.setHeader('WWW-Authenticate', 'Bearer');
           res.end();

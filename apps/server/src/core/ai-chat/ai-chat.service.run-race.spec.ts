@@ -1,4 +1,8 @@
-import { ConflictException, Logger } from '@nestjs/common';
+import {
+  ConflictException,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 
 // Mock the AI SDK so we can PROVE no provider call is made for the turn we are
 // about to reject. The race rejection happens at runHooks.begin(), long before
@@ -360,22 +364,22 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
 });
 
 /**
- * F14 — the begin-failure RESILIENCE branch (the `else` of the run-race guard).
+ * F14 — the begin-failure branch (the `else` of the run-race guard).
  *
  * stream() wraps runHooks.begin in try/catch with TWO branches:
  *   - RunAlreadyActiveError  -> 409 ConflictException (pinned above).
- *   - ANY OTHER begin failure -> SWALLOW + continue UNTRACKED on the socket signal
- *     (legacy fallback): it logs "...streaming without run tracking", leaves
- *     `effectiveSignal = signal` (runId undefined) and serves the turn anyway.
+ *   - ANY OTHER begin failure -> throw ServiceUnavailableException(A_RUN_BEGIN_FAILED)
+ *     BEFORE the first byte (#486, commit 4).
  *
- * The contract: a transient beginRun failure (e.g. a non-unique DB error inserting
- * the run row) must STILL serve the user's turn — it must NOT re-throw and must NOT
- * be misclassified as a 409. A regression that re-threw here would break EVERY turn
- * on a begin failure with nothing to catch it. This branch is otherwise undriven by
- * any spec, so it is pinned here SEPARATELY from the 409 path: a plain begin error
- * proceeds to streamText with the SOCKET signal and still persists the user turn.
+ * POLICY CHANGE (#486): the OLD contract here was "SWALLOW + stream the turn
+ * UNTRACKED on the socket signal". That was reversed: an untracked run is
+ * invisible to /stop, is not aborted on disconnect, and slips past the one-run
+ * gate — an unstoppable ghost run in autonomous mode. Now a plain begin failure
+ * FAILS the turn fast with a 503 A_RUN_BEGIN_FAILED, before any user row is
+ * persisted and before streamText runs. This case is INVERTED (not deleted) so
+ * the "plain begin failure" path stays explicitly pinned under the new policy.
  */
-describe('AiChatService.stream — begin-failure resilience / legacy fallback (#184 F14)', () => {
+describe('AiChatService.stream — begin-failure fails the turn (#184 F14 / #486)', () => {
   const streamTextMock = streamText as unknown as jest.Mock;
 
   function makeStreamResult() {
@@ -455,7 +459,7 @@ describe('AiChatService.stream — begin-failure resilience / legacy fallback (#
 
   afterEach(() => jest.restoreAllMocks());
 
-  it('a PLAIN begin() failure (NOT RunAlreadyActiveError) does NOT 409 — it swallows, logs, and streams the turn UNTRACKED on the socket signal', async () => {
+  it('a PLAIN begin() failure (NOT RunAlreadyActiveError) FAILS the turn with a 503 A_RUN_BEGIN_FAILED before the first byte — NO untracked stream (#486)', async () => {
     const errorSpy = jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined as never);
@@ -487,28 +491,26 @@ describe('AiChatService.stream — begin-failure resilience / legacy fallback (#
       } as never,
     });
 
-    // The turn proceeds: NO throw at all (in particular NOT a 409).
-    await expect(promise).resolves.toBeUndefined();
+    // NEW POLICY: the turn is REJECTED with a 503 A_RUN_BEGIN_FAILED (not a 409,
+    // and NOT swallowed into an untracked stream).
+    await expect(promise).rejects.toBeInstanceOf(ServiceUnavailableException);
+    const err = (await promise.catch(
+      (e) => e,
+    )) as ServiceUnavailableException;
+    expect(err.getStatus()).toBe(503);
+    expect(err.getResponse()).toMatchObject({ code: 'A_RUN_BEGIN_FAILED' });
 
     expect(begin).toHaveBeenCalledTimes(1);
 
-    // The resilience branch logged the legacy-fallback warning.
+    // It logged the fail-the-turn line.
     expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining('streaming without run tracking'),
+      expect.stringContaining('failing the turn'),
       expect.anything(),
     );
 
-    // The turn really streamed: the user message was persisted and streamText ran.
-    expect(aiChatMessageRepo.insert).toHaveBeenCalled();
-    expect(streamTextMock).toHaveBeenCalledTimes(1);
-
-    // The decisive wiring: with no run handle, the fallback uses the SOCKET signal
-    // (effectiveSignal = signal, runId undefined) — not a run-bound signal. #444:
-    // the signal is unioned with the degeneration controller via AbortSignal.any,
-    // so assert the socket abort still reaches the turn rather than identity.
-    const passed = streamTextMock.mock.calls[0][0].abortSignal as AbortSignal;
-    expect(passed.aborted).toBe(false);
-    socketController.abort();
-    expect(passed.aborted).toBe(true);
+    // Fail-fast: the turn NEVER streamed — no user row persisted, no streamText
+    // call, so no orphan/untracked run was left behind.
+    expect(aiChatMessageRepo.insert).not.toHaveBeenCalled();
+    expect(streamTextMock).not.toHaveBeenCalled();
   });
 });
