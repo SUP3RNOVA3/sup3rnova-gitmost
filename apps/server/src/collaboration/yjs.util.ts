@@ -145,6 +145,10 @@ type MarkedSegment = {
   length: number;
   text: string;
   markAttrs: Record<string, any>;
+  // The FULL attribute set of this delta run — the `comment` mark plus any
+  // inline formatting (bold/italic/code/link/…). Captured so apply can carry the
+  // original run's formatting onto the replacement instead of dropping it.
+  attributes: Record<string, any>;
 };
 
 /**
@@ -202,6 +206,7 @@ export function replaceYjsMarkedText(
             length,
             text: insert,
             markAttrs: markAttr,
+            attributes,
           });
         }
         offset += length;
@@ -251,15 +256,26 @@ export function replaceYjsMarkedText(
     return { applied: false, currentText: joinedText };
   }
 
-  // 3. All guards passed: delete the marked run and re-insert newText with the
-  // same comment attributes at the same offset. Atomic within the caller's
-  // transaction.
+  // 3. All guards passed: delete the marked run and re-insert newText at the
+  // same offset. Atomic within the caller's transaction.
   const start = segments[0].offset;
   const len = segments.reduce((sum, s) => sum + s.length, 0);
-  const markAttrs = segments[0].markAttrs;
+
+  // Carry the ORIGINAL run's formatting onto the replacement (#496): inserting
+  // with only the `comment` mark silently dropped bold/italic/code/link of the
+  // replaced text. Yjs applies one flat attribute set to the whole insert, so
+  // when the marked run mixes formatting we pick the DOMINANT segment (the one
+  // covering the most characters) and apply its attributes — a v1 that preserves
+  // the common single-format case exactly and, for a mixed run, keeps the
+  // prevailing style rather than losing all of it. The dominant segment already
+  // carries the `comment` mark (every collected segment does), so the anchor is
+  // preserved; we defensively re-assert it in case a future attribute shape
+  // omits it.
+  const dominant = segments.reduce((a, b) => (b.length > a.length ? b : a));
+  const insertAttrs = { ...dominant.attributes, comment: dominant.markAttrs };
 
   node.delete(start, len);
-  node.insert(start, newText, { comment: markAttrs });
+  node.insert(start, newText, insertAttrs);
 
   return { applied: true, currentText: newText };
 }

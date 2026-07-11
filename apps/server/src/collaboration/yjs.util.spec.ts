@@ -529,4 +529,79 @@ describe('replaceYjsMarkedText', () => {
     expect(result).toEqual({ applied: false, currentText: 'abcdef' });
     expect(text.toDelta()).toEqual(before);
   });
+
+  // #496: apply must NOT silently strip the replaced run's inline formatting.
+  // Build a paragraph and format the marked range with extra marks, then assert
+  // the replacement carries them.
+  function buildFormatted(
+    runs: Array<{ text: string; attrs?: Record<string, any> }>,
+  ): { fragment: Y.XmlFragment; text: Y.XmlText } {
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment('default');
+    const para = new Y.XmlElement('paragraph');
+    fragment.insert(0, [para]);
+    const text = new Y.XmlText();
+    para.insert(0, [text]);
+    text.insert(0, runs.map((r) => r.text).join(''));
+    let offset = 0;
+    for (const run of runs) {
+      if (run.attrs) text.format(offset, run.text.length, run.attrs);
+      offset += run.text.length;
+    }
+    return { fragment, text };
+  }
+
+  it('preserves the original run formatting (bold + link) on the replacement', () => {
+    const { fragment, text } = buildFormatted([
+      { text: 'see ' },
+      {
+        text: 'old',
+        attrs: {
+          comment: { commentId: 'c1', resolved: false },
+          bold: true,
+          link: { href: 'https://x.test' },
+        },
+      },
+      { text: ' end' },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'old', 'new');
+
+    expect(result).toEqual({ applied: true, currentText: 'new' });
+    // The comment anchor AND the bold/link marks survive the delete+insert.
+    expect(text.toDelta()).toEqual([
+      { insert: 'see ' },
+      {
+        insert: 'new',
+        attributes: {
+          comment: { commentId: 'c1', resolved: false },
+          bold: true,
+          link: { href: 'https://x.test' },
+        },
+      },
+      { insert: ' end' },
+    ]);
+  });
+
+  it('mixed formatting under the mark: replacement takes the DOMINANT run marks', () => {
+    // Marked run = "bold" (bold, 4 chars) + "x" (plain, 1 char), same commentId.
+    // The dominant (longer) segment is bold, so the flat replacement is bold.
+    const { fragment, text } = buildFormatted([
+      {
+        text: 'bold',
+        attrs: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+      { text: 'x', attrs: { comment: { commentId: 'c1', resolved: false } } },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'boldx', 'Z');
+
+    expect(result).toEqual({ applied: true, currentText: 'Z' });
+    expect(text.toDelta()).toEqual([
+      {
+        insert: 'Z',
+        attributes: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+    ]);
+  });
 });
