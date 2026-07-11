@@ -248,14 +248,15 @@ describe("ChatThread — send now", () => {
     startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, aborts A
-    // A ends via isDisconnect (the server CAS closed it). The OLD overlap bug would
-    // route the LIVE new run into a false reconnect banner.
+    // A ends via a REAL network drop { isError:true, isDisconnect:true } (the server
+    // CAS closed it). The OLD overlap bug would route the LIVE new run into a false
+    // reconnect banner.
     await act(async () => {
       h.state.onFinish?.({
         message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "x" }] },
         isAbort: false,
         isDisconnect: true,
-        isError: false,
+        isError: true,
       });
       await Promise.resolve();
     });
@@ -326,6 +327,23 @@ describe("ChatThread — send now", () => {
     expect(h.state.stop).toHaveBeenCalledTimes(1); // no second abort
     // Y is still queued (kept, not lost, not sent).
     expect(screen.getAllByLabelText("Remove queued message")).toHaveLength(1);
+  });
+
+  it("Stop then a REAL network-drop finish exits to idle (honor-in-stopping), NOT a false reconnect", () => {
+    // Regression for the disconnect-first reorder: on the STOP path, even a drop-
+    // form finish { isError:true, isDisconnect:true } arriving in `stopping` must be
+    // HONORED (reducer) and exit to idle — it must NOT enter the reconnect ladder.
+    startLocalStreamWithRun(); // live local stream, autonomous
+    fireEvent.click(screen.getByLabelText("Stop")); // STOP_REQUESTED -> stopping
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: true,
+        isError: true,
+      });
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
   });
 
   it("Send now is HIDDEN while observing a resumed run and VISIBLE on a local stream", () => {
@@ -419,15 +437,18 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
     expect(screen.getByText("Response stopped.")).toBeTruthy();
   });
 
-  it("ENDS — keeps the queue on a disconnect (non-autonomous) and shows the notice", () => {
-    finishWith({ isDisconnect: true });
+  it("ENDS — keeps the queue on a REAL disconnect (non-autonomous) and shows the notice", () => {
+    // Real SDK drop form: { isError:true, isDisconnect:true }. With the buggy
+    // isError-first order this would fall to the terminal error branch (no notice).
+    finishWith({ isDisconnect: true, isError: true });
     expect(h.state.sendMessage).not.toHaveBeenCalled();
     expect(
       screen.getByText("Connection lost — the answer was interrupted."),
     ).toBeTruthy();
   });
 
-  it("ENDS — keeps the queue on a stream error (no notice)", () => {
+  it("ENDS — keeps the queue on a NON-disconnect stream error (no notice)", () => {
+    // A provider error is { isError:true, isDisconnect:false } — terminal.
     finishWith({ isError: true });
     expect(h.state.sendMessage).not.toHaveBeenCalled();
     expect(screen.queryByText("Response stopped.")).toBeNull();
@@ -437,7 +458,7 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
     for (const flags of [
       {},
       { isAbort: true },
-      { isDisconnect: true },
+      { isDisconnect: true, isError: true },
       { isError: true },
     ]) {
       cleanup();
@@ -787,13 +808,18 @@ describe("ChatThread — live reconnect + stalled", () => {
     cleanup();
   });
 
+  // A REAL live SSE drop. ai@6.0.207 emits BOTH { isError:true, isDisconnect:true }
+  // for a network TypeError — NOT the { isError:false } form the old tests fed. This
+  // is the form browser QA hit; with the buggy isError-first routing these tests go
+  // red (a real drop would surface the terminal error banner, not the reconnect
+  // ladder). MUTATION-VERIFY of the disconnect-first fix.
   function disconnect(message: unknown = liveMsg) {
     act(() => {
       h.state.onFinish?.({
         message,
         isAbort: false,
         isDisconnect: true,
-        isError: false,
+        isError: true,
       });
     });
   }

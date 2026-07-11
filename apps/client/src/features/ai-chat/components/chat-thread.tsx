@@ -626,10 +626,13 @@ export default function ChatThread({
         machineRef.current.phase.name === "superseding" &&
         pendingSupersedeTextRef.current !== null
       ) {
-        if (isError) dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
-        else if (isAbort) dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
-        else if (isDisconnect)
+        // Disconnect-first (see the routing note below): a real drop is
+        // { isError:true, isDisconnect:true }. All of these are dropped by I1 here
+        // (superseding bumped the epoch) — the order only mirrors the main routing.
+        if (isDisconnect)
           dispatch({ type: "FINISH_DISCONNECT", hasVisibleContent: msgHasVisible, epoch: stampEpoch });
+        else if (isError) dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        else if (isAbort) dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
         else dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
         const text = pendingSupersedeTextRef.current;
         pendingSupersedeTextRef.current = null;
@@ -642,18 +645,14 @@ export default function ChatThread({
         return;
       }
 
-      if (isError) {
-        dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
-        setStopNotice(null);
-        return;
-      }
-      if (isAbort) {
-        // A user Stop / an interrupt abort finished. The FSM stopping/idle exit is
-        // by DATA (this terminal outcome, I4).
-        dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
-        setStopNotice("manual");
-        return;
-      }
+      // #488 (browser QA): route DISCONNECT FIRST. In ai@6.0.207 a real network drop
+      // yields BOTH `{ isError:true, isDisconnect:true }` — the SDK sets `isError`
+      // unconditionally in its catch and `isDisconnect` only ALONGSIDE it (for a
+      // fetch/network TypeError). Checking `isError` first therefore sent EVERY real
+      // drop to the terminal error banner and NEVER entered the reconnect ladder
+      // (`FINISH_DISCONNECT` is its only entry). A disconnect — the detached run
+      // keeps executing server-side — must win; only a NON-disconnect error (a
+      // provider 500, `{ isError:true, isDisconnect:false }`) is terminal.
       if (isDisconnect) {
         if (wasObserver) {
           // A resumed/attached OBSERVER stream dropped. Recover via the degraded
@@ -720,6 +719,19 @@ export default function ChatThread({
           });
           setStopNotice("disconnect");
         }
+        return;
+      }
+      // A NON-disconnect stream error (a provider 500 etc.) -> terminal error banner.
+      if (isError) {
+        dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        setStopNotice(null);
+        return;
+      }
+      if (isAbort) {
+        // A user Stop / an interrupt abort finished. The FSM stopping/idle exit is
+        // by DATA (this terminal outcome, I4 — honored in `stopping` by the reducer).
+        dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
+        setStopNotice("manual");
         return;
       }
       // Clean finish.
