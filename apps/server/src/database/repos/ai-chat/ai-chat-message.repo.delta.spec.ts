@@ -1,7 +1,12 @@
 import { randomUUID } from 'crypto';
 import { CamelCasePlugin, Kysely, sql } from 'kysely';
 import { PostgresJSDialect } from 'kysely-postgres-js';
-import postgres from 'postgres';
+// NOT a default import: the project tsconfig is `module: commonjs` with NO
+// esModuleInterop, so `import postgres from 'postgres'` compiles to
+// `postgres_1.default(...)` and the CJS `postgres` export has no `.default` —
+// it threw in beforeAll, was swallowed as "DB unreachable", and SILENTLY voided
+// all six tests. Mirror the working integration harness (test/integration/db.ts).
+import * as postgres from 'postgres';
 import { AiChatMessageRepo } from './ai-chat-message.repo';
 import { AiChatRunRepo } from './ai-chat-run.repo';
 
@@ -50,8 +55,21 @@ beforeAll(async () => {
     await sql`set session_replication_role = replica`.execute(db);
     await sql`select 1`.execute(db);
     reachable = true;
-  } catch {
+  } catch (err) {
     reachable = false;
+    // A genuine connection failure (ECONNREFUSED etc.) is a legitimate skip on a
+    // DB-less CI. A PROGRAMMING error (bad import, typo, driver misuse) must NOT
+    // masquerade as "DB unreachable" and silently void the whole suite (that is
+    // exactly the bug that hid this spec's zero coverage) — rethrow it so the
+    // suite fails LOUDLY.
+    const msg = String((err as Error)?.message ?? err);
+    if (
+      !/ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EHOSTUNREACH|connect|terminating|password|authentication|role .* does not exist|database .* does not exist/i.test(
+        msg,
+      )
+    ) {
+      throw err;
+    }
   }
   msgRepo = new AiChatMessageRepo(db as never);
   runRepo = new AiChatRunRepo(db as never);
@@ -94,6 +112,34 @@ async function seedMessage(overrides: Record<string, unknown> = {}) {
 async function dbNow(): Promise<string> {
   const r = await sql<{ now: Date }>`select now() as now`.execute(db);
   return r.rows[0].now.toISOString();
+}
+
+// Fake ONLY the Date object (so in-process `new Date()`/`Date.now()` jump), while
+// leaving every TIMER function real. Faking timers wholesale freezes postgres.js's
+// internal connection/query timers, so the awaited DB round-trip would hang the
+// test (and the afterAll cleanup) at the jest 5s cap. With Date-only faking the
+// query resolves normally, and we still prove the stamp is the DB clock (not the
+// skewed process clock).
+function fakeDateOnly(iso: string): void {
+  jest.useFakeTimers({
+    doNotFake: [
+      'hrtime',
+      'nextTick',
+      'performance',
+      'queueMicrotask',
+      'requestAnimationFrame',
+      'cancelAnimationFrame',
+      'requestIdleCallback',
+      'cancelIdleCallback',
+      'setImmediate',
+      'clearImmediate',
+      'setInterval',
+      'clearInterval',
+      'setTimeout',
+      'clearTimeout',
+    ],
+    now: new Date(iso),
+  });
 }
 
 const maybe = (name: string, fn: () => Promise<void>) =>
@@ -188,9 +234,10 @@ describe('AiChatMessageRepo.findByChatUpdatedAfter (#491 delta poll)', () => {
     'update() stamps updatedAt from the DB clock, not the app clock',
     async () => {
       const m = await seedMessage();
-      // Fake the PROCESS clock ~73 years into the future. If the stamp came from
-      // `new Date()` the row would read year 2099; sql now() keeps it on DB time.
-      jest.useFakeTimers().setSystemTime(new Date('2099-01-01T00:00:00Z'));
+      // Skew the PROCESS clock ~73 years into the future (Date only). If the stamp
+      // came from `new Date()` the row would read year 2099; sql now() keeps it on
+      // DB time.
+      fakeDateOnly('2099-01-01T00:00:00Z');
       const updated = await msgRepo.update(m.id, workspaceId, {
         content: 'y',
       });
@@ -211,7 +258,7 @@ describe('AiChatMessageRepo.findByChatUpdatedAfter (#491 delta poll)', () => {
         status: 'running',
         stepCount: 0,
       } as never);
-      jest.useFakeTimers().setSystemTime(new Date('2099-01-01T00:00:00Z'));
+      fakeDateOnly('2099-01-01T00:00:00Z');
       const updated = await runRepo.update(run.id, workspaceId, {
         stepCount: 1,
       });

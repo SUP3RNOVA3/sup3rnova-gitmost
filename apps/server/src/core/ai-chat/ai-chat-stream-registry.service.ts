@@ -440,7 +440,13 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
    * An attach at frontier `n` is covered ⟺ coverageFloor <= n.
    */
   private coverageFloor(entry: Entry): number {
-    if (entry.frames.length === 0) return entry.currentStamp;
+    // Empty ring: only the live tail is coming. The floor is the current step,
+    // but never below persistedFloor — a confirmed persist can rotate the ring
+    // empty while currentStamp still lags a beat behind on another connection, so
+    // max() keeps the invariant STRUCTURAL (a client with n = persistedFloor is
+    // always covered) rather than timing-dependent.
+    if (entry.frames.length === 0)
+      return Math.max(entry.currentStamp, entry.persistedFloor);
     const min = entry.stamps[0];
     return entry.overflowThroughStamp >= min ? min + 1 : min;
   }

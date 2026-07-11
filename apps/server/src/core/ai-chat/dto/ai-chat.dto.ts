@@ -1,4 +1,10 @@
-import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import {
+  IsISO8601,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 /** Identify a chat by id (workspace-scoped on the server). */
 export class ChatIdDto {
@@ -47,8 +53,11 @@ export class GetChatDeltaDto {
   @IsString()
   chatId: string;
 
+  // ISO-8601 timestamp echoed from the previous poll's response. Validated as
+  // ISO-8601 (not a bare string): a malformed cursor would otherwise reach the
+  // `::timestamptz` cast in findByChatUpdatedAfter and 500 instead of a clean 400.
   @IsOptional()
-  @IsString()
+  @IsISO8601()
   cursor?: string;
 }
 
