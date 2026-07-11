@@ -34,6 +34,54 @@ export class RunAlreadyActiveError extends Error {
 export type TurnTerminalStatus = 'completed' | 'error' | 'aborted';
 export type RunTerminalStatus = 'succeeded' | 'failed' | 'aborted';
 
+/** The terminal run statuses — the row is done once it reads one of these. */
+export const RUN_TERMINAL_STATUSES: readonly RunTerminalStatus[] = [
+  'succeeded',
+  'failed',
+  'aborted',
+];
+
+/** Whether a persisted run status is terminal (settled). */
+export function isRunTerminal(status: string | null | undefined): boolean {
+  return (
+    status === 'succeeded' || status === 'failed' || status === 'aborted'
+  );
+}
+
+/**
+ * #487: the outcome a run's {@link AiChatRunService.finalizeRun} settled with.
+ * `terminalWriteFailed` = the terminal write GAVE UP after the bounded retry, so
+ * the row is still non-terminal ('running') and a ZOMBIE record holds the
+ * `intended` status for a later re-drive (reconcile / supersede / boot sweep). A
+ * subscriber (supersede, #487 commit 3) uses this to decide whether the slot is
+ * genuinely free or must first have the intended status applied.
+ */
+export interface RunSettleOutcome {
+  status: RunTerminalStatus;
+  error: string | null;
+  terminalWriteFailed: boolean;
+}
+
+/** A one-shot settle notifier (#487): `resolve` is called EXACTLY ONCE. */
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+}
+
+/**
+ * #487: a run whose terminal write GAVE UP (every bounded attempt failed). The
+ * row is stranded non-terminal ('running'); this record is the ONLY thing that
+ * distinguishes it from a live run, and carries the `intended` terminal status so
+ * a re-drive can apply it via the conditional UPDATE. Process-local (phase-1
+ * single-process assumption): a restart drops it, and the boot sweep then writes
+ * 'aborted' over the intended — a documented loss (see finalizeRun).
+ */
+interface ZombieRun {
+  workspaceId: string;
+  chatId: string;
+  intended: { status: RunTerminalStatus; error: string | null };
+}
+
 export function mapTurnStatusToRun(
   status: TurnTerminalStatus,
 ): RunTerminalStatus {
@@ -100,6 +148,22 @@ export class AiChatRunService implements OnModuleInit {
   // "entry already gone". Grows by one short UUID per finished run over process
   // uptime — negligible in phase 1's single process.
   private readonly settled = new Set<string>();
+
+  // #487 runId -> one-shot settle notifier. Kept in a SEPARATE map from `active`
+  // ON PURPOSE: it must OUTLIVE the `active.delete` claim inside finalizeRun (the
+  // claim frees the slot the instant finalize starts), so a subscriber can still
+  // await the outcome after the entry is gone. Created in beginRun, resolved
+  // EXACTLY ONCE in finalizeRun, then removed (bounded). Absence => this replica
+  // has no live notifier: a subscriber falls back to the zombie map, then to the
+  // row (see peekSettled). Process-local (phase-1 single-process assumption).
+  private readonly settledPromises = new Map<string, Deferred<RunSettleOutcome>>();
+
+  // #487 runId -> ZOMBIE record: a run whose terminal write gave up (row stranded
+  // non-terminal). BOUNDED — an entry is added only on give-up and removed on a
+  // successful re-drive (settleZombie) or when the row is found already terminal;
+  // a process restart clears it (and the boot sweep settles the stranded row).
+  // Process-local (phase-1 single-process assumption).
+  private readonly zombies = new Map<string, ZombieRun>();
 
   // Bounded retry for the terminal write (F6): a single PK UPDATE can fail
   // transiently under many fire-and-forget writes (pool exhaustion, deadlock, a
@@ -224,6 +288,10 @@ export class AiChatRunService implements OnModuleInit {
       chatId: args.chatId,
       workspaceId: args.workspaceId,
     });
+    // #487: arm the one-shot settle notifier BEFORE returning, so a subscriber
+    // that races in immediately after begin always finds a promise to await. It
+    // is resolved exactly once when the run settles (or gives up).
+    this.settledPromises.set(run.id, this.makeDeferred<RunSettleOutcome>());
     return { runId: run.id, signal: controller.signal };
   }
 
@@ -263,47 +331,43 @@ export class AiChatRunService implements OnModuleInit {
   }
 
   /**
-   * Finalize a run to its terminal status (succeeded / failed / aborted),
-   * stamping finishedAt + any error. Best-effort, but ROBUST against a transient
-   * terminal-write failure (F6) AND atomically safe against a concurrent settle.
+   * Finalize a run to its terminal status (succeeded / failed / aborted) via a
+   * CONDITIONAL UPDATE, stamping finishedAt + any error. Atomically safe against a
+   * concurrent settle AND robust against a transient terminal-write failure.
    *
    * ATOMIC ONCE-CLAIM (the gate must close in ONE synchronous tick): two
    * finalizeRun calls for the SAME run can race — the documented real path is
    * AiChatService.stream's safety-net catch settling the turn to 'error' while a
    * streamText terminal callback (onFinish/onAbort/onError) ALSO settles it. The
-   * `settled.has` check alone is NOT a gate: it is read BEFORE the awaited UPDATE,
-   * so two callers can both see `false` and both write the row (last-write-wins
-   * clobbers the real terminal status, and the bounded retry only widens that
-   * window). The claim therefore happens via `active.delete`, a SYNCHRONOUS
-   * check-and-clear with NO await between the gate and the entry removal: the
-   * second concurrent caller finds the entry already gone and returns in the same
-   * tick, before any UPDATE. The transition "nobody is finalizing" -> "I am
-   * finalizing" is thus a single atomic step.
+   * claim happens via `active.delete`, a SYNCHRONOUS check-and-clear with NO await
+   * between the gate and the entry removal: the second concurrent caller finds the
+   * entry already gone and returns in the same tick, before any UPDATE.
    *
-   * ORDER MATTERS (F6): once we own the claim, the terminal UPDATE happens FIRST;
-   * only once it SUCCEEDS do we record the run as settled. If the UPDATE fails on
-   * every bounded attempt we RESTORE the in-memory entry, leave the run UNsettled,
-   * and emit an ERROR signal that the row is left non-terminal 'running' (which
-   * would 409 every future turn in the chat until recovery). An in-process retry
-   * by a LATER settle is only POSSIBLE, never guaranteed: it needs (a) the entry
-   * to have been restored at the give-up path AND (b) a fresh settler to arrive
-   * AFTER that restore. A concurrent settler that arrives DURING the retry window
-   * — while the entry is deleted for backoff and not yet restored — is consumed at
-   * the synchronous `active.delete` claim (it finds nothing to delete and returns
-   * a no-op), so it does NOT become an in-process retrier. The NO-streamText path
-   * (the turn threw before streamText was wired, so ONLY the safety-net ever
-   * settles) likewise has no second in-process settler at all. The UNCONDITIONAL
-   * backstop in every case is the boot sweep on the next restart (phase 1 has no
-   * periodic in-process sweep); the retained entry is bounded (cleared on restart)
-   * and harmless meanwhile.
+   * ALL TERMINAL WRITES ARE CONDITIONAL (#487): `finalizeIfActive` only flips a
+   * row still in pending|running (mirror of the assistant message's
+   * `onlyIfStreaming`). So even a settle that DID reach the UPDATE (e.g. a
+   * reconcile stamp racing an owner finalize) can never clobber a terminal status
+   * — the loser matches nothing and is a benign no-op. `active.delete` is the
+   * fast, in-process gate; the conditional WHERE is the authoritative one.
    *
-   * IDEMPOTENT on SUCCESS (#184 review): the terminal write happens AT MOST ONCE
-   * per run. After a successful write the once-gate keys off {@link settled} (the
-   * terminal row already written) so a settle arriving AFTER the entry was already
-   * dropped-and-settled returns early; a settle racing the in-flight write is
-   * stopped earlier still, by the `active.delete` claim. Either way a genuine
-   * double-settle collapses to a single write and a late settle can never clobber
-   * the real terminal status or double-write the row.
+   * ZOMBIE ON GIVE-UP (#487): if every bounded attempt THROWS (the DB is down for
+   * the whole finalize), we do NOT restore the entry. The row is stranded
+   * non-terminal ('running'); we record a ZOMBIE `{ terminalWriteFailed, intended
+   * }` (the ONLY thing distinguishing this dead run from a live one) and resolve
+   * the settle notifier with `terminalWriteFailed: true`. A restore would make the
+   * zombie indistinguishable from a live run to every reader; instead a re-drive
+   * (settleZombie, called by the periodic reconcile / supersede / opportunistic
+   * paths) applies the intended status later via the same conditional UPDATE.
+   *
+   * DOCUMENTED LOSS (#487, single-process phase 1): if the process RESTARTS before
+   * a zombie is re-driven, the in-memory zombie map is gone and the boot sweep
+   * (unconditional) writes 'aborted' over the ACTUAL intended status. This is
+   * unavoidable while the run lifecycle is single-process — there is no durable
+   * record of `intended`; a cross-process durable intent is deferred to phase 2.
+   *
+   * IDEMPOTENT: the settle notifier resolves EXACTLY ONCE; a second settle is
+   * stopped at `settled.has` or the `active.delete` claim, so a double-settle
+   * collapses to a single write and can never double-resolve or clobber the row.
    */
   async finalizeRun(
     runId: string,
@@ -314,12 +378,16 @@ export class AiChatRunService implements OnModuleInit {
     // ---- Atomic once-claim (synchronous; NO await before the gate closes) ----
     // Already terminally written -> idempotent no-op.
     if (this.settled.has(runId)) return;
-    // Capture the entry BEFORE the delete so a total-failure path can restore it.
+    // Capture the entry BEFORE the delete for the give-up log context.
     const entry = this.active.get(runId);
     // SYNCHRONOUS check-and-clear: the FIRST caller deletes (claims) the entry;
     // any concurrent SECOND caller finds nothing to delete and returns HERE, in
     // the same tick, before any await — so it can never reach the UPDATE.
     if (!this.active.delete(runId)) return;
+
+    const status = mapTurnStatusToRun(turnStatus);
+    const err = error ?? null;
+    const chatId = entry?.chatId ?? 'unknown';
 
     let lastError: unknown;
     for (
@@ -328,47 +396,159 @@ export class AiChatRunService implements OnModuleInit {
       attempt++
     ) {
       try {
-        await this.runRepo.update(runId, workspaceId, {
-          status: mapTurnStatusToRun(turnStatus),
-          finishedAt: new Date(),
-          error: error ?? null,
+        const row = await this.runRepo.finalizeIfActive(runId, workspaceId, {
+          status,
+          error: err,
         });
-        // Terminal write landed: arm the once-gate. The entry is already gone
-        // (claimed above); we do NOT restore it. The slot is now free.
+        // No throw => the row is now terminal (we wrote it, or it was ALREADY
+        // terminal — another writer won the conditional UPDATE, a benign no-op).
         this.settled.add(runId);
+        this.zombies.delete(runId);
+        // Resolve with the persisted outcome: our status when WE wrote it, else
+        // the row's real terminal status (re-read on the already-terminal path so
+        // a subscriber never sees a status we did not actually persist).
+        const outcome: RunSettleOutcome = row
+          ? { status, error: err, terminalWriteFailed: false }
+          : await this.readTerminalOutcome(runId, workspaceId, status, err);
+        this.resolveSettled(runId, outcome);
         return;
-      } catch (err) {
-        lastError = err;
+      } catch (err2) {
+        lastError = err2;
         this.logger.warn(
           `Failed to finalize run ${runId} (attempt ${attempt}/${
             AiChatRunService.FINALIZE_MAX_ATTEMPTS
-          }): ${err instanceof Error ? err.message : 'unknown error'}`,
+          }): ${err2 instanceof Error ? err2.message : 'unknown error'}`,
         );
         if (attempt < AiChatRunService.FINALIZE_MAX_ATTEMPTS) {
           await this.delay(AiChatRunService.FINALIZE_RETRY_BASE_MS * attempt);
         }
       }
     }
-    // Every attempt failed: this is a give-up, materially worse than a per-attempt
-    // blip — the row is left NON-TERMINAL ('running'), so emit ONE explicit,
-    // greppable ERROR so an operator can tell "survived a blip" from "gave up, run
-    // held in memory until recovery" (the last warn alone says only "attempt 3/3").
+    // Every attempt threw: GIVE UP. The row is stranded non-terminal ('running').
+    // Do NOT restore the entry (a restored entry is indistinguishable from a live
+    // run); leave a ZOMBIE record instead, and resolve the notifier as
+    // terminalWriteFailed so a subscriber knows the slot still needs the intended
+    // status applied. One explicit, greppable ERROR so an operator can tell a
+    // give-up from a per-attempt blip.
     this.logger.error(
-      `Run ${runId} (chat ${entry?.chatId ?? 'unknown'}) left NON-TERMINAL ` +
-        `('running'): terminal write failed after ${
-          AiChatRunService.FINALIZE_MAX_ATTEMPTS
-        } attempts; entry retained in memory, recovery deferred to next settle / ` +
-        `boot sweep`,
+      `Run ${runId} (chat ${chatId}) left NON-TERMINAL ('running'): terminal ` +
+        `write failed after ${AiChatRunService.FINALIZE_MAX_ATTEMPTS} attempts; ` +
+        `ZOMBIE recorded (intended '${status}'), recovery deferred to reconcile / ` +
+        `supersede / boot sweep`,
       lastError,
     );
-    // RESTORE the claimed entry (and leave the run UNsettled) so a LATER settle
-    // that arrives AFTER this restore MAY retry the terminal write — but that
-    // in-process retry is NOT guaranteed (a concurrent settler caught in the retry
-    // window above is consumed at the `active.delete` claim, and the no-streamText
-    // path has no second settler at all). The UNCONDITIONAL backstop in every case
-    // is the boot sweep on the next restart; the restored entry is bounded and
-    // cleared on restart.
-    if (entry) this.active.set(runId, entry);
+    this.zombies.set(runId, {
+      workspaceId,
+      chatId,
+      intended: { status, error: err },
+    });
+    this.resolveSettled(runId, { status, error: err, terminalWriteFailed: true });
+  }
+
+  /**
+   * #487: re-drive a zombie run's intended terminal write (the conditional
+   * UPDATE). Called by the periodic reconcile (commit 4), an opportunistic
+   * single-chat reconcile, and supersede (commit 3). On success — the row is now
+   * terminal (written OR found already terminal) — the zombie is cleared and the
+   * once-gate armed; on another failure the zombie is kept for a later retry.
+   * Returns true when the row is now terminal. Best-effort; never throws.
+   */
+  async settleZombie(runId: string): Promise<boolean> {
+    const z = this.zombies.get(runId);
+    if (!z) return false;
+    try {
+      await this.runRepo.finalizeIfActive(runId, z.workspaceId, {
+        status: z.intended.status,
+        error: z.intended.error,
+      });
+      this.zombies.delete(runId);
+      this.settled.add(runId);
+      return true;
+    } catch (err) {
+      this.logger.warn(
+        `Re-drive of zombie run ${runId} (chat ${z.chatId}) failed; will retry ` +
+          `later: ${err instanceof Error ? err.message : 'unknown error'}`,
+      );
+      return false;
+    }
+  }
+
+  /**
+   * #487: the run's settle outcome as seen by THIS replica, or undefined when it
+   * has no record (the caller then reads the row — the DB is the source of truth).
+   * A LIVE deferred (still settling, or resolved-but-not-yet-consumed) wins; a
+   * ZOMBIE synthesizes the give-up outcome. A subscriber (supersede) races this
+   * against a timeout.
+   */
+  peekSettled(runId: string): Promise<RunSettleOutcome> | undefined {
+    const d = this.settledPromises.get(runId);
+    if (d) return d.promise;
+    const z = this.zombies.get(runId);
+    if (z) {
+      return Promise.resolve({
+        status: z.intended.status,
+        error: z.intended.error,
+        terminalWriteFailed: true,
+      });
+    }
+    return undefined;
+  }
+
+  /** #487 test/diagnostic seam: whether a give-up zombie is held for this run. */
+  hasZombie(runId: string): boolean {
+    return this.zombies.has(runId);
+  }
+
+  /** #487: every zombie runId held on this replica (reconcile clause a, commit 4). */
+  zombieRunIds(): string[] {
+    return [...this.zombies.keys()];
+  }
+
+  /** #487: create a one-shot deferred (resolve captured for a later single call). */
+  private makeDeferred<T>(): Deferred<T> {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  /** #487: resolve a run's settle notifier EXACTLY ONCE, then drop it (bounded).
+   *  A subscriber that already grabbed the promise still resolves; a later one
+   *  falls back to the zombie map / the row (see peekSettled). */
+  private resolveSettled(runId: string, outcome: RunSettleOutcome): void {
+    const d = this.settledPromises.get(runId);
+    if (!d) return;
+    this.settledPromises.delete(runId);
+    d.resolve(outcome);
+  }
+
+  /** #487: read the persisted terminal outcome when the conditional finalize was a
+   *  no-op (the row was already terminal). Falls back to the intended status when
+   *  the read fails or the row is unexpectedly missing/non-terminal. */
+  private async readTerminalOutcome(
+    runId: string,
+    workspaceId: string,
+    fallbackStatus: RunTerminalStatus,
+    fallbackError: string | null,
+  ): Promise<RunSettleOutcome> {
+    try {
+      const row = await this.runRepo.findById(runId, workspaceId);
+      if (row && isRunTerminal(row.status)) {
+        return {
+          status: row.status as RunTerminalStatus,
+          error: row.error ?? null,
+          terminalWriteFailed: false,
+        };
+      }
+    } catch {
+      // Fall through to the intended status — best-effort only.
+    }
+    return {
+      status: fallbackStatus,
+      error: fallbackError,
+      terminalWriteFailed: false,
+    };
   }
 
   /** Small async backoff between terminal-write retries (F6). Isolated so it is

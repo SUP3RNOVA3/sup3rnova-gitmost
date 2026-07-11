@@ -281,6 +281,52 @@ describe('AiChatRun durable lifecycle [integration]', () => {
     });
   });
 
+  it('#487 finalizeIfActive is CONDITIONAL: a late terminal write cannot clobber the settled status (real SQL)', async () => {
+    const c = (await createChat(db, { workspaceId, creatorId: userId })).id;
+    const run = await runRepo.insert({
+      chatId: c,
+      workspaceId,
+      createdBy: userId,
+      status: 'running',
+    });
+
+    // First terminal write: the run IS active, so it flips + returns the row.
+    const first = await runRepo.finalizeIfActive(run.id, workspaceId, {
+      status: 'succeeded',
+      error: null,
+    });
+    expect(first!.status).toBe('succeeded');
+    expect(first!.finishedAt).toBeTruthy();
+
+    // A late/second writer tries to flip it to 'aborted' — the WHERE status IN
+    // ('pending','running') guard matches NOTHING now, so it is a benign no-op.
+    const second = await runRepo.finalizeIfActive(run.id, workspaceId, {
+      status: 'aborted',
+      error: 'late clobber attempt',
+    });
+    expect(second).toBeUndefined();
+
+    // The persisted terminal status is UNCHANGED — last-writer-wins is gone.
+    const row = await runRepo.findById(run.id, workspaceId);
+    expect(row!.status).toBe('succeeded');
+    expect(row!.error).toBeNull();
+  });
+
+  it('#487 double-settle through the service collapses to one write at the SQL gate', async () => {
+    const c = (await createChat(db, { workspaceId, creatorId: userId })).id;
+    const handle = await service.beginRun({ chatId: c, workspaceId, userId });
+
+    // First settle writes 'aborted' via the conditional write.
+    await service.finalizeRun(handle.runId, workspaceId, 'aborted');
+    // A late safety-net settle to 'error' is a no-op (row already terminal).
+    await service.finalizeRun(handle.runId, workspaceId, 'error', 'late');
+
+    const row = await runRepo.findById(handle.runId, workspaceId);
+    expect(row!.status).toBe('aborted');
+    expect(service.isLocallyActive(handle.runId)).toBe(false);
+    expect(service.hasZombie(handle.runId)).toBe(false);
+  });
+
   it('sweepRunning() with NO args (boot sweep / variant C) aborts even a FRESH running run', async () => {
     // F1/DECISION C at the SQL level: the unconditional boot sweep has NO
     // staleness window, so a run updated just now (a fast restart) is settled too

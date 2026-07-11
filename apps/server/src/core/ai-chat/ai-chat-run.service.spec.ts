@@ -43,6 +43,9 @@ function makeRepo(overrides: Record<string, jest.Mock> = {}) {
       workspaceId: v.workspaceId,
     })),
     update: jest.fn(async () => ({ id: 'run-1' })),
+    // #487: terminal finalize now goes through the CONDITIONAL write. Default
+    // returns a truthy row (the run WAS active -> this call wrote it).
+    finalizeIfActive: jest.fn(async () => ({ id: 'run-1', status: 'succeeded' })),
     markStopRequested: jest.fn(async () => ({ id: 'run-1' })),
     findActiveByChat: jest.fn(async () => undefined),
     findLatestByChat: jest.fn(async () => undefined),
@@ -336,14 +339,12 @@ describe('AiChatRunService run lifecycle', () => {
     await svc.finalizeRun('run-1', 'ws-1', 'error', 'provider blew up');
 
     expect(svc.isLocallyActive('run-1')).toBe(false);
-    expect(repo.update).toHaveBeenCalledWith(
+    // #487: the terminal write is CONDITIONAL (finalizeIfActive); finishedAt is
+    // stamped inside the repo method, so the service passes just status + error.
+    expect(repo.finalizeIfActive).toHaveBeenCalledWith(
       'run-1',
       'ws-1',
-      expect.objectContaining({
-        status: 'failed',
-        error: 'provider blew up',
-        finishedAt: expect.any(Date),
-      }),
+      expect.objectContaining({ status: 'failed', error: 'provider blew up' }),
     );
   });
 
@@ -366,8 +367,8 @@ describe('AiChatRunService run lifecycle', () => {
     // A second settle (e.g. a streamText callback firing after the catch) no-ops.
     await svc.finalizeRun('run-1', 'ws-1', 'completed', undefined);
 
-    expect(repo.update).toHaveBeenCalledTimes(1);
-    expect(repo.update).toHaveBeenCalledWith(
+    expect(repo.finalizeIfActive).toHaveBeenCalledTimes(1);
+    expect(repo.finalizeIfActive).toHaveBeenCalledWith(
       'run-1',
       'ws-1',
       expect.objectContaining({ status: 'failed', error: 'first' }),
@@ -389,8 +390,8 @@ describe('AiChatRunService run lifecycle', () => {
     const updateGate = new Promise((res) => {
       resolveUpdate = res;
     });
-    const update = jest.fn(() => updateGate);
-    const repo = makeRepo({ update });
+    const finalizeIfActive = jest.fn(() => updateGate);
+    const repo = makeRepo({ finalizeIfActive });
     const svc = new AiChatRunService(repo as never, makeEnv() as never);
     await svc.beginRun({
       chatId: 'chat-1',
@@ -399,23 +400,23 @@ describe('AiChatRunService run lifecycle', () => {
     });
 
     // Fire both before the (pending) update resolves. The first synchronously
-    // claims the entry (active.delete) and awaits update; the second, started in
-    // the same macrotask, finds the entry already gone and returns at the claim
-    // WITHOUT ever calling update.
+    // claims the entry (active.delete) and awaits the write; the second, started
+    // in the same macrotask, finds the entry already gone and returns at the claim
+    // WITHOUT ever writing.
     const p1 = svc.finalizeRun('run-1', 'ws-1', 'completed');
     const p2 = svc.finalizeRun('run-1', 'ws-1', 'error', 'safety-net');
 
     // The decisive assertion: exactly one caller reached the terminal UPDATE.
-    expect(update).toHaveBeenCalledTimes(1);
+    expect(finalizeIfActive).toHaveBeenCalledTimes(1);
 
     // Let the single in-flight update land; both calls resolve cleanly.
-    resolveUpdate({ id: 'run-1' });
+    resolveUpdate({ id: 'run-1', status: 'succeeded' });
     await Promise.all([p1, p2]);
 
-    expect(update).toHaveBeenCalledTimes(1);
+    expect(finalizeIfActive).toHaveBeenCalledTimes(1);
     // The winner is the FIRST caller ('completed' -> 'succeeded'); the late
     // 'error' settle never wrote, so it could not clobber the real status.
-    expect(update).toHaveBeenCalledWith(
+    expect(finalizeIfActive).toHaveBeenCalledWith(
       'run-1',
       'ws-1',
       expect.objectContaining({ status: 'succeeded' }),
@@ -431,10 +432,10 @@ describe('AiChatRunService run lifecycle', () => {
     // 409s until a restart. The fix updates FIRST and retries.
     let calls = 0;
     const repo = makeRepo({
-      update: jest.fn(async () => {
+      finalizeIfActive: jest.fn(async () => {
         calls += 1;
         if (calls === 1) throw new Error('deadlock detected');
-        return { id: 'run-1' };
+        return { id: 'run-1', status: 'succeeded' };
       }),
     });
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
@@ -447,26 +448,29 @@ describe('AiChatRunService run lifecycle', () => {
 
     await svc.finalizeRun('run-1', 'ws-1', 'completed');
 
-    // The retry landed the terminal write: the entry is dropped (slot freed) and
-    // the row carries the real terminal status — NOT stranded at 'running'.
+    // The retry landed the terminal write: the entry is dropped (slot freed), no
+    // zombie left, and the row carries the real terminal status.
     expect(svc.isLocallyActive('run-1')).toBe(false);
-    expect(repo.update).toHaveBeenCalledTimes(2);
-    expect(repo.update).toHaveBeenLastCalledWith(
+    expect(svc.hasZombie('run-1')).toBe(false);
+    expect(repo.finalizeIfActive).toHaveBeenCalledTimes(2);
+    expect(repo.finalizeIfActive).toHaveBeenLastCalledWith(
       'run-1',
       'ws-1',
       expect.objectContaining({ status: 'succeeded' }),
     );
   });
 
-  it('F6: if the terminal write keeps failing, the entry is RETAINED and a LATER settle completes it (chat not permanently 409d)', async () => {
+  it('#487 give-up: if the terminal write keeps failing, finalizeRun leaves a ZOMBIE (does NOT restore the entry) and settleZombie re-drives it', async () => {
     // Worst case: the DB is down for the whole first finalize (all attempts fail).
-    // The run must NOT be silently lost — the entry stays so a subsequent settle
-    // (a streamText callback, requestStop -> onAbort, or a future sweep) can retry.
+    // #487 changes the give-up behaviour: the entry is NOT restored (a restored
+    // entry is indistinguishable from a live run). Instead a ZOMBIE record holds
+    // the intended terminal status, and a re-drive (settleZombie — called by the
+    // reconcile / supersede / opportunistic paths) applies it later.
     let healthy = false;
     const repo = makeRepo({
-      update: jest.fn(async () => {
+      finalizeIfActive: jest.fn(async () => {
         if (!healthy) throw new Error('pool exhausted');
-        return { id: 'run-1' };
+        return { id: 'run-1', status: 'succeeded' };
       }),
     });
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
@@ -480,35 +484,83 @@ describe('AiChatRunService run lifecycle', () => {
       userId: 'user-1',
     });
 
-    // First settle: every bounded attempt fails -> entry retained, NOT settled.
+    // First settle: every bounded attempt fails -> ZOMBIE, entry NOT restored.
     await svc.finalizeRun('run-1', 'ws-1', 'completed');
-    expect(svc.isLocallyActive('run-1')).toBe(true);
-    // F12: the give-up emits ONE explicit, greppable ERROR (run + chat context)
-    // so an operator can tell "gave up, run held in memory" from a per-attempt
-    // blip — distinct from the per-attempt warns.
+    expect(svc.isLocallyActive('run-1')).toBe(false); // NOT a live entry
+    expect(svc.hasZombie('run-1')).toBe(true);
+    expect(svc.zombieRunIds()).toContain('run-1');
+    // The give-up emits ONE explicit, greppable ERROR mentioning the zombie.
     const gaveUp = errorSpy.mock.calls.some(
       (c) =>
         /NON-TERMINAL/.test(String(c[0])) &&
+        /ZOMBIE/.test(String(c[0])) &&
         /run-1/.test(String(c[0])) &&
         /chat-1/.test(String(c[0])),
     );
     expect(gaveUp).toBe(true);
+    // The settle notifier resolved as terminalWriteFailed (a subscriber learns the
+    // slot still needs the intended status applied).
+    const outcome = await svc.peekSettled('run-1');
+    expect(outcome).toEqual({
+      status: 'succeeded',
+      error: null,
+      terminalWriteFailed: true,
+    });
 
-    // The DB recovers; a later settle now succeeds and frees the slot.
+    // The DB recovers; a re-drive settles the zombie via the conditional UPDATE.
     healthy = true;
-    await svc.finalizeRun('run-1', 'ws-1', 'completed');
-    expect(svc.isLocallyActive('run-1')).toBe(false);
-    expect(repo.update).toHaveBeenLastCalledWith(
+    const redriven = await svc.settleZombie('run-1');
+    expect(redriven).toBe(true);
+    expect(svc.hasZombie('run-1')).toBe(false);
+    expect(repo.finalizeIfActive).toHaveBeenLastCalledWith(
       'run-1',
       'ws-1',
       expect.objectContaining({ status: 'succeeded' }),
     );
 
-    // And it is now idempotent: a further settle no-ops (terminal row already
-    // written), so a double-settle can never clobber the real status.
-    const callsBefore = repo.update.mock.calls.length;
+    // A later finalizeRun is idempotent (row already terminal): it no-ops at the
+    // once-gate, never re-writing.
+    const callsBefore = repo.finalizeIfActive.mock.calls.length;
     await svc.finalizeRun('run-1', 'ws-1', 'error', 'late');
-    expect(repo.update).toHaveBeenCalledTimes(callsBefore);
+    expect(repo.finalizeIfActive).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it('#487 double-settle collapses to a benign no-op (conditional write; notifier resolves once)', async () => {
+    // A second concurrent settle is stopped at the synchronous active.delete
+    // claim, so the terminal write runs exactly once and the notifier resolves
+    // exactly once with the FIRST settler's outcome.
+    const repo = makeRepo();
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: 'chat-1', workspaceId: 'ws-1', userId: 'u1' });
+
+    await svc.finalizeRun('run-1', 'ws-1', 'aborted');
+    await svc.finalizeRun('run-1', 'ws-1', 'error', 'late'); // no-op
+
+    expect(repo.finalizeIfActive).toHaveBeenCalledTimes(1);
+    const outcome = await svc.peekSettled('run-1');
+    // peekSettled after resolve+delete falls through (notifier dropped, no zombie)
+    // -> undefined; the FIRST settler already resolved any earlier subscriber.
+    expect(outcome).toBeUndefined();
+  });
+
+  it('#487 late settledPromise subscriber gets the resolved outcome', async () => {
+    const repo = makeRepo();
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: 'chat-1', workspaceId: 'ws-1', userId: 'u1' });
+
+    // Subscribe BEFORE settle: hold the promise reference (as supersede does).
+    const early = svc.peekSettled('run-1');
+    expect(early).toBeDefined();
+
+    await svc.finalizeRun('run-1', 'ws-1', 'completed');
+
+    // The reference grabbed before settle resolves with the written outcome, even
+    // though the notifier was dropped from the map on resolve (bounded).
+    await expect(early).resolves.toEqual({
+      status: 'succeeded',
+      error: null,
+      terminalWriteFailed: false,
+    });
   });
 
   it('recordStep / linkAssistantMessage are best-effort: a repo failure is swallowed', async () => {

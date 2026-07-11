@@ -89,6 +89,11 @@ describe('AiChatService.stream run-lifecycle safety net (#184)', () => {
     const runRepo = {
       insert: jest.fn().mockResolvedValue({ id: 'run-1', status: 'running' }),
       update: jest.fn().mockResolvedValue({ id: 'run-1' }),
+      // #487: the terminal settle now goes through the CONDITIONAL write.
+      finalizeIfActive: jest
+        .fn()
+        .mockResolvedValue({ id: 'run-1', status: 'failed' }),
+      findById: jest.fn().mockResolvedValue(undefined),
     };
     const runService = new AiChatRunService(runRepo as never, { isCloud: () => false } as never);
 
@@ -148,9 +153,10 @@ describe('AiChatService.stream run-lifecycle safety net (#184)', () => {
 
     // The run was begun...
     expect(runRepo.insert).toHaveBeenCalledTimes(1);
-    // ...then settled to a terminal FAILED status by the safety net...
-    expect(runRepo.update).toHaveBeenCalledTimes(1);
-    expect(runRepo.update).toHaveBeenCalledWith(
+    // ...then settled to a terminal FAILED status by the safety net (via the
+    // #487 conditional write)...
+    expect(runRepo.finalizeIfActive).toHaveBeenCalledTimes(1);
+    expect(runRepo.finalizeIfActive).toHaveBeenCalledWith(
       'run-1',
       'ws1',
       expect.objectContaining({ status: 'failed' }),
