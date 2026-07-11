@@ -12,6 +12,7 @@ import { parseHtmlDocument, generateJsonWith } from "./dom-parser.js";
 import type { TokenizerExtension, RendererExtension } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
 import { parseAttachedComment } from "./attached-comment.js";
+import { markInternalLinks } from "./internal-links.js";
 import { splitFootnoteParagraphs } from "./footnote.js";
 import {
   decodeInlineMathLatex,
@@ -1094,7 +1095,12 @@ export function markdownToProseMirrorSync(markdownContent: string): any {
   const withFootnotes = assembleFootnotes(withAttrs);
   const bridged = bridgeTaskLists(withFootnotes);
   const doc = generateJsonWith(bridged, docmostExtensions);
-  return stripEmptyParagraphs(doc);
+  // Promote unambiguously-internal wiki-page links (`[t](/s/<space>/p/<slug>)`)
+  // to their native internal form (`internal:true, target:null, rel:null`) so
+  // they get same-tab SPA navigation, hover-preview, and backlink participation.
+  // Every markdown import path funnels through here, so all of them are fixed at
+  // once; external links are left untouched (#522).
+  return markInternalLinks(stripEmptyParagraphs(doc));
 }
 
 /**

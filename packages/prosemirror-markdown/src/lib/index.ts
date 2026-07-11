@@ -38,6 +38,10 @@ export {
   normalizeForeignMarkdown,
   normalizeAgentMarkdown,
 } from "./foreign-markdown.js";
+// Pure primitive: detect the unambiguously-internal wiki-page link path
+// (`/s/<space>/p/<slug>`) and promote such link marks to their native internal
+// form during import (#522). A strict subset of the server's INTERNAL_LINK_REGEX.
+export { isInternalPagePath, markInternalLinks } from "./internal-links.js";
 
 // The Docmost tiptap schema mirror. Exposed so consumers (and the sync
 // engine's schema-validity regression tests) can build the exact ProseMirror

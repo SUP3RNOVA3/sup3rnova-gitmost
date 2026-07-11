@@ -56,6 +56,14 @@ const KNOWN_DEFAULTS: Record<string, Record<string, unknown>> = {
   link: {
     target: "_blank",
     rel: "noopener noreferrer nofollow",
+    // Editor-authored EXTERNAL links store `internal: false` (editor-ext link
+    // default `packages/editor-ext/src/lib/link.ts`), while an imported external
+    // link leaves `internal` absent/null. Both mean "external", so `internal:
+    // false` must normalize away exactly like `null`/absent — otherwise a stored
+    // `internal:false` link diverges from its re-import under
+    // `docsCanonicallyEqual` (false !== null). The internal marker `internal:true`
+    // is NON-default, so it is KEPT and survives canonicalization (#522 §11).
+    internal: false,
   },
   comment: {
     resolved: false,
