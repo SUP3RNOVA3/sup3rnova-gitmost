@@ -115,6 +115,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the old ProseMirror-JSON output. Released together with the `#411`/`#412`
   breaking window so external configs break exactly once. (#413)
 
+- **The Prometheus `/metrics` listener now binds to `127.0.0.1` (loopback) by
+  default instead of `0.0.0.0` (all interfaces).** This closes an unauthenticated
+  endpoint that was previously reachable on every interface. **DEPLOY MIGRATION —
+  cross-container scraping breaks silently otherwise:** if your scraper runs in a
+  SEPARATE container and reaches the app as `docmost:9464` (the exact topology the
+  old `0.0.0.0` hardcode served), you MUST now set `METRICS_BIND=0.0.0.0` — and,
+  because that re-exposes the endpoint, also set `METRICS_TOKEN=<secret>` and
+  configure the scraper with a matching Bearer token. Without `METRICS_BIND`, the
+  scraper can no longer connect and metrics go dark with no error. See the
+  `METRICS_BIND` / `METRICS_TOKEN` block in `.env.example` for the migration.
+  Same-host (loopback) scrapers need no change. (#486)
+
 ### Added
 
 - **Place several images side by side in a row.** A new "Inline (side by
@@ -310,6 +322,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tee()` branch of the stream result — a ~20-step, ~28k-chunk agent run
   retained ~1.7 GB and OOM'd the 2 GB JS heap. Streaming granularity is
   unchanged; the patch must be re-created if `ai` is ever bumped. (#184)
+
+- **The server no longer leaks a hung stream pipe on every mid-run client
+  disconnect.** The same `ai@6.0.134` pnpm patch now also fixes the SDK's
+  `writeToServerResponse`, which awaited only a `"drain"` event under
+  backpressure: when a client disconnected mid-write the socket never drained, so
+  the write loop parked forever, `response.end()` was unreachable, and the stream
+  reader plus buffered chunks were pinned until process restart (every mid-run
+  disconnect in autonomous mode leaked one). The patch races `"drain"` against
+  `"close"`/`"error"`, cancels the reader and ends the response on disconnect, and
+  swallows the fire-and-forget read rejection instead of crashing on an
+  unhandledRejection. (#486)
+
+- **A failed autonomous agent-run start no longer becomes an unstoppable ghost
+  run.** When `beginRun` failed for a transient reason (e.g. a DB-pool blip),
+  the turn previously continued with NO run row — invisible to `/stop`, not
+  aborted on disconnect, and able to slip a second run past the one-run-per-chat
+  gate, leaving an unstoppable run until restart. The turn now fails fast with an
+  honest `503 A_RUN_BEGIN_FAILED` before the first byte (no orphan state), and the
+  client shows a "temporary — please try again" message instead of a misleading
+  "provider not configured". (#486)
+
+- **A pathological draw.io graph can no longer wedge the whole server.** The ELK
+  auto-layout (`layout:"elk"`) ran elkjs synchronously on the main event loop, so
+  a graph at the node/edge cap blocked ALL HTTP/SSE/loopback traffic while it
+  churned — and the old `setTimeout` "timeout" could never fire because the same
+  thread was blocked. Layout now runs in a worker thread with the timeout enforced
+  by `worker.terminate()`; the main loop stays responsive. (#486)
+
+- **The `/health` Redis probe no longer leaks a client on every tick while Redis
+  is down.** It built a new `ioredis` client per probe and disconnected it only on
+  success, so during an outage each health tick added another forever-reconnecting
+  client (an unbounded handle leak). A single long-lived probe client is now
+  reused and closed on shutdown. (#486)
 - **Internal links in exported Markdown no longer lose their visible text.** A
   link whose target page name had no file extension (e.g. a bare title) was
   collapsed to empty text during export, producing an unclickable, label-less
@@ -385,6 +430,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through that exact share (its own share or an ancestor `includeSubPages`
   share); any other value now returns the generic "not found" instead of
   serving the page. (#218)
+
+- **Tool and provider error text no longer leaks to anonymous readers in the
+  public-share AI chat.** A failing tool's raw error (which could carry an
+  internal page title or a stack fragment) and a provider error (which bundles the
+  provider `statusCode` and response body — potentially the internal baseUrl or
+  model name) were streamed verbatim to the anonymous reader over SSE. Errors are
+  now sanitized at the source: the share toolset collapses any unclassified tool
+  error to a safe generic string (safe, classified tool messages still pass
+  through for the model's self-correction), and the anonymous stream `onError`
+  maps provider failures to a fixed set of neutral strings — the full detail goes
+  only to the server log. A UI render gate is layered on top. (closes #394)
+
+- **The Prometheus `/metrics` endpoint can now require Bearer authentication and
+  is loopback-bound by default.** Previously it listened on all interfaces with no
+  auth. Setting `METRICS_TOKEN` requires every scrape to present
+  `Authorization: Bearer <token>` (compared in constant time), and the listener
+  defaults to `127.0.0.1` (see the Breaking Changes entry for the cross-container
+  migration). (#486)
 
 ## [0.94.0] - 2026-06-26
 

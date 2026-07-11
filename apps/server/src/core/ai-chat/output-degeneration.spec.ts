@@ -1,3 +1,5 @@
+import { Logger } from '@nestjs/common';
+import { streamText } from 'ai';
 import {
   hasRepeatedLineRun,
   hasPeriodicTail,
@@ -8,6 +10,15 @@ import {
   REPEATED_LINES_THRESHOLD,
   MIN_PERIOD_REPEATS,
 } from './output-degeneration';
+import { AiChatService } from './ai-chat.service';
+
+// Mock ONLY streamText so we can capture the onChunk/onStepFinish callbacks the
+// service registers and drive them by hand; every other `ai` export the service
+// uses (convertToModelMessages, stepCountIs, …) stays real.
+jest.mock('ai', () => {
+  const actual = jest.requireActual('ai');
+  return { ...actual, streamText: jest.fn() };
+});
 
 /**
  * Unit tests for the token-degeneration detector (#444) — the sole anti-babble
@@ -219,5 +230,151 @@ describe('shouldCheckDegeneration (throttle) + step-boundary reset (#486)', () =
     ).toBe(true);
     // ...and the detector catches the loop that would otherwise stream unchecked.
     expect(isDegenerateOutput(degenerateBurst)).toBe(true);
+  });
+});
+
+/**
+ * BEHAVIOR guard for the ACTUAL fix (#486, ai-chat.service.onStepFinish resets
+ * lastDegenerationCheckLen to 0). The pure tests above use a hard-coded
+ * resetWatermark, so a REVERT of the real `lastDegenerationCheckLen = 0` line
+ * would not redden any of them. This drives the REAL onChunk/onStepFinish
+ * closures from stream() end to end and asserts the run is aborted when a fresh
+ * degenerate burst arrives in the step AFTER a long clean step — which only
+ * happens if the watermark was actually zeroed on the step boundary.
+ */
+describe('AiChatService: onStepFinish re-arms the degeneration watermark (#486)', () => {
+  const streamTextMock = streamText as unknown as jest.Mock;
+
+  function makeRes() {
+    return {
+      raw: {
+        writeHead: jest.fn(),
+        write: jest.fn(),
+        once: jest.fn(),
+        on: jest.fn(),
+        flushHeaders: jest.fn(),
+        writableEnded: false,
+        destroyed: false,
+      },
+    };
+  }
+
+  function makeService() {
+    const aiChatRepo = {
+      findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
+      insert: jest.fn(),
+    };
+    const aiChatMessageRepo = {
+      insert: jest.fn(async () => ({ id: 'msg-1' })),
+      findAllByChat: jest.fn(async () => []),
+      update: jest.fn(async () => ({ id: 'msg-1' })),
+    };
+    const aiSettings = { resolve: jest.fn(async () => ({})) };
+    const tools = { forUser: jest.fn(async () => ({})) };
+    const mcpClients = {
+      toolsFor: jest.fn(async () => ({
+        tools: {},
+        clients: [],
+        outcomes: [],
+        instructions: [],
+      })),
+    };
+    return new AiChatService(
+      {} as never, // ai
+      aiChatRepo as never,
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo
+      aiSettings as never,
+      tools as never,
+      mcpClients as never,
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo
+      {} as never, // pageAccess
+      {
+        isAiChatDeferredToolsEnabled: () => false,
+        // Lockdown OFF -> the degeneration guard is the active anti-babble path.
+        isAiChatFinalStepLockdownEnabled: () => false,
+      } as never, // environment
+    );
+  }
+
+  beforeEach(() => {
+    streamTextMock.mockReset();
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined as never);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined as never);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('aborts on a fresh degenerate burst in the NEXT step (reverting the reset line reddens this)', async () => {
+    let captured:
+      | {
+          onChunk?: (e: { chunk: { type: string; text: string } }) => void;
+          onStepFinish?: (step: unknown) => void;
+          abortSignal?: AbortSignal;
+        }
+      | undefined;
+    streamTextMock.mockImplementation((opts: never) => {
+      captured = opts;
+      return {
+        consumeStream: jest.fn(),
+        pipeUIMessageStreamToResponse: jest.fn(),
+      };
+    });
+
+    const svc = makeService();
+    await svc.stream({
+      user: { id: 'user-1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 'sess-1',
+      body: {
+        chatId: 'chat-1',
+        messages: [
+          { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+        ],
+      } as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      // No runHooks -> legacy path (socket signal), degeneration guard active.
+    });
+
+    expect(streamTextMock).toHaveBeenCalledTimes(1);
+    const onChunk = captured!.onChunk!;
+    const onStepFinish = captured!.onStepFinish!;
+    const abortSignal = captured!.abortSignal!;
+    expect(abortSignal.aborted).toBe(false);
+
+    // STEP 1: a LONG, non-degenerate first step. Distinct lines never trip the
+    // detector, but they advance the throttle watermark far past the burst size
+    // that follows (to ~5x the step). This is the stale watermark that, WITHOUT
+    // the reset, would silence step 2.
+    let counter = 0;
+    let accumulated = 0;
+    while (accumulated < DEGENERATION_CHECK_STEP * 5) {
+      const line = `unique clean line number ${counter++} with distinct words\n`;
+      accumulated += line.length;
+      onChunk({ chunk: { type: 'text-delta', text: line } });
+    }
+    expect(abortSignal.aborted).toBe(false); // clean step must not abort
+
+    // STEP BOUNDARY: the real onStepFinish resets inProgressText AND (the fix)
+    // zeroes lastDegenerationCheckLen.
+    onStepFinish({ text: 'a clean first step', toolCalls: [], toolResults: [] });
+
+    // STEP 2: a FRESH, short degenerate burst (~3.3KB). Its length is far below
+    // the step-1 stale watermark (~10KB), so WITHOUT the reset the throttle stays
+    // silent and this streams unchecked. WITH the reset (watermark 0) it re-arms,
+    // the detector fires, and the run aborts.
+    const burst = 'loadTools.\n'.repeat(300);
+    expect(burst.length).toBeGreaterThanOrEqual(DEGENERATION_CHECK_STEP);
+    expect(burst.length).toBeLessThan(DEGENERATION_CHECK_STEP * 5);
+    onChunk({ chunk: { type: 'text-delta', text: burst } });
+
+    // The decisive assertion: the composed abortSignal (unioned with the
+    // degeneration controller) is now aborted. Reverting `lastDegenerationCheckLen
+    // = 0` in onStepFinish makes this stay false.
+    expect(abortSignal.aborted).toBe(true);
   });
 });

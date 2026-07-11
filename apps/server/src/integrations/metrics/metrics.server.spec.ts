@@ -128,9 +128,17 @@ describe('metrics server bind + auth (#486)', () => {
     const noAuth = await req(port);
     expect(noAuth.status).toBe(401);
 
-    // Wrong token -> 401.
+    // Wrong token, DIFFERENT length -> 401 (short-circuits on the length guard).
     const wrong = await req(port, { authorization: 'Bearer nope' });
     expect(wrong.status).toBe(401);
+
+    // Wrong token, SAME length -> 401. This drives the timingSafeEqual compare
+    // itself (the length guard passes: 'Bearer topsecreX' has the same length as
+    // 'Bearer topsecret'). Pins the constant-time compare: a regression that made
+    // it return true would let this equal-length wrong token through — the
+    // different-length case above would NOT catch that.
+    const sameLen = await req(port, { authorization: 'Bearer topsecreX' });
+    expect(sameLen.status).toBe(401);
 
     // Correct token -> 200 with the metrics body.
     const ok = await req(port, { authorization: 'Bearer topsecret' });
