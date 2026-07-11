@@ -363,6 +363,75 @@ describe("run-fsm — stop (I4: exit by data)", () => {
     m = reduce(m, { type: "RUN_FACT", runFact: null, epoch: m.ctx.epoch });
     expect(m.phase.name).toBe("idle");
   });
+
+  // Review #4: `stopping` arms the poll but had no inactivity backstop.
+  it("review-4: POLL_IDLE_CAP in `stopping` exits to idle (bounded), NOT stalled", () => {
+    let m = reduce(withRunFact(), { type: "STOP_REQUESTED" });
+    expect(m.phase.name).toBe("stopping");
+    expect(hasEffect(m, "armPoll")).toBe(true);
+    // MUTATION-VERIFY: drop the `stopping` branch in POLL_IDLE_CAP and this hangs
+    // in `stopping` (poll forever) -> red.
+    m = reduce(m, { type: "POLL_IDLE_CAP" });
+    expect(m.phase.name).toBe("idle");
+    expect(hasEffect(m, "disarmPoll")).toBe(true);
+    expect(m.ctx.ownership).toBe("local");
+  });
+});
+
+// Review #1: positive attach outcomes must be guarded by the SOURCE phase — the
+// epoch filter alone is insufficient because POLL_TERMINAL uses to() (no epoch
+// bump) and does not abort the in-flight GET.
+describe("run-fsm — review-1: attach outcomes guarded by source phase", () => {
+  it("a late RECONNECT_ATTACHED after POLL_TERMINAL stays idle (no phantom streaming)", () => {
+    let m = withRunFact("run-1");
+    m = reduce(m, { type: "FINISH_DISCONNECT", hasVisibleContent: true, epoch: m.ctx.epoch });
+    m = reduce(m, { type: "RECONNECT_ATTEMPT", attempt: 1, epoch: m.ctx.epoch }); // attach GET
+    const epoch = m.ctx.epoch;
+    // The armed degraded poll reaches the terminal row FIRST (epoch unchanged).
+    m = reduce(m, { type: "POLL_TERMINAL" });
+    expect(m.phase.name).toBe("idle");
+    expect(m.ctx.epoch).toBe(epoch); // POLL_TERMINAL did NOT bump the epoch
+    // The slow GET returns live 2xx under the SAME epoch — must NOT resurrect.
+    m = reduce(m, { type: "RECONNECT_ATTACHED", epoch });
+    expect(m.phase.name).toBe("idle");
+  });
+
+  it("a late ATTACH_LIVE / ATTACH_NONE after leaving `attaching` is ignored", () => {
+    let m = reduce(initialMachine(), { type: "ATTACH_START", runId: "r" });
+    const epoch = m.ctx.epoch;
+    m = reduce(m, { type: "ATTACH_NONE", epoch }); // attaching -> polling
+    m = reduce(m, { type: "POLL_TERMINAL" }); // -> idle (epoch unchanged)
+    expect(m.phase.name).toBe("idle");
+    m = reduce(m, { type: "ATTACH_LIVE", epoch }); // late 2xx, same epoch
+    expect(m.phase.name).toBe("idle");
+    // And a late ATTACH_NONE (not `attaching`) is a no-op too.
+    m = reduce(m, { type: "ATTACH_NONE", epoch });
+    expect(m.phase.name).toBe("idle");
+  });
+});
+
+// Review #2: every terminal transition resets ownership to local.
+describe("run-fsm — review-2: terminal transitions reset ownership to local", () => {
+  const observer = (): Machine => {
+    let m = reduce(initialMachine(), { type: "ATTACH_START", runId: "r" });
+    m = reduce(m, { type: "ATTACH_LIVE", epoch: m.ctx.epoch });
+    expect(m.ctx.ownership).toBe("observer");
+    return m;
+  };
+  it("FINISH_CLEAN resets ownership", () => {
+    const m = reduce(observer(), { type: "FINISH_CLEAN", epoch: observer().ctx.epoch });
+    expect(m.ctx.ownership).toBe("local");
+  });
+  it("FINISH_ERROR / POLL_TERMINAL / RUN_FACT(null) reset ownership", () => {
+    let o = observer();
+    expect(reduce(o, { type: "FINISH_ERROR", kind: "stream", epoch: o.ctx.epoch }).ctx.ownership).toBe("local");
+    // POLL_TERMINAL from an observer polling phase
+    let p = reduce(observer(), { type: "STREAM_INCOMPLETE", reason: "starved", epoch: observer().ctx.epoch });
+    expect(reduce(p, { type: "POLL_TERMINAL" }).ctx.ownership).toBe("local");
+    // RUN_FACT(null) from an observer attaching phase
+    let a = reduce(initialMachine(), { type: "ATTACH_START", runId: "r" });
+    expect(reduce(a, { type: "RUN_FACT", runFact: null, epoch: a.ctx.epoch }).ctx.ownership).toBe("local");
+  });
 });
 
 describe("run-fsm — ownership (I2) is context, orthogonal to phase", () => {

@@ -254,7 +254,9 @@ export function reduce(m: Machine, event: Event): Machine {
   // `superseding` (a successor B owns) — that is the F1 supersede drop.
   if (m.phase.name === "stopping" && isFinishEvent(event)) {
     return to(m, { name: "idle" }, {
-      ctx: { runFact: null, liveFollow: false },
+      // Reset ownership to local on this terminal transition (review #2): otherwise
+      // an observer-stop leaves ownership 'observer' and hides "Send now" forever.
+      ctx: { runFact: null, liveFollow: false, ownership: "local" },
       effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
     });
   }
@@ -297,9 +299,10 @@ export function reduce(m: Machine, event: Event): Machine {
     case "FINISH_CLEAN":
       // A clean terminal outcome. The run is done — clear the run-fact and go
       // idle. (The queue flush is a component concern gated by ownership; the
-      // FSM only models the phase.)
+      // FSM only models the phase.) Review #2: reset ownership to local so a
+      // just-finished observer-attach turn re-exposes "Send now" for the queue.
       return to(m, { name: "idle" }, {
-        ctx: { runFact: null, liveFollow: false },
+        ctx: { runFact: null, liveFollow: false, ownership: "local" },
         effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
       });
 
@@ -307,7 +310,7 @@ export function reduce(m: Machine, event: Event): Machine {
       // A user Stop / intentional abort finished. If we were stopping, the
       // terminal data has now arrived (I4) — go idle. The run-fact is cleared.
       return to(m, { name: "idle" }, {
-        ctx: { runFact: null, liveFollow: false },
+        ctx: { runFact: null, liveFollow: false, ownership: "local" },
         effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
       });
 
@@ -340,11 +343,13 @@ export function reduce(m: Machine, event: Event): Machine {
         });
       }
       // No run to recover: a plain disconnect. Surface the terminal notice.
-      return to(m, { name: "idle" }, { ctx: { runFact: null, liveFollow: false } });
+      return to(m, { name: "idle" }, {
+        ctx: { runFact: null, liveFollow: false, ownership: "local" },
+      });
 
     case "FINISH_ERROR":
       return to(m, { name: "error", kind: event.kind }, {
-        ctx: { runFact: null, liveFollow: false },
+        ctx: { runFact: null, liveFollow: false, ownership: "local" },
         effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
       });
 
@@ -364,6 +369,12 @@ export function reduce(m: Machine, event: Event): Machine {
 
     case "ATTACH_LIVE":
       // The attach GET returned a live 2xx stream — follow it as an observer.
+      // Review #1: guard by SOURCE phase. The epoch filter alone is not enough — a
+      // POLL_TERMINAL uses to() (no epoch bump) and does not abort the in-flight
+      // GET, so a slow 2xx landing after the machine already left `attaching` (e.g.
+      // the armed poll saw the terminal row -> idle) would resurrect a settled run
+      // into a phantom `streaming`. Only enter streaming FROM `attaching`.
+      if (m.phase.name !== "attaching") return stay(m);
       return to(m, { name: "streaming" });
 
     case "ATTACH_NONE":
@@ -371,6 +382,9 @@ export function reduce(m: Machine, event: Event): Machine {
       // follow the run to terminal from the DB. This is a soft-negative run-fact
       // (204 on a non-stripped path is authoritative-negative; the runtime may
       // pass a RUN_FACT null separately). Keep the run-fact as-is here.
+      // Review #1: guard by source phase for consistency (a late outcome after the
+      // machine already left `attaching` must not re-arm a poll).
+      if (m.phase.name !== "attaching") return stay(m);
       return to(m, { name: "polling", reason: "attach-none" }, {
         effects: [{ type: "armPoll", reason: "attach-none" }],
       });
@@ -391,6 +405,12 @@ export function reduce(m: Machine, event: Event): Machine {
       // attempt counter is dropped, so a LATER disconnect can start a fresh
       // ladder from attempt 1 (the old one-shot `!wasResumed` gate forbade a
       // second cycle, sending the second break to silent poll).
+      // Review #1: guard by SOURCE phase. The armed degraded poll can reach the
+      // terminal row (POLL_TERMINAL -> idle, via to(), NO epoch bump, GET not
+      // aborted) BEFORE a slow reconnect GET returns 2xx; without this guard that
+      // late RECONNECT_ATTACHED (same epoch) would resurrect a settled run into a
+      // phantom `streaming`. Only re-enter streaming FROM `reconnecting`.
+      if (m.phase.name !== "reconnecting") return stay(m);
       return to(m, { name: "streaming" }, {
         effects: [{ type: "cancelReconnect" }, { type: "disarmPoll" }],
       });
@@ -437,13 +457,24 @@ export function reduce(m: Machine, event: Event): Machine {
     case "POLL_TERMINAL":
       // The run reached a terminal row via the poll (or the reconcile merge). Go
       // idle and disarm everything (I4: this is a DATA-driven exit, incl. exit
-      // from `stopping`).
+      // from `stopping`). Review #2: reset ownership to local.
       return to(m, { name: "idle" }, {
-        ctx: { runFact: null, liveFollow: false },
+        ctx: { runFact: null, liveFollow: false, ownership: "local" },
         effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
       });
 
     case "POLL_IDLE_CAP":
+      // Review #4: `stopping` also arms the poll (STOP_REQUESTED) but has NO other
+      // backstop — an observer-stop with no SDK stream to fire onFinish, whose
+      // server stop never drives the run terminal, would poll the DB forever. Give
+      // it a bounded exit: cap -> idle + disarm (NOT `stalled`; Stop was already
+      // pressed, so there is nothing for the user to retry).
+      if (m.phase.name === "stopping") {
+        return to(m, { name: "idle" }, {
+          ctx: { runFact: null, liveFollow: false, ownership: "local" },
+          effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
+        });
+      }
       // #488 commit 4a: the poll hit the inactivity cap. Instead of going SILENT
       // (the old "forever half-done answer"), surface a stalled banner + Retry.
       if (m.phase.name !== "polling" && m.phase.name !== "reconnecting") return stay(m);
@@ -464,7 +495,8 @@ export function reduce(m: Machine, event: Event): Machine {
           m.phase.name === "stopping"
         ) {
           return to(m, { name: "idle" }, {
-            ctx: { runFact: null, liveFollow: false },
+            // Review #2: reset ownership to local on this terminal transition.
+            ctx: { runFact: null, liveFollow: false, ownership: "local" },
             effects: [{ type: "cancelReconnect" }, { type: "disarmPoll" }],
           });
         }

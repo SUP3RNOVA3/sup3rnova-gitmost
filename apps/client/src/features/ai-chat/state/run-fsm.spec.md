@@ -128,10 +128,12 @@ holds. **Pending column: empty.**
 | NEW | `pendingSupersedeRef` | **data** (send-plumbing) | the runId injected into the next `POST /stream {supersede}`; the single replacement for the 3 DELETED one-shots (#8/#9/#10) — net −2 refs |
 | NEW | `idleCapTimerRef` | **effect-owned timer** | the stalled inactivity cap → `POLL_IDLE_CAP` (commit 4a); not a flag |
 
-Net: the 13 lifecycle flags (#1–#13) are eliminated (7 → FSM phase/ctx/epoch/event,
-3 deleted, `reconnectTimerRef`/`attachAbortRef` become effect-owned controllers,
-`mountedRef` retained as React liveness). Two effect-owned timers + one send-plumbing
-data ref are added — none is a boolean lifecycle latch.
+Net: the 13 lifecycle flags (#1–#13) are eliminated: **8** → FSM phase/ctx/epoch/event
+(#1–#6, #11, #13), **3** deleted (#8/#9/#10), **`reconnectTimerRef` (#7)** becomes an
+effect-owned controller, and **`mountedRef` (#12)** is retained as React liveness
+(8 + 3 + 1 + 1 = 13). (`attachAbortRef` (#16) is outside the #1–#13 set — it was
+already an effect-owned controller.) Two effect-owned timers + one send-plumbing data
+ref are added — none is a boolean lifecycle latch.
 
 ---
 

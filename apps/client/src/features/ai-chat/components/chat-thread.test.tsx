@@ -353,6 +353,102 @@ describe("ChatThread — send now", () => {
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
   });
 
+  it("#488 review-2: an observer turn's clean finish re-exposes 'Send now' (ownership reset to local)", () => {
+    // Mount attach -> observer. The queued message shows only "Remove" while
+    // observing; once the attached run finishes CLEAN the FSM resets ownership to
+    // local, so "Send now" becomes available again (composer is free).
+    // MUTATION-VERIFY: drop `ownership:"local"` from FINISH_CLEAN -> stays observer
+    // -> "Send now" stays hidden -> red.
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(screen.queryByLabelText("Send now")).toBeNull(); // observer -> hidden
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "done" }] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(screen.getByLabelText("Send now")).toBeTruthy(); // ownership local again
+  });
+
+  it("#488 review-3: a successful CAS supersede POST (200) exits `superseding` (Send now works again)", async () => {
+    // Happy-path of the transport 409/CAS block: SUPERSEDE_READY was never executed
+    // in tests (reviewer confirmed no-op mutation stayed green). If it does not fire,
+    // the machine stays `superseding` for the whole B stream and "Send now" is dead.
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn")); // X
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, stop() #1
+    expect(h.state.stop).toHaveBeenCalledTimes(1);
+    // A's onFinish sends B (clears the pending-supersede text) — the realistic
+    // no-overlap sequence.
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: true,
+        isDisconnect: false,
+        isError: false,
+      });
+      await Promise.resolve();
+    });
+    // B's CAS POST returns 200 -> SUPERSEDE_READY -> streaming.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 })));
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // We LEFT `superseding`: a fresh Send now supersedes AGAIN (still stuck in
+    // superseding -> LOW-2 guard would no-op it). MUTATION-VERIFY: no-op
+    // SUPERSEDE_READY -> stuck superseding -> stop stays at 1 -> red.
+    fireEvent.click(screen.getByTestId("queue-btn")); // Y
+    fireEvent.click(screen.getByLabelText("Send now"));
+    expect(h.state.stop).toHaveBeenCalledTimes(2);
+  });
+
+  it("#488 review-3 sibling: a 409 SUPERSEDE_TARGET_MISMATCH fires the /run verify", async () => {
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding
+    h.state.getRun.mockClear();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ code: "SUPERSEDE_TARGET_MISMATCH", runId: "run-x" }),
+          { status: 409 },
+        ),
+      ),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // SUPERSEDE_MISMATCH -> error(supersede-mismatch) + postRun(verify) -> getRun.
+    expect(h.state.getRun).toHaveBeenCalledWith("c1");
+  });
+
+  it("#488 review-3 sibling: a plain 409 A_RUN_ALREADY_ACTIVE shows the classified banner", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    // The SDK sets useChat error to the 409 body on the failed POST.
+    h.state.error = {
+      message:
+        '{"message":"active","code":"A_RUN_ALREADY_ACTIVE","statusCode":409}',
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+          status: 409,
+        }),
+      ),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // RUN_ALREADY_ACTIVE -> phase error(kind) -> the phase-gate lets errorView show
+    // the classified banner.
+    expect(screen.getByText("The agent is already answering")).toBeTruthy();
+  });
+
   it("Send now is HIDDEN while observing a resumed run and VISIBLE on a local stream", () => {
     // Resumed (mount attach) -> observer -> hidden.
     renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
@@ -971,5 +1067,26 @@ describe("ChatThread — live reconnect + stalled", () => {
     });
     expect(screen.getByText(/the run stopped responding/i)).toBeTruthy();
     expect(screen.getByText("Retry")).toBeTruthy();
+  });
+
+  it("#488 review-4: an observer-stop's armed poll is bounded by the idle cap (exits to idle, disarm)", () => {
+    // STOP_REQUESTED arms the poll and enters `stopping`; an observer stop has no
+    // SDK stream to fire onFinish, and the server stop may never drive the run
+    // terminal. Without a backstop the DB would poll forever. The idle cap must give
+    // `stopping` a bounded exit -> idle + disarm (NOT stalled). MUTATION-VERIFY: drop
+    // `stopping` from the idle-cap effect / the POLL_IDLE_CAP branch -> no disarm.
+    const { onResumeFallback } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(), // mount attach -> observer
+    });
+    onResumeFallback.mockClear();
+    fireEvent.click(screen.getByLabelText("Stop")); // STOP_REQUESTED -> stopping + armPoll
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+    onResumeFallback.mockClear();
+    // No terminal row ever arrives; the inactivity cap bounds it.
+    act(() => {
+      vi.advanceTimersByTime(10 * 60_000);
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(false); // POLL_IDLE_CAP -> idle -> disarm
   });
 });

@@ -878,8 +878,10 @@ export default function ChatThread({
       clearTimeout(idleCapTimerRef.current);
       idleCapTimerRef.current = null;
     }
+    // Review #4: `stopping` also arms the poll and needs a bounded exit (the FSM
+    // maps POLL_IDLE_CAP from `stopping` -> idle, not stalled).
     const p = phase.name;
-    if (p !== "polling" && p !== "reconnecting") return;
+    if (p !== "polling" && p !== "reconnecting" && p !== "stopping") return;
     idleCapTimerRef.current = setTimeout(() => {
       dispatchRef.current({ type: "POLL_IDLE_CAP" });
     }, DEGRADED_POLL_IDLE_MAX_MS);
