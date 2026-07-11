@@ -638,14 +638,17 @@ export class CommentService {
    * inline `comment` anchor mark, then ATOMICALLY hard-delete the row only if it
    * is still childless. Shared by the apply/dismiss no-replies branches (#329).
    *
-   * ORDER MATTERS: the anchor mark is removed FIRST and FATALLY (mirrors
-   * applySuggestion, which mutates the doc before writing the DB). The row
-   * delete is irreversible, so if the mark removal fails — including the
-   * COLLAB_DISABLE_REDIS "no live instance" hard-error — we must NOT delete the
-   * row and report success, or the document is left with a permanent orphan
-   * anchor pointing at a comment that no longer exists (the exact data-integrity
-   * bug #329 targets). Let the exception propagate (→ 5xx); the operation is
-   * then repeatable with row + mark still consistent.
+   * ORDER MATTERS (updated #399 → #496): what runs FIRST and FATALLY here is the
+   * mark-removal ENQUEUE (a fast, durable Redis add), NOT the mark op itself.
+   * deleteCommentMark awaits only the enqueue, so a failed add throws BEFORE the
+   * irreversible row delete — the row + mark stay consistent and the operation is
+   * repeatable. The actual anchor strip then runs off the HTTP path in the worker
+   * (idempotent, 3 retries). Only an EXHAUSTED-retries job could leave the doc
+   * with an orphan anchor pointing at a hard-deleted comment (the data-integrity
+   * bug #329 targets); that residual divergence is now self-healed by the
+   * resolve/unresolve mark worker, which strips an orphan mark whenever its
+   * comment row is gone (#496), and it is meanwhile VISIBLE via BullMQ failed-job
+   * metrics rather than a silently-swallowed warn.
    *
    * RACE (#338 F4): the caller read `hasChildren` BEFORE the (slow) mark
    * removal, so a reply can land in that window. `comments.parent_comment_id` is
