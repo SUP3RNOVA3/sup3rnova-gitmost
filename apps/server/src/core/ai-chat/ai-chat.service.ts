@@ -1543,30 +1543,39 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // Per-step (non-terminal) update: persist the finished steps the moment a
       // step ends. Tolerant — a failed update is logged and swallowed so it never
       // throws into the stream. Keeps status 'streaming'.
-      const updateStreaming = async (): Promise<void> => {
-        if (!assistantId) return;
+      //
+      // #491: it now SIGNALS its outcome — the persisted `stepsPersisted` count on
+      // a CONFIRMED write, or null when it was skipped/failed. The caller rotates
+      // the run-stream registry ring ONLY on a non-null return (a confirmed
+      // persist), so a failed persist never rotates away a step nobody has (the
+      // classic inversion bug); a failure just makes the ring cover more.
+      const updateStreaming = async (): Promise<number | null> => {
+        if (!assistantId) return null;
         // Cheap short-circuit once the turn is finalized (see `finalized` below).
         // The AUTHORITATIVE guard is `onlyIfStreaming` on the UPDATE: a late
         // fire-and-forget step update could still be in flight on another pool
         // connection when finalize runs, so the SQL `WHERE status='streaming'`
         // (not this flag) is what prevents it clobbering the terminal row.
-        if (finalized) return;
+        if (finalized) return null;
+        // Build the flush ONCE so the returned count is EXACTLY the persisted
+        // `stepsPersisted` (both derive from capturedSteps.length at this instant).
+        const flushed = flushAssistant(capturedSteps, '', 'streaming', {
+          pageChanged,
+          partsCache,
+        });
+        const stepsPersisted = flushed.metadata.stepsPersisted as number;
         try {
-          await this.aiChatMessageRepo.update(
-            assistantId,
-            workspace.id,
-            flushAssistant(capturedSteps, '', 'streaming', {
-              pageChanged,
-              partsCache,
-            }),
-            { onlyIfStreaming: true },
-          );
+          await this.aiChatMessageRepo.update(assistantId, workspace.id, flushed, {
+            onlyIfStreaming: true,
+          });
+          return stepsPersisted;
         } catch (err) {
           this.logger.warn(
             `Failed to update streaming assistant row: ${
               err instanceof Error ? err.message : 'unknown error'
             }`,
           );
+          return null;
         }
       };
 
@@ -1742,7 +1751,24 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // this point still recovers the step. Not awaited here (never block the
             // stream), but SERIALIZED via stepUpdateChain so the writes commit in
             // step order; updateStreaming is error-tolerant (logs + swallows).
-            stepUpdateChain = stepUpdateChain.then(() => updateStreaming());
+            // #491: on a CONFIRMED persist, rotate the run-stream registry ring to
+            // drop the now-on-disk steps (stamp < stepsPersisted). Gated on the
+            // resumable flag (same as open/bind) and identity-checked in the
+            // registry; a null return (skipped/failed) rotates NOTHING (auto-safe).
+            stepUpdateChain = stepUpdateChain.then(async () => {
+              const persisted = await updateStreaming();
+              if (
+                persisted != null &&
+                runId &&
+                this.environment?.isAiChatResumableStreamEnabled?.()
+              ) {
+                this.streamRegistry?.confirmPersistedStep(
+                  chatId,
+                  runId,
+                  persisted,
+                );
+              }
+            });
             // #184: persist the run's progress (finished-step count). Fire-and-
             // forget; the hook swallows its own errors.
             if (runId) runHooks?.onStep?.(runId, capturedSteps.length);

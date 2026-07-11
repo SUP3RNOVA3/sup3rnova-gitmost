@@ -64,6 +64,47 @@ import {
   SUBSCRIBER_MAX_BUFFERED_BYTES,
 } from './ai-chat-stream-registry.service';
 import { startSseHeartbeat } from './sse-resilience';
+
+/**
+ * Write the attach TAIL to the hijacked socket in chunks that RESPECT drain
+ * (#491): each `write()` that returns false (the kernel buffer is full) is awaited
+ * on the next 'drain' before continuing. The old code wrote the whole buffer
+ * synchronously, which — with the pre-#491 32MB ring — spiked memory (half the
+ * OOM). Bails immediately if the socket ended/errored mid-write. Frames that the
+ * paused registry subscriber buffers while this awaits are delivered by start().
+ */
+async function writeTailRespectingDrain(
+  raw: {
+    write(chunk: string): boolean;
+    writableEnded?: boolean;
+    destroyed?: boolean;
+    once(event: string, cb: () => void): unknown;
+    removeListener?(event: string, cb: () => void): unknown;
+  },
+  frames: string[],
+): Promise<void> {
+  for (const frame of frames) {
+    if (raw.writableEnded || raw.destroyed) return;
+    const ok = raw.write(frame);
+    if (!ok) {
+      // Kernel buffer full — wait for drain (or an early close/error) before the
+      // next chunk, so a slow reader never forces the whole tail into memory.
+      // Remove ALL three listeners once any fires, so a many-chunk tail with
+      // repeated backpressure never leaks (MaxListenersExceededWarning).
+      await new Promise<void>((resolve) => {
+        const finish = (): void => {
+          raw.removeListener?.('drain', finish);
+          raw.removeListener?.('close', finish);
+          raw.removeListener?.('error', finish);
+          resolve();
+        };
+        raw.once('drain', finish);
+        raw.once('close', finish);
+        raw.once('error', finish);
+      });
+    }
+  }
+}
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 
 /**
@@ -290,19 +331,25 @@ export class AiChatController {
   }
 
   /**
-   * Attach to a chat's live run stream (#184 phase 1.5). A late/reloaded tab
-   * replays the frames buffered so far and then follows the live tail as a normal
-   * streamer. Owner-gated via assertOwnedChat (same gate as getRun). When there is
-   * nothing to resume — no entry, a finished run without expect=live, an
-   * overflowed buffer, or an anchor that pins a DIFFERENT run — the endpoint
-   * answers 204, the ONLY "nothing to resume" signal the AI SDK's reconnect
-   * accepts (it maps 204 to a silent no-op). With AI_CHAT_RESUMABLE_STREAM off the
-   * registry is never populated, so attach always 204s.
+   * Attach to a chat's live run stream from the client's step frontier (#184 phase
+   * 1.5, tail-only #491). A late/reloaded tab hands the server the step count it
+   * has PERSISTED (`n` = the seeded row's `metadata.stepsPersisted`) and its
+   * assistant row id (`anchor`); the registry answers with the TAIL past step `n`
+   * (a synthetic `start` frame + the buffered frames stamped >= n) and then the
+   * live tail. Owner-gated via assertOwnedChat (same gate as getRun). When there
+   * is nothing to resume — no entry, a ring that does not cover the client's
+   * frontier (overflow gap, or the client's seed lagged a rotation), or an anchor
+   * that pins a DIFFERENT run (invariant 6) — the endpoint answers 204, the ONLY
+   * "nothing to resume" signal the AI SDK's reconnect accepts (it maps 204 to a
+   * silent no-op); the client then refetches (a larger n) and re-attaches. With
+   * AI_CHAT_RESUMABLE_STREAM off the registry is never populated, so attach always
+   * 204s.
    *
-   * `expect=live` opts into replaying a finished-but-retained run (safe only when
-   * the client stripped the streaming tail); `anchor` is the client's assistant
-   * row id, which must match this run's (invariant 6) or a foreign run's
-   * transcript would be replayed into the store.
+   * The step marker `n` comes ONLY from the client — the server never reads the
+   * row to derive it, because a server-side n from a stale seed would open a
+   * silent one-step hole. The tail is written to the socket in CHUNKS respecting
+   * drain (writeTailRespectingDrain): the old code synchronously blasted the whole
+   * buffer, which — with the old 32MB cap — was half the OOM.
    */
   @SkipTransform()
   @UseGuards(JwtAuthGuard, UserThrottlerGuard)
@@ -310,39 +357,41 @@ export class AiChatController {
   @Get('runs/:chatId/stream')
   async attachRunStream(
     @Param('chatId', new ParseUUIDPipe()) chatId: string,
-    @Query('expect') expect: string | undefined,
     @Query('anchor') anchor: string | undefined,
+    @Query('n') n: string | undefined,
     @Req() req: FastifyRequest,
     @Res() res: FastifyReply,
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
   ): Promise<void> {
     await this.assertOwnedChat(chatId, user, workspace); // same gate as getRun
+    // The client's persisted step frontier. A missing/invalid value floors to 0
+    // ("give me everything") which, past any rotation, safely 204s.
+    const frontier = Number.isFinite(Number(n)) ? Math.max(0, Number(n)) : 0;
+    // The per-subscriber backpressure cap tracks the (env-tunable) ring cap.
+    const subscriberCap =
+      this.streamRegistry?.subscriberMaxBufferedBytes ??
+      SUBSCRIBER_MAX_BUFFERED_BYTES;
     let stopHeartbeat: () => void = () => undefined;
-    const attachment = await this.streamRegistry?.attach(
-      chatId,
-      expect === 'live',
-      anchor,
-      {
-        onFrame: (frame) => {
-          // Backpressure guard: 2x the replay cap, so the initial replay burst
-          // alone can never trip it; only a genuinely stalled socket can.
-          try {
-            if (res.raw.writableLength > SUBSCRIBER_MAX_BUFFERED_BYTES) {
-              res.raw.destroy(); // 'close' fires -> unsubscribe below
-              return;
-            }
-            if (!res.raw.writableEnded) res.raw.write(frame);
-          } catch {
-            res.raw.destroy();
+    const attachment = await this.streamRegistry?.attach(chatId, anchor, frontier, {
+      onFrame: (frame) => {
+        // Backpressure guard: 2x the ring cap, so the initial tail burst alone
+        // can never trip it; only a genuinely stalled socket can.
+        try {
+          if (res.raw.writableLength > subscriberCap) {
+            res.raw.destroy(); // 'close' fires -> unsubscribe below
+            return;
           }
-        },
-        onEnd: () => {
-          stopHeartbeat();
-          if (!res.raw.writableEnded) res.raw.end();
-        },
+          if (!res.raw.writableEnded) res.raw.write(frame);
+        } catch {
+          res.raw.destroy();
+        }
       },
-    );
+      onEnd: () => {
+        stopHeartbeat();
+        if (!res.raw.writableEnded) res.raw.end();
+      },
+    });
     if (!attachment) {
       res.status(204).send(); // the ONLY "nothing to resume" signal the SDK accepts
       return;
@@ -371,13 +420,16 @@ export class AiChatController {
         // deliberately NO Connection/Keep-Alive (hop-by-hop; Safari/HTTP2)
       });
       res.raw.flushHeaders?.();
-      for (const frame of attachment.replay) res.raw.write(frame);
+      // Write the tail in chunks respecting drain (not a synchronous blast, which
+      // was half the OOM). Frames the paused subscriber buffers meanwhile are
+      // drained by start() below; its cap is the backstop for a stalled socket.
+      await writeTailRespectingDrain(res.raw, attachment.replay);
       if (attachment.finished) {
-        res.raw.end();
+        if (!res.raw.writableEnded) res.raw.end();
         return;
       }
       stopHeartbeat = startSseHeartbeat(res.raw, 15_000);
-      attachment.start(); // drain pending accumulated during replay, go live
+      attachment.start(); // drain pending accumulated during the tail write, go live
     } catch {
       attachment.unsubscribe();
       stopHeartbeat();
