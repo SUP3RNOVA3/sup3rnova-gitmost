@@ -414,7 +414,9 @@ describe("ChatThread — send now", () => {
       "fetch",
       vi.fn().mockResolvedValue(
         new Response(
-          JSON.stringify({ code: "SUPERSEDE_TARGET_MISMATCH", runId: "run-x" }),
+          // REAL server body shape: the current run id is `activeRunId`, NOT `runId`
+          // (see ai-chat.controller.ts SUPERSEDE_TARGET_MISMATCH branch).
+          JSON.stringify({ code: "SUPERSEDE_TARGET_MISMATCH", activeRunId: "run-x" }),
           { status: 409 },
         ),
       ),
@@ -424,6 +426,84 @@ describe("ChatThread — send now", () => {
     });
     // SUPERSEDE_MISMATCH -> error(supersede-mismatch) + postRun(verify) -> getRun.
     expect(h.state.getRun).toHaveBeenCalledWith("c1");
+  });
+
+  it("#497/W1: the mismatch ABSORBS the server's activeRunId into runFact (fast hint is live) — a follow-up Send now CAS-targets it", async () => {
+    // The 409 body's current run id is `activeRunId`; read409 must feed THAT into
+    // SUPERSEDE_MISMATCH{currentRunId} -> runFact, else the fast hint is undefined.
+    // Observe the absorbed fact via the NEXT CAS supersede body. Keep the verify
+    // getRun PENDING so it cannot overwrite the absorbed fact with its own result.
+    h.state.getRun.mockReturnValue(new Promise(() => {})); // verify never resolves
+    startLocalStreamWithRun(); // runFact run-1, sending, local, autonomous
+    fireEvent.click(screen.getByTestId("queue-btn")); // X
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding (target run-1)
+    // A's onFinish sends B and CLEARS the pending-supersede text (no-overlap).
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: true,
+        isDisconnect: false,
+        isError: false,
+      });
+      await Promise.resolve();
+    });
+    // B's CAS POST -> 409 SUPERSEDE_TARGET_MISMATCH with the REAL field `activeRunId`.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ code: "SUPERSEDE_TARGET_MISMATCH", activeRunId: "run-x" }),
+          { status: 409 },
+        ),
+      ),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // runFact is now the absorbed "run-x". SEND_LOCAL preserves it; a fresh Send now
+    // then CAS-supersedes THAT run — surfacing runFact through the supersede body.
+    fireEvent.click(screen.getByTestId("send-btn")); // SEND_LOCAL -> sending, local
+    fireEvent.click(screen.getByTestId("queue-btn")); // Y
+    fireEvent.click(screen.getByLabelText("Send now")); // CAS -> arms pendingSupersede
+    const { body } = h.state.transport!.prepareSendMessagesRequest!({
+      messages: [],
+      body: {},
+    });
+    // MUTATION-VERIFY: revert read409 to `runId` -> currentRunId undefined -> runFact
+    // stays "run-1" -> the CAS targets "run-1" -> this assertion reddens.
+    expect((body.supersede as { runId?: string } | undefined)?.runId).toBe("run-x");
+  });
+
+  it("#497/S4: a plain 409 A_RUN_ALREADY_ACTIVE absorbs activeRunId into runFact so Send now CAS-targets the foreign run", async () => {
+    startLocalStreamWithRun(); // sending, local, autonomous, runFact run-1
+    // A plain (non-supersede) POST hits the one-active-run gate. The FSM must adopt
+    // the server's activeRunId as the run-fact — NOT stay blind.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE", activeRunId: "run-foreign" }),
+          { status: 409 },
+        ),
+      ),
+    );
+    // Drive a NON-supersede POST (phase is `sending`, not `superseding`).
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // runFact is now "run-foreign". SEND_LOCAL preserves it; Send now CAS-targets it.
+    fireEvent.click(screen.getByTestId("send-btn")); // SEND_LOCAL -> sending, local
+    fireEvent.click(screen.getByTestId("queue-btn")); // Y
+    fireEvent.click(screen.getByLabelText("Send now")); // CAS -> arms pendingSupersede
+    const { body } = h.state.transport!.prepareSendMessagesRequest!({
+      messages: [],
+      body: {},
+    });
+    // MUTATION-VERIFY: drop the activeRunId threading (or read the wrong field) ->
+    // runFact stays "run-1" -> the CAS targets "run-1" -> this assertion reddens.
+    expect((body.supersede as { runId?: string } | undefined)?.runId).toBe(
+      "run-foreign",
+    );
   });
 
   it("#488 review-3 sibling: a plain 409 A_RUN_ALREADY_ACTIVE shows the classified banner", async () => {

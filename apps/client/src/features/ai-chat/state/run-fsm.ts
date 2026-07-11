@@ -171,7 +171,7 @@ export type Event =
   | { type: "SUPERSEDE_MISMATCH"; currentRunId?: string; epoch?: number }
   | { type: "SUPERSEDE_TIMEOUT"; epoch?: number }
   | { type: "SUPERSEDE_INVALID"; epoch?: number }
-  | { type: "RUN_ALREADY_ACTIVE" }
+  | { type: "RUN_ALREADY_ACTIVE"; activeRunId?: string }
   // -- lifecycle --
   | { type: "DISPOSE" };
 
@@ -567,8 +567,13 @@ export function reduce(m: Machine, event: Event): Machine {
 
     case "RUN_ALREADY_ACTIVE":
       // A plain POST hit the one-active-run gate. NO auto-retry — the composer
-      // offers "interrupt and send" (supersede) instead.
-      return to(m, { name: "error", kind: "run-already-active" });
+      // offers "interrupt and send" (supersede) instead. #497/S4: adopt the
+      // server's activeRunId as the run-fact so that supersede can TARGET the
+      // (possibly foreign-tab) active run via the CAS, rather than a blind
+      // promote+abort that just 409s again. A stale/absent id keeps the prior fact.
+      return to(m, { name: "error", kind: "run-already-active" }, {
+        ctx: { runFact: event.activeRunId ? { runId: event.activeRunId } : m.ctx.runFact },
+      });
 
     // ---- lifecycle -----------------------------------------------------
     case "DISPOSE":

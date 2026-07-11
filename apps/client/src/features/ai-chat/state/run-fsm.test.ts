@@ -309,6 +309,27 @@ describe("run-fsm — commit 5: supersede CAS + error classification", () => {
     expect(m.phase).toEqual({ name: "error", kind: "run-already-active" });
     expect(m.effects).toEqual([]);
   });
+
+  it("#497/S4: RUN_ALREADY_ACTIVE{activeRunId} ADOPTS the server's active run as the run-fact", () => {
+    // The server sends `activeRunId` so a later supersede can TARGET that run
+    // instead of a blind promote+abort. Absorb it into runFact.
+    const m = reduce(run(initialMachine(), { type: "SEND_LOCAL" }), {
+      type: "RUN_ALREADY_ACTIVE",
+      activeRunId: "run-foreign",
+    });
+    expect(m.phase).toEqual({ name: "error", kind: "run-already-active" });
+    expect(m.ctx.runFact).toEqual({ runId: "run-foreign" });
+    expect(m.effects).toEqual([]);
+  });
+
+  it("#497/S4: RUN_ALREADY_ACTIVE without an activeRunId keeps the prior run-fact", () => {
+    const seeded = reduce(run(initialMachine(), { type: "SEND_LOCAL" }), {
+      type: "RUN_FACT",
+      runFact: { runId: "run-prior" },
+    });
+    const m = reduce(seeded, { type: "RUN_ALREADY_ACTIVE" });
+    expect(m.ctx.runFact).toEqual({ runId: "run-prior" });
+  });
 });
 
 // #488 F2 — a late mount `getRun → ATTACH_START` must not hijack a local turn.

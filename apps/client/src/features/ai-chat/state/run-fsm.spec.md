@@ -56,7 +56,7 @@ Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 | `SUPERSEDE_MISMATCH{currentRunId}` (409 SUPERSEDE_TARGET_MISMATCH) | superseding | error(supersede-mismatch) | `[postRun(verify)]`, runFact←currentRunId |
 | `SUPERSEDE_TIMEOUT` (409 SUPERSEDE_TIMEOUT) | superseding | error(supersede-timeout) | — (composer keeps text; no auto-retry) |
 | `SUPERSEDE_INVALID` (409 SUPERSEDE_INVALID) | superseding | error(supersede-invalid) | — |
-| `RUN_ALREADY_ACTIVE` (409 A_RUN_ALREADY_ACTIVE, plain POST) | sending | error(run-already-active) | — (composer offers supersede; NO auto-retry) |
+| `RUN_ALREADY_ACTIVE{activeRunId}` (409 A_RUN_ALREADY_ACTIVE, plain POST) | sending | error(run-already-active) | runFact←activeRunId (composer offers supersede; NO auto-retry) |
 | `DISPOSE` (unmount) | any | idle **†** | `[abortAttach, cancelReconnect, disarmPoll]` (I1/I5 — epoch++ kills late callbacks) |
 
 **`stopping` honors any finish (re-review MEDIUM):** BEFORE the epoch filter, a
@@ -90,8 +90,8 @@ share exactly the dispatched event set.
 
 | Server response | Event dispatched | error kind → banner |
 |---|---|---|
-| 409 `A_RUN_ALREADY_ACTIVE` (plain POST) | `RUN_ALREADY_ACTIVE` | run-already-active → "already answering / interrupt & send" |
-| 409 `SUPERSEDE_TARGET_MISMATCH` (+ body.runId) | `SUPERSEDE_MISMATCH{currentRunId}` | supersede-mismatch → verify via /run |
+| 409 `A_RUN_ALREADY_ACTIVE` (+ body.activeRunId) | `RUN_ALREADY_ACTIVE{activeRunId}` | run-already-active → "already answering / interrupt & send" |
+| 409 `SUPERSEDE_TARGET_MISMATCH` (+ body.activeRunId) | `SUPERSEDE_MISMATCH{currentRunId}` | supersede-mismatch → verify via /run |
 | 409 `SUPERSEDE_TIMEOUT` | `SUPERSEDE_TIMEOUT` | supersede-timeout → "couldn't interrupt in time, resend" |
 | 409 `SUPERSEDE_INVALID` | `SUPERSEDE_INVALID` | supersede-invalid → "couldn't interrupt this run" |
 | 503 `A_RUN_BEGIN_FAILED` | `FINISH_ERROR{begin-failed}` | begin-failed → "could not start, temporary" |

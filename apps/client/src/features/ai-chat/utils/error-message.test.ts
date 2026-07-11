@@ -56,8 +56,10 @@ describe("describeChatError", () => {
   });
 
   it("classifies SUPERSEDE_TARGET_MISMATCH (409) as run-changed", () => {
+    // Real server body shape: the current run id is `activeRunId` (NOT `runId`) —
+    // see ai-chat.controller.ts. describeChatError classifies off `code` only.
     const body =
-      '{"message":"active run does not match the supersede target","code":"SUPERSEDE_TARGET_MISMATCH","runId":"run-x","statusCode":409}';
+      '{"message":"active run does not match the supersede target","code":"SUPERSEDE_TARGET_MISMATCH","activeRunId":"run-x","statusCode":409}';
     expect(describeChatError(body, t).title).toBe(
       "Couldn't interrupt — the run changed",
     );

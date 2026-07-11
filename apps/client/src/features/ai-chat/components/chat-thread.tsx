@@ -87,15 +87,19 @@ function isActiveRunStatus(status: string | null | undefined): boolean {
   return status === "pending" || status === "running";
 }
 
-/** Read the `{ code, runId }` off a JSON error response WITHOUT consuming the
- *  original body (reads a clone), so the caller can still return the Response
- *  untouched to the SDK. Any parse failure => empty. */
-async function read409(response: Response): Promise<{ code?: string; runId?: string }> {
+/** Read the `{ code, activeRunId }` off a JSON error response WITHOUT consuming
+ *  the original body (reads a clone), so the caller can still return the Response
+ *  untouched to the SDK. `activeRunId` is the server's field for the run currently
+ *  active on the chat — it is the name emitted on BOTH 409 branches
+ *  (SUPERSEDE_TARGET_MISMATCH and A_RUN_ALREADY_ACTIVE, see ai-chat.controller.ts).
+ *  Reading `runId` here (the field the server never sends) silently yields
+ *  `undefined`. Any parse failure => empty. */
+async function read409(response: Response): Promise<{ code?: string; activeRunId?: string }> {
   try {
-    const b = (await response.clone().json()) as { code?: unknown; runId?: unknown };
+    const b = (await response.clone().json()) as { code?: unknown; activeRunId?: unknown };
     return {
       code: typeof b?.code === "string" ? b.code : undefined,
-      runId: typeof b?.runId === "string" ? b.runId : undefined,
+      activeRunId: typeof b?.activeRunId === "string" ? b.activeRunId : undefined,
     };
   } catch {
     return {};
@@ -486,11 +490,11 @@ export default function ChatThread({
               if (response.ok) {
                 dispatchRef.current({ type: "SUPERSEDE_READY", epoch: ep });
               } else if (response.status === 409) {
-                const { code, runId } = await read409(response);
+                const { code, activeRunId } = await read409(response);
                 if (code === "SUPERSEDE_TARGET_MISMATCH")
                   dispatchRef.current({
                     type: "SUPERSEDE_MISMATCH",
-                    currentRunId: runId,
+                    currentRunId: activeRunId,
                     epoch: ep,
                   });
                 else if (code === "SUPERSEDE_TIMEOUT")
@@ -499,9 +503,12 @@ export default function ChatThread({
                   dispatchRef.current({ type: "SUPERSEDE_INVALID", epoch: ep });
               }
             } else if (response.status === 409) {
-              const { code } = await read409(response);
+              const { code, activeRunId } = await read409(response);
               if (code === "A_RUN_ALREADY_ACTIVE")
-                dispatchRef.current({ type: "RUN_ALREADY_ACTIVE" });
+                // S4: thread the server's activeRunId into the event so the FSM can
+                // adopt it as the run-fact — a later "Send now" then CAS-supersedes
+                // that (possibly foreign-tab) run instead of a blind promote+abort.
+                dispatchRef.current({ type: "RUN_ALREADY_ACTIVE", activeRunId });
             }
             return response;
           }
