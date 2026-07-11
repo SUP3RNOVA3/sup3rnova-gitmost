@@ -103,12 +103,14 @@ export const MarkdownClipboard = Extension.create({
             }
 
             const schema = this.editor.schema;
-            // Capture the target range NOW. markdownToProseMirror is async (its
-            // marked pipeline is declared async), so the actual replace happens
-            // on the next microtask. No user input can interleave a microtask, so
-            // the state is unchanged when we dispatch — but we still re-read the
-            // live state and map the captured range through any doc steps for
-            // safety before replacing.
+            // Capture the target range NOW. markdownToProseMirror RETURNS A
+            // PROMISE (kept async only for the Node consumers' contract; the
+            // conversion pipeline itself is synchronous), so the actual replace
+            // happens on the next microtask. No user input can interleave a
+            // microtask, so the state is unchanged when we dispatch — but we
+            // still re-read the live state before replacing and, if the doc did
+            // change under us, fall back to the live selection rather than the
+            // captured (now-stale) range.
             const from = view.state.selection.from;
             const to = view.state.selection.to;
             const startDoc = view.state.doc;
@@ -154,9 +156,10 @@ export const MarkdownClipboard = Extension.create({
                   schema,
                 );
 
-                // Map the captured range through any doc changes since capture
-                // (normally none — same microtask) so the replace targets the
-                // right span even if the document moved.
+                // Target the captured range (normally still valid — same
+                // microtask). If the doc changed under us since capture, the
+                // captured absolute from/to are stale, so fall back to the live
+                // selection rather than StepMap-mapping the old range.
                 const tr = view.state.tr;
                 let mappedFrom = from;
                 let mappedTo = to;
@@ -177,11 +180,20 @@ export const MarkdownClipboard = Extension.create({
                 tr.setMeta("paste", true);
                 view.dispatch(tr);
               })
-              .catch(() => {
+              .catch((err) => {
                 // Fail-open: a conversion error must not swallow the paste
                 // silently in a way that loses the text. We already claimed the
                 // event (returned true), so re-insert the raw text as a plain
                 // paragraph so the user never loses their clipboard content.
+                // Log it: this catch covers BOTH the converter and the success
+                // `.then` body (e.g. PMNode.fromJSON throwing on a schema drift
+                // between the canonical package and the live editor schema), so a
+                // silent degrade to raw text would otherwise be an invisible,
+                // non-reproducible regression ("my table pasted as text").
+                console.error(
+                  "markdown paste conversion failed, inserting raw text",
+                  err,
+                );
                 if (view.isDestroyed) return;
                 const tr = view.state.tr;
                 // Same guard the success path uses: if the doc changed under us

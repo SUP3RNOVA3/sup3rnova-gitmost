@@ -270,6 +270,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Client markdown paste/copy and AI-chat rendering now go through the canonical
+  converter.** Pasting markdown into the editor, "Copy as markdown", the AI title
+  generator, and the AI-chat markdown renderer all now use
+  `@docmost/prosemirror-markdown` (via its new `browser` entry — native
+  `DOMParser`, no jsdom in the client bundle) instead of the hand-written
+  `marked`/`turndown` markdown layer in `editor-ext`, which was **deleted**. As a
+  result, pasting canonical markdown (`^[…]` footnotes, `<!--img …-->`,
+  `> [!type]` callouts, `$…$` math, `==…==` highlight, standalone `<!--subpages-->`
+  comments) now produces the SAME nodes the server import produces for the same
+  text. Chat/reasoning markdown now renders through the editor schema (list items
+  are wrapped in `<p>`; CSS keeps them tight). (#347)
+
 - **Enabling a public share no longer auto-shares the whole sub-tree.** Turning
   a page "Shared to web" now defaults to the page alone; descendant pages become
   public only when you explicitly turn on the dedicated "Include sub-pages"

@@ -110,3 +110,69 @@ describe("MarkdownClipboard handlePaste (async md -> PM)", () => {
     editor.destroy();
   });
 });
+
+// The async seam captures the target range synchronously, then replaces on the
+// next microtask. If the document changed under it between capture and resolve
+// (impossible in prod — same microtask — but pinned here), BOTH the success
+// (replaceRange) and the fail-open (insertText) branches must fall back to the
+// LIVE selection rather than a stale absolute range, so neither clobbers content
+// nor throws a RangeError. We force the mid-flight change by dispatching a
+// doc-mutating transaction AFTER the synchronous claim but BEFORE flushing the
+// microtask that runs the `.then`/`.catch`.
+describe("MarkdownClipboard handlePaste — doc-changed-mid-flight guard", () => {
+  // Insert marker text at the doc start via a raw transaction (synchronous),
+  // changing `view.state.doc` so the captured range goes stale.
+  function mutateDoc(editor: Editor, marker: string) {
+    editor.view.dispatch(editor.view.state.tr.insertText(marker, 1));
+  }
+
+  it("success branch: a mid-flight doc change routes the paste to the live selection (no clobber, no throw)", async () => {
+    const editor = makeEditor();
+    const claimed = paste(editor, "hello **bold**");
+    expect(claimed).toBe(true);
+    // Doc changes before the async replace runs: the captured from/to are stale.
+    mutateDoc(editor, "MARKER");
+    await flush();
+
+    const text = editor.getText();
+    // The pre-existing marker survived (a stale-range replaceRange would have
+    // clobbered it) AND the pasted content landed.
+    expect(text).toContain("MARKER");
+    expect(text).toContain("bold");
+    expect(text).not.toContain("**");
+    editor.destroy();
+  });
+
+  it("fail-open branch: a mid-flight doc change + conversion failure re-inserts raw text at the live selection (no RangeError)", async () => {
+    const editor = makeEditor();
+    // `# heading` -> a heading node the minimal schema lacks -> PMNode.fromJSON
+    // throws -> the fail-open catch runs, now with a changed doc.
+    paste(editor, "# raw heading");
+    mutateDoc(editor, "KEEP");
+    await flush();
+
+    const text = editor.getText();
+    // No RangeError/unhandled rejection (the test would fail on a throw), the
+    // marker survived, and the raw text was preserved.
+    expect(text).toContain("KEEP");
+    expect(text).toContain("raw heading");
+    editor.destroy();
+  });
+
+  it("two pastes in flight: neither payload is lost (no data loss)", async () => {
+    // Prod-unreachable (two paste events are separate macrotasks, and each
+    // conversion resolves on a microtask before the next), but pinned here: when
+    // both resolve back-to-back, the second sees the changed doc and inserts at
+    // the live selection the first left — so the two payloads may INTERLEAVE, but
+    // neither is dropped. We assert no data loss, not contiguity.
+    const editor = makeEditor();
+    paste(editor, "alphaword");
+    paste(editor, "betaword");
+    await flush();
+    const text = editor.getText();
+    // Neither payload fully dropped (interleaving may split one of them).
+    expect(text).toContain("alpha");
+    expect(text).toContain("beta");
+    editor.destroy();
+  });
+});

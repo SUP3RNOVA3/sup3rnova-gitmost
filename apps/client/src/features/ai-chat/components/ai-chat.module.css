@@ -181,6 +181,14 @@
     margin: 0 0 4px;
 }
 
+/* Same as `.markdown li p` above: the canonical converter wraps every list
+   item's content in a <p>, so without this each reasoning-panel list item would
+   pick up `.reasoningText p`'s 4px bottom margin and render too loose. Drop it
+   so Reasoning-panel lists stay tight, mirroring the pre-#347 marked output. */
+.reasoningText li p {
+    margin: 0;
+}
+
 .inputWrapper {
     flex: 0 0 auto;
     padding-top: var(--mantine-spacing-xs);
