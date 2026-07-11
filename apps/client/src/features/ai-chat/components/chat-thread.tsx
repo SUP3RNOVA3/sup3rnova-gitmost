@@ -34,7 +34,10 @@ import {
   shouldResetRolePicked,
 } from "@/features/ai-chat/utils/role-launch.ts";
 import { describeChatError } from "@/features/ai-chat/utils/error-message.ts";
-import { extractServerChatId } from "@/features/ai-chat/utils/adopt-chat-id.ts";
+import {
+  extractServerChatId,
+  extractRunId,
+} from "@/features/ai-chat/utils/adopt-chat-id.ts";
 import { assistantMessageHasVisibleContent } from "@/features/ai-chat/utils/message-content.ts";
 import {
   isStreamingTail,
@@ -42,6 +45,7 @@ import {
   seedRows,
   mergeById,
 } from "@/features/ai-chat/utils/resume-helpers.ts";
+import { getRun } from "@/features/ai-chat/services/ai-chat-service.ts";
 import { AI_CHAT_MESSAGES_RQ_KEY } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import type { EditorSelectionContext } from "@/features/editor/utils/get-editor-selection.ts";
 import {
@@ -51,6 +55,14 @@ import {
   removeQueuedById,
   type QueuedMessage,
 } from "@/features/ai-chat/utils/queue-helpers.ts";
+import {
+  reduce,
+  initialMachine,
+  RECONNECT_MAX_ATTEMPTS,
+  type Machine,
+  type Event as RunEvent,
+  type Effect as RunEffect,
+} from "@/features/ai-chat/state/run-fsm.ts";
 import classes from "@/features/ai-chat/components/ai-chat.module.css";
 
 // Throttle how often the streamed `messages` state triggers a re-render. Without
@@ -61,42 +73,32 @@ import classes from "@/features/ai-chat/components/ai-chat.module.css";
 // from the token rate.
 const STREAM_THROTTLE_MS = 50;
 
-// #430: auto-reconnect after a LIVE SSE disconnect of a DETACHED (autonomous) run.
-// The run keeps executing server-side, so instead of a dead "Lost connection"
-// banner we re-attach to the live tail through the SAME resumable machinery the
-// mount path uses. Attempts back off exponentially and are capped; on exhaustion
-// the user gets a manual Retry (the degraded poll keeps catching up underneath).
-const RECONNECT_MAX_ATTEMPTS = 5;
-// Backoff before attempt N (1-based): 1s, 2s, 4s, 8s, 16s.
-const RECONNECT_BASE_DELAY_MS = 1000;
+// #488 commit 4a: how long the degraded poll may run with NO new run activity
+// (its persisted rows unchanged) before the FSM declares the run STALLED and
+// surfaces a banner + Retry — instead of the old silent `refetchInterval -> false`
+// ("forever half-done answer"). Measured from INACTIVITY, so a long-but-progressing
+// run keeps polling; only a genuinely stuck run trips it. This cap lives in the
+// THREAD now (the FSM owns polling->stalled); the window just polls while armed.
+const DEGRADED_POLL_IDLE_MAX_MS = 10 * 60_000;
 
-// #396: bounded retry for the "Interrupt and send now" re-send when it races the
-// authoritative server stop of the just-superseded detached run. The re-POST can
-// arrive before the old run has released the one-active-run slot, so the server
-// returns 409 A_RUN_ALREADY_ACTIVE. The server stop guarantees the slot frees, so
-// a few short backoffs converge. 4 total attempts: attempt 1 fires immediately,
-// then these are the waits BEFORE attempts 2, 3 and 4 (150ms, 300ms, 600ms). If
-// all 4 attempts 409, the last 409 surfaces (the banner) — acceptable per #396.
-const SUPERSEDE_RETRY_DELAYS_MS = [150, 300, 600];
-// The server error code that means "another run is already active for this chat".
-const A_RUN_ALREADY_ACTIVE = "A_RUN_ALREADY_ACTIVE";
+/** The #487 active (non-terminal) run statuses — mirrors the server's
+ *  ACTIVE_RUN_STATUSES. A run-fact is "active" only for these. */
+function isActiveRunStatus(status: string | null | undefined): boolean {
+  return status === "pending" || status === "running";
+}
 
-/**
- * #396: defensively decide whether a 409 response is the one-active-run gate
- * rejection (code A_RUN_ALREADY_ACTIVE) vs. some other 409. Reads a CLONE so the
- * original response body stays intact for the caller when it is returned as-is.
- * Any parse failure or unexpected shape => false (do NOT retry).
- */
-async function isRunAlreadyActive(response: Response): Promise<boolean> {
+/** Read the `{ code, runId }` off a JSON error response WITHOUT consuming the
+ *  original body (reads a clone), so the caller can still return the Response
+ *  untouched to the SDK. Any parse failure => empty. */
+async function read409(response: Response): Promise<{ code?: string; runId?: string }> {
   try {
-    const body = (await response.clone().json()) as unknown;
-    return (
-      typeof body === "object" &&
-      body !== null &&
-      (body as { code?: unknown }).code === A_RUN_ALREADY_ACTIVE
-    );
+    const b = (await response.clone().json()) as { code?: unknown; runId?: unknown };
+    return {
+      code: typeof b?.code === "string" ? b.code : undefined,
+      runId: typeof b?.runId === "string" ? b.runId : undefined,
+    };
   } catch {
-    return false;
+    return {};
   }
 }
 
@@ -150,21 +152,18 @@ interface ChatThreadProps {
    *  which fires only at the terminal outcome. */
   onServerChatId?: (serverChatId?: string) => void;
   /** #184 phase 1.5: arm/disarm the parent's degraded-poll fallback for THIS
-   *  chat's window. Called `true` when a resume attempt could not attach to the
-   *  live run (attach 204 / starved-or-torn resumed finish), so the window starts
-   *  a dumb timed poll of the message history to follow the detached run to settle;
-   *  called `false` the moment a local stream starts or the terminal settled row is
-   *  merged (invariant 8). The window owns the timer + its 10-min cap. */
+   *  chat's window. Called `true` when the FSM enters a poll-bearing recovery
+   *  (attach 204 / starved-or-torn resumed finish / a stop), `false` the moment a
+   *  local stream starts or the run settles. The window owns only the dumb 2.5s
+   *  timer; the THREAD's FSM owns arm/disarm + the stalled cap (#488). */
   onResumeFallback?: (active: boolean) => void;
   /** #184: whether detached/autonomous agent runs are enabled for this workspace.
    *  When true the Stop button must additionally hit the AUTHORITATIVE server stop
    *  (via onServerStop) — aborting only the local SSE is just a client disconnect,
    *  which the server deliberately ignores, so the detached run would keep going. */
   autonomousRunsEnabled?: boolean;
-  /** #184: request the server-side stop of this chat's active run (the parent owns
-   *  the endpoint call + the "stopping" latch that keeps observer-polling from
-   *  immediately re-streaming the stopping run's output). Called with the resolved
-   *  chat id when the user presses Stop in autonomous mode. */
+  /** #184: request the server-side stop of this chat's active run. Called with the
+   *  resolved chat id when the user presses Stop in autonomous mode. */
   onServerStop?: (chatId: string) => void;
 }
 
@@ -199,6 +198,14 @@ function rowToUiMessage(row: IAiChatMessageRow): UIMessage {
  * Owns the AI SDK `useChat` lifecycle for ONE chat. The parent remounts this
  * with a `key` when the selected chat changes, so initial messages re-seed
  * cleanly (the v6 transport-based hook keeps its state per mount).
+ *
+ * #488: the resume/reconnect/poll/stop/supersede lifecycle is driven by the pure
+ * FSM in `state/run-fsm.ts` (see `run-fsm.spec.md`). The component is the RUNTIME:
+ * it dispatches typed events (from SDK callbacks / HTTP outcomes) and executes the
+ * reducer's command EFFECTS (attach GET, POST /run, POST /stop, POST /stream
+ * supersede, backoff timers, poll arm/disarm). The FSM lives in this thread (not
+ * the window) so a late SDK callback dies with the owner (#161). The one-shot-ref
+ * zoo is gone: the epoch counter (I1) drops stale-generation outcomes.
  */
 export default function ChatThread({
   chatId,
@@ -219,186 +226,221 @@ export default function ChatThread({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
-  // resume machinery refs (#184 phase 1.5)
-  const attachAbortRef = useRef<AbortController | null>(null);
-  const reconcileTailRef = useRef(false);
-  const noStreamHandledRef = useRef(false);
-  const onNoActiveStreamRef = useRef<(() => void) | null>(null);
-  // #430: called from the transport's reconnect-GET success branch when a live
-  // stream re-attached (2xx, not 204) — clears the reconnect banner. Kept in a ref
-  // because the transport's fetch closure (useMemo([])) reads it live.
-  const onReconnectAttachedRef = useRef<(() => void) | null>(null);
-  // Live mount flag. The attach GET and the resumed `onFinish` are async and can
-  // land AFTER this thread unmounts (the parent remounts per chat via `key`); with
-  // chatIdRef then pointing at the NEW chat, an ungated late callback would arm a
-  // spurious poll + foreign invalidation on the newly-opened chat. Every parent-
-  // facing resume side-effect is gated on this.
-  const mountedRef = useRef(true);
-  const [resumedTurn, setResumedTurn] = useState(false);
-  const resumedTurnRef = useRef(false);
-  // Identity-stable pair setter (bare useState setter + ref write): it is closed
-  // over by the transport useMemo([]), so it MUST NOT capture state.
-  const setResumedTurnPair = useCallback((v: boolean) => {
-    resumedTurnRef.current = v;
-    setResumedTurn(v);
-  }, []);
+  // --- The run-lifecycle FSM (source of truth) -----------------------------
+  // Stored in state (drives UI re-render on phase/ctx change) + mirrored in a ref
+  // for the transport/timer closures (useMemo([])-stable) that read it live.
+  const [machine, setMachine] = useState<Machine>(() => initialMachine());
+  const machineRef = useRef<Machine>(machine);
+  // I1: the current generation. Command-transitions bump it; async OUTCOME events
+  // carry the epoch they were issued under; a mismatch is dropped by the reducer.
+  const epochRef = useRef(0);
+  // The generation an in-flight attach GET was issued under (for stamping its
+  // 2xx/204/throw outcome). Replaces the one-shot `noStreamHandledRef` guard.
+  const pendingAttachEpochRef = useRef(0);
+  // Stable dispatch handle for closures defined before `dispatch` (transport,
+  // timers) — assigned once `dispatch` exists below.
+  const dispatchRef = useRef<(e: RunEvent) => void>(() => undefined);
 
-  // Mount-time resume gating (in refs — computed once for this mount; the parent
-  // remounts per chat via `key`).
-  //
-  // Attempt resume for any non-settled tail: a streaming tail (strip + expect
-  // live replay) or a user tail (the run may exist but its assistant row is not
-  // seeded yet — attach to the pre-opened registry entry and wait for frames).
-  // A settled assistant tail must NEVER resume: replaying a finished run into a
-  // store that already contains its message duplicates parts (SDK text-start
-  // always pushes a new part).
+  // --- Effect-dependency refs (live values for the stable effect runner) -----
+  // These are useChat/prop values that change identity across renders; the effect
+  // runner (useCallback([])) reads them live so it never captures a stale closure.
+  const resumeStreamRef = useRef<(() => Promise<void> | void) | null>(null);
+  const setMessagesRef = useRef<
+    ((updater: (prev: UIMessage[]) => UIMessage[]) => void) | null
+  >(null);
+  const sendMessageRef = useRef<((m: { text: string }) => void) | null>(null);
+  const stopFnRef = useRef<(() => void) | null>(null);
+  const onResumeFallbackRef = useRef<typeof onResumeFallback>(onResumeFallback);
+  onResumeFallbackRef.current = onResumeFallback;
+  const onServerStopRef = useRef<typeof onServerStop>(onServerStop);
+  onServerStopRef.current = onServerStop;
+
+  // Live mount flag: the attach GET / a resumed onFinish are async and can land
+  // AFTER unmount (the parent remounts per chat). The epoch (I1) drops stale FSM
+  // OUTCOMES, but the imperative onFinish side-effects (parent flush, invalidate)
+  // still need a plain React-liveness bit — orthogonal to the run-lifecycle, so it
+  // is NOT one of the lifecycle flags the FSM replaced.
+  const mountedRef = useRef(true);
+
+  // attachStrategy DATA (behind the resumeStream effect; #491 swaps it to tail-only
+  // WITHOUT touching the FSM). The controller is effect-owned (aborted in cleanup,
+  // I5). `stripRef`/`strippedRowRef` are the current full-replay+strip anchor.
+  const attachAbortRef = useRef<AbortController | null>(null);
   const stripRef = useRef(chatId !== null && isStreamingTail(initialRows ?? []));
-  const attemptResumeRef = useRef(
-    autonomousRunsEnabled === true &&
-      chatId !== null &&
-      !isSettledAssistantTail(initialRows ?? []),
-  );
   const strippedRowRef = useRef<IAiChatMessageRow | null>(
     stripRef.current ? (initialRows ?? [])[initialRows!.length - 1] : null,
   );
+  // Effect-owned backoff timers (not lifecycle flags): the reconnect ladder and the
+  // stalled inactivity cap. Cleared by the cancelReconnect effect / the cap effect.
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const idleCapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const initialMessages = useMemo<UIMessage[]>(
     () =>
       seedRows(
         initialRows ?? [],
-        attemptResumeRef.current && stripRef.current,
+        stripRef.current && autonomousRunsEnabled === true,
       ).map(rowToUiMessage),
     [initialRows],
   );
 
-  // The server resolves/creates the chat from the `chatId` in the request body.
-  // A new chat starts as null; we keep the id in a ref so the SAME hook instance
-  // can keep streaming to a chat once it exists (the parent adopts the id on
-  // finish, but within this mount the body carries whatever we know).
+  // Identity/data mirrors (NOT lifecycle flags — they stay as data).
   const chatIdRef = useRef<string | null>(chatId);
   chatIdRef.current = chatId;
-
-  // Keep the currently-open page in a ref, updated each render, so the LATEST
-  // open page is sent on every send WITHOUT re-creating the `useMemo([])`-stable
-  // transport (and thus without re-creating the useChat store mid-stream — see
-  // the `chatStoreId` note below). Read live inside `prepareSendMessagesRequest`.
   const openPageRef = useRef<OpenPageContext | null>(openPage ?? null);
   openPageRef.current = openPage ?? null;
-
-  // Keep the selection snapshotter in a ref, same rationale as openPageRef: the
-  // transport useMemo([]) closes it over, so prop-identity churn must not matter.
-  // Called at send time inside prepareSendMessagesRequest (#388).
   const getEditorSelectionRef = useRef<
     (() => EditorSelectionContext | null) | undefined
   >(getEditorSelection);
   getEditorSelectionRef.current = getEditorSelection;
-
-  // Keep the selected role id in a ref, same rationale as openPageRef. Only the
-  // FIRST request of a brand-new chat uses it (the server persists it then and
-  // ignores it for existing chats), but sending it on every send is harmless.
   const roleIdRef = useRef<string | null>(roleId ?? null);
   roleIdRef.current = roleId ?? null;
-
-  // Stable `useChat` store key for the lifetime of THIS mount.
-  //
-  // CRITICAL: `useChat` (@ai-sdk/react) re-creates its internal `Chat` store
-  // whenever the `id` option no longer equals the store's current id
-  // (`"id" in options && chatRef.current.id !== options.id`). For a brand-new
-  // chat (`chatId === null`) we previously passed `id: undefined`; the store
-  // then generated its OWN random id internally, so `store.id !== undefined`
-  // stayed true on EVERY render and the store was re-created on every render —
-  // wiping the optimistic user message, the "submitted" status, and every
-  // streamed delta until the turn fully finished (then the parent adopts the
-  // new chat id and remounts with the persisted history, making everything
-  // "appear at once"). Passing a STABLE non-undefined id keeps one store for
-  // the whole turn, so the user message shows immediately and tokens stream
-  // live. This id is purely the client store key; the server still resolves the
-  // real chat from `chatId` in the request body (see `prepareSendMessagesRequest`).
-  // The id only needs to be stable per mount — the parent remounts this via
-  // `key` on chat switch, which re-seeds cleanly.
+  // Stable useChat store key for this mount (see the long #137/#174 note that used
+  // to live here — recreating the store mid-stream wipes the live turn).
   const stableIdRef = useRef<string>(chatId ?? `new-${generateId()}`);
-  // Stable for the LIFETIME of this mount. When a brand-new chat adopts its
-  // server id, the parent now updates the `chatId` prop WITHOUT remounting this
-  // thread, so the store id must NOT follow `chatId`: recreating the useChat
-  // store would wipe the live (just-finished) turn. The server still resolves
-  // the real chat from `chatId` in the request body (see chatIdRef /
-  // prepareSendMessagesRequest), so this purely-client store key can stay fixed.
   const chatStoreId = stableIdRef.current;
 
-  // Pending messages the user composed WHILE a turn was streaming. They are sent
-  // automatically, FIFO, on successful turn completion (`onFinish`). The queue is
-  // LOCAL state so it is scoped to this conversation: it is cleared when the user
-  // deliberately switches chat / starts a new chat (the parent remounts this via
-  // `key`), but it SURVIVES in-place new-chat id adoption (no remount), so a
-  // message queued during a brand-new chat's first turn is not lost. On Stop or
-  // error the queue is intentionally preserved (onFinish does not fire then) so
-  // the user decides what to do with the pending messages.
+  // Pending messages composed while a turn streams; flushed FIFO on a clean finish.
   const [queued, setQueued] = useState<QueuedMessage[]>([]);
-  // Mirror the queue in a ref so the `onFinish` flush always reads the latest
-  // queue without a stale closure; `setQueue` updates BOTH the ref and the state.
   const queuedRef = useRef<QueuedMessage[]>([]);
   const setQueue = useCallback((next: QueuedMessage[]) => {
     queuedRef.current = next;
     setQueued(next);
   }, []);
 
-  // Capture the latest `sendMessage` (returned by useChat below) so the flush
-  // helper can call the current instance from the stable `onFinish` callback.
-  const sendMessageRef = useRef<((m: { text: string }) => void) | null>(null);
+  // #488 commit 5: the runId to inject into the NEXT POST as `supersede:{runId}`
+  // (read-and-cleared by prepareSendMessagesRequest). This is send-plumbing DATA
+  // (like chatIdRef/roleIdRef), the single replacement for the three REMOVED
+  // one-shot flags flushOnAbortRef/interruptNextSendRef/supersedeRetryRef.
+  const pendingSupersedeRef = useRef<string | null>(null);
+  // #488 F1: the interrupt-and-send text, held until the superseded stream A has
+  // FULLY finalized (its SDK `finally` cleared `activeResponse`) — only THEN is
+  // stream B started, so A cannot corrupt B (ai@6 AbstractChat.makeRequest reads
+  // `this.activeResponse.state.message` in its finally and then nulls it, so an
+  // overlapping B is clobbered). Send-plumbing DATA, not a lifecycle flag.
+  const pendingSupersedeTextRef = useRef<string | null>(null);
+  // #488 F1: the epoch under which the CURRENTLY-OWNED stream started, used to
+  // STAMP its onFinish (I1). A superseded/dead stream's late finish carries an OLD
+  // generation and is dropped by the reducer, so it cannot drive the live machine
+  // into a false reconnect or reset its run-fact. Set at each honored stream start
+  // (local send, resume/reconnect attach, the supersede B-send).
+  const turnEpochRef = useRef(0);
 
-  // "Send now" single-flight flags. Kept in refs (not state) so they are read
-  // inside the stable `onFinish` callback and the transport closure WITHOUT a
-  // re-render or a stale closure. Both are one-shot (read-and-clear).
-  // - flushOnAbortRef: flush the promoted head on the abort WE triggered, even
-  //   though an aborted turn normally keeps the queue intact.
-  // - interruptNextSendRef: tag the next send as a user interrupt so the server
-  //   injects the "your previous answer was interrupted" note for that turn only.
-  const flushOnAbortRef = useRef(false);
-  const interruptNextSendRef = useRef(false);
+  // --- Effect runner: executes the reducer's command effects ---------------
+  const runEffect = useCallback(
+    (eff: RunEffect, epoch: number) => {
+      switch (eff.type) {
+        case "resumeStream": {
+          // The attach GET. Stamp the outcome's generation (I1). A reconnect
+          // attempt filters the pinned live row from the store first (the mount
+          // seed already stripped it), so the live replay's text-start rebuilds it
+          // without duplicating parts (#430).
+          pendingAttachEpochRef.current = epoch;
+          // The resumed stream's onFinish is stamped with THIS attach generation
+          // (F1), so a superseded attempt's late finish is dropped.
+          turnEpochRef.current = epoch;
+          if (machineRef.current.phase.name === "reconnecting") {
+            const anchor = strippedRowRef.current;
+            if (anchor)
+              setMessagesRef.current?.((prev) =>
+                prev.filter((m) => m.id !== anchor.id),
+              );
+          }
+          void resumeStreamRef.current?.();
+          break;
+        }
+        case "scheduleReconnect": {
+          if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+          const attempt = eff.attempt;
+          const scheduledEpoch = epoch;
+          reconnectTimerRef.current = setTimeout(() => {
+            dispatchRef.current({
+              type: "RECONNECT_ATTEMPT",
+              attempt,
+              epoch: scheduledEpoch,
+            });
+          }, eff.delayMs);
+          break;
+        }
+        case "cancelReconnect":
+          if (reconnectTimerRef.current) {
+            clearTimeout(reconnectTimerRef.current);
+            reconnectTimerRef.current = null;
+          }
+          break;
+        case "armPoll":
+          onResumeFallbackRef.current?.(true);
+          break;
+        case "disarmPoll":
+          onResumeFallbackRef.current?.(false);
+          break;
+        case "abortAttach":
+          attachAbortRef.current?.abort();
+          break;
+        case "stopRun":
+          // Authoritative stop. When the chat id is not known yet (brand-new chat's
+          // first moment), it is deferred: the chat-id adoption effect fires
+          // onServerStop the moment the id lands while still in `stopping`.
+          if (chatIdRef.current)
+            onServerStopRef.current?.(chatIdRef.current);
+          break;
+        case "postRun": {
+          // (Re)establish / verify the run-fact from POST /ai-chat/run. Stamp the
+          // RUN_FACT outcome with the issuing generation so a superseded verify is
+          // dropped (I1).
+          const cid = chatIdRef.current;
+          if (!cid) break;
+          const ep = epoch;
+          void getRun(cid)
+            .then((res) => {
+              const active =
+                res.run && isActiveRunStatus(res.run.status)
+                  ? { runId: res.run.id }
+                  : null;
+              dispatchRef.current({ type: "RUN_FACT", runFact: active, epoch: ep });
+            })
+            .catch(() => undefined);
+          break;
+        }
+        case "supersede":
+          // Arm the next POST to carry `supersede:{runId}`; the send itself is
+          // triggered by the caller (sendNow) via sendMessage.
+          pendingSupersedeRef.current = eff.targetRunId;
+          break;
+      }
+    },
+    // Reads only refs + the stable queryClient — safe as an empty-dep callback.
+    [],
+  );
 
-  // #396: one-shot arm for the bounded 409 A_RUN_ALREADY_ACTIVE retry on the
-  // "Interrupt and send now" re-send in autonomous mode. sendNow triggers the
-  // authoritative server stop of the detached run, but that stop and the
-  // onFinish->flushNext re-POST race: the new POST can hit the one-active-run
-  // gate before the old detached run has settled, yielding a spurious 409. When
-  // this ref is armed, the transport's send path retries that 409 with a short
-  // bounded backoff (the server stop guarantees convergence). A normal send (ref
-  // not armed) must STILL fail a 409 instantly (e.g. a genuine two-tab conflict).
-  //
-  // INVARIANT: sendNow arms this only to be consumed by the ONE re-POST that
-  // flushNext fires from onFinish. But that re-POST does not always happen (the
-  // promoted head may be gone, the finish may be a resumed turn, or the arm may
-  // race a stale finish). To keep the arm strictly one-shot it is disarmed on
-  // EVERY path where the paired interrupt one-shots (flushOnAbortRef /
-  // interruptNextSendRef) are cleared without a POST: the transport POST branch
-  // consumes it (read-and-clear), the onFinish `!flushNext()` no-send branch
-  // clears it, and the isStreaming-defuse effect clears it symmetrically. So it
-  // can never leak into a later, unrelated send and retry that send's genuine 409.
-  const supersedeRetryRef = useRef(false);
+  // Dispatch: reduce, run effects, re-render on a real state change.
+  const dispatch = useCallback(
+    (event: RunEvent) => {
+      const prev = machineRef.current;
+      const next = reduce(prev, event);
+      machineRef.current = next;
+      epochRef.current = next.ctx.epoch;
+      if (next.phase !== prev.phase || next.ctx !== prev.ctx) setMachine(next);
+      for (const eff of next.effects) runEffect(eff, next.ctx.epoch);
+    },
+    [runEffect],
+  );
+  dispatchRef.current = dispatch;
 
-  // #234 F5: the user pressed Stop while streaming a BRAND-NEW chat whose server
-  // chat id has not been adopted yet (the `start` chunk carrying it hadn't landed
-  // when Stop was pressed). A local SSE abort alone does NOT stop the DETACHED
-  // autonomous run — it keeps burning tokens and WRITING TO PAGES — so we cannot
-  // just no-op. We latch the stop as PENDING and fire the authoritative server
-  // stop the moment onServerChatId adopts the id (below). Read-and-cleared there;
-  // also defused on every new turn start so it can never fire against a later,
-  // unrelated turn's run.
-  const stopPendingRef = useRef(false);
-
-  // FIFO dequeue + send the next queued message (no-op when the queue is empty).
-  // Returns whether a message was actually sent, so callers can tell an empty
-  // dequeue (nothing to flush) from a real send.
+  // FIFO dequeue + local send of the next queued message (no-op when empty).
+  const localSend = useCallback((text: string) => {
+    dispatchRef.current({ type: "SEND_LOCAL" });
+    // F1: this local stream's onFinish is stamped with the just-bumped generation.
+    turnEpochRef.current = epochRef.current;
+    sendMessageRef.current?.({ text });
+  }, []);
   const flushNext = useCallback(() => {
     const { head, rest } = dequeue(queuedRef.current);
     if (!head) return false;
     setQueue(rest);
-    // Local send: clear any resume-suppression flag so this genuine local turn's
-    // onFinish flushes normally (invariant 8).
-    setResumedTurnPair(false);
-    sendMessageRef.current?.({ text: head.text });
+    localSend(head.text);
     return true;
-  }, [setQueue, setResumedTurnPair]);
+  }, [setQueue, localSend]);
 
   const enqueue = useCallback(
     (text: string) => {
@@ -419,12 +461,11 @@ export default function ChatThread({
         api: "/api/ai-chat/stream",
         credentials: "include",
         prepareReconnectToStreamRequest: () => ({
-          // SDK default URL uses the useChat STORE id — always build from the real chat id.
-          // ?expect=live&anchor=<row id> ONLY when we stripped a streaming tail: expect=live
-          // is the only case where a finished-retained replay is safe (the row is stripped,
-          // replay rebuilds it), and the anchor pins the replay to OUR run — a mismatching
-          // (newer) run must 204 into the restore+poll path instead of replaying a foreign
-          // transcript into this store.
+          // Build the attach URL from the REAL chat id. ?expect=live&anchor=<row id>
+          // only when a streaming tail was stripped: expect=live opts into a
+          // finished-retained replay (safe only because the row is stripped and the
+          // replay rebuilds it), and the anchor pins the replay to OUR run — a
+          // mismatching (newer) run 204s into the restore+poll path instead.
           api: `/api/ai-chat/runs/${chatIdRef.current}/stream${
             stripRef.current
               ? `?expect=live&anchor=${strippedRowRef.current!.id}`
@@ -433,108 +474,114 @@ export default function ChatThread({
         }),
         fetch: async (input: RequestInfo | URL, init: RequestInit = {}) => {
           if ((init.method ?? "GET") !== "GET") {
-            // Send path (POST). #396: read-and-clear the one-shot supersede arm
-            // here so it is strictly scoped to THIS send. When unarmed, behave
-            // exactly as before — a single fetch, a 409 surfaces instantly (a
-            // genuine two-tab conflict must NOT be retried).
-            const supersede = supersedeRetryRef.current;
-            supersedeRetryRef.current = false;
-            if (!supersede) return fetch(input, init);
-            // Buffer a ReadableStream body once so each retry can replay it.
-            // DefaultChatTransport sends the body as a JSON STRING (replayable as
-            // is), but guard defensively in case a future SDK streams it.
-            let sendInit = init;
-            if (init.body instanceof ReadableStream) {
-              const buffered = await new Response(init.body).arrayBuffer();
-              sendInit = { ...init, body: buffered };
-            }
-            // Bounded retry: attempt 1 fires immediately, then wait between
-            // attempts per SUPERSEDE_RETRY_DELAYS_MS. Retry ONLY on a real
-            // 409 A_RUN_ALREADY_ACTIVE; any other status/body is returned as-is.
-            for (let attempt = 0; ; attempt++) {
-              const response = await fetch(input, sendInit);
-              if (
-                response.status !== 409 ||
-                attempt >= SUPERSEDE_RETRY_DELAYS_MS.length ||
-                !(await isRunAlreadyActive(response))
-              ) {
-                return response;
+            // Send path (POST). #488 commit 5: NO client 409 retry ladder anymore
+            // (the CAS supersede replaces it). We DO peek 409/CAS outcomes to drive
+            // the FSM, then return the Response untouched to the SDK (a 409 body is
+            // surfaced by the classified error banner via error-message.ts).
+            const wasSupersede =
+              machineRef.current.phase.name === "superseding";
+            const ep = epochRef.current;
+            const response = await fetch(input, init);
+            if (wasSupersede) {
+              if (response.ok) {
+                dispatchRef.current({ type: "SUPERSEDE_READY", epoch: ep });
+              } else if (response.status === 409) {
+                const { code, runId } = await read409(response);
+                if (code === "SUPERSEDE_TARGET_MISMATCH")
+                  dispatchRef.current({
+                    type: "SUPERSEDE_MISMATCH",
+                    currentRunId: runId,
+                    epoch: ep,
+                  });
+                else if (code === "SUPERSEDE_TIMEOUT")
+                  dispatchRef.current({ type: "SUPERSEDE_TIMEOUT", epoch: ep });
+                else if (code === "SUPERSEDE_INVALID")
+                  dispatchRef.current({ type: "SUPERSEDE_INVALID", epoch: ep });
               }
-              // The old detached run has not released the one-active-run slot
-              // yet; the server stop we requested guarantees it will, so back off
-              // and re-POST (the 409 fired before the user message was persisted,
-              // so re-POSTing is safe — no duplicate rows).
-              await new Promise((r) =>
-                setTimeout(r, SUPERSEDE_RETRY_DELAYS_MS[attempt]),
-              );
+            } else if (response.status === 409) {
+              const { code } = await read409(response);
+              if (code === "A_RUN_ALREADY_ACTIVE")
+                dispatchRef.current({ type: "RUN_ALREADY_ACTIVE" });
             }
+            return response;
           }
-          // Reconnect GET: the SDK passes no AbortSignal, so wire our own controller
-          // for observer Stop / unmount abort.
+          // Reconnect/attach GET: the SDK passes no AbortSignal, so wire our own
+          // controller for observer Stop / unmount abort (effect-owned, I5).
           const controller = new AbortController();
           attachAbortRef.current = controller;
+          const ep = pendingAttachEpochRef.current;
+          const wasReconnecting =
+            machineRef.current.phase.name === "reconnecting";
           try {
             const response = await fetch(input, {
               ...init,
               signal: controller.signal,
             });
-            // No onFinish will come for a 204 (silent no-op) OR any non-2xx
-            // (5xx/502 — a server restart mid-attach). Both run the same
-            // no-active-stream recovery: restore the stripped row, invalidate, and
-            // arm the degraded poll (idempotent via noStreamHandledRef; its part-d
-            // also clears the resumedTurn flag). This is the restart-survival path
-            // the removed F7 latch used to guard — a transient attach failure must
-            // NOT drop the in-progress row or stop tracking the durable run.
             if (response.status === 204 || !response.ok)
-              onNoActiveStreamRef.current?.();
-            // #430: a 2xx stream re-attached (live tail or finished-replay). Signal
-            // the reconnect controller to clear its banner. No-op outside an active
-            // reconnect sequence (e.g. the mount attach), so it is safe here.
-            else onReconnectAttachedRef.current?.();
+              handleAttachOutcome(ep, wasReconnecting, false);
+            else handleAttachOutcome(ep, wasReconnecting, true);
             return response;
           } catch (err) {
-            // Network throw: same no-onFinish recovery, then rethrow so the SDK
-            // still surfaces the error to its own machinery.
-            onNoActiveStreamRef.current?.();
+            handleAttachOutcome(ep, wasReconnecting, false);
             throw err;
           }
         },
-        // Inject the chat id and the currently-open page alongside the useChat
-        // messages so the server can resolve an existing chat (or create one
-        // when null) and tell the agent which page "this page" refers to. Both
-        // are read live from refs so changing chats/pages does NOT recreate the
-        // transport. `openPage` is null on a non-page route.
         prepareSendMessagesRequest: ({ messages, body }) => {
-          // Read-and-clear the interrupt flag so the "you were interrupted" note
-          // is carried by ONLY this request (the one resending the promoted
-          // message right after we aborted the previous turn). The server still
-          // confirms it against history before acting on it.
-          const interrupted = interruptNextSendRef.current;
-          interruptNextSendRef.current = false; // one-shot
+          // #488 commit 5: read-and-clear the supersede runId so `supersede:{runId}`
+          // is carried by ONLY this request (the CAS "interrupt and send now").
+          const supersedeRunId = pendingSupersedeRef.current;
+          pendingSupersedeRef.current = null;
           return {
             body: {
               ...body,
               chatId: chatIdRef.current,
-              // Attach the live editor selection to the open-page context at send
-              // time — "this"/"here" in the user's message means THIS selection.
-              // Nested inside openPage so it dies with the page when the server
-              // rejects the page id (#388). Null when nothing is selected.
               openPage: openPageRef.current
                 ? {
                     ...openPageRef.current,
                     selection: getEditorSelectionRef.current?.() ?? null,
                   }
                 : null,
-              // Honoured by the server only when creating a new chat; null =>
-              // universal assistant.
               roleId: roleIdRef.current,
-              interrupted,
+              ...(supersedeRunId
+                ? { supersede: { runId: supersedeRunId } }
+                : {}),
               messages,
             },
           };
         },
       }),
     [],
+  );
+
+  // Attach GET outcome -> FSM event. The epoch guard replaces BOTH the one-shot
+  // 204 guard (noStreamHandledRef) and the unmount gate: a stale/superseded or
+  // post-DISPOSE outcome is dropped (I1). For a NONE outcome the attachStrategy
+  // recovery (restore the stripped row + invalidate for a fresh poll) runs first.
+  const handleAttachOutcome = useCallback(
+    (ep: number, wasReconnecting: boolean, live: boolean) => {
+      if (ep !== epochRef.current) return; // stale generation — drop
+      if (live) {
+        dispatchRef.current(
+          wasReconnecting
+            ? { type: "RECONNECT_ATTACHED", epoch: ep }
+            : { type: "ATTACH_LIVE", epoch: ep },
+        );
+        return;
+      }
+      if (strippedRowRef.current)
+        setMessagesRef.current?.((prev) =>
+          mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
+        );
+      queryClient.invalidateQueries({
+        queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
+      });
+      dispatchRef.current(
+        wasReconnecting
+          ? { type: "RECONNECT_NONE", epoch: ep }
+          : { type: "ATTACH_NONE", epoch: ep },
+      );
+    },
+    [queryClient],
   );
 
   const {
@@ -546,558 +593,407 @@ export default function ChatThread({
     setMessages,
     resumeStream,
   } = useChat({
-    // Stable per-mount key. Existing chats use their real id; new chats use a
-    // generated client id (never `undefined`) so the store is NOT re-created on
-    // every render mid-stream (see `chatStoreId` above).
     id: chatStoreId,
     messages: initialMessages,
     transport,
-    // See STREAM_THROTTLE_MS — bounds re-render/markdown-reparse frequency.
     experimental_throttle: STREAM_THROTTLE_MS,
-    // `onFinish` (ai@6 useChat) fires from a `finally` on EVERY terminal outcome
-    // — success, user Stop/abort (`isAbort`), network drop (`isDisconnect`), and
-    // stream error (`isError`). Keep calling `onTurnFinished()` on all of them
-    // (chat-list refresh + new-chat id adoption must happen even on a failed
-    // first turn), but flush the pending queue ONLY on a clean finish: auto-
-    // sending after the user hit Stop — or blindly retrying after a failure —
-    // would be wrong, so on Stop/disconnect/error the queue is left intact for
-    // the user to decide.
     onFinish: ({ message, isAbort, isDisconnect, isError }) => {
-      // (1) Capture whether THIS finish belongs to a resumed (attach) turn and
-      // immediately clear the flag so it can never suppress a LATER local turn.
-      const wasResumed = resumedTurnRef.current;
-      setResumedTurnPair(false);
-      // (2) Recovery after a starved/torn resumed finish (invariant 9). The arm
-      // and the stripped-row restore are gated DIFFERENTLY. Skip entirely once
-      // unmounted (an abort-triggered onFinish landing after a chat switch must
-      // not arm a poll / invalidate on the new chat).
-      if (wasResumed && mountedRef.current) {
-        const hasVisibleContent = assistantMessageHasVisibleContent(message);
-        // ARM the reconcile + degraded poll when the resumed message carries no
-        // visible content (starved replay) OR the connection dropped mid-run — in
-        // both cases the poll must drive the row to its real terminal state.
-        if (isDisconnect || !hasVisibleContent) {
-          reconcileTailRef.current = true;
-          queryClient.invalidateQueries({
-            queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
-          });
-          onResumeFallback?.(true);
-        }
-        // RESTORE the stripped streaming row ONLY when the resumed message has no
-        // visible content. On isDisconnect WITH visible content restore is
-        // FORBIDDEN: the live stream may have advanced far past the mount-time
-        // snapshot, so restoring would clobber on-screen content (invariant 9) —
-        // the arm above suffices, the poll reaches the true terminal.
-        if (!hasVisibleContent && strippedRowRef.current) {
-          setMessages((prev) =>
-            mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
-          );
-        }
-      }
-      // (2b) #430: a LIVE (non-resumed) detached run whose SSE just dropped. The
-      // server run keeps executing, so instead of a dead "Lost connection" banner
-      // start a reconnect sequence: pin the CURRENT streaming assistant row as the
-      // strip/anchor (the live tail is the already-shown partial in `messages`, not
-      // a persistent row) and re-attach to the live tail via the resumable machinery.
-      const startedReconnect =
-        isDisconnect &&
-        !wasResumed &&
-        autonomousRunsEnabled === true &&
-        mountedRef.current &&
-        message?.role === "assistant" &&
-        typeof message.id === "string";
-      if (startedReconnect) {
-        beginReconnect({
-          id: message.id,
-          role: "assistant",
-          content: "",
-          status: "streaming",
-          createdAt: new Date().toISOString(),
-          // Preserve the partial parts so a 204 restore (onNoActiveStream) re-shows
-          // what was on screen while the degraded poll catches the run up to
-          // terminal (rowToUiMessage prefers metadata.parts).
-          metadata: { parts: message.parts },
-        });
-      }
-      // (3) Standard branches.
-      // Forward the authoritative server chatId (streamed on the assistant
-      // message metadata) so the parent adopts the REAL created chat id for a new
-      // chat — see adopt-chat-id.ts for the full #137 design. `threadKey` lets the
-      // session ignore this finish if it belongs to a thread abandoned by New chat
-      // mid-stream (#161).
+      // #488 F1: STAMP this finish with the generation the stream STARTED under
+      // (I1). A superseded/dead stream's late finish carries an OLD generation and
+      // is dropped by the reducer, so it cannot drive the live machine.
+      const stampEpoch = turnEpochRef.current;
+      // Ownership (I2) is the FSM ctx: a resumed/attached/reconnected turn is an
+      // OBSERVER; a local send is the owner. The queue flushes ONLY under local
+      // ownership; an observer never flushes (invariant 7).
+      const wasObserver = machineRef.current.ctx.ownership === "observer";
+      // Notify the parent on EVERY terminal outcome (threadKey-guarded downstream
+      // for #161); fires even while unmounting.
       onTurnFinished(extractServerChatId(message), threadKey);
-      // Show a neutral "stopped" marker for an aborted turn; the red error banner
-      // (via `error`) already covers isError, and a clean finish clears any marker.
-      // On a live disconnect that STARTED a reconnect, suppress the terminal
-      // "connection lost" notice — the reconnect banner takes over (#430).
-      if (isError) setStopNotice(null);
-      else if (isAbort) setStopNotice("manual");
-      else if (isDisconnect) setStopNotice(startedReconnect ? null : "disconnect");
-      else setStopNotice(null);
-      // A resumed turn NEVER flushes the queue (invariant 7): skip BOTH the
-      // flush-on-abort branch and the plain flush. The local streamer is the only
-      // tab that owns the queue.
-      if (wasResumed) return;
-      // "Send now": WE triggered this abort to interrupt the current turn and
-      // immediately send the promoted head. Flush it even though the turn was
-      // aborted (the normal abort path below keeps the queue intact). The
-      // interrupt note travels with this send via interruptNextSendRef.
-      if (flushOnAbortRef.current) {
-        flushOnAbortRef.current = false;
-        // Suppress the "Response stopped." flash for an intentional interrupt.
+
+      // A missing message (a pre-first-frame break) has no visible content.
+      const msgHasVisible = message
+        ? assistantMessageHasVisibleContent(message)
+        : false;
+
+      // #488 F1: the SUPERSEDED stream A just finalized (we are still `superseding`
+      // and stream B has not been sent yet). Record A's terminal outcome STAMPED —
+      // I1 drops it (superseding bumped the epoch), so A cannot drive a false
+      // reconnect / reset the run-fact — then start B NOW that A is fully done. B is
+      // deferred to a microtask so A's SDK `finally` (`activeResponse = void 0`)
+      // runs BEFORE B's makeRequest sets `activeResponse`, else the dying A clobbers
+      // B (ai@6). This is the no-overlap guarantee the CAS supersede needs.
+      if (
+        machineRef.current.phase.name === "superseding" &&
+        pendingSupersedeTextRef.current !== null
+      ) {
+        // Disconnect-first (see the routing note below): a real drop is
+        // { isError:true, isDisconnect:true }. All of these are dropped by I1 here
+        // (superseding bumped the epoch) — the order only mirrors the main routing.
+        if (isDisconnect)
+          dispatch({ type: "FINISH_DISCONNECT", hasVisibleContent: msgHasVisible, epoch: stampEpoch });
+        else if (isError) dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        else if (isAbort) dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
+        else dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
+        const text = pendingSupersedeTextRef.current;
+        pendingSupersedeTextRef.current = null;
         setStopNotice(null);
-        // If the promoted head vanished (e.g. the user removed it before the
-        // abort landed) flushNext sends nothing — clear the one-shot interrupt
-        // tag AND the #396 supersede arm so neither can leak onto the next
-        // unrelated send (no re-POST will consume the arm here). On a real send
-        // the tag is consumed by prepareSendMessagesRequest and the arm by the
-        // transport POST branch, so both stay untouched then.
-        if (!flushNext()) {
-          interruptNextSendRef.current = false;
-          supersedeRetryRef.current = false;
+        queueMicrotask(() => {
+          if (!mountedRef.current) return;
+          turnEpochRef.current = epochRef.current; // B's (superseding) generation
+          sendMessageRef.current?.({ text });
+        });
+        return;
+      }
+
+      // #488 (browser QA): route DISCONNECT FIRST. In ai@6.0.207 a real network drop
+      // yields BOTH `{ isError:true, isDisconnect:true }` — the SDK sets `isError`
+      // unconditionally in its catch and `isDisconnect` only ALONGSIDE it (for a
+      // fetch/network TypeError). Checking `isError` first therefore sent EVERY real
+      // drop to the terminal error banner and NEVER entered the reconnect ladder
+      // (`FINISH_DISCONNECT` is its only entry). A disconnect — the detached run
+      // keeps executing server-side — must win; only a NON-disconnect error (a
+      // provider 500, `{ isError:true, isDisconnect:false }`) is terminal.
+      if (isDisconnect) {
+        if (wasObserver) {
+          // A resumed/attached OBSERVER stream dropped. Recover via the degraded
+          // poll (restore the stripped row only when there is no visible content;
+          // never clobber a fuller on-screen tail, invariant 9). The FSM decides
+          // reconnect-vs-poll from liveFollow (a live-follow drop reconnects again,
+          // #488 commit 3; a mount-resume drop polls).
+          if (mountedRef.current) {
+            const hasVisible = msgHasVisible;
+            if (!hasVisible && strippedRowRef.current)
+              setMessages((prev) =>
+                mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
+              );
+            queryClient.invalidateQueries({
+              queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
+            });
+            dispatch({
+              type: "FINISH_DISCONNECT",
+              hasVisibleContent: hasVisible,
+              epoch: stampEpoch,
+            });
+          }
+          setStopNotice(null);
+          return;
+        }
+        // A LOCAL live turn dropped. #488 commit 2: recover by the RUN-FACT, not by
+        // the presence of an assistant message — a setup-phase break (before the
+        // first frame) still leaves a detached run writing to pages. In autonomous
+        // mode a run is active for the whole turn, so seed the run-fact from the
+        // start-metadata runId when known, else a sentinel (the attach GET goes by
+        // chatId, not runId). Pin the assistant row as the strip/anchor when present.
+        if (autonomousRunsEnabled === true && mountedRef.current) {
+          const hasAnchor =
+            message?.role === "assistant" && typeof message.id === "string";
+          if (hasAnchor) {
+            strippedRowRef.current = {
+              id: message.id,
+              role: "assistant",
+              content: "",
+              status: "streaming",
+              createdAt: new Date().toISOString(),
+              metadata: { parts: message.parts },
+            };
+            stripRef.current = true;
+          } else {
+            strippedRowRef.current = null;
+            stripRef.current = false;
+          }
+          dispatch({
+            type: "RUN_FACT",
+            runFact: { runId: extractRunId(message) ?? "pending" },
+          });
+          dispatch({
+            type: "FINISH_DISCONNECT",
+            hasVisibleContent: msgHasVisible,
+            epoch: stampEpoch,
+          });
+          setStopNotice(null);
+        } else {
+          dispatch({
+            type: "FINISH_DISCONNECT",
+            hasVisibleContent: false,
+            epoch: stampEpoch,
+          });
+          setStopNotice("disconnect");
         }
         return;
       }
-      if (isAbort || isDisconnect || isError) return;
-      // Gate the final flush on the live-mount flag (#486): a clean onFinish can
-      // land AFTER this thread unmounted (a New-chat / chat-switch mid-stream —
-      // the async attach/resume settles late). Flushing then dequeues and POSTs a
-      // queued message from an abandoned thread — a "ghost" send / ghost chat.
-      // Every other queue side effect already guards on mountedRef; this last one
-      // was the gap.
+      // A NON-disconnect stream error (a provider 500 etc.) -> terminal error banner.
+      if (isError) {
+        dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        setStopNotice(null);
+        return;
+      }
+      if (isAbort) {
+        // A user Stop / an interrupt abort finished. The FSM stopping/idle exit is
+        // by DATA (this terminal outcome, I4 — honored in `stopping` by the reducer).
+        dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
+        setStopNotice("manual");
+        return;
+      }
+      // Clean finish.
+      if (wasObserver) {
+        if (mountedRef.current) {
+          const hasVisible = msgHasVisible;
+          if (!hasVisible) {
+            // Starved replay: restore the stripped row + poll to the real terminal.
+            if (strippedRowRef.current)
+              setMessages((prev) =>
+                mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
+              );
+            queryClient.invalidateQueries({
+              queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
+            });
+            dispatch({ type: "STREAM_INCOMPLETE", reason: "starved", epoch: stampEpoch });
+          } else {
+            // Healthy resumed finish — nothing to restore/arm, just settle.
+            dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
+          }
+        }
+        setStopNotice(null);
+        return;
+      }
+      // Local clean finish: settle + flush the queue (gated on liveness, #486).
+      dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
+      setStopNotice(null);
       if (mountedRef.current) flushNext();
     },
-    // `onError` runs in addition to `onFinish` (which ai@6 also calls on error).
-    // Log the raw failure here for devtools; the UI shows a friendly classified
-    // banner via `error` below. We still call `onTurnFinished()` with NO server id
-    // (idempotent with the onFinish call): for a brand-new chat that ARMS the
-    // bounded list-refetch fallback (adopt the single newly-appeared chat once the
-    // refetch lands); for an existing chat it just refreshes the chat list
-    // immediately rather than after a manual refresh.
     onError: (streamError) => {
-      // Surface the raw failure in the browser console (devtools) for debugging;
-      // the UI separately shows a friendly classified banner (see errorView).
       console.error("AI chat stream error:", streamError);
       onTurnFinished(undefined, threadKey);
     },
   });
 
-  // Keep the flush helper pointed at the latest sendMessage instance.
+  // Publish the live useChat handles to the effect-runner refs.
+  resumeStreamRef.current = resumeStream;
+  setMessagesRef.current = setMessages as unknown as (
+    updater: (prev: UIMessage[]) => UIMessage[],
+  ) => void;
   sendMessageRef.current = sendMessage;
+  stopFnRef.current = stop;
 
-  // Mirror the live turn status in a ref so event handlers (sendNow) branch on the
-  // CURRENT status rather than a value captured in a stale render closure — a turn
-  // can finish between render and click, and arming the interrupt refs against a
-  // no-op stop() would leave them set to leak into a later, unrelated Stop.
-  const statusRef = useRef(status);
-  statusRef.current = status;
-
-  // EARLY chat-id adoption (#174): the server streams the authoritative chat id
-  // on the assistant message metadata at the `start` chunk (message.metadata.
-  // chatId — see adopt-chat-id.ts / chatStreamMetadata). Forward it to the parent
-  // AS SOON AS it appears (mid-stream), so a brand-new chat adopts its real id
-  // WHILE the first turn is still streaming and activeChatId-gated affordances
-  // (the Copy/export button) light up immediately, instead of only at onFinish.
-  // Keyed by the last-seen id so we forward each distinct id exactly once. The
-  // parent's onServerChatId is idempotent and a no-op once the chat has an id.
+  // EARLY chat-id (#174) + runId (#488) adoption from the streaming assistant
+  // message's start metadata. Forward the chat id once; adopt the runId into the
+  // FSM run-fact; and (#234 F5) fire a DEFERRED server stop the moment the id lands
+  // while still `stopping` — no stopPendingRef needed (the FSM phase is the latch).
   const lastForwardedChatIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (!onServerChatId) return;
     const tail = messages[messages.length - 1];
     if (tail?.role !== "assistant") return;
     const serverChatId = extractServerChatId(tail);
-    if (!serverChatId || serverChatId === lastForwardedChatIdRef.current)
-      return;
-    lastForwardedChatIdRef.current = serverChatId;
-    onServerChatId(serverChatId);
-    // #234 F5: if Stop was pressed before the id was known, the authoritative
-    // server stop was deferred to this adoption point — fire it now with the
-    // just-adopted id. One-shot (read-and-clear) so it can't fire twice.
-    if (stopPendingRef.current) {
-      stopPendingRef.current = false;
-      onServerStop?.(serverChatId);
+    if (
+      onServerChatId &&
+      serverChatId &&
+      serverChatId !== lastForwardedChatIdRef.current
+    ) {
+      lastForwardedChatIdRef.current = serverChatId;
+      onServerChatId(serverChatId);
+      if (machineRef.current.phase.name === "stopping")
+        onServerStopRef.current?.(serverChatId);
     }
-  }, [messages, onServerChatId, onServerStop]);
+    // #488 F4: the FIRST assistant frame of a LOCAL turn moves the FSM
+    // `sending -> streaming` (and adopts the runId), matching the spec's
+    // STREAM_START transition. Later frames / observer turns (already streaming)
+    // just refresh the run-fact.
+    const runId = extractRunId(tail);
+    if (machineRef.current.phase.name === "sending") {
+      dispatch({ type: "STREAM_START", runId, epoch: epochRef.current });
+    } else if (runId && machineRef.current.ctx.runFact?.runId !== runId) {
+      dispatch({ type: "RUN_FACT", runFact: { runId } });
+    }
+  }, [messages, onServerChatId, dispatch]);
 
-  // Live "turn was interrupted" marker for the CURRENT session. The red error
-  // banner (driven by `error`) covers the error case; this covers an aborted
-  // turn, distinguishing a manual Stop (`isAbort`) from a dropped connection
-  // (`isDisconnect`) — a distinction only available live (the server persists
-  // both as finishReason 'aborted'). Cleared when the next turn starts.
+  // Live "turn was interrupted" marker (a manual Stop vs a dropped connection — a
+  // distinction only available live). Cleared when the next turn starts.
   const [stopNotice, setStopNotice] = useState<null | "manual" | "disconnect">(
     null,
   );
 
   const isStreaming = status === "submitted" || status === "streaming";
+  const phase = machine.phase;
+  const isObserver = machine.ctx.ownership === "observer";
 
-  // #430: live-disconnect reconnect controller. `null` = idle; `{ trying, attempt }`
-  // = a backoff sequence is running (drives the "reconnecting… (N/max)" banner);
-  // `{ failed }` = attempts exhausted (drives the manual Retry). Mirrored into a ref
-  // so the transport/onNoActiveStream closures branch on the LIVE value.
-  type ReconnectState =
-    | null
-    | { phase: "trying"; attempt: number }
-    | { phase: "failed" };
-  const [reconnectState, setReconnectState] = useState<ReconnectState>(null);
-  const reconnectStateRef = useRef<ReconnectState>(null);
-  const setReconnectStatePair = useCallback((s: ReconnectState) => {
-    reconnectStateRef.current = s;
-    setReconnectState(s);
-  }, []);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const clearReconnectTimer = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-  }, []);
-
-  // One reconnect attempt — MIRRORS the mount strip/anchor path for the LIVE case.
-  // beginReconnect pinned strippedRowRef/stripRef to the run's assistant row, so:
-  //  - remove that row from the store (the mount path strips it from the SEED; here
-  //    it is already shown, so filter it out) — the live replay's `text-start` then
-  //    rebuilds it without DUPLICATING parts (the main dedup risk, #430);
-  //  - reset the one-shot 204 guard so onNoActiveStream can fire for THIS attempt;
-  //  - mark the turn resumed (invariant 7/8) so onFinish runs the recovery block and
-  //    never flushes the queue;
-  //  - resumeStream() -> prepareReconnectToStreamRequest builds
-  //    ?expect=live&anchor=<pinned id>, pinning the replay to OUR run (invariant 6).
-  const attemptReconnectOnce = useCallback(
-    (attempt: number) => {
-      if (!mountedRef.current) return;
-      const anchor = strippedRowRef.current;
-      if (anchor) {
-        setMessages((prev) => prev.filter((m) => m.id !== anchor.id));
-      }
-      noStreamHandledRef.current = false;
-      setResumedTurnPair(true);
-      setReconnectStatePair({ phase: "trying", attempt });
-      void resumeStream();
-    },
-    [setMessages, setResumedTurnPair, setReconnectStatePair, resumeStream],
-  );
-
-  // Schedule attempt `attempt` after an exponential backoff.
-  const scheduleReconnectAttempt = useCallback(
-    (attempt: number) => {
-      clearReconnectTimer();
-      setReconnectStatePair({ phase: "trying", attempt });
-      reconnectTimerRef.current = setTimeout(
-        () => attemptReconnectOnce(attempt),
-        RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1),
-      );
-    },
-    [clearReconnectTimer, setReconnectStatePair, attemptReconnectOnce],
-  );
-
-  // Start a fresh reconnect sequence, pinning `anchorRow` (the live run's assistant
-  // row) as the strip/anchor reused by every attempt.
-  const beginReconnect = useCallback(
-    (anchorRow: IAiChatMessageRow) => {
-      if (!autonomousRunsEnabled || !mountedRef.current) return;
-      strippedRowRef.current = anchorRow;
-      stripRef.current = true;
-      scheduleReconnectAttempt(1);
-    },
-    [autonomousRunsEnabled, scheduleReconnectAttempt],
-  );
-
-  // Manual Retry (shown once attempts are exhausted): restart at attempt 1 and fire
-  // immediately (the user asked for it now — no backoff).
-  const retryReconnect = useCallback(() => {
-    clearReconnectTimer();
-    attemptReconnectOnce(1);
-  }, [clearReconnectTimer, attemptReconnectOnce]);
-
-  // Live SSE re-attached (the reconnect GET returned a 2xx stream): clear the
-  // banner + any pending backoff. No-op outside a sequence (e.g. the mount attach).
-  const onReconnectAttached = useCallback(() => {
-    if (!mountedRef.current || !reconnectStateRef.current) return;
-    clearReconnectTimer();
-    setReconnectStatePair(null);
-  }, [clearReconnectTimer, setReconnectStatePair]);
-  onReconnectAttachedRef.current = onReconnectAttached;
-
-  // The reconnect GET could not attach (204 / error). onNoActiveStream has already
-  // armed the degraded poll (the robust fallback that drives the row to terminal
-  // from the DB), so this only decides the LIVE-attach retry: back off and try
-  // again up to the cap, else surface the manual Retry.
-  const onReconnectNoStream = useCallback(() => {
-    const s = reconnectStateRef.current;
-    if (s?.phase !== "trying") return;
-    if (s.attempt < RECONNECT_MAX_ATTEMPTS)
-      scheduleReconnectAttempt(s.attempt + 1);
-    else setReconnectStatePair({ phase: "failed" });
-  }, [scheduleReconnectAttempt, setReconnectStatePair]);
-
-  // 204-handler (`onNoActiveStream`): the attach returned 204 — nothing live to
-  // resume (overflow / begin-failure / after retention / anchor-mismatch). One-
-  // shot via noStreamHandledRef (we do NOT null onNoActiveStreamRef). Exactly four
-  // parts. Kept in a ref (read by the transport's fetch closure) and refreshed
-  // each render below.
-  const onNoActiveStream = useCallback(() => {
-    // A late attach outcome after unmount must not arm a poll / invalidate on the
-    // now-different chat this thread's refs were reused for.
-    if (!mountedRef.current) return;
-    if (noStreamHandledRef.current) return;
-    noStreamHandledRef.current = true;
-    // (a) Restore the stripped streaming row to the store — ONLY when we actually
-    // stripped one (a user-tail 204 does NOT reach here with a stripped row, so do
-    // not dereference null).
-    if (strippedRowRef.current) {
-      setMessages((prev) =>
-        mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
-      );
-    }
-    // (b) Reconcile the tail from the message history + invalidate it so the
-    // degraded poll starts from a fresh fetch.
-    reconcileTailRef.current = true;
-    queryClient.invalidateQueries({
-      queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
-    });
-    // (c) Arm the degraded poll (a dumb timer with a 10-min cap in the window);
-    // the thread disarms it via onResumeFallback(false) on settle / local stream.
-    onResumeFallback?.(true);
-    // (d) 204 means onFinish will NOT fire — clear the suppression flag so it
-    // cannot swallow the NEXT local turn's queue flush.
-    setResumedTurnPair(false);
-    // (e) #430: if this 204/error landed during a live-disconnect reconnect
-    // sequence, back off and retry the live attach (or give up to the manual
-    // Retry). The degraded poll armed in (c) is the fallback either way.
-    onReconnectNoStream();
-  }, [
-    setMessages,
-    queryClient,
-    onResumeFallback,
-    setResumedTurnPair,
-    onReconnectNoStream,
-  ]);
-  onNoActiveStreamRef.current = onNoActiveStream;
-
-  // Mount effect: kick off the resume attempt for a non-settled tail. Marking the
-  // turn as resumed BEFORE resumeStream so onFinish (invariant 7/8) sees it.
+  // Mount effect: arm the resume attempt — ONLY on a server-confirmed active run
+  // (#488 commit 4b). A STREAMING tail IS the run-fact (status streaming) -> attach
+  // now. A USER tail (ended on a user message) may have NO active run, so confirm
+  // via POST /run first: a chat with no active run must NOT arm a poll (the old code
+  // attached -> 204 -> ~240 req/10min storm). A SETTLED assistant tail never resumes.
   useEffect(() => {
-    // Re-arm on (re)mount — StrictMode dev-mounts twice, and the cleanup below
-    // flips this false between the two.
     mountedRef.current = true;
-    if (attemptResumeRef.current) {
-      setResumedTurnPair(true);
-      void resumeStream();
+    if (autonomousRunsEnabled === true && chatId !== null) {
+      const rows = initialRows ?? [];
+      if (isStreamingTail(rows)) {
+        dispatch({ type: "ATTACH_START" });
+      } else if (!isSettledAssistantTail(rows)) {
+        void getRun(chatId)
+          .then((res) => {
+            if (!mountedRef.current) return;
+            if (res.run && isActiveRunStatus(res.run.status))
+              dispatch({ type: "ATTACH_START", runId: res.run.id });
+          })
+          .catch(() => undefined);
+      }
     }
-    // Unmount: mark unmounted (gates late attach/onFinish side-effects) and abort
-    // the in-flight attach GET so its callbacks don't fire against the next chat.
     return () => {
       mountedRef.current = false;
-      attachAbortRef.current?.abort();
-      // #430: drop any pending reconnect backoff so it can't fire against the next
-      // chat this thread's refs are reused for.
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      dispatch({ type: "DISPOSE" }); // aborts attach + timers, bumps epoch (I5)
     };
     // Mount-only by design; the parent remounts per chat via `key`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Reconciliation + degraded-merge (invariant 8). Deps are EXACTLY
-  // [initialRows, isStreaming, setMessages].
+  // Reconciliation + degraded-merge (invariant 8): while a poll-bearing recovery is
+  // active (polling / reconnecting / stopping), merge the polled assistant tail on
+  // every initialRows update and settle to terminal via POLL_TERMINAL.
   useEffect(() => {
-    // A local stream owns the view: disarm BOTH the merge and the window poll.
-    if (isStreaming) {
-      reconcileTailRef.current = false;
-      onResumeFallback?.(false);
-      return;
-    }
-    if (!reconcileTailRef.current) return;
+    if (isStreaming) return; // a local stream owns the view
+    const p = machineRef.current.phase.name;
+    if (p !== "polling" && p !== "reconnecting" && p !== "stopping") return;
     const rows = initialRows ?? [];
     const tail = rows[rows.length - 1];
     if (!tail || tail.role !== "assistant") return;
-    // Merge the polled assistant tail on EVERY initialRows update — while the
-    // degraded poll is active this IS the live per-step progress.
     setMessages((prev) => mergeById(prev, rowToUiMessage(tail)));
-    // Anchor-mismatch coherence: when we restored a stripped streaming row A but a
-    // DIFFERENT run's row B is now the tail (A finished, B replaced the registry
-    // entry, so the attach 204'd), A would otherwise linger forever as an orphan
-    // jumping-dots row over the real run. Settle it from fresh history (where A is
-    // now persisted) so no phantom row survives. No-op in the common case where A
-    // IS the tail (id match).
+    // Anchor-mismatch coherence: a restored stripped row A that a DIFFERENT run's
+    // row B has replaced as the tail would linger as an orphan — settle A from
+    // fresh history so no phantom row survives.
     const stripped = strippedRowRef.current;
     if (stripped && stripped.id !== tail.id) {
       const historical = rows.find((r) => r.id === stripped.id);
       if (historical)
         setMessages((prev) => mergeById(prev, rowToUiMessage(historical)));
     }
-    // Settled: the terminal merge is done — disarm the flag AND the window poll
-    // explicitly (the window only has a time cap, it will not disarm itself).
-    if (tail.status !== "streaming") {
-      reconcileTailRef.current = false;
-      onResumeFallback?.(false);
-      // #430: the run reached its terminal state via the degraded poll — there is
-      // no live tail left to reconnect to, so drop any reconnect banner / Retry.
-      clearReconnectTimer();
-      setReconnectStatePair(null);
-    }
-    // onResumeFallback intentionally omitted (parent-stable callback); deps are
-    // fixed by the resume design.
+    if (tail.status !== "streaming") dispatch({ type: "POLL_TERMINAL" });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialRows, isStreaming, setMessages]);
 
-  // #430: a real stream is live again — the reconnect re-attached to the live tail
-  // (status -> "streaming") OR the user started a new local turn. Either way clear
-  // the reconnect banner + any pending backoff. Gated on "streaming" (not the
-  // broader "submitted") so a still-pending attach GET does not clear prematurely.
+  // #488 commit 4a: the stalled inactivity cap. While polling/reconnecting, if no
+  // new run activity (initialRows unchanged) for DEGRADED_POLL_IDLE_MAX_MS, fire
+  // POLL_IDLE_CAP -> the FSM goes `stalled` (banner + Retry) instead of silent.
+  // Reset on every activity (initialRows change) and on phase change.
   useEffect(() => {
-    if (status === "streaming") {
-      clearReconnectTimer();
-      setReconnectStatePair(null);
+    if (idleCapTimerRef.current) {
+      clearTimeout(idleCapTimerRef.current);
+      idleCapTimerRef.current = null;
     }
-  }, [status, clearReconnectTimer, setReconnectStatePair]);
+    // Review #4: `stopping` also arms the poll and needs a bounded exit (the FSM
+    // maps POLL_IDLE_CAP from `stopping` -> idle, not stalled).
+    const p = phase.name;
+    if (p !== "polling" && p !== "reconnecting" && p !== "stopping") return;
+    idleCapTimerRef.current = setTimeout(() => {
+      dispatchRef.current({ type: "POLL_IDLE_CAP" });
+    }, DEGRADED_POLL_IDLE_MAX_MS);
+    return () => {
+      if (idleCapTimerRef.current) clearTimeout(idleCapTimerRef.current);
+    };
+  }, [phase, initialRows]);
 
-  // "Send now" on a queued message: interrupt the current turn and immediately
-  // send THIS message, keeping the agent's partial output. Other queued messages
-  // stay queued and flush normally after the new turn. Reuses the existing
-  // queue/flush machinery: promote the target to the head, then abort — the
-  // onFinish flush-on-abort branch sends exactly that head, tagged as an
-  // interrupt so the server notes the previous answer was cut off.
-  const sendNow = useCallback(
-    (id: string) => {
-      // Branch on the LIVE status (statusRef), NOT the closure-captured isStreaming:
-      // the turn may have finished between this render and the click, in which case
-      // stop() is a no-op and arming the interrupt refs would strand them for a
-      // later, unrelated Stop. Reading the ref always sees the current status.
-      const liveStreaming =
-        statusRef.current === "submitted" || statusRef.current === "streaming";
-      if (liveStreaming) {
-        // Promote to head so the onFinish -> flushNext path sends exactly it.
-        setQueue(promoteToHead(queuedRef.current, id));
-        flushOnAbortRef.current = true;
-        interruptNextSendRef.current = true;
-        // #396: in autonomous mode the turn is a DETACHED run — a local stop()
-        // is only a client disconnect the server ignores, so the run keeps going.
-        // The onFinish->flushNext re-POST would then hit the one-active-run gate
-        // and get a spurious 409 A_RUN_ALREADY_ACTIVE. Mirror handleStop: request
-        // the AUTHORITATIVE server stop so the detached run settles, and arm the
-        // one-shot bounded 409 retry BEFORE stop() so the re-send converges once
-        // the slot frees. Read chatId live from chatIdRef (adopted at the `start`
-        // chunk). If it is not known yet (brand-new chat, first moment of its
-        // first turn), defer the server stop via stopPendingRef exactly as
-        // handleStop does — the onServerChatId adoption effect fires it once the
-        // id lands; the retry stays armed so the re-send still converges then.
-        if (autonomousRunsEnabled) {
-          supersedeRetryRef.current = true; // arm the bounded 409 retry
-          if (chatIdRef.current) {
-            onServerStop?.(chatIdRef.current);
-          } else {
-            // Same #234-F5 sub-window limitation documented in handleStop: if the
-            // local abort below cancels the reader before the `start` chunk lands,
-            // the adoption effect never runs and the deferred stop never fires. Not
-            // a regression; at minimum we don't strand refs (the isStreaming effect
-            // defuses stopPendingRef on the next turn start).
-            stopPendingRef.current = true;
-          }
-        }
-        stop(); // -> onFinish({ isAbort: true }) flushes the promoted head
-      } else {
-        // Nothing to interrupt: just send it now (no interrupt note).
-        const msg = queuedRef.current.find((m) => m.id === id);
-        if (!msg) return;
-        setQueue(removeQueuedById(queuedRef.current, id));
-        // Local send: clear any resume-suppression flag (invariant 8).
-        setResumedTurnPair(false);
-        sendMessageRef.current?.({ text: msg.text });
-      }
-    },
-    [setQueue, stop, setResumedTurnPair, autonomousRunsEnabled, onServerStop],
-  );
-
-  // Stop the current turn. ALWAYS abort the local SSE (`stop()`) so the composer
-  // returns to idle immediately. In AUTONOMOUS mode the turn is a DETACHED run:
-  // aborting the local SSE is only a client disconnect, which the server ignores,
-  // so the run would keep executing — we ADDITIONALLY request the authoritative
-  // server-side stop (the parent owns that call + the "stopping" latch that keeps
-  // observer-polling from re-streaming the stopping run's output). The chat id is
-  // read live from chatIdRef (adopted early at the stream's `start` chunk); if it
-  // is not known yet — a brand-new chat in the first moment of its first turn —
-  // only the local abort happens (there is no server-side run handle to stop yet).
-  const handleStop = useCallback(() => {
-    // Abort the resume/attach GET first: the SDK does not pass it a signal, so an
-    // observer's Stop would otherwise leave the attach fetch running.
-    attachAbortRef.current?.abort();
-    stop();
-    // #430: pressing Stop also cancels an in-progress reconnect sequence.
-    clearReconnectTimer();
-    setReconnectStatePair(null);
-    if (!autonomousRunsEnabled) return;
-    if (chatIdRef.current) {
-      onServerStop?.(chatIdRef.current);
-    } else {
-      // #234 F5: no chat id yet (brand-new chat in the first moment of its first
-      // turn, before the `start` chunk adopted the id). Latch the stop as pending;
-      // the onServerChatId adoption effect fires the deferred server stop as soon
-      // as the id appears, so the detached run is still authoritatively stopped
-      // instead of left running by a silent local-only abort.
-      //
-      // KNOWN LIMITATION (#234 F5 review): `stop()` above has already aborted the
-      // local SSE reader. In the rare sub-window where Stop is pressed while still
-      // `submitted` (request sent, not one chunk read yet), that abort can cancel
-      // the reader BEFORE the `start` chunk is applied to `messages`, so the
-      // adoption effect never runs and this pending stop never fires. The detached
-      // run then keeps going for that turn. This is not a regression (the pre-fix
-      // behavior sent no server stop at all); closing it fully would require
-      // deferring the local abort until adoption, which is riskier and out of scope
-      // for this fix. Documented so a future change can address the abort-ordering.
-      stopPendingRef.current = true;
-    }
-  }, [
-    stop,
-    autonomousRunsEnabled,
-    onServerStop,
-    clearReconnectTimer,
-    setReconnectStatePair,
-  ]);
-
-  // Clear the stopped marker as soon as a new turn begins streaming, and drop any
-  // stale "Send now" interrupt flags. On the legit interrupt path both refs are
-  // already consumed synchronously (onFinish + prepareSendMessagesRequest) before
-  // this effect runs, so clearing here is a no-op for it; its purpose is to defuse
-  // the race where a flag was armed but the expected abort never fired (the turn
-  // finished in the same tick as the click), so it cannot leak into a later turn.
+  // Clear the stopped marker as soon as a new turn begins streaming.
   useEffect(() => {
-    if (isStreaming) {
-      setStopNotice(null);
-      flushOnAbortRef.current = false;
-      interruptNextSendRef.current = false;
-      // #396: symmetric with the other one-shot interrupt flags — defuse a stale
-      // supersede arm that was set but whose expected re-POST never fired (the
-      // turn finished in the same tick as the click, or the promoted head was
-      // gone), so it can never leak into this (or a later) turn's send and retry
-      // that send's genuine 409. A legit arm is consumed by the transport POST
-      // branch before this new turn streams, so this does not clobber it.
-      supersedeRetryRef.current = false;
-      // #234 F5: a new turn is starting — drop any pending deferred-stop from a
-      // previous turn that never adopted an id, so it can never fire against this
-      // (or a later) unrelated turn's run. A deferred stop for the CURRENT turn is
-      // set AFTER this effect (on the Stop click), so this does not clobber it.
-      stopPendingRef.current = false;
-    }
+    if (isStreaming) setStopNotice(null);
   }, [isStreaming]);
 
-  // Classify the turn error into a heading + detail so the banner names the cause
-  // (connection reset, timeout, rate limit, context overflow, quota, ...) instead
-  // of a generic "Something went wrong". Computed here (not only in the JSX) so
-  // the SAME on-screen banner text can be mirrored into the export (issue #160).
+  // "Send now" on a queued message: #488 commit 5 — interrupt the active run and
+  // send THIS message via the server CAS supersede (POST /stream {supersede:{runId}})
+  // when the run id is known. No local stop/re-POST dance, no client retry ladder.
+  const sendNow = useCallback(
+    (id: string) => {
+      const msg = queuedRef.current.find((m) => m.id === id);
+      if (!msg) return;
+      // #488 LOW-2: a supersede is already in flight (stream A aborted, B not sent
+      // yet). A second "Send now" must NOT clobber the pending message nor start a
+      // competing send. Least-surprising choice: this click is a NO-OP and the
+      // message stays queued — the user can send it once B has started (nothing is
+      // lost). (Guarding on both the pending text and the FSM phase.)
+      if (
+        pendingSupersedeTextRef.current !== null ||
+        machineRef.current.phase.name === "superseding"
+      ) {
+        return;
+      }
+      // #488 LOW-1: decide "is stream A still live" from the FSM phase (machineRef),
+      // which onFinish updates SYNCHRONOUSLY — NOT the render-lagged statusRef. In
+      // the sub-frame window where A has already fired onFinish (FSM -> idle) but
+      // statusRef still reads "streaming", treating A as live would abort a dead
+      // stream (no second onFinish -> B never sent, message lost). The FSM phase
+      // closes that window: a settled A reads as not-live -> B is sent immediately.
+      const p = machineRef.current.phase.name;
+      const aLiveLocal =
+        (p === "sending" || p === "streaming") &&
+        machineRef.current.ctx.ownership === "local";
+      const runId = machineRef.current.ctx.runFact?.runId;
+      if (aLiveLocal && autonomousRunsEnabled === true && runId && runId !== "pending") {
+        // CAS supersede: the server stops the old run + starts this one atomically.
+        // #488 F1: do NOT start stream B synchronously — the local stream A is still
+        // live, and overlapping streams corrupt each other in ai@6 (A's `finally`
+        // reads then nulls the shared `activeResponse`). ABORT A now and stash the
+        // text; A's onFinish (dropped by the epoch stamp) starts B in a microtask,
+        // AFTER A is fully finalized (no overlap). The POST then carries the
+        // supersede body (pendingSupersedeRef, armed by the effect).
+        setQueue(removeQueuedById(queuedRef.current, id));
+        pendingSupersedeTextRef.current = msg.text;
+        dispatch({ type: "SUPERSEDE_REQUESTED", targetRunId: runId });
+        stopFnRef.current?.(); // abort A -> its onFinish sends B
+        return;
+      }
+      if (aLiveLocal) {
+        // No CAS possible (legacy without a run, or the runId not adopted yet):
+        // promote to head and abort; the local turn's abort finishes and the queue
+        // holds the promoted head for the user (a blind re-POST would 409 -> the
+        // classified "already answering — interrupt and send" banner guides them).
+        setQueue(promoteToHead(queuedRef.current, id));
+        stopFnRef.current?.();
+        return;
+      }
+      // Nothing live to interrupt (idle, or A already settled): send it now.
+      setQueue(removeQueuedById(queuedRef.current, id));
+      localSend(msg.text);
+    },
+    [setQueue, autonomousRunsEnabled, dispatch, localSend],
+  );
+
+  // Stop the current turn. Abort the local SSE + the attach GET; in AUTONOMOUS mode
+  // additionally request the AUTHORITATIVE server stop (a local abort is only a
+  // client disconnect the server ignores). The FSM `stopping` exits by DATA (I4):
+  // the local turn's onFinish (FINISH_ABORT) or the poll reaching terminal.
+  const handleStop = useCallback(() => {
+    stopFnRef.current?.();
+    if (autonomousRunsEnabled) {
+      dispatch({ type: "STOP_REQUESTED" });
+    } else {
+      // Legacy: no server run to stop from the client (the server's onClose issues
+      // requestStop on disconnect). Just reset the FSM recovery.
+      attachAbortRef.current?.abort();
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      dispatch({ type: "FINISH_ABORT" });
+    }
+  }, [autonomousRunsEnabled, dispatch]);
+
+  // Manual Retry from the reconnect-failed OR stalled banner.
+  const onRetry = useCallback(() => {
+    dispatch({ type: "RETRY" });
+  }, [dispatch]);
+
+  // Classify the turn error into a heading + detail (connection reset, timeout, the
+  // #487 409 codes, ...). Computed here so the SAME text can mirror into the export.
   const errorView = error ? describeChatError(error.message ?? "", t) : null;
 
-  // A role was picked with autoStart=false: the role is bound but NOTHING was
-  // sent, so chatId stays null and the empty state would keep showing the cards.
-  // This flag hides the cards and reveals the composer (with the role indicated)
-  // so the user can type the first message themselves. roleIdRef is already set,
-  // so that first manual message carries the roleId.
-  const [rolePickedNoSend, setRolePickedNoSend] = useState(false);
+  // #488 (browser QA): the FSM PHASE is the source of truth for WHICH banner to
+  // show. A real network drop leaves useChat `error` SET even after the FSM has
+  // moved to `reconnecting` — in ai@6 a drop is always `{isError:true,
+  // isDisconnect:true}` and the SDK sets `error` alongside `isError`. So the
+  // terminal error banner must show ONLY when the FSM is actually TERMINAL
+  // (`error(kind)`); during recovery (reconnecting / polling / stalled /
+  // superseding / stopping) the recovery banner — or the streaming content — wins
+  // over the residual `error`, otherwise the terminal "Lost connection… reload"
+  // banner masks "reconnecting… (N/5)". This still surfaces the classified #487 409
+  // errors: a supersede/gate 409 lands the FSM in `error(kind)`, so it shows then.
+  const showError = errorView !== null && phase.name === "error";
 
-  // Clicking a role card always binds the role to THIS new chat. Whether it also
-  // auto-starts the conversation is per-role (autoStart). roleIdRef is set
-  // synchronously here because the parent's selectedRoleId state update would
-  // only reach roleIdRef on the next render — after this synchronous sendMessage
-  // has already read it.
+  // Role-picker empty state (unchanged from #149).
+  const [rolePickedNoSend, setRolePickedNoSend] = useState(false);
   const handleRolePick = (role: IAiRole): void => {
     roleIdRef.current = role.id;
     onRolePicked?.(role);
@@ -1106,20 +1002,11 @@ export default function ChatThread({
       t("Take a look at the current document"),
     );
     if (launch !== null) {
-      sendMessage({ text: launch });
+      localSend(launch);
     } else {
-      // autoStart=false -> bind only: hide the cards, show the composer.
       setRolePickedNoSend(true);
     }
   };
-  // Reset the "picked, not sent" flag when the thread returns to a truly empty,
-  // role-less state — e.g. the user hit "New chat" after picking an autoStart=false
-  // role. That path clears the parent's selectedRoleId (roleId -> null) but leaves
-  // chatId null, so the thread never remounts and the flag would stay set, hiding
-  // the cards forever. A picked-and-bound role keeps roleId non-null, so the cards
-  // correctly stay hidden then. Render-phase reset (React "adjust state on prop
-  // change"): one-shot — it re-renders with the flag false and the guard no longer
-  // matches, so it cannot loop. (Review of #149.)
   if (shouldResetRolePicked(chatId, roleId, rolePickedNoSend)) {
     setRolePickedNoSend(false);
   }
@@ -1138,30 +1025,20 @@ export default function ChatThread({
         assistantName={assistantName}
       />
 
-      {errorView ? (
-        <ChatErrorAlert
-          title={errorView.title}
-          detail={errorView.detail}
-          mb="xs"
-        />
-      ) : reconnectState ? (
-        // #430: while auto-reconnecting to a detached run's live tail, show progress
-        // instead of a dead "Lost connection" banner; once attempts are exhausted,
-        // offer a manual Retry (the degraded poll keeps catching up underneath).
-        <Alert
-          variant="light"
-          color="gray"
-          p="xs"
-          mb="xs"
-          style={{ flexShrink: 0 }}
-        >
+      {showError && errorView ? (
+        <ChatErrorAlert title={errorView.title} detail={errorView.detail} mb="xs" />
+      ) : phase.name === "reconnecting" ? (
+        // #430/#488: while auto-reconnecting to a detached run's live tail, show
+        // progress; once attempts are exhausted, offer a manual Retry (the degraded
+        // poll keeps catching up underneath).
+        <Alert variant="light" color="gray" p="xs" mb="xs" style={{ flexShrink: 0 }}>
           <Group gap={8} wrap="nowrap" align="center">
-            {reconnectState.phase === "trying" ? (
+            {!phase.failed ? (
               <>
                 <Loader size={14} color="gray" style={{ flex: "none" }} />
                 <Text size="sm" lh={1.3} c="dimmed">
                   {t("Connection lost — reconnecting…")}
-                  {` (${reconnectState.attempt}/${RECONNECT_MAX_ATTEMPTS})`}
+                  {` (${phase.attempt}/${RECONNECT_MAX_ATTEMPTS})`}
                 </Text>
               </>
             ) : (
@@ -1173,12 +1050,30 @@ export default function ChatThread({
                   size="compact-xs"
                   variant="light"
                   color="gray"
-                  onClick={retryReconnect}
+                  onClick={onRetry}
                 >
                   {t("Retry")}
                 </Button>
               </>
             )}
+          </Group>
+        </Alert>
+      ) : phase.name === "stalled" ? (
+        // #488 commit 4a: the degraded poll hit the inactivity cap — instead of a
+        // silent "forever half-done answer", tell the user and offer Retry.
+        <Alert variant="light" color="gray" p="xs" mb="xs" style={{ flexShrink: 0 }}>
+          <Group gap={8} wrap="nowrap" align="center">
+            <Text size="sm" lh={1.3} c="dimmed" style={{ flex: 1 }}>
+              {t("The answer may be incomplete — the run stopped responding.")}
+            </Text>
+            <Button
+              size="compact-xs"
+              variant="light"
+              color="gray"
+              onClick={onRetry}
+            >
+              {t("Retry")}
+            </Button>
           </Group>
         </Alert>
       ) : stopNotice ? (
@@ -1206,11 +1101,11 @@ export default function ChatThread({
                 <Text size="xs" lineClamp={2} className={classes.queuedText}>
                   {m.text}
                 </Text>
-                {/* "Send now" (interrupt) is hidden on a RESUMED turn: a local
-                    stop() does not abort the resumed attach fetch, so the click
-                    would be swallowed while flushOnAbortRef would fire minutes
-                    later on the natural finish. Only the remove affordance stays. */}
-                {!resumedTurn && (
+                {/* "Send now" (interrupt) is hidden while OBSERVING a detached run
+                    (ownership observer): a local stop() does not abort the attach
+                    fetch, so the interrupt would be swallowed. Only the remove
+                    affordance stays. */}
+                {!isObserver && (
                   <Tooltip label={t("Interrupt and send now")} withArrow>
                     <ActionIcon
                       size="xs"
@@ -1237,11 +1132,7 @@ export default function ChatThread({
           </Stack>
         )}
         <ChatInput
-          onSend={(text) => {
-            // Local send: clear any resume-suppression flag (invariant 8).
-            setResumedTurnPair(false);
-            sendMessage({ text });
-          }}
+          onSend={(text) => localSend(text)}
           onQueue={enqueue}
           onStop={handleStop}
           isStreaming={isStreaming}

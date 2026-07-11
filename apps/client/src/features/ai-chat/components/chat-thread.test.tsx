@@ -15,12 +15,16 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 const h = vi.hoisted(() => ({
   state: {
     status: "streaming" as string,
+    messages: [] as unknown[],
+    // Mirrors the SDK: on an isError finish (incl. a network drop, which is ALWAYS
+    // isError+isDisconnect) the SDK ALSO sets useChat `error`. Realistic tests set
+    // this so the banner-priority (errorView vs recovery phase) is actually exercised.
+    error: null as null | { message: string },
     onFinish: null as null | ((arg: Record<string, unknown>) => void),
     sendMessage: vi.fn(),
     stop: vi.fn(),
     setMessages: vi.fn(),
     resumeStream: vi.fn(),
-    // The messages array useChat was seeded with (to assert strip/seed behavior).
     seededMessages: null as null | unknown[],
     transport: null as null | {
       prepareSendMessagesRequest?: (arg: {
@@ -33,11 +37,17 @@ const h = vi.hoisted(() => ({
         init?: { method?: string; body?: unknown },
       ) => Promise<unknown>;
     },
+    // getRun mock (POST /ai-chat/run run-fact). Default: no active run.
+    getRun: vi.fn(
+      async (_chatId?: string) =>
+        ({ run: null, message: null }) as {
+          run: { id: string; status: string } | null;
+          message: unknown;
+        },
+    ),
   },
 }));
 
-// Mock useChat: capture onFinish + seeded messages, return the spies and the
-// controllable status.
 vi.mock("@ai-sdk/react", () => ({
   useChat: (opts: {
     messages?: unknown[];
@@ -46,19 +56,17 @@ vi.mock("@ai-sdk/react", () => ({
     h.state.onFinish = opts.onFinish ?? null;
     h.state.seededMessages = opts.messages ?? null;
     return {
-      messages: [],
+      messages: h.state.messages,
       sendMessage: h.state.sendMessage,
       status: h.state.status,
       stop: h.state.stop,
-      error: null,
+      error: h.state.error,
       setMessages: h.state.setMessages,
       resumeStream: h.state.resumeStream,
     };
   },
 }));
 
-// Mock "ai": deterministic ids + a transport that records its options so the test
-// can invoke prepareSendMessagesRequest / prepareReconnectToStreamRequest / fetch.
 vi.mock("ai", () => {
   let counter = 0;
   return {
@@ -71,15 +79,16 @@ vi.mock("ai", () => {
   };
 });
 
-// Keep the ai-chat-query import light: ChatThread only needs the messages RQ key,
-// so stub the module to avoid pulling axios / i18n transitively.
 vi.mock("@/features/ai-chat/queries/ai-chat-query.ts", () => ({
   AI_CHAT_MESSAGES_RQ_KEY: (chatId: string) => ["ai-chat-messages", chatId],
 }));
 
-// Stub the heavy children: MessageList (markdown/render) and ChatInput (the
-// composer). The ChatInput stub exposes a button that queues a message, the only
-// interaction this test needs to populate the queue while "streaming".
+// The run-fact service (POST /ai-chat/run). Mocked so a user-tail mount and the
+// supersede verify do not hit axios.
+vi.mock("@/features/ai-chat/services/ai-chat-service.ts", () => ({
+  getRun: (chatId: string) => h.state.getRun(chatId),
+}));
+
 vi.mock("@/features/ai-chat/components/message-list.tsx", () => ({
   default: () => <div data-testid="message-list" />,
 }));
@@ -87,13 +96,18 @@ vi.mock("@/features/ai-chat/components/chat-input.tsx", () => ({
   default: ({
     onQueue,
     onStop,
+    onSend,
   }: {
     onQueue: (text: string) => void;
     onStop: () => void;
+    onSend: (text: string) => void;
   }) => (
     <>
       <button data-testid="queue-btn" onClick={() => onQueue("queued text")}>
         queue
+      </button>
+      <button data-testid="send-btn" onClick={() => onSend("typed text")}>
+        send
       </button>
       <button aria-label="Stop" onClick={() => onStop()}>
         stop
@@ -145,6 +159,8 @@ function renderThread(props?: {
 
 function resetState() {
   h.state.status = "streaming";
+  h.state.messages = [];
+  h.state.error = null;
   h.state.onFinish = null;
   h.state.seededMessages = null;
   h.state.transport = null;
@@ -152,325 +168,118 @@ function resetState() {
   h.state.stop.mockClear();
   h.state.setMessages.mockClear();
   h.state.resumeStream.mockClear();
+  h.state.getRun.mockReset();
+  h.state.getRun.mockResolvedValue({ run: null, message: null });
 }
 
-describe("ChatThread — send now (#198)", () => {
+const streamingTail = () => [
+  row("u1", "user", undefined, "hi"),
+  row("a1", "assistant", "streaming", "partial"),
+];
+const settledTail = () => [
+  row("u1", "user", undefined, "hi"),
+  row("a1", "assistant", "succeeded", "done"),
+];
+const userTail = () => [row("u1", "user", undefined, "hi")];
+
+// -----------------------------------------------------------------------------
+// Send now (#198) — local send + #488 commit 5 CAS supersede.
+// -----------------------------------------------------------------------------
+describe("ChatThread — send now", () => {
   beforeEach(resetState);
+  afterEach(cleanup);
 
-  it("aborts the current turn and resends the queued message on the abort", () => {
-    renderThread();
-
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    const sendNowBtn = screen.getByLabelText("Send now");
-    expect(sendNowBtn).toBeTruthy();
-
-    fireEvent.click(sendNowBtn);
-    expect(h.state.stop).toHaveBeenCalledTimes(1);
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-
-    act(() => {
-      h.state.onFinish?.({
-        message: { id: "a", role: "assistant", parts: [] },
-        isAbort: true,
-        isDisconnect: false,
-        isError: false,
-      });
-    });
-    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-  });
-
-  it("tags exactly the next send as interrupted (one-shot flag)", () => {
-    renderThread();
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
-
-    const prep = h.state.transport!.prepareSendMessagesRequest!;
-    expect(prep({ messages: [], body: {} }).body.interrupted).toBe(true);
-    expect(prep({ messages: [], body: {} }).body.interrupted).toBe(false);
-  });
-
-  it("sends immediately without an interrupt when not streaming", () => {
+  it("sends immediately (no interrupt) when not streaming", () => {
     h.state.status = "ready";
-    renderThread();
-
+    renderThread({ initialRows: settledTail() });
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now"));
-
     expect(h.state.stop).not.toHaveBeenCalled();
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-    const prep = h.state.transport!.prepareSendMessagesRequest!;
-    expect(prep({ messages: [], body: {} }).body.interrupted).toBe(false);
-  });
-});
-
-// #486: the final onFinish -> flushNext() must be gated on the live-mount flag.
-// A clean onFinish can land AFTER the thread unmounts (New-chat / chat-switch
-// mid-stream — the async attach/resume settles late); flushing then dequeues and
-// re-POSTs a queued message from an abandoned thread (a "ghost" send).
-describe("ChatThread — onFinish flush gated on mount (#486)", () => {
-  beforeEach(resetState);
-  afterEach(cleanup);
-
-  it("a clean onFinish WHILE MOUNTED flushes the queued message (control)", () => {
-    renderThread();
-    fireEvent.click(screen.getByTestId("queue-btn")); // enqueue "queued text"
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-
-    act(() => {
-      h.state.onFinish?.({
-        message: { id: "a", role: "assistant", parts: [] },
-        isAbort: false,
-        isDisconnect: false,
-        isError: false,
-      });
-    });
-    // Mounted: the queue flushes normally.
-    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
   });
 
-  it("a clean onFinish AFTER unmount does NOT flush (no ghost send)", () => {
-    const { unmount } = renderThread();
-    fireEvent.click(screen.getByTestId("queue-btn")); // enqueue "queued text"
-    h.state.sendMessage.mockClear();
-
-    // Chat switched away mid-stream: the streamer unmounts...
-    unmount();
-    // ...and a late, clean onFinish lands on the abandoned thread.
-    act(() => {
-      h.state.onFinish?.({
-        message: { id: "a", role: "assistant", parts: [] },
-        isAbort: false,
-        isDisconnect: false,
-        isError: false,
-      });
-    });
-    // Gated on mountedRef: NOTHING is sent from the dead thread.
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-  });
-});
-
-// #396: in autonomous mode a live sendNow must additionally request the
-// AUTHORITATIVE server stop of the detached run (a local abort is only a client
-// disconnect the server ignores) and arm a bounded 409 retry so the re-POST
-// converges once the one-active-run slot frees. Legacy mode is unchanged.
-describe("ChatThread — send now server-stop + supersede retry (#396)", () => {
-  beforeEach(resetState);
-  afterEach(cleanup);
-
-  // A settled assistant tail => no mount resume (attemptResumeRef false), so the
-  // "Send now" button is visible for the NEW local streaming turn while
-  // autonomous runs are enabled.
-  const settledTail = () => [
-    row("u1", "user", undefined, "hi"),
-    row("a1", "assistant", "succeeded", "done"),
-  ];
-
-  it("autonomous: sendNow during a live stream calls onServerStop with the chat id", () => {
-    const { onServerStop } = renderThread({
+  // Drive a REAL live LOCAL stream with an active run-fact: a runId-bearing
+  // assistant message (mount adoption -> RUN_FACT) + a local send (SEND_LOCAL ->
+  // FSM `sending`, ownership local). sendNow reads LIVENESS off the FSM phase
+  // (LOW-1), so a faked SDK status alone is not enough — the stream must be real.
+  function startLocalStreamWithRun() {
+    h.state.status = "streaming";
+    h.state.messages = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [{ type: "text", text: "x" }],
+        metadata: { runId: "run-1" },
+      },
+    ];
+    const view = renderThread({
       autonomousRunsEnabled: true,
       initialRows: settledTail(),
     });
+    fireEvent.click(screen.getByTestId("send-btn")); // SEND_LOCAL -> FSM `sending`
+    h.state.sendMessage.mockClear();
+    return view;
+  }
+
+  it("#488 commit 5 / F1: sendNow ABORTS stream A first, then sends B (CAS) only after A finalizes", async () => {
+    startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now"));
-
+    // F1: A is ABORTED, and B is NOT sent yet (no overlap).
     expect(h.state.stop).toHaveBeenCalledTimes(1);
-    expect(onServerStop).toHaveBeenCalledWith("c1");
-  });
-
-  it("legacy (autonomous off): sendNow does NOT call onServerStop and does NOT retry the send", async () => {
-    const { onServerStop } = renderThread({
-      autonomousRunsEnabled: false,
-      initialRows: settledTail(),
-    });
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
-    expect(onServerStop).not.toHaveBeenCalled();
-
-    // The supersede retry must NOT be armed: a POST that 409s is returned as-is
-    // (single fetch, no retry).
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(
-        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
-          status: 409,
-        }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    let res!: Response;
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    // A's onFinish fires -> B is scheduled on a microtask (after A finalizes).
     await act(async () => {
-      res = (await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      })) as Response;
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(res.status).toBe(409);
-  });
-
-  it("armed supersede send retries 409 A_RUN_ALREADY_ACTIVE and succeeds once the slot frees", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
-    // Arm the retry by performing a live sendNow (autonomous branch sets the ref).
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
-
-    const fetchMock = vi
-      .fn()
-      // First POST: the old detached run still holds the slot -> 409.
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
-          status: 409,
-        }),
-      )
-      // Retry: the server stop settled the old run -> 200.
-      .mockResolvedValueOnce(new Response("ok", { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    let res!: Response;
-    await act(async () => {
-      res = (await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      })) as Response;
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(res.status).toBe(200);
-  });
-
-  it("supersede retry is one-shot: a later send (ref cleared) does NOT retry a 409", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now")); // arms the one-shot
-
-    // First armed send: immediately succeeds, consuming the arm.
-    let fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response("ok", { status: 200 }));
-    vi.stubGlobal("fetch", fetchMock);
-    await act(async () => {
-      await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      });
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    // A subsequent send is NOT armed -> a 409 is returned as-is (no retry).
-    fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
-        status: 409,
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    let res!: Response;
-    await act(async () => {
-      res = (await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      })) as Response;
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(res.status).toBe(409);
-  });
-
-  it("supersede retry is bounded: exhaustion surfaces the 409 error", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
-
-    // Every attempt 409s -> after 4 attempts the last 409 surfaces.
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
-        status: 409,
-      }),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    let res!: Response;
-    await act(async () => {
-      res = (await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      })) as Response;
-    });
-    // 4 attempts total (1 immediate + 3 backoff retries), then give up.
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect(res.status).toBe(409);
-  });
-
-  it("armed supersede send does NOT retry a non-409 status", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response("boom", { status: 500 }));
-    vi.stubGlobal("fetch", fetchMock);
-    let res!: Response;
-    await act(async () => {
-      res = (await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      })) as Response;
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(res.status).toBe(500);
-  });
-
-  // Strand-path regression: sendNow arms the supersede retry, but if the promoted
-  // head is removed before the abort's onFinish lands, flushNext() sends nothing
-  // (returns false) and NO re-POST consumes the arm. The arm must be disarmed on
-  // that no-send branch so the NEXT unrelated NORMAL send does not inherit it and
-  // silently retry a genuine 409 (e.g. a legitimate two-tab conflict) 4x instead
-  // of surfacing it immediately.
-  it("strand-path: a stranded supersede arm (flushNext no-send) does NOT retry a later normal 409", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
-    // Arm the retry via a live autonomous sendNow (promotes the head + arms).
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
-
-    // Remove the promoted head BEFORE the abort lands, so flushNext() returns
-    // false (no POST) and the arm would strand without the disarm fix.
-    fireEvent.click(screen.getByLabelText("Remove queued message"));
-
-    // The abort's onFinish now takes the flushOnAbortRef branch, calls flushNext()
-    // which finds an empty queue and returns false -> the no-send disarm must run.
-    act(() => {
       h.state.onFinish?.({
         message: { id: "a1", role: "assistant", parts: [] },
         isAbort: true,
         isDisconnect: false,
         isError: false,
       });
+      await Promise.resolve();
     });
-    // No re-POST was sent (nothing to flush).
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-
-    // A subsequent NORMAL send that 409s must be returned as-is (exactly 1 fetch):
-    // the stranded arm must NOT cause the genuine 409 to be retried.
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(
-        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
-          status: 409,
-        }),
-      );
-    vi.stubGlobal("fetch", fetchMock);
-    let res!: Response;
-    await act(async () => {
-      res = (await h.state.transport!.fetch!("http://x", {
-        method: "POST",
-        body: "{}",
-      })) as Response;
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+    // B's POST carries supersede:{runId} (read-and-cleared once).
+    const prep = h.state.transport!.prepareSendMessagesRequest!;
+    expect(prep({ messages: [], body: {} }).body.supersede).toEqual({
+      runId: "run-1",
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(res.status).toBe(409);
+    expect(prep({ messages: [], body: {} }).body.supersede).toBeUndefined();
   });
 
-  it("armed supersede send does NOT retry a 409 with a different (non-A_RUN_ALREADY_ACTIVE) body", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+  it("#488 F1: a superseded stream's LATE disconnect does NOT falsely reconnect (epoch stamp drops it)", async () => {
+    // MUTATION-VERIFY: drop `epoch: stampEpoch` from the supersede-branch
+    // FINISH_DISCONNECT dispatch and this goes red (A's disconnect -> reconnecting).
+    startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
-    fireEvent.click(screen.getByLabelText("Send now"));
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, aborts A
+    // A ends via a REAL network drop { isError:true, isDisconnect:true } + error set
+    // (the server CAS closed it). The OLD overlap bug would route the LIVE new run
+    // into a false reconnect banner.
+    h.state.error = { message: "Failed to fetch" };
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "x" }] },
+        isAbort: false,
+        isDisconnect: true,
+        isError: true,
+      });
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    // ...and B was still sent.
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+  });
+
+  it("#488 commit 5: a supersede POST that 409s SUPERSEDE_TIMEOUT is returned as-is (NO retry ladder)", async () => {
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, arms body
+    // Consume the supersede body (as the SDK would) so the POST is the CAS one.
+    h.state.transport!.prepareSendMessagesRequest!({ messages: [], body: {} });
+
     const fetchMock = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ code: "SOMETHING_ELSE" }), {
+      new Response(JSON.stringify({ code: "SUPERSEDE_TIMEOUT" }), {
         status: 409,
       }),
     );
@@ -482,14 +291,294 @@ describe("ChatThread — send now server-stop + supersede retry (#396)", () => {
         body: "{}",
       })) as Response;
     });
+    // Exactly ONE fetch (the old bounded 409 retry ladder is gone).
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.status).toBe(409);
   });
+
+  it("#488 LOW-1: sendNow when A has ALREADY settled (statusRef stale) sends immediately, not stuck superseding", () => {
+    startLocalStreamWithRun(); // FSM `sending`, mock status "streaming"
+    // A settles cleanly -> FSM `idle`. The mock status stays "streaming" (render-
+    // lagged), which the OLD statusRef gate would misread as "still live".
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "done" }] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    h.state.sendMessage.mockClear();
+    h.state.stop.mockClear();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+    // The FSM phase (idle) is authoritative -> B is sent IMMEDIATELY, not routed
+    // into an aborting supersede that would strand the machine (A's second onFinish
+    // never comes) and lose the message.
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+    expect(h.state.stop).not.toHaveBeenCalled();
+  });
+
+  it("#488 LOW-2: a second Send now while a supersede is in flight is a no-op (first message not lost)", () => {
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn")); // X
+    fireEvent.click(screen.getByTestId("queue-btn")); // Y
+    expect(screen.getAllByLabelText("Send now")).toHaveLength(2);
+    fireEvent.click(screen.getAllByLabelText("Send now")[0]); // supersede X -> superseding
+    expect(h.state.stop).toHaveBeenCalledTimes(1);
+    // Y is still queued; a second Send now must NOT clobber X or re-abort.
+    const remaining = screen.getAllByLabelText("Send now");
+    expect(remaining).toHaveLength(1);
+    fireEvent.click(remaining[0]);
+    expect(h.state.stop).toHaveBeenCalledTimes(1); // no second abort
+    // Y is still queued (kept, not lost, not sent).
+    expect(screen.getAllByLabelText("Remove queued message")).toHaveLength(1);
+  });
+
+  it("Stop then a REAL network-drop finish exits to idle (honor-in-stopping), NOT a false reconnect", () => {
+    // Regression for the disconnect-first reorder: on the STOP path, even a drop-
+    // form finish { isError:true, isDisconnect:true } arriving in `stopping` must be
+    // HONORED (reducer) and exit to idle — it must NOT enter the reconnect ladder.
+    startLocalStreamWithRun(); // live local stream, autonomous
+    fireEvent.click(screen.getByLabelText("Stop")); // STOP_REQUESTED -> stopping
+    h.state.error = { message: "Failed to fetch" };
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: true,
+        isError: true,
+      });
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+  });
+
+  it("#488 review-2: an observer turn's clean finish re-exposes 'Send now' (ownership reset to local)", () => {
+    // Mount attach -> observer. The queued message shows only "Remove" while
+    // observing; once the attached run finishes CLEAN the FSM resets ownership to
+    // local, so "Send now" becomes available again (composer is free).
+    // MUTATION-VERIFY: drop `ownership:"local"` from FINISH_CLEAN -> stays observer
+    // -> "Send now" stays hidden -> red.
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(screen.queryByLabelText("Send now")).toBeNull(); // observer -> hidden
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "done" }] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(screen.getByLabelText("Send now")).toBeTruthy(); // ownership local again
+  });
+
+  it("#488 review-3: a successful CAS supersede POST (200) exits `superseding` (Send now works again)", async () => {
+    // Happy-path of the transport 409/CAS block: SUPERSEDE_READY was never executed
+    // in tests (reviewer confirmed no-op mutation stayed green). If it does not fire,
+    // the machine stays `superseding` for the whole B stream and "Send now" is dead.
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn")); // X
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, stop() #1
+    expect(h.state.stop).toHaveBeenCalledTimes(1);
+    // A's onFinish sends B (clears the pending-supersede text) — the realistic
+    // no-overlap sequence.
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: true,
+        isDisconnect: false,
+        isError: false,
+      });
+      await Promise.resolve();
+    });
+    // B's CAS POST returns 200 -> SUPERSEDE_READY -> streaming.
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("{}", { status: 200 })));
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // We LEFT `superseding`: a fresh Send now supersedes AGAIN (still stuck in
+    // superseding -> LOW-2 guard would no-op it). MUTATION-VERIFY: no-op
+    // SUPERSEDE_READY -> stuck superseding -> stop stays at 1 -> red.
+    fireEvent.click(screen.getByTestId("queue-btn")); // Y
+    fireEvent.click(screen.getByLabelText("Send now"));
+    expect(h.state.stop).toHaveBeenCalledTimes(2);
+  });
+
+  it("#488 review-3 sibling: a 409 SUPERSEDE_TARGET_MISMATCH fires the /run verify", async () => {
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding
+    h.state.getRun.mockClear();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ code: "SUPERSEDE_TARGET_MISMATCH", runId: "run-x" }),
+          { status: 409 },
+        ),
+      ),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // SUPERSEDE_MISMATCH -> error(supersede-mismatch) + postRun(verify) -> getRun.
+    expect(h.state.getRun).toHaveBeenCalledWith("c1");
+  });
+
+  it("#488 review-3 sibling: a plain 409 A_RUN_ALREADY_ACTIVE shows the classified banner", async () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    // The SDK sets useChat error to the 409 body on the failed POST.
+    h.state.error = {
+      message:
+        '{"message":"active","code":"A_RUN_ALREADY_ACTIVE","statusCode":409}',
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE" }), {
+          status: 409,
+        }),
+      ),
+    );
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // RUN_ALREADY_ACTIVE -> phase error(kind) -> the phase-gate lets errorView show
+    // the classified banner.
+    expect(screen.getByText("The agent is already answering")).toBeTruthy();
+  });
+
+  it("Send now is HIDDEN while observing a resumed run and VISIBLE on a local stream", () => {
+    // Resumed (mount attach) -> observer -> hidden.
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(screen.queryByLabelText("Send now")).toBeNull();
+    // Local stream (no resume) -> visible.
+    cleanup();
+    resetState();
+    renderThread({ initialRows: [] });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(screen.getByLabelText("Send now")).toBeTruthy();
+  });
 });
 
-// #388: the editor selection is snapshotted at send time and nested inside
-// openPage on the wire. The getter is read live from a ref, so each send ships a
-// fresh snapshot.
+// -----------------------------------------------------------------------------
+// onFinish flush gated on mount (#486).
+// -----------------------------------------------------------------------------
+describe("ChatThread — onFinish flush gated on mount (#486)", () => {
+  beforeEach(resetState);
+  afterEach(cleanup);
+
+  it("a clean onFinish WHILE MOUNTED flushes the queued message", () => {
+    renderThread();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+  });
+
+  it("a clean onFinish AFTER unmount does NOT flush (no ghost send)", () => {
+    const { unmount } = renderThread();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    h.state.sendMessage.mockClear();
+    unmount();
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Turn-end decision (onFinish).
+// -----------------------------------------------------------------------------
+describe("ChatThread — turn-end decision (onFinish)", () => {
+  beforeEach(resetState);
+  afterEach(cleanup);
+
+  function finishWith(flags: {
+    isAbort?: boolean;
+    isDisconnect?: boolean;
+    isError?: boolean;
+  }) {
+    const { onTurnFinished } = renderThread();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    // Mirror the SDK: any isError finish (a provider error or a drop) also sets
+    // useChat `error` (a drop message triggers the connection-lost classification).
+    if (flags.isError)
+      h.state.error = { message: flags.isDisconnect ? "Failed to fetch" : "500: boom" };
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+        ...flags,
+      });
+    });
+    return { onTurnFinished };
+  }
+
+  it("CONTINUES — flushes the next queued message on a clean finish", () => {
+    finishWith({});
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+    expect(screen.queryByText("Response stopped.")).toBeNull();
+  });
+
+  it("ENDS — keeps the queue on a user abort and shows the stopped notice", () => {
+    finishWith({ isAbort: true });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    expect(screen.getByText("Response stopped.")).toBeTruthy();
+  });
+
+  it("ENDS — keeps the queue on a REAL disconnect (non-autonomous) and shows the notice", () => {
+    // Real SDK drop form: { isError:true, isDisconnect:true }. With the buggy
+    // isError-first order this would fall to the terminal error branch (no notice).
+    finishWith({ isDisconnect: true, isError: true });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("Connection lost — the answer was interrupted."),
+    ).toBeTruthy();
+  });
+
+  it("ENDS — keeps the queue on a NON-disconnect stream error (no notice)", () => {
+    // A provider error is { isError:true, isDisconnect:false } — terminal.
+    finishWith({ isError: true });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    expect(screen.queryByText("Response stopped.")).toBeNull();
+  });
+
+  it("notifies the parent on EVERY terminal outcome", () => {
+    for (const flags of [
+      {},
+      { isAbort: true },
+      { isDisconnect: true, isError: true },
+      { isError: true },
+    ]) {
+      cleanup();
+      resetState();
+      const { onTurnFinished } = finishWith(flags);
+      expect(onTurnFinished).toHaveBeenCalled();
+    }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// editor selection wiring (#388).
+// -----------------------------------------------------------------------------
 describe("ChatThread — editor selection wiring (#388)", () => {
   beforeEach(resetState);
   afterEach(cleanup);
@@ -518,7 +607,7 @@ describe("ChatThread — editor selection wiring (#388)", () => {
     );
   }
 
-  it("nests the snapshot from the getter into openPage.selection at send time", () => {
+  it("nests the snapshot into openPage.selection at send time", () => {
     const selection = { text: "fix this", blockIds: ["b1"], before: "a " };
     renderWithSelection({
       openPage: { id: "p1", title: "Doc" },
@@ -545,131 +634,36 @@ describe("ChatThread — editor selection wiring (#388)", () => {
     expect(openPage).toEqual({ id: "p1", title: "Doc", selection: null });
   });
 
-  it("does not send selection at all on a non-page route (openPage null)", () => {
+  it("does not consult the getter on a non-page route (openPage null)", () => {
     const getter = vi.fn(() => ({ text: "sel" }));
     renderWithSelection({ openPage: null, getEditorSelection: getter });
     const prep = h.state.transport!.prepareSendMessagesRequest!;
     expect(prep({ messages: [], body: {} }).body.openPage).toBeNull();
-    // The getter must not even be consulted when there is no page.
     expect(getter).not.toHaveBeenCalled();
   });
 });
 
-describe("ChatThread — turn-end decision (onFinish)", () => {
+// -----------------------------------------------------------------------------
+// Resume (attach) machinery (#184) + #488 commit 4b run-fact gating.
+// -----------------------------------------------------------------------------
+describe("ChatThread — resume (attach) machinery", () => {
   beforeEach(resetState);
-
-  function finishWith(flags: {
-    isAbort?: boolean;
-    isDisconnect?: boolean;
-    isError?: boolean;
-  }) {
-    cleanup();
-    h.state.sendMessage.mockClear();
-    const { onTurnFinished } = renderThread();
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    act(() => {
-      h.state.onFinish?.({
-        message: { id: "a", role: "assistant", parts: [] },
-        isAbort: false,
-        isDisconnect: false,
-        isError: false,
-        ...flags,
-      });
-    });
-    return { onTurnFinished };
-  }
-
-  it("CONTINUES — flushes the next queued message on a clean finish", () => {
-    finishWith({});
-    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-    expect(screen.queryByText("Response stopped.")).toBeNull();
-  });
-
-  it("ENDS — keeps the queue intact on a user abort and shows the stopped notice", () => {
-    finishWith({ isAbort: true });
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-    expect(screen.getByText("Response stopped.")).toBeTruthy();
-  });
-
-  it("ENDS — keeps the queue intact on a disconnect and shows the connection-lost notice", () => {
-    finishWith({ isDisconnect: true });
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-    expect(
-      screen.getByText("Connection lost — the answer was interrupted."),
-    ).toBeTruthy();
-  });
-
-  it("ENDS — keeps the queue intact on a stream error (no auto-retry, no stopped notice)", () => {
-    finishWith({ isError: true });
-    expect(h.state.sendMessage).not.toHaveBeenCalled();
-    expect(screen.queryByText("Response stopped.")).toBeNull();
-  });
-
-  it("notifies the parent on EVERY terminal outcome", () => {
-    for (const flags of [
-      {},
-      { isAbort: true },
-      { isDisconnect: true },
-      { isError: true },
-    ]) {
-      const { onTurnFinished } = finishWith(flags);
-      expect(onTurnFinished).toHaveBeenCalled();
-    }
-  });
-});
-
-// #184 phase 1.5: the resumable-SSE client. A reopened tab resumes the live run
-// via the SDK's reconnect transport (attach: replay + tail) instead of polling.
-describe("ChatThread — resume (attach) machinery (#184)", () => {
-  const streamingTail = () => [
-    row("u1", "user", undefined, "hi"),
-    row("a1", "assistant", "streaming", "partial"),
-  ];
-  const settledTail = () => [
-    row("u1", "user", undefined, "hi"),
-    row("a1", "assistant", "succeeded", "done"),
-  ];
-  const userTail = () => [row("u1", "user", undefined, "hi")];
-
-  const visibleMsg = {
-    id: "a1",
-    role: "assistant",
-    parts: [{ type: "text", text: "streamed answer" }],
-  };
-  const emptyMsg = { id: "a1", role: "assistant", parts: [] };
-
-  beforeEach(resetState);
-  // NOTE: do NOT vi.unstubAllGlobals() here — vitest.setup.ts installs
-  // matchMedia/localStorage via vi.stubGlobal and unstubbing wipes them for the
-  // rest of the file. Fetch is re-stubbed per test that needs it.
   afterEach(cleanup);
 
-  it("resumes on mount only when the flag is on, chatId is set, and the tail is not a settled assistant", () => {
-    // streaming tail -> resume
+  it("resumes on mount for a STREAMING tail (the streaming status is the run-fact)", () => {
     renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+  });
 
-    // user tail -> resume (the assistant row may not be seeded yet)
-    cleanup();
-    h.state.resumeStream.mockClear();
-    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
-    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
-
-    // settled assistant tail -> NO resume
-    cleanup();
-    h.state.resumeStream.mockClear();
+  it("does NOT resume for a settled tail, flag off, or no chatId", () => {
     renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
     expect(h.state.resumeStream).not.toHaveBeenCalled();
-
-    // flag off -> NO resume
     cleanup();
-    h.state.resumeStream.mockClear();
+    resetState();
     renderThread({ autonomousRunsEnabled: false, initialRows: streamingTail() });
     expect(h.state.resumeStream).not.toHaveBeenCalled();
-
-    // no chatId -> NO resume
     cleanup();
-    h.state.resumeStream.mockClear();
+    resetState();
     renderThread({
       autonomousRunsEnabled: true,
       chatId: null,
@@ -678,61 +672,112 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
     expect(h.state.resumeStream).not.toHaveBeenCalled();
   });
 
-  it("strips the streaming tail from the seed, but keeps a user tail whole", () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
-    // 2 rows in, streaming tail stripped -> 1 seeded message.
-    expect(h.state.seededMessages).toHaveLength(1);
-
-    cleanup();
+  it("#488 commit 4b: a USER tail resumes ONLY when POST /run confirms an active run", async () => {
+    h.state.getRun.mockResolvedValue({
+      run: { id: "run-1", status: "running" },
+      message: null,
+    });
     renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
-    // user tail is not stripped.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(h.state.getRun).toHaveBeenCalledWith("c1");
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("#488 commit 4b: a USER tail with NO active run does NOT resume and does NOT arm the poll", async () => {
+    h.state.getRun.mockResolvedValue({ run: null, message: null });
+    const { onResumeFallback } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: userTail(),
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+    expect(onResumeFallback).not.toHaveBeenCalledWith(true);
+  });
+
+  it("#488 F2: a local send DURING the mount getRun round-trip is NOT hijacked by the late attach", async () => {
+    // getRun stays pending while the user sends locally; its late resolve would
+    // otherwise ATTACH_START and flip the local turn into an observer-attach.
+    let resolveGetRun!: (v: {
+      run: { id: string; status: string } | null;
+      message: unknown;
+    }) => void;
+    h.state.getRun.mockReturnValue(
+      new Promise((r) => {
+        resolveGetRun = r;
+      }),
+    );
+    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
+    // Local send in flight of getRun -> SEND_LOCAL (phase sending, ownership local).
+    fireEvent.click(screen.getByTestId("send-btn"));
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "typed text" });
+    // getRun resolves with an ACTIVE run -> the F2 guard ignores ATTACH_START.
+    await act(async () => {
+      resolveGetRun({ run: { id: "run-1", status: "running" }, message: null });
+      await Promise.resolve();
+    });
+    // The local turn was NOT hijacked into a resume/attach.
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+  });
+
+  it("strips the streaming tail from the seed, keeps a user tail whole", () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    expect(h.state.seededMessages).toHaveLength(1);
+    cleanup();
+    resetState();
+    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
     expect(h.state.seededMessages).toHaveLength(1);
   });
 
-  it("builds the attach URL with expect=live&anchor only when the streaming tail was stripped", () => {
+  it("builds the attach URL with expect=live&anchor only for a stripped streaming tail", () => {
     renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
     expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
       "/api/ai-chat/runs/c1/stream?expect=live&anchor=a1",
     );
-
     cleanup();
+    resetState();
     renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
     expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
       "/api/ai-chat/runs/c1/stream",
     );
   });
 
-  async function fetch204() {
+  async function attachFetch(response: unknown, reject = false) {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue({ status: 204, ok: false }),
+      reject
+        ? vi.fn().mockRejectedValue(response)
+        : vi.fn().mockResolvedValue(response),
     );
     await act(async () => {
-      await h.state.transport!.fetch!("http://x", { method: "GET" });
+      await h.state
+        .transport!.fetch!("http://x", { method: "GET" })
+        .catch(() => undefined);
     });
   }
-
-  it("204 on a user tail: no crash, no restore, reconcile+invalidate, onResumeFallback(true)", async () => {
-    const { onResumeFallback, invalidateSpy } = renderThread({
-      autonomousRunsEnabled: true,
-      initialRows: userTail(),
-    });
-    await fetch204();
-    // No stripped row -> no restore merge.
-    expect(h.state.setMessages).not.toHaveBeenCalled();
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ["ai-chat-messages", "c1"],
-    });
-    expect(onResumeFallback).toHaveBeenCalledWith(true);
-  });
 
   it("204 on a streaming tail: restore + invalidate + onResumeFallback(true)", async () => {
     const { onResumeFallback, invalidateSpy } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
     });
-    await fetch204();
-    // Stripped row is restored to the store.
+    await attachFetch({ status: 204, ok: false });
+    expect(h.state.setMessages).toHaveBeenCalledTimes(1); // restore
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["ai-chat-messages", "c1"],
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+  });
+
+  it("F7 restart-survival: a 500 attach failure restores the row AND arms the poll", async () => {
+    const { onResumeFallback, invalidateSpy } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(),
+    });
+    await attachFetch({ status: 500, ok: false });
     expect(h.state.setMessages).toHaveBeenCalledTimes(1);
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["ai-chat-messages", "c1"],
@@ -740,39 +785,12 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
     expect(onResumeFallback).toHaveBeenCalledWith(true);
   });
 
-  it("F7 restart-survival: a 500 attach failure restores the stripped row AND arms the poll (not lost)", async () => {
+  it("F7 restart-survival: a network throw restores the row AND arms the poll", async () => {
     const { onResumeFallback, invalidateSpy } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
     });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ status: 500, ok: false }),
-    );
-    await act(async () => {
-      await h.state.transport!.fetch!("http://x", { method: "GET" });
-    });
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1); // stripped row restored
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ["ai-chat-messages", "c1"],
-    });
-    expect(onResumeFallback).toHaveBeenCalledWith(true); // degraded poll armed
-  });
-
-  it("F7 restart-survival: a network throw restores the stripped row AND arms the poll", async () => {
-    const { onResumeFallback, invalidateSpy } = renderThread({
-      autonomousRunsEnabled: true,
-      initialRows: streamingTail(),
-    });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockRejectedValue(new Error("network down")),
-    );
-    await act(async () => {
-      await h.state
-        .transport!.fetch!("http://x", { method: "GET" })
-        .catch(() => undefined); // the wrapper rethrows; swallow here
-    });
+    await attachFetch(new Error("network down"), true);
     expect(h.state.setMessages).toHaveBeenCalledTimes(1);
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["ai-chat-messages", "c1"],
@@ -780,7 +798,7 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
     expect(onResumeFallback).toHaveBeenCalledWith(true);
   });
 
-  it("unmount during a pending attach aborts the controller and gates late callbacks", async () => {
+  it("unmount during a pending attach aborts the controller and gates late callbacks (epoch I1)", async () => {
     const { onResumeFallback, invalidateSpy, unmount } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
@@ -798,55 +816,33 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
         });
       }),
     );
-    // Kick a reconnect GET (stays pending).
     let pending!: Promise<unknown>;
     act(() => {
       pending = h.state.transport!.fetch!("http://x", { method: "GET" });
     });
-    // Unmount: the cleanup aborts the in-flight attach.
-    unmount();
+    unmount(); // DISPOSE aborts the attach + bumps the epoch
     expect(abortSeen).toBe(true);
-    // A late 204 landing after unmount must NOT arm a poll / invalidate the (now
-    // different) chat.
     onResumeFallback.mockClear();
     invalidateSpy.mockClear();
     await act(async () => {
       resolveFetch({ status: 204, ok: false });
       await pending;
     });
+    // The stale (superseded-epoch) outcome is dropped.
     expect(onResumeFallback).not.toHaveBeenCalledWith(true);
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
-  it("a resume fetch error clears resumedTurn so the next local turn flushes the queue", async () => {
-    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
-    h.state.status = "ready";
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ status: 500, ok: false }),
-    );
-    await act(async () => {
-      await h.state.transport!.fetch!("http://x", { method: "GET" });
-    });
-    // Queue then clean-finish: suppression was cleared, so the queue flushes.
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    act(() => {
-      h.state.onFinish?.({
-        message: visibleMsg,
-        isAbort: false,
-        isDisconnect: false,
-        isError: false,
-      });
-    });
-    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-  });
-
-  it("a resumed turn's onFinish does NOT flush the queue", () => {
+  it("a resumed (observer) turn's onFinish does NOT flush the queue", () => {
     renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
     fireEvent.click(screen.getByTestId("queue-btn"));
     act(() => {
       h.state.onFinish?.({
-        message: visibleMsg,
+        message: {
+          id: "a1",
+          role: "assistant",
+          parts: [{ type: "text", text: "streamed answer" }],
+        },
         isAbort: false,
         isDisconnect: false,
         isError: false,
@@ -855,7 +851,7 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
     expect(h.state.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("a healthy resumed finish (visible content) arms nothing and keeps the store", () => {
+  it("an empty resumed message (starved replay) restores the row AND arms the poll", () => {
     h.state.status = "ready";
     const { onResumeFallback } = renderThread({
       autonomousRunsEnabled: true,
@@ -865,53 +861,7 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
     onResumeFallback.mockClear();
     act(() => {
       h.state.onFinish?.({
-        message: visibleMsg,
-        isAbort: false,
-        isDisconnect: false,
-        isError: false,
-      });
-    });
-    // No restore (would clobber the fuller streamed message), no poll arm.
-    expect(h.state.setMessages).not.toHaveBeenCalled();
-    expect(onResumeFallback).not.toHaveBeenCalledWith(true);
-  });
-
-  it("isDisconnect WITH visible content arms the poll but does NOT restore", () => {
-    h.state.status = "ready";
-    const { onResumeFallback, invalidateSpy } = renderThread({
-      autonomousRunsEnabled: true,
-      initialRows: streamingTail(),
-    });
-    h.state.setMessages.mockClear();
-    onResumeFallback.mockClear();
-    invalidateSpy.mockClear();
-    act(() => {
-      h.state.onFinish?.({
-        message: visibleMsg,
-        isAbort: false,
-        isDisconnect: true,
-        isError: false,
-      });
-    });
-    expect(onResumeFallback).toHaveBeenCalledWith(true);
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ["ai-chat-messages", "c1"],
-    });
-    // Restore forbidden: the on-screen partial must not roll back.
-    expect(h.state.setMessages).not.toHaveBeenCalled();
-  });
-
-  it("an empty resumed message (starved replay) restores the stripped row AND arms the poll", () => {
-    h.state.status = "ready";
-    const { onResumeFallback } = renderThread({
-      autonomousRunsEnabled: true,
-      initialRows: streamingTail(),
-    });
-    h.state.setMessages.mockClear();
-    onResumeFallback.mockClear();
-    act(() => {
-      h.state.onFinish?.({
-        message: emptyMsg,
+        message: { id: "a1", role: "assistant", parts: [] },
         isAbort: false,
         isDisconnect: false,
         isError: false,
@@ -921,67 +871,11 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
     expect(onResumeFallback).toHaveBeenCalledWith(true); // arm
   });
 
-  it("degraded-merge: merges the tail per initialRows update, and settles disarm the poll", async () => {
-    h.state.status = "ready";
-    const { rerender, onResumeFallback } = renderResumable(streamingTail());
-    // Arm reconcile via a 204.
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ status: 204, ok: false }),
-    );
-    await act(async () => {
-      await h.state.transport!.fetch!("http://x", { method: "GET" });
-    });
-    h.state.setMessages.mockClear();
-    onResumeFallback.mockClear();
-
-    // A streaming-tail update: merge, poll stays armed.
-    rerender([
-      row("u1", "user", undefined, "hi"),
-      row("a1", "assistant", "streaming", "step 1\nstep 2"),
-    ]);
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
-    expect(onResumeFallback).not.toHaveBeenCalledWith(false);
-
-    // A settled-tail update: merge + disarm.
-    h.state.setMessages.mockClear();
-    rerender([
-      row("u1", "user", undefined, "hi"),
-      row("a1", "assistant", "succeeded", "final"),
-    ]);
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
-    expect(onResumeFallback).toHaveBeenCalledWith(false);
-  });
-
-  it("a local stream disarms both the merge and the poll", () => {
-    h.state.status = "streaming";
-    const { rerender, onResumeFallback } = renderResumable(streamingTail());
-    onResumeFallback.mockClear();
-    // A re-render while streaming: the reconciliation effect disarms.
-    rerender(streamingTail());
-    expect(onResumeFallback).toHaveBeenCalledWith(false);
-  });
-
-  it("Send now is hidden on a resumed turn but visible on a local stream", () => {
-    // Resumed turn: hidden.
-    renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    expect(screen.queryByLabelText("Send now")).toBeNull();
-
-    // Local streaming turn (no resume): visible.
-    cleanup();
-    resetState();
-    renderThread({ initialRows: [] });
-    fireEvent.click(screen.getByTestId("queue-btn"));
-    expect(screen.getByLabelText("Send now")).toBeTruthy();
-  });
-
-  it("handleStop aborts the attach controller and calls onServerStop", async () => {
+  it("handleStop aborts the attach controller and calls onServerStop", () => {
     const { onServerStop } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
     });
-    // Establish an attach controller via a (pending) reconnect GET.
     let abortSeen = false;
     vi.stubGlobal(
       "fetch",
@@ -989,7 +883,7 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
         init.signal?.addEventListener("abort", () => {
           abortSeen = true;
         });
-        return new Promise(() => undefined); // never resolves
+        return new Promise(() => undefined);
       }),
     );
     act(() => {
@@ -1001,45 +895,10 @@ describe("ChatThread — resume (attach) machinery (#184)", () => {
   });
 });
 
-// Helper: render a resumable thread and expose a rerender that only swaps
-// initialRows (the degraded-merge effect depends on it).
-function renderResumable(initialRows: IAiChatMessageRow[]) {
-  const onResumeFallback = vi.fn();
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
-  const Wrapper = ({ rows }: { rows: IAiChatMessageRow[] }) => (
-    <QueryClientProvider client={queryClient}>
-      <MantineProvider>
-        <ChatThread
-          chatId="c1"
-          initialRows={rows}
-          autonomousRunsEnabled
-          onTurnFinished={vi.fn()}
-          onResumeFallback={onResumeFallback}
-        />
-      </MantineProvider>
-    </QueryClientProvider>
-  );
-  const view = render(<Wrapper rows={initialRows} />);
-  const rerender = (rows: IAiChatMessageRow[]) =>
-    act(() => view.rerender(<Wrapper rows={rows} />));
-  return { rerender, onResumeFallback };
-}
-
-// #430: auto-reconnect to a DETACHED run after a LIVE SSE disconnect. The mount
-// path only resumes on mount/reload; these cover the missing trigger — a live
-// `isDisconnect` on onFinish must (backoff-)re-attach WITHOUT a reload, pin+strip
-// the live row to avoid duplicates, fall back to the degraded poll on a 204, and
-// exhaust to a manual Retry.
-describe("ChatThread — live reconnect after isDisconnect (#430)", () => {
-  // A LIVE local turn that just dropped: the settled tail existed before, and the
-  // partial assistant row lives only in `messages` (not persisted as a tail).
-  const settledTail = () => [
-    row("u1", "user", undefined, "hi"),
-    row("a1", "assistant", "succeeded", "done"),
-  ];
-  // The partial assistant message onFinish hands us for the dropped LIVE turn.
+// -----------------------------------------------------------------------------
+// Live reconnect (#430) + #488 commits 2/3 + stalled (4a). Fake timers.
+// -----------------------------------------------------------------------------
+describe("ChatThread — live reconnect + stalled", () => {
   const liveMsg = {
     id: "a2",
     role: "assistant",
@@ -1048,8 +907,6 @@ describe("ChatThread — live reconnect after isDisconnect (#430)", () => {
 
   beforeEach(() => {
     resetState();
-    // status "ready": with a live disconnect the mock is not streaming, so the
-    // status==="streaming" auto-clear effect stays out of the way.
     h.state.status = "ready";
     vi.useFakeTimers();
   });
@@ -1058,115 +915,113 @@ describe("ChatThread — live reconnect after isDisconnect (#430)", () => {
     cleanup();
   });
 
-  // Render a NON-resuming mount (settled tail -> no mount resume) with autonomous
-  // runs on, then simulate a live disconnect via onFinish.
-  function renderLiveThenDisconnect() {
+  // A REAL live SSE drop. ai@6.0.207 emits BOTH { isError:true, isDisconnect:true }
+  // for a network TypeError AND sets useChat `error` — NOT the { isError:false,
+  // error:null } form the old tests fed. This is the form browser QA hit; with the
+  // buggy isError-first routing OR without the errorView render-gate these tests go
+  // red (a real drop surfaces the terminal error banner, masking the reconnect
+  // ladder). MUTATION-VERIFY of disconnect-first + the errorView phase-gate.
+  function disconnect(message: unknown = liveMsg) {
+    h.state.error = { message: "Failed to fetch" }; // the SDK sets error on the drop
+    act(() => {
+      h.state.onFinish?.({
+        message,
+        isAbort: false,
+        isDisconnect: true,
+        isError: true,
+      });
+    });
+  }
+  function renderLive() {
     const view = renderThread({
       autonomousRunsEnabled: true,
       initialRows: settledTail(),
     });
-    // The settled tail must NOT have triggered a mount resume.
     expect(h.state.resumeStream).not.toHaveBeenCalled();
-    act(() => {
-      h.state.onFinish?.({
-        message: liveMsg,
-        isAbort: false,
-        isDisconnect: true,
-        isError: false,
-      });
-    });
     return view;
   }
-
-  // Fire the pending (scheduled) attempt for `attempt` (backoff = 1s,2s,4s,...).
   function advanceToAttempt(attempt: number) {
     act(() => {
       vi.advanceTimersByTime(1000 * 2 ** (attempt - 1));
     });
   }
-
-  // Simulate the reconnect GET returning 204 (nothing live) so the transport's
-  // no-active-stream recovery runs.
-  async function reconnect204() {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ status: 204, ok: false }),
-    );
+  async function reconnect(response: unknown) {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
     await act(async () => {
       await h.state.transport!.fetch!("http://x", { method: "GET" });
     });
   }
 
-  // Simulate the reconnect GET returning a live 2xx stream.
-  async function reconnect200() {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ status: 200, ok: true }),
-    );
-    await act(async () => {
-      await h.state.transport!.fetch!("http://x", { method: "GET" });
-    });
-  }
-
-  it("calls resumeStream POST-mount (a live disconnect triggers a backoff reconnect)", () => {
-    renderLiveThenDisconnect();
-    // The banner shows immediately; the attach itself fires after the first backoff.
+  it("a live disconnect starts a backoff reconnect (banner + resumeStream after backoff)", () => {
+    renderLive();
+    disconnect();
     expect(screen.getByText(/reconnecting/i)).toBeTruthy();
     expect(h.state.resumeStream).not.toHaveBeenCalled();
     advanceToAttempt(1);
-    // resumeStream is now called AFTER mount — the bug was it only ever fired once
-    // on mount. The reconnect URL pins expect=live&anchor to OUR run.
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
     expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
       "/api/ai-chat/runs/c1/stream?expect=live&anchor=a2",
     );
   });
 
-  it("strips the pinned live row before replay so content is NOT duplicated", () => {
-    renderLiveThenDisconnect();
+  it("#488 (browser QA): the reconnect banner is SHOWN, not masked by the residual useChat error", () => {
+    // The drop sets useChat `error` (real SDK), and the terminal errorView describes
+    // it ("Lost connection to the server"). The FSM phase-gate must let the
+    // `reconnecting` banner WIN over that residual error. MUTATION-VERIFY: revert the
+    // errorView phase-gate (show errorView whenever error is set) and the terminal
+    // banner masks "reconnecting…" -> red.
+    renderLive();
+    disconnect();
+    expect(h.state.error).not.toBeNull(); // the SDK error IS set during recovery
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    // The terminal "Lost connection… reload" banner must NOT be showing.
+    expect(screen.queryByText(/reload and try again/i)).toBeNull();
+  });
+
+  it("#488 commit 2: a disconnect BEFORE the first assistant frame reconnects with NO anchor", () => {
+    renderLive();
+    disconnect(null); // no assistant message yet (pre-first-frame break)
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    expect(
+      screen.queryByText("Connection lost — the answer was interrupted."),
+    ).toBeNull();
     advanceToAttempt(1);
-    // The attempt strips the anchor row from the store (the live replay rebuilds
-    // it). Apply the setMessages updater to prove it removes exactly the anchor.
-    const updater = h.state.setMessages.mock.calls.at(-1)![0] as (
-      prev: { id: string }[],
-    ) => { id: string }[];
-    expect(updater([{ id: "u1" }, { id: "a2" }])).toEqual([{ id: "u1" }]);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
   });
 
   it("a live re-attach (2xx) clears the reconnect banner", async () => {
-    renderLiveThenDisconnect();
+    renderLive();
+    disconnect();
     advanceToAttempt(1);
-    await reconnect200();
+    await reconnect({ status: 200, ok: true });
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
   });
 
   it("a 204 arms the degraded poll and backs off to the next attempt", async () => {
-    const { onResumeFallback } = renderLiveThenDisconnect();
+    const { onResumeFallback } = renderLive();
+    disconnect();
     advanceToAttempt(1);
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
-    await reconnect204();
-    // Fallback engaged: the degraded poll is armed (204 -> onNoActiveStream).
+    await reconnect({ status: 204, ok: false });
     expect(onResumeFallback).toHaveBeenCalledWith(true);
-    // Still reconnecting — the banner advanced to attempt 2/5.
     expect(screen.getByText(/reconnecting.*2\/5/i)).toBeTruthy();
-    // The next backoff fires attempt 2 (another resumeStream).
     advanceToAttempt(2);
     expect(h.state.resumeStream).toHaveBeenCalledTimes(2);
   });
 
   it("exhausts the attempt limit into a manual Retry, which restarts the sequence", async () => {
-    renderLiveThenDisconnect();
-    // Drive all 5 attempts, each failing with a 204.
+    renderLive();
+    disconnect();
     for (let n = 1; n <= 5; n++) {
       advanceToAttempt(n);
       expect(h.state.resumeStream).toHaveBeenCalledTimes(n);
-      await reconnect204();
+      await reconnect({ status: 204, ok: false });
     }
-    // The 5th 204 exhausted the cap -> the manual Retry replaces the banner.
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
     const retry = screen.getByText("Retry");
-    expect(retry).toBeTruthy();
-    // Retry fires attempt 1 immediately (no backoff) — a 6th resumeStream.
     act(() => {
       fireEvent.click(retry);
     });
@@ -1174,22 +1029,64 @@ describe("ChatThread — live reconnect after isDisconnect (#430)", () => {
     expect(screen.getByText(/reconnecting/i)).toBeTruthy();
   });
 
+  it("#488 commit 3: two breaks in a row produce two reconnect cycles", async () => {
+    renderLive();
+    // First break -> reconnect -> re-attach live.
+    disconnect();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    await reconnect({ status: 200, ok: true });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    // The re-attached observer stream drops AGAIN -> a SECOND reconnect cycle
+    // (the old one-shot !wasResumed gate sent this to silent poll).
+    disconnect();
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(2);
+  });
+
   it("does NOT reconnect when autonomous runs are disabled", () => {
     renderThread({ autonomousRunsEnabled: false, initialRows: settledTail() });
-    act(() => {
-      h.state.onFinish?.({
-        message: liveMsg,
-        isAbort: false,
-        isDisconnect: true,
-        isError: false,
-      });
-    });
+    disconnect();
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
-    // The terminal "connection lost" notice is shown instead (unchanged behavior).
     expect(
       screen.getByText("Connection lost — the answer was interrupted."),
     ).toBeTruthy();
     advanceToAttempt(1);
     expect(h.state.resumeStream).not.toHaveBeenCalled();
+  });
+
+  it("#488 commit 4a: the poll idle cap surfaces a stalled banner + Retry (not silent)", async () => {
+    renderLive();
+    disconnect();
+    advanceToAttempt(1);
+    await reconnect({ status: 204, ok: false }); // arms the poll (reconnecting)
+    // No activity for the whole idle cap -> stalled.
+    act(() => {
+      vi.advanceTimersByTime(10 * 60_000);
+    });
+    expect(screen.getByText(/the run stopped responding/i)).toBeTruthy();
+    expect(screen.getByText("Retry")).toBeTruthy();
+  });
+
+  it("#488 review-4: an observer-stop's armed poll is bounded by the idle cap (exits to idle, disarm)", () => {
+    // STOP_REQUESTED arms the poll and enters `stopping`; an observer stop has no
+    // SDK stream to fire onFinish, and the server stop may never drive the run
+    // terminal. Without a backstop the DB would poll forever. The idle cap must give
+    // `stopping` a bounded exit -> idle + disarm (NOT stalled). MUTATION-VERIFY: drop
+    // `stopping` from the idle-cap effect / the POLL_IDLE_CAP branch -> no disarm.
+    const { onResumeFallback } = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: streamingTail(), // mount attach -> observer
+    });
+    onResumeFallback.mockClear();
+    fireEvent.click(screen.getByLabelText("Stop")); // STOP_REQUESTED -> stopping + armPoll
+    expect(onResumeFallback).toHaveBeenCalledWith(true);
+    onResumeFallback.mockClear();
+    // No terminal row ever arrives; the inactivity cap bounds it.
+    act(() => {
+      vi.advanceTimersByTime(10 * 60_000);
+    });
+    expect(onResumeFallback).toHaveBeenCalledWith(false); // POLL_IDLE_CAP -> idle -> disarm
   });
 });

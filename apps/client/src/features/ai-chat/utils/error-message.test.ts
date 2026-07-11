@@ -42,6 +42,51 @@ describe("describeChatError", () => {
     );
   });
 
+  // #488 commit 5: the #487 concurrency-gate / supersede 409s. FULL real bodies:
+  // a ConflictException(object) whose response is serialized verbatim, carrying a
+  // `code` and statusCode 409. Each must classify to a human text, not raw JSON.
+  it("classifies A_RUN_ALREADY_ACTIVE (409) as already-answering, not raw JSON", () => {
+    const body =
+      '{"message":"A run is already active for this chat","code":"A_RUN_ALREADY_ACTIVE","statusCode":409}';
+    expect(describeChatError(body, t).title).toBe(
+      "The agent is already answering",
+    );
+    // Never leaks the raw code as the detail.
+    expect(describeChatError(body, t).detail).not.toContain("A_RUN_ALREADY_ACTIVE");
+  });
+
+  it("classifies SUPERSEDE_TARGET_MISMATCH (409) as run-changed", () => {
+    const body =
+      '{"message":"active run does not match the supersede target","code":"SUPERSEDE_TARGET_MISMATCH","runId":"run-x","statusCode":409}';
+    expect(describeChatError(body, t).title).toBe(
+      "Couldn't interrupt — the run changed",
+    );
+  });
+
+  it("classifies SUPERSEDE_TIMEOUT (409) as couldn't-interrupt-in-time", () => {
+    const body =
+      '{"message":"the run did not settle within the supersede window","code":"SUPERSEDE_TIMEOUT","statusCode":409}';
+    expect(describeChatError(body, t).title).toBe("Couldn't interrupt in time");
+  });
+
+  it("classifies SUPERSEDE_INVALID (409) as couldn't-interrupt-that-run", () => {
+    const body =
+      '{"message":"supervise requires chatId","code":"SUPERSEDE_INVALID","statusCode":409}';
+    expect(describeChatError(body, t).title).toBe(
+      "Couldn't interrupt that run",
+    );
+  });
+
+  it("ORDER GUARD: A_RUN_ALREADY_ACTIVE wins over any generic status branch", () => {
+    // Even though the body could superficially look 4xx-ish, the code branch runs
+    // first, so it is never mislabeled by a generic status heading.
+    const body =
+      '{"message":"conflict","code":"A_RUN_ALREADY_ACTIVE","statusCode":409}';
+    const view = describeChatError(body, t);
+    expect(view.title).not.toBe("Something went wrong");
+    expect(view.title).not.toBe("AI provider not configured");
+  });
+
   it("classifies a dropped connection (ECONNRESET) as a lost-connection error", () => {
     expect(
       describeChatError("Cannot connect to API: read ECONNRESET", t).title,
