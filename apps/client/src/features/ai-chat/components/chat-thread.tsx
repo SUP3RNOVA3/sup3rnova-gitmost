@@ -763,9 +763,6 @@ export default function ChatThread({
   sendMessageRef.current = sendMessage;
   stopFnRef.current = stop;
 
-  const statusRef = useRef(status);
-  statusRef.current = status;
-
   // EARLY chat-id (#174) + runId (#488) adoption from the streaming assistant
   // message's start metadata. Forward the chat id once; adopt the runId into the
   // FSM run-fact; and (#234 F5) fire a DEFERRED server stop the moment the id lands
@@ -891,29 +888,43 @@ export default function ChatThread({
     (id: string) => {
       const msg = queuedRef.current.find((m) => m.id === id);
       if (!msg) return;
-      const liveStreaming =
-        statusRef.current === "submitted" || statusRef.current === "streaming";
-      const runId = machineRef.current.ctx.runFact?.runId;
+      // #488 LOW-2: a supersede is already in flight (stream A aborted, B not sent
+      // yet). A second "Send now" must NOT clobber the pending message nor start a
+      // competing send. Least-surprising choice: this click is a NO-OP and the
+      // message stays queued — the user can send it once B has started (nothing is
+      // lost). (Guarding on both the pending text and the FSM phase.)
       if (
-        liveStreaming &&
-        autonomousRunsEnabled === true &&
-        runId &&
-        runId !== "pending"
+        pendingSupersedeTextRef.current !== null ||
+        machineRef.current.phase.name === "superseding"
       ) {
+        return;
+      }
+      // #488 LOW-1: decide "is stream A still live" from the FSM phase (machineRef),
+      // which onFinish updates SYNCHRONOUSLY — NOT the render-lagged statusRef. In
+      // the sub-frame window where A has already fired onFinish (FSM -> idle) but
+      // statusRef still reads "streaming", treating A as live would abort a dead
+      // stream (no second onFinish -> B never sent, message lost). The FSM phase
+      // closes that window: a settled A reads as not-live -> B is sent immediately.
+      const p = machineRef.current.phase.name;
+      const aLiveLocal =
+        (p === "sending" || p === "streaming") &&
+        machineRef.current.ctx.ownership === "local";
+      const runId = machineRef.current.ctx.runFact?.runId;
+      if (aLiveLocal && autonomousRunsEnabled === true && runId && runId !== "pending") {
         // CAS supersede: the server stops the old run + starts this one atomically.
-        // #488 F1: do NOT start stream B synchronously here — the local stream A is
-        // still live, and overlapping streams corrupt each other in ai@6 (A's
-        // `finally` reads/ nulls the shared `activeResponse`). Instead ABORT A now
-        // and stash the text; A's onFinish (dropped by the epoch stamp) starts B in
-        // a microtask, AFTER A is fully finalized (no overlap). The POST then
-        // carries the supersede body (pendingSupersedeRef, armed by the effect).
+        // #488 F1: do NOT start stream B synchronously — the local stream A is still
+        // live, and overlapping streams corrupt each other in ai@6 (A's `finally`
+        // reads then nulls the shared `activeResponse`). ABORT A now and stash the
+        // text; A's onFinish (dropped by the epoch stamp) starts B in a microtask,
+        // AFTER A is fully finalized (no overlap). The POST then carries the
+        // supersede body (pendingSupersedeRef, armed by the effect).
         setQueue(removeQueuedById(queuedRef.current, id));
         pendingSupersedeTextRef.current = msg.text;
         dispatch({ type: "SUPERSEDE_REQUESTED", targetRunId: runId });
         stopFnRef.current?.(); // abort A -> its onFinish sends B
         return;
       }
-      if (liveStreaming) {
+      if (aLiveLocal) {
         // No CAS possible (legacy without a run, or the runId not adopted yet):
         // promote to head and abort; the local turn's abort finishes and the queue
         // holds the promoted head for the user (a blind re-POST would 409 -> the
@@ -922,7 +933,7 @@ export default function ChatThread({
         stopFnRef.current?.();
         return;
       }
-      // Nothing to interrupt: send it now.
+      // Nothing live to interrupt (idle, or A already settled): send it now.
       setQueue(removeQueuedById(queuedRef.current, id));
       localSend(msg.text);
     },

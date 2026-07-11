@@ -232,7 +232,33 @@ function command(
 // The pure reducer.
 // ---------------------------------------------------------------------------
 
+/** The terminal stream-finish events (one turn's stream ended). */
+function isFinishEvent(event: Event): boolean {
+  return (
+    event.type === "FINISH_ABORT" ||
+    event.type === "FINISH_CLEAN" ||
+    event.type === "FINISH_DISCONNECT" ||
+    event.type === "FINISH_ERROR" ||
+    event.type === "STREAM_INCOMPLETE"
+  );
+}
+
 export function reduce(m: Machine, event: Event): Machine {
+  // MEDIUM (#488 re-review): honor ANY stream finish in `stopping` regardless of
+  // generation. A plain user Stop has NO successor stream — the aborted stream's
+  // finish IS the expected end of the stop, so exit `stopping -> idle` by that DATA
+  // (I4). The epoch filter below must NOT drop it: STOP_REQUESTED bumped the epoch,
+  // but the finish carries the PRE-stop generation (the runtime stamps it with the
+  // stream's start epoch), so I1 would otherwise strand the machine in `stopping`
+  // forever (no idle-cap covers `stopping`). The epoch filter stays in force for
+  // `superseding` (a successor B owns) — that is the F1 supersede drop.
+  if (m.phase.name === "stopping" && isFinishEvent(event)) {
+    return to(m, { name: "idle" }, {
+      ctx: { runFact: null, liveFollow: false },
+      effects: [{ type: "disarmPoll" }, { type: "cancelReconnect" }],
+    });
+  }
+
   // I1: drop a stale outcome (an event issued under a superseded epoch).
   if ("epoch" in event && event.epoch !== undefined && event.epoch !== m.ctx.epoch) {
     return stay(m);
@@ -455,8 +481,10 @@ export function reduce(m: Machine, event: Event): Machine {
       // abort the local/attach reader. ALSO arm the poll so the terminal row is
       // observed — the exit is by DATA (I4: a terminal row / negative run-fact),
       // never by the stopRun HTTP response (which returns after abort, before
-      // finalization). For a local turn the onFinish FINISH_ABORT exits first and
-      // disarms; for an observer the poll drives to the aborted terminal.
+      // finalization). For a local turn the aborted stream's onFinish (ANY finish)
+      // is HONORED in `stopping` at the top of reduce() — regardless of generation
+      // — and exits to idle; the armed poll is the fallback for an observer stop
+      // with no local onFinish.
       return command(
         m,
         { name: "stopping" },

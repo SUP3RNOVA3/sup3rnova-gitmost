@@ -336,12 +336,26 @@ describe("run-fsm — stop (I4: exit by data)", () => {
     expect(effectTypes(m)).toEqual(expect.arrayContaining(["stopRun", "abortAttach"]));
   });
 
-  it("stopping exits on a terminal FINISH_ABORT (data), not on the stopRun response", () => {
-    let m = reduce(withRunFact(), { type: "STOP_REQUESTED" });
-    // No transition keys off the HTTP result — only the terminal finish moves us.
-    m = reduce(m, { type: "FINISH_ABORT", epoch: m.ctx.epoch });
+  it("stopping exits on the aborted stream's finish carrying the PRE-STOP epoch", () => {
+    // MEDIUM (#488 re-review): STOP_REQUESTED is a command that BUMPS the epoch, but
+    // the runtime stamps the aborted stream's onFinish with the stream's START (pre-
+    // stop) generation — exactly what the component sends. `stopping` must HONOR
+    // that finish regardless of generation (no idle-cap covers `stopping`).
+    // MUTATION-VERIFY: remove the honor-in-`stopping` branch and this hangs in
+    // `stopping` (the epoch filter drops the pre-stop finish) -> red.
+    const preStopEpoch = withRunFact().ctx.epoch; // E1 (the stream's start epoch)
+    let m = reduce(withRunFact(), { type: "STOP_REQUESTED" }); // E1 -> E2, stopping
+    expect(m.ctx.epoch).toBe(preStopEpoch + 1);
+    m = reduce(m, { type: "FINISH_ABORT", epoch: preStopEpoch }); // NOT the current epoch
     expect(m.phase.name).toBe("idle");
     expect(m.ctx.runFact).toBeNull();
+  });
+
+  it("stopping exits on a clean finish carrying the pre-stop epoch too", () => {
+    const preStopEpoch = withRunFact().ctx.epoch;
+    let m = reduce(withRunFact(), { type: "STOP_REQUESTED" });
+    m = reduce(m, { type: "FINISH_CLEAN", epoch: preStopEpoch });
+    expect(m.phase.name).toBe("idle");
   });
 
   it("stopping exits on a negative run-fact (data)", () => {

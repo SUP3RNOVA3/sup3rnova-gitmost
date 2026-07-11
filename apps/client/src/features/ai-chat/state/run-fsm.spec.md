@@ -59,7 +59,15 @@ Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 | `RUN_ALREADY_ACTIVE` (409 A_RUN_ALREADY_ACTIVE, plain POST) | sending | error(run-already-active) | — (composer offers supersede; NO auto-retry) |
 | `DISPOSE` (unmount) | any | idle **†** | `[abortAttach, cancelReconnect, disarmPoll]` (I1/I5 — epoch++ kills late callbacks) |
 
-**Epoch filter (I1):** the reducer FIRST drops any event carrying an `epoch` that
+**`stopping` honors any finish (re-review MEDIUM):** BEFORE the epoch filter, a
+stream finish (`FINISH_*`/`STREAM_INCOMPLETE`) arriving in phase `stopping` exits
+`stopping -> idle` regardless of generation. A plain Stop has no successor stream,
+so the aborted stream's finish IS the expected end (I4 exit by data) — and it
+carries the PRE-stop generation (STOP_REQUESTED bumped the epoch), so the filter
+would otherwise strand the machine in `stopping` (no idle-cap covers it). The filter
+stays in force for `superseding` (that is the F1 supersede drop).
+
+**Epoch filter (I1):** the reducer then drops any event carrying an `epoch` that
 does not equal the current `ctx.epoch`. Outcome events (`STREAM_START`, `ATTACH_*`,
 `RECONNECT_*`, `SUPERSEDE_*`, **`FINISH_*`/`STREAM_INCOMPLETE`**, `RUN_FACT`) are
 stamped with the generation the corresponding STREAM started under (the runtime

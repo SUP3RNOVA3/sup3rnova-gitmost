@@ -193,9 +193,11 @@ describe("ChatThread — send now", () => {
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
   });
 
-  // A streaming assistant message carrying the start-metadata runId -> the FSM
-  // adopts the run-fact so sendNow can interrupt via the server CAS.
-  const withRunId = () => {
+  // Drive a REAL live LOCAL stream with an active run-fact: a runId-bearing
+  // assistant message (mount adoption -> RUN_FACT) + a local send (SEND_LOCAL ->
+  // FSM `sending`, ownership local). sendNow reads LIVENESS off the FSM phase
+  // (LOW-1), so a faked SDK status alone is not enough — the stream must be real.
+  function startLocalStreamWithRun() {
     h.state.status = "streaming";
     h.state.messages = [
       {
@@ -205,11 +207,17 @@ describe("ChatThread — send now", () => {
         metadata: { runId: "run-1" },
       },
     ];
-  };
+    const view = renderThread({
+      autonomousRunsEnabled: true,
+      initialRows: settledTail(),
+    });
+    fireEvent.click(screen.getByTestId("send-btn")); // SEND_LOCAL -> FSM `sending`
+    h.state.sendMessage.mockClear();
+    return view;
+  }
 
   it("#488 commit 5 / F1: sendNow ABORTS stream A first, then sends B (CAS) only after A finalizes", async () => {
-    withRunId();
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now"));
     // F1: A is ABORTED, and B is NOT sent yet (no overlap).
@@ -237,8 +245,7 @@ describe("ChatThread — send now", () => {
   it("#488 F1: a superseded stream's LATE disconnect does NOT falsely reconnect (epoch stamp drops it)", async () => {
     // MUTATION-VERIFY: drop `epoch: stampEpoch` from the supersede-branch
     // FINISH_DISCONNECT dispatch and this goes red (A's disconnect -> reconnecting).
-    withRunId();
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, aborts A
     // A ends via isDisconnect (the server CAS closed it). The OLD overlap bug would
@@ -258,16 +265,7 @@ describe("ChatThread — send now", () => {
   });
 
   it("#488 commit 5: a supersede POST that 409s SUPERSEDE_TIMEOUT is returned as-is (NO retry ladder)", async () => {
-    h.state.status = "streaming";
-    h.state.messages = [
-      {
-        id: "a1",
-        role: "assistant",
-        parts: [{ type: "text", text: "x" }],
-        metadata: { runId: "run-1" },
-      },
-    ];
-    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, arms body
     // Consume the supersede body (as the SDK would) so the POST is the CAS one.
@@ -289,6 +287,45 @@ describe("ChatThread — send now", () => {
     // Exactly ONE fetch (the old bounded 409 retry ladder is gone).
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(res.status).toBe(409);
+  });
+
+  it("#488 LOW-1: sendNow when A has ALREADY settled (statusRef stale) sends immediately, not stuck superseding", () => {
+    startLocalStreamWithRun(); // FSM `sending`, mock status "streaming"
+    // A settles cleanly -> FSM `idle`. The mock status stays "streaming" (render-
+    // lagged), which the OLD statusRef gate would misread as "still live".
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "done" }] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    h.state.sendMessage.mockClear();
+    h.state.stop.mockClear();
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now"));
+    // The FSM phase (idle) is authoritative -> B is sent IMMEDIATELY, not routed
+    // into an aborting supersede that would strand the machine (A's second onFinish
+    // never comes) and lose the message.
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+    expect(h.state.stop).not.toHaveBeenCalled();
+  });
+
+  it("#488 LOW-2: a second Send now while a supersede is in flight is a no-op (first message not lost)", () => {
+    startLocalStreamWithRun();
+    fireEvent.click(screen.getByTestId("queue-btn")); // X
+    fireEvent.click(screen.getByTestId("queue-btn")); // Y
+    expect(screen.getAllByLabelText("Send now")).toHaveLength(2);
+    fireEvent.click(screen.getAllByLabelText("Send now")[0]); // supersede X -> superseding
+    expect(h.state.stop).toHaveBeenCalledTimes(1);
+    // Y is still queued; a second Send now must NOT clobber X or re-abort.
+    const remaining = screen.getAllByLabelText("Send now");
+    expect(remaining).toHaveLength(1);
+    fireEvent.click(remaining[0]);
+    expect(h.state.stop).toHaveBeenCalledTimes(1); // no second abort
+    // Y is still queued (kept, not lost, not sent).
+    expect(screen.getAllByLabelText("Remove queued message")).toHaveLength(1);
   });
 
   it("Send now is HIDDEN while observing a resumed run and VISIBLE on a local stream", () => {
