@@ -14,7 +14,10 @@ function run(m: Machine, ...events: Event[]): Machine {
   return events.reduce(reduce, m);
 }
 function withRunFact(runId = "run-1"): Machine {
-  return { ...initialMachine(), ctx: { epoch: 0, ownership: "local", runFact: { runId } } };
+  return {
+    ...initialMachine(),
+    ctx: { epoch: 0, ownership: "local", runFact: { runId }, liveFollow: false },
+  };
 }
 function effectTypes(m: Machine): string[] {
   return m.effects.map((e) => e.type);
@@ -138,6 +141,38 @@ describe("run-fsm — commit 3: repeated reconnect cycles", () => {
     expect(m.phase.name).toBe("reconnecting");
     if (m.phase.name === "reconnecting") expect(m.phase.attempt).toBe(1);
     expect(hasEffect(m, "scheduleReconnect")).toBe(true);
+  });
+
+  it("a MOUNT-attach observer drop falls to POLL, not the reconnect ladder", () => {
+    // Distinguishes commit 3 from a one-shot resume: an observer that never
+    // live-followed (liveFollow false) polls on a drop.
+    let m = reduce(initialMachine(), { type: "ATTACH_START", runId: "r" });
+    m = reduce(m, { type: "ATTACH_LIVE", epoch: m.ctx.epoch });
+    expect(m.ctx.ownership).toBe("observer");
+    expect(m.ctx.liveFollow).toBe(false);
+    m = reduce(m, { type: "FINISH_DISCONNECT", hasVisibleContent: true, epoch: m.ctx.epoch });
+    expect(m.phase.name).toBe("polling");
+    expect(hasEffect(m, "armPoll")).toBe(true);
+  });
+
+  it("STREAM_INCOMPLETE (observer starved/torn finish) → polling", () => {
+    let m = reduce(initialMachine(), { type: "ATTACH_START", runId: "r" });
+    m = reduce(m, { type: "ATTACH_LIVE", epoch: m.ctx.epoch });
+    m = reduce(m, { type: "STREAM_INCOMPLETE", reason: "starved", epoch: m.ctx.epoch });
+    expect(m.phase).toEqual({ name: "polling", reason: "starved" });
+    expect(hasEffect(m, "armPoll")).toBe(true);
+  });
+
+  it("liveFollow is set on the first local drop and kept across a re-attach", () => {
+    let m = withRunFact("run-3");
+    m = reduce(m, { type: "FINISH_DISCONNECT", hasVisibleContent: false, epoch: m.ctx.epoch });
+    expect(m.ctx.liveFollow).toBe(true);
+    m = reduce(m, { type: "RECONNECT_ATTEMPT", attempt: 1, epoch: m.ctx.epoch });
+    m = reduce(m, { type: "RECONNECT_ATTACHED", epoch: m.ctx.epoch });
+    expect(m.ctx.liveFollow).toBe(true); // kept — so a second drop reconnects
+    // A clean finish clears it.
+    m = reduce(m, { type: "FINISH_CLEAN", epoch: m.ctx.epoch });
+    expect(m.ctx.liveFollow).toBe(false);
   });
 
   it("RECONNECT_NONE backs off through the ladder, then fails at the cap", () => {
@@ -276,8 +311,8 @@ describe("run-fsm — commit 5: supersede CAS + error classification", () => {
   });
 
   it("RUN_SUPERSEDED (observer's run killed) → attaching + postRun(observer-follow)", () => {
-    const observer = { ...withRunFact("run-dead"), ctx: { epoch: 0, ownership: "observer" as const, runFact: { runId: "run-dead" } } };
-    const streaming: Machine = { phase: { name: "streaming" }, ctx: observer.ctx, effects: [] };
+    const ctx = { epoch: 0, ownership: "observer" as const, runFact: { runId: "run-dead" }, liveFollow: false };
+    const streaming: Machine = { phase: { name: "streaming" }, ctx, effects: [] };
     const m = reduce(streaming, { type: "RUN_SUPERSEDED" });
     expect(m.phase.name).toBe("attaching");
     expect(m.effects.find((e) => e.type === "postRun")).toEqual({

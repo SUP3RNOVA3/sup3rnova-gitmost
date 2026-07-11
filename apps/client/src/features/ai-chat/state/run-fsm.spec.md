@@ -18,7 +18,10 @@ the observable property) — see `run-fsm.test.ts`.
 
 Phases: `idle | sending | streaming | attaching | reconnecting(attempt,failed) |
 polling(reason) | stalled | stopping | superseding | error(kind)`.
-Context (orthogonal): `epoch`, `ownership: local|observer`, `runFact: {runId}|null`.
+Context (orthogonal): `epoch`, `ownership: local|observer`, `runFact: {runId}|null`,
+`liveFollow` (are we following a live run we locally streamed — the reconnect
+ladder — vs a one-shot mount-attach resume? both are `observer`, but a live-follow
+drop RE-ENTERS the ladder (#488 commit 3) while a mount-resume drop polls).
 
 Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 
@@ -28,8 +31,10 @@ Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 | `STREAM_START{runId}` (SDK `start` metadata) | sending, attaching, reconnecting, superseding | streaming | `[cancelReconnect, disarmPoll]`, runFact←runId |
 | `FINISH_CLEAN` (onFinish clean) | streaming, … | idle | `[disarmPoll, cancelReconnect]`, runFact←null |
 | `FINISH_ABORT` (onFinish isAbort) | streaming, stopping | idle | `[disarmPoll, cancelReconnect]`, runFact←null (I4 exits stopping by this DATA) |
-| `FINISH_DISCONNECT{hasVisibleContent}` (onFinish isDisconnect) | streaming | reconnecting(1) **†** *iff runFact* | `[scheduleReconnect(1)]` (+`armPoll(disconnect-visible)` if visible), ownership=observer |
-| `FINISH_DISCONNECT` (no runFact) | streaming | idle | runFact←null (plain terminal "connection lost") |
+| `FINISH_DISCONNECT` (observer, NOT liveFollow) | streaming(observer) | polling(disconnect-visible) | `[armPoll]` (a mount-resume drop polls) |
+| `FINISH_DISCONNECT{hasVisibleContent}` (local drop OR liveFollow) | streaming | reconnecting(1) **†** *iff runFact\|liveFollow* | `[scheduleReconnect(1)]` (+`armPoll` if visible), ownership=observer, liveFollow=true (commit 3: repeatable) |
+| `FINISH_DISCONNECT` (no runFact, not liveFollow) | streaming | idle | runFact←null (plain terminal "connection lost") |
+| `STREAM_INCOMPLETE{reason}` (observer starved/torn clean finish) | streaming(observer) | polling(reason) | `[armPoll(reason)]` |
 | `FINISH_ERROR{kind}` (onFinish isError) | any | error(kind) | `[disarmPoll, cancelReconnect]`, runFact←null |
 | `ATTACH_START{runId}` (mount resume) | idle | attaching **†** | `[resumeStream]`, ownership=observer, runFact←runId |
 | `ATTACH_LIVE` (attach GET 2xx) | attaching | streaming | — |
@@ -74,44 +79,40 @@ disconnects) carry no epoch.
 
 ---
 
-## 2. Ref-map — every `chat-thread.tsx` ref → its new home
+## 2. Ref-map — every `chat-thread.tsx` ref → its new home  (MIGRATION RESOLVED)
 
-(develop@363f20ab counted "26"; the branch already collapsed one during #486/#487,
-so 25 refs are present today. Each is classified below; the run-lifecycle FLAGS
-move into the FSM, the identity/data mirrors STAY as data — the post-merge rule
-forbids only new **lifecycle-flag** refs.)
+The migration is COMPLETE: the 13 run-lifecycle FLAGS below are GONE from
+`chat-thread.tsx` (collapsed into FSM phase/ctx/effects, or deleted). What remains
+are identity/data mirrors, effect-owned controllers/timers, and ONE React-liveness
+bit — none of which is a run-lifecycle flag, so the post-merge "no new flags" rule
+holds. **Pending column: empty.**
 
-| # | Ref | Classification | Notes |
+| # | Old ref | Resolved to | Where now |
 |---|---|---|---|
-| 1 | `reconcileTailRef` | **FSM** (polling phase) | "poll is driving the tail" is `phase=polling` |
-| 2 | `noStreamHandledRef` | **FSM ctx (epoch)** | one-shot 204 guard → epoch drops the stale second outcome |
-| 3 | `onNoActiveStreamRef` | **FSM effect** | the transport dispatches `ATTACH_NONE`; no ref-callback |
-| 4 | `onReconnectAttachedRef` | **FSM effect** | transport dispatches `RECONNECT_ATTACHED` / `ATTACH_LIVE` |
-| 5 | `resumedTurnRef` | **FSM ctx (ownership)** | `ownership==='observer'` ⇒ resumed turn ⇒ never flush |
-| 6 | `reconnectStateRef` | **FSM** (reconnecting phase) | `{trying,attempt}`/`{failed}` = `reconnecting(attempt,failed)` |
-| 7 | `reconnectTimerRef` | **FSM effect** | `scheduleReconnect`/`cancelReconnect` own the timer |
-| 8 | `flushOnAbortRef` | **FSM** (superseding/queue) | flush-on-abort is the superseding→READY / interrupt transition |
-| 9 | `interruptNextSendRef` | **FSM ctx** (interrupt tag) | tag carried by the supersede/interrupt transition, one-shot via epoch |
-| 10 | `supersedeRetryRef` | **REMOVED** (commit 5) | the client 409 retry ladder is deleted; CAS supersede replaces it |
-| 11 | `stopPendingRef` | **FSM** (stopping deferral) | deferred stop is a `STOP_REQUESTED` pended on run-fact adoption |
-| 12 | `mountedRef` | **FSM ctx (epoch)** + `DISPOSE` | unmount → `DISPOSE` bumps epoch; late callbacks dropped by I1 |
-| 13 | `attemptResumeRef` | **FSM** (ATTACH_START decision) | armed ONLY on a server-confirmed run-fact (commit 4b) |
-| 14 | `stripRef` | **data** (attachStrategy) | strip+replay strategy detail; effect-owned |
-| 15 | `strippedRowRef` | **data** (attachStrategy) | the anchor row; effect-owned, aborts in cleanup |
-| 16 | `attachAbortRef` | **FSM effect** (`abortAttach`) | controller owned by the attach effect, aborted in cleanup (I5) |
-| 17 | `chatIdRef` | **data** (identity mirror) | stays; live chat id for the transport body |
-| 18 | `openPageRef` | **data** | stays; live open-page for the send body |
-| 19 | `getEditorSelectionRef` | **data** | stays; live selection snapshotter |
-| 20 | `roleIdRef` | **data** | stays; live role id for the first send |
-| 21 | `stableIdRef` | **data** | stays; the useChat store key (mount-stable) |
-| 22 | `queuedRef` | **data** (queue) | stays; the queue is a data structure (decision #8) |
-| 23 | `sendMessageRef` | **data** | stays; latest `sendMessage` for the flush |
-| 24 | `statusRef` | **data** | stays; live SDK status mirror |
-| 25 | `lastForwardedChatIdRef` | **data** (one-shot forward) | stays; dedupes the chat-id forward |
+| 1 | `reconcileTailRef` | **FSM phase** | reconcile-merge gated on `phase ∈ {polling, reconnecting, stopping}` |
+| 2 | `noStreamHandledRef` | **FSM epoch (I1)** | the attach outcome's epoch guard drops the stale/second outcome |
+| 3 | `onNoActiveStreamRef` | **FSM event** | transport → `handleAttachOutcome` dispatches `ATTACH_NONE`/`RECONNECT_NONE` |
+| 4 | `onReconnectAttachedRef` | **FSM event** | transport dispatches `ATTACH_LIVE` / `RECONNECT_ATTACHED` |
+| 5 | `resumedTurnRef` + `resumedTurn` state | **FSM ctx `ownership`** | `ownership==='observer'` ⇒ never flush; hides "Send now" |
+| 6 | `reconnectStateRef` + `reconnectState` state | **FSM phase** | `reconnecting(attempt,failed)` renders the banner |
+| 7 | `reconnectTimerRef` | **effect-owned timer** | owned by `scheduleReconnect`/`cancelReconnect` effects (not a flag) |
+| 8 | `flushOnAbortRef` | **DELETED** | the stop→flush dance is replaced by the CAS supersede (commit 5) |
+| 9 | `interruptNextSendRef` | **DELETED** | the server injects the interrupt note from the supersede itself |
+| 10 | `supersedeRetryRef` | **DELETED** (commit 5) | the client 409 retry ladder is gone; CAS supersede replaces it |
+| 11 | `stopPendingRef` | **FSM phase `stopping`** | the deferred stop fires from the chat-id adoption effect while `stopping` |
+| 12 | `mountedRef` | **retained (React liveness)** | orthogonal to run-lifecycle; gates imperative onFinish side-effects post-unmount. Epoch (I1) handles stale COMMAND-outcomes; DISPOSE bumps it |
+| 13 | `attemptResumeRef` | **FSM `ATTACH_START` + run-fact** | mount arms attach ONLY on a confirmed active run (commit 4b: streaming-tail status, or POST /run for a user tail) |
+| 14 | `stripRef` | **data** (attachStrategy) | strip+replay detail; the `resumeStream` effect reads it |
+| 15 | `strippedRowRef` | **data** (attachStrategy) | the anchor row |
+| 16 | `attachAbortRef` | **effect-owned controller** | aborted by the `abortAttach` effect in cleanup (I5) |
+| 17–25 | `chatIdRef`, `openPageRef`, `getEditorSelectionRef`, `roleIdRef`, `stableIdRef`, `queuedRef`, `sendMessageRef`, `statusRef`, `lastForwardedChatIdRef` | **data** (identity/send mirrors) | unchanged — not lifecycle flags |
+| NEW | `pendingSupersedeRef` | **data** (send-plumbing) | the runId injected into the next `POST /stream {supersede}`; the single replacement for the 3 DELETED one-shots (#8/#9/#10) — net −2 refs |
+| NEW | `idleCapTimerRef` | **effect-owned timer** | the stalled inactivity cap → `POLL_IDLE_CAP` (commit 4a); not a flag |
 
-Run-lifecycle FLAGS eliminated by the FSM: #1–#13 (10 collapse into phase/ctx/effects;
-#10 is deleted). Identity/data mirrors (#14–#25 minus the two attach-strategy/effect
-items) intentionally stay — they are not lifecycle flags.
+Net: the 13 lifecycle flags (#1–#13) are eliminated (7 → FSM phase/ctx/epoch/event,
+3 deleted, `reconnectTimerRef`/`attachAbortRef` become effect-owned controllers,
+`mountedRef` retained as React liveness). Two effect-owned timers + one send-plumbing
+data ref are added — none is a boolean lifecycle latch.
 
 ---
 
