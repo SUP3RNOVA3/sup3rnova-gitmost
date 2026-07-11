@@ -120,41 +120,69 @@ describe("MarkdownClipboard handlePaste (async md -> PM)", () => {
 // doc-mutating transaction AFTER the synchronous claim but BEFORE flushing the
 // microtask that runs the `.then`/`.catch`.
 describe("MarkdownClipboard handlePaste — doc-changed-mid-flight guard", () => {
-  // Insert marker text at the doc start via a raw transaction (synchronous),
-  // changing `view.state.doc` so the captured range goes stale.
-  function mutateDoc(editor: Editor, marker: string) {
-    editor.view.dispatch(editor.view.state.tr.insertText(marker, 1));
+  // Replace the whole doc with one paragraph of `text` (synchronous dispatch).
+  // An empty string yields an empty paragraph (a text node may not be empty).
+  function seedContent(editor: Editor, text: string) {
+    editor.commands.setContent({
+      type: "doc",
+      content: [
+        text
+          ? { type: "paragraph", content: [{ type: "text", text }] }
+          : { type: "paragraph" },
+      ],
+    });
   }
 
-  it("success branch: a mid-flight doc change routes the paste to the live selection (no clobber, no throw)", async () => {
+  it("success branch: mid-flight doc change routes the paste to the LIVE selection, never the stale range (clobber-proving)", async () => {
+    // The paste captures a NON-EMPTY range {1,5} (over "AAAA"). Then, before the
+    // async resolve, the doc GROWS ("MARKER" inserted at the start) and the cursor
+    // is parked at the doc END. The captured {1,5} is now stale and points INTO
+    // "MARKER". A WORKING guard replaces at the live (end) selection → MARKER is
+    // untouched. A BROKEN guard replaces the stale {1,5} → it erases the first
+    // characters of MARKER (this is what a zero-width `from==to` range could never
+    // reveal, which is why the earlier version was vacuous).
     const editor = makeEditor();
+    seedContent(editor, "AAAABBBB");
+    editor.commands.setTextSelection({ from: 1, to: 5 }); // captured range = {1,5}
     const claimed = paste(editor, "hello **bold**");
     expect(claimed).toBe(true);
-    // Doc changes before the async replace runs: the captured from/to are stale.
-    mutateDoc(editor, "MARKER");
+
+    // Mid-flight: grow the doc and move the cursor to a KNOWN-safe end position.
+    editor.view.dispatch(editor.view.state.tr.insertText("MARKER", 1));
+    const end = editor.state.doc.content.size;
+    editor.commands.setTextSelection({ from: end, to: end });
     await flush();
 
     const text = editor.getText();
-    // The pre-existing marker survived (a stale-range replaceRange would have
-    // clobbered it) AND the pasted content landed.
+    // MARKER intact only if the guard used the live selection, not the stale range.
     expect(text).toContain("MARKER");
     expect(text).toContain("bold");
     expect(text).not.toContain("**");
     editor.destroy();
   });
 
-  it("fail-open branch: a mid-flight doc change + conversion failure re-inserts raw text at the live selection (no RangeError)", async () => {
+  it("fail-open branch: a mid-flight doc SHRINK makes the stale `to` out of bounds — the guard must avoid a RangeError (throw-proving)", async () => {
+    // The paste captures a range {1,9} over an 8-char paragraph, then the
+    // conversion FAILS (`# heading` -> a heading node the minimal schema lacks,
+    // so PMNode.fromJSON throws -> the fail-open catch runs). Before the reject,
+    // the doc is SHRUNK to an empty paragraph, so the captured `to` (9) is now far
+    // past the doc's end. A WORKING guard inserts the raw text at the live (valid)
+    // selection → "raw heading" lands. A BROKEN guard does insertText(md, 1, 9) on
+    // a size-2 doc → RangeError, so the dispatch never runs and "raw heading" is
+    // absent (the assertion reddens). A zero-width/growing-doc setup could never
+    // push `to` out of bounds, which is why the earlier version was vacuous.
     const editor = makeEditor();
-    // `# heading` -> a heading node the minimal schema lacks -> PMNode.fromJSON
-    // throws -> the fail-open catch runs, now with a changed doc.
+    seedContent(editor, "AAAABBBB");
+    editor.commands.setTextSelection({ from: 1, to: 9 }); // captured range = {1,9}
     paste(editor, "# raw heading");
-    mutateDoc(editor, "KEEP");
+
+    // Mid-flight: shrink the doc so the captured `to` = 9 is now out of bounds.
+    seedContent(editor, "");
     await flush();
 
     const text = editor.getText();
-    // No RangeError/unhandled rejection (the test would fail on a throw), the
-    // marker survived, and the raw text was preserved.
-    expect(text).toContain("KEEP");
+    // Raw text lands (via the live selection) only if the guard avoided the
+    // stale, now-out-of-bounds range.
     expect(text).toContain("raw heading");
     editor.destroy();
   });
