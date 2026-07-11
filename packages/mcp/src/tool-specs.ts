@@ -1963,13 +1963,17 @@ export const SHARED_TOOL_SPECS = {
       'value escaping) — a violation returns a structured error naming the rule ' +
       'and cellId so you can fix and retry. `where` positions the block like ' +
       'insertNode: position before/after (with exactly one of anchorNodeId or ' +
-      'anchorText) or append. Returns { nodeId, attachmentId, warnings }. The ' +
-      'returned `nodeId` is an index-based "#<index>" handle (drawio nodes carry ' +
-      'no attrs.id): it addresses the new top-level block and can be fed straight ' +
-      'back into drawioGet / drawioUpdate for THIS document. It is positional, ' +
-      'so if you add or remove blocks before it, re-resolve via getOutline. The ' +
-      'diagram is editable in the draw.io editor and can be re-read with ' +
-      'drawioGet.' +
+      'anchorText) or append. Returns { nodeId, attachmentId, warnings }. On a ' +
+      'top-level insert the returned `nodeId` is an index-based "#<index>" handle ' +
+      '(drawio nodes carry no attrs.id): it addresses the new block and can be fed ' +
+      'straight back into drawioGet / drawioUpdate for THIS document. It is ' +
+      'positional, so if you add or remove blocks before it, re-resolve via ' +
+      'getOutline. When the block lands NESTED (e.g. anchored inside a callout or ' +
+      'table cell), "#<index>" cannot address it, so `nodeId` is `null` — the ' +
+      'write STILL SUCCEEDED (success:true, a warning explains this); do NOT ' +
+      're-create it. Re-read or edit that nested diagram by locating it via ' +
+      'getOutline / getPageJson using the returned attachmentId. The diagram is ' +
+      'editable in the draw.io editor and can be re-read with drawioGet.' +
       DRAWIO_HARD_RULES,
     tier: 'deferred',
     catalogLine:

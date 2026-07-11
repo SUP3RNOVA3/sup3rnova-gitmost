@@ -732,20 +732,32 @@ export async function acquireCollabSession(
   // until there is room. PREFER an IDLE victim (#494): a session with an in-flight
   // mutate may have already sent (and persisted) its update, so evicting it would
   // reject that write as a FALSE failure → a retry-prone agent re-issues it →
-  // DUPLICATE write (the #435 class). So walk LRU order and skip busy sessions,
-  // evicting the oldest IDLE one. Only when EVERY cached session is busy (eviction
-  // unavoidable to admit this write) do we evict the LRU busy one — via
-  // evictForCap(), which rejects its in-flight op with a tagged INDETERMINATE
+  // DUPLICATE write (the #435 class). So walk LRU order and skip non-idle sessions,
+  // evicting the oldest IDLE one. Only when EVERY cached session is non-idle (eviction
+  // unavoidable to admit this write) do we evict the LRU non-idle one — via
+  // evictForCap(), which rejects an in-flight op with a tagged INDETERMINATE
   // "verify before retry" error rather than a plain failure.
+  //
+  // "Non-idle" = busy OR still opening. `sessions.set(key)` below runs BEFORE the
+  // `await session.open()` that resolves it, so a `connecting` session is in the
+  // map while its handshake is still in flight. Such a session is NOT busy yet
+  // (isBusy() needs an in-flight mutate), but it is ALSO not a legitimate idle
+  // victim: in multi-user HTTP two acquires for DIFFERENT pages interleave across
+  // that await, and under saturation the second acquire would otherwise pick the
+  // first's freshly-inserted `connecting` session as an "idle" victim and destroy
+  // it, rejecting the first's pending open() as "evicted (LRU cap)" — a spurious
+  // failure of a write that never even started. So exclude `state !== "ready"`
+  // from the idle scan; a connecting session falls into the last-resort bucket and
+  // is evicted ONLY when every other entry is busy-or-connecting too.
   while (sessions.size >= cfg.maxEntries) {
     let idleKey: string | undefined;
     let oldestBusyKey: string | undefined;
     for (const [k, s] of sessions) {
-      if (s.isBusy()) {
+      if (s.isBusy() || s.state !== "ready") {
         if (oldestBusyKey === undefined) oldestBusyKey = k;
         continue;
       }
-      idleKey = k; // first (LRU) idle session
+      idleKey = k; // first (LRU) genuinely-idle session
       break;
     }
     const victimKey = idleKey ?? oldestBusyKey;

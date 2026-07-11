@@ -22,14 +22,14 @@
  * inline markdown (`**bold**`, `` `code` ``, `[t](u)`), the raw locator will not
  * match the document's plain text. Exactly like editPageText's json-edit
  * fallback, we first try the verbatim selection and, ONLY if it anchors nowhere
- * in the whole document, retry with `stripInlineMarkdown` applied. `canAnchorInDoc`,
- * `getAnchoredText` and `applyAnchorInDoc` share this decision via
- * `resolveAnchorSelection`. `countAnchorMatches` keeps its OWN parallel exact-wins
- * implementation (it needs a raw match COUNT, not a single resolved locator), kept
- * deliberately in sync with `resolveAnchorSelection`: raw match ⇒ use raw, else fall
- * back to the stripped count. All four therefore agree on which locator matched —
- * the suggestion-uniqueness gate depends on count and can/get never disagreeing, so
- * these two exact-wins implementations MUST stay in sync if either is changed.
+ * in the whole document, retry with `stripInlineMarkdown` applied. All four entry
+ * points — `canAnchorInDoc`, `getAnchoredText`, `applyAnchorInDoc` and
+ * `countAnchorMatches` — share this exact-wins / strip-fallback decision through the
+ * SINGLE resolver `resolveAnchorSelection`; there is no second copy of the control
+ * flow. `countAnchorMatches` just asks the resolver which selection form wins and
+ * returns the raw occurrence count of that winning form. Because count and anchor
+ * derive from the same resolver, the suggestion-uniqueness gate (which depends on
+ * count) can never disagree with what actually anchors.
  */
 
 import { stripInlineMarkdown } from "./text-normalize.js";
