@@ -371,6 +371,76 @@ export class CommentService {
   }
 
   /**
+   * Re-sync a suggestion's stored `selection` (== apply-time expectedText) to the
+   * RAW substring the inline mark actually covers in the LIVE document (#496).
+   *
+   * The MCP client creates the comment from a DEBOUNCED REST snapshot, then
+   * anchors the mark in the live collab doc. When the two disagree (the doc moved
+   * on in the debounce window) the stored selection no longer equals the marked
+   * text, so EVERY apply 409s ("the commented text changed"). After anchoring the
+   * client re-reads the exact marked substring and calls this to store it, making
+   * apply's strict equality hold.
+   *
+   * Only meaningful for an un-settled top-level suggestion authored by the
+   * caller: applying/resolving freezes the anchor, and a reply-carrying thread is
+   * preserved rather than mutated. The new text must still differ from the
+   * suggestion (else "apply" would be a no-op), preserving create()'s invariant.
+   */
+  async resyncSuggestionAnchor(
+    comment: Comment,
+    selection: string,
+    user: User,
+  ): Promise<Comment> {
+    if (comment.creatorId !== user.id) {
+      throw new ForbiddenException(
+        'You can only re-anchor your own suggestion',
+      );
+    }
+    if (comment.parentCommentId) {
+      throw new BadRequestException(
+        'Only a top-level comment can carry a suggested edit',
+      );
+    }
+    if (!comment.suggestedText) {
+      throw new BadRequestException('This comment has no suggested edit');
+    }
+    // A settled suggestion's anchor is frozen: re-anchoring an applied/resolved
+    // thread is meaningless and could resurrect a stale expectedText.
+    if (comment.suggestionAppliedAt || comment.resolvedAt) {
+      throw new BadRequestException(
+        'Cannot re-anchor a suggestion that was already applied or resolved',
+      );
+    }
+    const trimmed = selection.trim();
+    if (trimmed.length === 0) {
+      throw new BadRequestException('The re-anchored selection cannot be empty');
+    }
+    // Same no-op guard as create(): the suggestion must differ from the text it
+    // replaces, or apply becomes indistinguishable from already-applied.
+    if (trimmed === comment.suggestedText.trim()) {
+      throw new BadRequestException(
+        'A suggested edit must differ from the selected text',
+      );
+    }
+
+    // Idempotent: nothing to persist when the anchor already matches.
+    if (comment.selection === selection) {
+      return comment;
+    }
+
+    await this.commentRepo.updateComment({ selection }, comment.id);
+
+    const updatedComment = await this.commentRepo.findById(comment.id, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
+
+    // Re-anchoring only corrects stored metadata; it does not change the page
+    // text or the comment body, so no ws broadcast / notification is warranted.
+    return updatedComment;
+  }
+
+  /**
    * Apply the suggested edit carried by a top-level inline comment: atomically
    * replace the text under the comment mark in the collaborative document with
    * the comment's suggestedText, then stamp the applied fields and auto-resolve

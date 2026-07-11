@@ -554,6 +554,189 @@ test("suggestedText: the stored selection is the doc's RAW typographic substring
 });
 
 // -----------------------------------------------------------------------------
+// 8b) #496: the DEBOUNCED REST snapshot (pages/info) DIFFERS from the LIVE collab
+//     doc (mutatePage) — the doc moved on in the debounce window. The stored
+//     selection is captured from the snapshot at create time, but the mark is set
+//     in the live doc, so apply would 409 forever. After anchoring, the client
+//     re-reads the RAW substring under the mark from the LIVE doc and POSTs it to
+//     /comments/resync-suggestion-anchor so the stored expectedText matches.
+// -----------------------------------------------------------------------------
+test("suggestion: re-syncs the stored selection to the LIVE doc substring when the REST snapshot lagged", async () => {
+  let createPayload = null;
+  let resyncPayload = null;
+
+  const { baseURL } = await spawn(async (req, res) => {
+    const raw = await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    if (req.url === "/api/pages/info") {
+      // DEBOUNCED snapshot: ASCII quotes (stale — the live doc has since been
+      // typographically corrected).
+      sendJson(res, 200, {
+        data: {
+          id: "33333333-3333-3333-3333-333333333333",
+          content: {
+            type: "doc",
+            content: [
+              {
+                type: "paragraph",
+                content: [{ type: "text", text: 'he said "hello" loudly' }],
+              },
+            ],
+          },
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/create") {
+      createPayload = JSON.parse(raw);
+      sendJson(res, 200, {
+        data: {
+          id: "cmt-resync-1",
+          content: createPayload.content,
+          selection: createPayload.selection,
+          suggestedText: createPayload.suggestedText,
+          type: createPayload.type,
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/resync-suggestion-anchor") {
+      resyncPayload = JSON.parse(raw);
+      sendJson(res, 200, { data: { id: "cmt-resync-1" } });
+      return;
+    }
+    sendJson(res, 404, { message: "not found" });
+  });
+
+  class TestClient extends DocmostClient {
+    async getCollabTokenWithReauth() {
+      return "collab-token";
+    }
+    async resolvePageId() {
+      return "33333333-3333-3333-3333-333333333333";
+    }
+    async mutatePage(pageId, collabToken, apiUrl, transform) {
+      // LIVE doc: SMART quotes (what the mark is actually set over).
+      const doc = {
+        type: "doc",
+        content: [
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: "he said “hello” loudly" }],
+          },
+        ],
+      };
+      const out = transform(doc);
+      return { doc: out, verify: { ok: true } };
+    }
+  }
+
+  const client = new TestClient(baseURL, "user@example.com", "pw");
+
+  const result = await client.createComment(
+    "33333333-3333-3333-3333-333333333333",
+    "please change",
+    "inline",
+    '"hello"', // ASCII quotes
+    undefined,
+    "goodbye",
+  );
+
+  assert.equal(result.success, true);
+  assert.equal(result.anchored, true);
+  // Create stored the STALE snapshot substring (ASCII quotes).
+  assert.equal(createPayload.selection, '"hello"');
+  // …then the client re-synced to the LIVE marked substring (smart quotes).
+  assert.ok(resyncPayload, "/comments/resync-suggestion-anchor must be called");
+  assert.equal(resyncPayload.commentId, "cmt-resync-1");
+  assert.equal(resyncPayload.selection, "“hello”");
+  // The returned comment reflects the corrected anchor.
+  assert.equal(result.data.selection, "“hello”");
+});
+
+// -----------------------------------------------------------------------------
+// 8c) #496: when the REST snapshot and the LIVE doc AGREE, no resync round-trip
+//     is made (the common case must stay a single write).
+// -----------------------------------------------------------------------------
+test("suggestion: no resync call when the snapshot already matches the live doc", async () => {
+  let resyncCalls = 0;
+
+  const { baseURL } = await spawn(async (req, res) => {
+    const raw = await readBody(req);
+    if (req.url === "/api/auth/login") {
+      sendJson(res, 200, { success: true }, {
+        "Set-Cookie": "authToken=t; Path=/; HttpOnly",
+      });
+      return;
+    }
+    if (req.url === "/api/pages/info") {
+      sendJson(res, 200, {
+        data: {
+          id: "44444444-4444-4444-4444-444444444444",
+          content: {
+            type: "doc",
+            content: [
+              { type: "paragraph", content: [{ type: "text", text: "Hello brave world" }] },
+            ],
+          },
+        },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/create") {
+      const p = JSON.parse(raw);
+      sendJson(res, 200, {
+        data: { id: "cmt-nosync-1", content: p.content, selection: p.selection, suggestedText: p.suggestedText, type: p.type },
+      });
+      return;
+    }
+    if (req.url === "/api/comments/resync-suggestion-anchor") {
+      resyncCalls++;
+      sendJson(res, 200, { data: {} });
+      return;
+    }
+    sendJson(res, 404, { message: "not found" });
+  });
+
+  class TestClient extends DocmostClient {
+    async getCollabTokenWithReauth() {
+      return "collab-token";
+    }
+    async resolvePageId() {
+      return "44444444-4444-4444-4444-444444444444";
+    }
+    async mutatePage(pageId, collabToken, apiUrl, transform) {
+      const doc = {
+        type: "doc",
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "Hello brave world" }] },
+        ],
+      };
+      const out = transform(doc);
+      return { doc: out, verify: { ok: true } };
+    }
+  }
+
+  const client = new TestClient(baseURL, "user@example.com", "pw");
+  const result = await client.createComment(
+    "44444444-4444-4444-4444-444444444444",
+    "rename",
+    "inline",
+    "brave",
+    undefined,
+    "bold",
+  );
+
+  assert.equal(result.anchored, true);
+  assert.equal(resyncCalls, 0, "matching snapshot must NOT trigger a resync round-trip");
+});
+
+// -----------------------------------------------------------------------------
 // 8) #408: a not-found selection error QUOTES the closest block text so the
 //    model can self-correct instead of blind-retrying.
 // -----------------------------------------------------------------------------
