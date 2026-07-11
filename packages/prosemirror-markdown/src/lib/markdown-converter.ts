@@ -1492,11 +1492,16 @@ export function convertProseMirrorToMarkdown(
         }
         let t = escapeHtmlText(n.text || "");
         // #515: wrap `<code>` INNERMOST first (before the array-order mark loop),
-        // then skip `code` in the loop. Import (`generateJSON`) always yields the
-        // code mark LAST in the array (canonical order `[emphasis, code]`), so an
-        // order-sensitive loop would flip `<strong><code>` to `<code><strong>` on
-        // re-export and break the byte fixpoint. Code-innermost is stable in both
-        // directions and matches the markdown path (case "text" / run factoring).
+        // then skip `code` in the loop. The imported mark order is NOT fixed — it
+        // DEPENDS on the emphasis extension: import (`generateJSON`) yields code
+        // LAST for bold/italic/strike (`[emphasis, code]`) but code FIRST for the
+        // `==`-highlight extension (`[code, highlight]`). So we cannot rely on a
+        // fixed array position; the invariant is instead "wrap `<code>` innermost
+        // regardless of the imported order". That keeps `<code>` nested inside the
+        // emphasis tag both directions (preserving the byte fixpoint — an order-
+        // sensitive loop would flip `<strong><code>`↔`<code><strong>` depending on
+        // which order it happened to see) and matches the markdown path (case
+        // "text" / run factoring).
         if ((n.marks || []).some((m: any) => m.type === "code")) {
           t = `<code>${t}</code>`;
         }

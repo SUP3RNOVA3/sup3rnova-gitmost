@@ -143,8 +143,10 @@ export const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // #515: code COMBINED with a bare-delimiter emphasis mark. The converter nests
   // the backtick span inside the emphasis delimiters (`` **`x`** ``) and, when
   // such runs sit adjacent, factors a shared mark or falls back to schema-HTML.
-  // Mark order is `[emphasis, code]` — the canonical order the HTML->PM import
-  // yields (code last) — so the P1 semantic round-trip is order-exact.
+  // Mark order here is `[emphasis, code]` — the order the HTML->PM import yields
+  // for bold/italic/strike specifically (code last). This is NOT universal: the
+  // `==`-highlight case below imports code FIRST — so match each case to its own
+  // imported order for the order-exact P1 round-trip (do not assume a fixed order).
   fc
     .tuple(safeTextArb, fc.constantFrom('bold', 'italic', 'strike'))
     .map(([t, m]) => ({ type: 'text', text: t, marks: [{ type: m }, { type: 'code' }] })),
