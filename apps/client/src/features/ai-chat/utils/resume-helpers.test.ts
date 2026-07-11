@@ -109,4 +109,37 @@ describe("mergeById", () => {
     expect(mergeById(prev, null)).toBe(prev);
     expect(mergeById(prev, undefined)).toBe(prev);
   });
+
+  // #491 CONTRACT: the delta poll's overlap window GUARANTEES the same row is
+  // re-delivered across close polls, so merging must be IDEMPOTENT by id — merging
+  // the same row (or an equal-length list of rows) twice must not duplicate or
+  // reorder. This is the property the whole delta-poll design leans on; a
+  // regression here would re-introduce duplicate assistant bubbles on every poll.
+  it("is idempotent by id: re-merging the same row does not duplicate or reorder", () => {
+    const seed = [makeMsg("u1", "hi"), makeMsg("a1", "step 1")];
+    const repeat = makeMsg("a1", "step 1"); // the SAME row the overlap re-delivers
+    const once = mergeById(seed, repeat);
+    const twice = mergeById(once, repeat);
+    const thrice = mergeById(twice, repeat);
+    // Length is stable (no growth), order is stable (user then assistant).
+    expect(once.map((m) => m.id)).toEqual(["u1", "a1"]);
+    expect(twice.map((m) => m.id)).toEqual(["u1", "a1"]);
+    expect(thrice.map((m) => m.id)).toEqual(["u1", "a1"]);
+    // The repeated merge converges: the row is replaced in place, never appended.
+    expect(twice[1]).toBe(repeat);
+  });
+
+  it("is idempotent across a batch of repeated + grown rows (delta re-delivery)", () => {
+    // A delta poll re-delivers a1 (unchanged) and a2 (grown one step). Applying the
+    // batch twice must equal applying it once — the poll can re-send either.
+    const start = [makeMsg("u1", "hi"), makeMsg("a1", "done")];
+    const batch = [makeMsg("a1", "done"), makeMsg("a2", "grown step 2")];
+    const apply = (list: typeof start) =>
+      batch.reduce((acc, row) => mergeById(acc, row), list);
+    const once = apply(start);
+    const twice = apply(once);
+    expect(once.map((m) => m.id)).toEqual(["u1", "a1", "a2"]);
+    expect(twice.map((m) => m.id)).toEqual(["u1", "a1", "a2"]);
+    expect(twice).toEqual(once);
+  });
 });

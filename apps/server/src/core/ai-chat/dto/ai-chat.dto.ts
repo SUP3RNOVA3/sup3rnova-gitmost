@@ -37,6 +37,21 @@ export class GetChatMessagesDto {
   cursor?: string;
 }
 
+/**
+ * Delta poll (#491): pull the chat's rows changed since `cursor` (a DB-clock
+ * timestamp from the previous poll) plus the current run fact — the degraded-poll
+ * fallback's payload, replacing the full infinite-query refetch. Omit `cursor` on
+ * the first poll (returns just a fresh cursor to start the chain).
+ */
+export class GetChatDeltaDto {
+  @IsString()
+  chatId: string;
+
+  @IsOptional()
+  @IsString()
+  cursor?: string;
+}
+
 /** Resolve the chat bound to a document (the page's most-recent owned chat). */
 export class BoundChatDto {
   @IsString()

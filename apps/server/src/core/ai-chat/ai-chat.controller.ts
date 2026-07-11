@@ -51,6 +51,7 @@ import {
   ChatIdDto,
   ExportChatDto,
   GeneratePageTitleDto,
+  GetChatDeltaDto,
   GetChatMessagesDto,
   GetRunDto,
   RenameChatDto,
@@ -147,6 +148,46 @@ export class AiChatController {
       workspace.id,
       pagination,
     );
+  }
+
+  /**
+   * Delta poll (#491) — the degraded-poll fallback's payload. Returns the chat's
+   * message rows changed since `cursor` (a DB-clock timestamp from the previous
+   * poll), a FRESH cursor, AND the current run fact `{ id, status } | null`. This
+   * replaces the old degraded poll that refetched ALL infinite-query pages (full
+   * parts) every 2.5s: the client seeds once and thereafter merges only the
+   * deltas by id (the overlap window guarantees repeats — the merge is idempotent,
+   * see mergeById). The run fact rides IN the delta (a separate /run poll would
+   * double the poll QPS), so the client FSM gets the run's status on the same tick.
+   * Owner-gated via assertOwnedChat (same gate as the other read endpoints).
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('messages/delta')
+  async getMessagesDelta(
+    @Body() dto: GetChatDeltaDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{
+    rows: AiChatMessage[];
+    cursor: string;
+    run: { id: string; status: string } | null;
+  }> {
+    await this.assertOwnedChat(dto.chatId, user, workspace);
+    const { rows, cursor } =
+      await this.aiChatMessageRepo.findByChatUpdatedAfter(
+        dto.chatId,
+        workspace.id,
+        dto.cursor ?? null,
+      );
+    const run = await this.aiChatRunService.getLatestForChat(
+      dto.chatId,
+      workspace.id,
+    );
+    return {
+      rows,
+      cursor,
+      run: run ? { id: run.id, status: run.status } : null,
+    };
   }
 
   /**
