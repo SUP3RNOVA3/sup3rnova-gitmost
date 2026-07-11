@@ -313,6 +313,18 @@ export default function ChatThread({
   // (like chatIdRef/roleIdRef), the single replacement for the three REMOVED
   // one-shot flags flushOnAbortRef/interruptNextSendRef/supersedeRetryRef.
   const pendingSupersedeRef = useRef<string | null>(null);
+  // #488 F1: the interrupt-and-send text, held until the superseded stream A has
+  // FULLY finalized (its SDK `finally` cleared `activeResponse`) — only THEN is
+  // stream B started, so A cannot corrupt B (ai@6 AbstractChat.makeRequest reads
+  // `this.activeResponse.state.message` in its finally and then nulls it, so an
+  // overlapping B is clobbered). Send-plumbing DATA, not a lifecycle flag.
+  const pendingSupersedeTextRef = useRef<string | null>(null);
+  // #488 F1: the epoch under which the CURRENTLY-OWNED stream started, used to
+  // STAMP its onFinish (I1). A superseded/dead stream's late finish carries an OLD
+  // generation and is dropped by the reducer, so it cannot drive the live machine
+  // into a false reconnect or reset its run-fact. Set at each honored stream start
+  // (local send, resume/reconnect attach, the supersede B-send).
+  const turnEpochRef = useRef(0);
 
   // --- Effect runner: executes the reducer's command effects ---------------
   const runEffect = useCallback(
@@ -324,6 +336,9 @@ export default function ChatThread({
           // seed already stripped it), so the live replay's text-start rebuilds it
           // without duplicating parts (#430).
           pendingAttachEpochRef.current = epoch;
+          // The resumed stream's onFinish is stamped with THIS attach generation
+          // (F1), so a superseded attempt's late finish is dropped.
+          turnEpochRef.current = epoch;
           if (machineRef.current.phase.name === "reconnecting") {
             const anchor = strippedRowRef.current;
             if (anchor)
@@ -415,6 +430,8 @@ export default function ChatThread({
   // FIFO dequeue + local send of the next queued message (no-op when empty).
   const localSend = useCallback((text: string) => {
     dispatchRef.current({ type: "SEND_LOCAL" });
+    // F1: this local stream's onFinish is stamped with the just-bumped generation.
+    turnEpochRef.current = epochRef.current;
     sendMessageRef.current?.({ text });
   }, []);
   const flushNext = useCallback(() => {
@@ -581,6 +598,10 @@ export default function ChatThread({
     transport,
     experimental_throttle: STREAM_THROTTLE_MS,
     onFinish: ({ message, isAbort, isDisconnect, isError }) => {
+      // #488 F1: STAMP this finish with the generation the stream STARTED under
+      // (I1). A superseded/dead stream's late finish carries an OLD generation and
+      // is dropped by the reducer, so it cannot drive the live machine.
+      const stampEpoch = turnEpochRef.current;
       // Ownership (I2) is the FSM ctx: a resumed/attached/reconnected turn is an
       // OBSERVER; a local send is the owner. The queue flushes ONLY under local
       // ownership; an observer never flushes (invariant 7).
@@ -589,22 +610,50 @@ export default function ChatThread({
       // for #161); fires even while unmounting.
       onTurnFinished(extractServerChatId(message), threadKey);
 
+      // A missing message (a pre-first-frame break) has no visible content.
+      const msgHasVisible = message
+        ? assistantMessageHasVisibleContent(message)
+        : false;
+
+      // #488 F1: the SUPERSEDED stream A just finalized (we are still `superseding`
+      // and stream B has not been sent yet). Record A's terminal outcome STAMPED —
+      // I1 drops it (superseding bumped the epoch), so A cannot drive a false
+      // reconnect / reset the run-fact — then start B NOW that A is fully done. B is
+      // deferred to a microtask so A's SDK `finally` (`activeResponse = void 0`)
+      // runs BEFORE B's makeRequest sets `activeResponse`, else the dying A clobbers
+      // B (ai@6). This is the no-overlap guarantee the CAS supersede needs.
+      if (
+        machineRef.current.phase.name === "superseding" &&
+        pendingSupersedeTextRef.current !== null
+      ) {
+        if (isError) dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        else if (isAbort) dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
+        else if (isDisconnect)
+          dispatch({ type: "FINISH_DISCONNECT", hasVisibleContent: msgHasVisible, epoch: stampEpoch });
+        else dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
+        const text = pendingSupersedeTextRef.current;
+        pendingSupersedeTextRef.current = null;
+        setStopNotice(null);
+        queueMicrotask(() => {
+          if (!mountedRef.current) return;
+          turnEpochRef.current = epochRef.current; // B's (superseding) generation
+          sendMessageRef.current?.({ text });
+        });
+        return;
+      }
+
       if (isError) {
-        dispatch({ type: "FINISH_ERROR", kind: "stream" });
+        dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
         setStopNotice(null);
         return;
       }
       if (isAbort) {
         // A user Stop / an interrupt abort finished. The FSM stopping/idle exit is
         // by DATA (this terminal outcome, I4).
-        dispatch({ type: "FINISH_ABORT" });
+        dispatch({ type: "FINISH_ABORT", epoch: stampEpoch });
         setStopNotice("manual");
         return;
       }
-      // A missing message (a pre-first-frame break) has no visible content.
-      const msgHasVisible = message
-        ? assistantMessageHasVisibleContent(message)
-        : false;
       if (isDisconnect) {
         if (wasObserver) {
           // A resumed/attached OBSERVER stream dropped. Recover via the degraded
@@ -624,6 +673,7 @@ export default function ChatThread({
             dispatch({
               type: "FINISH_DISCONNECT",
               hasVisibleContent: hasVisible,
+              epoch: stampEpoch,
             });
           }
           setStopNotice(null);
@@ -659,10 +709,15 @@ export default function ChatThread({
           dispatch({
             type: "FINISH_DISCONNECT",
             hasVisibleContent: msgHasVisible,
+            epoch: stampEpoch,
           });
           setStopNotice(null);
         } else {
-          dispatch({ type: "FINISH_DISCONNECT", hasVisibleContent: false });
+          dispatch({
+            type: "FINISH_DISCONNECT",
+            hasVisibleContent: false,
+            epoch: stampEpoch,
+          });
           setStopNotice("disconnect");
         }
         return;
@@ -680,17 +735,17 @@ export default function ChatThread({
             queryClient.invalidateQueries({
               queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
             });
-            dispatch({ type: "STREAM_INCOMPLETE", reason: "starved" });
+            dispatch({ type: "STREAM_INCOMPLETE", reason: "starved", epoch: stampEpoch });
           } else {
             // Healthy resumed finish — nothing to restore/arm, just settle.
-            dispatch({ type: "FINISH_CLEAN" });
+            dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
           }
         }
         setStopNotice(null);
         return;
       }
       // Local clean finish: settle + flush the queue (gated on liveness, #486).
-      dispatch({ type: "FINISH_CLEAN" });
+      dispatch({ type: "FINISH_CLEAN", epoch: stampEpoch });
       setStopNotice(null);
       if (mountedRef.current) flushNext();
     },
@@ -730,9 +785,16 @@ export default function ChatThread({
       if (machineRef.current.phase.name === "stopping")
         onServerStopRef.current?.(serverChatId);
     }
+    // #488 F4: the FIRST assistant frame of a LOCAL turn moves the FSM
+    // `sending -> streaming` (and adopts the runId), matching the spec's
+    // STREAM_START transition. Later frames / observer turns (already streaming)
+    // just refresh the run-fact.
     const runId = extractRunId(tail);
-    if (runId && machineRef.current.ctx.runFact?.runId !== runId)
+    if (machineRef.current.phase.name === "sending") {
+      dispatch({ type: "STREAM_START", runId, epoch: epochRef.current });
+    } else if (runId && machineRef.current.ctx.runFact?.runId !== runId) {
       dispatch({ type: "RUN_FACT", runFact: { runId } });
+    }
   }, [messages, onServerChatId, dispatch]);
 
   // Live "turn was interrupted" marker (a manual Stop vs a dropped connection — a
@@ -839,9 +901,16 @@ export default function ChatThread({
         runId !== "pending"
       ) {
         // CAS supersede: the server stops the old run + starts this one atomically.
+        // #488 F1: do NOT start stream B synchronously here — the local stream A is
+        // still live, and overlapping streams corrupt each other in ai@6 (A's
+        // `finally` reads/ nulls the shared `activeResponse`). Instead ABORT A now
+        // and stash the text; A's onFinish (dropped by the epoch stamp) starts B in
+        // a microtask, AFTER A is fully finalized (no overlap). The POST then
+        // carries the supersede body (pendingSupersedeRef, armed by the effect).
         setQueue(removeQueuedById(queuedRef.current, id));
+        pendingSupersedeTextRef.current = msg.text;
         dispatch({ type: "SUPERSEDE_REQUESTED", targetRunId: runId });
-        sendMessageRef.current?.({ text: msg.text }); // POST carries supersede body
+        stopFnRef.current?.(); // abort A -> its onFinish sends B
         return;
       }
       if (liveStreaming) {

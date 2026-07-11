@@ -113,7 +113,7 @@ export interface Machine {
 
 export type Effect =
   /** POST /run to (re)establish or verify the run-fact. `reason` is diagnostic. */
-  | { type: "postRun"; reason: "mount" | "verify" | "observer-follow" }
+  | { type: "postRun"; reason: "mount" | "verify" }
   /** Trigger the SDK `resumeStream()` (attach GET via prepareReconnectToStream). */
   | { type: "resumeStream" }
   /** Schedule a reconnect attempt after a backoff, then dispatch RECONNECT_ATTEMPT. */
@@ -153,15 +153,12 @@ export type Event =
   | { type: "ATTACH_START"; runId?: string }
   | { type: "ATTACH_LIVE"; epoch?: number }
   | { type: "ATTACH_NONE"; epoch?: number }
-  // -- reconnect after a live disconnect --
-  /** #488 commit 2: entered by the RUN-FACT, not by an assistant message. */
-  | { type: "RECONNECT_BEGIN" }
+  // -- reconnect after a live disconnect (entered by FINISH_DISCONNECT, #488 c2) --
   | { type: "RECONNECT_ATTEMPT"; attempt: number; epoch?: number }
   | { type: "RECONNECT_ATTACHED"; epoch?: number }
   | { type: "RECONNECT_NONE"; epoch?: number }
   | { type: "RETRY" }
   // -- degraded poll --
-  | { type: "POLL_ACTIVITY" }
   | { type: "POLL_TERMINAL" }
   | { type: "POLL_IDLE_CAP" }
   // -- run-fact (server-confirmed active run) --
@@ -175,10 +172,6 @@ export type Event =
   | { type: "SUPERSEDE_TIMEOUT"; epoch?: number }
   | { type: "SUPERSEDE_INVALID"; epoch?: number }
   | { type: "RUN_ALREADY_ACTIVE" }
-  /** An observer's attached run was aborted because it was superseded server-side:
-   *  ask for the latest run and follow it (else an observer tab freezes on the
-   *  killed run). */
-  | { type: "RUN_SUPERSEDED" }
   // -- lifecycle --
   | { type: "DISPOSE" };
 
@@ -332,6 +325,12 @@ export function reduce(m: Machine, event: Event): Machine {
     // ---- mount attach (resume) ----------------------------------------
     case "ATTACH_START":
       // A reopened tab attaches to a still-running run: observer ownership.
+      // #488 F2: ONLY from idle. The mount `getRun` round-trip resolves async, and
+      // a local send may have started meanwhile (phase `sending`, ownership local);
+      // a late ATTACH_START must NOT hijack that local turn into an observer-attach
+      // (queue would stop flushing, "Send now" would hide). Guarding in the reducer
+      // covers every dispatch source.
+      if (m.phase.name !== "idle") return stay(m);
       return command(m, { name: "attaching" }, [{ type: "resumeStream" }], {
         ownership: "observer",
         runFact: event.runId ? { runId: event.runId } : m.ctx.runFact,
@@ -351,17 +350,6 @@ export function reduce(m: Machine, event: Event): Machine {
       });
 
     // ---- reconnect after a live disconnect ----------------------------
-    case "RECONNECT_BEGIN":
-      // Explicit begin (used when the runtime decides to reconnect from a signal
-      // other than FINISH_DISCONNECT). Requires a run-fact (I3).
-      if (!m.ctx.runFact) return stay(m);
-      return command(
-        m,
-        { name: "reconnecting", attempt: 1, failed: false },
-        [{ type: "scheduleReconnect", attempt: 1, delayMs: reconnectDelayMs(1) }],
-        { ownership: "observer" },
-      );
-
     case "RECONNECT_ATTEMPT":
       // A scheduled backoff fired — fire the attach GET. epoch++ so the previous
       // attempt's late outcome cannot drive this one.
@@ -420,11 +408,6 @@ export function reduce(m: Machine, event: Event): Machine {
       return stay(m);
 
     // ---- degraded poll -------------------------------------------------
-    case "POLL_ACTIVITY":
-      // The polled rows changed (progress). No phase change — the runtime resets
-      // its inactivity clock. Only meaningful while a poll-bearing phase is active.
-      return stay(m);
-
     case "POLL_TERMINAL":
       // The run reached a terminal row via the poll (or the reconcile merge). Go
       // idle and disarm everything (I4: this is a DATA-driven exit, incl. exit
@@ -526,13 +509,6 @@ export function reduce(m: Machine, event: Event): Machine {
       // A plain POST hit the one-active-run gate. NO auto-retry — the composer
       // offers "interrupt and send" (supersede) instead.
       return to(m, { name: "error", kind: "run-already-active" });
-
-    case "RUN_SUPERSEDED":
-      // An observer's attached run was killed by a server-side supersede. Ask for
-      // the latest run and follow it, instead of freezing on the dead run.
-      return command(m, { name: "attaching" }, [{ type: "postRun", reason: "observer-follow" }], {
-        ownership: "observer",
-      });
 
     // ---- lifecycle -----------------------------------------------------
     case "DISPOSE":

@@ -309,16 +309,23 @@ describe("run-fsm — commit 5: supersede CAS + error classification", () => {
     expect(m.phase).toEqual({ name: "error", kind: "run-already-active" });
     expect(m.effects).toEqual([]);
   });
+});
 
-  it("RUN_SUPERSEDED (observer's run killed) → attaching + postRun(observer-follow)", () => {
-    const ctx = { epoch: 0, ownership: "observer" as const, runFact: { runId: "run-dead" }, liveFollow: false };
-    const streaming: Machine = { phase: { name: "streaming" }, ctx, effects: [] };
-    const m = reduce(streaming, { type: "RUN_SUPERSEDED" });
+// #488 F2 — a late mount `getRun → ATTACH_START` must not hijack a local turn.
+describe("run-fsm — F2: ATTACH_START only from idle", () => {
+  it("ATTACH_START from a local `sending` turn is ignored (no observer hijack)", () => {
+    const sending = reduce(initialMachine(), { type: "SEND_LOCAL" }); // idle -> sending, local
+    const m = reduce(sending, { type: "ATTACH_START", runId: "r" });
+    expect(m.phase.name).toBe("sending");
+    expect(m.ctx.ownership).toBe("local"); // NOT flipped to observer
+    expect(m.effects).toEqual([]); // no resumeStream
+  });
+
+  it("ATTACH_START from idle attaches as normal", () => {
+    const m = reduce(initialMachine(), { type: "ATTACH_START", runId: "r" });
     expect(m.phase.name).toBe("attaching");
-    expect(m.effects.find((e) => e.type === "postRun")).toEqual({
-      type: "postRun",
-      reason: "observer-follow",
-    });
+    expect(m.ctx.ownership).toBe("observer");
+    expect(hasEffect(m, "resumeStream")).toBe(true);
   });
 });
 

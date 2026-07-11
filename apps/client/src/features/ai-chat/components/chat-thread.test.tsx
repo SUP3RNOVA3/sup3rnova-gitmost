@@ -193,9 +193,9 @@ describe("ChatThread — send now", () => {
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
   });
 
-  it("#488 commit 5: autonomous live sendNow with a known runId POSTs a supersede body", () => {
-    // A streaming assistant message carrying the start-metadata runId -> the FSM
-    // adopts the run-fact; sendNow then interrupts via the server CAS.
+  // A streaming assistant message carrying the start-metadata runId -> the FSM
+  // adopts the run-fact so sendNow can interrupt via the server CAS.
+  const withRunId = () => {
     h.state.status = "streaming";
     h.state.messages = [
       {
@@ -205,17 +205,56 @@ describe("ChatThread — send now", () => {
         metadata: { runId: "run-1" },
       },
     ];
+  };
+
+  it("#488 commit 5 / F1: sendNow ABORTS stream A first, then sends B (CAS) only after A finalizes", async () => {
+    withRunId();
     renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now"));
-    // The message is sent...
+    // F1: A is ABORTED, and B is NOT sent yet (no overlap).
+    expect(h.state.stop).toHaveBeenCalledTimes(1);
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    // A's onFinish fires -> B is scheduled on a microtask (after A finalizes).
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: true,
+        isDisconnect: false,
+        isError: false,
+      });
+      await Promise.resolve();
+    });
     expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
-    // ...and the NEXT POST carries supersede:{runId} (read-and-cleared once).
+    // B's POST carries supersede:{runId} (read-and-cleared once).
     const prep = h.state.transport!.prepareSendMessagesRequest!;
-    const body = prep({ messages: [], body: {} }).body as Record<string, unknown>;
-    expect(body.supersede).toEqual({ runId: "run-1" });
-    // One-shot: a subsequent request has no supersede.
+    expect(prep({ messages: [], body: {} }).body.supersede).toEqual({
+      runId: "run-1",
+    });
     expect(prep({ messages: [], body: {} }).body.supersede).toBeUndefined();
+  });
+
+  it("#488 F1: a superseded stream's LATE disconnect does NOT falsely reconnect (epoch stamp drops it)", async () => {
+    // MUTATION-VERIFY: drop `epoch: stampEpoch` from the supersede-branch
+    // FINISH_DISCONNECT dispatch and this goes red (A's disconnect -> reconnecting).
+    withRunId();
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    fireEvent.click(screen.getByTestId("queue-btn"));
+    fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, aborts A
+    // A ends via isDisconnect (the server CAS closed it). The OLD overlap bug would
+    // route the LIVE new run into a false reconnect banner.
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "x" }] },
+        isAbort: false,
+        isDisconnect: true,
+        isError: false,
+      });
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    // ...and B was still sent.
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
   });
 
   it("#488 commit 5: a supersede POST that 409s SUPERSEDE_TIMEOUT is returned as-is (NO retry ladder)", async () => {
@@ -492,6 +531,31 @@ describe("ChatThread — resume (attach) machinery", () => {
     });
     expect(h.state.resumeStream).not.toHaveBeenCalled();
     expect(onResumeFallback).not.toHaveBeenCalledWith(true);
+  });
+
+  it("#488 F2: a local send DURING the mount getRun round-trip is NOT hijacked by the late attach", async () => {
+    // getRun stays pending while the user sends locally; its late resolve would
+    // otherwise ATTACH_START and flip the local turn into an observer-attach.
+    let resolveGetRun!: (v: {
+      run: { id: string; status: string } | null;
+      message: unknown;
+    }) => void;
+    h.state.getRun.mockReturnValue(
+      new Promise((r) => {
+        resolveGetRun = r;
+      }),
+    );
+    renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
+    // Local send in flight of getRun -> SEND_LOCAL (phase sending, ownership local).
+    fireEvent.click(screen.getByTestId("send-btn"));
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "typed text" });
+    // getRun resolves with an ACTIVE run -> the F2 guard ignores ATTACH_START.
+    await act(async () => {
+      resolveGetRun({ run: { id: "run-1", status: "running" }, message: null });
+      await Promise.resolve();
+    });
+    // The local turn was NOT hijacked into a resume/attach.
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
   });
 
   it("strips the streaming tail from the seed, keeps a user tail whole", () => {

@@ -36,36 +36,47 @@ Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 | `FINISH_DISCONNECT` (no runFact, not liveFollow) | streaming | idle | runFact←null (plain terminal "connection lost") |
 | `STREAM_INCOMPLETE{reason}` (observer starved/torn clean finish) | streaming(observer) | polling(reason) | `[armPoll(reason)]` |
 | `FINISH_ERROR{kind}` (onFinish isError) | any | error(kind) | `[disarmPoll, cancelReconnect]`, runFact←null |
-| `ATTACH_START{runId}` (mount resume) | idle | attaching **†** | `[resumeStream]`, ownership=observer, runFact←runId |
+| `STREAM_START{runId}` (first assistant frame of a local turn) | sending | streaming | runFact←runId, `[cancelReconnect, disarmPoll]` |
+| `ATTACH_START{runId}` (mount resume) | **idle only** (F2) | attaching **†** | `[resumeStream]`, ownership=observer, runFact←runId; ignored from any non-idle phase |
 | `ATTACH_LIVE` (attach GET 2xx) | attaching | streaming | — |
 | `ATTACH_NONE` (attach GET 204/err/throw) | attaching | polling(attach-none) | `[armPoll(attach-none)]` |
-| `RECONNECT_BEGIN` | streaming, idle | reconnecting(1) **†** *iff runFact* | `[scheduleReconnect(1)]`, ownership=observer |
 | `RECONNECT_ATTEMPT{n}` (backoff timer) | reconnecting | reconnecting(n) **†** | `[resumeStream]` |
 | `RECONNECT_ATTACHED` (reconnect GET 2xx) | reconnecting | streaming | `[cancelReconnect, disarmPoll]` — **counter reset** (commit 3) |
 | `RECONNECT_NONE` (reconnect GET 204/err), attempt<MAX | reconnecting | reconnecting(n+1) **†** | `[armPoll(attach-none), scheduleReconnect(n+1)]` |
 | `RECONNECT_NONE`, attempt=MAX | reconnecting | reconnecting(MAX, failed) | `[armPoll(reconnect-exhausted)]` |
 | `RETRY` (manual, failed banner) | reconnecting(failed) | reconnecting(1) **†** | `[resumeStream]` |
 | `RETRY` (manual, stalled banner) | stalled | polling(attach-none) **†** | `[armPoll]` |
-| `POLL_ACTIVITY` (rows changed) | polling, reconnecting | (same) | — (runtime resets inactivity clock) |
 | `POLL_TERMINAL` (settled tail merged) | polling, reconnecting, stopping | idle | `[disarmPoll, cancelReconnect]`, runFact←null (I4) |
 | `POLL_IDLE_CAP` (inactivity cap) | polling, reconnecting | stalled | `[disarmPoll, cancelReconnect]` (commit 4a — no more silent) |
 | `RUN_FACT{null}` (POST /run → null/terminal, 204) | reconnecting/attaching/polling/stopping | idle | `[cancelReconnect, disarmPoll]`, runFact←null (I3 fresh-negative gate) |
 | `RUN_FACT{runId}` | any | (same) | runFact←runId (pessimism toward an attempt) |
-| `STOP_REQUESTED` (user Stop) | streaming, reconnecting, polling | stopping **†** | `[stopRun, abortAttach, cancelReconnect]` |
+| `STOP_REQUESTED` (user Stop) | streaming, reconnecting, polling | stopping **†** | `[stopRun, abortAttach, cancelReconnect, armPoll]` (poll drives the terminal — I4 exit by data) |
 | `SUPERSEDE_REQUESTED{targetRunId}` (interrupt+send) | streaming, reconnecting, polling, error | superseding **†** | `[supersede(target), cancelReconnect, disarmPoll]` |
 | `SUPERSEDE_READY{runId}` (CAS ok) | superseding | streaming | ownership=local, runFact←runId |
 | `SUPERSEDE_MISMATCH{currentRunId}` (409 SUPERSEDE_TARGET_MISMATCH) | superseding | error(supersede-mismatch) | `[postRun(verify)]`, runFact←currentRunId |
 | `SUPERSEDE_TIMEOUT` (409 SUPERSEDE_TIMEOUT) | superseding | error(supersede-timeout) | — (composer keeps text; no auto-retry) |
 | `SUPERSEDE_INVALID` (409 SUPERSEDE_INVALID) | superseding | error(supersede-invalid) | — |
 | `RUN_ALREADY_ACTIVE` (409 A_RUN_ALREADY_ACTIVE, plain POST) | sending | error(run-already-active) | — (composer offers supersede; NO auto-retry) |
-| `RUN_SUPERSEDED` (observer's run aborted by supersede) | streaming(observer), polling | attaching **†** | `[postRun(observer-follow)]`, ownership=observer |
 | `DISPOSE` (unmount) | any | idle **†** | `[abortAttach, cancelReconnect, disarmPoll]` (I1/I5 — epoch++ kills late callbacks) |
 
 **Epoch filter (I1):** the reducer FIRST drops any event carrying an `epoch` that
 does not equal the current `ctx.epoch`. Outcome events (`STREAM_START`, `ATTACH_*`,
-`RECONNECT_*`, `SUPERSEDE_*`, `FINISH_*`, `RUN_FACT`) are stamped with the epoch of
-the command that could produce them; trigger events (user actions, fresh
-disconnects) carry no epoch.
+`RECONNECT_*`, `SUPERSEDE_*`, **`FINISH_*`/`STREAM_INCOMPLETE`**, `RUN_FACT`) are
+stamped with the generation the corresponding STREAM started under (the runtime
+holds a per-owned-stream `turnEpoch`); trigger events (user actions, fresh
+disconnects) carry no epoch. **F1:** this is what makes a SUPERSEDED stream's late
+`onFinish` (a dead stream A closing after the CAS started stream B) get dropped, so
+A cannot drive the live new run into a false reconnect or reset its run-fact. The
+supersede path additionally ABORTS A and starts B only from A's onFinish (a
+microtask), because ai@6 `AbstractChat.makeRequest` corrupts overlapping streams
+(A's `finally` reads then nulls the shared `activeResponse`).
+
+**Removed events (scope-cut, internal review):** `RUN_SUPERSEDED` (a ghost feature —
+never dispatched; the observer-superseded case is handled by the degraded poll,
+which follows the latest rows regardless of runId), `RECONNECT_BEGIN` (reconnect is
+entered by `FINISH_DISCONNECT`), and `POLL_ACTIVITY` (the window's activity clock was
+removed when the idle-cap moved into the thread). The reducer and this table now
+share exactly the dispatched event set.
 
 ### 409-code → event map (the real #487 contract consumed here)
 
