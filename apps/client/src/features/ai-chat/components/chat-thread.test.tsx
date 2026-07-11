@@ -203,6 +203,52 @@ describe("ChatThread — send now (#198)", () => {
   });
 });
 
+// #486: the final onFinish -> flushNext() must be gated on the live-mount flag.
+// A clean onFinish can land AFTER the thread unmounts (New-chat / chat-switch
+// mid-stream — the async attach/resume settles late); flushing then dequeues and
+// re-POSTs a queued message from an abandoned thread (a "ghost" send).
+describe("ChatThread — onFinish flush gated on mount (#486)", () => {
+  beforeEach(resetState);
+  afterEach(cleanup);
+
+  it("a clean onFinish WHILE MOUNTED flushes the queued message (control)", () => {
+    renderThread();
+    fireEvent.click(screen.getByTestId("queue-btn")); // enqueue "queued text"
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    // Mounted: the queue flushes normally.
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+  });
+
+  it("a clean onFinish AFTER unmount does NOT flush (no ghost send)", () => {
+    const { unmount } = renderThread();
+    fireEvent.click(screen.getByTestId("queue-btn")); // enqueue "queued text"
+    h.state.sendMessage.mockClear();
+
+    // Chat switched away mid-stream: the streamer unmounts...
+    unmount();
+    // ...and a late, clean onFinish lands on the abandoned thread.
+    act(() => {
+      h.state.onFinish?.({
+        message: { id: "a", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: false,
+      });
+    });
+    // Gated on mountedRef: NOTHING is sent from the dead thread.
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
 // #396: in autonomous mode a live sendNow must additionally request the
 // AUTHORITATIVE server stop of the detached run (a local abort is only a client
 // disconnect the server ignores) and arm a bounded 409 retry so the re-POST

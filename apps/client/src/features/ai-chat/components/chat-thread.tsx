@@ -659,7 +659,13 @@ export default function ChatThread({
         return;
       }
       if (isAbort || isDisconnect || isError) return;
-      flushNext();
+      // Gate the final flush on the live-mount flag (#486): a clean onFinish can
+      // land AFTER this thread unmounted (a New-chat / chat-switch mid-stream —
+      // the async attach/resume settles late). Flushing then dequeues and POSTs a
+      // queued message from an abandoned thread — a "ghost" send / ghost chat.
+      // Every other queue side effect already guards on mountedRef; this last one
+      // was the gap.
+      if (mountedRef.current) flushNext();
     },
     // `onError` runs in addition to `onFinish` (which ai@6 also calls on error).
     // Log the raw failure here for devtools; the UI shows a friendly classified
