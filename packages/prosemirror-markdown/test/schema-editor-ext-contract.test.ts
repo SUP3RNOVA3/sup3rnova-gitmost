@@ -88,6 +88,39 @@ describe("docmost schema vs @docmost/editor-ext (name-level contract)", () => {
   });
 });
 
+// ── #515 CODE-MARK `excludes` PARITY (data-loss-sensitive) ──────────────────
+//
+// The `code` mark's `excludes` field decides whether inline code can co-occur
+// with other marks. #515 sets it to "" (excludes nothing) in the canonical
+// `Code` exported by @docmost/editor-ext AND, because the vendored markdown
+// mirror must NOT pull that React-aware package into its node runtime, RE-DECLARES
+// the same override locally in docmost-schema.ts. If the two drift, markdown
+// import would silently strip bold/italic adjacent to inline code again. Guard it
+// mechanically: the mirror's built `code` mark and the canonical editor-ext
+// `Code` must agree on `excludes` (both ""). getSchema surfaces the resolved
+// value on the mark spec.
+describe("docmost schema vs @docmost/editor-ext (#515 code excludes parity)", () => {
+  it("keeps the vendored `code` mark's excludes in lockstep with editor-ext Code", () => {
+    // Mirror side: the value the mirror's BUILT schema resolves for `code`.
+    const mirrorExcludes = getSchema(docmostExtensions as never).marks.code.spec
+      .excludes;
+    // Canonical side: the `excludes` DECLARED on the editor-ext `Code` extension
+    // (read from its config — getSchema needs a full node set, so a lone mark
+    // can't be built into a schema here).
+    const canonicalCode = (
+      editorExt as unknown as { Code?: { config?: { excludes?: unknown } } }
+    ).Code;
+    const canonicalExcludes = canonicalCode?.config?.excludes;
+    // Both must be the empty string: `code` excludes NOTHING, so bold/italic/…
+    // survive alongside inline code (#515). A drift here would silently strip
+    // marks adjacent to code on markdown import again.
+    expect(canonicalCode).toBeDefined();
+    expect(mirrorExcludes).toBe("");
+    expect(canonicalExcludes).toBe("");
+    expect(mirrorExcludes).toBe(canonicalExcludes);
+  });
+});
+
 // ── ATTRIBUTE-LEVEL CONTRACT (#493 commit 2) ────────────────────────────────
 //
 // The name-level contract above catches a WHOLE node/mark type going unmirrored,
