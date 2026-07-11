@@ -152,6 +152,18 @@ export class PersistenceExtension implements Extension {
   // Set when the pending idle job is first armed (empty entry), read to enforce
   // the max-wait ceiling in computeHistoryJob, and cleared when the idle job is
   // consumed/cancelled so the next burst starts a fresh window.
+  //
+  // Single-process assumption (like `contributors` / `agentTouched` above): this
+  // lives only in THIS collab process's memory. A restart, or a page's ownership
+  // moving to another node, loses the burst-start marker. Consequence: a burst
+  // that spans the restart looks like a fresh burst to the surviving process, so
+  // its max-wait ceiling is re-anchored to the first post-restart edit — a single
+  // continuous session straddling a restart can therefore wait up to ~2× the cap
+  // for its idle snapshot (once for the lost pre-restart window, once for the new
+  // one). Bounded and benign (it only DELAYS a safety-net autosnapshot; manual
+  // saves are unaffected and the next quiet period always flushes), but the
+  // assumption and its consequence are recorded here so no one mistakes the
+  // in-memory marker for a durable, cross-process guarantee.
   private idleBurstStart: Map<string, number> = new Map();
   // #251 — per-document "intentional clear pending" flags. Keyed by
   // documentName, value = expiry timestamp (ms). Set by onStateless when the
@@ -790,6 +802,36 @@ export class PersistenceExtension implements Extension {
       now,
     );
 
+    // remove-then-add trailing-debounce idiom, and its ONE race. We delete the
+    // pending delayed job and re-add it under the same jobId so the timer resets
+    // to the trailing edge of the burst. The race is the small window between
+    // these two awaits: if the delayed job's `delay` elapses in that gap it goes
+    // ACTIVE, and then:
+    //   - remove() on an active/locked job is a no-op (BullMQ won't yank a job a
+    //     worker holds), and our `.catch(() => undefined)` swallows that too; and
+    //   - add() with a jobId that already exists (the now-active job's id) is
+    //     DROPPED by BullMQ — a duplicate add is a no-op.
+    // So this store fails to re-arm the trailing job: the just-fired snapshot
+    // captured content up to the moment it went active, and THIS edit is left
+    // without a pending trailing job. It is bounded and self-healing — the NEXT
+    // store re-arms a fresh delayed job (the id is free again once the active job
+    // completes / removeOnComplete frees it), and the processor's
+    // isDeepStrictEqual gate collapses any content-identical duplicate. The only
+    // uncovered case is when the racing store was the LAST in the session: the
+    // tail edits made after the job went active get NO trailing snapshot until
+    // the next edit re-arms one. That is an acceptable safety-net gap (a manual
+    // Save, a source-transition boundary, or simply the next edit all still cover
+    // it), which is why the reviewer accepts documenting it here rather than
+    // adding a post-add "did the add actually arm a job?" re-check.
+    //
+    // NOTE — do NOT "unify" this with the neighbouring embed-debounce idiom
+    // (aiQueue.add of PAGE_CONTENT_UPDATED above): that one uses a STABLE jobId
+    // and NO remove(), relying purely on BullMQ coalescing a repeated add under
+    // the same id, because a re-embed only needs to eventually run once on the
+    // latest content and re-anchoring its delay on every keystroke is undesirable.
+    // THIS idiom deliberately removes-then-adds precisely to PUSH the delay back
+    // to the trailing edge on every store (a true debounce), which coalescing
+    // alone cannot do. Collapsing them would silently change the history cadence.
     await this.historyQueue.remove(jobId).catch(() => undefined);
 
     await this.historyQueue.add(

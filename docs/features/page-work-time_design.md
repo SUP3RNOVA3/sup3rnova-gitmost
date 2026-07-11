@@ -387,7 +387,7 @@ bucketByDay(sessions, tz):
 факты ниже — ground truth, можно дозапросить файлы через gitea MCP по указанному SHA):
 
 - `page_history.kind` — `varchar(20)`, NULLABLE, БЕЗ дефолта (migration
-  `20260705T120000-page-history-kind.ts`). Домен: `manual`/`agent`/`idle`/`boundary`;
+  `20260707T120000-page-history-kind.ts`). Домен: `manual`/`agent`/`idle`/`boundary`;
   legacy `null` = автосейв (`collaboration/constants.ts`, `PageHistoryKind`).
 - `kind` УЖЕ включён в `PageHistoryRepo.baseFields` (`page-history.repo.ts`) — читается всеми
   выборками истории. `saveHistory({kind})` и `updateHistoryKind(id, kind)` существуют.
