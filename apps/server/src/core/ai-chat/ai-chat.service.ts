@@ -56,6 +56,12 @@ import {
 } from './tools/current-page.util';
 import { roleModelOverride } from './roles/role-model-config';
 import {
+  resolveReplayBudget,
+  isContextOverflowError,
+  trimHistoryForReplay,
+  REPLAY_AGGRESSIVE_FRACTION,
+} from './history-budget';
+import {
   startSseHeartbeat,
   stripStreamingHopByHopHeaders,
 } from './sse-resilience';
@@ -131,6 +137,15 @@ const STEP_LIMIT_NO_ANSWER_MARKER =
 // and from a server restart ('streaming' -> swept to 'aborted' with no message).
 const OUTPUT_DEGENERATION_ERROR =
   'Output degeneration detected (repeated token loop)';
+
+// Prefix recorded on the assistant row when the provider rejected the turn for
+// CONTEXT OVERFLOW (#490): the replayed history exceeded the model's window. The
+// row is ALSO stamped `metadata.replayOverflow` so the NEXT turn's budgeter trims
+// aggressively (the reactive recovery — the overflowing turn had no usage signal
+// to trigger preventive trimming, so the classified 400 is what un-bricks it).
+export const CONTEXT_OVERFLOW_ERROR_PREFIX =
+  'Диалог превысил контекстное окно модели; история будет агрессивно ' +
+  'сокращена на следующем ходу.';
 
 /**
  * Compute the step-budget warning text (#444), or '' when this step is outside
@@ -1091,7 +1106,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // per-row conversion and degraded to plain text with a "[tool context
       // omitted]" marker rather than 500-ing the whole turn (silent loss of tool
       // context is not acceptable — the model must see the truncation).
-      const messages = await convertHistoryResilient(uiMessages, (index, err) =>
+      let messages = await convertHistoryResilient(uiMessages, (index, err) =>
         this.logger.warn(
           `Degraded unconvertible history row ${index} on chat ${chatId} to text: ${
             err instanceof Error ? err.message : 'unknown error'
@@ -1139,6 +1154,58 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // The model is resolved by the controller before hijack (clean 503 path).
       // Here we only need the admin-configured system prompt.
       const resolved = await this.aiSettings.resolve(workspace.id);
+
+      // History-replay token budget (#490). The full conversation is replayed to
+      // the provider every turn, so a long chat eventually 400s on the context
+      // window — forever. Bound the REPLAYED history (never the persisted rows).
+      // PRIMARY signal is the provider's own fact: the last turn's contextTokens.
+      const replayBudget = resolveReplayBudget(resolved?.chatContextWindowRaw);
+      if (replayBudget.usedDefault) {
+        // The default fires precisely for installs with NO configured window —
+        // the ones that hit terminal overflow. Warn so it is observable.
+        this.logger.warn(
+          `AI chat (chat ${chatId}): no chatContextWindow configured; ` +
+            `applying the default replay budget (${replayBudget.thresholdTokens} tokens).`,
+        );
+      }
+      // Last turn's provider-reported context size (authoritative when present).
+      const priorContextTokens = lastAssistantContextTokens(oldHistory);
+      // Reactive recovery (#490): if the LAST turn was rejected for context
+      // overflow (stamped by onError), trim AGGRESSIVELY this turn — the
+      // overflowing turn produced no usage signal, so a normal-threshold trim may
+      // not shrink enough to fit. This is what un-bricks a chat that just 400'd.
+      const priorOverflowed = lastAssistantReplayOverflow(oldHistory);
+      const effectiveThreshold =
+        priorOverflowed && replayBudget.thresholdTokens != null
+          ? Math.floor(
+              replayBudget.thresholdTokens * REPLAY_AGGRESSIVE_FRACTION,
+            )
+          : replayBudget.thresholdTokens;
+      if (priorOverflowed) {
+        this.logger.warn(
+          `AI chat (chat ${chatId}): previous turn hit context overflow; ` +
+            `applying aggressive replay budget (${effectiveThreshold} tokens).`,
+        );
+      }
+      const preTrim = trimHistoryForReplay(
+        messages,
+        effectiveThreshold,
+        // A prior OVERFLOW means the provider count is stale/absent — force the
+        // char-estimate path by ignoring priorContextTokens on recovery.
+        priorOverflowed ? undefined : priorContextTokens,
+      );
+      messages = preTrim.messages;
+      // Observability (#490): record the budgeter's decision on the turn so the UI
+      // can surface "replay truncated at N tokens". Threaded into flushAssistant.
+      let replayTrimmedToTokens: number | undefined = preTrim.trimmed
+        ? preTrim.estimatedTokens
+        : undefined;
+      if (preTrim.trimmed) {
+        this.logger.log(
+          `AI chat (chat ${chatId}): replay history trimmed to ~${preTrim.estimatedTokens} ` +
+            `tokens (budget ${replayBudget.thresholdTokens}).`,
+        );
+      }
 
       // Build the external MCP toolset FIRST so the system prompt can carry each
       // connected server's admin-authored guidance (#180). Merge in admin-
@@ -1670,6 +1737,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 maxContextTokens: resolved?.chatContextWindow,
                 pageChanged,
                 partsCache,
+                replayTrimmedToTokens,
               }),
             );
             // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
@@ -1717,7 +1785,16 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // object, so the actual provider cause is clearly logged. Reuse the
             // shared formatter so provider error formatting stays unified.
             const e = error as { stack?: string };
-            const errorText = describeProviderError(error, String(error));
+            // #490 reactive branch: classify a CONTEXT-OVERFLOW rejection (the
+            // replayed history exceeded the model window). The overflowing turn had
+            // no prior usage to trigger preventive trimming, so we record a clear,
+            // distinguishable cause AND stamp the row so the NEXT turn's budgeter
+            // trims aggressively — the reactive recovery that un-bricks the chat.
+            const overflow = isContextOverflowError(error);
+            const providerError = describeProviderError(error, String(error));
+            const errorText = overflow
+              ? `${CONTEXT_OVERFLOW_ERROR_PREFIX} (${providerError})`
+              : providerError;
             this.logger.error(`AI chat stream error: ${errorText}`, e?.stack);
             // DIAGNOSTIC (Safari stream-drop investigation) — temporary: timing of
             // an error-terminated stream.
@@ -1736,6 +1813,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 error: errorText,
                 pageChanged,
                 partsCache,
+                replayTrimmedToTokens,
+                replayOverflow: overflow || undefined,
               }),
             );
             // #184: settle the RUN as failed, carrying the provider/transport cause.
@@ -2113,6 +2192,45 @@ export function chatStreamMetadata(
     return usage ? { usage } : undefined;
   }
   return undefined;
+}
+
+/**
+ * The provider-reported context size of the most recent assistant turn, read from
+ * its persisted `metadata.contextTokens` (#490 replay budgeter's PRIMARY signal —
+ * the provider's own fact, not an estimate). Returns undefined for a chat with no
+ * assistant turn yet, or one whose last turn recorded no usage (e.g. it errored),
+ * in which case the budgeter falls back to the char-estimate.
+ */
+export function lastAssistantContextTokens(
+  history: ReadonlyArray<AiChatMessage>,
+): number | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const row = history[i];
+    if (row.role !== 'assistant') continue;
+    const meta = (row.metadata ?? {}) as { contextTokens?: unknown };
+    const n = meta.contextTokens;
+    return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Whether the most recent assistant turn was rejected for CONTEXT OVERFLOW
+ * (#490): its row carries `metadata.replayOverflow` (stamped by the stream's
+ * onError). The next turn's budgeter reads this to trim aggressively — the
+ * reactive recovery. Only the LAST assistant turn matters (an older overflow was
+ * already recovered), so we stop at the first assistant row scanning backwards.
+ */
+export function lastAssistantReplayOverflow(
+  history: ReadonlyArray<AiChatMessage>,
+): boolean {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const row = history[i];
+    if (row.role !== 'assistant') continue;
+    const meta = (row.metadata ?? {}) as { replayOverflow?: unknown };
+    return meta.replayOverflow === true;
+  }
+  return false;
 }
 
 /** The last message with role 'user' from a useChat payload, if any. */
@@ -2648,6 +2766,13 @@ export function flushAssistant(
     // Per-turn step->parts memo (#490): pass the SAME cache on every flush of a
     // turn so each finished step's output is stringified once, not once per flush.
     partsCache?: StepPartsCache;
+    // #490 observability: when the replay budgeter trimmed this turn's history,
+    // the (estimated) token size it trimmed to — the UI can show "replay truncated
+    // at N tokens". Omitted when nothing was trimmed.
+    replayTrimmedToTokens?: number;
+    // #490 reactive branch: set when the provider rejected this turn for context
+    // overflow. Stamped into metadata so the NEXT turn's budgeter trims aggressively.
+    replayOverflow?: boolean;
   },
 ): AssistantFlush {
   const finished = capturedSteps ?? [];
@@ -2686,6 +2811,9 @@ export function flushAssistant(
   if (extra?.contextTokens) metadata.contextTokens = extra.contextTokens;
   if (extra?.maxContextTokens)
     metadata.maxContextTokens = extra.maxContextTokens;
+  if (extra?.replayTrimmedToTokens)
+    metadata.replayTrimmedToTokens = extra.replayTrimmedToTokens;
+  if (extra?.replayOverflow) metadata.replayOverflow = true;
   if (extra?.error) metadata.error = extra.error;
   // Persist the page-change diff the agent saw this turn (#274 observability),
   // so history / the Markdown export can show what the user changed. Only when

@@ -29,6 +29,8 @@ import {
   FINAL_STEP_NUDGE,
   STEP_LIMIT_NO_ANSWER_MARKER,
   OUTPUT_DEGENERATION_ERROR,
+  lastAssistantContextTokens,
+  lastAssistantReplayOverflow,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
@@ -413,6 +415,55 @@ describe('toolTraceVersion era marker (#490)', () => {
   });
 });
 
+// #490 replay-budget signal helpers over persisted history.
+describe('lastAssistantContextTokens', () => {
+  const row = (
+    role: string,
+    metadata: Record<string, unknown> | null,
+  ): AiChatMessage => ({ role, metadata }) as unknown as AiChatMessage;
+
+  it('reads the most recent assistant turn contextTokens (provider fact)', () => {
+    const hist = [
+      row('user', null),
+      row('assistant', { contextTokens: 12000 }),
+      row('user', null),
+      row('assistant', { contextTokens: 41000 }),
+    ];
+    expect(lastAssistantContextTokens(hist)).toBe(41000);
+  });
+
+  it('returns undefined when the last assistant turn recorded no usage', () => {
+    const hist = [row('assistant', { error: 'boom' }), row('user', null)];
+    expect(lastAssistantContextTokens(hist)).toBeUndefined();
+    expect(lastAssistantContextTokens([])).toBeUndefined();
+  });
+});
+
+describe('lastAssistantReplayOverflow', () => {
+  const row = (
+    role: string,
+    metadata: Record<string, unknown> | null,
+  ): AiChatMessage => ({ role, metadata }) as unknown as AiChatMessage;
+
+  it('is true only when the LAST assistant turn overflowed', () => {
+    expect(
+      lastAssistantReplayOverflow([
+        row('assistant', { replayOverflow: true }),
+        row('user', null),
+      ]),
+    ).toBe(true);
+    // A recovered (later, non-overflow) assistant turn clears it.
+    expect(
+      lastAssistantReplayOverflow([
+        row('assistant', { replayOverflow: true }),
+        row('user', null),
+        row('assistant', { contextTokens: 5 }),
+      ]),
+    ).toBe(false);
+    expect(lastAssistantReplayOverflow([])).toBe(false);
+  });
+});
+
 describe('rowToUiMessage', () => {
   it('prefers metadata.parts over content', () => {
     const row = {
@@ -741,6 +792,23 @@ describe('flushAssistant', () => {
     expect(flushed.content).toBe('looked it up and then');
     expect(flushed.toolCalls).not.toBeNull();
     expect(flushed.metadata.error).toBe('boom');
+  });
+
+  // #490 observability: the replay budgeter's decision is stamped on the turn.
+  it('records replayTrimmedToTokens + replayOverflow when provided', () => {
+    const f = flushAssistant([], '', 'error', {
+      error: 'ctx',
+      replayTrimmedToTokens: 42_000,
+      replayOverflow: true,
+    });
+    expect(f.metadata.replayTrimmedToTokens).toBe(42_000);
+    expect(f.metadata.replayOverflow).toBe(true);
+  });
+
+  it('omits the replay metadata when not provided', () => {
+    const f = flushAssistant([], '', 'completed', { finishReason: 'stop' });
+    expect('replayTrimmedToTokens' in f.metadata).toBe(false);
+    expect('replayOverflow' in f.metadata).toBe(false);
   });
 
   // #274 observability: the page-change diff the agent saw this turn is persisted

@@ -245,6 +245,9 @@ export class AiSettingsService {
       // Max context window for the chat header badge denominator. Stored as
       // ::text; 0/unset/invalid = no limit (undefined).
       chatContextWindow: parsePositiveInt(provider.chatContextWindow),
+      // RAW stored value (#490): the replay budgeter reads this to distinguish an
+      // explicit `0` (off-switch) from unset, which parsePositiveInt cannot.
+      chatContextWindowRaw: provider.chatContextWindow,
       // Plain passthrough; getChatModel defaults unset to 'openai-compatible'.
       chatApiStyle: provider.chatApiStyle,
       // Cheap model id for the anonymous public-share assistant; reuses the chat
