@@ -978,6 +978,18 @@ export default function ChatThread({
   // #487 409 codes, ...). Computed here so the SAME text can mirror into the export.
   const errorView = error ? describeChatError(error.message ?? "", t) : null;
 
+  // #488 (browser QA): the FSM PHASE is the source of truth for WHICH banner to
+  // show. A real network drop leaves useChat `error` SET even after the FSM has
+  // moved to `reconnecting` — in ai@6 a drop is always `{isError:true,
+  // isDisconnect:true}` and the SDK sets `error` alongside `isError`. So the
+  // terminal error banner must show ONLY when the FSM is actually TERMINAL
+  // (`error(kind)`); during recovery (reconnecting / polling / stalled /
+  // superseding / stopping) the recovery banner — or the streaming content — wins
+  // over the residual `error`, otherwise the terminal "Lost connection… reload"
+  // banner masks "reconnecting… (N/5)". This still surfaces the classified #487 409
+  // errors: a supersede/gate 409 lands the FSM in `error(kind)`, so it shows then.
+  const showError = errorView !== null && phase.name === "error";
+
   // Role-picker empty state (unchanged from #149).
   const [rolePickedNoSend, setRolePickedNoSend] = useState(false);
   const handleRolePick = (role: IAiRole): void => {
@@ -1011,7 +1023,7 @@ export default function ChatThread({
         assistantName={assistantName}
       />
 
-      {errorView ? (
+      {showError && errorView ? (
         <ChatErrorAlert title={errorView.title} detail={errorView.detail} mb="xs" />
       ) : phase.name === "reconnecting" ? (
         // #430/#488: while auto-reconnecting to a detached run's live tail, show

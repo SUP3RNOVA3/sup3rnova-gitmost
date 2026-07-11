@@ -16,6 +16,10 @@ const h = vi.hoisted(() => ({
   state: {
     status: "streaming" as string,
     messages: [] as unknown[],
+    // Mirrors the SDK: on an isError finish (incl. a network drop, which is ALWAYS
+    // isError+isDisconnect) the SDK ALSO sets useChat `error`. Realistic tests set
+    // this so the banner-priority (errorView vs recovery phase) is actually exercised.
+    error: null as null | { message: string },
     onFinish: null as null | ((arg: Record<string, unknown>) => void),
     sendMessage: vi.fn(),
     stop: vi.fn(),
@@ -56,7 +60,7 @@ vi.mock("@ai-sdk/react", () => ({
       sendMessage: h.state.sendMessage,
       status: h.state.status,
       stop: h.state.stop,
-      error: null,
+      error: h.state.error,
       setMessages: h.state.setMessages,
       resumeStream: h.state.resumeStream,
     };
@@ -156,6 +160,7 @@ function renderThread(props?: {
 function resetState() {
   h.state.status = "streaming";
   h.state.messages = [];
+  h.state.error = null;
   h.state.onFinish = null;
   h.state.seededMessages = null;
   h.state.transport = null;
@@ -248,9 +253,10 @@ describe("ChatThread — send now", () => {
     startLocalStreamWithRun();
     fireEvent.click(screen.getByTestId("queue-btn"));
     fireEvent.click(screen.getByLabelText("Send now")); // -> superseding, aborts A
-    // A ends via a REAL network drop { isError:true, isDisconnect:true } (the server
-    // CAS closed it). The OLD overlap bug would route the LIVE new run into a false
-    // reconnect banner.
+    // A ends via a REAL network drop { isError:true, isDisconnect:true } + error set
+    // (the server CAS closed it). The OLD overlap bug would route the LIVE new run
+    // into a false reconnect banner.
+    h.state.error = { message: "Failed to fetch" };
     await act(async () => {
       h.state.onFinish?.({
         message: { id: "a1", role: "assistant", parts: [{ type: "text", text: "x" }] },
@@ -335,6 +341,7 @@ describe("ChatThread — send now", () => {
     // HONORED (reducer) and exit to idle — it must NOT enter the reconnect ladder.
     startLocalStreamWithRun(); // live local stream, autonomous
     fireEvent.click(screen.getByLabelText("Stop")); // STOP_REQUESTED -> stopping
+    h.state.error = { message: "Failed to fetch" };
     act(() => {
       h.state.onFinish?.({
         message: { id: "a1", role: "assistant", parts: [] },
@@ -413,6 +420,10 @@ describe("ChatThread — turn-end decision (onFinish)", () => {
   }) {
     const { onTurnFinished } = renderThread();
     fireEvent.click(screen.getByTestId("queue-btn"));
+    // Mirror the SDK: any isError finish (a provider error or a drop) also sets
+    // useChat `error` (a drop message triggers the connection-lost classification).
+    if (flags.isError)
+      h.state.error = { message: flags.isDisconnect ? "Failed to fetch" : "500: boom" };
     act(() => {
       h.state.onFinish?.({
         message: { id: "a", role: "assistant", parts: [] },
@@ -809,11 +820,13 @@ describe("ChatThread — live reconnect + stalled", () => {
   });
 
   // A REAL live SSE drop. ai@6.0.207 emits BOTH { isError:true, isDisconnect:true }
-  // for a network TypeError — NOT the { isError:false } form the old tests fed. This
-  // is the form browser QA hit; with the buggy isError-first routing these tests go
-  // red (a real drop would surface the terminal error banner, not the reconnect
-  // ladder). MUTATION-VERIFY of the disconnect-first fix.
+  // for a network TypeError AND sets useChat `error` — NOT the { isError:false,
+  // error:null } form the old tests fed. This is the form browser QA hit; with the
+  // buggy isError-first routing OR without the errorView render-gate these tests go
+  // red (a real drop surfaces the terminal error banner, masking the reconnect
+  // ladder). MUTATION-VERIFY of disconnect-first + the errorView phase-gate.
   function disconnect(message: unknown = liveMsg) {
+    h.state.error = { message: "Failed to fetch" }; // the SDK sets error on the drop
     act(() => {
       h.state.onFinish?.({
         message,
@@ -853,6 +866,20 @@ describe("ChatThread — live reconnect + stalled", () => {
     expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
       "/api/ai-chat/runs/c1/stream?expect=live&anchor=a2",
     );
+  });
+
+  it("#488 (browser QA): the reconnect banner is SHOWN, not masked by the residual useChat error", () => {
+    // The drop sets useChat `error` (real SDK), and the terminal errorView describes
+    // it ("Lost connection to the server"). The FSM phase-gate must let the
+    // `reconnecting` banner WIN over that residual error. MUTATION-VERIFY: revert the
+    // errorView phase-gate (show errorView whenever error is set) and the terminal
+    // banner masks "reconnecting…" -> red.
+    renderLive();
+    disconnect();
+    expect(h.state.error).not.toBeNull(); // the SDK error IS set during recovery
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    // The terminal "Lost connection… reload" banner must NOT be showing.
+    expect(screen.queryByText(/reload and try again/i)).toBeNull();
   });
 
   it("#488 commit 2: a disconnect BEFORE the first assistant frame reconnects with NO anchor", () => {
