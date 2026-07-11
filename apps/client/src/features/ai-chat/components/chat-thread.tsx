@@ -720,12 +720,32 @@ export default function ChatThread({
         const runId = extractRunId(message ?? undefined) ?? "pending";
         const enterReconnect = (fact: string): void => {
           if (!mountedRef.current) return;
-          dispatch({ type: "RUN_FACT", runFact: { runId: fact } });
+          // Epoch-stamp the run-fact too (I1): the getRun rtt widens the
+          // onFinish->dispatch window, so a concurrent SEND_LOCAL during it must be
+          // able to drop this stale RUN_FACT (else it clobbers the new turn's
+          // runFact.runId). Consistent with the postRun RUN_FACT stamp.
+          dispatch({ type: "RUN_FACT", runFact: { runId: fact }, epoch: stampEpoch });
           dispatch({
             type: "FINISH_DISCONNECT",
             hasVisibleContent: msgHasVisible,
             epoch: stampEpoch,
           });
+        };
+        // Restore the STRUCTURAL guarantee that the live partial is never the
+        // tail-apply base: drop the live partial from the store by id and null the
+        // anchor, so the reconnect replays from step 0 into a CLEAN store (a full
+        // rebuild) or, past any rotation, 204s -> degraded poll. Used on BOTH the
+        // no-persisted-row and getRun-FAILURE paths — after this there is no path
+        // where the attach tail-applies frames onto a row that already has them
+        // (the #137/#161 duplication class).
+        const dropLivePartialAndReplayFromStart = (): void => {
+          if (message?.role === "assistant" && typeof message.id === "string") {
+            const liveId = message.id;
+            setMessagesRef.current?.((prev) =>
+              prev.filter((m) => m.id !== liveId),
+            );
+          }
+          anchorRef.current = null;
         };
         if (cid) {
           void getRun(cid)
@@ -738,23 +758,29 @@ export default function ChatThread({
                   stepsPersisted: stepsPersistedOf(persisted),
                 };
                 // Replace the live partial with the persisted row IN PLACE by id —
-                // the re-seed from persist.
+                // the re-seed from persist. The attach's tail (steps >= N) then
+                // appends to a store holding EXACTLY steps 0..N-1: no duplication.
                 setMessages((prev) => mergeById(prev, rowToUiMessage(persisted)));
               } else {
-                // No persisted assistant row (pre-first-frame break): no anchor; the
-                // reconnect attaches with no params and replays from start.
-                anchorRef.current = null;
+                // No persisted assistant row (pre-first-frame break): drop the live
+                // partial + replay from start (no anchor/n) so nothing is duplicated.
+                dropLivePartialAndReplayFromStart();
               }
               enterReconnect(res.run?.id ?? runId);
             })
             .catch(() => {
-              // Persist read failed: keep whatever anchor we had and still enter the
-              // ladder so a live detached run is not stranded (the attach 204s ->
-              // degraded poll if it cannot cover).
+              if (!mountedRef.current) return;
+              // Persist read FAILED: we cannot re-seed from fresh persist, and a
+              // stale mount-time anchor over the live partial would tail-apply
+              // already-present steps -> duplication (a flaky-network blip:
+              // SSE + getRun both fail, network recovers in ~1s, the registry still
+              // covers from the mount frontier). Restore the removed-filter guarantee
+              // instead: drop the live partial + replay from start / 204 -> poll.
+              dropLivePartialAndReplayFromStart();
               enterReconnect(runId);
             });
         } else {
-          anchorRef.current = null;
+          dropLivePartialAndReplayFromStart();
           enterReconnect(runId);
         }
         setStopNotice(null);

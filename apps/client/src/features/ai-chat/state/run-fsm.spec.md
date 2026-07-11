@@ -121,8 +121,7 @@ holds. **Pending column: empty.**
 | 11 | `stopPendingRef` | **FSM phase `stopping`** | the deferred stop fires from the chat-id adoption effect while `stopping` |
 | 12 | `mountedRef` | **retained (React liveness)** | orthogonal to run-lifecycle; gates imperative onFinish side-effects post-unmount. Epoch (I1) handles stale COMMAND-outcomes; DISPOSE bumps it |
 | 13 | `attemptResumeRef` | **FSM `ATTACH_START` + run-fact** | mount arms attach ONLY on a confirmed active run (commit 4b: streaming-tail status, or POST /run for a user tail) |
-| 14 | `stripRef` | **data** (attachStrategy) | strip+replay detail; the `resumeStream` effect reads it |
-| 15 | `strippedRowRef` | **data** (attachStrategy) | the anchor row |
+| 14–15 | `anchorRef {id, stepsPersisted}` | **data** (attachStrategy) | #491 tail-only: replaced `stripRef`/`strippedRowRef`. The PERSISTED assistant row that pins the run (server invariant 6) + its step frontier N; feeds `?anchor=<id>&n=<stepsPersisted>`. No strip — the seed keeps every row; entering reconnecting re-seeds from persist |
 | 16 | `attachAbortRef` | **effect-owned controller** | aborted by the `abortAttach` effect in cleanup (I5) |
 | 17–25 | `chatIdRef`, `openPageRef`, `getEditorSelectionRef`, `roleIdRef`, `stableIdRef`, `queuedRef`, `sendMessageRef`, `statusRef`, `lastForwardedChatIdRef` | **data** (identity/send mirrors) | unchanged — not lifecycle flags |
 | NEW | `pendingSupersedeRef` | **data** (send-plumbing) | the runId injected into the next `POST /stream {supersede}`; the single replacement for the 3 DELETED one-shots (#8/#9/#10) — net −2 refs |
@@ -178,6 +177,9 @@ Pessimism rule: a stale-but-positive fact PERMITS entering recovery (attach); th
   /run) are effect-owned and aborted in cleanup (`abortAttach` on `DISPOSE`), not
   render-phase refs. A client abort of an already-sent POST does not cancel the
   server action, so disarming on unmount is safe.
-- **attachStrategy** (strip+replay today) is behind the `resumeStream` effect; the
-  resume-stack iteration (#491) swaps it to tail-only WITHOUT touching the FSM.
+- **attachStrategy** is behind the `resumeStream` effect; #491 swapped it to
+  tail-only (`?anchor=&n=`, `anchorRef` data) WITHOUT touching the FSM. Entering
+  reconnecting always re-seeds from persist; on a getRun failure the live partial
+  is dropped + replay-from-start so it is never the tail-apply base (no #137/#161
+  duplication).
 - **Queue** stays a data structure; flush/interrupt decisions are transitions.

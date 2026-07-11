@@ -1089,6 +1089,43 @@ describe("ChatThread — live reconnect + stalled", () => {
     );
   });
 
+  it("#491 regression (#137/#161 dup): getRun REJECT on a live disconnect drops the live partial + nulls the anchor", async () => {
+    // The re-seed source (getRun) FAILS — a flaky-network blip (SSE + getRun both
+    // fail, network recovers in ~1s). The OLD .catch just re-entered the ladder with
+    // NO re-seed and NO filter, so the reconnect could tail-apply the registry's
+    // frames onto the live partial that ALREADY has those steps -> duplicated text.
+    renderLive();
+    h.state.getRun.mockReset();
+    h.state.getRun.mockRejectedValue(new Error("network"));
+    await disconnect(); // live partial = liveMsg (id "a2")
+    expect(h.state.getRun).toHaveBeenCalledWith("c1");
+    // THE GUARANTEE: on the getRun failure the live partial (a2) is FILTERED from the
+    // store, so the reconnect can never tail-apply already-present steps onto it.
+    // MUTATION-VERIFY: revert the .catch fix (enterReconnect only, no filter) and no
+    // setMessages call removes a2 -> this reddens.
+    const removedLivePartial = (
+      h.state.setMessages as unknown as {
+        mock: { calls: [unknown][] };
+      }
+    ).mock.calls.some(([updater]) => {
+      if (typeof updater !== "function") return false;
+      const out = (updater as (p: { id: string }[]) => { id: string }[])([
+        { id: "a2" },
+        { id: "u1" },
+      ]);
+      return !out.some((m) => m.id === "a2");
+    });
+    expect(removedLivePartial).toBe(true);
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    // Anchor was nulled -> replay-from-start (no params) / 204 -> poll; never a stale
+    // ?anchor=&n= over the live partial.
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
+  });
+
   it("#488 (browser QA): the reconnect banner is SHOWN, not masked by the residual useChat error", async () => {
     // The drop sets useChat `error` (real SDK), and the terminal errorView describes
     // it ("Lost connection to the server"). The FSM phase-gate must let the
