@@ -442,3 +442,71 @@ test("checkNewComments subtree includes the root without a separate getPageRaw",
   assert.equal(result.checkedPages, 2, "root + one descendant scanned");
   assert.equal(result.totalNewComments, 1, "the root's fresh comment found");
 });
+
+// -----------------------------------------------------------------------------
+// 6) checkNewComments parallelism (#490): the per-page comment fetches run with
+//    bounded concurrency (not one-at-a-time), and the results still preserve the
+//    page order deterministically regardless of which fetch finishes first.
+// -----------------------------------------------------------------------------
+test("checkNewComments fetches pages concurrently (bounded) and preserves order", async () => {
+  // A subtree with 12 descendants so the scan has plenty to parallelize.
+  const NODES = [{ id: "parent", title: "Parent", parentPageId: null, hasChildren: true }];
+  for (let i = 0; i < 12; i++) {
+    NODES.push({ id: `k${i}`, title: `Kid ${i}`, parentPageId: "parent", hasChildren: false });
+  }
+
+  let inFlight = 0;
+  let maxInFlight = 0;
+
+  const { baseURL } = await spawn(async (req, res) => {
+    const raw = await readBody(req);
+    if (handleLogin(req, res)) return;
+    if (req.url === "/api/pages/tree") {
+      sendJson(res, 200, { success: true, data: { items: NODES } });
+      return;
+    }
+    if (req.url === "/api/comments") {
+      const body = JSON.parse(raw || "{}");
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Hold the response briefly so concurrent fetches actually overlap.
+      setTimeout(() => {
+        inFlight--;
+        // Every page carries one fresh comment so ordering is observable.
+        sendJson(res, 200, {
+          success: true,
+          data: {
+            items: [
+              { id: `c-${body.pageId}`, createdAt: "2030-01-01T00:00:00.000Z", content: null },
+            ],
+            meta: { nextCursor: null },
+          },
+        });
+      }, 25);
+      return;
+    }
+    sendJson(res, 404, {});
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+  const result = await client.checkNewComments(
+    "space-1",
+    "2020-01-01T00:00:00.000Z",
+    "parent",
+  );
+
+  // 13 pages (parent + 12 kids) were scanned; each had a fresh comment.
+  assert.equal(result.checkedPages, 13, "all pages scanned");
+  assert.equal(result.totalNewComments, 13, "one fresh comment per page");
+  // Parallelism: more than one request was in flight at once, but never above the
+  // cap (6). A serial implementation would show maxInFlight === 1.
+  assert.ok(maxInFlight > 1, `expected concurrent fetches, saw max ${maxInFlight}`);
+  assert.ok(maxInFlight <= 6, `concurrency must be bounded, saw ${maxInFlight}`);
+  // Deterministic order: results follow the page-enumeration order (parent first).
+  assert.equal(result.comments[0].pageId, "parent", "results preserve page order");
+  assert.deepEqual(
+    result.comments.map((r) => r.pageId),
+    ["parent", ...Array.from({ length: 12 }, (_, i) => `k${i}`)],
+    "result order matches the enumeration order regardless of finish order",
+  );
+});
