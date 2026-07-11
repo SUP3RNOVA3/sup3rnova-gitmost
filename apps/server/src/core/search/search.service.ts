@@ -55,6 +55,11 @@ export function buildTsQuery(raw: string): string {
 // Escape the LIKE metacharacters (`%`, `_`, `\`) so every character is matched
 // LITERALLY by a `col LIKE '%' || q || '%'` predicate. Without this a query of
 // `%` or `_` would match every row.
+//
+// S2 (acceptance #10): escaping is intentionally SYMMETRIC on `%` and `_` — the
+// ability to literal-search a bare `%` (or `_`) as a real character was
+// deliberately dropped. Such a query parses to no positive recall and returns
+// total:0 rather than matching everything. That trade-off is accepted.
 export function escapeLikePattern(raw: string): string {
   return (raw ?? '')
     .replace(/\\/g, '\\\\')
@@ -361,6 +366,16 @@ export class SearchService {
       orderedIds = orderedIds.filter((id) => accessibleSet.has(id));
     }
 
+    // W1 — CANDIDATE_CAP bounds pagination REACHABILITY (JS-side), NOT query
+    // compute. The `ranked` CTE deliberately has no SQL LIMIT: an exact `total`
+    // requires counting EVERY match, and the permission anti-join must run over
+    // the full match set, so a SQL LIMIT would corrupt `total`. The consequence
+    // is that a broad common term in a tenant with restricted pages sorts +
+    // anti-joins the whole match set on every request; the cap only truncates the
+    // reachable window afterwards (rows past it are unreachable → truncatedAtCap).
+    // Accepted for the small-tenant fork target — do NOT convert `cap` into a SQL
+    // LIMIT thinking it bounds compute; it does not, and doing so breaks the exact
+    // total contract (acceptance #8/#11).
     const total = orderedIds.length;
     const truncatedAtCap = total > cap;
     const window = orderedIds.slice(0, cap);
@@ -438,7 +453,15 @@ export class SearchService {
     parsed: ParsedQuery,
     titleOnly: boolean,
   ): Promise<SearchResultDto[]> {
-    const tsq = this.combineTsq(parsed.positive, parsed.mode);
+    // S1: rank/highlight/matchedFields must reflect required terms too, not just
+    // bare positives — a required-only query like `+кофейня` (no bare positive)
+    // really matches, so it must not report matchedFields:[] / rank:null. Build
+    // every detail expression from the SAME [...positive, ...required] set the
+    // matchedTerms path uses (`detailTerms` below). Excluded terms stay out (they
+    // are anti-matches). The candidate WHERE already enforced required-AND, so
+    // OR-combining them here is purely for display scoring/highlighting.
+    const detailTerms = [...parsed.positive, ...parsed.required];
+    const tsq = this.combineTsq(detailTerms, parsed.mode);
     // rank/highlight are FTS-only (null for substring-only hits — the web already
     // falls back). ts_headline runs over the ORIGINAL text.
     const rankExpr = tsq
@@ -475,7 +498,7 @@ export class SearchService {
         );
       }
     }
-    for (const t of parsed.positive.filter((x) => x.branch === 'substring')) {
+    for (const t of detailTerms.filter((x) => x.branch === 'substring')) {
       const pat = this.likePattern(t);
       titleMatchParts.push(
         sql`LOWER(f_unaccent(pages.title)) LIKE ${pat} ESCAPE '\\'`,
@@ -494,10 +517,10 @@ export class SearchService {
       : sql<boolean>`false`;
 
     // Per-term matched flags (positive + required), assembled into matchedTerms.
-    // NB: aliases must be UNDERSCORE-FREE — the app's Kysely runs the
-    // CamelCasePlugin, which would rewrite a `t_0` result key to `t0`. `tmatch0`
-    // survives the round-trip unchanged.
-    const allTerms = [...parsed.positive, ...parsed.required];
+    // Same set as `detailTerms` above. NB: aliases must be UNDERSCORE-FREE — the
+    // app's Kysely runs the CamelCasePlugin, which would rewrite a `t_0` result
+    // key to `t0`. `tmatch0` survives the round-trip unchanged.
+    const allTerms = detailTerms;
     const termCols = allTerms.map(
       (t, i) =>
         sql`(${this.termMatchPred(t, titleOnly)}) AS "tmatch${sql.raw(String(i))}"`,

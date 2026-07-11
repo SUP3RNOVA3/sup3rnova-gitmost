@@ -385,4 +385,80 @@ describe('SearchService #529 lexical overhaul [integration]', () => {
     `.execute(db);
     expect(row.rows[0].m).toBe(true);
   });
+
+  // W4 — substring-tier dominance under RRF: title-exact (tier 3) > title-
+  // substring (tier 2) > text-only (tier 1). The engine encodes this via
+  // sub_tier DESC → rn_sub → RRF; no test asserted the end-to-end ordering, so
+  // this restores that guarantee. match:'substring' routes the term to the
+  // substring branch (no FTS leg), so sub_tier alone drives the order.
+  it('W4 tier dominance: title-exact > title-substring > text-only', async () => {
+    const exact = await insertPage({ title: 'tierdomxyz' }); // tier 3
+    const titleSub = await insertPage({
+      title: 'prefix tierdomxyz suffix', // tier 2
+    });
+    const textOnly = await insertPage({
+      title: 'w4 unrelated heading',
+      textContent: 'body has tierdomxyz here', // tier 1
+    });
+    const res = await search(buildService(), {
+      query: 'tierdomxyz',
+      match: 'substring',
+      spaceId,
+    });
+    const ids = res.items.map((i: any) => i.id);
+    expect(ids).toContain(exact);
+    expect(ids).toContain(titleSub);
+    expect(ids).toContain(textOnly);
+    // Strict tier order.
+    expect(ids.indexOf(exact)).toBeLessThan(ids.indexOf(titleSub));
+    expect(ids.indexOf(titleSub)).toBeLessThan(ids.indexOf(textOnly));
+  });
+
+  // S3 — an exact-title hit must NOT be lost when the match set exceeds
+  // CANDIDATE_CAP: it ranks first under RRF (tier 3) so it lands in the reachable
+  // window even with a tiny cap. Restores a guarantee the old lookup suite gave.
+  it('S3 exact-title survives the CANDIDATE_CAP window', async () => {
+    const exact = await insertPage({ title: 'capmarkerxyz' }); // tier 3
+    for (let i = 0; i < 6; i++) {
+      await insertPage({
+        title: `cap filler ${i}`,
+        textContent: 'noise capmarkerxyz noise', // tier 1
+      });
+    }
+    process.env.SEARCH_CANDIDATE_CAP = '2';
+    try {
+      const res = await search(buildService(), {
+        query: 'capmarkerxyz',
+        match: 'substring',
+        spaceId,
+        limit: 25,
+      });
+      // More matches than the cap → truncated, but the exact-title survives.
+      expect(res.total).toBeGreaterThan(2);
+      expect(res.truncatedAtCap).toBe(true);
+      expect(res.items.length).toBe(2); // the reachable window
+      expect(res.items.map((i: any) => i.id)).toContain(exact);
+    } finally {
+      delete process.env.SEARCH_CANDIDATE_CAP;
+    }
+  });
+
+  // S1 — a required-only query (`+term`, no bare positive) really matches, so its
+  // hits must report matchedFields / rank / highlight, not [] / null. Before the
+  // fix these detail exprs were built from parsed.positive only.
+  it('S1 required-only query populates matchedFields + rank on a title match', async () => {
+    const page = await insertPage({
+      title: 'Кофейня s1маркер центр',
+      textContent: 'обычный текст без ключевого слова',
+    });
+    const res = await search(buildService(), { query: '+кофейня', spaceId });
+    const hit = res.items.find((i: any) => i.id === page);
+    expect(hit).toBeDefined();
+    // The title matches the required term → matchedFields includes 'title'.
+    expect(hit.matchedFields).toContain('title');
+    // FTS rank is populated (was null before the S1 fix).
+    expect(hit.rank).not.toBeNull();
+    // matchedTerms already echoed the required term; still true.
+    expect(hit.matchedTerms).toContain('кофейня');
+  });
 });
