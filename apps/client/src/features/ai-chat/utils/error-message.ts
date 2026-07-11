@@ -39,6 +39,44 @@ export function describeChatError(
     };
   }
 
+  // #488 commit 5: the #487 concurrency-gate / supersede 409s. These arrive as a
+  // ConflictException(object) body carrying a `code` (and statusCode 409). They
+  // MUST be classified by `code` STRICTLY BEFORE any generic status branch, or the
+  // user sees the raw JSON `{"code":"A_RUN_ALREADY_ACTIVE",…}`. The code strings
+  // are the real #487 server contract (ai-chat.controller.ts) — do not invent.
+  if (/"code"\s*:\s*"A_RUN_ALREADY_ACTIVE"/.test(msg)) {
+    return {
+      title: t("The agent is already answering"),
+      detail: t(
+        "This chat already has a run in progress. Wait for it to finish, or interrupt it and send now.",
+      ),
+    };
+  }
+  if (/"code"\s*:\s*"SUPERSEDE_TARGET_MISMATCH"/.test(msg)) {
+    return {
+      title: t("Couldn't interrupt — the run changed"),
+      detail: t(
+        "The run you tried to interrupt is no longer the active one. Check the latest answer and try again.",
+      ),
+    };
+  }
+  if (/"code"\s*:\s*"SUPERSEDE_TIMEOUT"/.test(msg)) {
+    return {
+      title: t("Couldn't interrupt in time"),
+      detail: t(
+        "The previous run didn't stop in time. Nothing was sent — try sending again.",
+      ),
+    };
+  }
+  if (/"code"\s*:\s*"SUPERSEDE_INVALID"/.test(msg)) {
+    return {
+      title: t("Couldn't interrupt that run"),
+      detail: t(
+        "The run to interrupt doesn't belong to this chat. Reload and try again.",
+      ),
+    };
+  }
+
   if (/"statusCode"\s*:\s*403\b/.test(msg)) {
     return {
       title: t("AI chat is disabled"),
