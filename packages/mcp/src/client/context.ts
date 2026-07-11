@@ -206,7 +206,6 @@ export abstract class DocmostClientContext {
   public getToolAbortSignal(): AbortSignal | null {
     return this.toolAbortSignal;
   }
->>>>>>> 917c4064 (fix(ai-chat): in-app тулы — race-on-abort + safe-points + per-call cap (#487))
 
   // Two construction forms:
   //  - new DocmostClient(config)                  // discriminated union (current)
