@@ -294,10 +294,11 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
     );
   });
 
-  // 5. code + link co-occur: the schema's `code` mark excludes all other marks
-  //    (including link), so the link cannot survive import. The lossless,
-  //    byte-stable behavior is to emit ONLY the backtick code span (code wins).
-  it('a code+link run emits the backtick code form (code wins, link dropped)', () => {
+  // 5. code + link co-occur (#515): `code` no longer excludes other marks, so a
+  //    link can wrap inline code. The code span is emitted innermost and the link
+  //    wraps it — CommonMark allows inline code inside link text, so it survives
+  //    the round trip.
+  it('a code+link run nests the backtick span inside the link (#515)', () => {
     const out = convertProseMirrorToMarkdown(
       doc(
         para({
@@ -310,7 +311,7 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
         }),
       ),
     );
-    expect(out).toBe('`x`');
+    expect(out).toBe('[`x`](http://a?b&c"d)');
   });
 
   // 6. hardBreak inside a heading: prefix applied once, "  \n" between a and b.

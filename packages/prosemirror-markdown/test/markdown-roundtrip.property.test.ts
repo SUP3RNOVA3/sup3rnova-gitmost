@@ -80,13 +80,7 @@ import { stripBlockIds } from './roundtrip-helpers.js';
 // `it.fails` blocks below (so the suite stays green only because they are marked
 // expected-to-fail, never by hiding them):
 //
-//   1. The `code` mark COMBINED with any other mark. The converter emits nested
-//      HTML (`<strong><code>x</code></strong>`), but the schema's `code` mark
-//      declares `excludes: "_"`, so on import every co-occurring mark is dropped
-//      and the run comes back as `code` only -> md2 == "`x`". Acknowledged in
-//      markdown-converter.ts (the long comment above the marks switch);
-//      impossible to round-trip both while `code` excludes them.
-//   2. A BLOCK-level `image` placed BETWEEN other blocks. The Docmost image node
+//   1. A BLOCK-level `image` placed BETWEEN other blocks. The Docmost image node
 //      is block-level but `![](url)` is inline; marked wraps it in a <p>, the
 //      schema hoists the <img> out and leaves an empty paragraph sibling, which
 //      injects an extra blank gap on the second export. An image IS byte-stable
@@ -625,7 +619,7 @@ describe('markdown <-> ProseMirror round-trip (property-based)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // KNOWN, DOCUMENTED non-roundtrip bug #2 (kept honest as it.fails).
+  // KNOWN, DOCUMENTED non-roundtrip bug #1 (kept honest as it.fails).
   //
   // BUG: a block-level `image` placed BETWEEN other blocks is not byte-stable.
   // The Docmost image node is BLOCK-level but its markdown form `![](url)` is
@@ -655,23 +649,18 @@ describe('markdown <-> ProseMirror round-trip (property-based)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // KNOWN, DOCUMENTED non-roundtrip bug #1 (kept honest as it.fails).
+  // #515 ROUND-TRIP PIN: `code` combined with another mark.
   //
-  // BUG: the `code` mark combined with ANY other mark does NOT round-trip.
-  // The converter emits nested HTML so the output is well-formed, e.g.
-  //   marks [code, bold]  ->  md1 = "<strong><code>x</code></strong>"
-  // but the schema's `code` mark declares `excludes: "_"`, so on import the
-  // co-occurring mark is dropped and the run comes back as code-only:
-  //   md2 = "`x`"   (=> md2 !== md1).
-  // Minimal repro doc:
-  //   { type:'doc', content:[ { type:'paragraph', content:[
-  //       { type:'text', text:'x', marks:[{type:'code'},{type:'bold'}] } ] } ] }
-  // This is acknowledged in markdown-converter.ts (the long comment above the
-  // marks switch): preserving both marks is impossible while `code` excludes
-  // them. Documented here, not "fixed", because the source must not change.
+  // Before #515 the `code` mark declared `excludes: "_"`, dropping every co-
+  // occurring mark on import so `` **`x`** `` came back as code-only. Now
+  // `excludes: ""` lets code combine with all marks (CommonMark nests them,
+  // `<strong><code>x</code></strong>`), so the run BOTH round-trips byte-stably
+  // AND preserves the co-occurring mark. This asserts the observable property in
+  // both directions: md2 === md1 (idempotent export) and the imported doc still
+  // carries [code, other].
   // -------------------------------------------------------------------------
   it(
-    'code mark combined with another mark is byte-stable',
+    'code combined with another mark round-trips and keeps both marks (#515)',
     async () => {
       const codeComboArb = fc
         .tuple(safeTextArb, fc.constantFrom('bold', 'italic', 'strike'))
@@ -688,11 +677,90 @@ describe('markdown <-> ProseMirror round-trip (property-based)', () => {
         }));
       await fc.assert(
         fc.asyncProperty(codeComboArb, async (doc) => {
-          const { md1, md2 } = await roundTrip(doc);
+          const { md1, md2, doc2 } = await roundTrip(doc);
           expect(md2).toBe(md1);
+          // The re-imported run carries BOTH code and the co-occurring mark.
+          const run = doc2?.content?.[0]?.content?.[0];
+          const markTypes = (run?.marks || []).map((m: any) => m.type).sort();
+          expect(markTypes).toContain('code');
+          expect(markTypes.length).toBe(2);
         }),
         { numRuns: 20, seed: SEED },
       );
     },
   );
+
+  // -------------------------------------------------------------------------
+  // #515 REPRO CASES: the five markdown inputs from the issue must import to a
+  // code+bold node (import correctness) AND re-export byte-stably with no
+  // dangling `**` (export correctness). Import direction is checked against the
+  // real markdown->PM bridge; export direction via the md->pm->md fixpoint.
+  // -------------------------------------------------------------------------
+  it('the five #515 repro cases import to [code,bold] and round-trip clean', async () => {
+    // Collect every inline text run in a doc with its mark type set.
+    const runs = (node: any): { text: string; marks: string[] }[] => {
+      if (node?.type === 'text') {
+        return [{ text: node.text || '', marks: (node.marks || []).map((m: any) => m.type) }];
+      }
+      return (node?.content || []).flatMap(runs);
+    };
+    const findRun = (doc: any, text: string) =>
+      runs(doc).find((r) => r.text === text);
+
+    // Case 1: **`code1`** -> code1 = [code, bold].
+    {
+      const md = '**`code1`**';
+      const pm = await markdownToProseMirror(md);
+      const r = findRun(pm, 'code1');
+      expect(r?.marks.sort()).toEqual(['bold', 'code']);
+      const md2 = convertProseMirrorToMarkdown(pm);
+      expect(md2).toBe('**`code1`**');
+      // md -> pm -> md fixpoint.
+      expect(convertProseMirrorToMarkdown(await markdownToProseMirror(md2))).toBe(md2);
+    }
+
+    // Case 2: **`aaa` + `bbb`** -> aaa,bbb = [code,bold], "+" carries bold; no
+    // dangling `**` on export.
+    {
+      const md = '**`aaa` + `bbb`**';
+      const pm = await markdownToProseMirror(md);
+      expect(findRun(pm, 'aaa')?.marks.sort()).toEqual(['bold', 'code']);
+      expect(findRun(pm, 'bbb')?.marks.sort()).toEqual(['bold', 'code']);
+      const md2 = convertProseMirrorToMarkdown(pm);
+      expect(md2).toBe('**`aaa` + `bbb`**');
+      // NOT the old broken export with the bold delimiters split onto each span.
+      expect(md2).not.toBe('`aaa`** + **`bbb`');
+      expect(convertProseMirrorToMarkdown(await markdownToProseMirror(md2))).toBe(md2);
+    }
+
+    // Case 3 (control): **bold3** and `code3` -> bold and code stay SEPARATE.
+    {
+      const md = '**bold3** and `code3`';
+      const pm = await markdownToProseMirror(md);
+      expect(findRun(pm, 'bold3')?.marks).toEqual(['bold']);
+      expect(findRun(pm, 'code3')?.marks).toEqual(['code']);
+      const md2 = convertProseMirrorToMarkdown(pm);
+      expect(md2).toBe('**bold3** and `code3`');
+    }
+
+    // Case 4: **`code4` tail** -> code4 = [code,bold], " tail" = [bold].
+    {
+      const md = '**`code4` tail**';
+      const pm = await markdownToProseMirror(md);
+      expect(findRun(pm, 'code4')?.marks.sort()).toEqual(['bold', 'code']);
+      const md2 = convertProseMirrorToMarkdown(pm);
+      expect(md2).toBe('**`code4` tail**');
+      expect(convertProseMirrorToMarkdown(await markdownToProseMirror(md2))).toBe(md2);
+    }
+
+    // Case 5: pre **`code5`** post -> code5 = [code,bold], surroundings plain.
+    {
+      const md = 'pre **`code5`** post';
+      const pm = await markdownToProseMirror(md);
+      expect(findRun(pm, 'code5')?.marks.sort()).toEqual(['bold', 'code']);
+      const md2 = convertProseMirrorToMarkdown(pm);
+      expect(md2).toBe('pre **`code5`** post');
+      expect(convertProseMirrorToMarkdown(await markdownToProseMirror(md2))).toBe(md2);
+    }
+  });
 });
