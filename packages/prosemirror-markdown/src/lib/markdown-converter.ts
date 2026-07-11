@@ -63,6 +63,54 @@ export interface ConvertProseMirrorToMarkdownOptions {
  * separator is emitted for any other join, so non-list output is unchanged.
  */
 const LIST_MARKER_SEPARATOR = "<!-- -->";
+
+/**
+ * Backslash-escape a leading markdown BLOCK trigger so a serialized paragraph
+ * line re-parses as a PARAGRAPH, not another block. Without this, a paragraph
+ * whose text begins at column 0 with an ATX heading `#`, a blockquote/callout
+ * `>`, a bullet marker `-`/`*`/`+`, an ordered marker `N.`/`N)`, a code fence
+ * (```` ``` ````/`~~~`), a table `|`, or a thematic break (`---`/`***`/`___`,
+ * solid or spaced) silently becomes a heading/list/quote/code block/table/rule
+ * on the next markdown -> ProseMirror import — a known data-loss class (the
+ * thematic-break case drops the text entirely, since a horizontalRule carries
+ * none). CommonMark's escape tokenizer decodes the inserted `\` back to the
+ * literal character on import AND stops the block interpretation, so the line
+ * round-trips byte-exact as paragraph text. Only the FIRST offending character
+ * is escaped (the minimum needed to break block recognition); a line that does
+ * NOT open a block — emphasis `**x**`, an inline code span, ordinary prose — is
+ * returned verbatim, so there is no backslash churn for the common case.
+ *
+ * Applied ONLY to paragraph text: headings/lists/blockquotes legitimately open
+ * with these markers and render them from their own cases. This is the single,
+ * canonical fix for the class the client bridge worked around with a ZWSP
+ * (`gitmost-recording.ts`) and the generative suite self-censored around
+ * (`text-arbitraries.ts`) — both now removed.
+ */
+function escapeLeadingBlockTrigger(line: string): string {
+  // ATX heading: 1..6 `#` then whitespace/EOL.
+  if (/^#{1,6}(?:\s|$)/.test(line)) return "\\" + line;
+  // Blockquote / Docmost callout opener (`>` or `> [!info]`).
+  if (line.startsWith(">")) return "\\" + line;
+  // Bullet list marker then whitespace/EOL. Emphasis (`*x*`, `**x**`) has no
+  // space after the leading marker and is intentionally left verbatim.
+  if (/^[-*+](?:\s|$)/.test(line)) return "\\" + line;
+  // Ordered list marker `N.` / `N)`: escape the DELIMITER so the digits stay
+  // literal (`1. x` -> `1\. x`, which imports back as the text `1. x`).
+  const ordered = line.match(/^(\d+)[.)](?:\s|$)/);
+  if (ordered) {
+    const digits = ordered[1].length;
+    return line.slice(0, digits) + "\\" + line.slice(digits);
+  }
+  // Fenced code block: 3+ backticks or tildes. A single/double backtick is an
+  // inline code span and is left verbatim.
+  if (/^(?:`{3,}|~{3,})/.test(line)) return "\\" + line;
+  // Thematic break: a WHOLE line of 3+ identical `-`/`*`/`_`, optionally spaced.
+  if (/^([-*_])(?:\s*\1){2,}\s*$/.test(line)) return "\\" + line;
+  // GFM table row opener.
+  if (line.startsWith("|")) return "\\" + line;
+  return line;
+}
+
 function listMarkerFamily(type: string | undefined): "ul" | "ol" | null {
   if (type === "bulletList" || type === "taskList") return "ul";
   if (type === "orderedList") return "ol";
@@ -412,7 +460,10 @@ export function convertProseMirrorToMarkdown(
       }
 
       case "paragraph": {
-        const text = renderInlineChildren(nodeContent);
+        // Escape a leading block trigger so a paragraph whose text opens with
+        // `#`/`-`/`>`/`1.`/`|`/a fence/`---` round-trips as a paragraph instead
+        // of silently re-parsing into another block on the next import.
+        const text = escapeLeadingBlockTrigger(renderInlineChildren(nodeContent));
         const align = node.attrs?.textAlign;
         // Non-default alignment round-trips as an ATTACHED HTML comment at the
         // END of the block line (#293 canon #9):

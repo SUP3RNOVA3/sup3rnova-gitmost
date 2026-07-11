@@ -213,13 +213,41 @@ export function normalizeInline(nodes: any[]): any[] {
 }
 
 /**
+ * #493 commit 1: a plain-text run whose text DELIBERATELY OPENS with a markdown
+ * BLOCK trigger — ATX heading `#`, bullet `-`/`*`/`+`, blockquote `>`, ordered
+ * `N.`/`N)`, or a table `|` — followed by safe text. Pre-#493 the corpus
+ * self-censored these away (safeTextArb's leading-word guarantee); the paragraph
+ * serializer now BLOCK-ESCAPES a leading trigger, so the generative round-trip
+ * itself proves the data-loss class is closed rather than avoiding it.
+ *
+ * DELIBERATELY excludes the code-fence (backtick) trigger — the backtick is a
+ * code-span delimiter that re-pairs globally (see specialCharArb's note), an
+ * instability UNRELATED to block-escape — and the whole-line thematic break
+ * (`---`), which only triggers when the line is ONLY dashes; both are covered by
+ * the deterministic pin (gitmost-transcript-neutralization.test.ts). Each still
+ * ENDS in a word (safeTextArb) so adjacent-run concatenation stays safe.
+ */
+export const blockTriggerLeadRunArb: fc.Arbitrary<any> = fc
+  .tuple(
+    fc.constantFrom('# ', '## ', '- ', '* ', '+ ', '> ', '1. ', '1) ', '| '),
+    safeTextArb,
+  )
+  .map(([trigger, rest]) => ({ type: 'text', text: trigger + rest }));
+
+/**
  * Inline content for a paragraph: at least one marked text run, optionally with
- * inline atoms (math/mention) and hard breaks interspersed. Always starts with a
- * text run so the paragraph never opens with a block trigger. (Ported.)
+ * inline atoms (math/mention) and hard breaks interspersed. The FIRST run is
+ * usually an ordinary marked run, but sometimes a block-trigger-leading run
+ * (blockTriggerLeadRunArb) so the paragraph OPENS with a markdown block trigger
+ * — exercising the serializer's leading block-escape end-to-end. (Ported, with
+ * the #493 leading-trigger dimension added.)
  */
 export const inlineContentArb: fc.Arbitrary<any[]> = fc
   .tuple(
-    markedTextRunArb,
+    fc.oneof(
+      { weight: 5, arbitrary: markedTextRunArb },
+      { weight: 1, arbitrary: blockTriggerLeadRunArb },
+    ),
     fc.array(
       fc.oneof(
         { weight: 5, arbitrary: markedTextRunArb },

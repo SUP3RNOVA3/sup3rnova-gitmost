@@ -5,31 +5,20 @@ import { convertProseMirrorToMarkdown } from "../src/lib/markdown-converter.js";
 import { markdownToProseMirror } from "../src/lib/markdown-to-prosemirror.js";
 
 /**
- * gitmost #377 (round-1 review, finding #1) — proof, against the REAL
- * converter, that the transcript-insert boundary defense survives git-sync.
+ * #493 commit 1 — the paragraph serializer's leading-block-escape closes the
+ * data-loss class where a paragraph whose text opens at column 0 with a markdown
+ * block trigger (`#`/`-`/`*`/`+`/`>`, an ordered `N.`/`N)`, a code fence, a
+ * table `|`, a callout opener, or a thematic break) silently re-parsed into a
+ * heading / list / quote / code block / table / horizontalRule on the git-sync
+ * doc -> markdown -> doc cycle. The thematic-break case was the worst: a
+ * horizontalRule carries NO text, so the line's text was lost entirely.
  *
- * The web bridge (apps/client .../gitmost/gitmost-recording.ts,
- * `gitmostInsertTranscriptIntoEditor`) appends each transcript line as a
- * PARAGRAPH text node. The paragraph serializer here (`case "paragraph"`) emits
- * that text VERBATIM with no block-escape, so a line whose text begins with a
- * col-0 markdown block trigger would, on the doc -> markdown -> doc git-sync
- * cycle, silently re-parse into a heading / list / quote / callout / code block.
- * That missing block-escape is the pre-existing root cause; the bridge's
- * boundary defense prepends an invisible zero-width space (U+200B) to a line
- * that begins with such a trigger, shifting it off column 0.
- *
- * This test keeps a COPY of the bridge's trigger regex (the bridge is in a
- * different package and can't be imported here) and asserts:
- *   1. bare trigger lines DO corrupt (documents the root cause), and
- *   2. the ZWSP-neutralized form round-trips as a single PARAGRAPH with the
- *      text byte-preserved.
+ * This is the deterministic PIN, one assertion per trigger, exercised through
+ * the REAL converter round-trip (not a mock): each bare trigger line now
+ * round-trips as a SINGLE paragraph with its text byte-preserved — proving the
+ * class is closed WITHOUT the former client-side ZWSP workaround (removed) or
+ * the generative suite's leading-word self-censorship (removed).
  */
-
-const ZWSP = "​"; // U+200B
-
-// MUST stay in sync with GITMOST_MD_BLOCK_TRIGGER_RE in the client bridge.
-const MD_BLOCK_TRIGGER_RE =
-  /^(?:#{1,6}(?:\s|$)|[-*+](?:\s|$)|>|\d+[.)](?:\s|$)|```|~~~|\||([-*_])(?:\s*\1){2,}\s*$)/;
 
 const doc = (...nodes: any[]) => ({ type: "doc", content: nodes });
 const para = (t: string) => ({
@@ -43,78 +32,74 @@ const roundtrip = async (text: string) => {
   return back.content as any[];
 };
 
-describe("gitmost transcript neutralization (git-sync round-trip)", () => {
-  // Lines that, at column 0, the serializer's missing block-escape would let
-  // git-sync re-parse into a non-paragraph block.
+describe("paragraph block-escape (git-sync round-trip)", () => {
+  // Every line here, at column 0, WOULD (pre-fix) re-parse into a non-paragraph
+  // block. Each is now block-escaped by the serializer and round-trips clean.
   const triggerLines = [
     "- dash",
     "* star",
     "+ plus",
     "> quote",
     "# hash",
+    "## two hash",
+    "###### six hash",
     "1. one",
     "1) one",
     "> [!info] note",
     "```js",
     "~~~",
-    // Solid + spaced thematic breaks — these re-parse into a `horizontalRule`,
-    // which carries NO text, so a bare separator line LOSES its text entirely
-    // (round-2 finding). `_` also only forms a block via this construct.
+    "| a | b |",
+    // Solid + spaced thematic breaks — the text-LOSING case pre-fix.
     "---",
     "***",
     "___",
-    "- - -", // spaced dash break (solid form is caught by [-*+]\s too, but this is the break)
+    "- - -",
     "_ _ _",
   ];
 
-  it("BARE trigger lines corrupt into non-paragraph blocks (root cause)", async () => {
+  it("every bare trigger line round-trips as a single paragraph, text byte-preserved", async () => {
     for (const line of triggerLines) {
       const blocks = await roundtrip(line);
-      // At least one produced block is NOT a paragraph — i.e. corruption.
-      const allParagraphs = blocks.every((b) => b.type === "paragraph");
-      expect(
-        allParagraphs,
-        `expected "${line}" to corrupt when inserted bare`,
-      ).toBe(false);
-    }
-  });
-
-  it("BARE solid thematic breaks corrupt into a text-LOSING horizontalRule", async () => {
-    // The severe case: no text node survives. Documents why neutralization
-    // matters more here than for list/quote (where the text survived).
-    for (const line of ["---", "***", "___"]) {
-      const blocks = await roundtrip(line);
-      expect(blocks.map((b) => b.type)).toContain("horizontalRule");
-      // No block carries the original text anywhere.
-      const flat = JSON.stringify(blocks);
-      expect(flat).not.toContain(line);
-    }
-  });
-
-  it("ZWSP-neutralized trigger lines round-trip as a single paragraph, text preserved", async () => {
-    for (const line of triggerLines) {
-      // The regex must actually classify each as a trigger.
-      expect(MD_BLOCK_TRIGGER_RE.test(line), `regex missed "${line}"`).toBe(
-        true,
+      expect(blocks, `"${line}" should be one block`).toHaveLength(1);
+      expect(blocks[0].type, `"${line}" should stay a paragraph`).toBe(
+        "paragraph",
       );
-      const neutralized = ZWSP + line;
-      const blocks = await roundtrip(neutralized);
-
-      expect(blocks).toHaveLength(1);
-      expect(blocks[0].type).toBe("paragraph");
-      // Text is byte-preserved (ZWSP + original line), so the display is the
-      // original line with only an invisible leading character.
-      expect(blocks[0].content[0].text).toBe(neutralized);
+      expect(
+        blocks[0].content?.[0]?.text,
+        `"${line}" text should survive byte-exact`,
+      ).toBe(line);
     }
   });
 
-  it("normal host-prefixed lines never match the trigger regex and round-trip byte-exact", async () => {
+  it("emphasis / inline-code paragraphs are NOT escaped (no backslash churn)", async () => {
+    // These open with `*`/`` ` `` but are NOT block triggers; the serialized
+    // markdown must not gain a stray leading backslash, and they round-trip.
+    for (const [text, mark] of [
+      ["bold", "bold"],
+      ["italic", "italic"],
+      ["code", "code"],
+    ] as const) {
+      const node = doc({
+        type: "paragraph",
+        content: [{ type: "text", text, marks: [{ type: mark }] }],
+      });
+      const md = convertProseMirrorToMarkdown(node);
+      expect(md.startsWith("\\"), `${mark} must not be block-escaped`).toBe(
+        false,
+      );
+      const back = await markdownToProseMirror(md);
+      expect(back.content[0].type).toBe("paragraph");
+      expect(back.content[0].content[0].text).toBe(text);
+      expect(back.content[0].content[0].marks?.[0]?.type).toBe(mark);
+    }
+  });
+
+  it("normal host-prefixed lines round-trip byte-exact (unaffected)", async () => {
     for (const line of [
       "You: hello there",
       "Speaker 1: - and then a dash mid-line",
       "Speaker 2: 1. not a list",
     ]) {
-      expect(MD_BLOCK_TRIGGER_RE.test(line)).toBe(false);
       const blocks = await roundtrip(line);
       expect(blocks).toHaveLength(1);
       expect(blocks[0].type).toBe("paragraph");
