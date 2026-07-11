@@ -758,6 +758,13 @@ export class AiChatService implements OnModuleInit {
       // or violate the page_id FK on insert (this runs after res.hijack(), so a
       // DB error would break the stream).
       const originPageId: string | null = openPageContext?.id ?? null;
+      // ORPHAN-ON-BEGIN-FAILURE tradeoff (#486, B3): the chat row is inserted
+      // HERE, before runHooks.begin below. If begin fails (e.g. a 503 / run-slot
+      // rejection) the turn aborts before the client is told this new chatId, so
+      // an empty chat is left behind and a retry mints ANOTHER one. We accept this
+      // over reordering: begin needs a chatId to bind the run to, and inserting
+      // the chat first keeps the id stable + the FK/history-join invariants above
+      // intact. Orphan empty chats are cheap and swept by normal chat cleanup.
       const chat = await this.aiChatRepo.insert({
         creatorId: user.id,
         workspaceId: workspace.id,

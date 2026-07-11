@@ -923,9 +923,10 @@ export const SHARED_TOOL_SPECS = {
       'List the most recent pages (ordered by updatedAt, descending), ' +
       'optionally scoped to a single space. Returns a bounded list (default ' +
       '50, max 100) — use search for lookups in large spaces. tree:true (with ' +
-      "spaceId) returns the space's full page hierarchy as a nested tree, but " +
-      'is DEPRECATED — use getTree instead (leaner nodes, plus rootPageId / ' +
-      'maxDepth).',
+      "spaceId) returns { tree, truncated } — the space's full page hierarchy " +
+      'as a nested tree, plus a `truncated` flag that is true when the tree was ' +
+      'capped and is INCOMPLETE — but is DEPRECATED, use getTree instead ' +
+      '(leaner nodes, plus rootPageId / maxDepth).',
     tier: 'core',
     catalogLine:
       "listPages — list recent pages (tree:true is deprecated; use getTree for the hierarchy).",
