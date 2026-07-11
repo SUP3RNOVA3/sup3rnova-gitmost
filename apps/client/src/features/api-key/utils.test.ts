@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DEFAULT_LIFETIME,
   EXPIRY_WARNING_DAYS,
+  isExpired,
   isExpiringSoon,
   lastUsedBucket,
   lifetimeToExpiresAt,
@@ -47,6 +48,36 @@ describe("isExpiringSoon (acceptance #3 highlight)", () => {
 
   it("an already-expired key is highlighted", () => {
     expect(isExpiringSoon(daysFromNow(-3), NOW)).toBe(true);
+  });
+});
+
+describe("isExpired (past vs future expiry)", () => {
+  it("an unlimited key is never expired", () => {
+    expect(isExpired(null, NOW)).toBe(false);
+  });
+
+  it("a past expiry is expired", () => {
+    expect(isExpired(daysFromNow(-3), NOW)).toBe(true);
+    expect(isExpired(daysFromNow(-1), NOW)).toBe(true);
+  });
+
+  it("a future expiry is not expired (even within the warning window)", () => {
+    expect(isExpired(daysFromNow(1), NOW)).toBe(false);
+    expect(isExpired(daysFromNow(EXPIRY_WARNING_DAYS - 1), NOW)).toBe(false);
+    expect(isExpired(daysFromNow(200), NOW)).toBe(false);
+  });
+
+  it("an expiry exactly at 'now' counts as expired (boundary is inclusive)", () => {
+    expect(isExpired(NOW.toISOString(), NOW)).toBe(true);
+  });
+
+  it("is mutually distinguishable from isExpiringSoon: expired vs soon-but-future", () => {
+    // A key 3 days in the past: expired, and (by design) also matches
+    // isExpiringSoon — the UI resolves this by checking isExpired first.
+    expect(isExpired(daysFromNow(-3), NOW)).toBe(true);
+    // A key 10 days in the future: NOT expired, but expiring soon.
+    expect(isExpired(daysFromNow(10), NOW)).toBe(false);
+    expect(isExpiringSoon(daysFromNow(10), NOW)).toBe(true);
   });
 });
 

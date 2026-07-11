@@ -32,8 +32,24 @@ export function lifetimeToExpiresAt(
   }
 }
 
+// True when a bounded key's expiry is already in the past (or exactly now). An
+// unlimited key (null) is never expired. This is distinct from "expiring soon":
+// the two states are mutually exclusive at the call site (see api-keys-manager),
+// so an already-expired key is labelled "Expired", not "Expiring soon".
+export function isExpired(
+  expiresAt: string | null,
+  now: Date = new Date(),
+): boolean {
+  if (!expiresAt) return false;
+  const expiry = new Date(expiresAt).getTime();
+  if (Number.isNaN(expiry)) return false;
+  return expiry <= now.getTime();
+}
+
 // True when a bounded key expires within the warning window (or is already
-// expired). An unlimited key (null) is never "expiring soon".
+// expired). An unlimited key (null) is never "expiring soon". Callers that need
+// to distinguish an already-past expiry should check isExpired() first, as this
+// predicate deliberately also covers the already-expired case.
 export function isExpiringSoon(
   expiresAt: string | null,
   now: Date = new Date(),

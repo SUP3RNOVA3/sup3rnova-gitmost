@@ -27,7 +27,11 @@ import {
   IApiKey,
   ICreateApiKeyResponse,
 } from "@/features/api-key/types/api-key.types";
-import { isExpiringSoon, lastUsedBucket } from "@/features/api-key/utils";
+import {
+  isExpired,
+  isExpiringSoon,
+  lastUsedBucket,
+} from "@/features/api-key/utils";
 import { CreateApiKeyModal } from "./create-api-key-modal";
 import { ShowTokenModal } from "./show-token-modal";
 
@@ -120,7 +124,11 @@ export default function ApiKeysManager() {
   }
 
   const rows = (keys ?? []).map((key) => {
-    const soon = isExpiringSoon(key.expiresAt);
+    // Mutually exclusive: an already-expired key is labelled "Expired" (a past
+    // expiry) rather than the forward-looking "Expiring soon". isExpiringSoon
+    // also matches past expiries, so gate "soon" on !expired.
+    const expired = isExpired(key.expiresAt);
+    const soon = !expired && isExpiringSoon(key.expiresAt);
     return (
       <Table.Tr key={key.id}>
         <Table.Td>
@@ -131,6 +139,18 @@ export default function ApiKeysManager() {
           {key.expiresAt ? (
             <Group gap={6} wrap="nowrap">
               <Text size="sm">{formatDate(key.expiresAt)}</Text>
+              {expired && (
+                <Tooltip label={t("This key has expired")} withArrow>
+                  <Badge
+                    color="red"
+                    variant="light"
+                    size="sm"
+                    leftSection={<IconAlertTriangle size={12} />}
+                  >
+                    {t("Expired")}
+                  </Badge>
+                </Tooltip>
+              )}
               {soon && (
                 <Tooltip
                   label={t("This key expires within 30 days")}
