@@ -56,6 +56,7 @@ import {
 import {
   isDegenerateOutput,
   truncateDegeneratedTail,
+  shouldCheckDegeneration,
 } from './output-degeneration';
 
 // Max agent steps per turn. One step = one model generation; a step that calls
@@ -1101,7 +1102,6 @@ export class AiChatService implements OnModuleInit {
       const degenerationController = new AbortController();
       let degenerationDetected = false;
       let lastDegenerationCheckLen = 0;
-      const DEGENERATION_CHECK_STEP = 2000;
 
       // Step-granular durability (#183): create the assistant row UPFRONT in the
       // 'streaming' state (before any token), then UPDATE it as each step finishes
@@ -1275,8 +1275,10 @@ export class AiChatService implements OnModuleInit {
               // trigger, abort the run ONCE with a distinguishable reason.
               if (
                 !degenerationDetected &&
-                inProgressText.length - lastDegenerationCheckLen >=
-                  DEGENERATION_CHECK_STEP
+                shouldCheckDegeneration(
+                  inProgressText.length,
+                  lastDegenerationCheckLen,
+                )
               ) {
                 lastDegenerationCheckLen = inProgressText.length;
                 if (isDegenerateOutput(inProgressText)) {
@@ -1296,6 +1298,13 @@ export class AiChatService implements OnModuleInit {
             // the in-progress accumulator for the next step.
             capturedSteps.push(step as StepLike);
             inProgressText = '';
+            // Reset the degeneration-check watermark too (#486): it tracks a byte
+            // offset INTO inProgressText, so once that resets to '' a stale (large)
+            // mark makes `inProgressText.length - lastDegenerationCheckLen` go
+            // negative and the throttled detector stays silent until a later step's
+            // text re-grows past the old offset — a whole degenerate step could slip
+            // through undetected. Zeroing it re-arms the check from the next byte.
+            lastDegenerationCheckLen = 0;
             // Step-granular durability (#183): persist this finished step (its text +
             // tool calls + tool RESULTS) the moment it ends, so a process death after
             // this point still recovers the step. Not awaited here (never block the

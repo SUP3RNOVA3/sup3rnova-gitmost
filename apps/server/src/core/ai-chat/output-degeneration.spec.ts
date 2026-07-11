@@ -3,6 +3,8 @@ import {
   hasPeriodicTail,
   isDegenerateOutput,
   truncateDegeneratedTail,
+  shouldCheckDegeneration,
+  DEGENERATION_CHECK_STEP,
   REPEATED_LINES_THRESHOLD,
   MIN_PERIOD_REPEATS,
 } from './output-degeneration';
@@ -178,5 +180,44 @@ describe('truncateDegeneratedTail', () => {
   it('returns non-degenerate text unchanged (by identity)', () => {
     const text = 'A perfectly normal, finished assistant answer.';
     expect(truncateDegeneratedTail(text)).toBe(text);
+  });
+});
+
+/**
+ * Throttle + step-boundary reset (#486). The stream keeps a watermark
+ * (`lastDegenerationCheckLen`) that is an OFFSET into the accumulated step text.
+ * On a step boundary the accumulator resets to '', so the watermark MUST reset to
+ * 0 too — otherwise the throttle goes silent for the whole next step. These tests
+ * pin the pure decision AND the reset property that ai-chat.service.onStepFinish
+ * now enforces.
+ */
+describe('shouldCheckDegeneration (throttle) + step-boundary reset (#486)', () => {
+  it('fires once the text grows a full DEGENERATION_CHECK_STEP past the mark', () => {
+    expect(shouldCheckDegeneration(DEGENERATION_CHECK_STEP, 0)).toBe(true);
+    expect(shouldCheckDegeneration(DEGENERATION_CHECK_STEP - 1, 0)).toBe(false);
+    expect(shouldCheckDegeneration(5000, 3000)).toBe(true); // grew 2000 since mark
+    expect(shouldCheckDegeneration(4000, 3000)).toBe(false); // grew only 1000
+  });
+
+  it('BUG (no reset): a stale large watermark silences the next step', () => {
+    // End of a long step: the watermark sits at 5000. The step ends and the
+    // accumulator resets to '' — but if the watermark is NOT reset, a fresh short
+    // degenerate burst (length 2000) never triggers a check: 2000 - 5000 < STEP.
+    const staleWatermark = 5000;
+    const nextStepLen = DEGENERATION_CHECK_STEP; // a fresh 2KB burst
+    expect(shouldCheckDegeneration(nextStepLen, staleWatermark)).toBe(false);
+  });
+
+  it('FIX (reset to 0): the same short degenerate burst IS checked and detected', () => {
+    // onStepFinish now zeroes the watermark, so the fresh burst re-arms the check.
+    const resetWatermark = 0;
+    const degenerateBurst = 'loadTools.\n'.repeat(300); // real degeneration
+    expect(degenerateBurst.length).toBeGreaterThanOrEqual(DEGENERATION_CHECK_STEP);
+    // The throttle now fires...
+    expect(
+      shouldCheckDegeneration(degenerateBurst.length, resetWatermark),
+    ).toBe(true);
+    // ...and the detector catches the loop that would otherwise stream unchecked.
+    expect(isDegenerateOutput(degenerateBurst)).toBe(true);
   });
 });
