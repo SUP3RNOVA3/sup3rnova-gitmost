@@ -23,6 +23,7 @@ import {
 } from "@docmost/prosemirror-markdown";
 import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 import { normalizeAndMergeFootnotes } from "./footnote-normalize-merge.js";
+import { regraftResolvedComments } from "./comment-anchor.js";
 import { VerifyReport } from "./diff.js";
 import { acquireCollabSession } from "./collab-session.js";
 
@@ -338,6 +339,12 @@ export async function updatePageContentRealtime(
     pageId,
     collabToken,
     baseUrl,
-    () => tiptapJson,
+    // #493: an agent read HIDES resolved-comment anchors (#337), so the markdown
+    // it sends here no longer carries them — a naive full rewrite would erase
+    // every resolved comment mark. Re-graft the resolved marks from the LIVE doc
+    // onto the matching text in the freshly-imported body. Active comments are
+    // untouched (they ride through the markdown themselves); a resolved span whose
+    // text the agent changed simply does not re-anchor and is dropped.
+    (liveDoc) => regraftResolvedComments(liveDoc, tiptapJson),
   );
 }
