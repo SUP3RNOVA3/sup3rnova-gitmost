@@ -1,3 +1,4 @@
+import { Logger } from '@nestjs/common';
 import { DatabaseAuditService } from './database-audit.service';
 import { AUDIT_CONTEXT_KEY } from '../../common/middlewares/audit-context.middleware';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
@@ -115,13 +116,39 @@ describe('DatabaseAuditService', () => {
     expect(inserted).toHaveLength(0);
   });
 
-  it('a failed insert never throws to the caller (audit is a side-record)', async () => {
-    const { service, failInsert } = makeService(ctx());
-    failInsert();
-    // Must not reject / throw.
-    expect(() => service.log(applyPayload())).not.toThrow();
-    await Promise.resolve();
-    await Promise.resolve();
+  it('a failed insert is swallowed with a warn and floats no rejection (audit is a side-record)', async () => {
+    // This pins the load-bearing swallow inside persist(). Because log() is
+    // fire-and-forget (`void this.persist(...)`), it always returns synchronously
+    // without throwing — so `not.toThrow()` alone would stay green even if the
+    // try/catch were removed. We instead observe the two effects the catch is
+    // responsible for: a warn IS emitted, and NO unhandled rejection floats.
+    // Removing persist()'s try/catch reddens both assertions (warn count 0 + a
+    // captured rejection).
+    const warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined as any);
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => rejections.push(err);
+    process.on('unhandledRejection', onRejection);
+    try {
+      const { service, failInsert } = makeService(ctx());
+      failInsert();
+      expect(() => service.log(applyPayload())).not.toThrow();
+      // Flush microtasks so the rejected insert settles, then give any floated
+      // rejection a macrotask tick to be reported by the runtime.
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise((r) => setImmediate(r));
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(String(warnSpy.mock.calls[0][0])).toContain(
+        'Failed to persist audit event',
+      );
+      expect(rejections).toHaveLength(0);
+    } finally {
+      process.off('unhandledRejection', onRejection);
+      warnSpy.mockRestore();
+    }
   });
 
   it('logWithContext() persists with an explicit (non-request) context', async () => {

@@ -267,12 +267,11 @@ export function replaceYjsMarkedText(
   // when the marked run mixes formatting we pick the DOMINANT segment (the one
   // covering the most characters) and apply its attributes — a v1 that preserves
   // the common single-format case exactly and, for a mixed run, keeps the
-  // prevailing style rather than losing all of it. The dominant segment already
-  // carries the `comment` mark (every collected segment does), so the anchor is
-  // preserved; we defensively re-assert it in case a future attribute shape
-  // omits it.
+  // prevailing style rather than losing all of it. `attributes` already carries
+  // the `comment` mark (every collected segment is filtered on it above), so the
+  // anchor is preserved by copying the run's attribute set verbatim.
   const dominant = segments.reduce((a, b) => (b.length > a.length ? b : a));
-  const insertAttrs = { ...dominant.attributes, comment: dominant.markAttrs };
+  const insertAttrs = { ...dominant.attributes };
 
   node.delete(start, len);
   node.insert(start, newText, insertAttrs);

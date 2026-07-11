@@ -583,24 +583,52 @@ describe('replaceYjsMarkedText', () => {
     ]);
   });
 
-  it('mixed formatting under the mark: replacement takes the DOMINANT run marks', () => {
-    // Marked run = "bold" (bold, 4 chars) + "x" (plain, 1 char), same commentId.
-    // The dominant (longer) segment is bold, so the flat replacement is bold.
+  it('mixed formatting under the mark: replacement takes the DOMINANT (longest) run, NOT the leading one', () => {
+    // Leading run is SHORT + plain ("x", 1 char); the following run is LONGER +
+    // bold ("bolded", 6 chars), same commentId. The longest run is deliberately
+    // NOT first: a "first-wins" pick would carry plain (no bold), so asserting
+    // bold on the result only holds if the code genuinely selects the LONGEST run.
     const { fragment, text } = buildFormatted([
+      { text: 'x', attrs: { comment: { commentId: 'c1', resolved: false } } },
       {
-        text: 'bold',
+        text: 'bolded',
         attrs: { comment: { commentId: 'c1', resolved: false }, bold: true },
       },
-      { text: 'x', attrs: { comment: { commentId: 'c1', resolved: false } } },
     ]);
 
-    const result = replaceYjsMarkedText(fragment, 'c1', 'boldx', 'Z');
+    const result = replaceYjsMarkedText(fragment, 'c1', 'xbolded', 'Z');
 
     expect(result).toEqual({ applied: true, currentText: 'Z' });
     expect(text.toDelta()).toEqual([
       {
         insert: 'Z',
         attributes: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+    ]);
+  });
+
+  it('mixed formatting under the mark: on a length tie the FIRST run wins', () => {
+    // Two equal-length runs (2 chars each) with different formatting, same
+    // commentId. The reduce keeps the accumulator on a tie, so the FIRST run
+    // (italic) prevails over the later bold one.
+    const { fragment, text } = buildFormatted([
+      {
+        text: 'AA',
+        attrs: { comment: { commentId: 'c1', resolved: false }, italic: true },
+      },
+      {
+        text: 'BB',
+        attrs: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'AABB', 'Z');
+
+    expect(result).toEqual({ applied: true, currentText: 'Z' });
+    expect(text.toDelta()).toEqual([
+      {
+        insert: 'Z',
+        attributes: { comment: { commentId: 'c1', resolved: false }, italic: true },
       },
     ]);
   });
