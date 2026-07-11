@@ -86,6 +86,17 @@ export type { OutlineEntry } from "./node-ops.js";
 // string (#414: single copy shared by mcp and the CommonJS server app).
 export { parseNodeArg } from "./parse-node-arg.js";
 
+// Locator markdown-stripping (#493 dedup): the single canonical copy of the
+// markdown-tolerant anchor-normalization primitives, imported by mcp's
+// text-normalize.ts instead of a forked duplicate. `stripInlineMarkdown` is the
+// lenient locator normalizer (trims stray decoration); `stripWrappersAndLinks`
+// is the strict balanced-wrapper/link primitive mcp builds `stripBalancedWrappers`
+// on top of.
+export {
+  stripInlineMarkdown,
+  stripWrappersAndLinks,
+} from "./text-normalize.js";
+
 // Inline-footnote authoring convention (#414: single copy, formerly the mcp
 // `footnote-authoring.ts` fork), shared with the importer's `assembleFootnotes`.
 export {
