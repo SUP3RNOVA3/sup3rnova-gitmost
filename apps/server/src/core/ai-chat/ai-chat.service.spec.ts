@@ -13,6 +13,7 @@ import {
   compactToolOutput,
   assistantParts,
   serializeSteps,
+  type StepPartsCache,
   rowToUiMessage,
   prepareAgentStep,
   stepBudgetWarning,
@@ -113,6 +114,54 @@ describe('compactToolOutput', () => {
  */
 describe('assistantParts', () => {
   type AnyPart = Record<string, unknown>;
+
+  // #490 memoization: assistantParts builds each step's parts once and caches
+  // them by the step OBJECT's identity, so a mid-stream flush does not
+  // re-stringify every prior step's (large) output. Observable property: with a
+  // shared cache, the second call over the SAME step object returns the cached
+  // (identical) part array even if the step's underlying output was swapped —
+  // proving the work was memoized, not redone.
+  it('memoizes a step by identity (shared cache => one build per step)', () => {
+    const cache: StepPartsCache = new WeakMap();
+    const step = {
+      text: 'x',
+      toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: {} }],
+      toolResults: [{ toolCallId: 'c1', toolName: 'getPage', output: { v: 1 } }],
+    };
+    const first = assistantParts([step], '', cache) as AnyPart[];
+    expect((first.find((p) => p.type === 'tool-getPage')!.output as any).v).toBe(
+      1,
+    );
+    // Swap the output for a NEW value; a re-build would pick it up, a cache hit
+    // keeps the first result.
+    step.toolResults[0] = {
+      toolCallId: 'c1',
+      toolName: 'getPage',
+      output: { v: 2 },
+    };
+    const second = assistantParts([step], '', cache) as AnyPart[];
+    expect((second.find((p) => p.type === 'tool-getPage')!.output as any).v).toBe(
+      1,
+    );
+    // Same cached part objects are reused.
+    expect(second.find((p) => p.type === 'tool-getPage')).toBe(
+      first.find((p) => p.type === 'tool-getPage'),
+    );
+  });
+
+  it('without a cache, each call rebuilds (no stale memo)', () => {
+    const step = {
+      text: 'x',
+      toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: {} }],
+      toolResults: [{ toolCallId: 'c1', toolName: 'getPage', output: { v: 1 } }],
+    };
+    const first = assistantParts([step], '') as AnyPart[];
+    step.toolResults[0].output = { v: 2 };
+    const second = assistantParts([step], '') as AnyPart[];
+    expect((second.find((p) => p.type === 'tool-getPage')!.output as any).v).toBe(
+      2,
+    );
+  });
 
   it('emits output-available for a tool-call WITH a paired result', () => {
     const steps = [

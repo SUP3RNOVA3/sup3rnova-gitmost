@@ -1352,6 +1352,11 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       const capturedSteps: StepLike[] = [];
       let inProgressText = '';
 
+      // Per-turn step->parts memo (#490): shared across every flushAssistant call
+      // this turn so each finished step's (large) output is JSON-stringified ONCE,
+      // not re-stringified on every subsequent onStepFinish flush (was O(N²)).
+      const partsCache: StepPartsCache = new WeakMap();
+
       // Token-degeneration guard (#444). When the final-step lockdown is OFF, a
       // runaway repetition loop (the 255KB "loadTools." incident) is aborted via
       // this internal controller, unioned with the run/socket signal below. The
@@ -1421,7 +1426,10 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           await this.aiChatMessageRepo.update(
             assistantId,
             workspace.id,
-            flushAssistant(capturedSteps, '', 'streaming', { pageChanged }),
+            flushAssistant(capturedSteps, '', 'streaming', {
+              pageChanged,
+              partsCache,
+            }),
             { onlyIfStreaming: true },
           );
         } catch (err) {
@@ -1661,6 +1669,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 // closure scope here). Omitted/0 = no limit.
                 maxContextTokens: resolved?.chatContextWindow,
                 pageChanged,
+                partsCache,
               }),
             );
             // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
@@ -1726,6 +1735,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
               flushAssistant(capturedSteps, inProgressText, 'error', {
                 error: errorText,
                 pageChanged,
+                partsCache,
               }),
             );
             // #184: settle the RUN as failed, carrying the provider/transport cause.
@@ -1749,6 +1759,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 flushAssistant(capturedSteps, truncated, 'error', {
                   error: OUTPUT_DEGENERATION_ERROR,
                   pageChanged,
+                  partsCache,
                 }),
               );
               if (runId)
@@ -1783,6 +1794,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             await finalizeAssistant(
               flushAssistant(capturedSteps, inProgressText, 'aborted', {
                 pageChanged,
+                partsCache,
               }),
             );
             // #184: settle the RUN as aborted (an explicit user stop reached the
@@ -2380,71 +2392,97 @@ function normalizeToolError(error: unknown): string {
  */
 // Exported only so the unit tests can import these pure helpers; exporting
 // them does not change runtime behavior.
+/**
+ * Per-turn memo for {@link assistantParts}: a step's rebuilt parts keyed by the
+ * step OBJECT's identity (#490). A finished step in `capturedSteps` keeps a stable
+ * reference across every mid-stream flush, and `compactToolOutput` inside it does a
+ * `JSON.stringify` of the whole (often 50–200 KB) output — so without a memo each
+ * `onStepFinish` re-stringifies EVERY prior step's output (O(N²) stringify over a
+ * turn). Keyed by step identity => one stringify per step per turn. WeakMap so a
+ * turn's steps are GC'd with the turn.
+ */
+export type StepPartsCache = WeakMap<object, Array<Record<string, unknown>>>;
+
+/** Build the parts for ONE step (text + a part per tool call). Pure. */
+function buildStepParts(step: StepLike): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  if (step.text) {
+    parts.push({ type: 'text', text: step.text });
+  }
+  // Index this step's results by tool call id to pair calls with outputs.
+  const resultsById = new Map<string, unknown>();
+  for (const r of step.toolResults ?? []) {
+    if (r.toolCallId) resultsById.set(r.toolCallId, r.output);
+  }
+  // Index this step's THROWN tool failures (ai@6 `tool-error` content parts)
+  // by tool call id, so a call that failed replays with its real error text.
+  const errorsById = new Map<string, unknown>();
+  for (const part of step.content ?? []) {
+    if (part.type === 'tool-error' && part.toolCallId) {
+      errorsById.set(part.toolCallId, part.error);
+    }
+  }
+  for (const call of step.toolCalls ?? []) {
+    if (!call.toolName || !call.toolCallId) continue;
+    const hasResult = resultsById.has(call.toolCallId);
+    if (hasResult) {
+      // output-available: the tool returned; the next turn replays its result.
+      parts.push({
+        type: `tool-${call.toolName}`,
+        toolCallId: call.toolCallId,
+        state: 'output-available',
+        input: call.input,
+        output: compactToolOutput(resultsById.get(call.toolCallId)),
+      });
+    } else if (errorsById.has(call.toolCallId)) {
+      // The tool THREW: replay the REAL error so the model on the next turn
+      // knows WHY the call failed (and does not blindly repeat it). An
+      // output-error round-trips through convertToModelMessages as a balanced
+      // tool-call + tool-result, keeping the rebuilt history valid.
+      parts.push({
+        type: `tool-${call.toolName}`,
+        toolCallId: call.toolCallId,
+        state: 'output-error',
+        input: call.input,
+        errorText: normalizeToolError(errorsById.get(call.toolCallId)),
+      });
+    } else {
+      // No paired result AND no tool-error (e.g. aborted mid-step). Persisting
+      // a bare tool-call (input-available) would replay as an unpaired call and
+      // throw MissingToolResultsError on the next turn (convertToModelMessages
+      // emits no tool-result for it). Emit a SYNTHETIC paired result instead:
+      // an output-error round-trips through convertToModelMessages as a
+      // balanced tool-call + tool-result, keeping the rebuilt history valid.
+      parts.push({
+        type: `tool-${call.toolName}`,
+        toolCallId: call.toolCallId,
+        state: 'output-error',
+        input: call.input,
+        errorText: TOOL_CALL_INCOMPLETE_TEXT,
+      });
+    }
+  }
+  return parts;
+}
+
 export function assistantParts(
   steps: ReadonlyArray<StepLike> | undefined,
   fallbackText: string,
+  cache?: StepPartsCache,
 ): UIMessage['parts'] {
   const parts: Array<Record<string, unknown>> = [];
-  let sawText = false;
   for (const step of steps ?? []) {
-    if (step.text) {
-      parts.push({ type: 'text', text: step.text });
-      sawText = true;
+    // Memoize per step object (#490): a finished step is immutable and keeps its
+    // reference across flushes, so its parts (and the costly output stringify) are
+    // built exactly once per turn. A cache miss (or no cache) just rebuilds.
+    let stepParts = cache?.get(step as object);
+    if (!stepParts) {
+      stepParts = buildStepParts(step);
+      cache?.set(step as object, stepParts);
     }
-    // Index this step's results by tool call id to pair calls with outputs.
-    const resultsById = new Map<string, unknown>();
-    for (const r of step.toolResults ?? []) {
-      if (r.toolCallId) resultsById.set(r.toolCallId, r.output);
-    }
-    // Index this step's THROWN tool failures (ai@6 `tool-error` content parts)
-    // by tool call id, so a call that failed replays with its real error text.
-    const errorsById = new Map<string, unknown>();
-    for (const part of step.content ?? []) {
-      if (part.type === 'tool-error' && part.toolCallId) {
-        errorsById.set(part.toolCallId, part.error);
-      }
-    }
-    for (const call of step.toolCalls ?? []) {
-      if (!call.toolName || !call.toolCallId) continue;
-      const hasResult = resultsById.has(call.toolCallId);
-      if (hasResult) {
-        // output-available: the tool returned; the next turn replays its result.
-        parts.push({
-          type: `tool-${call.toolName}`,
-          toolCallId: call.toolCallId,
-          state: 'output-available',
-          input: call.input,
-          output: compactToolOutput(resultsById.get(call.toolCallId)),
-        });
-      } else if (errorsById.has(call.toolCallId)) {
-        // The tool THREW: replay the REAL error so the model on the next turn
-        // knows WHY the call failed (and does not blindly repeat it). An
-        // output-error round-trips through convertToModelMessages as a balanced
-        // tool-call + tool-result, keeping the rebuilt history valid.
-        parts.push({
-          type: `tool-${call.toolName}`,
-          toolCallId: call.toolCallId,
-          state: 'output-error',
-          input: call.input,
-          errorText: normalizeToolError(errorsById.get(call.toolCallId)),
-        });
-      } else {
-        // No paired result AND no tool-error (e.g. aborted mid-step). Persisting
-        // a bare tool-call (input-available) would replay as an unpaired call and
-        // throw MissingToolResultsError on the next turn (convertToModelMessages
-        // emits no tool-result for it). Emit a SYNTHETIC paired result instead:
-        // an output-error round-trips through convertToModelMessages as a
-        // balanced tool-call + tool-result, keeping the rebuilt history valid.
-        parts.push({
-          type: `tool-${call.toolName}`,
-          toolCallId: call.toolCallId,
-          state: 'output-error',
-          input: call.input,
-          errorText: TOOL_CALL_INCOMPLETE_TEXT,
-        });
-      }
-    }
+    parts.push(...stepParts);
   }
+  const sawText = parts.some((p) => p.type === 'text');
   if (!sawText && fallbackText) {
     // No per-step text (e.g. a single final block): append the final text after
     // any tool parts so the natural call -> result -> answer order is preserved.
@@ -2607,6 +2645,9 @@ export function flushAssistant(
     maxContextTokens?: number;
     error?: string;
     pageChanged?: { title: string; diff: string } | null;
+    // Per-turn step->parts memo (#490): pass the SAME cache on every flush of a
+    // turn so each finished step's output is stringified once, not once per flush.
+    partsCache?: StepPartsCache;
   },
 ): AssistantFlush {
   const finished = capturedSteps ?? [];
@@ -2616,9 +2657,11 @@ export function flushAssistant(
   // in-progress step's text (the partial answer cut off by an error/abort, or
   // simply not yet flushed mid-stream) as the last text part so the persisted
   // parts match what streamed to the client.
-  const parts = assistantParts(finished, '') as unknown as Array<
-    Record<string, unknown>
-  >;
+  const parts = assistantParts(
+    finished,
+    '',
+    extra?.partsCache,
+  ) as unknown as Array<Record<string, unknown>>;
   if (trailing) parts.push({ type: 'text', text: trailing });
 
   const metadata: Record<string, unknown> = {
