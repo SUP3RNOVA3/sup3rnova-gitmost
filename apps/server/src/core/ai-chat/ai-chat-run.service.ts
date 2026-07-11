@@ -508,6 +508,52 @@ export class AiChatRunService implements OnModuleInit {
   }
 
   /**
+   * #487 reconcile clause (c): abort runs the DB still shows active (pending|
+   * running) but that this replica does NOT own — NO live entry AND NO zombie —
+   * and that have been UNTOUCHED past `staleMs` (from last-progress `updated_at`,
+   * NOT startedAt, so a legit long marathon is never a candidate). "No entry" is
+   * the PRIMARY gate: a live entry (an actively-executing run on this replica) is
+   * NEVER aborted, whatever its age. Returns the number aborted. Best-effort —
+   * never throws (a periodic-job failure must not crash the process).
+   */
+  async reconcileStaleRuns(staleMs: number): Promise<number> {
+    let candidates: Array<{ id: string; workspaceId: string; chatId: string }>;
+    try {
+      candidates = await this.runRepo.findStaleActive(staleMs);
+    } catch (err) {
+      this.logger.warn(
+        `Reconcile (stale runs) query failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
+      return 0;
+    }
+    let aborted = 0;
+    for (const c of candidates) {
+      // PRIMARY gate: never touch a live entry, and never race a zombie we are
+      // already re-driving (settleZombie owns those).
+      if (this.active.has(c.id) || this.zombies.has(c.id)) continue;
+      try {
+        const row = await this.runRepo.finalizeIfActive(c.id, c.workspaceId, {
+          status: 'aborted',
+          error: 'Run aborted by reconcile: no live runner (stale).',
+        });
+        if (row) {
+          aborted += 1;
+          this.settled.add(c.id);
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Reconcile abort of stale run ${c.id} failed: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        );
+      }
+    }
+    return aborted;
+  }
+
+  /**
    * #487: the run's settle outcome as seen by THIS replica, or undefined when it
    * has no record (the caller then reads the row — the DB is the source of truth).
    * A LIVE deferred (still settling, or resolved-but-not-yet-consumed) wins; a

@@ -704,6 +704,38 @@ describe('#487 AiChatRunService.supersede (CAS)', () => {
     expect(await svc.supersede(chat, 'run-1', ws)).toEqual({ kind: 'degrade' });
   });
 
+  it('reconcileStaleRuns: aborts a stale run with NO entry/zombie; NEVER touches a live entry', async () => {
+    const finalizeIfActive = jest.fn(async () => ({ id: 'x', status: 'aborted' }));
+    const repo = makeRepo({
+      insert: jest.fn(async (v: any) => ({
+        id: 'live-1',
+        status: 'running',
+        chatId: v.chatId,
+        workspaceId: v.workspaceId,
+      })),
+      finalizeIfActive,
+      findStaleActive: jest.fn(async () => [
+        { id: 'orphan-1', workspaceId: ws, chatId: 'c-orphan' },
+        { id: 'live-1', workspaceId: ws, chatId: 'c-live' },
+      ]),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    // A LIVE run this replica owns (in the `active` map).
+    await svc.beginRun({ chatId: 'c-live', workspaceId: ws, userId: 'u1' });
+    expect(svc.isLocallyActive('live-1')).toBe(true);
+
+    const aborted = await svc.reconcileStaleRuns(15 * 60 * 1000);
+    expect(aborted).toBe(1);
+    // The orphan (no entry) was aborted; the live entry was NEVER passed to the DB.
+    expect(finalizeIfActive).toHaveBeenCalledTimes(1);
+    expect(finalizeIfActive).toHaveBeenCalledWith(
+      'orphan-1',
+      ws,
+      expect.objectContaining({ status: 'aborted' }),
+    );
+    expect(svc.isLocallyActive('live-1')).toBe(true);
+  });
+
   it('gave-up zombie: supersede applies the intended status (settleZombie) then is ready', async () => {
     let healthy = false;
     let active: unknown = {

@@ -1315,8 +1315,12 @@ describe('AiChatService page-change lifecycle (#274)', () => {
 describe('isInterruptResume', () => {
   // history tail is the just-inserted user row; [len-2] is the previous turn.
   const withPrev = (
-    prev: { role: string; status?: string | null } | null,
-  ): Array<{ role: string; status?: string | null }> =>
+    prev: {
+      role: string;
+      status?: string | null;
+      metadata?: unknown;
+    } | null,
+  ): Array<{ role: string; status?: string | null; metadata?: unknown }> =>
     prev
       ? [prev, { role: 'user', status: null }]
       : [{ role: 'user', status: null }];
@@ -1356,6 +1360,33 @@ describe('isInterruptResume', () => {
 
   it('false when there is no preceding turn (only the new user row)', () => {
     expect(isInterruptResume(withPrev(null), true)).toBe(false);
+  });
+
+  it('#487 EXCLUDES a reconcile stamp (finalizeFailed) — not a genuine interruption', () => {
+    // A row a reconcile settled to 'aborted' carries metadata.finalizeFailed. It
+    // must NOT be treated as an interrupt-resume (that would inject a false
+    // "you were interrupted" note), even though its status is 'aborted'.
+    expect(
+      isInterruptResume(
+        withPrev({
+          role: 'assistant',
+          status: 'aborted',
+          metadata: { finalizeFailed: true },
+        }),
+        true,
+      ),
+    ).toBe(false);
+    // A genuine abort (no finalizeFailed) still counts.
+    expect(
+      isInterruptResume(
+        withPrev({
+          role: 'assistant',
+          status: 'aborted',
+          metadata: { parts: [] },
+        }),
+        true,
+      ),
+    ).toBe(true);
   });
 });
 
@@ -1419,6 +1450,9 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
       insert: jest.fn(async () => ({ id: 'msg-1' })),
       findAllByChat: jest.fn(async () => []),
       update: jest.fn(async () => ({ id: 'msg-1' })),
+      // #487: the terminal owner-write + the opportunistic reconcile query.
+      finalizeOwner: jest.fn(async () => ({ id: 'msg-1' })),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
     };
     const aiSettings = { resolve: jest.fn(async () => ({})) };
     const tools = { forUser: jest.fn(async () => ({})) };
@@ -1623,6 +1657,19 @@ describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
           return { id };
         },
       ),
+      // #487: the terminal owner-write records into the SAME `updated` recorder so
+      // assertions on the terminal 'completed'/'error'/'aborted' write still hold.
+      finalizeOwner: jest.fn(
+        async (
+          id: string,
+          workspaceId: string,
+          patch: Record<string, unknown>,
+        ) => {
+          updated.push({ id, workspaceId, patch });
+          return { id };
+        },
+      ),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
     };
     const aiSettings = { resolve: jest.fn(async () => ({})) };
     const tools = { forUser: jest.fn(async () => ({})) };

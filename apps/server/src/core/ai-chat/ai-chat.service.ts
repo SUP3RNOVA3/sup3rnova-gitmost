@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   Logger,
+  OnModuleDestroy,
   OnModuleInit,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -42,7 +43,11 @@ import {
   makeLoadToolsTool,
   buildExternalToolCatalog,
 } from './tools/tool-tiers';
-import { RunAlreadyActiveError } from './ai-chat-run.service';
+import {
+  RunAlreadyActiveError,
+  AiChatRunService,
+} from './ai-chat-run.service';
+import { inAppToolCallCapMs } from './tools/ai-chat-tools.service';
 import { computePageChange } from './page-change/page-change.util';
 import {
   sanitizeSelection,
@@ -250,15 +255,23 @@ export function cleanGeneratedTitle(text: string): string {
  * partial output is already in history thanks to the step-granular write path).
  */
 export function isInterruptResume(
-  history: Array<{ role: string; status?: string | null }>,
+  history: Array<{
+    role: string;
+    status?: string | null;
+    metadata?: unknown;
+  }>,
   clientInterrupted: boolean | undefined,
 ): boolean {
   if (clientInterrupted !== true) return false;
   const prev = history[history.length - 2];
-  return (
-    prev?.role === 'assistant' &&
-    (prev.status === 'aborted' || prev.status === 'streaming')
-  );
+  if (prev?.role !== 'assistant') return false;
+  // #487: a reconcile STAMP (metadata.finalizeFailed) is NOT a genuine user
+  // interruption — the previous turn's process died and a reconcile settled the
+  // row as 'aborted'. Treating it as an interrupt-resume would inject a false
+  // "you were interrupted" note. Exclude any finalizeFailed row.
+  const meta = prev.metadata as { finalizeFailed?: unknown } | null | undefined;
+  if (meta && meta.finalizeFailed === true) return false;
+  return prev.status === 'aborted' || prev.status === 'streaming';
 }
 
 /**
@@ -457,7 +470,7 @@ export interface AiChatStreamArgs {
  *                    can be rebuilt for `convertToModelMessages`.
  */
 @Injectable()
-export class AiChatService implements OnModuleInit {
+export class AiChatService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AiChatService.name);
 
   constructor(
@@ -478,7 +491,16 @@ export class AiChatService implements OnModuleInit {
     // constructions (int-specs) compile unchanged; Nest always injects the real
     // provider in production. Only ever touched on the run-wrapped + flag-on path.
     private readonly streamRegistry?: AiChatStreamRegistryService,
+    // #487: the run lifecycle service, for the periodic + opportunistic reconcile
+    // (zombie re-drive + stale-run abort). OPTIONAL so positional test
+    // constructions compile unchanged; Nest always injects the real singleton, so
+    // reconcile sees the SAME in-memory active/zombie maps the runner mutates.
+    private readonly aiChatRunService?: AiChatRunService,
   ) {}
+
+  // #487: periodic reconcile timer (single-process phase 1). Started in
+  // onModuleInit, cleared in onModuleDestroy.
+  private reconcileTimer?: ReturnType<typeof setInterval>;
 
   /**
    * Crash-recovery sweep on server start (#183): any assistant row left in the
@@ -502,6 +524,158 @@ export class AiChatService implements OnModuleInit {
         `Startup sweep of dangling 'streaming' messages failed: ${
           err instanceof Error ? err.message : 'unknown error'
         }`,
+      );
+    }
+
+    // #487: start the PERIODIC reconcile (was boot-only). It heals both directions
+    // of the run<->message lifecycle asymmetry that a boot sweep alone left to the
+    // NEXT restart. Single-process phase 1: the in-memory active/zombie maps are
+    // authoritative, so "no live entry" is a safe primary gate.
+    const staleMs = this.reconcileStalenessMs();
+    // boot-warn if the per-call cap is configured so high the derived staleness is
+    // unusually long (a stale run then lingers longer before reconcile aborts it).
+    if (staleMs > 30 * 60 * 1000) {
+      this.logger.warn(
+        `#487 reconcile staleness is ${Math.round(staleMs / 60000)}min ` +
+          `(derived from max(2 x per-call cap, 15min)); a per-call cap this high ` +
+          `delays stale-run recovery. Review AI_CHAT_INAPP_TOOL_CALL_CAP_MS.`,
+      );
+    }
+    const intervalMs = this.reconcileIntervalMs();
+    this.reconcileTimer = setInterval(() => {
+      void this.reconcile().catch((err) => {
+        this.logger.warn(
+          `Periodic reconcile failed: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        );
+      });
+    }, intervalMs);
+    this.reconcileTimer.unref?.();
+  }
+
+  /** #487: stop the periodic reconcile timer on shutdown. */
+  onModuleDestroy(): void {
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = undefined;
+    }
+  }
+
+  /**
+   * #487: reconcile staleness threshold X — a run/message is only a "no live
+   * runner" abort candidate once UNTOUCHED past this. Derived as
+   * max(2 x per-call cap, 15min): 2x the longest legitimate single tool call plus
+   * a floor, so a marathon turn making steady progress (updatedAt bumped each
+   * step) is never swept.
+   */
+  private reconcileStalenessMs(): number {
+    return Math.max(2 * inAppToolCallCapMs(), 15 * 60 * 1000);
+  }
+
+  /** #487: how often the periodic reconcile runs (env-tunable, default 2min). */
+  private reconcileIntervalMs(): number {
+    const raw = Number(process.env.AI_CHAT_RECONCILE_INTERVAL_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 2 * 60 * 1000;
+  }
+
+  /**
+   * #487: the periodic BIDIRECTIONAL reconcile. Runs the clauses IN ORDER; each is
+   * best-effort (a failure of one never blocks the others). Single-process phase 1
+   * — the run service's in-memory maps are authoritative for "live entry".
+   *
+   *  (a) re-drive ZOMBIE runs (a terminal write that gave up) — apply the intended
+   *      status via the conditional UPDATE;
+   *  (b) message 'streaming' + its RUN terminal -> stamp the message by the run's
+   *      status (succeeded-run + stuck row -> 'aborted'+finalizeFailed, NOT
+   *      'completed' with empty parts — the final text lived only in the dead
+   *      process's memory, a documented loss);
+   *  (c) run active + NO live entry + NO zombie + stale -> aborted (the run
+   *      service applies the "no entry" primary gate + last-progress staleness);
+   *  (d) message 'streaming' + age>X + NO active run on the chat -> aborted
+   *      (historical-row safety, double-gated).
+   */
+  async reconcile(): Promise<void> {
+    const staleMs = this.reconcileStalenessMs();
+
+    // (a) zombie re-drive.
+    if (this.aiChatRunService) {
+      for (const runId of this.aiChatRunService.zombieRunIds()) {
+        try {
+          await this.aiChatRunService.settleZombie(runId);
+        } catch (err) {
+          this.logger.warn(
+            `Reconcile (a) zombie ${runId} re-drive failed: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          );
+        }
+      }
+    }
+
+    // (b) message streaming + run terminal -> stamp message by run status.
+    try {
+      const stuck = await this.aiChatMessageRepo.findStreamingWithTerminalRun();
+      for (const s of stuck) {
+        // succeeded-run -> 'aborted' (NOT 'completed'-empty); failed -> 'error';
+        // aborted -> 'aborted'. All via the finalizeFailed stamp.
+        const status = s.runStatus === 'failed' ? 'error' : 'aborted';
+        await this.aiChatMessageRepo.stampTerminalIfStreaming(
+          s.messageId,
+          s.workspaceId,
+          status,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Reconcile (b) message<-run failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
+    }
+
+    // (c) stale active run with no live runner -> aborted.
+    if (this.aiChatRunService) {
+      try {
+        await this.aiChatRunService.reconcileStaleRuns(staleMs);
+      } catch (err) {
+        this.logger.warn(
+          `Reconcile (c) stale-run abort failed: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        );
+      }
+    }
+
+    // (d) historical streaming row, no active run on the chat, stale -> aborted.
+    try {
+      await this.aiChatMessageRepo.sweepStreamingWithoutActiveRun(staleMs);
+    } catch (err) {
+      this.logger.warn(
+        `Reconcile (d) historical-row sweep failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
+    }
+  }
+
+  /**
+   * #487: OPPORTUNISTIC single-chat reconcile at the start of a turn (beginRun /
+   * supersede path), so a user who returns to a chat with a stuck streaming row
+   * (its run already terminal) sees it settled WITHOUT waiting for the periodic
+   * job. Best-effort — a failure NEVER fails the turn (swallowed by the caller).
+   */
+  async reconcileChat(chatId: string, workspaceId: string): Promise<void> {
+    const stuck = await this.aiChatMessageRepo.findStreamingWithTerminalRun(50, {
+      chatId,
+      workspaceId,
+    });
+    for (const s of stuck) {
+      const status = s.runStatus === 'failed' ? 'error' : 'aborted';
+      await this.aiChatMessageRepo.stampTerminalIfStreaming(
+        s.messageId,
+        s.workspaceId,
+        status,
       );
     }
   }
@@ -847,6 +1021,20 @@ export class AiChatService implements OnModuleInit {
           statusCode: 503,
         });
       }
+    }
+
+    // #487: opportunistic single-chat reconcile — settle any streaming row on this
+    // chat whose run is already terminal BEFORE this turn's history load, so the
+    // user never waits on the periodic job and the new turn's model history is not
+    // polluted by a stuck 'streaming' row. Best-effort: it must NEVER fail the turn.
+    try {
+      await this.reconcileChat(chatId, workspace.id);
+    } catch (err) {
+      this.logger.debug(
+        `Opportunistic reconcile for chat ${chatId} failed (ignored): ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
     }
 
     try {
@@ -1211,29 +1399,59 @@ export class AiChatService implements OnModuleInit {
       // callbacks — mirroring the pre-#183 persist-at-most-once guard for the
       // TERMINAL status (the row may be updated many times with 'streaming' before
       // this fires once).
+      // #487: the once-gate closes ONLY AFTER a successful write, and the write is
+      // BOUNDED-RETRIED. Previously `finalized` was set BEFORE the write and never
+      // retried, so a single failed UPDATE stranded the row 'streaming' forever
+      // (the boot-only sweep was the only recovery). Now a transient blip is ridden
+      // out in place; a total give-up leaves the gate OPEN and logs, and the
+      // periodic reconcile (clauses b/d) later settles the row. Returns whether the
+      // terminal write LANDED, so the caller can error-mark the RUN on a message
+      // failure (the run is finalized regardless — never gated on the message).
       let finalized = false;
+      const FINALIZE_MSG_MAX_ATTEMPTS = 3;
       const finalizeAssistant = async (
         flushed: AssistantFlush,
-      ): Promise<void> => {
-        if (finalized) return;
-        finalized = true;
+      ): Promise<boolean> => {
+        if (finalized) return true;
         const plan = planFinalizeAssistant(assistantId);
-        try {
-          // Shared dispatch (see applyFinalize): UPDATE the upfront row, or — when
-          // the upfront insert failed (kind 'insert') — INSERT the terminal row as
-          // the only safety against losing the turn entirely.
-          await applyFinalize(
-            this.aiChatMessageRepo,
-            plan,
-            { chatId, workspaceId: workspace.id, userId: user.id },
-            flushed,
-          );
-        } catch (err) {
-          this.logger.error(
-            `Failed to finalize assistant message (kind=${plan.kind})`,
-            err as Error,
-          );
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= FINALIZE_MSG_MAX_ATTEMPTS; attempt++) {
+          try {
+            // Shared dispatch (see applyFinalize): conditionally UPDATE the upfront
+            // row (owner-write priority), or — when the upfront insert failed (kind
+            // 'insert') — INSERT the terminal row as the only safety against losing
+            // the turn entirely.
+            await applyFinalize(
+              this.aiChatMessageRepo,
+              plan,
+              { chatId, workspaceId: workspace.id, userId: user.id },
+              flushed,
+            );
+            finalized = true; // gate closes ONLY after a successful write
+            return true;
+          } catch (err) {
+            lastError = err;
+            this.logger.warn(
+              `Assistant message finalize attempt ${attempt}/${FINALIZE_MSG_MAX_ATTEMPTS} ` +
+                `failed (kind=${plan.kind}): ${
+                  err instanceof Error ? err.message : 'unknown error'
+                }`,
+            );
+            if (attempt < FINALIZE_MSG_MAX_ATTEMPTS) {
+              await new Promise((r) => setTimeout(r, 50 * attempt));
+            }
+          }
         }
+        // Gave up: leave the gate OPEN (no in-process second settler exists — the
+        // terminal callbacks are mutually exclusive) and log. The periodic reconcile
+        // settles the stranded row; a late owner-write is impossible for this turn,
+        // so the reconcile stamp (aborted+finalizeFailed) is the final state.
+        this.logger.error(
+          `Assistant message finalize GAVE UP after ${FINALIZE_MSG_MAX_ATTEMPTS} ` +
+            `attempts (row left 'streaming', chat ${chatId}); reconcile will settle it`,
+          lastError as Error,
+        );
+        return false;
       };
 
       // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Measure
@@ -1378,7 +1596,7 @@ export class AiChatService implements OnModuleInit {
             const stepExhausted = steps.length >= MAX_AGENT_STEPS;
             const emptyTurnMarker =
               !producedText && stepExhausted ? STEP_LIMIT_NO_ANSWER_MARKER : '';
-            await finalizeAssistant(
+            const msgOk = await finalizeAssistant(
               flushAssistant(steps as StepLike[], emptyTurnMarker, 'completed', {
                 finishReason: finishReason as string,
                 usage: totalUsage as StreamUsage,
@@ -1392,9 +1610,19 @@ export class AiChatService implements OnModuleInit {
                 pageChanged,
               }),
             );
-            // #184: settle the RUN as succeeded (best-effort, after the projection
-            // is finalized above).
-            if (runId) await runHooks?.onSettled?.(runId, 'completed');
+            // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
+            // If the message finalize GAVE UP, error-mark the run so the asymmetry
+            // "run succeeded / message streaming forever" cannot arise; the
+            // periodic reconcile then settles the stuck message from this run.
+            if (runId) {
+              await runHooks?.onSettled?.(
+                runId,
+                msgOk ? 'completed' : 'error',
+                msgOk
+                  ? undefined
+                  : 'Assistant message could not be persisted (finalize failed).',
+              );
+            }
             // Lifecycle: release the external MCP clients leased for this turn.
             await closeExternalClients();
 
@@ -2135,7 +2363,10 @@ export function planFinalizeAssistant(
  *  a test mock both satisfy it). */
 export interface FinalizeRepo {
   insert(insertable: Record<string, unknown>): Promise<unknown>;
-  update(
+  // #487: the OWNER terminal write is CONDITIONAL (status='streaming' OR
+  // metadata.finalizeFailed) so the owner overwrites a reconcile stamp but never
+  // an already-proper terminal row (owner-write priority).
+  finalizeOwner(
     id: string,
     workspaceId: string,
     patch: AssistantFlush,
@@ -2144,10 +2375,11 @@ export interface FinalizeRepo {
 
 /**
  * Apply a finalize `plan` to the repo with the terminal `flushed` payload (#183):
- * UPDATE the upfront row, or INSERT a fresh terminal row as the fallback when the
- * upfront insert failed. The SINGLE dispatch shared by the service's
- * finalizeAssistant and its test, so the test exercises the real path instead of
- * a copy (#186 review). Pure of error handling — the caller wraps it.
+ * conditionally UPDATE the upfront row (owner-write priority, #487), or INSERT a
+ * fresh terminal row as the fallback when the upfront insert failed. The SINGLE
+ * dispatch shared by the service's finalizeAssistant and its test, so the test
+ * exercises the real path instead of a copy (#186 review). Pure of error
+ * handling — the caller wraps it (and RETRIES it, #487).
  */
 export async function applyFinalize(
   repo: FinalizeRepo,
@@ -2156,7 +2388,7 @@ export async function applyFinalize(
   flushed: AssistantFlush,
 ): Promise<void> {
   if (plan.kind === 'update') {
-    await repo.update(plan.id, base.workspaceId, flushed);
+    await repo.finalizeOwner(plan.id, base.workspaceId, flushed);
     return;
   }
   await repo.insert({

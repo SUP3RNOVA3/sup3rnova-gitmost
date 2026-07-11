@@ -155,6 +155,8 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       insert: jest.fn(async () => ({ id: 'msg-1' })),
       findAllByChat: jest.fn(async () => []),
       update: jest.fn(async () => ({ id: 'msg-1' })),
+      finalizeOwner: jest.fn(async () => ({ id: 'msg-1' })),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
     };
     const aiSettings = { resolve: jest.fn(async () => ({})) };
     const tools = { forUser: jest.fn(async () => ({})) };
@@ -332,7 +334,13 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       usage: {},
       steps: [],
     });
-    expect(runHooks.onSettled).toHaveBeenCalledWith('run-1', 'completed');
+    // #487: onFinish passes the (undefined) error slot so a message-finalize
+    // failure could error-mark the run; on the success path it is undefined.
+    expect(runHooks.onSettled).toHaveBeenCalledWith(
+      'run-1',
+      'completed',
+      undefined,
+    );
   });
 
   it('F9: onAbort settles the run "aborted"', async () => {
@@ -415,6 +423,8 @@ describe('AiChatService.stream — begin-failure fails the turn (#184 F14 / #486
       insert: jest.fn(async () => ({ id: 'msg-1' })),
       findAllByChat: jest.fn(async () => []),
       update: jest.fn(async () => ({ id: 'msg-1' })),
+      finalizeOwner: jest.fn(async () => ({ id: 'msg-1' })),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
     };
     const aiSettings = { resolve: jest.fn(async () => ({})) };
     const tools = { forUser: jest.fn(async () => ({})) };

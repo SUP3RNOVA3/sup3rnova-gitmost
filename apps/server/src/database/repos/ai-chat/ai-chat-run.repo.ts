@@ -219,6 +219,31 @@ export class AiChatRunRepo {
    * sweeps only runs UNTOUCHED past the window. Phase 1 is single-process, so the
    * boot path supplies no window.
    */
+  /**
+   * #487 reconcile clause (c): active (pending|running) runs UNTOUCHED past
+   * `staleMs` — candidates for "no live runner" abort. Staleness is measured from
+   * `updated_at` (the LAST-PROGRESS timestamp — recordStep bumps it), NOT
+   * `started_at`, so a legitimate long-running marathon (11–25 min of steady
+   * progress) is never a candidate. The caller filters these against its in-memory
+   * `active` / zombie maps ("no entry" is the PRIMARY gate — a live entry is never
+   * aborted) before settling any of them. Bounded.
+   */
+  async findStaleActive(
+    staleMs: number,
+    limit = 200,
+    trx?: KyselyTransaction,
+  ): Promise<Array<{ id: string; workspaceId: string; chatId: string }>> {
+    const db = dbOrTx(this.db, trx);
+    const staleBefore = new Date(Date.now() - staleMs);
+    return db
+      .selectFrom('aiChatRuns')
+      .select(['id', 'workspaceId', 'chatId'])
+      .where('status', 'in', ACTIVE_RUN_STATUSES as unknown as string[])
+      .where('updatedAt', '<', staleBefore)
+      .limit(limit)
+      .execute();
+  }
+
   async sweepRunning(
     opts: { staleMs?: number } = {},
     trx?: KyselyTransaction,
