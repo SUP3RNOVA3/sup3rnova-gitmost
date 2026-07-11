@@ -1440,7 +1440,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
   }
 
   // Wire only the deps reached on the way to the pipe call, plus a spy registry.
-  function makeService(opts: { resumable: boolean }) {
+  function makeService(opts: { resumable: boolean; history?: unknown[] }) {
     const aiChatRepo = {
       findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
       insert: jest.fn(),
@@ -1448,7 +1448,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
     const aiChatMessageRepo = {
       // Both the user insert and the assistant seed return the same row id.
       insert: jest.fn(async () => ({ id: 'msg-1' })),
-      findAllByChat: jest.fn(async () => []),
+      findAllByChat: jest.fn(async () => opts.history ?? []),
       update: jest.fn(async () => ({ id: 'msg-1' })),
       // #487: the terminal owner-write + the opportunistic reconcile query.
       finalizeOwner: jest.fn(async () => ({ id: 'msg-1' })),
@@ -1487,7 +1487,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
       } as never,
       streamRegistry as never,
     );
-    return { svc, streamRegistry };
+    return { svc, streamRegistry, aiChatMessageRepo };
   }
 
   const body = {
@@ -1569,6 +1569,86 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
     });
     await expect(drive(svc, makeRunHooks())).rejects.toThrow('boom');
     expect(streamRegistry.abortEntry).toHaveBeenCalledWith('chat-1', 'run-1');
+  });
+
+  // #489 REGRESSION (against the REAL convertToModelMessages — not mocked here):
+  // a persisted history row whose parts contain a `null` element makes the real
+  // convertToModelMessages THROW ("Cannot read properties of null"). Pre-fix that
+  // 500-ed every turn forever and each retry appended a duplicate user row. The
+  // fix converts BEFORE the insert and isolates the poisoned row per-row, degrading
+  // it to text with a "[tool context omitted]" marker. Assert the turn still runs,
+  // the marker reaches the model, and exactly ONE user row is inserted.
+  it('#489: a poisoned OLD-history row keeps the chat working; the marker reaches the model; one user insert', async () => {
+    const { svc, aiChatMessageRepo } = makeService({
+      resumable: false,
+      history: [
+        {
+          id: 'old-1',
+          role: 'assistant',
+          content: 'earlier answer',
+          // A null part is the poison: rowToUiMessage keeps it (the array is
+          // non-empty) and the real convertToModelMessages throws on it.
+          metadata: { parts: [{ type: 'text', text: 'earlier answer' }, null] },
+          status: 'completed',
+        },
+      ],
+    });
+    // Must NOT throw — the poisoned row is degraded, not fatal.
+    await drive(svc, makeRunHooks());
+    expect(streamTextMock).toHaveBeenCalledTimes(1);
+    const passedMessages = streamTextMock.mock.calls[0][0].messages;
+    const serialized = JSON.stringify(passedMessages);
+    // The model sees the truncation marker (silent tool-context loss is not ok)
+    // AND the row's readable text is preserved alongside it.
+    expect(serialized).toContain('[tool context omitted]');
+    expect(serialized).toContain('earlier answer');
+    // Exactly ONE user row inserted (no duplicate), inserted AFTER conversion.
+    const userInserts = aiChatMessageRepo.insert.mock.calls
+      .map((c: unknown[]) => c[0] as { role?: string })
+      .filter((r) => r.role === 'user');
+    expect(userInserts).toHaveLength(1);
+  });
+
+  // #489: client-supplied non-text parts (a tool-part in `input-available`, the
+  // exact "bricking" payload) are dropped ON RECEIPT — never persisted — so they
+  // can never poison future turns. Only the text survives into metadata.parts.
+  it('#489: a non-text client part is stripped before persist (only text survives)', async () => {
+    const { svc, aiChatMessageRepo } = makeService({ resumable: false });
+    await svc.stream({
+      user: { id: 'u1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 's1',
+      body: {
+        chatId: 'chat-1',
+        messages: [
+          {
+            id: 'm1',
+            role: 'user',
+            parts: [
+              { type: 'text', text: 'hello' },
+              // untrusted tool-part — must be dropped, never persisted
+              {
+                type: 'tool-getPage',
+                toolCallId: 't1',
+                state: 'input-available',
+                input: { pageId: 'p' },
+              },
+            ],
+          },
+        ],
+      } as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      runHooks: makeRunHooks() as never,
+    });
+    const userInsert = aiChatMessageRepo.insert.mock.calls
+      .map((c: unknown[]) => c[0] as { role?: string; metadata?: unknown })
+      .find((r) => r.role === 'user');
+    const parts = (userInsert?.metadata as { parts?: Array<{ type: string }> })
+      ?.parts;
+    expect(parts).toEqual([{ type: 'text', text: 'hello' }]);
   });
 });
 

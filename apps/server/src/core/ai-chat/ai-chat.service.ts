@@ -14,6 +14,7 @@ import {
   convertToModelMessages,
   stepCountIs,
   type UIMessage,
+  type ModelMessage,
   type LanguageModel,
 } from 'ai';
 import { AiService } from '../../integrations/ai/ai.service';
@@ -1042,7 +1043,58 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       const incoming = lastUserMessage(body.messages);
       const incomingText = uiMessageText(incoming);
 
-      // Persist the user message before contacting the model.
+      // #489: sanitize client-supplied parts ON RECEIPT. The client only ever
+      // sends `sendMessage({ text })` (a single text part); there is no
+      // file/attachment path. Any other part — most dangerously a tool-part in
+      // `input-available` state — is untrusted data that, once persisted to
+      // `metadata.parts` verbatim, is REPLAYED through convertToModelMessages on
+      // every later turn. A malformed tool-part makes that conversion throw,
+      // 500-ing every future turn of the chat forever ("bricked"). Drop any
+      // non-whitelisted part with a warn.
+      const sanitizedParts = sanitizeUserParts(incoming?.parts, (type) =>
+        this.logger.warn(
+          `Dropping unsupported user message part '${type}' on chat ${chatId}`,
+        ),
+      );
+
+      // #489: rebuild the conversation from persisted history (not the client
+      // payload) and CONVERT it to model messages BEFORE persisting the user row.
+      // Load the OLD history (WITHOUT the new row) and append the incoming turn in
+      // memory for the conversion. This makes the insert happen only after a
+      // successful conversion, so a conversion failure cannot leave a DUPLICATE
+      // user row behind on the client's retry (the "bricked chat" that accreted a
+      // dup on every 500). `findAllByChat` returns chronological order (oldest ->
+      // newest) and keeps a 5000-row memory-safety backstop (on overflow it keeps
+      // the NEWEST rows and logs a warning); that is a safety net far above any
+      // realistic chat, not a conversational limit.
+      const oldHistory = await this.aiChatMessageRepo.findAllByChat(
+        chatId,
+        workspace.id,
+      );
+      const uiMessages: Array<Omit<UIMessage, 'id'> & { id: string }> = [
+        ...oldHistory.map(rowToUiMessage),
+        {
+          id: 'pending-user',
+          role: 'user',
+          parts: (sanitizedParts && sanitizedParts.length > 0
+            ? sanitizedParts
+            : textPart(incomingText)) as UIMessage['parts'],
+        },
+      ];
+      // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
+      // Resilient (#489): a single poisoned row in the OLD history is isolated via
+      // per-row conversion and degraded to plain text with a "[tool context
+      // omitted]" marker rather than 500-ing the whole turn (silent loss of tool
+      // context is not acceptable — the model must see the truncation).
+      const messages = await convertHistoryResilient(uiMessages, (index, err) =>
+        this.logger.warn(
+          `Degraded unconvertible history row ${index} on chat ${chatId} to text: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        ),
+      );
+
+      // Persist the user message only AFTER a successful conversion (#489).
       await this.aiChatMessageRepo.insert({
         chatId,
         workspaceId: workspace.id,
@@ -1050,31 +1102,21 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         role: 'user',
         content: incomingText,
         // jsonb column: UIMessage parts are JSON-serializable at runtime but not
-        // structurally `JsonValue`, so cast through unknown.
-        metadata: (incoming?.parts ? { parts: incoming.parts } : null) as never,
+        // structurally `JsonValue`, so cast through unknown. Persist the SANITIZED
+        // parts (never the raw client parts) so the row is always convertible.
+        metadata: (sanitizedParts ? { parts: sanitizedParts } : null) as never,
       });
-
-      // Rebuild the conversation from persisted history (not the client payload),
-      // so the model always sees the authoritative server-side transcript. Load
-      // the FULL history in chronological order (oldest -> newest, incl. the user
-      // message just inserted above) so NO turns are dropped — there is no
-      // recent-tail window anymore. `findAllByChat` keeps a 5000-row memory-safety
-      // backstop (on overflow it keeps the NEWEST rows and logs a warning); that
-      // is a safety net far above any realistic chat, not a conversational limit.
-      const history = await this.aiChatMessageRepo.findAllByChat(
-        chatId,
-        workspace.id,
-      );
-      const uiMessages = history.map(rowToUiMessage);
-      // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
-      const messages = await convertToModelMessages(uiMessages);
 
       // Interrupt-resume detection (#198): the client "send now" flag is only a
       // hint — confirm it against the persisted history (the preceding assistant
       // turn must really be aborted/streaming) so a spoofed flag cannot inject the
       // interrupt note onto an ordinary turn. The partial output the model needs is
       // already in `messages` (the aborted assistant row replays via findRecent).
-      const interrupted = isInterruptResume(history, body.interrupted);
+      // Append the new user turn (shape-only) so index -2 is the prior assistant.
+      const interrupted = isInterruptResume(
+        [...oldHistory, { role: 'user', status: null, metadata: null }],
+        body.interrupted,
+      );
 
       // Per-turn page-change detection (#274): if the open page was hand-edited by
       // the user since the agent's last turn ended, compute the unified diff so the
@@ -2072,6 +2114,82 @@ function uiMessageText(message: UIMessage | undefined): string {
 /** Build a single text part array (or empty when there is no text). */
 function textPart(text: string): Array<{ type: 'text'; text: string }> {
   return text ? [{ type: 'text', text }] : [];
+}
+
+/**
+ * Part types accepted on an INCOMING user turn (#489). The client only ever
+ * sends `sendMessage({ text })` (a single text part); there is no file/attachment
+ * path. Everything else on a client-supplied user message — most dangerously a
+ * tool-part in `input-available` state — is untrusted data that would be
+ * persisted to `metadata.parts` verbatim and replayed through
+ * `convertToModelMessages` on every later turn, potentially bricking the chat.
+ */
+const ALLOWED_USER_PART_TYPES: ReadonlySet<string> = new Set(['text']);
+
+/**
+ * Keep only whitelisted parts on a client-supplied user message; report each
+ * dropped part's type via `onDrop` (the caller warns). Returns `undefined` when
+ * nothing survives (no parts / none whitelisted), so the caller persists a null
+ * metadata rather than an empty-parts object. Never throws.
+ */
+export function sanitizeUserParts(
+  parts: UIMessage['parts'] | undefined,
+  onDrop: (type: string) => void,
+): UIMessage['parts'] | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  const kept = parts.filter((p) => {
+    const type =
+      typeof (p as { type?: unknown })?.type === 'string'
+        ? (p as { type: string }).type
+        : '';
+    if (ALLOWED_USER_PART_TYPES.has(type)) return true;
+    onDrop(type || '(unknown)');
+    return false;
+  });
+  return kept.length > 0 ? (kept as UIMessage['parts']) : undefined;
+}
+
+/** Marker for a history row whose tool parts could not be replayed (#489). */
+export const TOOL_CONTEXT_OMITTED_MARKER = '[tool context omitted]';
+
+/**
+ * Convert persisted UI history to model messages, tolerating a single poisoned
+ * row (#489). `convertToModelMessages` over the WHOLE array throws if ANY row is
+ * malformed (e.g. a tool-part left unbalanced / in `input-available` state),
+ * which would otherwise 500 every turn of the chat forever. On a batch failure we
+ * fall back to per-row conversion so the bad row is isolated: it is degraded to
+ * plain text carrying its readable text plus a `[tool context omitted]` marker
+ * (the model MUST see that its tool context was truncated — silent loss is not
+ * acceptable), while every healthy row converts normally. Because AI SDK v6
+ * carries a tool call and its result inside the SAME assistant UIMessage's parts,
+ * per-row conversion preserves call/result pairing.
+ */
+export async function convertHistoryResilient(
+  uiMessages: Array<Omit<UIMessage, 'id'> & { id: string }>,
+  onDegrade: (index: number, err: unknown) => void,
+): Promise<ModelMessage[]> {
+  try {
+    return await convertToModelMessages(uiMessages as UIMessage[]);
+  } catch {
+    const out: ModelMessage[] = [];
+    for (let i = 0; i < uiMessages.length; i++) {
+      const m = uiMessages[i];
+      try {
+        out.push(...(await convertToModelMessages([m as UIMessage])));
+      } catch (err) {
+        onDegrade(i, err);
+        const text = uiMessageText(m as UIMessage);
+        const degraded = text
+          ? `${text}\n\n${TOOL_CONTEXT_OMITTED_MARKER}`
+          : TOOL_CONTEXT_OMITTED_MARKER;
+        out.push({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: degraded,
+        } as ModelMessage);
+      }
+    }
+    return out;
+  }
 }
 
 /**
