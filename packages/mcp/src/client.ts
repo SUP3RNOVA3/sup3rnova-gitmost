@@ -33,18 +33,11 @@ import { TransformsMixin, type ITransformsMixin } from "./client/transforms.js";
 export type { DocmostMcpConfig, SandboxPut } from "./client/context.js";
 export { formatDocmostAxiosError, assertFullUuid } from "./client/errors.js";
 
-// Branded page-identity types + validating constructors/guards (#435): a page's
-// internal UUID (`PageId`) and public slug (`SlugId`) are distinct nominal types
-// so the two can't be swapped as bare strings. Re-exported on the package
-// surface so hosts/tests can validate + brand identities at their boundaries.
-export type { PageId, SlugId, PageRef } from "./lib/page-id.js";
-export {
-  asPageId,
-  asSlugId,
-  isPageId,
-  isSlugId,
-  SLUG_ID_RE,
-} from "./lib/page-id.js";
+// Branded canonical page-identity type (#435): the internal page UUID is a
+// distinct nominal type so an unresolved raw/slug string can't be swapped into
+// the seams that require the canonical id (see lib/page-id.ts). Re-exported on
+// the package surface for hosts that type against the resolved id.
+export type { PageId } from "./lib/page-id.js";
 
 // The full public + shared instance surface of the assembled client. Built by
 // INTERSECTING each domain mixin's public interface (each DERIVED from its class

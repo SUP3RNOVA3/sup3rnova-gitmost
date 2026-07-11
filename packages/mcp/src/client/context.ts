@@ -721,9 +721,10 @@ export abstract class DocmostClientContext {
     // is minted (#435). The value is validated here — a UUID input by isUuid, a
     // resolved id as the server's own page.id — so the downstream write path
     // (withPageLock / mutatePageContent) can require the brand and reject any
-    // unresolved raw id at compile time. The brand is applied by cast, not the
-    // asPageId() validator, to avoid rejecting the fake ids the mock tests feed
-    // a server stub; asPageId() guards the untrusted PUBLIC boundary instead.
+    // unresolved raw id at compile time. The brand is a pure compile-time marker
+    // applied by cast (no runtime guard): the guarantee is that this seam is the
+    // only place a `PageId` is produced, so every branded value went through the
+    // UUID/resolve check above.
     if (isUuid(pageId)) return pageId as PageId;
     const cached = this.pageIdCache.get(pageId);
     if (cached) return cached as PageId;
