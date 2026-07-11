@@ -718,7 +718,11 @@ export class AiChatToolsService {
       if (spec.mcpOnly) continue;
       if (spec.inlineBothHosts) continue;
       const run = spec.inAppExecute ?? spec.execute;
-      if (!run) continue; // defensive: a shared spec always carries one of them.
+      // Guaranteed present by assertEverySpecIsRegisterable() (#494), which runs
+      // at tool-specs module load and throws if a non-inline spec the in-app host
+      // registers carries neither inAppExecute nor execute — so this can no longer
+      // silently drop a mis-declared tool. Kept as a type-narrowing guard.
+      if (!run) continue;
       tools[spec.inAppKey] = sharedTool(
         spec,
         (async (args) =>

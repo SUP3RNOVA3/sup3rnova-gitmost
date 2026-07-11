@@ -304,7 +304,11 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
           content: { type: "text"; text: string }[];
         };
       }
-      // Canonical execute returns raw data; wrap it as JSON text content.
+      // Canonical execute returns raw data; wrap it as JSON text content. The `!`
+      // is backed by assertEverySpecIsRegisterable() (#494), which runs at
+      // tool-specs module load and throws if a non-inline, non-inAppOnly spec
+      // reaches this loop without an execute/mcpExecute — so this can no longer be
+      // a call-time TypeError in production.
       const raw = await spec.execute!(docmostClient, args);
       return jsonContent(raw);
     };
