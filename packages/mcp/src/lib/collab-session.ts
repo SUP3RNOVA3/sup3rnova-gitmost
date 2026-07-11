@@ -57,6 +57,40 @@ export function isCollabAuthFailedError(e: unknown): boolean {
 }
 
 /**
+ * Marker set on the Error a still-in-flight mutate is rejected with when its
+ * session is LRU-evicted while busy (#494). Unlike a plain destroy/failure, this
+ * write is INDETERMINATE: the local update may already have been sent to (and
+ * persisted by) the server before the eviction, so a blind retry risks a DUPLICATE
+ * write (the #435 double-apply class). A tagged property (not a message match)
+ * lets a caller distinguish "verify before retry" from a clean failure.
+ */
+const COLLAB_INDETERMINATE_MARKER = "collabIndeterminate";
+
+/** True when `e` is the tagged "write may have applied — verify before retry"
+ *  error raised when a busy session is LRU-evicted (see marker above). */
+export function isCollabIndeterminateError(e: unknown): boolean {
+  return !!(
+    e &&
+    typeof e === "object" &&
+    (e as Record<string, unknown>)[COLLAB_INDETERMINATE_MARKER] === true
+  );
+}
+
+/** Build the tagged INDETERMINATE error an in-flight mutate is rejected with when
+ *  its session must be evicted while busy (#494). */
+function makeCollabIndeterminateError(pageId: string): Error {
+  const err = new Error(
+    `Collaboration write INDETERMINATE (pageId ${pageId}): the live session was ` +
+      `evicted under the LRU cap while this write was in flight, and its update ` +
+      `MAY already have reached and persisted on the server. Do NOT blindly ` +
+      `retry — re-read the page and verify whether the edit applied first (a ` +
+      `blind retry risks a duplicate write).`,
+  ) as Error & { [COLLAB_INDETERMINATE_MARKER]?: boolean };
+  err[COLLAB_INDETERMINATE_MARKER] = true;
+  return err;
+}
+
+/**
  * Tunables, read fresh from the environment on every acquire so tests (and a
  * live rollback) can change them without reloading the module. Mirrors how
  * http.ts parses MCP_SESSION_IDLE_MS.
@@ -593,6 +627,36 @@ export class CollabSession {
   }
 
   /**
+   * True while a mutate is in flight (an update may already be on the wire /
+   * persisted server-side). The LRU-eviction path (#494) uses this to AVOID
+   * evicting a session mid-write when an idle victim exists, and to tag the error
+   * as INDETERMINATE when evicting a busy one is unavoidable.
+   */
+  isBusy(): boolean {
+    return !this.dead && this.inflightReject !== undefined;
+  }
+
+  /**
+   * Evict this session for the LRU cap (#494). When a mutate is IN FLIGHT its
+   * update may already have reached the server, so rejecting it as a plain
+   * failure would make a retry-prone agent re-issue the write and DUPLICATE it
+   * (the #435 class). Reject the in-flight op with the tagged INDETERMINATE error
+   * (verify-before-retry) instead. When idle, this is an ordinary destroy.
+   */
+  evictForCap(): void {
+    if (this.dead) return;
+    if (this.isBusy()) {
+      if (process.env.DEBUG)
+        console.error(
+          `Evicting BUSY collab session ${this.pageId} (LRU cap) — in-flight write is INDETERMINATE`,
+        );
+      this.teardown(makeCollabIndeterminateError(this.pageId), false);
+    } else {
+      this.destroy("evicted (LRU cap)");
+    }
+  }
+
+  /**
    * Public idempotent teardown used by the acquire/eviction paths and by a
    * caller that wants the session dropped after a failed op ("next call
    * reconnects fresh").
@@ -664,15 +728,33 @@ export async function acquireCollabSession(
     existing.destroy("stale on reuse");
   }
 
-  // Enforce the registry cap before inserting: destroy-evict the least recently
-  // used (the first entry in insertion order) until there is room.
+  // Enforce the registry cap before inserting: evict least-recently-used entries
+  // until there is room. PREFER an IDLE victim (#494): a session with an in-flight
+  // mutate may have already sent (and persisted) its update, so evicting it would
+  // reject that write as a FALSE failure → a retry-prone agent re-issues it →
+  // DUPLICATE write (the #435 class). So walk LRU order and skip busy sessions,
+  // evicting the oldest IDLE one. Only when EVERY cached session is busy (eviction
+  // unavoidable to admit this write) do we evict the LRU busy one — via
+  // evictForCap(), which rejects its in-flight op with a tagged INDETERMINATE
+  // "verify before retry" error rather than a plain failure.
   while (sessions.size >= cfg.maxEntries) {
-    const oldestKey: string | undefined = sessions.keys().next().value;
-    if (oldestKey === undefined) break;
-    const victim = sessions.get(oldestKey);
-    if (victim) victim.destroy("evicted (LRU cap)");
-    // destroy() removes it from the map; guard against a no-op destroy.
-    if (sessions.has(oldestKey)) sessions.delete(oldestKey);
+    let idleKey: string | undefined;
+    let oldestBusyKey: string | undefined;
+    for (const [k, s] of sessions) {
+      if (s.isBusy()) {
+        if (oldestBusyKey === undefined) oldestBusyKey = k;
+        continue;
+      }
+      idleKey = k; // first (LRU) idle session
+      break;
+    }
+    const victimKey = idleKey ?? oldestBusyKey;
+    if (victimKey === undefined) break; // registry empty (shouldn't happen)
+    // evictForCap() picks the plain-destroy vs INDETERMINATE-reject path itself
+    // based on whether the victim is busy.
+    sessions.get(victimKey)?.evictForCap();
+    // teardown removes it from the map; guard against a no-op.
+    if (sessions.has(victimKey)) sessions.delete(victimKey);
   }
 
   const session = new CollabSession(
