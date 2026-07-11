@@ -24,6 +24,54 @@ export const MAX_PERIOD_LEN = 150;
 export const MIN_PERIOD_REPEATS = 20;
 
 /**
+ * Read a positive-integer threshold from an env var, falling back to `fallback`
+ * on unset/blank/invalid/non-positive. Mirrors the `AI_STREAM_PRE_RESPONSE_RETRIES`
+ * resolver in `ai-streaming-fetch.ts`: read the RAW string first so a blank value
+ * is treated as "unset" (→ fallback) rather than coercing to 0. Thresholds must
+ * stay ≥ 1 — a 0/negative would make the detector fire on any text (or never), so
+ * a bad value degrades to the safe compiled default instead. Env-tunable so an
+ * operator can retune the anti-babble guard (#444) without a redeploy, following
+ * the `AI_CHAT_FINAL_STEP_LOCKDOWN` toggle convention.
+ */
+function envThreshold(name: string, fallback: number): number {
+  const rawStr = process.env[name];
+  if (rawStr === undefined || rawStr.trim() === '') return fallback;
+  const raw = Number(rawStr);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : fallback;
+}
+
+/**
+ * Resolve the degeneration-detector thresholds from the environment, each
+ * defaulting to the compiled constant above. Read fresh per call (not cached at
+ * import) so a test — or a runtime env change — takes effect deterministically.
+ */
+export function degenerationThresholds(): {
+  repeatedLines: number;
+  maxPeriodLen: number;
+  minPeriodRepeats: number;
+  checkStep: number;
+} {
+  return {
+    repeatedLines: envThreshold(
+      'AI_CHAT_DEGENERATION_REPEATED_LINES',
+      REPEATED_LINES_THRESHOLD,
+    ),
+    maxPeriodLen: envThreshold(
+      'AI_CHAT_DEGENERATION_PERIOD_MAX_LEN',
+      MAX_PERIOD_LEN,
+    ),
+    minPeriodRepeats: envThreshold(
+      'AI_CHAT_DEGENERATION_PERIOD_MIN_REPEATS',
+      MIN_PERIOD_REPEATS,
+    ),
+    checkStep: envThreshold(
+      'AI_CHAT_DEGENERATION_CHECK_STEP',
+      DEGENERATION_CHECK_STEP,
+    ),
+  };
+}
+
+/**
  * Rule 1 — ≥`REPEATED_LINES_THRESHOLD` consecutive IDENTICAL non-empty lines at
  * the tail. Catches the classic newline-delimited loop ("loadTools.\n" ×N).
  * Blank lines break a run (a table / list with blank separators never trips it);
@@ -128,7 +176,11 @@ export function hasPeriodicTail(
  * Pure — the caller owns the abort side effect.
  */
 export function isDegenerateOutput(text: string): boolean {
-  return hasRepeatedLineRun(text) || hasPeriodicTail(text);
+  const cfg = degenerationThresholds();
+  return (
+    hasRepeatedLineRun(text, cfg.repeatedLines) ||
+    hasPeriodicTail(text, cfg.maxPeriodLen, cfg.minPeriodRepeats)
+  );
 }
 
 /**
@@ -154,7 +206,7 @@ export function shouldCheckDegeneration(
   textLen: number,
   lastCheckLen: number,
 ): boolean {
-  return textLen - lastCheckLen >= DEGENERATION_CHECK_STEP;
+  return textLen - lastCheckLen >= degenerationThresholds().checkStep;
 }
 
 /**

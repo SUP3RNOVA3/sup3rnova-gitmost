@@ -77,6 +77,22 @@ export function describeChatError(
     };
   }
 
+  // Our own token-degeneration abort (#444): the server aborts a runaway
+  // repetition loop and persists this exact reason in metadata.error. LIVE, the
+  // same abort surfaces as the neutral "Response stopped." notice (the client
+  // cannot tell it from a manual Stop mid-stream), so the persisted banner must
+  // read the SAME "Response stopped." marker — otherwise the live view and a
+  // later refetch show two different texts for one event. The detail explains the
+  // loop-guard cause without contradicting the shared heading.
+  if (/output degeneration detected|repeated token loop/i.test(msg)) {
+    return {
+      title: t("Response stopped."),
+      detail: t(
+        "The answer was stopped automatically because the model fell into a repeated output loop.",
+      ),
+    };
+  }
+
   if (/"statusCode"\s*:\s*403\b/.test(msg)) {
     return {
       title: t("AI chat is disabled"),
