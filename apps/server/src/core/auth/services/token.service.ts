@@ -4,7 +4,6 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
-import type { StringValue } from 'ms';
 import { EnvironmentService } from '../../../integrations/environment/environment.service';
 import {
   JwtApiKeyPayload,
@@ -123,9 +122,8 @@ export class TokenService {
     apiKeyId: string;
     user: User;
     workspaceId: string;
-    expiresIn?: StringValue | number;
   }): Promise<string> {
-    const { apiKeyId, user, workspaceId, expiresIn } = opts;
+    const { apiKeyId, user, workspaceId } = opts;
     if (isUserDisabled(user)) {
       throw new ForbiddenException();
     }
@@ -137,7 +135,32 @@ export class TokenService {
       type: JwtType.API_KEY,
     };
 
-    return this.jwtService.sign(payload, expiresIn ? { expiresIn } : {});
+    // API-key tokens carry NO `exp` claim EVER — the ONLY source of truth for a
+    // key's lifetime and revocation is its `api_keys` row (checked on every
+    // request), not the JWT. This CANNOT use `this.jwtService`: TokenModule
+    // registers it with a global `signOptions.expiresIn` (JWT_TOKEN_EXPIRES_IN,
+    // default '90d'), which merges into EVERY sign() call — even `sign(payload,
+    // {})` — and `{ expiresIn: undefined }` THROWS rather than stripping it
+    // (verified empirically). So an "unlimited" key minted through the shared
+    // signer would silently get exp=now+90d and die in 90 days regardless of its
+    // row. We mint through a dedicated no-expiry signer, re-stamping only
+    // `issuer: 'Docmost'` for claim parity with the shared signer.
+    return this.apiKeyJwtService().sign(payload);
+  }
+
+  // Lazily-built JWT signer for API-key tokens: same APP_SECRET, same 'Docmost'
+  // issuer, but WITHOUT the global `expiresIn` — so minted API-key tokens have no
+  // `exp` claim. Built once and cached. Verification still goes through the
+  // shared verifier (same secret); `verifyAsync` does not require an `exp`.
+  private _apiKeyJwtService?: JwtService;
+  private apiKeyJwtService(): JwtService {
+    if (!this._apiKeyJwtService) {
+      this._apiKeyJwtService = new JwtService({
+        secret: this.environmentService.getAppSecret(),
+        signOptions: { issuer: 'Docmost' },
+      });
+    }
+    return this._apiKeyJwtService;
   }
 
   async generatePdfRenderToken(
@@ -170,6 +193,33 @@ export class TokenService {
     });
 
     if (payload.type !== tokenType) {
+      throw new UnauthorizedException(
+        'Invalid JWT token. Token type does not match.',
+      );
+    }
+
+    return payload;
+  }
+
+  /**
+   * Verify a token's signature ONCE and assert its `type` is one of `allowed`.
+   *
+   * This is the type-routing primitive for surfaces that legitimately accept
+   * more than one token type on the same Bearer slot (the /mcp Bearer path
+   * accepts both an ACCESS and an API_KEY token). It is deliberately NOT a
+   * "verify-and-return-whatever-type" helper — that would be a reusable
+   * confused-deputy footgun (any caller could then feed an attachment/collab
+   * token where an access token is expected). An explicit allowlist preserves
+   * the type-pinning property of `verifyJwt`: a token whose `type` is not in the
+   * allowlist is rejected with the SAME generic error as a type mismatch, and
+   * the signature is verified exactly once (no double-verify).
+   */
+  async verifyJwtOneOf(token: string, allowed: JwtType[]) {
+    const payload = await this.jwtService.verifyAsync(token, {
+      secret: this.environmentService.getAppSecret(),
+    });
+
+    if (!allowed.includes(payload.type)) {
       throw new UnauthorizedException(
         'Invalid JWT token. Token type does not match.',
       );
