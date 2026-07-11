@@ -132,17 +132,29 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       // BFS hit its node cap) had no way to know pages were missing. Return the
       // tree alongside the flag; the primary /pages/tree path is uncapped so this
       // is false there.
-      const { pages, truncated } = await this.enumerateSpacePages(spaceId);
-      return { tree: buildPageTree(pages), truncated };
+      // #534: spaceId is required here; wrap so a bad-spaceId 404 (from the
+      // /pages/tree seed inside enumerateSpacePages) becomes an actionable hint.
+      return this.withSpaceAccessDiagnostics(spaceId, "listPages", async () => {
+        const { pages, truncated } = await this.enumerateSpacePages(spaceId);
+        return { tree: buildPageTree(pages), truncated };
+      });
     }
 
     const clampedLimit = Math.max(1, Math.min(100, limit));
     const payload: Record<string, any> = { limit: clampedLimit, page: 1 };
     if (spaceId) payload.spaceId = spaceId;
-    const response = await this.client.post("/pages/recent", payload);
-    const data = response.data;
-    const items = data.data?.items || data.items || [];
-    return items.map((page: any) => filterPage(page));
+    // #534: only the WITH-spaceId recent path can 404 on space access; wrap it so
+    // that 404 is rewritten. Without a spaceId there is no space to diagnose, so
+    // the wrapper is inert (run the request directly).
+    const runRecent = async () => {
+      const response = await this.client.post("/pages/recent", payload);
+      const data = response.data;
+      const items = data.data?.items || data.items || [];
+      return items.map((page: any) => filterPage(page));
+    };
+    return spaceId
+      ? this.withSpaceAccessDiagnostics(spaceId, "listPages", runRecent)
+      : runRecent();
   }
 
   /**
@@ -174,8 +186,16 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
         "getTree: spaceId is required (a page tree is scoped to one space).",
       );
     }
-    const { pages } = await this.enumerateSpacePages(spaceId, rootPageId);
-    return buildPageTree(pages, { shape: "getTree", maxDepth });
+    // #534: the 404 for a bad/inaccessible spaceId surfaces from the
+    // `/pages/tree` seeding step inside enumerateSpacePages (which is NOT in a
+    // try/catch of its own for that case) — wrap the whole body so it is caught
+    // and rewritten into an actionable "spaceId not accessible" message. Only the
+    // space membership check can 404 here (rootPageId 403/200), see the
+    // wrap-allowlist invariant on withSpaceAccessDiagnostics.
+    return this.withSpaceAccessDiagnostics(spaceId, "getTree", async () => {
+      const { pages } = await this.enumerateSpacePages(spaceId, rootPageId);
+      return buildPageTree(pages, { shape: "getTree", maxDepth });
+    });
   }
 
   /**
@@ -700,17 +720,27 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     if (limit !== undefined) {
       payload.limit = Math.max(1, Math.min(50, limit));
     }
-    const response = await this.client.post("/search", payload);
 
-    // Normalize both response shapes: bare array and paginated { items: [...] }
-    const data = response.data?.data;
-    const items = Array.isArray(data) ? data : data?.items || [];
-    const filteredItems = items.map((item: any) => filterSearchResult(item));
+    const runSearch = async () => {
+      const response = await this.client.post("/search", payload);
 
-    return {
-      items: filteredItems,
-      success: response.data?.success || false,
+      // Normalize both response shapes: bare array and paginated { items: [...] }
+      const data = response.data?.data;
+      const items = Array.isArray(data) ? data : data?.items || [];
+      const filteredItems = items.map((item: any) => filterSearchResult(item));
+
+      return {
+        items: filteredItems,
+        success: response.data?.success || false,
+      };
     };
+
+    // #534: a search scoped to a spaceId 404s when that space is inaccessible;
+    // wrap only that case so the 404 becomes an actionable hint. A workspace-wide
+    // search (no spaceId) has no space to diagnose — run it directly (inert).
+    return spaceId
+      ? this.withSpaceAccessDiagnostics(spaceId, "search", runSearch)
+      : runSearch();
   }
 
   }

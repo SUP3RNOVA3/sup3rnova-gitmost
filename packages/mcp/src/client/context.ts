@@ -25,7 +25,10 @@ import {
 } from "../lib/collab-session.js";
 import { withPageLock, isUuid } from "../lib/page-lock.js";
 import { getCollabToken, performLogin } from "../lib/auth-utils.js";
-import { formatDocmostAxiosError } from "./errors.js";
+import {
+  formatDocmostAxiosError,
+  formatSpaceNotAccessible,
+} from "./errors.js";
 import { GetPageConversionCache } from "./getpage-cache.js";
 
 // A generic mixin base constructor (issue #450). Each domain mixin is a factory
@@ -116,6 +119,36 @@ function readCollabTokenTtlMs(): number {
   return Number.isFinite(raw) ? Math.max(0, raw) : 5 * 60 * 1000;
 }
 
+/**
+ * Accessible-space index cache TTL in milliseconds (issue #534). Read fresh from
+ * the environment on every access — mirroring readCollabTokenTtlMs above — so a
+ * test or a live rollback can change it without reloading the module.
+ *
+ * The index (see getAccessibleSpaceIndex) is fetched ONLY on the enrich-on-404
+ * slow path to turn an opaque "Space permissions not found" 404 into a factual
+ * "spaceId X is not among your accessible spaces" hint; a short TTL keeps a burst
+ * of failing tool calls from re-sweeping /spaces each time while never widening
+ * the permission-staleness window meaningfully. Default 60s. An EXPLICIT 0 (or
+ * negative) DISABLES the cache (exact fetch-per-enrichment). Unset/unparseable
+ * (NaN) falls back to the 60s default with the cache ON.
+ */
+function readSpacesCacheTtlMs(): number {
+  const raw = parseInt(process.env.MCP_SPACES_CACHE_TTL_MS ?? "", 10);
+  return Number.isFinite(raw) ? Math.max(0, raw) : 60000;
+}
+
+/**
+ * The set of spaces the current token can see, plus a `complete` flag that is
+ * false when the /spaces listing was truncated at the pagination ceiling. Used
+ * by the enrich-on-404 diagnostics: an authoritative membership test is only
+ * possible when `complete` is true (see withSpaceAccessDiagnostics).
+ */
+export type AccessibleSpaceIndex = {
+  ids: Set<string>;
+  spaces: { id: string; name: string }[];
+  complete: boolean;
+};
+
 export abstract class DocmostClientContext {
   protected client: AxiosInstance;
   protected token: string | null = null;
@@ -162,6 +195,27 @@ export abstract class DocmostClientContext {
   // Reset whenever the client's identity changes (login() / this.token cleared);
   // bypassed on a forced refresh (the 401/403 reauth path). null = no token yet.
   protected collabTokenCache: { token: string; mintedAt: number } | null = null;
+
+  // Accessible-space index cache + single-flight (issue #534). TWO separate
+  // fields, mirroring loginPromise (in-flight dedup) vs collabTokenCache
+  // (persistent value):
+  //   - spaceIndexCache: the last SUCCESSFULLY-FETCHED, COMPLETE index plus the
+  //     wall-clock time it was fetched. Written ONLY from a resolved /spaces
+  //     sweep whose result was complete (a truncated list is never cached, since
+  //     it cannot answer "is this spaceId missing?"). Per-instance (a
+  //     DocmostClient is built per user / per chat) so it can never leak across
+  //     identities; invalidated on every identity change exactly like
+  //     collabTokenCache (login() + the 401/403 reauth interceptor).
+  //   - spaceIndexInFlight: dedups concurrent enrich-on-404 fetches into ONE
+  //     /spaces sweep. CRITICAL INVARIANT: this promise is nulled in `.finally`
+  //     on BOTH resolve AND reject — a rejected/settled promise is NEVER
+  //     memoized, so a transient /spaces blip during one failed tool call cannot
+  //     poison the diagnostics for the rest of the session.
+  protected spaceIndexCache: {
+    index: AccessibleSpaceIndex;
+    fetchedAt: number;
+  } | null = null;
+  protected spaceIndexInFlight: Promise<AccessibleSpaceIndex> | null = null;
 
   // Content-addressed conversion cache for getPage (issue #479). Keyed on
   // (canonical pageId, updatedAt, optionsHash) -> the converted Markdown, so a
@@ -280,6 +334,9 @@ export abstract class DocmostClientContext {
           // keep serving a collab token minted under the old one.
           this.token = null;
           this.collabTokenCache = null;
+          // #534: a new identity/login must not keep serving a space index
+          // computed under the old token (same reasoning as collabTokenCache).
+          this.spaceIndexCache = null;
           delete this.client.defaults.headers.common["Authorization"];
           try {
             await this.login();
@@ -412,6 +469,8 @@ export abstract class DocmostClientContext {
           // Identity (re)established: drop any collab token minted under a
           // previous identity so the #435 cache can never outlive it.
           this.collabTokenCache = null;
+          // #534: likewise drop the accessible-space index of the old identity.
+          this.spaceIndexCache = null;
           this.client.defaults.headers.common["Authorization"] =
             `Bearer ${token}`;
         })
@@ -622,13 +681,34 @@ export abstract class DocmostClientContext {
   }
 
   /**
-   * Generic pagination handler for Docmost API endpoints
+   * Generic pagination handler for Docmost API endpoints. Thin wrapper over
+   * paginateAllWithMeta that discards the `truncated` flag — the historical
+   * contract every caller (getSpaces, etc.) relies on. Callers that need to KNOW
+   * whether the result set was complete (e.g. #534's getAccessibleSpaceIndex,
+   * which must not assert "spaceId missing" against a truncated list) call
+   * paginateAllWithMeta directly.
    */
   async paginateAll<T = any>(
     endpoint: string,
     basePayload: Record<string, any> = {},
     limit: number = 100,
   ): Promise<T[]> {
+    return (await this.paginateAllWithMeta<T>(endpoint, basePayload, limit))
+      .items;
+  }
+
+  /**
+   * Generic pagination handler that ALSO surfaces whether the result was
+   * truncated at the MAX_PAGES ceiling. `paginateAll` swallows this flag (it only
+   * warns); callers that must distinguish "complete listing" from "gave up at the
+   * cap" use this overload. `truncated` is true iff the loop stopped at the
+   * ceiling while the server still reported more pages.
+   */
+  async paginateAllWithMeta<T = any>(
+    endpoint: string,
+    basePayload: Record<string, any> = {},
+    limit: number = 100,
+  ): Promise<{ items: T[]; truncated: boolean }> {
     await this.ensureAuthenticated();
 
     const clampedLimit = Math.max(1, Math.min(100, limit));
@@ -689,7 +769,137 @@ export abstract class DocmostClientContext {
       );
     }
 
-    return allItems;
+    return { items: allItems, truncated };
+  }
+
+  /**
+   * The set of spaces the current token can access (issue #534), fetched from the
+   * single source of truth — the `/spaces` listing — with a per-instance
+   * short-TTL cache and single-flight dedup. Used ONLY by the enrich-on-404 slow
+   * path (withSpaceAccessDiagnostics), so the happy path incurs ZERO extra
+   * requests.
+   *
+   * `complete` is `!truncated`: it is false when the /spaces listing was cut at
+   * the pagination ceiling. A truncated index can never authoritatively answer
+   * "is this spaceId missing?", so only a complete result is cached AND only a
+   * complete result is allowed to drive the "not accessible" rewrite.
+   *
+   * Cache/single-flight discipline (see the spaceIndexCache / spaceIndexInFlight
+   * field docs):
+   *   - serve a fresh, complete cached index without any request;
+   *   - otherwise collapse concurrent callers onto ONE in-flight /spaces sweep;
+   *   - write the persistent cache ONLY from a resolved, complete fetch;
+   *   - null the in-flight promise on BOTH resolve and reject (never memoize a
+   *     rejected promise — a transient /spaces failure must be retried fresh).
+   */
+  async getAccessibleSpaceIndex(): Promise<AccessibleSpaceIndex> {
+    const ttl = readSpacesCacheTtlMs();
+
+    // Fast path: a still-fresh, complete cached index needs no request at all.
+    if (
+      ttl > 0 &&
+      this.spaceIndexCache &&
+      Date.now() - this.spaceIndexCache.fetchedAt < ttl
+    ) {
+      return this.spaceIndexCache.index;
+    }
+
+    // Single-flight: a concurrent enrichment joins the in-flight sweep instead of
+    // issuing its own. (A settled/rejected promise is never left here — see the
+    // `.finally` below — so this only ever joins a genuinely in-progress fetch.)
+    if (this.spaceIndexInFlight) return this.spaceIndexInFlight;
+
+    const fetchPromise = (async (): Promise<AccessibleSpaceIndex> => {
+      const { items, truncated } = await this.paginateAllWithMeta("/spaces", {});
+      const spaces = items.map((s: any) => ({
+        id: s?.id,
+        name: s?.name,
+      }));
+      return {
+        ids: new Set(spaces.map((s) => s.id)),
+        spaces,
+        complete: !truncated,
+      };
+    })();
+
+    this.spaceIndexInFlight = fetchPromise
+      .then((index) => {
+        // Cache ONLY a complete result, and only while the cache is enabled.
+        if (ttl > 0 && index.complete) {
+          this.spaceIndexCache = { index, fetchedAt: Date.now() };
+        }
+        return index;
+      })
+      .finally(() => {
+        // CRITICAL (#534): clear the in-flight slot on BOTH resolve and reject.
+        // Nulling on reject too means a transient /spaces error is retried by the
+        // NEXT enrichment with a fresh fetch, never re-serving the rejection.
+        this.spaceIndexInFlight = null;
+      });
+
+    return this.spaceIndexInFlight;
+  }
+
+  /**
+   * Wrap a client method whose 404 means "the supplied spaceId is not accessible"
+   * and, ONLY on that 404, replace the opaque server text ("Space permissions not
+   * found") with a factual, actionable message naming the spaceId and the spaces
+   * the token can actually see (issue #534). A HINT layered on top of the
+   * backend, which stays authoritative — so it FAILS OPEN on ANY uncertainty:
+   * every branch below that is not a confident "this spaceId is genuinely
+   * missing" rethrows the ORIGINAL server error unchanged. The happy path returns
+   * fn()'s value with zero extra requests.
+   *
+   * WRAP-ALLOWLIST INVARIANT (load-bearing — read before wrapping a new method):
+   * among the currently wrapped tools a 404 comes ONLY from the spaceId
+   * membership / space-permissions check — their pageId / rootPageId /
+   * parentPageId branches resolve to 403 or 200, NEVER 404. If a future change
+   * adds a `NotFoundException` to `/pages/tree`, `/pages/recent`,
+   * `/pages/sidebar-pages` or `/search` (e.g. "page not found"), this enrichment
+   * would MISATTRIBUTE that 404 to the spaceId. Re-audit the wrapped call before
+   * relying on this, and only wrap paths where the sole 404 cause is the space.
+   */
+  protected async withSpaceAccessDiagnostics<T>(
+    spaceId: string,
+    mcpName: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await fn();
+    } catch (e) {
+      // Abort/cap wins FIRST and is detected by the SIGNAL FLAG, not e.name: a
+      // per-call cap may be an AbortSignal.timeout() (reason name "TimeoutError")
+      // or a custom reason, so `e.name === 'AbortError'` is NOT reliable (#534
+      // hole B). A stopped/capped turn must propagate its reason, never trigger a
+      // /spaces sweep or a rewrite.
+      if (this.toolAbortSignal?.aborted) throw e;
+
+      // Only a 404 is enrichable; any other status/shape is a different failure.
+      if (!(axios.isAxiosError(e) && e.response?.status === 404)) throw e;
+
+      let idx: AccessibleSpaceIndex;
+      try {
+        idx = await this.getAccessibleSpaceIndex();
+      } catch (fetchErr) {
+        // The /spaces sweep itself failed. If we were aborted mid-sweep,
+        // propagate the abort reason; otherwise FAIL OPEN with the ORIGINAL
+        // server error rather than a misleading "not found".
+        if (this.toolAbortSignal?.aborted) throw fetchErr;
+        if (process.env.DEBUG) {
+          console.error("space-diag: /spaces fetch failed:", fetchErr);
+        }
+        throw e;
+      }
+
+      // Fail open when the listing is incomplete (can't assert "missing") or when
+      // the spaceId IS present (the 404 is about something else, not the space).
+      if (!idx.complete) throw e;
+      if (idx.ids.has(spaceId)) throw e;
+
+      // Confident: the spaceId is well-formed but not among the accessible
+      // spaces. Replace the opaque server text with the actionable fact.
+      throw new Error(formatSpaceNotAccessible(mcpName, spaceId, idx.spaces));
+    }
   }
 
 

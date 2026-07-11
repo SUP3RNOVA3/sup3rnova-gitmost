@@ -31,7 +31,11 @@ import { TransformsMixin, type ITransformsMixin } from "./client/transforms.js";
 // existing importer (index.ts, http.ts, stdio.ts, the in-app host) keeps working
 // with ZERO changes.
 export type { DocmostMcpConfig, SandboxPut } from "./client/context.js";
-export { formatDocmostAxiosError, assertFullUuid } from "./client/errors.js";
+export {
+  formatDocmostAxiosError,
+  assertFullUuid,
+  formatSpaceNotAccessible,
+} from "./client/errors.js";
 
 // The full public + shared instance surface of the assembled client. Built by
 // INTERSECTING each domain mixin's public interface (each DERIVED from its class
