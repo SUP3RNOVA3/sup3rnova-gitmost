@@ -4,6 +4,7 @@ import { stabilizePageFile, type PageMeta } from '../src/engine/stabilize.js';
 // global DOM via jsdom at module load time (required for @tiptap/html under Node).
 import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
 import { parseDocmostMarkdown } from '@docmost/prosemirror-markdown';
+import { ConverterLossError } from '@docmost/prosemirror-markdown';
 
 // stabilize.ts (SPEC §11 normalize-on-write) was 0% covered (only the gated e2e
 // touched it). stabilizePageFile is import-testable: build a small ProseMirror
@@ -64,6 +65,23 @@ describe('stabilizePageFile — normalize-on-write fixpoint (SPEC §11)', () => 
     // a reliable convergence proof.
     expect(body1).toContain('data-type="drawio"');
     expect(body1).toContain('data-src="/d.drawio"');
+  });
+
+  it('runs the serializer in STRICT mode — an unmappable node throws, not a lossy write (#493)', async () => {
+    // git-sync is the lossless mirror path: a node type the converter has no
+    // case for (here a fabricated one, standing in for a schema type added
+    // without a matching serializer arm) must surface loudly at write time
+    // rather than being silently flattened into a lossy .md file.
+    const content = {
+      type: 'doc',
+      content: [
+        { type: 'paragraph', content: [{ type: 'text', text: 'ok' }] },
+        { type: 'quantumWidget', content: [{ type: 'text', text: 'lost?' }] },
+      ],
+    };
+    await expect(stabilizePageFile(content, meta)).rejects.toBeInstanceOf(
+      ConverterLossError,
+    );
   });
 
   it('already-stable content is unchanged by the pass (idempotent)', async () => {

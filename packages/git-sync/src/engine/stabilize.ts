@@ -72,7 +72,13 @@ export async function stabilizePageFile(
  * keeps re-pulls of an unchanged page byte-identical (no churn, loop-guard).
  */
 export async function stabilizePageBody(content: unknown): Promise<string> {
-  const md1 = convertProseMirrorToMarkdown(content);
+  // git-sync is the LOSSLESS mirror path, so run the serializer in `strict`
+  // mode: a node/mark type the converter has no case for (e.g. one added to the
+  // schema without a matching serializer arm) throws a ConverterLossError here
+  // rather than silently degrading — surfacing the loss loudly at write time
+  // instead of committing a lossy file. Valid content (every current schema type
+  // has a case) is unaffected.
+  const md1 = convertProseMirrorToMarkdown(content, { strict: true });
   const doc2 = await markdownToProseMirror(md1);
-  return convertProseMirrorToMarkdown(doc2);
+  return convertProseMirrorToMarkdown(doc2, { strict: true });
 }

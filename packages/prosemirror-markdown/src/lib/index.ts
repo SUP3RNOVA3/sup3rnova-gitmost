@@ -15,7 +15,10 @@ export {
 } from "./markdown-document.js";
 export type { DocmostMdMeta } from "./markdown-document.js";
 
-export { convertProseMirrorToMarkdown } from "./markdown-converter.js";
+export {
+  convertProseMirrorToMarkdown,
+  ConverterLossError,
+} from "./markdown-converter.js";
 export type { ConvertProseMirrorToMarkdownOptions } from "./markdown-converter.js";
 
 export {

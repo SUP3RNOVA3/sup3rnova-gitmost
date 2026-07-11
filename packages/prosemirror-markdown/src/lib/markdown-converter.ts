@@ -34,6 +34,26 @@ import {
 const MAX_NODE_DEPTH = 400;
 
 /**
+ * Thrown by {@link convertProseMirrorToMarkdown} in `strict` mode when it hits a
+ * node or mark type it has no lossless markdown form for (the serializer would
+ * otherwise silently degrade it — drop an unknown mark, flatten an unknown node
+ * to its children). Carries the offending kind/name so a caller (git-sync) can
+ * surface exactly what would have been lost.
+ */
+export class ConverterLossError extends Error {
+  readonly kind: "node" | "mark";
+  readonly typeName: string;
+  constructor(kind: "node" | "mark", typeName: string) {
+    super(
+      `convertProseMirrorToMarkdown: unknown ${kind} type "${typeName}" has no lossless markdown representation (strict mode)`,
+    );
+    this.name = "ConverterLossError";
+    this.kind = kind;
+    this.typeName = typeName;
+  }
+}
+
+/**
  * Options for {@link convertProseMirrorToMarkdown}.
  */
 export interface ConvertProseMirrorToMarkdownOptions {
@@ -46,6 +66,23 @@ export interface ConvertProseMirrorToMarkdownOptions {
    * path where resolved anchors MUST be preserved for round-tripping.
    */
   dropResolvedCommentAnchors?: boolean;
+  /**
+   * Optional sink for LOSS warnings. When the serializer reaches a node or mark
+   * type it has no dedicated case for, it degrades gracefully (flattens an
+   * unknown node to its children, drops an unknown mark) — historically a SILENT
+   * data loss. When this array is provided, one human-readable message per such
+   * event is pushed here so the caller can observe (and log) what was degraded.
+   * Not provided by default -> behavior is byte-identical to before for existing
+   * callers.
+   */
+  warnings?: string[];
+  /**
+   * When true, THROW a {@link ConverterLossError} on the FIRST unknown node/mark
+   * instead of degrading silently — a warning becomes a hard error. Used by the
+   * lossless git-sync export path and the converter tests, where an unmapped
+   * type is a bug to surface, not data to quietly drop.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -156,6 +193,26 @@ export function convertProseMirrorToMarkdown(
   // loop and the raw-HTML inlineToHtml path). Off by default; the agent-read
   // callers (mcp getPage / in-app AI chat) pass it true.
   const dropResolvedCommentAnchors = options.dropResolvedCommentAnchors === true;
+
+  // Loss reporting for node/mark types with no dedicated serializer case. In
+  // `strict` mode the FIRST such type throws (git-sync, tests); otherwise the
+  // serializer degrades gracefully (as it always has) but records one warning
+  // per unmapped type into the optional sink so the loss is observable, not
+  // silent. Deduped per type so a document with many unknown nodes of one type
+  // produces one message.
+  const strict = options.strict === true;
+  const warningsSink = options.warnings;
+  const seenLossTypes = new Set<string>();
+  const warnLoss = (kind: "node" | "mark", typeName: string): void => {
+    if (strict) throw new ConverterLossError(kind, typeName);
+    if (!warningsSink) return;
+    const key = `${kind}:${typeName}`;
+    if (seenLossTypes.has(key)) return;
+    seenLossTypes.add(key);
+    warningsSink.push(
+      `Unknown ${kind} type "${typeName}" has no lossless markdown form; it was degraded on export.`,
+    );
+  };
 
   // Escape a value interpolated into an HTML double-quoted attribute value
   // (textAlign, colors, image src, math `text`, all data-* attrs, etc.). In the
@@ -646,6 +703,12 @@ export function convertProseMirrorToMarkdown(
                 }
                 break;
               }
+              default:
+                // Unknown mark: no dedicated case, so it has no markdown form and
+                // is dropped from the run. Report the loss (throws in strict
+                // mode) then leave the text unwrapped — the historical behavior.
+                warnLoss("mark", String(mark.type));
+                break;
             }
           }
         }
@@ -1224,7 +1287,11 @@ export function convertProseMirrorToMarkdown(
       }
 
       default:
-        // Fallback: process children
+        // Unknown node type: no dedicated case, so the node's identity + attrs
+        // have no lossless markdown form. Report the loss (throws in strict
+        // mode) then degrade by flattening to its children — the historical
+        // graceful fallback.
+        warnLoss("node", String(type));
         return nodeContent.map(processNode).join("");
     }
   };
@@ -1347,6 +1414,12 @@ export function convertProseMirrorToMarkdown(
                 const r = mark.attrs?.resolved ? ` data-resolved="true"` : "";
                 t = `<span data-comment-id="${escapeAttr(mark.attrs.commentId)}"${r}>${t}</span>`;
               }
+              break;
+            default:
+              // Unknown mark on the raw-HTML path: dropped (no HTML form). Report
+              // the loss (throws in strict mode) — same policy as the markdown
+              // path's marks loop above.
+              warnLoss("mark", String(mark.type));
               break;
           }
         }
