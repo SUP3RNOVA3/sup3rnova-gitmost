@@ -42,10 +42,11 @@ describe('search ru_en config migration [integration]', () => {
   });
 
   afterAll(async () => {
-    // Restore the migrated (ru_en) state for any later suite, then close.
-    if (!(await configExists())) {
-      await migration.up(db);
-    }
+    // Restore the canonical ru_en state for any later suite regardless of where
+    // a test left off. up() is now safe on an existing config (ensureRuEnConfig
+    // no-ops) and re-asserts both stored sides to ru_en.
+    delete process.env.SEARCH_EMBEDDINGS_FTS_INLINE_REWRITE;
+    await migration.up(db);
     await destroyTestDb();
   });
 
@@ -68,5 +69,43 @@ describe('search ru_en config migration [integration]', () => {
     expect(await configExists()).toBe(true);
     expect(await ftsDef()).toContain('ru_en');
     expect(await triggerSrc()).toContain('ru_en');
+  });
+
+  // B1.1 — running up() a SECOND time on an already-migrated DB is a true no-op:
+  // it must NOT throw (the old drop-recreate-config would fail on the fts hard
+  // dependency) and must NOT re-rewrite the embeddings table — the fts column
+  // already references ru_en, so the at-target check short-circuits.
+  it('up() is idempotent: a 2nd run does not error and leaves ru_en intact', async () => {
+    await expect(migration.up(db)).resolves.toBeUndefined();
+    expect(await configExists()).toBe(true);
+    expect(await ftsDef()).toContain('ru_en');
+    expect(await triggerSrc()).toContain('ru_en');
+  });
+
+  // B1.2 — env-gate opt-out: with SEARCH_EMBEDDINGS_FTS_INLINE_REWRITE=false the
+  // embeddings rewrite is SKIPPED (fts stays where it was) but pages.tsv still
+  // swaps inline, and the ru_en config is left in place (fts still depends on it).
+  // Runs down() as the vehicle: english is NOT the current fts config, so the
+  // skip path — not the at-target no-op — is exercised.
+  it('env-gate=false: skips the fts rewrite but still swaps pages.tsv', async () => {
+    // Precondition: fts + trigger on ru_en (from the prior test).
+    expect(await ftsDef()).toContain('ru_en');
+    process.env.SEARCH_EMBEDDINGS_FTS_INLINE_REWRITE = 'false';
+    try {
+      await migration.down(db);
+      // fts rewrite skipped → still ru_en (the ACCESS EXCLUSIVE rewrite avoided).
+      expect(await ftsDef()).toContain('ru_en');
+      expect(await ftsDef()).not.toContain('english');
+      // pages.tsv trigger still swapped inline to english (gate is fts-only).
+      expect(await triggerSrc()).toContain('english');
+      // Config left in place because fts still references it (guarded drop).
+      expect(await configExists()).toBe(true);
+    } finally {
+      // Restore ru_en fully for the afterAll / later suites.
+      delete process.env.SEARCH_EMBEDDINGS_FTS_INLINE_REWRITE;
+      await migration.up(db);
+      expect(await ftsDef()).toContain('ru_en');
+      expect(await triggerSrc()).toContain('ru_en');
+    }
   });
 });
