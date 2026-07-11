@@ -57,11 +57,11 @@ import {
 // Derived from the class below; `implements IDrawioMixin` fails to compile on drift.
 export interface IDrawioMixin {
   drawioGet(pageId: string, node: string, format?: "xml" | "svg"): Promise<{ pageId: string; nodeId: string; format: "xml" | "svg"; content: string; meta: { attachmentId: string | null; title: string | null; width: number | null; height: number | null; cellCount: number; hash: string; }; }>;
-  drawioCreate(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, xml: string, title?: string, layout?: "elk"): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; verify?: any; }>;
+  drawioCreate(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, xml: string, title?: string, layout?: "elk"): Promise<{ success: boolean; nodeId: string | null; attachmentId: string; warnings: string[]; verify?: any; }>;
   drawioUpdate(pageId: string, node: string, xml: string, baseHash: string, layout?: "elk"): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; verify?: any; }>;
   drawioEditCells(pageId: string, node: string, operations: CellOp[], baseHash: string): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; verify?: any; }>;
-  drawioFromGraph(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, graph: Graph, direction?: "LR" | "RL" | "TB" | "BT", preset?: string, layout?: GraphLayoutMode, node?: string): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; iconsResolved: number; iconsMissing: string[]; verify?: any; }>;
-  drawioFromMermaid(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, mermaid: string, preset?: string): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; iconsResolved: number; iconsMissing: string[]; verify?: any; }>;
+  drawioFromGraph(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, graph: Graph, direction?: "LR" | "RL" | "TB" | "BT", preset?: string, layout?: GraphLayoutMode, node?: string): Promise<{ success: boolean; nodeId: string | null; attachmentId: string; warnings: string[]; iconsResolved: number; iconsMissing: string[]; verify?: any; }>;
+  drawioFromMermaid(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, mermaid: string, preset?: string): Promise<{ success: boolean; nodeId: string | null; attachmentId: string; warnings: string[]; iconsResolved: number; iconsMissing: string[]; verify?: any; }>;
 }
 
 export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Base: TBase): GConstructor<DocmostClientContext & IDrawioMixin> & TBase {
@@ -164,7 +164,9 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
     layout?: "elk",
   ): Promise<{
     success: boolean;
-    nodeId: string;
+    // `null` when the diagram was written but nested (no addressable "#<index>"
+    // handle) — see the nested-insert branch below (#494).
+    nodeId: string | null;
     attachmentId: string;
     warnings: string[];
     verify?: any;
@@ -276,11 +278,28 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
       // anchor), where "#<index>" — which addresses only top-level blocks —
       // cannot reference it. drawio nodes carry no persisted id, so there is no
       // stable handle for a nested diagram.
-      throw new Error(
-        `drawioCreate: the diagram was inserted on page ${pageId} but not as a ` +
-          `top-level block, so it has no addressable "#<index>" handle. Anchor ` +
-          `on a top-level block (or append) so the diagram can be re-read.`,
-      );
+      //
+      // CRITICAL (#494): the diagram is ALREADY WRITTEN and committed at this
+      // point (the mutation above succeeded). Throwing here reported a FAILURE for
+      // a write that in fact landed, so a retry-prone agent re-ran drawioCreate
+      // and inserted a DUPLICATE diagram (the #435 double-apply class). Return
+      // SUCCESS with nodeId:null and a warning instead: the write is
+      // acknowledged, and the agent is told there is no addressable handle and how
+      // to re-read the diagram — so it never blind-retries a landed write.
+      return {
+        success: true,
+        nodeId: null,
+        attachmentId: att.id,
+        warnings: [
+          ...prepared.warnings,
+          `The diagram was written on page ${pageId} but as a NESTED block (not ` +
+            `top-level), so it has no addressable "#<index>" handle. It is saved ` +
+            `— do NOT re-create it. To read or edit it, locate it via getOutline ` +
+            `/ getPageJson (attachmentId ${att.id}). To get a stable "#<index>" ` +
+            `handle, anchor on a top-level block (or append).`,
+        ],
+        verify: mutation.verify,
+      };
     }
 
     // The returned handle is POSITIONAL ("#<index>"): valid for the immediate
@@ -597,7 +616,9 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
     node?: string,
   ): Promise<{
     success: boolean;
-    nodeId: string;
+    // `null` when written nested (no addressable handle) — inherited from
+    // drawioCreate (#494).
+    nodeId: string | null;
     attachmentId: string;
     warnings: string[];
     iconsResolved: number;
@@ -682,7 +703,9 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
     preset?: string,
   ): Promise<{
     success: boolean;
-    nodeId: string;
+    // `null` when written nested (no addressable handle) — inherited from
+    // drawioFromGraph/drawioCreate (#494).
+    nodeId: string | null;
     attachmentId: string;
     warnings: string[];
     iconsResolved: number;
