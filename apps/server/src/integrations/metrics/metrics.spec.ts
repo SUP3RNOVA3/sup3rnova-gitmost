@@ -10,6 +10,8 @@ import {
   incConnectTimeout,
   incDocLoad,
   incDocUnload,
+  incGetPageCacheHit,
+  incGetPageCacheMiss,
   isMetricsEnabled,
   observeCollabAuth,
   observeCollabConnect,
@@ -197,6 +199,8 @@ describe('metrics helpers are safe no-ops when METRICS_PORT is unset', () => {
       incDocLoad();
       incDocUnload();
       incConnectTimeout();
+      incGetPageCacheHit();
+      incGetPageCacheMiss();
       // Registering a source must not create the gauge or invoke the fn.
       registerDocsOpenSource(() => {
         throw new Error('docsOpenSource must NOT be called when disabled');

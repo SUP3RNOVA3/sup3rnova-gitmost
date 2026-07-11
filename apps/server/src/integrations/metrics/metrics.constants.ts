@@ -25,6 +25,15 @@ export const METRIC_COLLAB_CONNECT_TIMEOUTS_TOTAL =
 export const METRIC_COLLAB_AUTH_DURATION = 'collab_auth_duration_seconds';
 export const METRIC_MCP_TOOL_DURATION = 'mcp_tool_duration_seconds';
 
+// #479 — getPage PM→Markdown conversion cache hit/miss counters. Emitted by the
+// MCP package via its dependency-neutral onMetric sink and routed onto these two
+// prom counters by the mcp.service onMetric callback; a >50% hit-rate is the
+// success signal for the getPage perf work. Same "do not rename" contract.
+export const METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL =
+  'mcp_getpage_cache_hits_total';
+export const METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL =
+  'mcp_getpage_cache_misses_total';
+
 // Histogram buckets (seconds). Chosen to give useful p50/p95/p99 resolution
 // for typical web/DB latencies without exploding series cardinality.
 export const HTTP_BUCKETS = [

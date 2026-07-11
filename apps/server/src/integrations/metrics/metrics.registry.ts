@@ -24,6 +24,8 @@ import {
   METRIC_DB_QUERY_DURATION,
   METRIC_HTTP_REQUEST_DURATION,
   METRIC_MCP_TOOL_DURATION,
+  METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL,
+  METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL,
   sizeBucket,
 } from './metrics.constants';
 
@@ -61,6 +63,9 @@ let connectTimeoutsCounter: Counter | null = null;
 let collabConnectHist: Histogram | null = null;
 let collabAuthHist: Histogram | null = null;
 let mcpToolHist: Histogram<'tool'> | null = null;
+// #479 — getPage conversion-cache hit/miss counters.
+let getPageCacheHitsCounter: Counter | null = null;
+let getPageCacheMissesCounter: Counter | null = null;
 
 // #402 — read-on-scrape source for collab_docs_open. The gauge is NEVER
 // inc/dec'd (that drifts under crashes/handoffs); instead its collect() callback
@@ -175,6 +180,18 @@ function init(): void {
     buckets: MCP_TOOL_BUCKETS,
     registers: [registry],
   });
+
+  getPageCacheHitsCounter = new Counter({
+    name: METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL,
+    help: 'Total getPage PM→Markdown conversions served from the cache (skipped)',
+    registers: [registry],
+  });
+
+  getPageCacheMissesCounter = new Counter({
+    name: METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL,
+    help: 'Total getPage PM→Markdown conversions computed (cache misses)',
+    registers: [registry],
+  });
 }
 
 // Runs once when this module is first imported. Safe to call again (idempotent).
@@ -245,6 +262,14 @@ export function observeCollabConnect(seconds: number): void {
 
 export function observeCollabAuth(seconds: number): void {
   collabAuthHist?.observe(seconds);
+}
+
+export function incGetPageCacheHit(): void {
+  getPageCacheHitsCounter?.inc();
+}
+
+export function incGetPageCacheMiss(): void {
+  getPageCacheMissesCounter?.inc();
 }
 
 export function observeMcpTool(tool: string, seconds: number): void {

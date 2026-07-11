@@ -10,7 +10,14 @@ import {
   filterComment,
   filterSearchResult,
 } from "../lib/filters.js";
-import { convertProseMirrorToMarkdown } from "../lib/markdown-converter.js";
+import {
+  convertProseMirrorToMarkdown,
+  type ConvertProseMirrorToMarkdownOptions,
+} from "../lib/markdown-converter.js";
+import {
+  GetPageConversionCache,
+  hashConvertOptions,
+} from "./getpage-cache.js";
 import {
   collectInternalFileNodes,
   normalizeFileUrl,
@@ -395,6 +402,19 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
 
   /** Raw page info including the ProseMirror JSON content and slugId. */
 
+  /**
+   * Overridable seam over convertProseMirrorToMarkdown (issue #479). Production
+   * just delegates; it exists as a method so a unit test can spy on it and
+   * assert the conversion is genuinely SKIPPED on a getPage cache HIT (the whole
+   * point of the cache) — an ESM named import cannot be intercepted otherwise.
+   */
+  protected convertPageMarkdown(
+    content: any,
+    options: ConvertProseMirrorToMarkdownOptions,
+  ): string {
+    return convertProseMirrorToMarkdown(content, options);
+  }
+
   async getPage(pageId: string) {
     await this.ensureAuthenticated();
     const resultData = await this.getPageRaw(pageId);
@@ -403,13 +423,55 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     // discussions. Active anchors are kept. (The lossless exportPageMarkdown
     // round-trip deliberately does NOT pass this flag — resolved anchors there
     // must be preserved.)
-    let content = resultData.content
-      ? convertProseMirrorToMarkdown(resultData.content, {
-          dropResolvedCommentAnchors: true,
-        })
-      : "";
+    //
+    // Content-addressed conversion cache (issue #479): the PM->Markdown walk is
+    // the dominant cost of this hot read op. Key on the page's canonical UUID +
+    // updatedAt (both from THIS /pages/info response, so mutually consistent) +
+    // a hash of the conversion options. A hit returns the cached markdown and
+    // skips the walk; a miss converts and stores. The cached value is the
+    // conversion output BEFORE the {{SUBPAGES}} substitution below, which uses
+    // live subpage data and stays outside the cache — so the final result is
+    // byte-identical to the uncached path.
+    const convertOptions = { dropResolvedCommentAnchors: true };
+    let content = "";
+    if (resultData.content) {
+      // Only cache when we have a stable identity+version for the key. Both come
+      // from the same response; if either is missing (unexpected server shape),
+      // fall back to converting uncached rather than keying on a partial tuple.
+      const cacheable =
+        typeof resultData.id === "string" &&
+        typeof resultData.updatedAt === "string";
+      const cacheKey = cacheable
+        ? GetPageConversionCache.key(
+            resultData.id,
+            resultData.updatedAt,
+            hashConvertOptions(convertOptions),
+          )
+        : null;
 
-    // Always fetch subpages to provide context to the agent
+      const cached = cacheKey ? this.getPageCache.get(cacheKey) : undefined;
+      if (cached !== undefined) {
+        content = cached;
+        this.onMetricFn?.("mcp_getpage_cache_hits_total", 1);
+      } else {
+        // Goes through the convertPageMarkdown seam (not the raw import) so a
+        // test can assert the conversion is SKIPPED on a hit (issue #479 F2).
+        content = this.convertPageMarkdown(resultData.content, convertOptions);
+        if (cacheKey) this.getPageCache.set(cacheKey, content);
+        // A non-cacheable page (missing id/updatedAt) is still a genuine
+        // conversion, so it counts as a miss for an honest hit-rate.
+        this.onMetricFn?.("mcp_getpage_cache_misses_total", 1);
+      }
+    }
+
+    // Always fetch subpages to provide context to the agent.
+    //
+    // NOT parallelizable with the page fetch (issue #479 asked to check): the
+    // sidebar-pages endpoint REQUIRES spaceId in its POST body, and spaceId is
+    // only known FROM this page fetch's response (resolvePageId yields the UUID
+    // but never the spaceId). So `Promise.all([pageFetch, subpagesFetch])` would
+    // have to invent a spaceId it does not have — the two calls are inherently
+    // sequential. Correctness wins; the conversion cache above is the real speedup.
     let subpages: any[] = [];
     try {
       // `pageId` may be a slugId, but the sidebar-pages endpoint requires the
