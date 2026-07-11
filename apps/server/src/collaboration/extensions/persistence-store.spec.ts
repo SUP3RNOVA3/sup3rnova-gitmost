@@ -653,5 +653,111 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
       expect(pageHistoryRepo.updateHistoryKind).not.toHaveBeenCalled();
     });
+
+    // #370 F8-twin — a COMMIT abort (serialization/deadlock/conn-drop) rejects
+    // OUTSIDE the tx callback, AFTER the destructive popContributors (SPOP) and
+    // saveHistory ran but the INSERT rolled back. onStateless has no retry, so
+    // the outer catch MUST re-add (SADD) the popped set or attribution is lost
+    // irrecoverably. MUTATION: drop the outer catch → addContributors is never
+    // called → this reddens.
+    it('restores popped contributors when the commit aborts after the callback', async () => {
+      const document = ydocFor(doc('VERSION ME'));
+      pageRepo.findById.mockResolvedValue(pageMatchingDoc(document));
+      // No matching snapshot → fresh version branch → pops contributors.
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
+      collabHistory.popContributors.mockResolvedValue(['u1', 'u2']);
+
+      // A db whose commit REJECTS after the callback body resolved: the SPOP and
+      // saveHistory already ran, then the tx aborts. onStoreDocument's flush uses
+      // the same db but its content matches (no-op branch) and its own retry loop
+      // swallows the throw, so only the versioning tx exercises the restore.
+      const commitFailingDb = {
+        transaction: () => ({
+          execute: async (fn: (trx: any) => Promise<any>) => {
+            await fn(trxStub);
+            throw new Error('commit aborted (serialization_failure)');
+          },
+        }),
+      };
+      const ext2 = new PersistenceExtension(
+        pageRepo as any,
+        pageHistoryRepo as any,
+        commitFailingDb as any,
+        aiQueue as any,
+        historyQueue as any,
+        notificationQueue as any,
+        collabHistory as any,
+        transclusionService as any,
+      );
+      jest.spyOn(ext2['logger'], 'debug').mockImplementation(() => undefined);
+      jest.spyOn(ext2['logger'], 'warn').mockImplementation(() => undefined);
+      jest.spyOn(ext2['logger'], 'error').mockImplementation(() => undefined);
+
+      await expect(
+        ext2.onStateless({
+          connection: {
+            readOnly: false,
+            context: { user: { id: USER_ID, name: 'Alice' }, actor: 'user' },
+          } as any,
+          documentName: `page.${PAGE_ID}`,
+          document: document as any,
+          payload: JSON.stringify({ type: 'save-version' }),
+        } as any),
+      ).rejects.toThrow();
+
+      // Attribution preserved: the popped set is SADD-restored, keyed by the page
+      // UUID it was popped under.
+      expect(collabHistory.addContributors).toHaveBeenCalledWith(PAGE_ID, [
+        'u1',
+        'u2',
+      ]);
+    });
+
+    // #370 #260 — for a `page.<slugId>` document the idle job is armed under the
+    // page UUID (computeHistoryJob's jobId = page.id), so the supersede-remove
+    // must target page.id, not the raw slugId doc-name id, or it silently misses.
+    it('cancels the superseded idle job by the page UUID for a slugId doc', async () => {
+      const SLUG = 'slug-1'; // persistedHumanPage.slugId
+      const document = ydocFor(doc('VERSION ME'));
+      pageRepo.findById.mockResolvedValue(pageMatchingDoc(document));
+      pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
+
+      await ext.onStateless({
+        connection: {
+          readOnly: false,
+          context: { user: { id: USER_ID, name: 'Alice' }, actor: 'user' },
+        } as any,
+        documentName: `page.${SLUG}`,
+        document: document as any,
+        payload: JSON.stringify({ type: 'save-version' }),
+      } as any);
+
+      // remove() keyed by the UUID (the real jobId), never the slugId.
+      expect(historyQueue.remove).toHaveBeenCalledWith(PAGE_ID);
+      expect(historyQueue.remove).not.toHaveBeenCalledWith(SLUG);
+    });
+  });
+
+  // #370 — the in-memory idle-burst marker must be dropped on doc unload (like
+  // its sibling per-document maps) or it grows unbounded for every page that was
+  // edited but never manually saved. MUTATION: drop the afterUnloadDocument
+  // delete → the entry survives → this reddens.
+  describe('idleBurstStart housekeeping', () => {
+    it('afterUnloadDocument clears the idle-burst marker armed by a store', async () => {
+      const document = ydocFor(doc('EDIT'));
+      pageRepo.findById.mockResolvedValue(persistedHumanPage('EDIT'));
+
+      await ext.onStoreDocument(buildData(document, 'user') as any);
+
+      const map = ext['idleBurstStart'] as Map<string, number>;
+      // Keyed by documentName (buildData uses `page.${PAGE_ID}`).
+      expect(map.has(`page.${PAGE_ID}`)).toBe(true);
+
+      await ext.afterUnloadDocument({
+        documentName: `page.${PAGE_ID}`,
+      } as any);
+
+      expect(map.has(`page.${PAGE_ID}`)).toBe(false);
+    });
   });
 });

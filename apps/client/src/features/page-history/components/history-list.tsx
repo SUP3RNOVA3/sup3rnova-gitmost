@@ -2,7 +2,9 @@ import {
   usePageHistoryListQuery,
   prefetchPageHistory,
 } from "@/features/page-history/queries/page-history-query";
-import HistoryItem from "@/features/page-history/components/history-item";
+import HistoryItem, {
+  historyKindMeta,
+} from "@/features/page-history/components/history-item";
 import {
   activeHistoryIdAtom,
   activeHistoryPrevIdAtom,
@@ -55,16 +57,15 @@ function HistoryList({ pageId }: Props) {
   // already-loaded pages; the diff/restore still targets the true previous
   // snapshot, so items carry their index within the FULL list.
   const [onlyVersions, setOnlyVersions] = useState(false);
-  const isVersion = useCallback(
-    (kind?: string | null) => kind === "manual" || kind === "agent",
-    [],
-  );
+  // Reuse historyKindMeta().version — the SAME predicate the badge (HistoryItem)
+  // uses to mark intentional points — so the "Only versions" filter and the badge
+  // can never drift apart when a future intentional kind is added.
   const visibleItems = useMemo(
     () =>
       onlyVersions
-        ? historyItems.filter((item) => isVersion(item.kind))
+        ? historyItems.filter((item) => historyKindMeta(item.kind).version)
         : historyItems,
-    [historyItems, onlyVersions, isVersion],
+    [historyItems, onlyVersions],
   );
 
   const loadMoreRef = useRef<HTMLDivElement>(null);

@@ -148,10 +148,15 @@ export class PersistenceExtension implements Extension {
   // coalescing window" per document and OR it across all edits in the window,
   // so the snapshot is marked 'agent' regardless of who wrote last.
   private agentTouched: Map<string, boolean> = new Map();
-  // #370 — epoch ms of the FIRST edit in the current idle-flush burst, per page.
+  // #370 — epoch ms of the FIRST edit in the current idle-flush burst. Keyed by
+  // documentName (like its sibling per-document maps above), NOT by page.id, so
+  // it can be cleaned in afterUnloadDocument alongside `contributors` /
+  // `agentTouched` / `intentionalClear` when the doc unloads — otherwise any page
+  // that was edited but never manually saved (the common case) would keep its
+  // entry forever and the Map would grow unbounded in this long-lived process.
   // Set when the pending idle job is first armed (empty entry), read to enforce
-  // the max-wait ceiling in computeHistoryJob, and cleared when the idle job is
-  // consumed/cancelled so the next burst starts a fresh window.
+  // the max-wait ceiling in computeHistoryJob, and cleared on doc unload or when
+  // a manual save cancels the idle job so the next burst starts a fresh window.
   //
   // Single-process assumption (like `contributors` / `agentTouched` above): this
   // lives only in THIS collab process's memory. A restart, or a page's ownership
@@ -552,7 +557,7 @@ export class PersistenceExtension implements Extension {
         { jobId: `embed-${page.id}`, delay: EMBED_DEBOUNCE_MS },
       );
 
-      await this.enqueuePageHistory(page, lastUpdatedSource);
+      await this.enqueuePageHistory(page, documentName, lastUpdatedSource);
     }
 
     // #402 — report the serialized size for the store histogram's size_bucket.
@@ -639,65 +644,108 @@ export class PersistenceExtension implements Extension {
       | { historyId: string; kind: PageHistoryKind; alreadySaved: boolean }
       | undefined;
 
-    await executeTx(this.db, async (trx) => {
-      const page = await this.pageRepo.findById(pageId, {
-        withLock: true,
-        includeContent: true,
-        trx,
-      });
-      if (!page) return;
-      // Never version an effectively-empty page (mirrors the processor's
-      // first-history guard); there is nothing intentional to pin.
-      if (isEmptyParagraphDoc(page.content as any)) return;
+    // #370 F8-twin — the contributor set popped from Redis (destructive SPOP)
+    // must be restored if the version row does not durably land. The inner
+    // try/catch below only covers a throw INSIDE the callback; but executeTx
+    // COMMITS after the callback, so a commit-abort (serialization/deadlock/
+    // connection drop — the transient class the epic retries in the processor)
+    // rejects OUTSIDE the callback, after saveHistory already ran and the SPOP
+    // already happened, while the INSERT rolls back. onStateless does NOT retry,
+    // so an unrestored pop is a one-shot irrecoverable attribution loss (the
+    // processor got exactly this fix: poppedForRestore + an outer catch). We
+    // track the popped set here (keyed by the page UUID it was popped by — never
+    // the doc-name id, which may be a slugId, #260) and restore it in the outer
+    // catch. addContributors is an idempotent Redis SADD, so a double-restore is
+    // harmless. versionedPageId is also reused below to remove the superseded
+    // idle job by its real jobId (page.id).
+    let poppedForRestore: string[] = [];
+    let versionedPageId: string | undefined;
 
-      const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
-        page.id,
-        { includeContent: true, trx },
-      );
-
-      if (
-        lastHistory &&
-        isDeepStrictEqual(lastHistory.content, page.content)
-      ) {
-        // Content is already snapshotted. Promote-not-dup.
-        if (lastHistory.kind === 'manual') {
-          result = {
-            historyId: lastHistory.id,
-            kind: 'manual',
-            alreadySaved: true,
-          };
-          return;
-        }
-        await this.pageHistoryRepo.updateHistoryKind(
-          lastHistory.id,
-          kind,
-          trx,
-        );
-        result = { historyId: lastHistory.id, kind, alreadySaved: false };
-        return;
-      }
-
-      // Fresh version row. Pop the contributors aggregated since the last
-      // snapshot (SPOP); restore them if the write fails so they aren't lost.
-      const contributorIds = await this.collabHistory.popContributors(page.id);
-      try {
-        const saved = await this.pageHistoryRepo.saveHistory(page, {
-          contributorIds,
-          kind,
+    try {
+      await executeTx(this.db, async (trx) => {
+        const page = await this.pageRepo.findById(pageId, {
+          withLock: true,
+          includeContent: true,
           trx,
         });
-        result = { historyId: saved.id, kind, alreadySaved: false };
-      } catch (err) {
-        await this.collabHistory.addContributors(page.id, contributorIds);
-        throw err;
+        if (!page) return;
+        versionedPageId = page.id;
+        // Never version an effectively-empty page (mirrors the processor's
+        // first-history guard); there is nothing intentional to pin.
+        if (isEmptyParagraphDoc(page.content as any)) return;
+
+        const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
+          page.id,
+          { includeContent: true, trx },
+        );
+
+        if (
+          lastHistory &&
+          isDeepStrictEqual(lastHistory.content, page.content)
+        ) {
+          // Content is already snapshotted. Promote-not-dup.
+          if (lastHistory.kind === 'manual') {
+            result = {
+              historyId: lastHistory.id,
+              kind: 'manual',
+              alreadySaved: true,
+            };
+            return;
+          }
+          await this.pageHistoryRepo.updateHistoryKind(
+            lastHistory.id,
+            kind,
+            trx,
+          );
+          result = { historyId: lastHistory.id, kind, alreadySaved: false };
+          return;
+        }
+
+        // Fresh version row. Pop the contributors aggregated since the last
+        // snapshot (SPOP); restore them if the write fails so they aren't lost.
+        const contributorIds = await this.collabHistory.popContributors(
+          page.id,
+        );
+        poppedForRestore = contributorIds;
+        try {
+          const saved = await this.pageHistoryRepo.saveHistory(page, {
+            contributorIds,
+            kind,
+            trx,
+          });
+          result = { historyId: saved.id, kind, alreadySaved: false };
+        } catch (err) {
+          await this.collabHistory.addContributors(page.id, contributorIds);
+          poppedForRestore = [];
+          throw err;
+        }
+      });
+    } catch (err) {
+      // A throw here means the tx did NOT commit (callback threw, or the commit
+      // itself failed and rolled back). If we popped contributors and the inner
+      // catch did not already restore them, restore now so attribution is not
+      // lost — onStateless has no retry to recover it. Restore by the page UUID
+      // the pop was keyed under (versionedPageId is always set before the pop).
+      if (poppedForRestore.length && versionedPageId) {
+        await this.collabHistory.addContributors(
+          versionedPageId,
+          poppedForRestore,
+        );
       }
-    });
+      throw err;
+    }
 
     // Housekeeping: this explicit version supersedes the page's pending idle
-    // autosnapshot, so cancel it (delayed job → remove() just deletes it) and
-    // end the current idle burst so the next edit starts a fresh max-wait window.
-    await this.historyQueue.remove(pageId).catch(() => undefined);
-    this.idleBurstStart.delete(pageId);
+    // autosnapshot, so cancel it and end the current idle burst so the next edit
+    // starts a fresh max-wait window. Remove the idle job by its REAL jobId
+    // (page.id UUID — computeHistoryJob arms it under page.id), not the raw
+    // doc-name id which may be a slugId for a `page.<slugId>` doc (#260), or the
+    // remove silently misses. The burst marker is keyed by documentName (like its
+    // sibling per-document maps), and is also cleaned in afterUnloadDocument.
+    if (versionedPageId) {
+      await this.historyQueue.remove(versionedPageId).catch(() => undefined);
+    }
+    this.idleBurstStart.delete(documentName);
 
     if (result) {
       document.broadcastStateless(
@@ -735,6 +783,10 @@ export class PersistenceExtension implements Extension {
     this.contributors.delete(documentName);
     this.agentTouched.delete(documentName);
     this.intentionalClear.delete(documentName);
+    // #370 — drop the idle-burst marker with the other per-document maps so it
+    // cannot accumulate across the process lifetime for never-manually-saved
+    // pages. The pending idle job (if any) is a self-expiring BullMQ delayed job.
+    this.idleBurstStart.delete(documentName);
   }
 
   private consumeContributors(documentName: string): string[] {
@@ -766,6 +818,7 @@ export class PersistenceExtension implements Extension {
 
   private async enqueuePageHistory(
     page: Page,
+    documentName: string,
     lastUpdatedSource: string,
   ): Promise<void> {
     // #370 — trailing idle debounce with a max-wait ceiling. One pending idle
@@ -789,10 +842,12 @@ export class PersistenceExtension implements Extension {
     const maxWait =
       lastUpdatedSource === 'agent' ? IDLE_MAX_WAIT_AGENT : IDLE_MAX_WAIT_USER;
     const now = Date.now();
-    let burstStart = this.idleBurstStart.get(page.id);
+    // Keyed by documentName (see the map declaration) so afterUnloadDocument can
+    // clean it; the queue jobId stays page.id (computeHistoryJob) as required.
+    let burstStart = this.idleBurstStart.get(documentName);
     if (burstStart === undefined || now - burstStart >= maxWait) {
       burstStart = now;
-      this.idleBurstStart.set(page.id, burstStart);
+      this.idleBurstStart.set(documentName, burstStart);
     }
 
     const { jobId, delay } = computeHistoryJob(
