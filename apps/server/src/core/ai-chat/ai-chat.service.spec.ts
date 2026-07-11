@@ -1929,3 +1929,148 @@ describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
     expect(patch.content).not.toContain(STEP_LIMIT_NO_ANSWER_MARKER);
   });
 });
+
+// #487 F3 — the reconcile() / reconcileChat() ORCHESTRATORS. The individual
+// clauses are exercised elsewhere; these pin the production orchestration the
+// per-clause specs do not: the clause ORDER, the per-clause try/catch ISOLATION
+// (one clause throwing must NOT abort the others), and reconcileChat() (which runs
+// at the start of every turn and was entirely uncovered).
+describe('AiChatService.reconcile / reconcileChat orchestrators (#487 F3)', () => {
+  let warnSpy: jest.SpyInstance;
+  beforeEach(() => {
+    // Silence the intentional clause-failure warnings (kept out of test output).
+    warnSpy = jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined);
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  function makeService(opts: {
+    messageRepo?: Record<string, jest.Mock>;
+    runService?: Record<string, jest.Mock>;
+  }) {
+    const aiChatMessageRepo = {
+      findStreamingWithTerminalRun: jest.fn(async () => []),
+      stampTerminalIfStreaming: jest.fn(async () => undefined),
+      sweepStreamingWithoutActiveRun: jest.fn(async () => 0),
+      ...(opts.messageRepo ?? {}),
+    };
+    const aiChatRunService = opts.runService
+      ? {
+          zombieRunIds: jest.fn(() => []),
+          settleZombie: jest.fn(async () => true),
+          reconcileStaleRuns: jest.fn(async () => 0),
+          ...opts.runService,
+        }
+      : undefined;
+    const svc = new AiChatService(
+      {} as never, // ai
+      {} as never, // aiChatRepo
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo
+      {} as never, // aiSettings
+      {} as never, // tools
+      {} as never, // mcpClients
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo
+      {} as never, // pageAccess
+      {} as never, // environment
+      {} as never, // streamRegistry
+      aiChatRunService as never, // aiChatRunService (#487)
+    );
+    return { svc, aiChatMessageRepo, aiChatRunService };
+  }
+
+  it('reconcile() fires all four clauses IN ORDER (a -> b -> c -> d)', async () => {
+    const order: string[] = [];
+    const { svc } = makeService({
+      messageRepo: {
+        findStreamingWithTerminalRun: jest.fn(async () => {
+          order.push('b:find');
+          return [
+            { messageId: 'm1', workspaceId: 'ws1', runStatus: 'succeeded' },
+          ];
+        }),
+        stampTerminalIfStreaming: jest.fn(async () => {
+          order.push('b:stamp');
+        }),
+        sweepStreamingWithoutActiveRun: jest.fn(async () => {
+          order.push('d');
+          return 0;
+        }),
+      },
+      runService: {
+        zombieRunIds: jest.fn(() => ['z1']),
+        settleZombie: jest.fn(async () => {
+          order.push('a');
+          return true;
+        }),
+        reconcileStaleRuns: jest.fn(async () => {
+          order.push('c');
+          return 0;
+        }),
+      },
+    });
+
+    await svc.reconcile();
+
+    expect(order).toEqual(['a', 'b:find', 'b:stamp', 'c', 'd']);
+  });
+
+  it('a clause that THROWS does not abort the remaining clauses (per-clause try/catch isolation)', async () => {
+    const { svc, aiChatMessageRepo, aiChatRunService } = makeService({
+      messageRepo: {
+        // Clause (b) blows up mid-reconcile.
+        findStreamingWithTerminalRun: jest.fn(async () => {
+          throw new Error('clause b DB blip');
+        }),
+      },
+      runService: {
+        zombieRunIds: jest.fn(() => ['z1']),
+      },
+    });
+
+    // reconcile() must SETTLE (the clause-b failure is swallowed), not reject.
+    await expect(svc.reconcile()).resolves.toBeUndefined();
+
+    // (a) ran before (b); crucially (c) and (d) STILL ran despite (b) throwing —
+    // the property a missing try/catch would break. MUTATION-VERIFY: drop clause
+    // (b)'s try/catch and this reddens (the throw propagates, skipping c + d).
+    expect(aiChatRunService!.settleZombie).toHaveBeenCalled(); // (a)
+    expect(aiChatRunService!.reconcileStaleRuns).toHaveBeenCalled(); // (c)
+    expect(
+      aiChatMessageRepo.sweepStreamingWithoutActiveRun,
+    ).toHaveBeenCalled(); // (d)
+  });
+
+  it('reconcileChat() settles THIS chat\'s stuck streaming rows by their run status', async () => {
+    const { svc, aiChatMessageRepo } = makeService({
+      messageRepo: {
+        findStreamingWithTerminalRun: jest.fn(async () => [
+          { messageId: 'm1', workspaceId: 'ws1', runStatus: 'failed' },
+          { messageId: 'm2', workspaceId: 'ws1', runStatus: 'succeeded' },
+        ]),
+      },
+    });
+
+    await svc.reconcileChat('chat-1', 'ws1');
+
+    // Scoped to THIS chat and bounded at 50 (the user-facing opportunistic path).
+    expect(
+      aiChatMessageRepo.findStreamingWithTerminalRun,
+    ).toHaveBeenCalledWith(50, { chatId: 'chat-1', workspaceId: 'ws1' });
+    // failed-run -> 'error'; every other terminal status -> 'aborted'.
+    expect(aiChatMessageRepo.stampTerminalIfStreaming).toHaveBeenCalledWith(
+      'm1',
+      'ws1',
+      'error',
+    );
+    expect(aiChatMessageRepo.stampTerminalIfStreaming).toHaveBeenCalledWith(
+      'm2',
+      'ws1',
+      'aborted',
+    );
+  });
+});
