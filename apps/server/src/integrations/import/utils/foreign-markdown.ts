@@ -238,8 +238,9 @@ function convertReferenceFootnotes(markdown: string): string {
  *
  * LINE-ANCHORED (the same shape the canonical parser uses in
  * prosemirror-markdown/page-file.ts): the block opens only on `---\n` at the
- * very start and closes only on a `\n---` line. The retired `markdownToHtml`
- * strip closed on the FIRST `---` ANYWHERE (an unanchored close), so a value
+ * very start and closes only on a `\n---` line. The retired editor-ext
+ * `markdownToHtml` front-matter strip (removed in #347) closed on the FIRST
+ * `---` ANYWHERE (an unanchored close), so a value
  * containing a triple-dash (e.g. `title: Q1 --- Q2`) truncated the front-matter
  * and leaked the rest into the body. An optional leading BOM is tolerated.
  */

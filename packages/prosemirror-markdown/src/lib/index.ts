@@ -18,7 +18,10 @@ export type { DocmostMdMeta } from "./markdown-document.js";
 export { convertProseMirrorToMarkdown } from "./markdown-converter.js";
 export type { ConvertProseMirrorToMarkdownOptions } from "./markdown-converter.js";
 
-export { markdownToProseMirror } from "./markdown-to-prosemirror.js";
+export {
+  markdownToProseMirror,
+  markdownToProseMirrorSync,
+} from "./markdown-to-prosemirror.js";
 
 // The Docmost tiptap schema mirror. Exposed so consumers (and the sync
 // engine's schema-validity regression tests) can build the exact ProseMirror

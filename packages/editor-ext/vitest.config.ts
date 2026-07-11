@@ -14,10 +14,15 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text-summary", "text"],
       all: false,
+      // functions lowered 60 -> 57 after issue #347 removed the editor-ext
+      // markdown layer (src/lib/markdown) and its image/footnote round-trip
+      // specs: that markdown behavior now lives in — and is tested by —
+      // @docmost/prosemirror-markdown, so the editor-ext baseline shifts down.
+      // Still a real gate (a few points below the post-removal measured level).
       thresholds: {
         statements: 54,
         branches: 44,
-        functions: 60,
+        functions: 57,
         lines: 54,
       },
     },

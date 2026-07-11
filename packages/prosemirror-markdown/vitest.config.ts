@@ -19,5 +19,9 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['test/**/*.test.ts'],
+    // Register the Node (jsdom) HTML parser before any test runs. Tests import
+    // the converter via relative src/lib modules, bypassing the top-level entry
+    // that normally installs the parser as a side effect (see setup file).
+    setupFiles: ['test/setup.dom-parser.ts'],
   },
 });

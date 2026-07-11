@@ -63,10 +63,9 @@ function getStyleProperty(element: HTMLElement, propertyName: string): string | 
  * The editor SCHEMA genuinely only supports these six banner types — there is no
  * `tip`/`caution`/`important`/`question` callout node. So those are NOT first-
  * class types we can round-trip literally; they are INPUT ALIASES (GitHub/Obsidian
- * alert syntax). The editor's own paste/import path maps them onto the supported
- * set (see `GITHUB_ALERT_TYPE_MAP` in
- * `@docmost/editor-ext` markdown/utils/github-callout.marked.ts:
- * tip -> success, caution -> danger, important -> info). We mirror that aliasing
+ * alert syntax). This package's own `> [!type]` import path maps them onto the
+ * supported set (see `CALLOUT_TYPE_ALIASES` below: tip -> success, caution ->
+ * danger, important -> info). We apply that aliasing
  * here so an ingested `> [!tip]` / `> [!caution]` lands on the closest real banner
  * (success / danger) instead of flatly collapsing to `info` — matching exactly how
  * the editor itself would interpret the same alias. A schema type always maps to
@@ -75,11 +74,11 @@ function getStyleProperty(element: HTMLElement, propertyName: string): string | 
  */
 const CALLOUT_TYPES = ["default", "info", "note", "success", "warning", "danger"];
 /**
- * NON-schema callout aliases -> their closest supported banner. Mirrors the
- * editor's `GITHUB_ALERT_TYPE_MAP` for the names that are NOT already schema
- * types (a schema type is preserved as-is and never consulted here). Keeping
- * these in lockstep means git-sync ingest and an editor paste interpret the same
- * `> [!alias]` identically.
+ * NON-schema callout aliases -> their closest supported banner, for the names
+ * that are NOT already schema types (a schema type is preserved as-is and never
+ * consulted here). This is the single canonical alias map now that the editor's
+ * old marked layer is gone; git-sync ingest and an editor paste both go through
+ * this package, so they interpret the same `> [!alias]` identically.
  */
 const CALLOUT_TYPE_ALIASES: Record<string, string> = {
   tip: "success",

@@ -14,7 +14,8 @@ import {
  * ProseMirror JSON directly (never running the editor's plugins), so the
  * canonical footnote topology was never enforced on those writes. The consumers
  * of this editor-ext copy are: the server markdown/HTML import
- * (`markdownToHtml -> htmlToJson` in import.service / file-import-task.service),
+ * (`markdownToProseMirror` from @docmost/prosemirror-markdown in import.service /
+ * file-import-task.service),
  * `PageService` create/update (`parseProsemirrorContent` for the JSON/markdown/
  * HTML REST write paths), and the client markdown PASTE path
  * (`markdown-clipboard.ts`). (The MCP package mirrors this canonicalizer in

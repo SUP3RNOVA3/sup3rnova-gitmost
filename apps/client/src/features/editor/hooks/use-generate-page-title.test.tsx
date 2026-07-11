@@ -33,10 +33,11 @@ vi.mock("@/lib/local-emitter.ts", () => ({
   default: { emit: (...args: unknown[]) => localEmitMock(...args) },
 }));
 
-// htmlToMarkdown just echoes the editor HTML so each test controls the markdown
-// purely via the fake page editor's getHTML().
-vi.mock("@docmost/editor-ext", () => ({
-  htmlToMarkdown: (html: string) => html,
+// convertProseMirrorToMarkdown echoes a marker carried on the fake editor's
+// getJSON() doc, so each test controls the markdown purely via the fake page
+// editor (issue #347: the hook now serializes editor JSON through the package).
+vi.mock("@docmost/prosemirror-markdown/browser", () => ({
+  convertProseMirrorToMarkdown: (doc: { __md?: string }) => doc?.__md ?? "",
 }));
 
 const notificationsShowMock = vi.fn();
@@ -53,10 +54,12 @@ import { useGeneratePageTitle } from "./use-generate-page-title.ts";
 
 // --- Test helpers -------------------------------------------------------------
 
-function makePageEditor(pageId: string, html = "<p>content</p>"): Editor {
+function makePageEditor(pageId: string, md = "content"): Editor {
   return {
     isDestroyed: false,
-    getHTML: () => html,
+    // The mocked convertProseMirrorToMarkdown reads `__md` back off this doc,
+    // so `md` is exactly the markdown the hook will send to the title service.
+    getJSON: () => ({ type: "doc", __md: md }),
     storage: { pageId },
   } as unknown as Editor;
 }

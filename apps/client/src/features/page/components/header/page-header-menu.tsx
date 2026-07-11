@@ -37,7 +37,7 @@ import { useTreeMutation } from "@/features/page/tree/hooks/use-tree-mutation.ts
 import { PageWidthToggle } from "@/features/user/components/page-width-pref.tsx";
 import { Trans, useTranslation } from "react-i18next";
 import ExportModal from "@/components/common/export-modal";
-import { htmlToMarkdown } from "@docmost/editor-ext";
+import { convertProseMirrorToMarkdown } from "@docmost/prosemirror-markdown/browser";
 import {
   pageEditorAtom,
   yjsConnectionStatusAtom,
@@ -199,8 +199,9 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
 
   const handleCopyAsMarkdown = () => {
     if (!pageEditor) return;
-    const html = pageEditor.getHTML();
-    const markdown = htmlToMarkdown(html);
+    // Copy the page as canonical markdown through the shared converter (issue
+    // #347), so "Copy as markdown" matches the server export byte-for-byte.
+    const markdown = convertProseMirrorToMarkdown(pageEditor.getJSON());
     const title = page?.title ? `# ${page.title}\n\n` : "";
     clipboard.copy(`${title}${markdown}`);
     notifications.show({ message: t("Copied") });

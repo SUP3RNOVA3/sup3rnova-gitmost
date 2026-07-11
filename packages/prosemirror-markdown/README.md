@@ -1,12 +1,31 @@
 # @docmost/prosemirror-markdown
 
 The single, canonical **ProseMirror ↔ Markdown converter** plus the Docmost
-schema mirror (#293/#345). Headless and framework-free: no React, no browser
-runtime. There is exactly ONE copy of this converter in the repo, consumed by:
+schema mirror (#293/#345/#347). Headless and framework-free: no React. There is
+exactly ONE copy of this converter in the repo, consumed by:
 
 - `packages/mcp` (the MCP server),
 - `packages/git-sync` (two-way Git sync),
-- `apps/server` (server-side markdown import/export, #345).
+- `apps/server` (server-side markdown import/export, #345),
+- `apps/client` (markdown paste/copy + AI-chat render, #347).
+
+### Node vs browser entry
+
+The HTML→DOM stage of markdown import runs on `jsdom` in Node and the native
+`DOMParser` in the browser, injected per environment so **jsdom never enters a
+client bundle**:
+
+- default entry (`@docmost/prosemirror-markdown`) — Node: registers jsdom +
+  `@tiptap/html`'s happy-dom `server` `generateJSON`. Used by mcp / git-sync /
+  apps/server.
+- `browser` entry (`@docmost/prosemirror-markdown/browser`, via the `"browser"`
+  exports condition) — registers the native `DOMParser` + `@tiptap/html`'s
+  browser `generateJSON`. Used by `apps/client`; carries no jsdom/happy-dom.
+
+Both entries expose the identical converter surface; only the injected
+DOM/`generateJSON` implementations differ (`src/lib/dom-parser.ts`). A
+`markdownToProseMirrorSync` variant exists for callers that cannot await (the
+client's synchronous chat renderer).
 
 `src/lib/docmost-schema.ts` **mirrors** the upstream Tiptap schema that lives in
 `packages/editor-ext`. The mirror is not free-floating: `serializer-contract.test.ts`
