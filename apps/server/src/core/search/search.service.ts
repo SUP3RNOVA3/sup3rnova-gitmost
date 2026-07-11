@@ -20,7 +20,7 @@ const tsquery = require('pg-tsquery')();
 // The previous inline form `tsquery(query.trim() + '*')` passed user input
 // (including to_tsquery operators like `&`, `|`, `!`, `<->`, `*`, backslashes)
 // straight through. pg-tsquery would then emit operator fragments that
-// `to_tsquery('english', ...)` can reject as a syntax error, turning a search
+// `to_tsquery('ru_en', ...)` can reject as a syntax error, turning a search
 // into a 500. We strip everything that is not a letter, number or whitespace
 // BEFORE handing the text to pg-tsquery, so adversarial input degrades to a
 // neutral (possibly empty) query instead of throwing, while normal word queries
@@ -126,17 +126,17 @@ export class SearchService {
         'creatorId',
         'createdAt',
         'updatedAt',
-        sql<number>`ts_rank(tsv, to_tsquery('english', f_unaccent(${searchQuery})))`.as(
+        sql<number>`ts_rank(tsv, to_tsquery('ru_en', f_unaccent(${searchQuery})))`.as(
           'rank',
         ),
-        sql<string>`ts_headline('english', text_content, to_tsquery('english', f_unaccent(${searchQuery})),'MinWords=9, MaxWords=10, MaxFragments=3')`.as(
+        sql<string>`ts_headline('ru_en', text_content, to_tsquery('ru_en', f_unaccent(${searchQuery})),'MinWords=9, MaxWords=10, MaxFragments=3')`.as(
           'highlight',
         ),
       ])
       .where(
         'tsv',
         '@@',
-        sql<string>`to_tsquery('english', f_unaccent(${searchQuery}))`,
+        sql<string>`to_tsquery('ru_en', f_unaccent(${searchQuery}))`,
       )
       .$if(Boolean(searchParams.creatorId), (qb) =>
         qb.where('creatorId', '=', searchParams.creatorId),
@@ -325,7 +325,7 @@ export class SearchService {
         ),
         // FTS secondary signal (0 when the tsquery is empty).
         hasTsQuery
-          ? sql<number>`ts_rank(pages.tsv, to_tsquery('english', f_unaccent(${tsQuery})))`.as(
+          ? sql<number>`ts_rank(pages.tsv, to_tsquery('ru_en', f_unaccent(${tsQuery})))`.as(
               'ftsRank',
             )
           : sql<number>`0`.as('ftsRank'),
@@ -360,7 +360,7 @@ export class SearchService {
                 then substring(LOWER(f_unaccent(pages.text_content)) from 1 for 300)
               ${
                 hasTsQuery
-                  ? sql`else ts_headline('english', coalesce(pages.text_content, ''), to_tsquery('english', f_unaccent(${tsQuery})), 'MinWords=25, MaxWords=40, MaxFragments=3')`
+                  ? sql`else ts_headline('ru_en', coalesce(pages.text_content, ''), to_tsquery('ru_en', f_unaccent(${tsQuery})), 'MinWords=25, MaxWords=40, MaxFragments=3')`
                   : sql``
               }
             end,
@@ -406,7 +406,7 @@ export class SearchService {
         );
         if (hasTsQuery) {
           ors.push(
-            sql<boolean>`pages.tsv @@ to_tsquery('english', f_unaccent(${tsQuery}))` as any,
+            sql<boolean>`pages.tsv @@ to_tsquery('ru_en', f_unaccent(${tsQuery}))` as any,
           );
         }
       }
@@ -430,7 +430,7 @@ export class SearchService {
     // column position (`ORDER BY 0` → "position 0 is not in select list"), so the
     // no-tsquery fallback is `0::float`, not `0`.
     const ftsRankExpr = hasTsQuery
-      ? sql`ts_rank(pages.tsv, to_tsquery('english', f_unaccent(${tsQuery})))`
+      ? sql`ts_rank(pages.tsv, to_tsquery('ru_en', f_unaccent(${tsQuery})))`
       : sql`0::float`;
     const candidatesCapped = candidates
       // Raw-SQL ORDER BY expressions: pass the full `<expr> <dir>` as ONE arg
