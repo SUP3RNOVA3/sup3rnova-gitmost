@@ -577,8 +577,10 @@ export class CommentService {
 
       // Auto-resolve the thread. resolveComment handles the resolve mark, its ws
       // broadcast and the resolve notification. Stay defensive on re-entry.
+      let didResolveBroadcast = false;
       if (!comment.resolvedAt) {
         await this.resolveComment(comment, true, user, provenance);
+        didResolveBroadcast = true;
       }
 
       const updatedComment = await this.commentRepo.findById(comment.id, {
@@ -586,11 +588,20 @@ export class CommentService {
         includeResolvedBy: true,
       });
 
-      this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
-        operation: 'commentUpdated',
-        pageId: comment.pageId,
-        comment: updatedComment,
-      });
+      // #496 dedup: resolveComment already broadcast `commentResolved` carrying
+      // the fully-enriched row (the applied stamps were persisted above, before
+      // that call, so its re-read reflects them). Emitting `commentUpdated` here
+      // too made the client receive TWO events for one apply. Broadcast the
+      // update ONLY when we did NOT resolve — i.e. the rare re-entry on an
+      // already-resolved thread, where the applied-stamp change still needs a
+      // broadcast and resolveComment did not run.
+      if (!didResolveBroadcast) {
+        this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
+          operation: 'commentUpdated',
+          pageId: comment.pageId,
+          comment: updatedComment,
+        });
+      }
 
       this.auditService.log({
         event: AuditEvent.COMMENT_SUGGESTION_APPLIED,

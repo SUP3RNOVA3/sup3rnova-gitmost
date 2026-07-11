@@ -197,17 +197,25 @@ describe('CommentService — applySuggestion', () => {
     expect(resolvePatch.resolvedAt).toBeInstanceOf(Date);
     expect(resolvePatch.resolvedById).toBe('user-1');
 
-    // NOT deleted; broadcast an update, not a deletion.
+    // NOT deleted.
     expect(commentRepo.deleteComment).not.toHaveBeenCalled();
     expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalledWith(
       'deleteCommentMark',
       expect.anything(),
       expect.anything(),
     );
+    // #496 dedup: resolveComment broadcasts `commentResolved` with the enriched
+    // row; finalize must NOT ALSO emit a redundant `commentUpdated`. So the
+    // thread receives exactly ONE resolve broadcast and no update broadcast.
     expect(wsService.emitCommentEvent).toHaveBeenCalledWith(
       'space-1',
       'page-1',
-      expect.objectContaining({ operation: 'commentUpdated', comment: UPDATED }),
+      expect.objectContaining({ operation: 'commentResolved', comment: UPDATED }),
+    );
+    expect(wsService.emitCommentEvent).not.toHaveBeenCalledWith(
+      'space-1',
+      'page-1',
+      expect.objectContaining({ operation: 'commentUpdated' }),
     );
 
     expect(auditService.log).toHaveBeenCalledWith(
@@ -217,6 +225,36 @@ describe('CommentService — applySuggestion', () => {
     );
     expect(result.id).toBe('c-1');
     expect(result.outcome).toBe('resolved');
+  });
+
+  it('re-entry: already applied+resolved WITH replies → emits commentUpdated (dedup does not over-suppress)', async () => {
+    // suggestionAppliedAt set → idempotent finalize; resolvedAt set → resolveComment
+    // is skipped, so there is NO commentResolved broadcast. The applied-stamp state
+    // must still reach clients via a single commentUpdated.
+    const { service, wsService } = makeService(
+      { applied: false, currentText: 'new text' },
+      true,
+    );
+
+    await service.applySuggestion(
+      suggestionComment({
+        suggestionAppliedAt: new Date(),
+        resolvedAt: new Date(),
+      }),
+      user(),
+    );
+
+    expect(wsService.emitCommentEvent).toHaveBeenCalledWith(
+      'space-1',
+      'page-1',
+      expect.objectContaining({ operation: 'commentUpdated', comment: UPDATED }),
+    );
+    // Nothing resolved this time (already resolved) → no resolve broadcast.
+    expect(wsService.emitCommentEvent).not.toHaveBeenCalledWith(
+      'space-1',
+      'page-1',
+      expect.objectContaining({ operation: 'commentResolved' }),
+    );
   });
 
   // --- error / rejection branches -----------------------------------------
