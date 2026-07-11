@@ -170,6 +170,40 @@ export abstract class DocmostClientContext {
   // cached conversion can never leak across identities. See getpage-cache.ts.
   protected getPageCache = new GetPageConversionCache();
 
+  // #487: an OPTIONAL abort signal the in-app tool host sets before each tool
+  // call (a composite of the turn's Stop signal + a per-call wall-clock cap). It
+  // is checked at safe-points BETWEEN the sequential HTTP calls of a paginated
+  // read (paginateAll) and just before the atomic collab commit of a write (the
+  // mutatePage/replacePage/mutateLiveContentUnlocked seams), so a Stop / cap
+  // stops the NEXT network call from STARTING. An already-started single call may
+  // still land — a documented limitation (#487).
+  //
+  // SINGLE-WRITER by phase-1 assumption: exactly one DocmostClient is built per
+  // turn and shared by every tool call; the host sets this per call and restores
+  // the prior value when the call unwinds. If the model emits PARALLEL in-app
+  // tool calls they share this one field, so the per-call CAP of one call is not
+  // guaranteed to bound another's in-flight pagination — but every composite the
+  // host sets carries the SAME turn Stop signal, so a Stop still aborts whichever
+  // signal is current. #487.
+  protected toolAbortSignal: AbortSignal | null = null;
+
+  /**
+   * #487: set (or clear with null) the in-app tool abort signal governing the
+   * NEXT client call's safe-points. The host wraps each in-app tool call: it sets
+   * the composite (Stop + per-call cap) here before invoking the tool and
+   * restores the prior value afterwards. Public so the server-side tool wrapper
+   * can reach it; harmless (a no-op) when never set.
+   */
+  public setToolAbortSignal(signal: AbortSignal | null): void {
+    this.toolAbortSignal = signal;
+  }
+
+  /** #487: the abort signal currently governing this client's safe-points. */
+  public getToolAbortSignal(): AbortSignal | null {
+    return this.toolAbortSignal;
+  }
+>>>>>>> 917c4064 (fix(ai-chat): in-app тулы — race-on-abort + safe-points + per-call cap (#487))
+
   // Two construction forms:
   //  - new DocmostClient(config)                  // discriminated union (current)
   //  - new DocmostClient(baseURL, email, password) // legacy positional creds
@@ -571,6 +605,10 @@ export abstract class DocmostClientContext {
           this.onMetricFn?.("collab_connect_timeouts_total", 1),
       });
       try {
+        // #487 PRE-COMMIT safe-point (reentrant twin of mutatePageContent): a
+        // Stop/cap after acquiring the session but before the atomic write skips
+        // this commit. Same limitation applies (stops the NEXT commit only).
+        this.toolAbortSignal?.throwIfAborted();
         return await session.mutate(transform);
       } catch (e) {
         // Drop the session on any failure so the next call reconnects fresh.
@@ -602,6 +640,11 @@ export abstract class DocmostClientContext {
     let truncated = false;
 
     for (let page = 0; page < MAX_PAGES; page++) {
+      // #487 safe-point: a Stop (or the in-app tool per-call cap) that fires
+      // BETWEEN sequential page fetches must stop the NEXT request from starting
+      // — a read tool that would otherwise paginate for minutes is interrupted
+      // here. throwIfAborted() rejects with the signal's reason.
+      this.toolAbortSignal?.throwIfAborted();
       const payload: Record<string, any> = {
         ...basePayload,
         limit: clampedLimit,
@@ -709,7 +752,15 @@ export abstract class DocmostClientContext {
     // #486: on a rejected collab-WS handshake, invalidate + refresh the token and
     // retry the write once (symmetric to the HTTP-401 reauth path).
     return this.writeWithCollabAuthRetry(collabToken, (token) =>
-      mutatePageContent(pageUuid, token, apiUrl, transform),
+      // #487: thread the in-app tool signal to mutatePageContent's pre-commit
+      // safe-point so a Stop/cap during the connect/lock window skips the write.
+      mutatePageContent(
+        pageUuid,
+        token,
+        apiUrl,
+        transform,
+        this.toolAbortSignal ?? undefined,
+      ),
     );
   }
 
@@ -733,7 +784,14 @@ export abstract class DocmostClientContext {
     // #486: on a rejected collab-WS handshake, invalidate + refresh the token and
     // retry the write once (symmetric to the HTTP-401 reauth path).
     return this.writeWithCollabAuthRetry(collabToken, (token) =>
-      replacePageContent(pageUuid, doc, token, apiUrl),
+      // #487: same pre-commit safe-point as mutatePage, for full-document writes.
+      replacePageContent(
+        pageUuid,
+        doc,
+        token,
+        apiUrl,
+        this.toolAbortSignal ?? undefined,
+      ),
     );
   }
 
