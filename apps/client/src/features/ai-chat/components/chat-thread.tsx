@@ -594,30 +594,49 @@ export default function ChatThread({
           );
         }
       }
-      // (2b) #430: a LIVE (non-resumed) detached run whose SSE just dropped. The
-      // server run keeps executing, so instead of a dead "Lost connection" banner
-      // start a reconnect sequence: pin the CURRENT streaming assistant row as the
-      // strip/anchor (the live tail is the already-shown partial in `messages`, not
-      // a persistent row) and re-attach to the live tail via the resumable machinery.
-      const startedReconnect =
+      // (2b) #430/#488: a LIVE (non-resumed) detached run whose SSE just dropped.
+      // The server run keeps executing, so instead of a dead "Lost connection"
+      // banner start a reconnect sequence and re-attach to the live tail via the
+      // resumable machinery.
+      //
+      // #488 commit 2 — enter reconnect by the RUN-FACT (an active detached run),
+      // NOT by the presence of an assistant message. The old gate additionally
+      // required `message?.role === "assistant"`, so a break during the SETUP phase
+      // — before the first assistant frame, INCLUDING an up-to-60s MCP-toolset
+      // assembly — fell through to neither reconnect NOR poll while the detached
+      // run kept writing to pages (a silent data-integrity hole). In autonomous
+      // mode a run is active for the whole turn, so `autonomousRunsEnabled` is the
+      // run-fact signal here; the richer server run-fact (POST /run / start-metadata
+      // runId) is modelled + tested in the FSM (run-fsm.ts `FINISH_DISCONNECT`,
+      // gated on `ctx.runFact`) and lands with the full component migration.
+      //
+      // When there IS an assistant row, pin it as the strip/anchor so the live
+      // replay rebuilds it without duplicating parts; when there is NONE (the
+      // pre-first-frame break), reconnect WITHOUT an anchor (a plain live attach —
+      // there is nothing on screen to rebuild).
+      const canReconnect =
         isDisconnect &&
         !wasResumed &&
         autonomousRunsEnabled === true &&
-        mountedRef.current &&
-        message?.role === "assistant" &&
-        typeof message.id === "string";
-      if (startedReconnect) {
-        beginReconnect({
-          id: message.id,
-          role: "assistant",
-          content: "",
-          status: "streaming",
-          createdAt: new Date().toISOString(),
-          // Preserve the partial parts so a 204 restore (onNoActiveStream) re-shows
-          // what was on screen while the degraded poll catches the run up to
-          // terminal (rowToUiMessage prefers metadata.parts).
-          metadata: { parts: message.parts },
-        });
+        mountedRef.current;
+      if (canReconnect) {
+        const hasAnchor =
+          message?.role === "assistant" && typeof message.id === "string";
+        beginReconnect(
+          hasAnchor
+            ? {
+                id: message.id,
+                role: "assistant",
+                content: "",
+                status: "streaming",
+                createdAt: new Date().toISOString(),
+                // Preserve the partial parts so a 204 restore (onNoActiveStream)
+                // re-shows what was on screen while the degraded poll catches the
+                // run up to terminal (rowToUiMessage prefers metadata.parts).
+                metadata: { parts: message.parts },
+              }
+            : null,
+        );
       }
       // (3) Standard branches.
       // Forward the authoritative server chatId (streamed on the assistant
@@ -632,7 +651,7 @@ export default function ChatThread({
       // "connection lost" notice — the reconnect banner takes over (#430).
       if (isError) setStopNotice(null);
       else if (isAbort) setStopNotice("manual");
-      else if (isDisconnect) setStopNotice(startedReconnect ? null : "disconnect");
+      else if (isDisconnect) setStopNotice(canReconnect ? null : "disconnect");
       else setStopNotice(null);
       // A resumed turn NEVER flushes the queue (invariant 7): skip BOTH the
       // flush-on-abort branch and the plain flush. The local streamer is the only
@@ -790,13 +809,15 @@ export default function ChatThread({
     [clearReconnectTimer, setReconnectStatePair, attemptReconnectOnce],
   );
 
-  // Start a fresh reconnect sequence, pinning `anchorRow` (the live run's assistant
-  // row) as the strip/anchor reused by every attempt.
+  // Start a fresh reconnect sequence. `anchorRow` (the live run's assistant row) is
+  // pinned as the strip/anchor reused by every attempt; `null` (a pre-first-frame
+  // break, #488 commit 2) means there is nothing on screen to rebuild, so attach
+  // WITHOUT a strip/anchor (a plain live attach to whatever the run is emitting).
   const beginReconnect = useCallback(
-    (anchorRow: IAiChatMessageRow) => {
+    (anchorRow: IAiChatMessageRow | null) => {
       if (!autonomousRunsEnabled || !mountedRef.current) return;
       strippedRowRef.current = anchorRow;
-      stripRef.current = true;
+      stripRef.current = anchorRow !== null;
       scheduleReconnectAttempt(1);
     },
     [autonomousRunsEnabled, scheduleReconnectAttempt],

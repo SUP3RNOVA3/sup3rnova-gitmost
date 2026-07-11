@@ -1122,6 +1122,35 @@ describe("ChatThread — live reconnect after isDisconnect (#430)", () => {
     );
   });
 
+  // #488 commit 2: a break during the SETUP phase — before the first assistant
+  // frame (onFinish carries no assistant message) — must STILL reconnect, because
+  // a detached autonomous run keeps writing to pages. The old gate required
+  // `message?.role === "assistant"`, so this fell through to neither reconnect nor
+  // poll. With no anchor row, the attach is a PLAIN live attach (no strip/anchor).
+  it("#488 commit 2: disconnect BEFORE the first assistant frame reconnects with no anchor", () => {
+    renderThread({ autonomousRunsEnabled: true, initialRows: settledTail() });
+    expect(h.state.resumeStream).not.toHaveBeenCalled();
+    act(() => {
+      h.state.onFinish?.({
+        message: undefined,
+        isAbort: false,
+        isDisconnect: true,
+        isError: false,
+      });
+    });
+    // The reconnect banner shows (not the dead terminal "connection lost" notice).
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    expect(
+      screen.queryByText("Connection lost — the answer was interrupted."),
+    ).toBeNull();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    // No anchor -> a plain attach URL (no expect=live&anchor pinning a row).
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
+  });
+
   it("strips the pinned live row before replay so content is NOT duplicated", () => {
     renderLiveThenDisconnect();
     advanceToAttempt(1);
