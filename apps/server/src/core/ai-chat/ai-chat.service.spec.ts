@@ -440,6 +440,80 @@ describe('lastAssistantContextTokens', () => {
   });
 });
 
+// #490 snapshotOpenPage fast-path: skip the full Markdown export + upsert when a
+// snapshot already exists at the page's CURRENT version (same updated_at instant).
+describe('snapshotOpenPage fast-path (#490)', () => {
+  function makeSvc(existingSnapshot: unknown, pageUpdatedAt: Date) {
+    const exportPageMarkdown = jest.fn(async () => '# md');
+    const upsert = jest.fn(async () => undefined);
+    const findByChatPage = jest.fn(async () => existingSnapshot);
+    const pageRepo = {
+      findById: jest.fn(async () => ({
+        id: 'p1',
+        workspaceId: 'ws1',
+        updatedAt: pageUpdatedAt,
+      })),
+    };
+    const svc = new AiChatService(
+      {} as never, // ai
+      {} as never, // aiChatRepo
+      {} as never, // aiChatMessageRepo
+      { findByChatPage, upsert } as never, // aiChatPageSnapshotRepo
+      {} as never, // aiSettings
+      { exportPageMarkdown } as never, // tools
+      {} as never, // mcpClients
+      {} as never, // aiAgentRoleRepo
+      pageRepo as never, // pageRepo
+      {} as never, // pageAccess
+      {} as never, // environment
+    );
+    return { svc, exportPageMarkdown, upsert, findByChatPage };
+  }
+
+  const args = () =>
+    [
+      'chat1',
+      'p1',
+      { id: 'ws1' } as never,
+      { id: 'u1' } as never,
+      'sess',
+    ] as const;
+
+  it('skips export + upsert when the snapshot is already at this page version', async () => {
+    const t = new Date('2026-07-07T10:00:00Z');
+    const { svc, exportPageMarkdown, upsert } = makeSvc(
+      { pageUpdatedAt: t, contentMd: '# md' },
+      t,
+    );
+    await (svc as unknown as { snapshotOpenPage: (...a: unknown[]) => Promise<void> })
+      .snapshotOpenPage(...args());
+    expect(exportPageMarkdown).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it('exports + upserts when the page advanced since the snapshot', async () => {
+    const { svc, exportPageMarkdown, upsert } = makeSvc(
+      { pageUpdatedAt: new Date('2026-07-07T10:00:00Z'), contentMd: 'old' },
+      new Date('2026-07-07T11:00:00Z'),
+    );
+    await (svc as unknown as { snapshotOpenPage: (...a: unknown[]) => Promise<void> })
+      .snapshotOpenPage(...args());
+    expect(exportPageMarkdown).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('seeds (exports + upserts) on the first turn (no snapshot yet)', async () => {
+    const { svc, exportPageMarkdown, upsert } = makeSvc(
+      undefined,
+      new Date('2026-07-07T10:00:00Z'),
+    );
+    await (svc as unknown as { snapshotOpenPage: (...a: unknown[]) => Promise<void> })
+      .snapshotOpenPage(...args());
+    expect(exportPageMarkdown).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+});
+
 // #490 deferred-tool activation persisted across turns.
 describe('seedActivatedTools', () => {
   const valid = new Set(['Search_web', 'getPageJson', 'diffPageVersions']);

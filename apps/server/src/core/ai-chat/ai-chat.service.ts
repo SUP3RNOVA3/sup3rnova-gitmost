@@ -902,6 +902,21 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       const freshPage = await this.pageRepo.findById(pageId);
       // Page deleted during the turn (or somehow foreign) => don't write.
       if (!freshPage || freshPage.workspaceId !== workspace.id) return;
+      // Fast-path (#490): if a snapshot already exists at THIS page version
+      // (same updated_at instant), its content is already current — skip the full
+      // Markdown export + upsert entirely. A turn that did NOT touch the open page
+      // (the common case) thus does no snapshot work. This mirrors the read-side
+      // fast path in detectPageChange (sameInstant): both trust that a page edit
+      // bumps updated_at. When the agent (or a human) DID edit the page this turn,
+      // updated_at advanced, so this does not match and we re-export as before.
+      const existing = await this.aiChatPageSnapshotRepo.findByChatPage(
+        chatId,
+        pageId,
+        workspace.id,
+      );
+      if (existing && sameInstant(existing.pageUpdatedAt, freshPage.updatedAt)) {
+        return;
+      }
       const currentMd = await this.tools.exportPageMarkdown(
         user,
         sessionId,
