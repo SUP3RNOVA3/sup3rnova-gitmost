@@ -55,7 +55,7 @@ const server = (over: Partial<FakeServer> = {}): FakeServer => ({
   ...over,
 });
 
-function buildService(servers: FakeServer[]) {
+function buildService(servers: FakeServer[], trusted = false) {
   const repo = { listEnabled: jest.fn().mockResolvedValue(servers) };
   const service = new McpClientsService(repo as never, {} as never);
   // Seed a DETERMINISTIC write-class map so the retry gate is controlled here
@@ -67,6 +67,21 @@ function buildService(servers: FakeServer[]) {
     getPage: 'readOnly',
     patchNode: 'write',
   });
+  // The service only APPLIES that map to a TRUSTED internal Docmost server
+  // (isInternalDocmostServer, really false for every third-party row). A retry
+  // test needs a trusted server to exercise the readOnly-retry path at all, so it
+  // passes trusted=true to model a Docmost-origin server; the third-party
+  // double-apply test leaves it at the real value (false).
+  if (trusted) {
+    jest
+      .spyOn(
+        service as unknown as {
+          isInternalDocmostServer: (s: FakeServer) => boolean;
+        },
+        'isInternalDocmostServer',
+      )
+      .mockReturnValue(true);
+  }
   return { service, repo };
 }
 
@@ -121,7 +136,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
 
   it('a readOnly tool whose transport breaks reconnects and retries WITHIN the same run', async () => {
     const realErr = await realSocketResetError();
-    const { service } = buildService([server()]);
+    const { service } = buildService([server()], true);
     const first = jest.fn().mockRejectedValue(realErr);
     const second = jest.fn().mockResolvedValue({ ok: true });
     const connectSpy = stubConnect(service, 'getPage', [first, second]);
@@ -146,7 +161,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
 
   it('a WRITE tool does NOT auto-retry on a transport error (indeterminate)', async () => {
     const realErr = await realSocketResetError();
-    const { service } = buildService([server()]);
+    const { service } = buildService([server()], true);
     const exec = jest.fn().mockRejectedValue(realErr);
     const connectSpy = stubConnect(service, 'patchNode', [exec]);
 
@@ -168,7 +183,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
 
   it('does NOT retry (or reconnect) after the run is aborted (Stop)', async () => {
     const realErr = await realSocketResetError();
-    const { service } = buildService([server()]);
+    const { service } = buildService([server()], true);
     const controller = new AbortController();
     // The transport error arrives, but the run was Stopped in the same tick.
     const first = jest.fn().mockImplementation(async () => {
@@ -194,7 +209,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
   });
 
   it('an app-level (non-transport) tool error is surfaced verbatim, never retried', async () => {
-    const { service } = buildService([server()]);
+    const { service } = buildService([server()], true);
     const appErr = new Error('tool says: bad input');
     const exec = jest.fn().mockRejectedValue(appErr);
     const connectSpy = stubConnect(service, 'getPage', [exec]);
@@ -209,6 +224,38 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     ).rejects.toThrow('tool says: bad input');
     expect(exec).toHaveBeenCalledTimes(1);
     expect(connectSpy).toHaveBeenCalledTimes(1); // no reconnect for an app error
+    await Promise.all(toolset.clients.map((c) => c.close()));
+  });
+
+  // #489 (review, MEDIUM) — the Docmost write-class map keys by DOCMOST tool
+  // names; a THIRD-PARTY server may name a WRITE tool `getPage` (a Docmost read
+  // name). It must NOT inherit readOnly and must NOT auto-retry on a transport
+  // error — a blind retry of that write is a double-apply (the #435 class). Here
+  // the server is UNTRUSTED (buildService default, isInternalDocmostServer=false),
+  // so the map is not applied and `getPage` classifies as a write.
+  //
+  // MUTATION-VERIFY: forcing the server "trusted" (buildService(..., true)) makes
+  // `getPage` inherit readOnly -> it WOULD reconnect+retry (connect twice) and the
+  // assertions below fail — i.e. removing the trust scope re-opens the bug.
+  it('a THIRD-PARTY WRITE tool named like a Docmost read does NOT auto-retry (no double-apply)', async () => {
+    const realErr = await realSocketResetError();
+    // Untrusted: default trusted=false — a real third-party server.
+    const { service } = buildService([server()]);
+    const exec = jest.fn().mockRejectedValue(realErr);
+    const connectSpy = stubConnect(service, 'getPage', [exec, exec]);
+
+    const toolset = await service.toolsFor('ws-5');
+    const tool = toolset.tools['srv_getPage'];
+    await expect(
+      (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
+        { pageId: 'p' },
+        opts(),
+      ),
+    ).rejects.toThrow(/MAY have already applied/);
+
+    // Exactly one call, NO reconnect — the name collision granted no readOnly-retry.
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(connectSpy).toHaveBeenCalledTimes(1);
     await Promise.all(toolset.clients.map((c) => c.close()));
   });
 });

@@ -217,6 +217,23 @@ export class McpClientsService {
     private readonly secretBox: SecretBoxService,
   ) {}
 
+  /**
+   * Whether an external MCP server is the TRUSTED internal Docmost MCP server —
+   * the only server whose tools may be classified by the Docmost write-class map
+   * (#489 review). Today this is ALWAYS false: every `ai_mcp_servers` row is an
+   * admin-configured THIRD-PARTY endpoint (there is no builtin/self flag, sentinel
+   * URL, or synthetic server in this path — Docmost's OWN tools are exposed via the
+   * separate in-app tools path, never through this external-MCP client). So no
+   * third-party tool can inherit `readOnly` by a name collision with a Docmost read
+   * tool, and none is ever auto-retried on a transport error (which would risk a
+   * double-apply — the #435 class). Flip this (an explicit `kind`/`isBuiltin`
+   * column, or a configured self-MCP URL) if a trusted internal server is ever
+   * introduced. A method (not a free function) so it is a single, mockable seam.
+   */
+  private isInternalDocmostServer(_server: AiMcpServer): boolean {
+    return false;
+  }
+
   /** Lazily load + memoize the shared write-class map (see the field doc). */
   private getWriteClassMap(): Promise<Record<string, ToolWriteClass>> {
     if (!this.writeClassMapPromise) {
@@ -388,9 +405,14 @@ export class McpClientsService {
     const instructions: McpServerInstruction[] = [];
     // merged-key -> provenance for the per-run recovery wrapper (#489).
     const toolMeta: Record<string, ToolProvenance> = {};
-    // Shared write-class map (#489): classifies each merged tool by its raw name
-    // so the recovery wrapper knows which tools are retry-safe reads.
-    const writeClassMap = await this.getWriteClassMap();
+    // Shared Docmost write-class map (#489) — classifies a tool by its raw name.
+    // Loaded ONLY when at least one server is a TRUSTED internal Docmost server
+    // (see isInternalDocmostServer): for third-party servers the map is never
+    // applied (a name collision must not grant readOnly-retry), so we skip the
+    // dynamic ESM load entirely in that (currently universal) case.
+    const writeClassMap = servers.some((s) => this.isInternalDocmostServer(s))
+      ? await this.getWriteClassMap()
+      : null;
 
     // Per-server connect+tools result, still tagged with its server so the merge
     // below can be applied in the SAME order as `servers` (see the parallel note).
@@ -464,6 +486,15 @@ export class McpClientsService {
       // against names already merged from earlier servers, so no external
       // tool is silently overwritten on collision. The returned count drives
       // whether this server's prompt guidance is included (≥1 tool merged).
+      // #489 (review): the Docmost write-class map keys by DOCMOST tool names and
+      // may ONLY be trusted for a server KNOWN to be the internal Docmost MCP
+      // server. Every row here is an admin-configured THIRD-PARTY endpoint, so a
+      // third-party WRITE tool that happens to be named like a Docmost read
+      // (getPage, listPages, ...) must NOT inherit readOnly — that would auto-retry
+      // a mutation on a transport error (double-apply, the #435 class). Gate the
+      // map on the trust check; untrusted servers get writeClass=undefined -> the
+      // recovery wrapper treats them as writes and never auto-retries.
+      const trustWriteClass = this.isInternalDocmostServer(server);
       const merged = this.mergeNamespaced(
         tools,
         result.guarded,
@@ -471,7 +502,7 @@ export class McpClientsService {
         server.id,
         toolMeta,
         i,
-        writeClassMap,
+        trustWriteClass ? writeClassMap : null,
       );
       outcomes.push({ name: server.name, ok: true });
       // Include this server's guidance ONLY when it actually contributed at
@@ -523,7 +554,9 @@ export class McpClientsService {
     serverId: string,
     toolMeta: Record<string, ToolProvenance>,
     serverIndex: number,
-    writeClassMap: Record<string, ToolWriteClass>,
+    // The Docmost write-class map, or `null` for an UNTRUSTED (third-party)
+    // server whose tools must all default to write (never auto-retried).
+    writeClassMap: Record<string, ToolWriteClass> | null,
   ): { count: number; prefix: string } {
     let count = 0;
     for (const { full, raw, tool } of namespace(picked, serverName)) {
@@ -537,13 +570,14 @@ export class McpClientsService {
       }
       target[key] = tool;
       // Record provenance so the per-run recovery wrapper (#489) can reconnect
-      // this tool's server and re-resolve it by its raw name, and gate the retry
-      // on its write-class (unknown third-party tool -> undefined -> treated as a
-      // write, i.e. never auto-retried).
+      // this tool's server and re-resolve it by its raw name. writeClass is set
+      // ONLY from a TRUSTED (internal-Docmost) map; for a third-party server the
+      // map is null -> writeClass stays undefined -> the wrapper treats the tool
+      // as a write and never auto-retries it (no double-apply on name collision).
       toolMeta[key] = {
         serverIndex,
         rawName: raw,
-        writeClass: writeClassMap[raw],
+        writeClass: writeClassMap ? writeClassMap[raw] : undefined,
       };
       count += 1;
     }
@@ -751,7 +785,15 @@ export class McpClientsService {
                 `retrying. (${shortError(err)})`,
             );
           }
-          // Abort check BEFORE minting a fresh connection.
+          // Abort check BEFORE minting a fresh connection (no socket for a
+          // stopped run). LIMITATION (#489, LOW): the reconnect's own connect is
+          // bounded by CONNECT_TIMEOUT_MS but does NOT itself observe `composed`,
+          // so a Stop that lands DURING the handshake is only honored at the next
+          // `stopped()` gate (before the retry) — a bounded ≤5s late-abort window;
+          // the throwaway client is closed at turn-end regardless. Threading
+          // `composed` into the SHARED (CAS-deduped) reconnect is deliberately
+          // avoided: it would let the first caller's abort tear down a reconnect a
+          // concurrent still-live caller depends on.
           if (stopped()) throw err;
           // CAS-swap by IDENTITY: mint+swap only if nobody swapped since this
           // call's snapshot; a losing concurrent call awaits the same reconnect
