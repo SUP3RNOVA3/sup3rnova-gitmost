@@ -30,6 +30,13 @@ export { destroyAllSessions } from "./lib/collab-session.js";
 // internals directly; it goes through loadDocmostMcp()).
 export { SHARED_TOOL_SPECS } from "./tool-specs.js";
 export type { SharedToolSpec } from "./tool-specs.js";
+// #489 — write-class registry consumed by the in-app external-MCP retry gate.
+export {
+  SHARED_TOOL_WRITE_CLASS,
+  isRetryableWriteClass,
+  assertEverySpecDeclaresWriteClass,
+} from "./tool-specs.js";
+export type { ToolWriteClass } from "./tool-specs.js";
 
 // Re-export the build-time REGISTRY_STAMP (issue #447): a deterministic hash of
 // the tool-specs registry content, generated into src/registry-stamp.generated.ts

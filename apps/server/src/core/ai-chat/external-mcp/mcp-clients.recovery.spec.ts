@@ -1,0 +1,214 @@
+import { errors } from 'undici';
+import {
+  McpClientsService,
+  isRetryableConnectError,
+} from './mcp-clients.service';
+
+/**
+ * #489 — external-MCP in-run transport recovery.
+ *
+ * The transport-error classification + retry gate are exercised against the REAL
+ * undici error CLASSES prod throws (`errors.SocketError` / `errors.BodyTimeoutError`,
+ * carrying the true `UND_ERR_*` codes and class names), wrapped EXACTLY as undici's
+ * `fetch` wraps them — a `TypeError('fetch failed'|'terminated')` whose `.cause` is
+ * the undici error. These are the real classes, not hand-rolled `{code:'...'}`
+ * mocks: constructing the genuine class is what makes this a faithful test of the
+ * prod predicate (epic root-cause #4 — a mock-shaped predicate would leave the
+ * evict/retry path silently dead in production while CI stays green). We construct
+ * rather than drive a live fetch because Jest's environment degrades the live-fetch
+ * error to a generic `Error` cause (no undici code), which would NOT be the prod
+ * shape.
+ */
+
+/** A REAL undici socket reset, wrapped as fetch wraps it. */
+function realSocketResetError(): unknown {
+  const err = new TypeError('fetch failed');
+  (err as { cause?: unknown }).cause = new errors.SocketError('other side closed');
+  return err;
+}
+
+/** A REAL undici body timeout, wrapped as fetch wraps it. */
+function realBodyTimeoutError(): unknown {
+  const err = new TypeError('terminated');
+  (err as { cause?: unknown }).cause = new errors.BodyTimeoutError();
+  return err;
+}
+
+type FakeServer = {
+  id: string;
+  name: string;
+  transport: 'http' | 'sse';
+  url: string;
+  headersEnc: string | null;
+  toolAllowlist: string[] | null;
+  instructions: string | null;
+};
+
+const server = (over: Partial<FakeServer> = {}): FakeServer => ({
+  id: 's1',
+  name: 'srv',
+  transport: 'http',
+  url: 'http://example.test/mcp',
+  headersEnc: null,
+  toolAllowlist: null,
+  instructions: null,
+  ...over,
+});
+
+function buildService(servers: FakeServer[]) {
+  const repo = { listEnabled: jest.fn().mockResolvedValue(servers) };
+  const service = new McpClientsService(repo as never, {} as never);
+  // Seed a DETERMINISTIC write-class map so the retry gate is controlled here
+  // (the production map loads from @docmost/mcp via a dynamic ESM import). getPage
+  // is a read, patchNode is a write — the real classifications.
+  (
+    service as unknown as { writeClassMapPromise: Promise<unknown> }
+  ).writeClassMapPromise = Promise.resolve({
+    getPage: 'readOnly',
+    patchNode: 'write',
+  });
+  return { service, repo };
+}
+
+/** Spy the private `connect` so each call yields a controlled fake client whose
+ *  single tool's execute is the supplied function. Returns the connect spy. */
+function stubConnect(
+  service: McpClientsService,
+  toolName: string,
+  execs: Array<(...a: unknown[]) => Promise<unknown>>,
+) {
+  let n = 0;
+  return jest
+    .spyOn(
+      service as unknown as { connect: (s: FakeServer) => Promise<unknown> },
+      'connect',
+    )
+    .mockImplementation(async () => {
+      const exec = execs[Math.min(n, execs.length - 1)];
+      n += 1;
+      return {
+        tools: async () => ({ [toolName]: { description: 'x', execute: exec } }),
+        close: jest.fn().mockResolvedValue(undefined),
+      };
+    });
+}
+
+const opts = (abortSignal?: AbortSignal) =>
+  ({ toolCallId: 't', messages: [], abortSignal }) as never;
+
+describe('isRetryableConnectError (#489, REAL error shapes)', () => {
+  it('classifies a real undici socket reset and body timeout as retryable', async () => {
+    const socketErr = await realSocketResetError();
+    const bodyErr = await realBodyTimeoutError();
+    expect(isRetryableConnectError(socketErr)).toBe(true);
+    expect(isRetryableConnectError(bodyErr)).toBe(true);
+    // Unwraps a wrapped cause chain (e.g. an MCPClientError around the socket err).
+    const wrapped = new Error('mcp call failed');
+    (wrapped as { cause?: unknown }).cause = socketErr;
+    expect(isRetryableConnectError(wrapped)).toBe(true);
+  });
+
+  it('does NOT classify an application-level error as a transport break', () => {
+    expect(isRetryableConnectError(new Error('validation failed'))).toBe(false);
+    expect(isRetryableConnectError({ name: 'HttpError', status: 400 })).toBe(false);
+    expect(isRetryableConnectError(undefined)).toBe(false);
+    expect(isRetryableConnectError('boom')).toBe(false);
+  });
+});
+
+describe('McpClientsService in-run transport recovery (#489)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('a readOnly tool whose transport breaks reconnects and retries WITHIN the same run', async () => {
+    const realErr = await realSocketResetError();
+    const { service } = buildService([server()]);
+    const first = jest.fn().mockRejectedValue(realErr);
+    const second = jest.fn().mockResolvedValue({ ok: true });
+    const connectSpy = stubConnect(service, 'getPage', [first, second]);
+
+    const toolset = await service.toolsFor('ws-1');
+    const tool = toolset.tools['srv_getPage'];
+    const result = await (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
+      { pageId: 'p' },
+      opts(),
+    );
+
+    // The repeat call within the run got a LIVE client and succeeded.
+    expect(result).toEqual({ ok: true });
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+    // Exactly one reconnect was minted (initial build connect + one recovery).
+    expect(connectSpy).toHaveBeenCalledTimes(2);
+    // The run accumulated BOTH leases (old + reconnected) — released together at end.
+    expect(toolset.clients).toHaveLength(2);
+    await Promise.all(toolset.clients.map((c) => c.close()));
+  });
+
+  it('a WRITE tool does NOT auto-retry on a transport error (indeterminate)', async () => {
+    const realErr = await realSocketResetError();
+    const { service } = buildService([server()]);
+    const exec = jest.fn().mockRejectedValue(realErr);
+    const connectSpy = stubConnect(service, 'patchNode', [exec]);
+
+    const toolset = await service.toolsFor('ws-2');
+    const tool = toolset.tools['srv_patchNode'];
+    await expect(
+      (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
+        { pageId: 'p' },
+        opts(),
+      ),
+    ).rejects.toThrow(/MAY have already applied/);
+
+    // Called exactly once — NO blind retry (avoids double-apply, the #435 class).
+    expect(exec).toHaveBeenCalledTimes(1);
+    // No fresh connection was minted for a write.
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+    await Promise.all(toolset.clients.map((c) => c.close()));
+  });
+
+  it('does NOT retry (or reconnect) after the run is aborted (Stop)', async () => {
+    const realErr = await realSocketResetError();
+    const { service } = buildService([server()]);
+    const controller = new AbortController();
+    // The transport error arrives, but the run was Stopped in the same tick.
+    const first = jest.fn().mockImplementation(async () => {
+      controller.abort();
+      throw realErr;
+    });
+    const second = jest.fn().mockResolvedValue({ ok: true });
+    const connectSpy = stubConnect(service, 'getPage', [first, second]);
+
+    const toolset = await service.toolsFor('ws-3');
+    const tool = toolset.tools['srv_getPage'];
+    await expect(
+      (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
+        { pageId: 'p' },
+        opts(controller.signal),
+      ),
+    ).rejects.toBeDefined();
+
+    // getPage IS readOnly, but the Stop blocks the retry — no second call, no mint.
+    expect(second).not.toHaveBeenCalled();
+    expect(connectSpy).toHaveBeenCalledTimes(1);
+    await Promise.all(toolset.clients.map((c) => c.close()));
+  });
+
+  it('an app-level (non-transport) tool error is surfaced verbatim, never retried', async () => {
+    const { service } = buildService([server()]);
+    const appErr = new Error('tool says: bad input');
+    const exec = jest.fn().mockRejectedValue(appErr);
+    const connectSpy = stubConnect(service, 'getPage', [exec]);
+
+    const toolset = await service.toolsFor('ws-4');
+    const tool = toolset.tools['srv_getPage'];
+    await expect(
+      (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
+        { pageId: 'p' },
+        opts(),
+      ),
+    ).rejects.toThrow('tool says: bad input');
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(connectSpy).toHaveBeenCalledTimes(1); // no reconnect for an app error
+    await Promise.all(toolset.clients.map((c) => c.close()));
+  });
+});

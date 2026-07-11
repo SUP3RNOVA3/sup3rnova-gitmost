@@ -127,6 +127,18 @@ export interface SharedToolSpec {
   mcpName: string;
   /** camelCase key in the ai-SDK tools object (the in-app layer). */
   inAppKey: string;
+  /**
+   * Write-class of the tool (#489), declared on EVERY spec (a registration-time
+   * assert enforces completeness; `satisfies Record<string, SharedToolSpec>`
+   * makes it a compile error to omit). 'readOnly' = a pure read that mutates
+   * NOTHING durable, so it is safe to auto-retry once after a transport break.
+   * 'write' = anything that mutates a page/comment/share/diagram/etc — a
+   * transport error is INDETERMINATE (the server may have applied it before the
+   * connection reset), so it is NEVER blind-retried (a retry would double-apply,
+   * the #435 incident class). Consumed by the external-MCP retry path
+   * (mcp-clients.service.ts) to gate its single auto-retry.
+   */
+  writeClass: 'readOnly' | 'write';
   /** Single canonical model-facing description used by both layers. */
   description: string;
   /**
@@ -240,6 +252,7 @@ export const SHARED_TOOL_SPECS = {
   getWorkspace: {
     mcpName: 'getWorkspace',
     inAppKey: 'getWorkspace',
+    writeClass: 'readOnly',
     description: 'Fetch metadata about the current workspace (name, settings).',
     tier: 'core',
     catalogLine: 'getWorkspace — fetch current workspace metadata (name, settings).',
@@ -249,6 +262,7 @@ export const SHARED_TOOL_SPECS = {
   listSpaces: {
     mcpName: 'listSpaces',
     inAppKey: 'listSpaces',
+    writeClass: 'readOnly',
     description:
       'List the spaces the current user can access. Returns the array of ' +
       'spaces (id, name, slug, ...).',
@@ -260,6 +274,7 @@ export const SHARED_TOOL_SPECS = {
   listShares: {
     mcpName: 'listShares',
     inAppKey: 'listShares',
+    writeClass: 'readOnly',
     description:
       'List all public shares in the workspace with page titles and public URLs.',
     tier: 'deferred',
@@ -272,6 +287,7 @@ export const SHARED_TOOL_SPECS = {
   getPageJson: {
     mcpName: 'getPageJson',
     inAppKey: 'getPageJson',
+    writeClass: 'readOnly',
     description:
       'Get page details with the raw ProseMirror JSON content (lossless: ' +
       'includes block ids, callouts, tables, link/image attributes) plus the ' +
@@ -289,6 +305,7 @@ export const SHARED_TOOL_SPECS = {
   getOutline: {
     mcpName: 'getOutline',
     inAppKey: 'getOutline',
+    writeClass: 'readOnly',
     description:
       "Return a COMPACT outline of a page's top-level blocks ({index, type, " +
       'id, level, firstText}; tables add rows/cols/header; lists add item ' +
@@ -309,6 +326,7 @@ export const SHARED_TOOL_SPECS = {
   getNode: {
     mcpName: 'getNode',
     inAppKey: 'getNode',
+    writeClass: 'readOnly',
     description:
       "Fetch a single block for editing. `nodeId` is a block id from the page " +
       'outline or page-JSON view (works for headings/paragraphs/callouts/images), OR ' +
@@ -350,6 +368,7 @@ export const SHARED_TOOL_SPECS = {
   searchInPage: {
     mcpName: 'searchInPage',
     inAppKey: 'searchInPage',
+    writeClass: 'readOnly',
     description:
       'Find every occurrence of a string (or regex) INSIDE one page and get ' +
       'WHERE each is — instead of pulling blocks one-by-one with getNode. ' +
@@ -413,6 +432,7 @@ export const SHARED_TOOL_SPECS = {
   deleteNode: {
     mcpName: 'deleteNode',
     inAppKey: 'deleteNode',
+    writeClass: 'write',
     description:
       'Remove a single block by its attrs.id (from the page outline or ' +
       'page-JSON view) WITHOUT resending the whole document.',
@@ -438,6 +458,7 @@ export const SHARED_TOOL_SPECS = {
   patchNode: {
     mcpName: 'patchNode',
     inAppKey: 'patchNode',
+    writeClass: 'write',
     description:
       'Replace a single content block identified by its attrs.id, WITHOUT ' +
       'resending the whole document; the replacement keeps the same block id. ' +
@@ -505,6 +526,7 @@ export const SHARED_TOOL_SPECS = {
   insertNode: {
     mcpName: 'insertNode',
     inAppKey: 'insertNode',
+    writeClass: 'write',
     description:
       'Insert content before/after another block (by attrs.id or anchor text) ' +
       'or append it at the end (top level). For before/after you MUST provide ' +
@@ -597,6 +619,7 @@ export const SHARED_TOOL_SPECS = {
   sharePage: {
     mcpName: 'sharePage',
     inAppKey: 'sharePage',
+    writeClass: 'write',
     // CANONICAL: merges the MCP copy's URL-format + idempotency detail with the
     // in-app copy's reversibility note; keeps the security framing both had.
     description:
@@ -626,6 +649,7 @@ export const SHARED_TOOL_SPECS = {
   unsharePage: {
     mcpName: 'unsharePage',
     inAppKey: 'unsharePage',
+    writeClass: 'write',
     description: 'Remove the public share of a page (revokes the public URL).',
     tier: 'deferred',
     catalogLine: "unsharePage — revoke a page's public share (removes the public URL).",
@@ -640,6 +664,7 @@ export const SHARED_TOOL_SPECS = {
   diffPageVersions: {
     mcpName: 'diffPageVersions',
     inAppKey: 'diffPageVersions',
+    writeClass: 'readOnly',
     description:
       'Diff two versions of a page and return a Docmost-equivalent change set ' +
       '(inserted/deleted text, integrity counts for images/links/tables/' +
@@ -672,6 +697,7 @@ export const SHARED_TOOL_SPECS = {
   listPageHistory: {
     mcpName: 'listPageHistory',
     inAppKey: 'listPageHistory',
+    writeClass: 'readOnly',
     description:
       "List a page's saved versions (Docmost auto-snapshots on every save), " +
       'newest first, cursor-paginated. Returns { items, nextCursor }; each ' +
@@ -693,6 +719,7 @@ export const SHARED_TOOL_SPECS = {
   restorePageVersion: {
     mcpName: 'restorePageVersion',
     inAppKey: 'restorePageVersion',
+    writeClass: 'write',
     description:
       'Restore a page to a saved version: writes that version\'s content back ' +
       'as the page\'s current content (Docmost has no restore endpoint, so ' +
@@ -713,6 +740,7 @@ export const SHARED_TOOL_SPECS = {
   importPageMarkdown: {
     mcpName: 'importPageMarkdown',
     inAppKey: 'importPageMarkdown',
+    writeClass: 'write',
     // IN-APP ONLY (issue #411): the external /mcp surface no longer exposes
     // importPageMarkdown — the registry loop in index.ts skips inAppOnly specs,
     // so this stays available to the in-app agent (round-tripping an EXPORTED
@@ -742,6 +770,7 @@ export const SHARED_TOOL_SPECS = {
   copyPageContent: {
     mcpName: 'copyPageContent',
     inAppKey: 'copyPageContent',
+    writeClass: 'write',
     description:
       "Replace targetPageId's content with a copy of sourcePageId's content, " +
       'entirely server-side — the document is NOT sent through the model. The ' +
@@ -770,6 +799,7 @@ export const SHARED_TOOL_SPECS = {
   editPageText: {
     mcpName: 'editPageText',
     inAppKey: 'editPageText',
+    writeClass: 'write',
     description:
       "Surgical find/replace inside a page's text, preserving all block " +
       'ids and marks. A find MAY cross bold/italic/link boundaries; the ' +
@@ -819,6 +849,7 @@ export const SHARED_TOOL_SPECS = {
   stashPage: {
     mcpName: 'stashPage',
     inAppKey: 'stashPage',
+    writeClass: 'readOnly',
     description:
       'Serialize a whole page (the full ProseMirror JSON, as getPageJson ' +
       'returns) into an ephemeral in-memory blob and return ONLY a short ' +
@@ -880,6 +911,7 @@ export const SHARED_TOOL_SPECS = {
   getPage: {
     mcpName: 'getPage',
     inAppKey: 'getPage',
+    writeClass: 'readOnly',
     description:
       'Fetch a single page as Markdown by its id. Returns the page title and ' +
       'its Markdown content. The converter is canonical (round-trips text and ' +
@@ -919,6 +951,7 @@ export const SHARED_TOOL_SPECS = {
   listPages: {
     mcpName: 'listPages',
     inAppKey: 'listPages',
+    writeClass: 'readOnly',
     description:
       'List the most recent pages (ordered by updatedAt, descending), ' +
       'optionally scoped to a single space. Returns a bounded list (default ' +
@@ -965,6 +998,7 @@ export const SHARED_TOOL_SPECS = {
   getTree: {
     mcpName: 'getTree',
     inAppKey: 'getTree',
+    writeClass: 'readOnly',
     description:
       "Get a space's page hierarchy (or one subtree) as a nested tree in a " +
       'SINGLE request — completely and without loss. Each node is ' +
@@ -1009,6 +1043,7 @@ export const SHARED_TOOL_SPECS = {
   getPageContext: {
     mcpName: 'getPageContext',
     inAppKey: 'getPageContext',
+    writeClass: 'readOnly',
     description:
       'Given a pageId, get its LOCATION and immediate surroundings (metadata ' +
       'only, no page content) in one call — answers "where am I / what is ' +
@@ -1038,6 +1073,7 @@ export const SHARED_TOOL_SPECS = {
   createPage: {
     mcpName: 'createPage',
     inAppKey: 'createPage',
+    writeClass: 'write',
     description:
       'Create a new page with a Markdown body in a space, optionally under a ' +
       'parent page (omit parentPageId to create at the space root). Returns ' +
@@ -1088,6 +1124,7 @@ export const SHARED_TOOL_SPECS = {
   movePage: {
     mcpName: 'movePage',
     inAppKey: 'movePage',
+    writeClass: 'write',
     description:
       'Move a page under a new parent page, or to the space root when no ' +
       'parent is given. Reversible: move it back at any time.',
@@ -1181,6 +1218,7 @@ export const SHARED_TOOL_SPECS = {
   renamePage: {
     mcpName: 'renamePage',
     inAppKey: 'renamePage',
+    writeClass: 'write',
     description:
       'Rename a page (change its title only; the body is untouched, never ' +
       'resent). Reversible: rename back at any time.',
@@ -1202,6 +1240,7 @@ export const SHARED_TOOL_SPECS = {
   deletePage: {
     mcpName: 'deletePage',
     inAppKey: 'deletePage',
+    writeClass: 'write',
     description:
       'Move a page to the trash — SOFT delete only: the page can be restored ' +
       'from trash and nothing is ever permanently deleted.',
@@ -1235,6 +1274,7 @@ export const SHARED_TOOL_SPECS = {
   updatePageJson: {
     mcpName: 'updatePageJson',
     inAppKey: 'updatePageJson',
+    writeClass: 'write',
     description:
       "Replace a page's content with a raw ProseMirror JSON document (lossless " +
       'write: preserves the block ids, callouts, tables and attributes you pass ' +
@@ -1291,6 +1331,7 @@ export const SHARED_TOOL_SPECS = {
   updatePageMarkdown: {
     mcpName: 'updatePageMarkdown',
     inAppKey: 'updatePageMarkdown',
+    writeClass: 'write',
     description:
       "Replace a page's body with new Markdown content (and optionally its " +
       'title). The whole body is re-imported from the markdown (block ids ' +
@@ -1325,6 +1366,7 @@ export const SHARED_TOOL_SPECS = {
   exportPageMarkdown: {
     mcpName: 'exportPageMarkdown',
     inAppKey: 'exportPageMarkdown',
+    writeClass: 'readOnly',
     // CANONICAL: the MCP copy (a strict superset of the terse in-app wording).
     description:
       'Export a page to a single self-contained Docmost-flavoured Markdown ' +
@@ -1373,6 +1415,7 @@ export const SHARED_TOOL_SPECS = {
   createComment: {
     mcpName: 'createComment',
     inAppKey: 'createComment',
+    writeClass: 'write',
     // CANONICAL: the in-app copy (the more-maintained one). It keeps the same
     // rules as the MCP copy — inline-only, top-level requires a `selection`, no
     // page-level comments, replies inherit the anchor, suggestedText must be
@@ -1505,6 +1548,7 @@ export const SHARED_TOOL_SPECS = {
   listComments: {
     mcpName: 'listComments',
     inAppKey: 'listComments',
+    writeClass: 'readOnly',
     // CANONICAL: the two copies are near-identical; the MCP copy is the
     // superset (it keeps the "(pagination is handled internally)" note the
     // in-app copy dropped), so it is used verbatim.
@@ -1532,6 +1576,7 @@ export const SHARED_TOOL_SPECS = {
   resolveComment: {
     mcpName: 'resolveComment',
     inAppKey: 'resolveComment',
+    writeClass: 'write',
     // CANONICAL: the MCP copy's richer wording, minus its reference
     // to `deleteComment` (a sibling tool that does NOT exist in the in-app
     // layer) — rephrased transport-neutrally per the registry convention.
@@ -1572,6 +1617,7 @@ export const SHARED_TOOL_SPECS = {
   checkNewComments: {
     mcpName: 'checkNewComments',
     inAppKey: 'checkNewComments',
+    writeClass: 'readOnly',
     // CANONICAL: the MCP copy (the more detailed of the two). The MCP layer's
     // execute-side guard that rejects an unparseable `since` timestamp stays in
     // its execute body (per-layer logic), not in the shared schema.
@@ -1651,6 +1697,7 @@ export const SHARED_TOOL_SPECS = {
   tableInsertRow: {
     mcpName: 'tableInsertRow',
     inAppKey: 'tableInsertRow',
+    writeClass: 'write',
     description:
       'Insert a row of plain-text cells into a table. `table` is `#<index>` ' +
       'from the page outline, or a block id inside it. `cells` is the text per ' +
@@ -1684,6 +1731,7 @@ export const SHARED_TOOL_SPECS = {
   tableDeleteRow: {
     mcpName: 'tableDeleteRow',
     inAppKey: 'tableDeleteRow',
+    writeClass: 'write',
     description:
       'Delete the row at 0-based `index` from a table (`table` is `#<index>` ' +
       'from the page outline, or a block id inside it). Refuses to delete the ' +
@@ -1707,6 +1755,7 @@ export const SHARED_TOOL_SPECS = {
   tableUpdateCell: {
     mcpName: 'tableUpdateCell',
     inAppKey: 'tableUpdateCell',
+    writeClass: 'write',
     description:
       'Set the plain-text content of cell [row, col] (0-based) in a table ' +
       '(`table` is `#<index>` from the page outline, or a block id inside it). ' +
@@ -1747,6 +1796,7 @@ export const SHARED_TOOL_SPECS = {
   insertFootnote: {
     mcpName: 'insertFootnote',
     inAppKey: 'insertFootnote',
+    writeClass: 'write',
     description:
       'Insert an AUTHOR-INLINE footnote: you specify only WHERE (anchorText) ' +
       'and WHAT (text). The footnote marker is placed right after anchorText in ' +
@@ -1784,6 +1834,7 @@ export const SHARED_TOOL_SPECS = {
   insertImage: {
     mcpName: 'insertImage',
     inAppKey: 'insertImage',
+    writeClass: 'write',
     description:
       'Download an image from a web (http/https) URL and insert it into ' +
       'a page in one step. By default ' +
@@ -1828,6 +1879,7 @@ export const SHARED_TOOL_SPECS = {
   replaceImage: {
     mcpName: 'replaceImage',
     inAppKey: 'replaceImage',
+    writeClass: 'write',
     description:
       'Replace an existing image on a page with a new image fetched from a web ' +
       '(http/https) URL: uploads the new file as a NEW ' +
@@ -1866,6 +1918,7 @@ export const SHARED_TOOL_SPECS = {
   drawioGet: {
     mcpName: 'drawioGet',
     inAppKey: 'drawioGet',
+    writeClass: 'readOnly',
     description:
       'Read a draw.io diagram on a page as mxGraph XML (default) or as its raw ' +
       '`.drawio.svg`. `node` is the drawio node\'s attrs.id (from getOutline / ' +
@@ -1899,6 +1952,7 @@ export const SHARED_TOOL_SPECS = {
   drawioCreate: {
     mcpName: 'drawioCreate',
     inAppKey: 'drawioCreate',
+    writeClass: 'write',
     description:
       'Create a draw.io diagram from mxGraph XML and insert it as a diagram ' +
       'block. `xml` is a bare `<mxGraphModel>` OR a list of `<mxCell>` elements ' +
@@ -1969,6 +2023,7 @@ export const SHARED_TOOL_SPECS = {
   drawioUpdate: {
     mcpName: 'drawioUpdate',
     inAppKey: 'drawioUpdate',
+    writeClass: 'write',
     description:
       'Replace a draw.io diagram\'s content with new mxGraph XML (same lint ' +
       'pipeline as drawioCreate). `baseHash` is MANDATORY: pass the hash from ' +
@@ -2020,6 +2075,7 @@ export const SHARED_TOOL_SPECS = {
   drawioEditCells: {
     mcpName: 'drawioEditCells',
     inAppKey: 'drawioEditCells',
+    writeClass: 'write',
     description:
       'Make TARGETED, id-based edits to an existing draw.io diagram instead of ' +
       'resending the whole XML (a full-XML diff is fragile — draw.io reorders ' +
@@ -2078,6 +2134,7 @@ export const SHARED_TOOL_SPECS = {
   drawioFromGraph: {
     mcpName: 'drawioFromGraph',
     inAppKey: 'drawioFromGraph',
+    writeClass: 'write',
     description:
       'Build a draw.io diagram from a SEMANTIC graph — you describe nodes, groups ' +
       'and edges by MEANING and the server picks every coordinate, color and icon ' +
@@ -2202,6 +2259,7 @@ export const SHARED_TOOL_SPECS = {
   drawioFromMermaid: {
     mcpName: 'drawioFromMermaid',
     inAppKey: 'drawioFromMermaid',
+    writeClass: 'write',
     description:
       'Convert Mermaid `flowchart` text into an EDITABLE draw.io diagram (LLMs ' +
       'write Mermaid reliably). Best for STANDARD flowcharts/decision trees: ' +
@@ -2248,6 +2306,7 @@ export const SHARED_TOOL_SPECS = {
   drawioShapes: {
     mcpName: 'drawioShapes',
     inAppKey: 'drawioShapes',
+    writeClass: 'readOnly',
     description:
       'Look up VERIFIED draw.io stencil style-strings so you never guess a ' +
       '`shape=mxgraph.*` name (a wrong name renders as an EMPTY BOX). Searches a ' +
@@ -2294,6 +2353,7 @@ export const SHARED_TOOL_SPECS = {
   drawioGuide: {
     mcpName: 'drawioGuide',
     inAppKey: 'drawioGuide',
+    writeClass: 'readOnly',
     description:
       'Progressive-disclosure draw.io authoring reference. Call with a `section` ' +
       'to pull one focused, <=4KB chapter instead of bloating context: ' +
@@ -2323,3 +2383,53 @@ export const SHARED_TOOL_SPECS = {
     inlineBothHosts: true,
   },
 } satisfies Record<string, SharedToolSpec>;
+
+// --- write-class registry (#489) ------------------------------------------
+
+/** A tool's retry-safety class. 'readOnly' may be auto-retried once after a
+ *  transport break; 'write' is indeterminate and must never be blind-retried. */
+export type ToolWriteClass = 'readOnly' | 'write';
+
+/**
+ * Name → write-class map for the shared registry, keyed by mcpName (=== inAppKey).
+ * The external-MCP retry path (mcp-clients.service.ts) looks a tool up here by its
+ * RAW (un-namespaced) name to decide whether a transport failure may be retried.
+ * A tool NOT in this map (a third-party external MCP tool) is treated as 'write'
+ * by the consumer — the safe default (never blind-retry an unknown tool).
+ */
+export const SHARED_TOOL_WRITE_CLASS: Record<string, ToolWriteClass> =
+  Object.fromEntries(
+    Object.values(SHARED_TOOL_SPECS).map((spec) => [spec.mcpName, spec.writeClass]),
+  );
+
+/** Whether a write-class permits a single automatic retry after a transport
+ *  break. Only a pure read is retry-safe; everything mutating is indeterminate. */
+export function isRetryableWriteClass(
+  writeClass: ToolWriteClass | undefined,
+): boolean {
+  return writeClass === 'readOnly';
+}
+
+/**
+ * Registration-time assert (#489): EVERY spec must declare a valid write-class.
+ * `satisfies Record<string, SharedToolSpec>` already makes an omission a compile
+ * error, but this guards a raw/cast construction path and documents the invariant
+ * at the point of use. Runs once on import — both hosts import this module, so
+ * both get the check. Throws (fails startup) rather than silently mis-gating a
+ * retry in production.
+ */
+export function assertEverySpecDeclaresWriteClass(): void {
+  for (const [key, spec] of Object.entries(SHARED_TOOL_SPECS)) {
+    const wc = (spec as SharedToolSpec).writeClass;
+    if (wc !== 'readOnly' && wc !== 'write') {
+      throw new Error(
+        `tool-specs: spec "${key}" must declare writeClass ('readOnly' | 'write'), got ${JSON.stringify(
+          wc,
+        )}`,
+      );
+    }
+  }
+}
+
+// Enforce at module load (registration time) on both hosts.
+assertEverySpecDeclaresWriteClass();
