@@ -364,6 +364,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before retry") so the agent re-reads instead of blind-retrying, and a
   still-connecting session is no longer picked as an idle eviction victim by a
   parallel acquire. (#494)
+- **A long AI chat no longer bricks on the model's context window, and each turn
+  stops re-persisting the whole tool-output history.** Tool outputs are now
+  stored ONCE, in `metadata.parts`; the `tool_calls` trace keeps only per-step
+  outcome flags (a v2 trace shape), ending the O(N²) write amplification that
+  re-wrote every prior output on every step (measured on a live Postgres via the
+  `pg_current_wal_lsn()` delta: the trace column shrank ~3200×, the full
+  assistant row ~51%). The persisted record is unchanged in content — the full
+  history still lives in `metadata.parts`. At REPLAY time only, the history sent
+  to the provider is now bounded by a deterministic, prompt-cache-friendly token
+  budget: `floor(0.7 × chatContextWindow)` when a window is configured (no cap —
+  anti-brick protection, not a cost limiter), a flat 100k fallback for installs
+  with no window set (exactly the ones that hit terminal overflow), or off when
+  the window is explicitly `0`. Trimming truncates old tool outputs first, then
+  mechanically collapses the oldest turns, always keeping the recent turns full
+  and the tool-call/result pairing balanced. A provider context-overflow 400 is
+  now classified and used as a reactive signal: the row is stamped so the NEXT
+  turn re-trims aggressively (0.5×), which un-bricks a chat that just 400'd. The
+  client token badge and the server budgeter now share one estimator (new
+  `@docmost/token-estimate` package) so they can never diverge. Deferred-tool
+  activation is also cached in the chat metadata to avoid re-resolving it each
+  turn. (#490)
 - **A chat with one malformed message part no longer 500s on every turn, and a
   failed send no longer duplicates the user's message.** Incoming client parts
   are now whitelisted to `text` (a forged tool-result part can no longer reach

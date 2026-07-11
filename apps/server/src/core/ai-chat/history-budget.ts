@@ -51,7 +51,10 @@ export interface ReplayBudget {
 
 /**
  * Resolve the replay budget from the RAW stored `chatContextWindow` (text/number).
- *  - a positive value  -> `min(default, floor(fraction × window))`
+ *  - a positive value  -> `floor(fraction × window)` (NO cap — the budgeter is
+ *    anti-brick protection against the window itself, not a cost/economy limiter,
+ *    exactly as the codebase already treats maxOutputTokens; the reactive branch
+ *    still guarantees anti-brick regardless of how high this budget is)
  *  - explicit `0`       -> OFF (admin opt-out; `null` threshold)
  *  - unset/empty/invalid-> the flat default (still protects — the installations
  *    that hit terminal overflow are exactly the ones that never set a window)
@@ -76,12 +79,28 @@ export function resolveReplayBudget(rawContextWindow: unknown): ReplayBudget {
     return { thresholdTokens: null, usedDefault: false };
   }
   return {
-    thresholdTokens: Math.min(
-      REPLAY_BUDGET_DEFAULT_TOKENS,
-      Math.floor(REPLAY_BUDGET_WINDOW_FRACTION * n),
-    ),
+    thresholdTokens: Math.floor(REPLAY_BUDGET_WINDOW_FRACTION * n),
     usedDefault: false,
   };
+}
+
+/**
+ * The effective replay threshold for THIS turn, given the base budget and whether
+ * the PREVIOUS turn hit a context-overflow 400 (the reactive-recovery signal,
+ * `metadata.replayOverflow`). On recovery the base budget is scaled down by
+ * {@link REPLAY_AGGRESSIVE_FRACTION}: the overflowing turn produced no usage
+ * signal, so the preventive estimate under-counted and a normal-threshold trim may
+ * not shrink enough to fit — this harder cut is what un-bricks the chat.
+ *
+ * A `null` base budget (trimming OFF) is passed through unchanged: an explicit
+ * off-switch is never overridden by the recovery path.
+ */
+export function resolveEffectiveReplayThreshold(
+  thresholdTokens: number | null,
+  priorOverflowed: boolean,
+): number | null {
+  if (!priorOverflowed || thresholdTokens == null) return thresholdTokens;
+  return Math.floor(thresholdTokens * REPLAY_AGGRESSIVE_FRACTION);
 }
 
 /**

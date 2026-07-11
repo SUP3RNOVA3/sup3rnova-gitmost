@@ -36,6 +36,7 @@ import {
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
 import type { McpClientsService } from './external-mcp/mcp-clients.service';
+import { resolveEffectiveReplayThreshold } from './history-budget';
 
 /**
  * Unit tests for compactToolOutput: the pure helper that shrinks tool outputs
@@ -575,6 +576,27 @@ describe('lastAssistantReplayOverflow', () => {
       ]),
     ).toBe(false);
     expect(lastAssistantReplayOverflow([])).toBe(false);
+  });
+
+  // #490 reactive recovery: a prior turn stamped `replayOverflow` must make the
+  // NEXT turn's effective budget the AGGRESSIVE 0.5x cut — that harder trim is
+  // what un-bricks a chat that just 400'd on the context window. This exercises
+  // the exact wiring the service uses: read the stamp, then scale the threshold.
+  it('#490: a prior replayOverflow drives the next turn to the 0.5x aggressive budget', () => {
+    const history = [
+      row('assistant', { replayOverflow: true }),
+      row('user', null),
+    ];
+    const priorOverflowed = lastAssistantReplayOverflow(history);
+    expect(priorOverflowed).toBe(true);
+    // Base budget 100k -> aggressive recovery halves it to 50k this turn.
+    expect(resolveEffectiveReplayThreshold(100_000, priorOverflowed)).toBe(50_000);
+    // Odd base floors, not rounds.
+    expect(resolveEffectiveReplayThreshold(99_999, true)).toBe(49_999);
+    // No prior overflow -> the base budget is used verbatim (no aggressive cut).
+    expect(resolveEffectiveReplayThreshold(100_000, false)).toBe(100_000);
+    // An explicit off-switch (null) is never overridden, even on recovery.
+    expect(resolveEffectiveReplayThreshold(null, true)).toBeNull();
   });
 });
 

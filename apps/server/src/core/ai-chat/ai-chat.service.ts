@@ -57,9 +57,9 @@ import {
 import { roleModelOverride } from './roles/role-model-config';
 import {
   resolveReplayBudget,
+  resolveEffectiveReplayThreshold,
   isContextOverflowError,
   trimHistoryForReplay,
-  REPLAY_AGGRESSIVE_FRACTION,
 } from './history-budget';
 import {
   startSseHeartbeat,
@@ -1197,12 +1197,10 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // overflowing turn produced no usage signal, so a normal-threshold trim may
       // not shrink enough to fit. This is what un-bricks a chat that just 400'd.
       const priorOverflowed = lastAssistantReplayOverflow(oldHistory);
-      const effectiveThreshold =
-        priorOverflowed && replayBudget.thresholdTokens != null
-          ? Math.floor(
-              replayBudget.thresholdTokens * REPLAY_AGGRESSIVE_FRACTION,
-            )
-          : replayBudget.thresholdTokens;
+      const effectiveThreshold = resolveEffectiveReplayThreshold(
+        replayBudget.thresholdTokens,
+        priorOverflowed,
+      );
       if (priorOverflowed) {
         this.logger.warn(
           `AI chat (chat ${chatId}): previous turn hit context overflow; ` +

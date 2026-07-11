@@ -10,15 +10,15 @@ import {
 } from './history-budget';
 
 describe('resolveReplayBudget', () => {
-  it('uses min(default, 0.7 x window) for a configured window', () => {
-    // 0.7 x 60k = 42k < 100k
+  it('uses floor(0.7 x window) for a configured window (no cap)', () => {
+    // 0.7 x 60k = 42k
     expect(resolveReplayBudget(60_000)).toEqual({
       thresholdTokens: 42_000,
       usedDefault: false,
     });
-    // 0.7 x 1M = 700k, capped to the 100k default
+    // 0.7 x 1M = 700k — NOT capped (anti-brick vs the window, not a cost limiter).
     expect(resolveReplayBudget(1_000_000)).toEqual({
-      thresholdTokens: REPLAY_BUDGET_DEFAULT_TOKENS,
+      thresholdTokens: 700_000,
       usedDefault: false,
     });
   });

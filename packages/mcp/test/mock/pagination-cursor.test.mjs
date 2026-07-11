@@ -510,3 +510,71 @@ test("checkNewComments fetches pages concurrently (bounded) and preserves order"
     "result order matches the enumeration order regardless of finish order",
   );
 });
+
+// -----------------------------------------------------------------------------
+// 7) checkNewComments partial failure (#490): the concurrent scan is resilient —
+//    if ONE page's /comments fetch rejects (deleted mid-scan, a transient 500),
+//    that page is skipped and the WHOLE scan still resolves with every other
+//    page's fresh comments. A single failing fetch must never reject the batch
+//    (Promise.all in mapWithConcurrency would otherwise abort all of it) nor
+//    corrupt the deterministic order of the pages that DID succeed.
+// -----------------------------------------------------------------------------
+test("checkNewComments skips a page whose fetch fails and still reports the rest", async () => {
+  const NODES = [{ id: "parent", title: "Parent", parentPageId: null, hasChildren: true }];
+  for (let i = 0; i < 5; i++) {
+    NODES.push({ id: `k${i}`, title: `Kid ${i}`, parentPageId: "parent", hasChildren: false });
+  }
+  // The one page whose comment fetch blows up (500 -> listComments rejects).
+  const FAILING = "k2";
+
+  const { baseURL } = await spawn(async (req, res) => {
+    const raw = await readBody(req);
+    if (handleLogin(req, res)) return;
+    if (req.url === "/api/pages/tree") {
+      sendJson(res, 200, { success: true, data: { items: NODES } });
+      return;
+    }
+    if (req.url === "/api/comments") {
+      const body = JSON.parse(raw || "{}");
+      if (body.pageId === FAILING) {
+        // A transient server error on exactly one page's fetch.
+        sendJson(res, 500, { success: false, message: "boom" });
+        return;
+      }
+      sendJson(res, 200, {
+        success: true,
+        data: {
+          items: [
+            { id: `c-${body.pageId}`, createdAt: "2030-01-01T00:00:00.000Z", content: null },
+          ],
+          meta: { nextCursor: null },
+        },
+      });
+      return;
+    }
+    sendJson(res, 404, {});
+  });
+
+  const client = new DocmostClient(baseURL, "user@example.com", "pw");
+  // Must RESOLVE (not reject) despite one page's fetch failing.
+  const result = await client.checkNewComments(
+    "space-1",
+    "2020-01-01T00:00:00.000Z",
+    "parent",
+  );
+
+  // Every page in scope was still scanned (the failing one counts as checked).
+  assert.equal(result.checkedPages, 6, "all pages scanned incl. the failing one");
+  // The failing page contributes nothing; the other 5 each report one comment.
+  assert.equal(result.pagesWithNewComments, 5, "the failing page is dropped");
+  assert.equal(result.totalNewComments, 5, "only the succeeding pages' comments");
+  const reportedIds = result.comments.map((r) => r.pageId);
+  assert.ok(!reportedIds.includes(FAILING), "the failing page is absent from results");
+  // Order of the survivors is still the deterministic enumeration order (the hole
+  // left by the failing page is closed without reordering the rest).
+  assert.deepEqual(
+    reportedIds,
+    ["parent", "k0", "k1", "k3", "k4"],
+    "survivors keep enumeration order with the failing page removed",
+  );
+});
