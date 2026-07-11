@@ -231,60 +231,136 @@ describe('assistantParts', () => {
   });
 });
 
-describe('serializeSteps', () => {
+// #490 trace format v2: per call the trace stores { input } for the call and an
+// OUTCOME element — { ok: true } on success, { error, kind: 'thrown' } on a
+// thrown tool-error, { error, kind: 'interrupted' } on a mid-step abort. The tool
+// OUTPUT is no longer duplicated here (it lives once in metadata.parts).
+describe('serializeSteps (trace v2)', () => {
   it('returns null when there are no calls or results', () => {
     expect(serializeSteps([])).toBeNull();
   });
 
-  it('flattens calls and results into a compact trace', () => {
+  it('pairs a successful call with an { ok: true } outcome and NO output', () => {
     const trace = serializeSteps([
       {
-        toolCalls: [{ toolName: 'getPage', input: { id: 'p1' } }],
-        toolResults: [{ toolName: 'getPage', output: { title: 'T' } }],
+        toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: { id: 'p1' } }],
+        toolResults: [{ toolCallId: 'c1', toolName: 'getPage' }],
       },
     ]) as Array<Record<string, unknown>>;
     expect(trace).toHaveLength(2);
     expect(trace[0]).toEqual({ toolName: 'getPage', input: { id: 'p1' } });
-    expect(trace[1]).toEqual({ toolName: 'getPage', output: { title: 'T' } });
+    expect(trace[1]).toEqual({ toolName: 'getPage', ok: true });
+    // The output is NOT stored in the trace any more (dedup: it lives in parts).
+    expect(trace.some((e) => 'output' in e)).toBe(false);
   });
 
-  it('records a THROWN tool failure (tool-error part) with its error message', () => {
+  it('records a THROWN failure with { error, kind: "thrown" }', () => {
     const trace = serializeSteps([
       {
-        toolCalls: [{ toolName: 'editPageText', input: { id: 'p1' } }],
+        toolCalls: [
+          { toolCallId: 'c1', toolName: 'editPageText', input: { id: 'p1' } },
+        ],
         toolResults: [],
         content: [
           {
             type: 'tool-error',
+            toolCallId: 'c1',
             toolName: 'editPageText',
             error: new Error('page is locked'),
           },
         ],
       },
     ]) as Array<Record<string, unknown>>;
-    // The call element is followed by a paired error element (mirroring how a
-    // successful result is appended), so the failure survives in the trace.
     expect(trace).toHaveLength(2);
     expect(trace[0]).toEqual({ toolName: 'editPageText', input: { id: 'p1' } });
     expect(trace[1]).toEqual({
       toolName: 'editPageText',
       error: 'page is locked',
+      kind: 'thrown',
     });
   });
 
-  it('truncates a very long tool-error message to the tool-output limit', () => {
+  it('marks an interrupted call (no result, no throw) with kind "interrupted"', () => {
+    const trace = serializeSteps([
+      {
+        toolCalls: [
+          { toolCallId: 'c1', toolName: 'createComment', input: { x: 1 } },
+        ],
+        toolResults: [],
+        content: [],
+      },
+    ]) as Array<Record<string, unknown>>;
+    expect(trace).toHaveLength(2);
+    expect(trace[1]).toEqual({
+      toolName: 'createComment',
+      error: 'Tool call did not complete.',
+      kind: 'interrupted',
+    });
+    // Structurally distinct from a thrown hard-fail so it never inflates an
+    // error-rate scan.
+    expect((trace[1] as { kind: string }).kind).not.toBe('thrown');
+  });
+
+  it('truncates a very long thrown-error message to the tool-output limit', () => {
     const long = 'x'.repeat(5000);
     const trace = serializeSteps([
       {
-        toolCalls: [{ toolName: 'editPageText', input: {} }],
+        toolCalls: [{ toolCallId: 'c1', toolName: 'editPageText', input: {} }],
         toolResults: [],
-        content: [{ type: 'tool-error', toolName: 'editPageText', error: long }],
+        content: [
+          {
+            type: 'tool-error',
+            toolCallId: 'c1',
+            toolName: 'editPageText',
+            error: long,
+          },
+        ],
       },
     ]) as Array<Record<string, unknown>>;
     const errorText = trace[1].error as string;
-    // Truncated (not the full 5000 chars) and carries the omission marker.
     expect(errorText.length).toBeLessThan(long.length);
     expect(errorText).toContain('chars omitted');
+  });
+
+  it('pairs parallel calls in one step with their outcomes by id', () => {
+    const trace = serializeSteps([
+      {
+        toolCalls: [
+          { toolCallId: 'a', toolName: 'getPage', input: {} },
+          { toolCallId: 'b', toolName: 'searchPages', input: {} },
+        ],
+        toolResults: [{ toolCallId: 'b', toolName: 'searchPages' }],
+        content: [
+          { type: 'tool-error', toolCallId: 'a', toolName: 'getPage', error: 'nope' },
+        ],
+      },
+    ]) as Array<Record<string, unknown>>;
+    // call a, outcome a (thrown), call b, outcome b (ok)
+    expect(trace).toHaveLength(4);
+    expect(trace[1]).toEqual({ toolName: 'getPage', error: 'nope', kind: 'thrown' });
+    expect(trace[3]).toEqual({ toolName: 'searchPages', ok: true });
+  });
+});
+
+// #490: every assistant row flushAssistant writes carries the v2 era marker so a
+// dual-shape diagnostic query can branch on the trace shape without inspecting it.
+describe('toolTraceVersion era marker (#490)', () => {
+  it('stamps metadata.toolTraceVersion = 2 on every flushed row', () => {
+    const seed = flushAssistant([], '', 'streaming');
+    expect(seed.metadata.toolTraceVersion).toBe(2);
+    const done = flushAssistant(
+      [
+        {
+          text: 'ok',
+          toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: {} }],
+          toolResults: [{ toolCallId: 'c1', toolName: 'getPage' }],
+        },
+      ],
+      '',
+      'completed',
+      { finishReason: 'stop' },
+    );
+    expect(done.metadata.toolTraceVersion).toBe(2);
   });
 });
 

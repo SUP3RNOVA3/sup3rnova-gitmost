@@ -2165,6 +2165,15 @@ export function sanitizeUserParts(
 export const TOOL_CONTEXT_OMITTED_MARKER = '[tool context omitted]';
 
 /**
+ * Synthetic error text for a tool call that neither returned a result nor threw
+ * a `tool-error` — i.e. it was interrupted mid-step (an abort / server restart).
+ * Shared by `assistantParts` (the replayed `output-error` part) and
+ * `serializeSteps` (the `{ kind: 'interrupted' }` trace element) so the replay
+ * text and the trace stay in lockstep (#490).
+ */
+export const TOOL_CALL_INCOMPLETE_TEXT = 'Tool call did not complete.';
+
+/**
  * Convert persisted UI history to model messages, tolerating a single poisoned
  * row (#489). `convertToModelMessages` over the WHOLE array throws if ANY row is
  * malformed (e.g. a tool-part left unbalanced / in `input-available` state),
@@ -2431,7 +2440,7 @@ export function assistantParts(
           toolCallId: call.toolCallId,
           state: 'output-error',
           input: call.input,
-          errorText: 'Tool call did not complete.',
+          errorText: TOOL_CALL_INCOMPLETE_TEXT,
         });
       }
     }
@@ -2614,6 +2623,11 @@ export function flushAssistant(
 
   const metadata: Record<string, unknown> = {
     parts: parts as unknown as UIMessage['parts'],
+    // Era marker for the `tool_calls` trace shape (#490): v2 stores outcome flags
+    // ({ ok } / { error, kind }) and NO tool output (the output lives once in
+    // `parts`). Old rows have no marker and the legacy { output } shape; a
+    // dual-shape query branches on this. Old rows are deliberately NOT migrated.
+    toolTraceVersion: 2,
   };
   // finishReason: prefer an explicit one; else derive a sensible value from the
   // terminal status (so onError/onAbort records keep their historical reason).
@@ -2654,42 +2668,85 @@ export function flushAssistant(
 
 /**
  * Reduce SDK step objects to a compact, JSON-serializable trace for the
- * `tool_calls` column. Stores only what the UI action-log and history need —
- * never raw provider payloads or keys.
+ * `tool_calls` column — trace format **v2** (#490).
+ *
+ * v2 stores, per call, ONLY the metadata a queryable trace needs — never the
+ * tool OUTPUT. Before #490 each output was persisted TWICE: once here (compacted)
+ * and once in `metadata.parts` (via `assistantParts`), so a 50-step run with
+ * 50–200 KB outputs wrote hundreds of MB per turn (each `onStepFinish` rewrote
+ * the whole row). The parts copy is the one the model replays and the UI/Markdown
+ * export render, so the trace copy of the output was pure duplication. v2 keeps
+ * the output ONLY in parts and reduces the trace to outcome flags.
+ *
+ * Element shapes (paired per call, in order):
+ *  - `{ toolName, input }`                       — the call
+ *  - `{ toolName, ok: true }`                     — it returned a result (success)
+ *  - `{ toolName, error, kind: 'thrown' }`        — it threw a `tool-error`
+ *  - `{ toolName, error, kind: 'interrupted' }`   — no result and no throw (an
+ *      abort / server restart mid-step). `kind` is MANDATORY: without it a
+ *      synthetic "Tool call did not complete." is indistinguishable from a real
+ *      hard-fail and pollutes any error-rate scan. The distinction is STRUCTURAL
+ *      (an `errorsById` hit vs the synthetic fallback branch), NOT a per-tool
+ *      classifier — soft failures stay OUT of the trace (they live in
+ *      `metadata.parts` outputs; a per-tool mirror would persist its own bugs).
+ *
+ * Rows carry `metadata.toolTraceVersion: 2` (set by {@link flushAssistant}) so a
+ * dual-shape query can branch on the era. Old rows are NOT migrated (rewriting
+ * giant jsonb is the very WAL churn this removes); see docs/reading-ai-logs.md.
  */
 export function serializeSteps(
   steps: ReadonlyArray<{
-    toolCalls?: ReadonlyArray<{ toolName?: string; input?: unknown }>;
-    toolResults?: ReadonlyArray<{ toolName?: string; output?: unknown }>;
+    toolCalls?: ReadonlyArray<{
+      toolCallId?: string;
+      toolName?: string;
+      input?: unknown;
+    }>;
+    toolResults?: ReadonlyArray<{ toolCallId?: string; toolName?: string }>;
     content?: ReadonlyArray<{
       type?: string;
+      toolCallId?: string;
       toolName?: string;
       error?: unknown;
     }>;
   }>,
 ): unknown {
-  const calls: Array<{
-    toolName?: string;
-    input?: unknown;
-    output?: unknown;
-    error?: string;
-  }> = [];
+  const calls: Array<
+    | { toolName?: string; input?: unknown }
+    | { toolName?: string; ok: true }
+    | { toolName?: string; error: string; kind: 'thrown' | 'interrupted' }
+  > = [];
   for (const step of steps ?? []) {
+    // Index this step's results + thrown errors by tool call id, so each call is
+    // paired with its outcome (mirrors assistantParts' pairing exactly).
+    const resultIds = new Set<string>();
+    for (const r of step.toolResults ?? []) {
+      if (r.toolCallId) resultIds.add(r.toolCallId);
+    }
+    const errorsById = new Map<string, unknown>();
+    for (const part of step.content ?? []) {
+      if (part.type === 'tool-error' && part.toolCallId) {
+        errorsById.set(part.toolCallId, part.error);
+      }
+    }
     for (const call of step.toolCalls ?? []) {
       calls.push({ toolName: call.toolName, input: call.input });
-    }
-    for (const r of step.toolResults ?? []) {
-      calls.push({ toolName: r.toolName, output: compactToolOutput(r.output) });
-    }
-    // ai@6 surfaces a THROWN tool failure as a `tool-error` content part, NOT as
-    // a `toolResults` entry. Record it as its own paired element (mirroring how a
-    // successful result is appended) so the failure and its reason survive in the
-    // trace instead of leaving an orphaned call with no result.
-    for (const part of step.content ?? []) {
-      if (part.type === 'tool-error') {
+      if (call.toolCallId && resultIds.has(call.toolCallId)) {
+        // Success: the output itself lives in metadata.parts, not here.
+        calls.push({ toolName: call.toolName, ok: true });
+      } else if (call.toolCallId && errorsById.has(call.toolCallId)) {
+        // Hard fail: the tool threw. Persist the real (bounded) reason.
         calls.push({
-          toolName: part.toolName,
-          error: normalizeToolError(part.error),
+          toolName: call.toolName,
+          error: normalizeToolError(errorsById.get(call.toolCallId)),
+          kind: 'thrown',
+        });
+      } else {
+        // Neither a result nor a throw: interrupted mid-step (abort/restart).
+        // Marked structurally so it never inflates a thrown-error count.
+        calls.push({
+          toolName: call.toolName,
+          error: TOOL_CALL_INCOMPLETE_TEXT,
+          kind: 'interrupted',
         });
       }
     }
