@@ -606,6 +606,9 @@ export interface AiChats {
   // The document the chat was created in (open page at first message). NULL =>
   // started outside any document. ON DELETE SET NULL on the page FK.
   pageId: string | null;
+  // Chat-level metadata bag (#490). jsonb, defaulted to '{}'. First key:
+  // `activatedTools` — the deferred-tool activation set persisted across turns.
+  metadata: Generated<Json>;
   createdAt: Generated<Timestamp>;
   updatedAt: Generated<Timestamp>;
   deletedAt: Timestamp | null;

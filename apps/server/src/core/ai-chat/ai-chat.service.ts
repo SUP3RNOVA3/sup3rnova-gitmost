@@ -941,10 +941,17 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
     // supplied or the supplied one does not belong to this workspace.
     let isNewChat = false;
     let chatId = body.chatId;
+    // Persisted chat-level metadata bag (#490): read once here so the deferred-tool
+    // activation set can be seeded from the previous turn. Undefined for a new chat.
+    let chatMetadata: Record<string, unknown> | undefined;
     if (chatId) {
       const existing = await this.aiChatRepo.findById(chatId, workspace.id);
       if (!existing) {
         chatId = undefined;
+      } else {
+        chatMetadata = (existing.metadata ?? undefined) as
+          | Record<string, unknown>
+          | undefined;
       }
     }
     // The open page the client sent is attacker-controllable — BOTH its id and
@@ -1398,9 +1405,18 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       //    tools + ALL external MCP tools), computed from the ACTUAL toolset so an
       //    external tool is loadable by its namespaced name. loadTools rejects any
       //    name outside this set.
-      const activatedTools = new Set<string>();
       const validDeferredNames = new Set<string>(
         Object.keys(baseTools).filter((k) => !CORE_TOOL_SET.has(k)),
+      );
+      // #490: seed the activation set from the chat's PERSISTED set so the model
+      // does not re-run loadTools every turn to re-activate the same tools. Only
+      // when deferred loading is enabled, and ALWAYS intersected with the CURRENT
+      // valid deferred names — an allowlist/role change must never resurrect a tool
+      // that no longer exists (prepareAgentStep would get a phantom active name).
+      const activatedTools = new Set<string>(
+        deferredEnabled
+          ? seedActivatedTools(chatMetadata, validDeferredNames)
+          : [],
       );
       // Add the loadTools meta-tool ONLY when the feature is enabled; when off the
       // toolset and behavior are exactly as before.
@@ -1410,6 +1426,39 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             [LOAD_TOOLS_NAME]: makeLoadToolsTool(activatedTools, validDeferredNames),
           }
         : baseTools;
+
+      // #490: persist the (deterministically ordered) activation set back onto the
+      // chat metadata at turn end, so the NEXT turn seeds from it. Once-guarded and
+      // skipped when nothing new was activated (the set equals its seed) so an
+      // ordinary turn adds no extra write. Preserves other metadata keys.
+      let activatedToolsPersisted = false;
+      const persistActivatedTools = async (): Promise<void> => {
+        if (!deferredEnabled || activatedToolsPersisted || !chatId) return;
+        activatedToolsPersisted = true;
+        const current = [...activatedTools].sort();
+        const seeded = seedActivatedTools(chatMetadata, validDeferredNames).sort();
+        if (current.length === 0 || current.join(' ') === seeded.join(' ')) {
+          return; // nothing new activated -> no write
+        }
+        try {
+          await this.aiChatRepo.update(
+            chatId,
+            {
+              metadata: {
+                ...(chatMetadata ?? {}),
+                activatedTools: current,
+              },
+            } as never,
+            workspace.id,
+          );
+        } catch (err) {
+          this.logger.warn(
+            `Failed to persist activated tools (chat ${chatId}): ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          );
+        }
+      };
 
       // Accumulate the turn's streamed output so a provider error / disconnect can
       // persist the PARTIAL answer the user already saw — the SDK's onError/onAbort
@@ -1762,6 +1811,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // own edits are baked in — and this also SEEDS the snapshot on the first
             // turn. Runs once across every terminal path (see snapshotTurnEnd).
             await snapshotTurnEnd();
+            // #490: persist the deferred-tool activation set for the next turn.
+            await persistActivatedTools();
 
             // Generate the chat title for a freshly created chat AFTER the stream's
             // provider call has completed — NOT concurrently with it. The z.ai coding
@@ -1824,6 +1875,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // committed before the error must be baked into the snapshot, or the
             // next turn would mis-report it as a user edit.
             await snapshotTurnEnd();
+            // #490: persist the deferred-tool activation set for the next turn.
+            await persistActivatedTools();
           },
           onAbort: async ({ steps }) => {
             // #444: distinguish a degeneration abort (our internal controller) from
@@ -1849,6 +1902,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 );
               await closeExternalClients();
               await snapshotTurnEnd();
+              // #490: persist the deferred-tool activation set for the next turn.
+              await persistActivatedTools();
               return;
             }
             const partialChars =
@@ -1884,6 +1939,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // committed before the client disconnect / stop() must be baked into the
             // snapshot, or the next turn would mis-report it as a user edit.
             await snapshotTurnEnd();
+            // #490: persist the deferred-tool activation set for the next turn.
+            await persistActivatedTools();
           },
         });
 
@@ -2212,6 +2269,31 @@ export function lastAssistantContextTokens(
     return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : undefined;
   }
   return undefined;
+}
+
+/**
+ * Seed the per-turn deferred-tool activation set from a chat's persisted metadata
+ * (#490), INTERSECTED with the current valid deferred names. Persisting the set
+ * across turns saves the model re-running loadTools every turn to re-activate the
+ * same tools; intersecting on load means a changed allowlist / role can never
+ * resurrect a tool that no longer exists (which would hand prepareAgentStep a
+ * phantom active name). Tolerant of any stored shape — a non-array is ignored.
+ */
+export function seedActivatedTools(
+  metadata: Record<string, unknown> | undefined,
+  validDeferredNames: ReadonlySet<string>,
+): string[] {
+  const stored = metadata?.activatedTools;
+  if (!Array.isArray(stored)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const name of stored) {
+    if (typeof name === 'string' && validDeferredNames.has(name) && !seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+  }
+  return out;
 }
 
 /**

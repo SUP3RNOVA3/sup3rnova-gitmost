@@ -31,6 +31,7 @@ import {
   OUTPUT_DEGENERATION_ERROR,
   lastAssistantContextTokens,
   lastAssistantReplayOverflow,
+  seedActivatedTools,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
@@ -436,6 +437,45 @@ describe('lastAssistantContextTokens', () => {
     const hist = [row('assistant', { error: 'boom' }), row('user', null)];
     expect(lastAssistantContextTokens(hist)).toBeUndefined();
     expect(lastAssistantContextTokens([])).toBeUndefined();
+  });
+});
+
+// #490 deferred-tool activation persisted across turns.
+describe('seedActivatedTools', () => {
+  const valid = new Set(['Search_web', 'getPageJson', 'diffPageVersions']);
+
+  it('seeds from persisted metadata, intersected with current valid names', () => {
+    expect(
+      seedActivatedTools(
+        { activatedTools: ['Search_web', 'getPageJson'] },
+        valid,
+      ),
+    ).toEqual(['Search_web', 'getPageJson']);
+  });
+
+  it('drops a stored tool that is no longer valid (allowlist/role changed)', () => {
+    // 'Habr_publish' was activated before but is not in the current allowlist.
+    expect(
+      seedActivatedTools({ activatedTools: ['Search_web', 'Habr_publish'] }, valid),
+    ).toEqual(['Search_web']);
+  });
+
+  it('is empty/robust for missing, non-array, or unknown-shaped metadata', () => {
+    expect(seedActivatedTools(undefined, valid)).toEqual([]);
+    expect(seedActivatedTools({}, valid)).toEqual([]);
+    expect(seedActivatedTools({ activatedTools: 'nope' }, valid)).toEqual([]);
+    expect(
+      seedActivatedTools({ activatedTools: [1, 'getPageJson', null] }, valid),
+    ).toEqual(['getPageJson']);
+  });
+
+  it('de-duplicates stored names', () => {
+    expect(
+      seedActivatedTools(
+        { activatedTools: ['getPageJson', 'getPageJson'] },
+        valid,
+      ),
+    ).toEqual(['getPageJson']);
   });
 });
 
