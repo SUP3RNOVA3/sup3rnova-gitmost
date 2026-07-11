@@ -190,10 +190,22 @@ export class AiService {
         }).chat(chatModel);
       }
       case 'gemini':
-        return createGoogleGenerativeAI({ apiKey })(chatModel);
+        // Route gemini through the same instrumented streaming fetch as openai
+        // (finite silence timeouts + keep-alive recycling + pre-response
+        // connection-reset retry). Without it the provider ran on the global
+        // undici fetch — no keep-alive recycle, no reset retries, default
+        // (unbounded silence) timeout — so incident classes #140/#175/#310 were
+        // reproducible for gemini too.
+        return createGoogleGenerativeAI({
+          apiKey,
+          fetch: this.aiProviderFetch,
+        })(chatModel);
       case 'ollama':
-        // Ollama needs no API key.
-        return createOllama({ baseURL: baseUrl })(chatModel);
+        // Ollama needs no API key. Same transport hardening as above (#140/#175/#310).
+        return createOllama({
+          baseURL: baseUrl,
+          fetch: this.aiProviderFetch,
+        })(chatModel);
       default:
         throw new AiNotConfiguredException();
     }

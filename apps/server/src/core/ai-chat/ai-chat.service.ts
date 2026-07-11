@@ -1514,6 +1514,13 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           system,
           messages,
           tools,
+          // Pin the AI SDK per-request retry budget explicitly instead of relying
+          // on its default (which is also 2). Connection arithmetic per turn:
+          // (1 + maxRetries=2) × (1 + AI_STREAM_PRE_RESPONSE_RETRIES) network
+          // connects worst-case — the two retry layers compose, so making the SDK
+          // side explicit keeps that ceiling visible and pinned against SDK-default
+          // drift.
+          maxRetries: 2,
           // No maxOutputTokens cap on the agent: tool-call arguments (e.g. a full
           // page body for the write tools) are emitted as OUTPUT tokens, so a fixed
           // cap would truncate complex tool calls mid-argument. Let the model use its
