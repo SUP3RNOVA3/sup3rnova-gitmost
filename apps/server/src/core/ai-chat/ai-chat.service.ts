@@ -379,6 +379,14 @@ export interface AiChatStreamBody {
   // it against persisted history (`isInterruptResume`) before injecting the
   // interrupt note, so a spoofed/stale flag on an ordinary turn is ignored.
   interrupted?: boolean;
+  // #487: server-side supersede CAS. When present, this POST asks the server to
+  // STOP the run `supersede.runId` (which the client saw as the chat's active run)
+  // and, once it has settled, start THIS turn in its place. The server validates
+  // the target against the chat and answers 400 (wrong chat) / 409
+  // SUPERSEDE_TARGET_MISMATCH / 409 SUPERSEDE_TIMEOUT, or proceeds normally
+  // (degrade / ready). Absent => an ordinary send (rejected with 409
+  // A_RUN_ALREADY_ACTIVE if a run is already active on the chat).
+  supersede?: { runId?: string } | null;
   // useChat sends the full UIMessage list; the last one is the new user turn.
   messages?: UIMessage[];
 }
@@ -428,6 +436,11 @@ export interface AiChatStreamArgs {
   // chat row (existing chat) or the request body (new chat). null => universal
   // assistant. Carried here so the turn never re-loads it.
   role: AiAgentRole | null;
+  // #487: true when this turn was started by SUPERSEDING a still-live previous run
+  // (the controller ran the supersede CAS to a `ready` result). Adds the
+  // SUPERSEDE_NOTE to the system prompt (the previous run's last ops may still be
+  // applying — no side-effect quiescence). Absent on an ordinary send.
+  superseded?: boolean;
 }
 
 /**
@@ -727,6 +740,7 @@ export class AiChatService implements OnModuleInit {
     model,
     role,
     runHooks,
+    superseded,
   }: AiChatStreamArgs): Promise<void> {
     // Resolve / create the chat. A new chat is created when no valid chatId is
     // supplied or the supplied one does not belong to this workspace.
@@ -1040,6 +1054,9 @@ export class AiChatService implements OnModuleInit {
           // History-confirmed interrupt-resume flag (#198): adds the interrupt note
           // so the model treats the partial answer above as cut off, not finished.
           interrupted,
+          // #487: this turn superseded a still-live run — warn the model the
+          // previous run's last ops may still be applying (no quiescence).
+          superseded,
           // Detected between-turns human edit to the open page (#274): adds the
           // page_changed note + unified diff so the agent doesn't overwrite it.
           pageChanged,

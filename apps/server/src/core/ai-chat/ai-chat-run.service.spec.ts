@@ -577,3 +577,165 @@ describe('AiChatRunService run lifecycle', () => {
     ).resolves.toBeUndefined();
   });
 });
+
+describe('#487 AiChatRunService.supersede (CAS)', () => {
+  const chat = 'chat-1';
+  const ws = 'ws-1';
+
+  it('degrade: no active run on the chat -> caller sends a normal turn', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => undefined),
+      findActiveByChat: jest.fn(async () => undefined),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    expect(await svc.supersede(chat, 'run-x', ws)).toEqual({ kind: 'degrade' });
+  });
+
+  it('invalid: the target run belongs to a DIFFERENT chat -> 400', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({
+        id: 'run-x',
+        chatId: 'other-chat',
+        workspaceId: ws,
+      })),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    expect(await svc.supersede(chat, 'run-x', ws)).toEqual({ kind: 'invalid' });
+  });
+
+  it('mismatch: a DIFFERENT run is active than the one targeted -> current runId', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({ id: 'run-x', chatId: chat, workspaceId: ws })),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-live',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    expect(await svc.supersede(chat, 'run-x', ws)).toEqual({
+      kind: 'mismatch',
+      activeRunId: 'run-live',
+    });
+  });
+
+  it('ready: the target IS active -> stop it, await its (fast) settle, free the slot', async () => {
+    // Simulate a live long TOOL (NOT a slow UPDATE): the run stays active until an
+    // explicit Stop unwinds it; commit-1's race makes that settle land quickly.
+    // The abort listener stands in for streamText's onAbort -> finalizeRun.
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'aborted',
+        error: null,
+      })),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    const handle = await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+    handle.signal.addEventListener('abort', () => {
+      void svc.finalizeRun('run-1', ws, 'aborted');
+    });
+
+    // supersede: getRun -> getActiveByChat(==target) -> requestStop -> the abort
+    // listener settles the run -> awaitSettled resolves -> ready.
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'ready',
+    });
+    expect(handle.signal.aborted).toBe(true); // Stop reached the run
+  });
+
+  it('timeout: the target never settles within W -> 409 SUPERSEDE_TIMEOUT (nothing persisted)', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({ id: 'run-1', chatId: chat, workspaceId: ws })),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+    // Do NOT settle the run: a tiny W elapses -> timeout.
+    const result = await svc.supersede(chat, 'run-1', ws, 30);
+    expect(result).toEqual({ kind: 'timeout' });
+  });
+
+  it('ready then a DUPLICATE supersede POST degrades (the run is already gone)', async () => {
+    let active: unknown = {
+      id: 'run-1',
+      chatId: chat,
+      workspaceId: ws,
+      status: 'running',
+    };
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'aborted',
+        error: null,
+      })),
+      findActiveByChat: jest.fn(async () => active),
+      finalizeIfActive: jest.fn(async () => {
+        active = undefined; // settling frees the active slot
+        return { id: 'run-1', status: 'aborted' };
+      }),
+    });
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    const handle = await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+    handle.signal.addEventListener('abort', () => {
+      void svc.finalizeRun('run-1', ws, 'aborted');
+    });
+
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'ready',
+    });
+    // The duplicate POST for the same target now finds no active run -> degrade.
+    expect(await svc.supersede(chat, 'run-1', ws)).toEqual({ kind: 'degrade' });
+  });
+
+  it('gave-up zombie: supersede applies the intended status (settleZombie) then is ready', async () => {
+    let healthy = false;
+    let active: unknown = {
+      id: 'run-1',
+      chatId: chat,
+      workspaceId: ws,
+      status: 'running',
+    };
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({ id: 'run-1', chatId: chat, workspaceId: ws })),
+      findActiveByChat: jest.fn(async () => active),
+      finalizeIfActive: jest.fn(async () => {
+        if (!healthy) throw new Error('db down');
+        active = undefined;
+        return { id: 'run-1', status: 'aborted' };
+      }),
+    });
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+
+    // The run's terminal write gives up -> zombie (row still 'running').
+    await svc.finalizeRun('run-1', ws, 'aborted');
+    expect(svc.hasZombie('run-1')).toBe(true);
+
+    // The DB recovers; supersede awaits the (already-resolved, terminalWriteFailed)
+    // settle, then settleZombie applies the intended status -> ready.
+    healthy = true;
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'ready',
+    });
+    expect(svc.hasZombie('run-1')).toBe(false);
+  });
+});

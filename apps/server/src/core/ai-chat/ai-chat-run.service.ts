@@ -62,6 +62,40 @@ export interface RunSettleOutcome {
   terminalWriteFailed: boolean;
 }
 
+/**
+ * #487: how long a supersede waits for the target run to settle after Stop before
+ * it degrades to `SUPERSEDE_TIMEOUT`. W=10s is generous under a HEALTHY DB: commit
+ * 1's race-on-abort makes an in-app tool abort->settle in ms/hundreds of ms, so a
+ * live run releases its slot well within the window. Under a DB brownout the
+ * timeout is normal (the write cannot land); W must NOT be raised to paper
+ * over a slow DB — a SUPERSEDE_TIMEOUT is the honest signal (nothing persisted,
+ * the composer keeps the user's text). Env-tunable for ops, default 10s.
+ */
+export const SUPERSEDE_SETTLE_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.AI_CHAT_SUPERSEDE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000;
+})();
+
+/**
+ * #487: the result of the supersede CAS ({@link AiChatRunService.supersede}).
+ *  - `degrade`  : no active run on the chat (it ended between click and POST) —
+ *                 the caller sends a NORMAL turn (NOT a mismatch);
+ *  - `invalid`  : the target runId belongs to a DIFFERENT chat (malformed CAS 400);
+ *  - `mismatch` : a DIFFERENT run is active than the one the client targeted —
+ *                 409 SUPERSEDE_TARGET_MISMATCH carrying the current `activeRunId`
+ *                 (the client does NOT auto-retry);
+ *  - `timeout`  : the target did not settle within W — 409 SUPERSEDE_TIMEOUT,
+ *                 nothing persisted;
+ *  - `ready`    : the target was stopped AND settled (or its zombie's intended was
+ *                 applied) — the slot is free; the caller may beginRun the new run.
+ */
+export type SupersedeResult =
+  | { kind: 'degrade' }
+  | { kind: 'invalid' }
+  | { kind: 'mismatch'; activeRunId: string }
+  | { kind: 'timeout' }
+  | { kind: 'ready' };
+
 /** A one-shot settle notifier (#487): `resolve` is called EXACTLY ONCE. */
 interface Deferred<T> {
   promise: Promise<T>;
@@ -492,6 +526,95 @@ export class AiChatRunService implements OnModuleInit {
       });
     }
     return undefined;
+  }
+
+  /**
+   * #487: await a run's settle outcome, bounded by `timeoutMs`. Returns the
+   * outcome on settle, or undefined on TIMEOUT (or when this replica has no record
+   * of the run and its row is not terminal). Uses the LIVE settle notifier / the
+   * zombie synth when present; else reads the row (the DB is the source of truth
+   * once the in-memory record is gone). The subscriber (supersede) grabs this
+   * right after Stop; commit 1's race makes the settle land in ms on a healthy DB.
+   */
+  async awaitSettled(
+    runId: string,
+    workspaceId: string,
+    timeoutMs: number,
+  ): Promise<RunSettleOutcome | undefined> {
+    const pending = this.peekSettled(runId);
+    if (pending) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        timer.unref?.();
+      });
+      try {
+        return await Promise.race([pending, timeout]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    // No live notifier and no zombie: read the row (already settled-and-written,
+    // or unknown here). A terminal row is an outcome; anything else -> undefined.
+    const row = await this.runRepo.findById(runId, workspaceId);
+    if (row && isRunTerminal(row.status)) {
+      return {
+        status: row.status as RunTerminalStatus,
+        error: row.error ?? null,
+        terminalWriteFailed: false,
+      };
+    }
+    return undefined;
+  }
+
+  /**
+   * #487: the SERVER supersede CAS for `POST /stream { supersede: { runId: X } }`.
+   * Atomically transitions "X is the chat's active run" -> "X is stopped, settled,
+   * slot free" so the caller can start a replacement run. See {@link
+   * SupersedeResult} for the branch semantics.
+   *
+   * On a `ready` result the caller MUST still go through the normal beginRun gate
+   * (the partial unique index) — between the slot freeing here and beginRun a
+   * neighbouring tab's ordinary POST can win the slot (documented SLOT-THEFT: the
+   * loser then gets a MISMATCH carrying the NEW runId). There is also NO side-
+   * effect quiescence: an in-flight write of the stopped run may still land AFTER
+   * the new run starts (commit 1 stops the NEXT call, not one already committing),
+   * so the caller adds a prompt note to the new run.
+   */
+  async supersede(
+    chatId: string,
+    targetRunId: string,
+    workspaceId: string,
+    timeoutMs: number = SUPERSEDE_SETTLE_TIMEOUT_MS,
+  ): Promise<SupersedeResult> {
+    // Validate the target belongs to THIS chat (a CAS targeting another chat's run
+    // is malformed -> 400). A missing row is NOT invalid: the run may have ended
+    // and been pruned; the active-run check below decides degrade vs mismatch.
+    const target = await this.getRun(targetRunId, workspaceId);
+    if (target && target.chatId !== chatId) return { kind: 'invalid' };
+
+    const active = await this.getActiveForChat(chatId, workspaceId);
+    // No active run: it ended between the client's click and this POST — this is a
+    // DEGRADE to a normal send, NOT a mismatch (the user's intent still holds).
+    if (!active) return { kind: 'degrade' };
+    // A DIFFERENT run is active than the one the client saw -> mismatch. The
+    // client does not auto-retry; it surfaces the new runId.
+    if (active.id !== targetRunId) {
+      return { kind: 'mismatch', activeRunId: active.id };
+    }
+
+    // The target IS active: stop it, then await its settle within W.
+    await this.requestStop(targetRunId, workspaceId);
+    const outcome = await this.awaitSettled(targetRunId, workspaceId, timeoutMs);
+    if (!outcome) return { kind: 'timeout' };
+    // Gave up (terminal write failed): apply the intended status via the
+    // conditional UPDATE so the slot actually frees. If that ALSO fails, the row
+    // is still stranded -> treat as a timeout (nothing persisted for the new run).
+    if (outcome.terminalWriteFailed) {
+      const settled = await this.settleZombie(targetRunId);
+      if (!settled) return { kind: 'timeout' };
+    }
+    return { kind: 'ready' };
   }
 
   /** #487 test/diagnostic seam: whether a give-up zombie is held for this run. */

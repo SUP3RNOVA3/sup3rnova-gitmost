@@ -102,6 +102,22 @@ const INTERRUPT_NOTE =
   'partial work — build on it or follow the new instruction.';
 
 /**
+ * #487: injected on a turn started by SUPERSEDING a previous run (the user hit
+ * "interrupt and send now" while a run was live). The previous run was Stopped,
+ * but there is NO side-effect quiescence — a write it had already committed, or
+ * one committing at the moment of Stop, may land with a small delay AFTER this new
+ * run starts. So the model is told its picture of the page/state may be a beat
+ * stale and to re-read before assuming an edit did or did not apply.
+ */
+const SUPERSEDE_NOTE =
+  'NOTE: A previous agent run in this conversation was just interrupted so this ' +
+  'new turn could start. That run was stopped, but any operation it had already ' +
+  'begun (e.g. a page edit) may still be applied with a short delay. Do not ' +
+  'assume the document/state is exactly as the interrupted run left it — if you ' +
+  'need to rely on the current content, RE-READ it with the page tools before ' +
+  'acting rather than trusting a cached view.';
+
+/**
  * Injected on a turn where the open page was hand-edited by the user (or anyone
  * else) AFTER the agent's previous response ended (#274). The server takes a
  * Markdown snapshot of the page at each turn's end and, at the next turn's start,
@@ -203,6 +219,14 @@ export interface BuildSystemPromptInput {
    * (partial) answer was cut off by the user's new message.
    */
   interrupted?: boolean;
+  /**
+   * #487: true when THIS turn was started by superseding a still-live previous run
+   * ("interrupt and send now"). Adds SUPERSEDE_NOTE so the model knows the previous
+   * run's last operations may still be applying and to re-read state it depends on.
+   * Distinct from `interrupted` (which is about a PARTIAL prior answer in history);
+   * both can be set together. Self-clears — set only for the superseding turn.
+   */
+  superseded?: boolean;
   /**
    * Set only when the open page was edited by the user AFTER the agent's previous
    * turn ended (#274), confirmed server-side by diffing the current page against
@@ -311,6 +335,7 @@ export function buildSystemPrompt({
   openedPage,
   mcpInstructions,
   interrupted,
+  superseded,
   pageChanged,
   deferredToolsEnabled,
   toolCatalog,
@@ -358,6 +383,13 @@ export function buildSystemPrompt({
   // here, so a spoofed flag on an ordinary turn never injects this note.
   if (interrupted) {
     context += `\n${INTERRUPT_NOTE}`;
+  }
+
+  // Supersede note (#487): present only for a turn that stopped and replaced a
+  // still-live previous run — warns the model the previous run's last operations
+  // may still be applying (no side-effect quiescence).
+  if (superseded) {
+    context += `\n${SUPERSEDE_NOTE}`;
   }
 
   // Per-turn page-change note (#274). Added to the context section (inside the

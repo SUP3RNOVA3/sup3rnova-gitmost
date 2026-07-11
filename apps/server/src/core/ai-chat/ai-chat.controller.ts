@@ -432,12 +432,66 @@ export class AiChatController {
     // HttpException) instead of breaking mid-stream.
     const model = await this.aiChatService.getChatModel(workspace.id, role);
 
-    // #184: one active run per chat. For an EXISTING chat reject a concurrent
-    // start with a clean 409 BEFORE hijack (the common double-submit / second-tab
-    // case), so the user gets JSON, not a mid-stream error. A brand-new chat
-    // (no chatId) cannot have a prior run, and the DB partial unique index is the
-    // backstop against any race that slips past this check.
-    if (autonomousRuns && body.chatId) {
+    // #487: server-side supersede CAS ("interrupt and send now"). When the client
+    // asks to replace a live run, atomically STOP it and wait for it to settle
+    // before this turn claims the slot. Runs BEFORE hijack so every branch returns
+    // clean JSON (the client keeps the composer text on a 409). See
+    // AiChatRunService.supersede for the branch semantics.
+    let superseded = false;
+    const supersedeRunId = body.supersede?.runId;
+    if (supersedeRunId) {
+      if (!body.chatId) {
+        throw new BadRequestException({
+          message: 'supersede requires chatId',
+          code: 'SUPERSEDE_INVALID',
+        });
+      }
+      const result = await this.aiChatRunService.supersede(
+        body.chatId,
+        supersedeRunId,
+        workspace.id,
+      );
+      switch (result.kind) {
+        case 'invalid':
+          throw new BadRequestException({
+            message: 'The run to supersede does not belong to this chat',
+            code: 'SUPERSEDE_INVALID',
+          });
+        case 'mismatch':
+          // A DIFFERENT run is active than the one the client targeted. Surface
+          // the CURRENT runId; the client does NOT auto-retry (a stale CAS).
+          throw new ConflictException({
+            message: 'A different agent run is now active on this chat',
+            code: 'SUPERSEDE_TARGET_MISMATCH',
+            activeRunId: result.activeRunId,
+          });
+        case 'timeout':
+          // The target did not settle within W — nothing was persisted, the
+          // composer keeps the text. NOT a rollback: the stop is already issued.
+          throw new ConflictException({
+            message:
+              'The previous run did not stop in time; nothing was sent — please try again',
+            code: 'SUPERSEDE_TIMEOUT',
+          });
+        case 'ready':
+          // The target stopped and settled: the slot is free. Prompt the new run
+          // that the old run's last operations may still be applying.
+          superseded = true;
+          break;
+        case 'degrade':
+          // The run already ended between click and POST — send normally.
+          break;
+      }
+    }
+
+    // #487: one active run per chat — ENFORCED IN BOTH MODES now (legacy mode used
+    // to have NO gate, so two tabs streamed two parallel turns on one chat, which
+    // interleaved history and crashed convertToModelMessages). Reject a concurrent
+    // start with a clean pre-hijack 409 (double-submit / second-tab). A brand-new
+    // chat (no chatId) cannot have a prior run, and the DB partial unique index in
+    // beginRun is the authoritative backstop for any race that slips past here
+    // (including a slot stolen between a supersede release and beginRun).
+    if (body.chatId) {
       const active = await this.aiChatRunService.getActiveForChat(
         body.chatId,
         workspace.id,
@@ -446,107 +500,94 @@ export class AiChatController {
         throw new ConflictException({
           message: 'An agent run is already in progress for this chat',
           code: 'A_RUN_ALREADY_ACTIVE',
+          activeRunId: active.id,
         });
       }
     }
 
-    // Run-lifecycle hooks (#184), only when the flag is on. They wrap the turn in
-    // a durable run whose abort is governed by the run (explicit stop), persist
-    // its progress, and settle its terminal status — see AiChatRunService.
-    const runHooks: AiChatRunHooks | undefined = autonomousRuns
-      ? {
-          begin: async (chatId) => {
-            const handle = await this.aiChatRunService.beginRun({
-              chatId,
-              workspaceId: workspace.id,
-              userId: user.id,
-              trigger: 'user',
-            });
-            // #184 phase 1.5: register the run-stream entry at BEGIN (before any
-            // frame) so a tab that attaches in the begin->seed window finds an
-            // entry to wait on. Gated on AI_CHAT_RESUMABLE_STREAM: with the flag
-            // off nothing is registered and attach always 204s.
-            if (
-              handle?.runId &&
-              this.environment?.isAiChatResumableStreamEnabled?.()
-            ) {
-              this.streamRegistry?.open(chatId, handle.runId);
-            }
-            return handle;
-          },
-          onAssistantSeeded: (runId, messageId) =>
-            this.aiChatRunService.linkAssistantMessage(
-              runId,
-              workspace.id,
-              messageId,
-            ),
-          onStep: (runId, stepCount) =>
-            void this.aiChatRunService.recordStep(
-              runId,
-              workspace.id,
-              stepCount,
-            ),
-          onSettled: (runId, status, error) =>
-            this.aiChatRunService.finalizeRun(
-              runId,
-              workspace.id,
-              status,
-              error,
-            ),
+    // #487: the turn is ALWAYS a first-class RUN now (both modes). The mode
+    // difference is only the abort semantics on a browser disconnect (onClose
+    // below). currentRunId is captured at begin so a legacy disconnect can stop
+    // the run through its stop lever.
+    let currentRunId: string | undefined;
+    const runHooks: AiChatRunHooks = {
+      begin: async (chatId) => {
+        const handle = await this.aiChatRunService.beginRun({
+          chatId,
+          workspaceId: workspace.id,
+          userId: user.id,
+          trigger: 'user',
+        });
+        currentRunId = handle?.runId;
+        // #184 phase 1.5: register the run-stream entry at BEGIN (before any
+        // frame) so a tab that attaches in the begin->seed window finds an entry
+        // to wait on. Gated on AI_CHAT_RESUMABLE_STREAM.
+        if (
+          handle?.runId &&
+          this.environment?.isAiChatResumableStreamEnabled?.()
+        ) {
+          this.streamRegistry?.open(chatId, handle.runId);
         }
-      : undefined;
+        return handle;
+      },
+      onAssistantSeeded: (runId, messageId) =>
+        this.aiChatRunService.linkAssistantMessage(
+          runId,
+          workspace.id,
+          messageId,
+        ),
+      onStep: (runId, stepCount) =>
+        void this.aiChatRunService.recordStep(runId, workspace.id, stepCount),
+      onSettled: (runId, status, error) =>
+        this.aiChatRunService.finalizeRun(runId, workspace.id, status, error),
+    };
 
-    // Abort the agent loop when the client disconnects. `close` also fires on
-    // normal completion, so only abort when the response has not finished
-    // writing (a genuine disconnect). `once` fires at most once and self-removes;
-    // we also drop it on response `finish` so it never lingers after the stream
-    // completes normally (the AI SDK pipes the response fire-and-forget, so we
-    // cannot simply remove it once `stream()` returns).
+    // Handle a client disconnect. `close` also fires on normal completion, so only
+    // act when the response has not finished writing (a genuine disconnect). `once`
+    // fires at most once and self-removes; we also drop it on response `finish`.
     // DIAGNOSTIC (Safari stream-drop investigation) — temporary: wall-clock at
     // which a Safari disconnect is observed, measured from request receipt.
     const reqStartedAt = Date.now();
     const controller = new AbortController();
     const onClose = (): void => {
-      // A genuine disconnect leaves the response unfinished (unlike a normal
-      // completion, which also fires `close`). Such a drop — e.g. a reverse
-      // proxy cutting the SSE mid-answer — is otherwise invisible server-side,
-      // so log it here.
       if (!res.raw.writableEnded) {
         if (autonomousRuns) {
-          // #184: the turn is a DETACHED run. A disconnect must NOT abort it —
-          // the run keeps executing and persisting server-side; the client
-          // reconnects via /ai-chat/run (or re-stops via /ai-chat/stop). Log only.
+          // #184: a DETACHED run — a disconnect must NOT stop it. The run keeps
+          // executing and persisting server-side; the client reconnects via
+          // /ai-chat/run (or re-stops via /ai-chat/stop). Log only.
           this.logger.log(
             `AI chat stream: client disconnected; run continues server-side ` +
               `(elapsed=${Date.now() - reqStartedAt}ms since request received)`,
           );
         } else {
+          // #487: legacy — a disconnect ENDS the turn, but the turn is now a RUN,
+          // so stop it through the run's stop lever (requestStop). streamText no
+          // longer consumes the socket signal (effectiveSignal is the run signal),
+          // so aborting `controller` would do nothing; requestStop aborts the run.
           this.logger.warn(
-            `AI chat stream: client disconnected before completion; aborting turn ` +
-              `(elapsed=${Date.now() - reqStartedAt}ms since request received)`,
+            `AI chat stream: client disconnected before completion; stopping the ` +
+              `run (elapsed=${Date.now() - reqStartedAt}ms since request received)`,
           );
-          controller.abort();
+          if (currentRunId) {
+            void this.aiChatRunService.requestStop(currentRunId, workspace.id);
+          }
         }
       }
     };
     req.raw.once('close', onClose);
     res.raw.once('finish', () => req.raw.off('close', onClose));
 
-    // #184: in detached mode the turn is NOT aborted on disconnect, so the SDK's
-    // pipe keeps writing to a socket the client may have dropped — for the rest of
-    // the (continuing) run. A write to the dead socket can emit an 'error' on the
-    // raw response; without a listener that surfaces as an unhandled error event.
-    // Swallow it (the run continues server-side regardless). Legacy mode aborts on
-    // disconnect, so it does not need this and keeps its exact prior behavior.
-    if (autonomousRuns) {
-      res.raw.on('error', (err) => {
-        this.logger.debug(
-          `AI chat detached stream: post-disconnect socket error swallowed: ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      });
-    }
+    // #184/#487: the run/pipe can outlive the socket in BOTH modes now (autonomous
+    // keeps going; legacy keeps going until requestStop's abort unwinds the turn).
+    // The SDK's pipe may then write to a dropped socket and emit an 'error' on the
+    // raw response — swallow it so it never surfaces as an unhandled error event.
+    res.raw.on('error', (err) => {
+      this.logger.debug(
+        `AI chat stream: post-disconnect socket error swallowed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
 
     // Commit to streaming: hijack so Fastify stops managing the response and
     // the AI SDK can write the UI-message stream directly to the Node socket.
@@ -562,8 +603,10 @@ export class AiChatController {
         signal: controller.signal,
         model,
         role,
-        // #184: present only when the flag is on; wraps the turn in a durable run.
+        // #487: the turn is always run-wrapped now (both modes).
         runHooks,
+        // #487: warn the new run that a superseded run's last ops may still apply.
+        superseded,
       });
     } catch (err) {
       // Any failure AFTER hijack can no longer go through Nest's exception
