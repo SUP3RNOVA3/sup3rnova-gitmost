@@ -223,21 +223,28 @@ export class ShareAliasService {
     alias: string;
     valid: boolean;
     available: boolean;
-    currentPageId: string | null;
   }> {
     const alias = normalizeShareAlias(rawAlias);
     if (!isValidShareAlias(alias)) {
-      return { alias, valid: false, available: false, currentPageId: null };
+      return { alias, valid: false, available: false };
     }
     const existing = await this.shareAliasRepo.findByAliasAndWorkspace(
       alias,
       workspaceId,
     );
+    // SECURITY (#495): return ONLY the boolean availability. The previous shape
+    // leaked `currentPageId` — the id of whatever page the alias already targets —
+    // to ANY authenticated workspace member, with no view-permission check on that
+    // page. An attacker could enumerate alias names and map them to page ids they
+    // have no access to. The taken/free bit is all the "is this address free"
+    // probe needs; the reassign flow surfaces the target's title only AFTER a real
+    // setAlias attempt (the 409 ALIAS_REASSIGN_REQUIRED path), which is access-
+    // gated. If a caller ever needs the target page id, it must be returned only
+    // behind an explicit `validateCanView` on that page.
     return {
       alias,
       valid: true,
       available: !existing,
-      currentPageId: existing?.pageId ?? null,
     };
   }
 

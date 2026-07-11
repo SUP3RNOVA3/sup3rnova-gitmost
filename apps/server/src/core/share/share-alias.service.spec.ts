@@ -450,18 +450,22 @@ describe('ShareAliasService', () => {
         alias: 'free-name',
         valid: true,
         available: true,
-        currentPageId: null,
       });
+      // SECURITY (#495): the availability probe must NOT leak any page id.
+      expect(res).not.toHaveProperty('currentPageId');
     });
 
-    it('reports taken with the current target page', async () => {
+    it('reports taken WITHOUT leaking the current target page id (#495)', async () => {
       const { service, shareAliasRepo } = makeService();
       shareAliasRepo.findByAliasAndWorkspace.mockResolvedValue({
         id: 'a-1',
         pageId: 'p-9',
       });
       const res = await service.checkAvailability('taken', 'ws-1');
-      expect(res).toMatchObject({ available: false, currentPageId: 'p-9' });
+      expect(res).toMatchObject({ available: false });
+      // The row exists (available:false) but its pageId is never returned — an
+      // authenticated member cannot map an alias name to a page id it can't view.
+      expect(res).not.toHaveProperty('currentPageId');
     });
   });
 
