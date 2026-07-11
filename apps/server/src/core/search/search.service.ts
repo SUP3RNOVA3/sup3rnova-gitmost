@@ -1,34 +1,49 @@
 import { Injectable } from '@nestjs/common';
 import { SearchDTO, SearchSuggestionDTO } from './dto/search.dto';
 import {
-  SearchLookupResponseDto,
   SearchResponseDto,
+  SearchResultDto,
 } from './dto/search-response.dto';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
-import { sql } from 'kysely';
+import { RawBuilder, sql } from 'kysely';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
+import {
+  ParsedQuery,
+  ParsedTerm,
+  parseSearchQuery,
+  SearchBooleanMode,
+  SearchMatchMode,
+  hasPositiveRecall,
+} from './search-query-parser';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const tsquery = require('pg-tsquery')();
 
-// Build a safe prefix tsquery string from a raw user query.
+// The FTS text-search configuration used on BOTH the stored side (pages.tsv via
+// its trigger, see migration 20260707T120000) and the query side here. #529
+// acceptance #13 invariant: column config and query config always change as a
+// pair — flip this only alongside the migration.
+const TS_CONFIG = 'ru_en';
+
+// RRF constant (Cormack et al. 2009; the Elasticsearch/OpenSearch default). RRF
+// fuses RANKS (not raw scores) so the incomparable ts_rank_cd (lexical) and the
+// substring tier scales never need normalizing — that is the whole point.
+const RRF_K = 60;
+
+// Legacy prefix-tsquery builder (kept for the /suggest path + back-compat unit
+// tests). The #529 engine below no longer uses it — it parses the query into an
+// AST instead — but `buildTsQuery` remains exported and behaviour-identical.
 //
-// The previous inline form `tsquery(query.trim() + '*')` passed user input
-// (including to_tsquery operators like `&`, `|`, `!`, `<->`, `*`, backslashes)
-// straight through. pg-tsquery would then emit operator fragments that
-// `to_tsquery('ru_en', ...)` can reject as a syntax error, turning a search
-// into a 500. We strip everything that is not a letter, number or whitespace
-// BEFORE handing the text to pg-tsquery, so adversarial input degrades to a
-// neutral (possibly empty) query instead of throwing, while normal word queries
-// (incl. accented / non-Latin words) are unaffected.
+// Strips everything that is not a letter/number/space BEFORE handing text to
+// pg-tsquery so adversarial to_tsquery operators degrade to a neutral query
+// instead of a 500.
 export function buildTsQuery(raw: string): string {
   const cleaned = (raw ?? '')
     .normalize('NFC')
-    // Keep Unicode letters/numbers and whitespace; drop everything else.
     .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -37,11 +52,9 @@ export function buildTsQuery(raw: string): string {
   return tsquery(cleaned + '*');
 }
 
-// Escape the LIKE metacharacters (`%`, `_`, `\`) in a raw user query so every
-// character — including `.`, `-`, `_`, `%`, `/` — is matched LITERALLY by a
-// `col LIKE '%' || q || '%'` predicate. Without this, a query of `%` or `_`
-// would match every row (see the #443 acceptance table). The backslash is the
-// escape char (Postgres LIKE default), so it must be escaped first.
+// Escape the LIKE metacharacters (`%`, `_`, `\`) so every character is matched
+// LITERALLY by a `col LIKE '%' || q || '%'` predicate. Without this a query of
+// `%` or `_` would match every row.
 export function escapeLikePattern(raw: string): string {
   return (raw ?? '')
     .replace(/\\/g, '\\\\')
@@ -49,39 +62,24 @@ export function escapeLikePattern(raw: string): string {
     .replace(/_/g, '\\_');
 }
 
-// Ranking tiers for the agent-lookup mode (#443), highest first. A hit's tier
-// is the strongest way it matched; ties inside a tier break on a secondary
-// signal (FTS rank, or first-match position). The numeric `score` returned to
-// the caller is derived from (tier, secondary) and is meaningful ONLY for
-// ordering within a single response.
+// Substring tier (highest first), used to rank the substring branch before RRF.
 export enum SearchLookupTier {
-  // Title equals the query, case-insensitively.
   TITLE_EXACT = 3,
-  // Query is a substring of the title.
   TITLE_SUBSTRING = 2,
-  // Query matched in the text (substring or FTS).
   TEXT = 1,
 }
 
-export interface RankableHit {
-  tier: SearchLookupTier;
-  // Secondary in-tier signal, higher = better (e.g. ts_rank, or a
-  // position-derived closeness score). Defaults to 0.
-  secondary?: number;
+// Env-tunable fusion window: the top-N candidates (by RRF) that pagination can
+// reach. The tail beyond it is unreachable (truncatedAtCap:true). Default 500.
+function getCandidateCap(): number {
+  const raw = Number(process.env.SEARCH_CANDIDATE_CAP);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 500;
 }
 
-// Map (tier, secondary) → a 0..1 float used ONLY to sort one response.
-//
-// Formula: score = (tier + squash(secondary)) / (maxTier + 1), where
-//   squash(x) = x / (1 + x)  maps any non-negative secondary into [0, 1)
-// so a stronger tier ALWAYS outranks a weaker one regardless of the secondary
-// value, and within a tier a larger secondary sorts higher. maxTier is the top
-// enum value (TITLE_EXACT = 3), so the divisor keeps the result in (0, 1].
-export function computeLookupScore(hit: RankableHit): number {
-  const maxTier = SearchLookupTier.TITLE_EXACT;
-  const secondary = Math.max(0, hit.secondary ?? 0);
-  const squashed = secondary / (1 + secondary);
-  return (hit.tier + squashed) / (maxTier + 1);
+// Global AND/OR toggle: SEARCH_MODE overrides the request `mode` default. Both
+// are valid on the ru_en tsv — this is a parser toggle, NOT a config rollback.
+function defaultBooleanMode(): SearchBooleanMode {
+  return process.env.SEARCH_MODE === 'and' ? 'and' : 'or';
 }
 
 @Injectable()
@@ -94,194 +92,196 @@ export class SearchService {
     private pagePermissionRepo: PagePermissionRepo,
   ) {}
 
-  async searchPage(
-    searchParams: SearchDTO,
-    opts: {
-      userId?: string;
-      workspaceId: string;
-    },
-  ): Promise<{ items: SearchResponseDto[] | SearchLookupResponseDto[] }> {
-    const { query } = searchParams;
+  // === #529 SQL fragment builders (parameterized AST, never string-concat) =====
 
-    if (query.length < 1) {
-      return { items: [] };
-    }
-
-    // Opt-in agent-lookup mode (#443). Guarded by the `substring` flag so the
-    // web-UI (which never sets it) keeps byte-identical FTS behaviour below.
-    if (searchParams.substring) {
-      return this.searchPageLookup(searchParams, opts);
-    }
-
-    const searchQuery = buildTsQuery(query);
-
-    let queryResults = this.db
-      .selectFrom('pages')
-      .select([
-        'id',
-        'slugId',
-        'title',
-        'icon',
-        'parentPageId',
-        'creatorId',
-        'createdAt',
-        'updatedAt',
-        sql<number>`ts_rank(tsv, to_tsquery('ru_en', f_unaccent(${searchQuery})))`.as(
-          'rank',
-        ),
-        sql<string>`ts_headline('ru_en', text_content, to_tsquery('ru_en', f_unaccent(${searchQuery})),'MinWords=9, MaxWords=10, MaxFragments=3')`.as(
-          'highlight',
-        ),
-      ])
-      .where(
-        'tsv',
-        '@@',
-        sql<string>`to_tsquery('ru_en', f_unaccent(${searchQuery}))`,
-      )
-      .$if(Boolean(searchParams.creatorId), (qb) =>
-        qb.where('creatorId', '=', searchParams.creatorId),
-      )
-      .where('deletedAt', 'is', null)
-      .orderBy('rank', 'desc')
-      .limit(searchParams.limit || 25)
-      .offset(searchParams.offset || 0);
-
-    if (!searchParams.shareId) {
-      queryResults = queryResults.select((eb) => this.pageRepo.withSpace(eb));
-    }
-
-    if (searchParams.spaceId) {
-      // search by spaceId
-      queryResults = queryResults.where('spaceId', '=', searchParams.spaceId);
-    } else if (opts.userId && !searchParams.spaceId) {
-      // only search spaces the user is a member of
-      queryResults = queryResults
-        .where(
-          'spaceId',
-          'in',
-          this.spaceMemberRepo.getUserSpaceIdsQuery(opts.userId),
-        )
-        .where('workspaceId', '=', opts.workspaceId);
-    } else if (searchParams.shareId && !searchParams.spaceId && !opts.userId) {
-      // search in shares
-      const shareId = searchParams.shareId;
-      const share = await this.shareRepo.findById(shareId);
-      if (!share || share.workspaceId !== opts.workspaceId) {
-        return { items: [] };
-      }
-
-      const isRestricted =
-        await this.pagePermissionRepo.hasRestrictedAncestor(share.pageId);
-      if (isRestricted) {
-        return { items: [] };
-      }
-
-      const pageIdsToSearch = [];
-      if (share.includeSubPages) {
-        const pageList = await this.pageRepo.getPageAndDescendantsExcludingRestricted(
-          share.pageId,
-          {
-            includeContent: false,
-          },
-        );
-
-        pageIdsToSearch.push(...pageList.map((page) => page.id));
-      } else {
-        pageIdsToSearch.push(share.pageId);
-      }
-
-      if (pageIdsToSearch.length > 0) {
-        queryResults = queryResults
-          .where('id', 'in', pageIdsToSearch)
-          .where('workspaceId', '=', opts.workspaceId);
-      } else {
-        return { items: [] };
-      }
-    } else {
-      return { items: [] };
-    }
-
-    //@ts-ignore
-    let results: any[] = await queryResults.execute();
-
-    // Filter results by page-level permissions (if user is authenticated)
-    if (opts.userId && results.length > 0) {
-      const pageIds = results.map((r: any) => r.id);
-      const accessibleIds =
-        await this.pagePermissionRepo.filterAccessiblePageIds({
-          pageIds,
-          userId: opts.userId,
-          spaceId: searchParams.spaceId,
-          // #348 — enables the workspace-level short-circuit when not space-scoped.
-          workspaceId: opts.workspaceId,
-        });
-      const accessibleSet = new Set(accessibleIds);
-      results = results.filter((r: any) => accessibleSet.has(r.id));
-    }
-
-    //@ts-ignore
-    const searchResults = results.map((result: SearchResponseDto) => {
-      if (result.highlight) {
-        result.highlight = result.highlight
-          .replace(/\r\n|\r|\n/g, ' ')
-          .replace(/\s+/g, ' ');
-      }
-      return result;
-    });
-
-    return { items: searchResults };
+  // to_tsquery for a single FTS term. The term's own (already metachar-stripped)
+  // words are joined with `&` and given a `:*` suffix for the prefix branch. The
+  // whole lexeme string is a BOUND parameter to to_tsquery — no user operator can
+  // reach the parser.
+  private ftsTermTsq(term: ParsedTerm): RawBuilder<unknown> {
+    const words = term.text.split(/\s+/).filter(Boolean);
+    const suffix = term.branch === 'ftsPrefix' ? ':*' : '';
+    const lexeme = words.map((w) => w + suffix).join(' & ');
+    return sql`to_tsquery(${TS_CONFIG}, f_unaccent(${lexeme}))`;
   }
 
-  /**
-   * Agent-lookup search (#443, opt-in via `SearchDTO.substring`).
-   *
-   * ADDITIVE to the FTS path: runs a substring branch (title + optionally
-   * text_content, LIKE with metacharacters escaped) MERGED with the existing
-   * FTS branch, so technical tokens that the `english` tokenizer mangles
-   * (`backup-srv.local`, `10.0.12.5`, `WB-MGE-30D86B`) are still found — even
-   * when `buildTsQuery()` returns '' for a dotted/numeric query. Results carry a
-   * location (`path`), a windowed `snippet` and a per-response `score`.
-   *
-   * The whole method is only reached when `substring: true`; the web-UI never
-   * sets it, so its behaviour is unchanged.
-   */
-  private async searchPageLookup(
+  private phraseTermTsq(term: ParsedTerm): RawBuilder<unknown> {
+    return sql`phraseto_tsquery(${TS_CONFIG}, f_unaccent(${term.text}))`;
+  }
+
+  private termTsq(term: ParsedTerm): RawBuilder<unknown> {
+    return term.branch === 'phrase'
+      ? this.phraseTermTsq(term)
+      : this.ftsTermTsq(term);
+  }
+
+  // Fold FTS/phrase term tsqueries into ONE tsquery via the SQL `||` operator
+  // (AND via `&&` when mode is 'and'). Returns null when there are no such terms.
+  private combineTsq(
+    terms: ParsedTerm[],
+    mode: SearchBooleanMode,
+  ): RawBuilder<unknown> | null {
+    const ftsTerms = terms.filter((t) => t.branch !== 'substring');
+    if (ftsTerms.length === 0) return null;
+    const op = mode === 'and' ? sql`&&` : sql`||`;
+    let acc: RawBuilder<unknown> = sql`(${this.termTsq(ftsTerms[0])})`;
+    for (let i = 1; i < ftsTerms.length; i++) {
+      acc = sql`(${acc}) ${op} (${this.termTsq(ftsTerms[i])})`;
+    }
+    return acc;
+  }
+
+  // A LIKE '%needle%' pattern in the LOWER(f_unaccent(...)) space. Coalesce-free
+  // so it can use the trigram GIN indexes (a coalesce wrapper would force a seq
+  // scan). NULL title/text simply doesn't match, exactly as '' wouldn't.
+  private likePattern(term: ParsedTerm): RawBuilder<unknown> {
+    const body = '%' + escapeLikePattern(term.text) + '%';
+    return sql`LOWER(f_unaccent(${body}))`;
+  }
+
+  private substringPred(
+    term: ParsedTerm,
+    titleOnly: boolean,
+  ): RawBuilder<unknown> {
+    const pat = this.likePattern(term);
+    const title = sql`LOWER(f_unaccent(pages.title)) LIKE ${pat} ESCAPE '\\'`;
+    if (titleOnly) return sql`(${title})`;
+    const text = sql`LOWER(f_unaccent(pages.text_content)) LIKE ${pat} ESCAPE '\\'`;
+    return sql`(${title} OR ${text})`;
+  }
+
+  // Whole-candidate match predicate for a single term (required / excluded
+  // predicates, and per-hit matchedTerms).
+  private termMatchPred(
+    term: ParsedTerm,
+    titleOnly: boolean,
+  ): RawBuilder<unknown> {
+    if (term.branch === 'substring') return this.substringPred(term, titleOnly);
+    return sql`(pages.tsv @@ ${this.termTsq(term)})`;
+  }
+
+  // The positive RECALL predicate: OR (or AND, per mode) of every positive term's
+  // match — the FTS terms via one combined tsquery, the substring terms via LIKE.
+  private positiveRecall(
+    parsed: ParsedQuery,
+    titleOnly: boolean,
+  ): RawBuilder<unknown> {
+    const parts: RawBuilder<unknown>[] = [];
+    const tsq = this.combineTsq(parsed.positive, parsed.mode);
+    if (tsq) parts.push(sql`(pages.tsv @@ (${tsq}))`);
+    for (const t of parsed.positive.filter((x) => x.branch === 'substring')) {
+      parts.push(this.substringPred(t, titleOnly));
+    }
+    if (parts.length === 0) return sql`false`;
+    const op = parsed.mode === 'and' ? sql` AND ` : sql` OR `;
+    return sql`(${sql.join(parts, op)})`;
+  }
+
+  // The full candidate WHERE: positive recall AND every required AND none of the
+  // excluded. Required terms with no positive term ARE the recall (A2).
+  private candidatePredicate(
+    parsed: ParsedQuery,
+    titleOnly: boolean,
+  ): RawBuilder<unknown> {
+    const preds: RawBuilder<unknown>[] = [];
+    if (parsed.positive.length > 0) {
+      preds.push(this.positiveRecall(parsed, titleOnly));
+    }
+    for (const t of parsed.required) {
+      preds.push(this.termMatchPred(t, titleOnly));
+    }
+    for (const t of parsed.excluded) {
+      preds.push(sql`NOT ${this.termMatchPred(t, titleOnly)}`);
+    }
+    if (preds.length === 0) return sql`false`;
+    return sql`(${sql.join(preds, sql` AND `)})`;
+  }
+
+  // ts_rank_cd over the positive FTS tsquery. NULL when the query has no FTS
+  // positive term (pure-substring query) — the row is then absent from the FTS
+  // RRF branch.
+  private ftsScoreExpr(parsed: ParsedQuery): RawBuilder<unknown> {
+    const tsq = this.combineTsq(parsed.positive, parsed.mode);
+    if (!tsq) return sql`NULL::float`;
+    return sql`CASE WHEN pages.tsv @@ (${tsq}) THEN ts_rank_cd(pages.tsv, (${tsq})) ELSE NULL END`;
+  }
+
+  // Substring tier (3 title-exact / 2 title-substring / 1 text) or NULL when the
+  // row matched no positive substring term. Drives the substring RRF branch.
+  private subTierExpr(
+    parsed: ParsedQuery,
+    titleOnly: boolean,
+  ): RawBuilder<unknown> {
+    const subTerms = parsed.positive.filter((t) => t.branch === 'substring');
+    if (subTerms.length === 0) return sql`NULL::int`;
+    const exact: RawBuilder<unknown>[] = [];
+    const titleSub: RawBuilder<unknown>[] = [];
+    const textSub: RawBuilder<unknown>[] = [];
+    for (const t of subTerms) {
+      const needle = sql`LOWER(f_unaccent(${t.text}))`;
+      const pat = this.likePattern(t);
+      exact.push(sql`LOWER(f_unaccent(pages.title)) = ${needle}`);
+      titleSub.push(sql`LOWER(f_unaccent(pages.title)) LIKE ${pat} ESCAPE '\\'`);
+      textSub.push(
+        sql`LOWER(f_unaccent(pages.text_content)) LIKE ${pat} ESCAPE '\\'`,
+      );
+    }
+    const exactOr = sql`(${sql.join(exact, sql` OR `)})`;
+    const titleOr = sql`(${sql.join(titleSub, sql` OR `)})`;
+    const textOr = titleOnly
+      ? sql`false`
+      : sql`(${sql.join(textSub, sql` OR `)})`;
+    return sql`CASE WHEN ${exactOr} THEN 3 WHEN ${titleOr} THEN 2 WHEN ${textOr} THEN 1 ELSE NULL END`;
+  }
+
+  // === Main entry (A6 unified path) ==========================================
+
+  async searchPage(
     searchParams: SearchDTO,
     opts: { userId?: string; workspaceId: string },
-  ): Promise<{ items: SearchLookupResponseDto[] }> {
-    const rawQuery = searchParams.query.trim();
-    if (!rawQuery) {
-      return { items: [] };
+  ): Promise<SearchResponseDto> {
+    const rawQuery = (searchParams.query ?? '').trim();
+    const mode = defaultBooleanMode();
+    const match = (searchParams.match as SearchMatchMode) ?? 'auto';
+    const parsed = parseSearchQuery(rawQuery, { match, mode });
+    const titleOnly = Boolean(searchParams.titleOnly);
+    const limit = Math.min(Math.max(searchParams.limit || 25, 1), 100);
+    const offset = Math.max(searchParams.offset || 0, 0);
+    const cap = getCandidateCap();
+
+    const queryMeta = {
+      raw: parsed.raw,
+      parsed: {
+        positive: parsed.positive.map((t) => t.text),
+        required: parsed.required.map((t) => t.text),
+        excluded: parsed.excluded.map((t) => t.text),
+        reason: parsed.reason,
+      },
+      mode: parsed.mode,
+      match,
+    };
+
+    const empty = (reason?: string): SearchResponseDto => ({
+      items: [],
+      total: 0,
+      hasMore: false,
+      truncatedAtCap: false,
+      offset,
+      query: reason
+        ? { ...queryMeta, parsed: { ...queryMeta.parsed, reason } }
+        : queryMeta,
+    });
+
+    // Only-negation / empty query: never run an expensive NOT-only scan (A2).
+    if (!hasPositiveRecall(parsed)) {
+      return empty(parsed.reason);
     }
 
-    const limit = Math.min(Math.max(searchParams.limit || 10, 1), 50);
+    // --- Resolve scope (A6). --------------------------------------------------
+    const scope = await this.resolveScope(searchParams, opts);
+    if (scope.kind === 'none') return empty();
 
-    // Normalize the query the same way as the FTS / suggest path: f_unaccent +
-    // lower, done in SQL. `q` is the escaped LIKE pattern body (literal chars).
-    const likeBody = escapeLikePattern(rawQuery);
-    // Compare against `LOWER(f_unaccent(col))`; unaccent+lower the needle too.
-    const needle = sql<string>`LOWER(f_unaccent(${rawQuery}))`;
-    const likePattern = sql<string>`LOWER(f_unaccent(${'%' + likeBody + '%'}))`;
-    const tsQuery = buildTsQuery(rawQuery);
-    const hasTsQuery = tsQuery.length > 0;
-
-    // --- Resolve the space scope. ---------------------------------------------
-    // Mirrors searchPage: explicit spaceId, else the authenticated user's member
-    // spaces. The share path is not exposed to this opt-in mode.
-    let spaceIds: string[] = [];
-    if (searchParams.spaceId) {
-      spaceIds = [searchParams.spaceId];
-    } else if (opts.userId) {
-      spaceIds = await this.spaceMemberRepo.getUserSpaceIds(opts.userId);
-    } else {
-      return { items: [] };
-    }
-    if (spaceIds.length === 0) {
-      return { items: [] };
-    }
-
-    // --- Optional parentPageId subtree scope (inclusive). ---------------------
-    // Reuse the same recursive-descendants pattern used for share-scope.
+    // --- Optional parentPageId subtree scope. ---------------------------------
     let descendantIds: string[] | null = null;
     if (searchParams.parentPageId) {
       const descendants = await this.pageRepo.getPageAndDescendants(
@@ -289,239 +289,302 @@ export class SearchService {
         { includeContent: false },
       );
       descendantIds = descendants.map((p: any) => p.id);
-      if (descendantIds.length === 0) {
-        return { items: [] };
-      }
+      if (descendantIds.length === 0) return empty();
     }
 
-    // --- Candidate query: substring (title + text) UNION FTS. -----------------
-    // We compute everything the ranker needs in SQL and pull only small columns
-    // (never the whole text_content) into Node:
-    //   - titleExact / titleSub: tier signals
-    //   - textMatchPos: 1-based position of the first text match (0 = none)
-    //   - ftsRank: ts_rank for the FTS secondary signal (0 when no tsquery)
-    //   - snippet: windowed ~500 chars around the first text match, or a leading
-    //     text window (title-only hit), or an extended ts_headline fallback.
-    const N_BEFORE = 60; // chars of context before the first match
-    const SNIPPET_LEN = 500;
+    // --- Build the shared candidate WHERE fragment. ---------------------------
+    const scopePreds: RawBuilder<unknown>[] = [sql`pages.deleted_at IS NULL`];
+    if (scope.kind === 'spaces') {
+      scopePreds.push(
+        sql`pages.space_id = ANY(${scope.spaceIds}::uuid[])`,
+        sql`pages.workspace_id = ${scope.workspaceId}`,
+      );
+    } else {
+      // share: an explicit (already permission-filtered) id set.
+      scopePreds.push(
+        sql`pages.id = ANY(${scope.pageIds}::uuid[])`,
+        sql`pages.workspace_id = ${scope.workspaceId}`,
+      );
+    }
+    if (searchParams.creatorId) {
+      scopePreds.push(sql`pages.creator_id = ${searchParams.creatorId}`);
+    }
+    if (descendantIds) {
+      scopePreds.push(sql`pages.id = ANY(${descendantIds}::uuid[])`);
+    }
+    const scopeSql = sql`(${sql.join(scopePreds, sql` AND `)})`;
+    const candidateSql = sql`(${scopeSql} AND ${this.candidatePredicate(parsed, titleOnly)})`;
 
-    let candidates = this.db
+    // --- Ranked candidate ids (ALL matches, RRF order). -----------------------
+    // Two independent branches ranked SEPARATELY (FTS by ts_rank_cd, substring by
+    // tier) then fused with RRF: score = Σ 1/(k + rank_branch). Deterministic
+    // ORDER BY rrf DESC, id so pagination never dupes/skips (A4, acceptance #8).
+    const rankedRows = await sql<{ id: string }>`
+      WITH candidates AS (
+        SELECT pages.id AS id,
+               ${this.ftsScoreExpr(parsed)} AS fts_score,
+               ${this.subTierExpr(parsed, titleOnly)} AS sub_tier
+        FROM pages
+        WHERE ${candidateSql}
+      ),
+      ranked AS (
+        SELECT id, fts_score, sub_tier,
+               row_number() OVER (ORDER BY fts_score DESC NULLS LAST, id) AS rn_fts,
+               row_number() OVER (ORDER BY sub_tier DESC NULLS LAST, id) AS rn_sub
+        FROM candidates
+      )
+      SELECT id
+      FROM ranked
+      ORDER BY
+        (CASE WHEN fts_score IS NOT NULL THEN 1.0/(${RRF_K} + rn_fts) ELSE 0 END)
+        + (CASE WHEN sub_tier IS NOT NULL THEN 1.0/(${RRF_K} + rn_sub) ELSE 0 END) DESC,
+        id ASC
+    `.execute(this.db);
+
+    let orderedIds = rankedRows.rows.map((r) => r.id);
+
+    // --- Permission filter (fail-closed, exact total). ------------------------
+    // filterAccessiblePageIds runs the #348 hasRestricted pre-check internally:
+    // no restricted pages in scope → returns the ids untouched (fast path, total
+    // stays trivially exact); otherwise a SQL anti-join drops hidden pages. An
+    // error PROPAGATES (500) — it never degrades to an empty lexical result, so
+    // hidden-page cardinality never leaks into `total`. The share path is already
+    // permission-filtered by getPageAndDescendantsExcludingRestricted.
+    if (opts.userId && scope.kind === 'spaces' && orderedIds.length > 0) {
+      const accessible = await this.pagePermissionRepo.filterAccessiblePageIds({
+        pageIds: orderedIds,
+        userId: opts.userId,
+        spaceId: searchParams.spaceId,
+        workspaceId: opts.workspaceId,
+      });
+      const accessibleSet = new Set(accessible);
+      orderedIds = orderedIds.filter((id) => accessibleSet.has(id));
+    }
+
+    const total = orderedIds.length;
+    const truncatedAtCap = total > cap;
+    const window = orderedIds.slice(0, cap);
+    const pageIds = window.slice(offset, offset + limit);
+    const hasMore = offset + pageIds.length < window.length;
+
+    if (pageIds.length === 0) {
+      return { items: [], total, hasMore, truncatedAtCap, offset, query: queryMeta };
+    }
+
+    // --- Detail fetch for the page slice only (ts_headline/snippet are costly, so
+    //     compute them ONLY for the returned rows), preserving RRF order. -------
+    const items = await this.fetchDetails(pageIds, parsed, titleOnly);
+
+    return { items, total, hasMore, truncatedAtCap, offset, query: queryMeta };
+  }
+
+  // Resolve the search scope: explicit space, the authed user's member spaces, or
+  // a public share's descendant id set (permission-filtered). Mirrors the legacy
+  // branch logic (A6) but returns a small tagged union.
+  private async resolveScope(
+    searchParams: SearchDTO,
+    opts: { userId?: string; workspaceId: string },
+  ): Promise<
+    | { kind: 'none' }
+    | { kind: 'spaces'; spaceIds: string[]; workspaceId: string }
+    | { kind: 'ids'; pageIds: string[]; workspaceId: string }
+  > {
+    if (searchParams.spaceId) {
+      return {
+        kind: 'spaces',
+        spaceIds: [searchParams.spaceId],
+        workspaceId: opts.workspaceId,
+      };
+    }
+
+    if (opts.userId && !searchParams.shareId) {
+      const spaceIds = await this.spaceMemberRepo.getUserSpaceIds(opts.userId);
+      if (spaceIds.length === 0) return { kind: 'none' };
+      return { kind: 'spaces', spaceIds, workspaceId: opts.workspaceId };
+    }
+
+    if (searchParams.shareId && !opts.userId) {
+      const share = await this.shareRepo.findById(searchParams.shareId);
+      if (!share || share.workspaceId !== opts.workspaceId) {
+        return { kind: 'none' };
+      }
+      const isRestricted = await this.pagePermissionRepo.hasRestrictedAncestor(
+        share.pageId,
+      );
+      if (isRestricted) return { kind: 'none' };
+
+      const pageIds: string[] = [];
+      if (share.includeSubPages) {
+        // A6: exclude restricted descendants + honour a restricted ancestor.
+        const pageList =
+          await this.pageRepo.getPageAndDescendantsExcludingRestricted(
+            share.pageId,
+            { includeContent: false },
+          );
+        pageIds.push(...pageList.map((p) => p.id));
+      } else {
+        pageIds.push(share.pageId);
+      }
+      if (pageIds.length === 0) return { kind: 'none' };
+      return { kind: 'ids', pageIds, workspaceId: opts.workspaceId };
+    }
+
+    return { kind: 'none' };
+  }
+
+  // Fetch the display superset (A7) for the given page ids, in the given order.
+  private async fetchDetails(
+    pageIds: string[],
+    parsed: ParsedQuery,
+    titleOnly: boolean,
+  ): Promise<SearchResultDto[]> {
+    const tsq = this.combineTsq(parsed.positive, parsed.mode);
+    // rank/highlight are FTS-only (null for substring-only hits — the web already
+    // falls back). ts_headline runs over the ORIGINAL text.
+    const rankExpr = tsq
+      ? sql<number>`CASE WHEN pages.tsv @@ (${tsq}) THEN ts_rank_cd(pages.tsv, (${tsq})) ELSE NULL END`
+      : sql<number>`NULL::float`;
+    const highlightExpr = tsq
+      ? sql<string>`CASE WHEN pages.tsv @@ (${tsq}) THEN ts_headline(${TS_CONFIG}, coalesce(pages.text_content, ''), (${tsq}), 'MinWords=9, MaxWords=10, MaxFragments=3') ELSE NULL END`
+      : sql<string>`NULL::text`;
+
+    // Windowed plain snippet: leading window, else the FTS headline (plain).
+    const snippetExpr = titleOnly
+      ? sql<string>`''`
+      : sql<string>`coalesce(
+          case
+            when coalesce(pages.text_content, '') <> ''
+              then substring(LOWER(f_unaccent(pages.text_content)) from 1 for 300)
+            ${
+              tsq
+                ? sql`else ts_headline(${TS_CONFIG}, coalesce(pages.text_content, ''), (${tsq}), 'MinWords=25, MaxWords=40, MaxFragments=3')`
+                : sql``
+            }
+          end, '')`;
+
+    // matchedFields: title / text.
+    const titleMatchParts: RawBuilder<unknown>[] = [];
+    const textMatchParts: RawBuilder<unknown>[] = [];
+    if (tsq) {
+      titleMatchParts.push(
+        sql`to_tsvector(${TS_CONFIG}, f_unaccent(coalesce(pages.title, ''))) @@ (${tsq})`,
+      );
+      if (!titleOnly) {
+        textMatchParts.push(
+          sql`(pages.tsv @@ (${tsq}) AND NOT to_tsvector(${TS_CONFIG}, f_unaccent(coalesce(pages.title, ''))) @@ (${tsq}))`,
+        );
+      }
+    }
+    for (const t of parsed.positive.filter((x) => x.branch === 'substring')) {
+      const pat = this.likePattern(t);
+      titleMatchParts.push(
+        sql`LOWER(f_unaccent(pages.title)) LIKE ${pat} ESCAPE '\\'`,
+      );
+      if (!titleOnly) {
+        textMatchParts.push(
+          sql`LOWER(f_unaccent(pages.text_content)) LIKE ${pat} ESCAPE '\\'`,
+        );
+      }
+    }
+    const titleMatchExpr = titleMatchParts.length
+      ? sql<boolean>`(${sql.join(titleMatchParts, sql` OR `)})`
+      : sql<boolean>`false`;
+    const textMatchExpr = textMatchParts.length
+      ? sql<boolean>`(${sql.join(textMatchParts, sql` OR `)})`
+      : sql<boolean>`false`;
+
+    // Per-term matched flags (positive + required), assembled into matchedTerms.
+    // NB: aliases must be UNDERSCORE-FREE — the app's Kysely runs the
+    // CamelCasePlugin, which would rewrite a `t_0` result key to `t0`. `tmatch0`
+    // survives the round-trip unchanged.
+    const allTerms = [...parsed.positive, ...parsed.required];
+    const termCols = allTerms.map(
+      (t, i) =>
+        sql`(${this.termMatchPred(t, titleOnly)}) AS "tmatch${sql.raw(String(i))}"`,
+    );
+
+    let q = this.db
       .selectFrom('pages')
       .select([
         'pages.id as id',
         'pages.slugId as slugId',
         'pages.title as title',
+        'pages.icon as icon',
         'pages.parentPageId as parentPageId',
-        // Tier signals.
-        sql<boolean>`LOWER(f_unaccent(coalesce(pages.title, ''))) = ${needle}`.as(
-          'titleExact',
-        ),
-        sql<boolean>`LOWER(f_unaccent(coalesce(pages.title, ''))) LIKE ${likePattern} ESCAPE '\\'`.as(
-          'titleSub',
-        ),
-        // 1-based position of the first text match (0 = no text match).
-        sql<number>`strpos(LOWER(f_unaccent(coalesce(pages.text_content, ''))), ${needle})`.as(
-          'textMatchPos',
-        ),
-        // FTS secondary signal (0 when the tsquery is empty).
-        hasTsQuery
-          ? sql<number>`ts_rank(pages.tsv, to_tsquery('ru_en', f_unaccent(${tsQuery})))`.as(
-              'ftsRank',
-            )
-          : sql<number>`0`.as('ftsRank'),
-        // Windowed snippet, computed entirely in SQL. Priority:
-        //  1. window around the first text match;
-        //  2. otherwise (titleOnly: no snippet; else) a leading window of the
-        //     page text (title-only hit);
-        //  3. otherwise an extended ts_headline for pure-FTS hits.
-        //
-        // #443 snippet-position fix: the match position (`strpos`) is computed in
-        // the LOWER(f_unaccent(...)) space, but f_unaccent is NOT length-
-        // preserving (ß→ss, æ→ae, …→..., ½→ 1/2, full-width forms), so slicing
-        // the ORIGINAL text at that position was misaligned — a single expanding
-        // char before the match shifted the window (or ran it past end → empty).
-        // We now slice from the SAME LOWER(f_unaccent(...)) string so position
-        // and slice share one coordinate space. DELIBERATE trade-off: the snippet
-        // loses original case/diacritics — acceptable for an agent-facing snippet
-        // (position accuracy over original-glyph fidelity). The ts_headline branch
-        // matches over the ORIGINAL text itself, so it is unaffected and kept as-is.
-        searchParams.titleOnly
-          ? sql<string>`''`.as('snippet')
-          : sql<string>`
-          coalesce(
-            case
-              when strpos(LOWER(f_unaccent(coalesce(pages.text_content, ''))), ${needle}) > 0
-                then substring(
-                  LOWER(f_unaccent(coalesce(pages.text_content, '')))
-                  from greatest(1, strpos(LOWER(f_unaccent(coalesce(pages.text_content, ''))), ${needle}) - ${N_BEFORE})
-                  for ${SNIPPET_LEN}
-                )
-              when coalesce(pages.text_content, '') <> ''
-                then substring(LOWER(f_unaccent(pages.text_content)) from 1 for 300)
-              ${
-                hasTsQuery
-                  ? sql`else ts_headline('ru_en', coalesce(pages.text_content, ''), to_tsquery('ru_en', f_unaccent(${tsQuery})), 'MinWords=25, MaxWords=40, MaxFragments=3')`
-                  : sql``
-              }
-            end,
-            ''
-          )
-        `.as('snippet'),
+        'pages.creatorId as creatorId',
+        'pages.spaceId as spaceId',
+        'pages.createdAt as createdAt',
+        'pages.updatedAt as updatedAt',
+        rankExpr.as('rank'),
+        highlightExpr.as('highlight'),
+        snippetExpr.as('snippet'),
+        titleMatchExpr.as('titleMatch'),
+        textMatchExpr.as('textMatch'),
       ])
-      .where('pages.deletedAt', 'is', null)
-      .where('pages.spaceId', 'in', spaceIds);
+      .select((eb) => this.pageRepo.withSpace(eb))
+      .where(sql<boolean>`pages.id = ANY(${pageIds}::uuid[])` as any);
 
-    if (descendantIds) {
-      candidates = candidates.where('pages.id', 'in', descendantIds);
+    if (termCols.length > 0) {
+      q = q.select(termCols as any);
     }
 
-    // Match predicate: title substring OR (unless titleOnly) text substring OR
-    // (unless titleOnly) FTS. The substring branch runs even when the tsquery is
-    // empty — that is the dotted/numeric-token case the FTS path misses.
-    //
-    // #443 dead-index fix: these two LIKE predicates MUST match the GIN trgm
-    // index expressions EXACTLY for Postgres to use them. The indexes are on the
-    // coalesce-FREE expressions `LOWER(f_unaccent(title))` (#348's
-    // idx_pages_title_trgm) and `LOWER(f_unaccent(text_content))` (this PR's
-    // idx_pages_text_content_trgm). A `coalesce(col,'')` wrapper here would make
-    // the query expression differ from the index expression and force a Seq Scan
-    // on pages for every lookup. Dropping coalesce is SEMANTICALLY EQUIVALENT:
-    // `NULL LIKE '%q%'` is NULL (falsy), so a NULL title/text simply doesn't
-    // match — exactly as an empty string wouldn't match `%q%`.
-    candidates = candidates.where((eb) => {
-      const ors = [
-        eb(
-          sql`LOWER(f_unaccent(pages.title))`,
-          'like',
-          sql`${likePattern} ESCAPE '\\'`,
-        ),
-      ];
-      if (!searchParams.titleOnly) {
-        ors.push(
-          eb(
-            sql`LOWER(f_unaccent(pages.text_content))`,
-            'like',
-            sql`${likePattern} ESCAPE '\\'`,
-          ),
-        );
-        if (hasTsQuery) {
-          ors.push(
-            sql<boolean>`pages.tsv @@ to_tsquery('ru_en', f_unaccent(${tsQuery}))` as any,
-          );
-        }
-      }
-      return eb.or(ors);
-    });
+    const rows: any[] = await q.execute();
 
-    // Pull a generous candidate set (before permission filtering + limit).
-    // Cap it so a pathological match set cannot blow up memory; 200 >> limit
-    // (max 50) leaves ample headroom for the post-permission truncation.
-    //
-    // #443 cap-ordering fix: the 200-cap MUST be deterministic and relevance-
-    // biased. Without an ORDER BY, Postgres returns an ARBITRARY 200 rows, so on
-    // a broad match set (common word / short substring) a strong TITLE_EXACT hit
-    // could be among the dropped rows while 200 low-tier TEXT hits fill the cap.
-    // We order by the SAME SQL tier proxies the Node ranker uses — title-exact,
-    // then title-substring, then fts-rank (nulls last), then earliest text-match
-    // position — so the cap keeps the strongest candidates. The Node-side final
-    // tier sort + slice(0, limit) below still runs and stays authoritative; this
-    // ORDER BY only decides WHICH candidates survive the 200-cap.
-    // NB: a BARE integer literal in ORDER BY is read by Postgres as an ordinal
-    // column position (`ORDER BY 0` → "position 0 is not in select list"), so the
-    // no-tsquery fallback is `0::float`, not `0`.
-    const ftsRankExpr = hasTsQuery
-      ? sql`ts_rank(pages.tsv, to_tsquery('ru_en', f_unaccent(${tsQuery})))`
-      : sql`0::float`;
-    const candidatesCapped = candidates
-      // Raw-SQL ORDER BY expressions: pass the full `<expr> <dir>` as ONE arg
-      // (the two-arg form treats a raw-SQL second arg as an ORDER BY position).
-      .orderBy(
-        sql`(LOWER(f_unaccent(coalesce(pages.title, ''))) = ${needle}) desc`,
-      )
-      .orderBy(
-        sql`(LOWER(f_unaccent(coalesce(pages.title, ''))) LIKE ${likePattern} ESCAPE '\\') desc`,
-      )
-      .orderBy(sql`${ftsRankExpr} desc nulls last`)
-      // Earlier text match first; strpos returns 0 for "no match", which would
-      // sort BEFORE a real (>=1) position under plain ASC, so push 0 to the end.
-      .orderBy(
-        sql`case when strpos(LOWER(f_unaccent(coalesce(pages.text_content, ''))), ${needle}) = 0 then 2147483647 else strpos(LOWER(f_unaccent(coalesce(pages.text_content, ''))), ${needle}) end asc`,
-      );
+    const byId = new Map<string, any>(rows.map((r) => [r.id, r]));
+    const pathById = await this.buildAncestorPaths(pageIds);
 
-    let rows: any[] = await candidatesCapped.limit(200).execute();
-
-    if (rows.length === 0) {
-      return { items: [] };
-    }
-
-    // --- Permissions BEFORE limit. --------------------------------------------
-    // Apply the existing page-level post-filter to the MERGED set, then rank and
-    // only THEN truncate to `limit` — never lose the permission filter.
-    if (opts.userId) {
-      const accessibleIds =
-        await this.pagePermissionRepo.filterAccessiblePageIds({
-          pageIds: rows.map((r) => r.id),
-          userId: opts.userId,
-          spaceId: searchParams.spaceId,
-          workspaceId: opts.workspaceId,
-        });
-      const accessibleSet = new Set(accessibleIds);
-      rows = rows.filter((r) => accessibleSet.has(r.id));
-    }
-
-    if (rows.length === 0) {
-      return { items: [] };
-    }
-
-    // --- Tiered ranking + dedup. ----------------------------------------------
-    // Rows are already unique by id (single pages scan), so no cross-branch
-    // dedup is needed here; the tier captures the strongest match reason.
-    const ranked = rows.map((r) => {
-      let tier: SearchLookupTier;
-      let secondary: number;
-      if (r.titleExact) {
-        tier = SearchLookupTier.TITLE_EXACT;
-        secondary = Number(r.ftsRank) || 0;
-      } else if (r.titleSub) {
-        tier = SearchLookupTier.TITLE_SUBSTRING;
-        secondary = Number(r.ftsRank) || 0;
-      } else {
-        tier = SearchLookupTier.TEXT;
-        // Prefer earlier text matches; map position → closeness in (0, 1].
-        const pos = Number(r.textMatchPos) || 0;
-        secondary =
-          pos > 0 ? 1 / (1 + (pos - 1) / 100) : Number(r.ftsRank) || 0;
-      }
-      return { row: r, tier, score: computeLookupScore({ tier, secondary }) };
-    });
-
-    ranked.sort((a, b) => b.score - a.score);
-    const top = ranked.slice(0, limit);
-
-    // --- Batch ancestor path (ONE recursive CTE, not N+1). --------------------
-    const pathById = await this.buildAncestorPaths(top.map((t) => t.row.id));
-
-    const items: SearchLookupResponseDto[] = top.map((t) => ({
-      id: t.row.id,
-      slugId: t.row.slugId,
-      title: t.row.title,
-      parentPageId: t.row.parentPageId ?? null,
-      path: pathById.get(t.row.id) ?? [],
-      snippet: (t.row.snippet ?? '')
+    const items: SearchResultDto[] = [];
+    for (const id of pageIds) {
+      const r = byId.get(id);
+      if (!r) continue;
+      const matchedFields: string[] = [];
+      if (r.titleMatch) matchedFields.push('title');
+      if (r.textMatch) matchedFields.push('text');
+      const matchedTerms: string[] = [];
+      allTerms.forEach((t, i) => {
+        if (r[`tmatch${i}`]) matchedTerms.push(t.text);
+      });
+      const rank = r.rank == null ? null : Number(r.rank);
+      const highlight = r.highlight
+        ? String(r.highlight)
+            .replace(/\r\n|\r|\n/g, ' ')
+            .replace(/\s+/g, ' ')
+        : null;
+      const snippet = (r.snippet ?? '')
         .replace(/\r\n|\r|\n/g, ' ')
         .replace(/\s+/g, ' ')
-        .trim(),
-      score: t.score,
-    }));
-
-    return { items };
+        .trim();
+      items.push({
+        id: r.id,
+        pageId: r.id,
+        slugId: r.slugId,
+        icon: r.icon,
+        title: r.title,
+        space: r.space,
+        creatorId: r.creatorId,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+        rank,
+        highlight,
+        snippet,
+        path: pathById.get(id) ?? [],
+        // A per-response ordering proxy for legacy consumers; falls back to rank.
+        score: rank ?? 0,
+        matchedFields,
+        matchedTerms: Array.from(new Set(matchedTerms)),
+      });
+    }
+    return items;
   }
 
   /**
-   * Batch ancestor-titles helper (#443): ONE recursive CTE seeded with ALL hit
-   * ids, walking UP parentPageId. Returns a map hitId → ancestor titles ordered
-   * root → direct parent (the hit's own title is excluded). Root pages map to
-   * an empty array. Avoids the N+1 of a per-page breadcrumb call.
+   * Batch ancestor-titles helper: ONE recursive CTE seeded with ALL hit ids,
+   * walking UP parentPageId. Returns hitId → ancestor titles ordered root →
+   * direct parent (the hit's own title excluded).
+   *
+   * A8 fix: the recursive walk now skips soft-deleted ancestors (`deleted_at IS
+   * NULL`) and stays within the hit's own space, so a deleted or cross-space
+   * ancestor's title can no longer leak into `path`.
    */
   private async buildAncestorPaths(
     hitIds: string[],
@@ -529,8 +592,6 @@ export class SearchService {
     const result = new Map<string, string[]>();
     if (hitIds.length === 0) return result;
 
-    // ancestry(hit_id, page_id, title, parent_page_id, depth): seed one row per
-    // hit at depth 0 (the hit itself), then walk to parents (increasing depth).
     const rows = await this.db
       .withRecursive('ancestry', (db) =>
         db
@@ -540,29 +601,32 @@ export class SearchService {
             'pages.id as pageId',
             'pages.title as title',
             'pages.parentPageId as parentPageId',
+            'pages.spaceId as spaceId',
             sql<number>`0`.as('depth'),
           ])
           .where('pages.id', 'in', hitIds)
+          .where('pages.deletedAt', 'is', null)
           .unionAll((exp) =>
             exp
               .selectFrom('pages as p')
               .innerJoin('ancestry as a', 'p.id', 'a.parentPageId')
+              // A8: don't cross into a deleted ancestor or another space.
+              .where('p.deletedAt', 'is', null)
+              .whereRef('p.spaceId', '=', 'a.spaceId')
               .select([
                 'a.hitId as hitId',
                 'p.id as pageId',
                 'p.title as title',
                 'p.parentPageId as parentPageId',
+                'a.spaceId as spaceId',
                 sql<number>`a.depth + 1`.as('depth'),
               ]),
           ),
       )
       .selectFrom('ancestry')
       .select(['hitId', 'title', 'depth'])
-      // depth 0 is the hit itself — excluded from the path.
       .where('depth', '>', 0)
       .orderBy('hitId')
-      // Larger depth = closer to the space root. Ordering DESC gives
-      // root → parent once collected.
       .orderBy('depth', 'desc')
       .execute();
 
@@ -639,12 +703,10 @@ export class SearchService {
         .where('workspaceId', '=', workspaceId)
         .limit(limit);
 
-      // Template picker: restrict to pages flagged as templates.
       if (suggestion.onlyTemplates) {
         pageSearch = pageSearch.where('isTemplate', '=', true);
       }
 
-      // search all spaces the user has access to, prioritizing the current space
       const userSpaceIds = await this.spaceMemberRepo.getUserSpaceIds(userId);
 
       if (userSpaceIds?.length > 0) {
@@ -660,14 +722,12 @@ export class SearchService {
         pages = await pageSearch.execute();
       }
 
-      // Filter by page-level permissions
       if (pages.length > 0) {
         const pageIds = pages.map((p) => p.id);
         const accessibleIds =
           await this.pagePermissionRepo.filterAccessiblePageIds({
             pageIds,
             userId,
-            // #348 — workspace-level short-circuit for the suggest path.
             workspaceId,
           });
         const accessibleSet = new Set(accessibleIds);
