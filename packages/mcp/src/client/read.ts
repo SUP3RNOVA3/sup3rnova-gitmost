@@ -78,7 +78,7 @@ export interface IReadMixin {
   getNode(pageId: string, nodeId: string, format?: "markdown" | "json"): any;
   searchInPage(pageId: string, query: string, opts?: SearchOptions): any;
   getTable(pageId: string, tableRef: string): any;
-  search(query: string, spaceId?: string, limit?: number, opts?: { parentPageId?: string; titleOnly?: boolean }): any;
+  search(query: string, spaceId?: string, limit?: number, opts?: { parentPageId?: string; titleOnly?: boolean; offset?: number; match?: "auto" | "word" | "prefix" | "substring" }): any;
 }
 
 export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base: TBase): GConstructor<DocmostClientContext & IReadMixin> & TBase {
@@ -701,13 +701,19 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     query: string,
     spaceId?: string,
     limit?: number,
-    opts: { parentPageId?: string; titleOnly?: boolean } = {},
+    opts: {
+      parentPageId?: string;
+      titleOnly?: boolean;
+      offset?: number;
+      match?: "auto" | "word" | "prefix" | "substring";
+    } = {},
   ) {
     await this.ensureAuthenticated();
-    // Opt into the #443 agent-lookup mode: `substring: true` turns on the hybrid
-    // substring + FTS branch that returns path + snippet + score. A stock
-    // upstream server strips these unknown DTO fields (whitelist:true) and
-    // silently degrades to plain FTS — see the tool-registration comment.
+    // #529 unified engine: the query is parsed SERVER-SIDE (operators
+    // "phrase"/+/-, OR default, RU+EN morphology, match=auto). We forward the RAW
+    // query plus flags. `substring: true` is kept as a back-compat hint for a
+    // stock upstream server (whitelist:true strips the unknown #529 fields and it
+    // degrades to plain FTS — see the tool-registration comment).
     const payload: Record<string, any> = {
       query,
       spaceId,
@@ -715,22 +721,34 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     };
     if (opts.parentPageId) payload.parentPageId = opts.parentPageId;
     if (opts.titleOnly) payload.titleOnly = true;
+    if (opts.match) payload.match = opts.match;
     // Clamp an optional caller-supplied limit into the lookup range (1..50)
     // before forwarding; omit it when not provided so the server default applies.
     if (limit !== undefined) {
       payload.limit = Math.max(1, Math.min(50, limit));
     }
 
+    if (opts.offset !== undefined) {
+      payload.offset = Math.max(0, Math.floor(opts.offset));
+    }
+
     const runSearch = async () => {
       const response = await this.client.post("/search", payload);
 
-      // Normalize both response shapes: bare array and paginated { items: [...] }
+      // Normalize both response shapes: bare array and paginated { items: [...] }.
       const data = response.data?.data;
       const items = Array.isArray(data) ? data : data?.items || [];
       const filteredItems = items.map((item: any) => filterSearchResult(item));
 
+      // Surface the #529 pagination envelope when present (a stock upstream has
+      // none — the fields are simply undefined and the caller sees just `items`).
+      const envelope = Array.isArray(data) ? undefined : data;
       return {
         items: filteredItems,
+        total: envelope?.total,
+        hasMore: envelope?.hasMore,
+        truncatedAtCap: envelope?.truncatedAtCap,
+        offset: envelope?.offset,
         success: response.data?.success || false,
       };
     };

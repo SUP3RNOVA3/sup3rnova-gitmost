@@ -175,3 +175,26 @@ test("#494: PROSE_NON_TOOL_TERMS holds no actually-registered tool name", () => 
     );
   }
 });
+
+// #529: the search routing prose must document the new engine contract — the
+// operators, OR/morphology default, pagination fields and the relevance-CAP
+// caveat — so an agent uses the operators and understands the unreachable tail.
+test("SERVER_INSTRUCTIONS documents the #529 search operators, pagination and CAP", () => {
+  const read = ROUTING_PROSE.split("EDIT:")[0]; // the READ family section
+  // Operators.
+  assert.ok(/\+require/.test(read), "search prose missing +require operator");
+  assert.ok(/-exclude/.test(read), "search prose missing -exclude operator");
+  assert.ok(/phrase/i.test(read), "search prose missing phrase operator");
+  // OR default + morphology.
+  assert.ok(/\bOR\b/.test(read), "search prose missing OR-default note");
+  assert.ok(/morpholog/i.test(read), "search prose missing morphology note");
+  // Pagination + exact permission-filtered total.
+  assert.ok(/offset/.test(read), "search prose missing offset/pagination");
+  assert.ok(/total is exact/i.test(read), "search prose missing exact total");
+  assert.ok(/hasMore|truncatedAtCap/.test(read), "search prose missing hasMore/cap flags");
+  // The relevance CAP caveat (tail unreachable by pagination).
+  assert.ok(
+    /cap/i.test(read) && /unreachable/i.test(read),
+    "search prose missing the relevance-CAP unreachable-tail caveat",
+  );
+});
