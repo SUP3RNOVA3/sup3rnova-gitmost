@@ -4,7 +4,8 @@ import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.t
 import {
   isStreamingTail,
   isSettledAssistantTail,
-  seedRows,
+  stepsPersistedOf,
+  mergeDeltaRowsIntoPages,
   mergeById,
 } from "./resume-helpers.ts";
 
@@ -12,8 +13,18 @@ function row(
   id: string,
   role: string,
   status?: string,
+  stepsPersisted?: number,
 ): IAiChatMessageRow {
-  return { id, role, content: "", status, createdAt: "2026-01-01T00:00:00Z" };
+  return {
+    id,
+    role,
+    content: "",
+    status,
+    createdAt: "2026-01-01T00:00:00Z",
+    ...(stepsPersisted !== undefined
+      ? { metadata: { stepsPersisted } }
+      : {}),
+  };
 }
 
 function makeMsg(id: string, text: string): UIMessage {
@@ -65,23 +76,92 @@ describe("isSettledAssistantTail", () => {
   });
 });
 
-describe("seedRows", () => {
-  const rows = [row("u1", "user"), row("a1", "assistant", "streaming")];
-
-  it("returns the rows unchanged when not stripping", () => {
-    expect(seedRows(rows, false)).toBe(rows);
+describe("stepsPersistedOf", () => {
+  it("reads metadata.stepsPersisted", () => {
+    expect(stepsPersistedOf(row("a1", "assistant", "streaming", 3))).toBe(3);
+    expect(stepsPersistedOf(row("a1", "assistant", "streaming", 0))).toBe(0);
   });
 
-  it("drops the last row when stripping", () => {
-    const seeded = seedRows(rows, true);
-    expect(seeded).toHaveLength(1);
-    expect(seeded[0].id).toBe("u1");
+  it("defaults to 0 for a pre-#491 row (absent), null/undefined, or a bad value", () => {
+    expect(stepsPersistedOf(row("a1", "assistant", "streaming"))).toBe(0);
+    expect(stepsPersistedOf(null)).toBe(0);
+    expect(stepsPersistedOf(undefined)).toBe(0);
+    expect(
+      stepsPersistedOf({
+        id: "a1",
+        role: "assistant",
+        content: "",
+        createdAt: "x",
+        metadata: { stepsPersisted: -2 },
+      }),
+    ).toBe(0);
   });
 
-  it("returns an empty list when stripping a single-row list", () => {
-    expect(seedRows([row("a1", "assistant", "streaming")], true)).toHaveLength(
-      0,
-    );
+  it("floors a non-integer count", () => {
+    expect(
+      stepsPersistedOf({
+        id: "a1",
+        role: "assistant",
+        content: "",
+        createdAt: "x",
+        metadata: { stepsPersisted: 2.9 },
+      }),
+    ).toBe(2);
+  });
+});
+
+describe("mergeDeltaRowsIntoPages", () => {
+  const pages = () => [
+    { items: [row("u1", "user"), row("a1", "assistant", "streaming", 1)], meta: {} },
+  ];
+
+  it("returns the pages unchanged for an empty delta", () => {
+    const p = pages();
+    expect(mergeDeltaRowsIntoPages(p, [])).toBe(p);
+  });
+
+  it("appends a genuinely new row to the last page in chronological order", () => {
+    const merged = mergeDeltaRowsIntoPages(pages(), [row("a2", "assistant", "streaming", 0)]);
+    expect(merged[0].items.map((i) => i.id)).toEqual(["u1", "a1", "a2"]);
+  });
+
+  it("replaces a grown row in place (per-step growth), never appends a duplicate", () => {
+    const merged = mergeDeltaRowsIntoPages(pages(), [
+      row("a1", "assistant", "streaming", 2),
+    ]);
+    expect(merged[0].items.map((i) => i.id)).toEqual(["u1", "a1"]);
+    // the in-place replacement carries the grown step frontier.
+    expect(stepsPersistedOf(merged[0].items[1])).toBe(2);
+  });
+
+  it("does not mutate the input pages", () => {
+    const input = pages();
+    const before = input[0].items.slice();
+    mergeDeltaRowsIntoPages(input, [row("a2", "assistant", "streaming", 0)]);
+    expect(input[0].items).toEqual(before); // untouched
+  });
+
+  // #491 CONTRACT: the delta overlap window re-delivers the same rows, so merging
+  // MUST be idempotent — applying a delta twice equals applying it once (no growth,
+  // no reorder). A regression re-introduces duplicate assistant bubbles per poll.
+  it("is idempotent: applying the same delta twice equals once", () => {
+    const delta = [
+      row("a1", "assistant", "streaming", 2), // grown existing row
+      row("a2", "assistant", "streaming", 0), // new row
+    ];
+    const once = mergeDeltaRowsIntoPages(pages(), delta);
+    const twice = mergeDeltaRowsIntoPages(once, delta);
+    const thrice = mergeDeltaRowsIntoPages(twice, delta);
+    expect(once[0].items.map((i) => i.id)).toEqual(["u1", "a1", "a2"]);
+    expect(twice[0].items.map((i) => i.id)).toEqual(["u1", "a1", "a2"]);
+    expect(twice).toEqual(once);
+    expect(thrice).toEqual(once);
+  });
+
+  it("seeds a first page when the cache is empty", () => {
+    const merged = mergeDeltaRowsIntoPages([], [row("u1", "user")]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].items.map((i) => i.id)).toEqual(["u1"]);
   });
 });
 

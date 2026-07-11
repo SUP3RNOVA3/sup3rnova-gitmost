@@ -172,9 +172,18 @@ function resetState() {
   h.state.getRun.mockResolvedValue({ run: null, message: null });
 }
 
+// #491: the streaming tail carries a persisted step frontier (metadata.stepsPersisted),
+// which the tail-only attach reads as `n` in `?anchor=<id>&n=<n>`. Seeded WHOLE now.
 const streamingTail = () => [
   row("u1", "user", undefined, "hi"),
-  row("a1", "assistant", "streaming", "partial"),
+  {
+    id: "a1",
+    role: "assistant",
+    content: "partial",
+    status: "streaming",
+    createdAt: "2026-01-01T00:00:00Z",
+    metadata: { stepsPersisted: 2 },
+  } as IAiChatMessageRow,
 ];
 const settledTail = () => [
   row("u1", "user", undefined, "hi"),
@@ -335,20 +344,24 @@ describe("ChatThread — send now", () => {
     expect(screen.getAllByLabelText("Remove queued message")).toHaveLength(1);
   });
 
-  it("Stop then a REAL network-drop finish exits to idle (honor-in-stopping), NOT a false reconnect", () => {
+  it("Stop then a REAL network-drop finish exits to idle (honor-in-stopping), NOT a false reconnect", async () => {
     // Regression for the disconnect-first reorder: on the STOP path, even a drop-
     // form finish { isError:true, isDisconnect:true } arriving in `stopping` must be
     // HONORED (reducer) and exit to idle — it must NOT enter the reconnect ladder.
     startLocalStreamWithRun(); // live local stream, autonomous
     fireEvent.click(screen.getByLabelText("Stop")); // STOP_REQUESTED -> stopping
     h.state.error = { message: "Failed to fetch" };
-    act(() => {
+    // #491: the disconnect re-seeds from persist (async getRun) before dispatching
+    // FINISH_DISCONNECT, which the reducer HONORS in `stopping` -> idle. Flush it.
+    await act(async () => {
       h.state.onFinish?.({
         message: { id: "a1", role: "assistant", parts: [] },
         isAbort: false,
         isDisconnect: true,
         isError: true,
       });
+      await Promise.resolve();
+      await Promise.resolve();
     });
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
   });
@@ -803,19 +816,24 @@ describe("ChatThread — resume (attach) machinery", () => {
     expect(h.state.resumeStream).not.toHaveBeenCalled();
   });
 
-  it("strips the streaming tail from the seed, keeps a user tail whole", () => {
+  it("#491 tail-only: seeds the streaming tail WHOLE (no strip), keeps a user tail whole", () => {
     renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
-    expect(h.state.seededMessages).toHaveLength(1);
+    // MUTATION-VERIFY: re-introduce the seed-strip and this goes red — the streaming
+    // tail (steps 0..N-1) MUST be seeded so the SDK continuation appends the tail to
+    // the RIGHT message. Both rows (user + assistant) are seeded.
+    expect(h.state.seededMessages).toHaveLength(2);
     cleanup();
     resetState();
     renderThread({ autonomousRunsEnabled: true, initialRows: userTail() });
     expect(h.state.seededMessages).toHaveLength(1);
   });
 
-  it("builds the attach URL with expect=live&anchor only for a stripped streaming tail", () => {
+  it("#491 tail-only: builds the attach URL with ?anchor=&n= from the persisted step frontier", () => {
     renderThread({ autonomousRunsEnabled: true, initialRows: streamingTail() });
+    // n=2 comes from a1's metadata.stepsPersisted (MUTATION-VERIFY: hardcode n=0 and
+    // this fails). No `expect=live` param anymore.
     expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
-      "/api/ai-chat/runs/c1/stream?expect=live&anchor=a1",
+      "/api/ai-chat/runs/c1/stream?anchor=a1&n=2",
     );
     cleanup();
     resetState();
@@ -839,39 +857,41 @@ describe("ChatThread — resume (attach) machinery", () => {
     });
   }
 
-  it("204 on a streaming tail: restore + invalidate + onResumeFallback(true)", async () => {
+  it("204 on a streaming tail: NO restore (row kept) + invalidate + onResumeFallback(true)", async () => {
     const { onResumeFallback, invalidateSpy } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
     });
     await attachFetch({ status: 204, ok: false });
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1); // restore
+    // #491 tail-only: the anchor row was never stripped, so there is NOTHING to
+    // restore. MUTATION-VERIFY: re-add a restore setMessages here and it goes red.
+    expect(h.state.setMessages).not.toHaveBeenCalled();
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["ai-chat-messages", "c1"],
     });
     expect(onResumeFallback).toHaveBeenCalledWith(true);
   });
 
-  it("F7 restart-survival: a 500 attach failure restores the row AND arms the poll", async () => {
+  it("F7 restart-survival: a 500 attach failure arms the poll WITHOUT a restore", async () => {
     const { onResumeFallback, invalidateSpy } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
     });
     await attachFetch({ status: 500, ok: false });
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    expect(h.state.setMessages).not.toHaveBeenCalled();
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["ai-chat-messages", "c1"],
     });
     expect(onResumeFallback).toHaveBeenCalledWith(true);
   });
 
-  it("F7 restart-survival: a network throw restores the row AND arms the poll", async () => {
+  it("F7 restart-survival: a network throw arms the poll WITHOUT a restore", async () => {
     const { onResumeFallback, invalidateSpy } = renderThread({
       autonomousRunsEnabled: true,
       initialRows: streamingTail(),
     });
     await attachFetch(new Error("network down"), true);
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1);
+    expect(h.state.setMessages).not.toHaveBeenCalled();
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ["ai-chat-messages", "c1"],
     });
@@ -931,7 +951,7 @@ describe("ChatThread — resume (attach) machinery", () => {
     expect(h.state.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("an empty resumed message (starved replay) restores the row AND arms the poll", () => {
+  it("an empty resumed message (starved replay) arms the poll WITHOUT a restore", () => {
     h.state.status = "ready";
     const { onResumeFallback } = renderThread({
       autonomousRunsEnabled: true,
@@ -947,7 +967,9 @@ describe("ChatThread — resume (attach) machinery", () => {
         isError: false,
       });
     });
-    expect(h.state.setMessages).toHaveBeenCalledTimes(1); // restore
+    // #491 tail-only: the seeded steps 0..N-1 are still on screen (the SDK
+    // continuation never wiped them), so there is nothing to restore — just poll.
+    expect(h.state.setMessages).not.toHaveBeenCalled();
     expect(onResumeFallback).toHaveBeenCalledWith(true); // arm
   });
 
@@ -995,24 +1017,41 @@ describe("ChatThread — live reconnect + stalled", () => {
     cleanup();
   });
 
+  // #491: the authoritative PERSISTED assistant row `getRun` projects on a local
+  // disconnect — the re-seed source. Its metadata.stepsPersisted becomes `n`.
+  const persistedAnchor = (steps = 3) => ({
+    run: { id: "run-1", status: "running" },
+    message: {
+      id: "a2",
+      role: "assistant",
+      content: "persisted 0..N-1",
+      status: "streaming",
+      createdAt: "2026-01-01T00:00:00Z",
+      metadata: { stepsPersisted: steps },
+    },
+  });
+
   // A REAL live SSE drop. ai@6.0.207 emits BOTH { isError:true, isDisconnect:true }
-  // for a network TypeError AND sets useChat `error` — NOT the { isError:false,
-  // error:null } form the old tests fed. This is the form browser QA hit; with the
-  // buggy isError-first routing OR without the errorView render-gate these tests go
-  // red (a real drop surfaces the terminal error banner, masking the reconnect
-  // ladder). MUTATION-VERIFY of disconnect-first + the errorView phase-gate.
-  function disconnect(message: unknown = liveMsg) {
+  // for a network TypeError AND sets useChat `error`. #491: an autonomous local drop
+  // now RE-SEEDS from persist (async getRun) BEFORE entering the reconnect ladder, so
+  // this helper is async and flushes the getRun microtask before returning.
+  async function disconnect(message: unknown = liveMsg) {
     h.state.error = { message: "Failed to fetch" }; // the SDK sets error on the drop
-    act(() => {
+    await act(async () => {
       h.state.onFinish?.({
         message,
         isAbort: false,
         isDisconnect: true,
         isError: true,
       });
+      // Flush the getRun().then re-seed + the deferred FINISH_DISCONNECT dispatch.
+      await Promise.resolve();
+      await Promise.resolve();
     });
   }
   function renderLive() {
+    // The persisted-anchor read the local disconnect performs to re-seed from persist.
+    h.state.getRun.mockResolvedValue(persistedAnchor());
     const view = renderThread({
       autonomousRunsEnabled: true,
       initialRows: settledTail(),
@@ -1032,35 +1071,43 @@ describe("ChatThread — live reconnect + stalled", () => {
     });
   }
 
-  it("a live disconnect starts a backoff reconnect (banner + resumeStream after backoff)", () => {
+  it("#491: a live disconnect RE-SEEDS from persist, then backs off to reconnect with ?anchor=&n=", async () => {
     renderLive();
-    disconnect();
+    await disconnect();
+    // The re-seed read the authoritative persisted row and replaced the live partial.
+    // MUTATION-VERIFY: skip the getRun re-seed (send `n` off the live message) and the
+    // n below no longer matches the PERSISTED stepsPersisted.
+    expect(h.state.getRun).toHaveBeenCalledWith("c1");
+    expect(h.state.setMessages).toHaveBeenCalled(); // re-seeded the store from persist
     expect(screen.getByText(/reconnecting/i)).toBeTruthy();
     expect(h.state.resumeStream).not.toHaveBeenCalled();
     advanceToAttempt(1);
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    // n=3 is the PERSISTED row's stepsPersisted (from getRun), NOT the live store.
     expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
-      "/api/ai-chat/runs/c1/stream?expect=live&anchor=a2",
+      "/api/ai-chat/runs/c1/stream?anchor=a2&n=3",
     );
   });
 
-  it("#488 (browser QA): the reconnect banner is SHOWN, not masked by the residual useChat error", () => {
+  it("#488 (browser QA): the reconnect banner is SHOWN, not masked by the residual useChat error", async () => {
     // The drop sets useChat `error` (real SDK), and the terminal errorView describes
     // it ("Lost connection to the server"). The FSM phase-gate must let the
     // `reconnecting` banner WIN over that residual error. MUTATION-VERIFY: revert the
     // errorView phase-gate (show errorView whenever error is set) and the terminal
     // banner masks "reconnecting…" -> red.
     renderLive();
-    disconnect();
+    await disconnect();
     expect(h.state.error).not.toBeNull(); // the SDK error IS set during recovery
     expect(screen.getByText(/reconnecting/i)).toBeTruthy();
     // The terminal "Lost connection… reload" banner must NOT be showing.
     expect(screen.queryByText(/reload and try again/i)).toBeNull();
   });
 
-  it("#488 commit 2: a disconnect BEFORE the first assistant frame reconnects with NO anchor", () => {
+  it("#488 commit 2: a disconnect BEFORE the first assistant frame reconnects with NO anchor", async () => {
     renderLive();
-    disconnect(null); // no assistant message yet (pre-first-frame break)
+    // No persisted assistant row for a pre-first-frame break -> no anchor.
+    h.state.getRun.mockResolvedValue({ run: null, message: null });
+    await disconnect(null); // no assistant message yet (pre-first-frame break)
     expect(screen.getByText(/reconnecting/i)).toBeTruthy();
     expect(
       screen.queryByText("Connection lost — the answer was interrupted."),
@@ -1074,7 +1121,7 @@ describe("ChatThread — live reconnect + stalled", () => {
 
   it("a live re-attach (2xx) clears the reconnect banner", async () => {
     renderLive();
-    disconnect();
+    await disconnect();
     advanceToAttempt(1);
     await reconnect({ status: 200, ok: true });
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
@@ -1082,7 +1129,7 @@ describe("ChatThread — live reconnect + stalled", () => {
 
   it("a 204 arms the degraded poll and backs off to the next attempt", async () => {
     const { onResumeFallback } = renderLive();
-    disconnect();
+    await disconnect();
     advanceToAttempt(1);
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
     await reconnect({ status: 204, ok: false });
@@ -1094,7 +1141,7 @@ describe("ChatThread — live reconnect + stalled", () => {
 
   it("exhausts the attempt limit into a manual Retry, which restarts the sequence", async () => {
     renderLive();
-    disconnect();
+    await disconnect();
     for (let n = 1; n <= 5; n++) {
       advanceToAttempt(n);
       expect(h.state.resumeStream).toHaveBeenCalledTimes(n);
@@ -1112,22 +1159,23 @@ describe("ChatThread — live reconnect + stalled", () => {
   it("#488 commit 3: two breaks in a row produce two reconnect cycles", async () => {
     renderLive();
     // First break -> reconnect -> re-attach live.
-    disconnect();
+    await disconnect();
     advanceToAttempt(1);
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
     await reconnect({ status: 200, ok: true });
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
-    // The re-attached observer stream drops AGAIN -> a SECOND reconnect cycle
-    // (the old one-shot !wasResumed gate sent this to silent poll).
-    disconnect();
+    // The re-attached observer (live-follow) stream drops AGAIN -> a SECOND reconnect
+    // cycle. #491: this too re-seeds from persist before re-attaching (never tail-
+    // applies over the live-follow partial).
+    await disconnect();
     expect(screen.getByText(/reconnecting/i)).toBeTruthy();
     advanceToAttempt(1);
     expect(h.state.resumeStream).toHaveBeenCalledTimes(2);
   });
 
-  it("does NOT reconnect when autonomous runs are disabled", () => {
+  it("does NOT reconnect when autonomous runs are disabled", async () => {
     renderThread({ autonomousRunsEnabled: false, initialRows: settledTail() });
-    disconnect();
+    await disconnect();
     expect(screen.queryByText(/reconnecting/i)).toBeNull();
     expect(
       screen.getByText("Connection lost — the answer was interrupted."),
@@ -1138,7 +1186,7 @@ describe("ChatThread — live reconnect + stalled", () => {
 
   it("#488 commit 4a: the poll idle cap surfaces a stalled banner + Retry (not silent)", async () => {
     renderLive();
-    disconnect();
+    await disconnect();
     advanceToAttempt(1);
     await reconnect({ status: 204, ok: false }); // arms the poll (reconnecting)
     // No activity for the whole idle cap -> stalled.
