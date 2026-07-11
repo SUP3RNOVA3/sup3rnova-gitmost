@@ -524,7 +524,7 @@ export class CommentService {
         resourceType: AuditResource.COMMENT,
         resourceId: comment.id,
         spaceId: comment.spaceId,
-        metadata: { pageId: comment.pageId },
+        metadata: this.suggestionAuditMetadata(comment, user),
       });
       return { ...updatedComment, outcome: 'resolved' };
     }
@@ -538,7 +538,7 @@ export class CommentService {
       resourceType: AuditResource.COMMENT,
       resourceId: comment.id,
       spaceId: comment.spaceId,
-      metadata: { pageId: comment.pageId },
+      metadata: this.suggestionAuditMetadata(comment, user),
     });
     return settled;
   }
@@ -597,7 +597,7 @@ export class CommentService {
         resourceType: AuditResource.COMMENT,
         resourceId: comment.id,
         spaceId: comment.spaceId,
-        metadata: { pageId: comment.pageId },
+        metadata: this.suggestionAuditMetadata(comment, user),
       });
 
       return { ...updatedComment, outcome: 'resolved' };
@@ -616,7 +616,7 @@ export class CommentService {
       resourceType: AuditResource.COMMENT,
       resourceId: comment.id,
       spaceId: comment.spaceId,
-      metadata: { pageId: comment.pageId },
+      metadata: this.suggestionAuditMetadata(comment, user),
     });
 
     return settled;
@@ -730,6 +730,27 @@ export class CommentService {
       userId,
     };
     return this.generalQueue.add(QueueJob.COMMENT_MARK_UPDATE, jobData);
+  }
+
+  /**
+   * Build the audit metadata for a suggestion apply/dismiss decision (#496).
+   * The subject comment is HARD-DELETED on the childless path, so the audit row
+   * is the only surviving record — capture the decision's substance (what was
+   * suggested, the anchored text it replaced, who authored it, who decided)
+   * before the row can vanish. `decidedBy` is the acting user; `commentAuthor`
+   * is the suggestion's creator.
+   */
+  private suggestionAuditMetadata(
+    comment: Comment,
+    user: User,
+  ): Record<string, any> {
+    return {
+      pageId: comment.pageId,
+      suggestedText: comment.suggestedText ?? null,
+      selection: comment.selection ?? null,
+      commentAuthor: comment.creatorId ?? null,
+      decidedBy: user.id,
+    };
   }
 
   private async queueCommentNotification(
