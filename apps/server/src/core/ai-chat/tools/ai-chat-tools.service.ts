@@ -426,6 +426,7 @@ export class AiChatToolsService {
     const {
       sharedToolSpecs,
       createCommentSignalTracker,
+      createListCommentsProbe,
       searchShapes,
       getGuideSection,
     } = await loadDocmostMcp();
@@ -768,35 +769,21 @@ export class AiChatToolsService {
     // wrapper below) so the race governs the whole call. The client carries the
     // per-call composite signal via setToolAbortSignal.
     const capMs = inAppToolCallCapMs();
-    if (!createCommentSignalTracker) {
+    // The signal needs BOTH the tracker factory AND the shared count-source probe
+    // factory (#494). Either being absent (a stale @docmost/mcp build or a mocked
+    // loader) => signal disabled, tool results byte-identical.
+    if (!createCommentSignalTracker || !createListCommentsProbe) {
       return wrapInAppToolsWithCap(tools, client, capMs);
     }
 
+    // Shared probe (#494): the SAME factory the standalone MCP host uses, so the
+    // in-app probe body is no longer a hand-mirror that could drift (counting the
+    // full feed newer than the watermark, labelling a hit with the light page
+    // title). `client` supplies the loopback listComments/getPageRaw reads.
     const tracker = createCommentSignalTracker({
-      probe: async (pageId: string, sinceMs: number) => {
-        const { items } = await client.listComments(pageId, true);
-        const count = (items as Array<{ createdAt?: string }>).filter((c) => {
-          const created = c?.createdAt ? new Date(c.createdAt).getTime() : NaN;
-          return Number.isFinite(created) && created > sinceMs;
-        }).length;
-        let title: string | undefined;
-        if (count > 0) {
-          // Title labels the signal; untrusted, defanged by the shared builder.
-          // Fetched only on a hit so the no-signal path never pays for it. Uses
-          // the LIGHT raw page info (title only) — mirroring the standalone MCP
-          // probe's getPageRaw — instead of the heavy getPage (which also renders
-          // Markdown + subpages) just to read one field.
-          try {
-            const res = (await client.getPageRaw(pageId)) as {
-              title?: string;
-            } | null;
-            title = res?.title ?? undefined;
-          } catch {
-            // Title is optional — omit it when the page can't be fetched.
-          }
-        }
-        return { count, title };
-      },
+      probe: createListCommentsProbe(
+        client as unknown as Parameters<typeof createListCommentsProbe>[0],
+      ),
     });
 
     return wrapInAppToolsWithCap(

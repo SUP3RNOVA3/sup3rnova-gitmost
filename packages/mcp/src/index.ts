@@ -10,6 +10,7 @@ import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
 import { SERVER_INSTRUCTIONS } from "./server-instructions.js";
 import {
   createCommentSignalTracker,
+  createListCommentsProbe,
   CommentSignalTracker,
   DEFAULT_COMMENT_SIGNAL_DEBOUNCE_MS,
 } from "./comment-signal.js";
@@ -52,6 +53,7 @@ export { REGISTRY_STAMP } from "./registry-stamp.generated.js";
 // only in their per-surface probe + result shaping.
 export {
   createCommentSignalTracker,
+  createListCommentsProbe,
   buildCommentSignalLine,
   defangCommentSignalTitle,
   COMMENT_SIGNAL_EXCLUDED_TOOLS,
@@ -236,27 +238,10 @@ export function createDocmostMcpServer(config: DocmostMcpConfig): McpServer {
   // a single list call per page per window and an empty working set => zero calls.
   const commentSignal = createCommentSignalTracker({
     debounceMs: resolveCommentSignalDebounceMs(),
-    probe: async (pageId: string, sinceMs: number) => {
-      // Full feed (incl. resolved) so a human's comment on any thread is seen;
-      // count only those created strictly after the watermark.
-      const { items } = await docmostClient.listComments(pageId, true);
-      const count = (items as any[]).filter((c) => {
-        const created = c && c.createdAt ? new Date(c.createdAt).getTime() : NaN;
-        return Number.isFinite(created) && created > sinceMs;
-      }).length;
-      let title: string | undefined;
-      if (count > 0) {
-        // Title labels the signal; untrusted, defanged by the shared builder.
-        // Fetched only on a hit, so the no-signal path never pays for it.
-        try {
-          const page: any = await docmostClient.getPageRaw(pageId);
-          title = page?.title ?? undefined;
-        } catch {
-          // Title is optional — omit it if the page can't be fetched.
-        }
-      }
-      return { count, title };
-    },
+    // Shared count-source probe (#494): counts comments newer than the watermark
+    // over the full feed and labels a hit with the light page title. The in-app
+    // host uses the SAME factory, so the two probe bodies can no longer drift.
+    probe: createListCommentsProbe(docmostClient),
   });
 
   // Single choke point again: the timing monkeypatch (above) and the new comment
