@@ -36,6 +36,7 @@ const STATIC_ROUTES = new Set<string>([
   '/setup/register',
   '/settings/account/profile',
   '/settings/account/preferences',
+  '/settings/account/api-keys',
   '/settings/workspace',
   '/settings/ai',
   '/settings/members',
