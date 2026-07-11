@@ -179,8 +179,11 @@ export abstract class DocmostClientContext {
   // still land — a documented limitation (#487).
   //
   // SINGLE-WRITER by phase-1 assumption: exactly one DocmostClient is built per
-  // turn and shared by every tool call; the host sets this per call and restores
-  // the prior value when the call unwinds. If the model emits PARALLEL in-app
+  // turn and shared by every tool call; the host sets this per call and does NOT
+  // restore the prior value on unwind (set-and-leave) — a fresh client per turn
+  // plus overwrite-by-the-next-call keeps it correct, and leaving a settled
+  // call's signal in place is what makes a discarded race-loser throw on its
+  // next safe-point. If the model emits PARALLEL in-app
   // tool calls they share this one field, so the per-call CAP of one call is not
   // guaranteed to bound another's in-flight pagination — but every composite the
   // host sets carries the SAME turn Stop signal, so a Stop still aborts whichever
@@ -190,9 +193,10 @@ export abstract class DocmostClientContext {
   /**
    * #487: set (or clear with null) the in-app tool abort signal governing the
    * NEXT client call's safe-points. The host wraps each in-app tool call: it sets
-   * the composite (Stop + per-call cap) here before invoking the tool and
-   * restores the prior value afterwards. Public so the server-side tool wrapper
-   * can reach it; harmless (a no-op) when never set.
+   * the composite (Stop + per-call cap) here before invoking the tool and leaves
+   * it in place afterwards (set-and-leave, NOT restored) — the next call
+   * overwrites it, and a fresh client is built per turn. Public so the
+   * server-side tool wrapper can reach it; harmless (a no-op) when never set.
    */
   public setToolAbortSignal(signal: AbortSignal | null): void {
     this.toolAbortSignal = signal;
