@@ -74,6 +74,48 @@ describe("treeModel.isDescendant", () => {
   });
 });
 
+// #525: the single "is this branch unloaded?" predicate shared by the lazy-load
+// gate and the insert paths. Unloaded == server says hasChildren but none are
+// present locally (canonical form `children: []`, also `undefined`). A parent
+// without hasChildren is genuinely empty, not unloaded.
+describe("treeModel.isUnloadedBranch", () => {
+  type PH = TreeNode<{ name: string; hasChildren?: boolean }>;
+  it("true for hasChildren + empty array (canonical unloaded form)", () => {
+    const n: PH = { id: "p", name: "P", hasChildren: true, children: [] };
+    expect(treeModel.isUnloadedBranch(n)).toBe(true);
+  });
+  it("true for hasChildren + undefined children", () => {
+    const n: PH = { id: "p", name: "P", hasChildren: true };
+    expect(treeModel.isUnloadedBranch(n)).toBe(true);
+  });
+  it("false for hasChildren + already-loaded children", () => {
+    const n: PH = {
+      id: "p",
+      name: "P",
+      hasChildren: true,
+      children: [{ id: "c", name: "C" }],
+    };
+    expect(treeModel.isUnloadedBranch(n)).toBe(false);
+  });
+  it("false for a genuinely-empty parent (no hasChildren)", () => {
+    expect(
+      treeModel.isUnloadedBranch({
+        id: "p",
+        name: "P",
+        hasChildren: false,
+        children: [],
+      } as PH),
+    ).toBe(false);
+    expect(
+      treeModel.isUnloadedBranch({ id: "p", name: "P" } as PH),
+    ).toBe(false);
+  });
+  it("false for null/undefined", () => {
+    expect(treeModel.isUnloadedBranch(null)).toBe(false);
+    expect(treeModel.isUnloadedBranch(undefined)).toBe(false);
+  });
+});
+
 describe("treeModel.visible", () => {
   it("returns only root nodes when no openIds", () => {
     const v = treeModel.visible(fixture, new Set());
@@ -197,43 +239,64 @@ describe("treeModel.insertByPosition", () => {
     ]);
   });
 
-  // #159 #1: inserting/moving a node under a parent whose children are NOT
-  // loaded (`children === undefined`, e.g. a collapsed page) must NOT materialize
-  // a partial `[node]` list — that would defeat the lazy-load gate and hide the
-  // parent's other real children. The node is left to be lazy-loaded; only
-  // `hasChildren` is flagged so the chevron appears.
-  it("does NOT materialize a child under an UNLOADED parent (children undefined)", () => {
-    type PH = TreeNode<{
-      name: string;
-      position?: string;
-      hasChildren?: boolean;
-    }>;
+  type PH = TreeNode<{
+    name: string;
+    position?: string;
+    hasChildren?: boolean;
+  }>;
+
+  // #159 #1 / #525: inserting/moving a node under an UNLOADED parent must NOT
+  // materialize a partial `[node]` list — that would defeat the lazy-load gate and
+  // hide the parent's other real children. The canonical unloaded form here is
+  // `children: []` + `hasChildren: true` (from `pageToTreeNode` /
+  // `pruneCollapsedChildren`), which the pre-#525 `=== undefined` guard MISSED.
+  // The node is left to be lazy-loaded; the chevron stays enabled.
+  it("does NOT materialize a child under an UNLOADED parent (children: [], hasChildren: true)", () => {
     const tree: PH[] = [
-      { id: "p", name: "P", position: "a0", hasChildren: false }, // children: undefined
+      { id: "p", name: "P", position: "a0", hasChildren: true, children: [] },
     ];
     const node: PH = { id: "x", name: "X", position: "a1" };
     const t = treeModel.insertByPosition(tree, "p", node);
     const parent = treeModel.find(t, "p");
     // The node was NOT inserted (children stay unloaded -> lazy-load fetches the
-    // full set, including this node, on expand).
-    expect(parent?.children).toBeUndefined();
+    // full set, including this node, on expand). MUTATION: the pre-#525 predicate
+    // `children === undefined` does not fire for `[]`, so it would insert `[x]`
+    // here and reredden this expectation.
+    expect(parent?.children).toEqual([]);
     expect(treeModel.find(t, "x")).toBeNull();
-    // ...but the chevron is enabled so the user can expand to load it.
+    // ...and the chevron stays enabled so the user can expand to load it.
     expect((parent as PH).hasChildren).toBe(true);
   });
 
-  it("DOES insert under a LOADED-but-empty parent (children: [])", () => {
-    type PH = TreeNode<{
-      name: string;
-      position?: string;
-      hasChildren?: boolean;
-    }>;
+  it("does NOT materialize a child under an UNLOADED parent (children undefined, hasChildren: true)", () => {
+    const tree: PH[] = [
+      { id: "p", name: "P", position: "a0", hasChildren: true }, // children: undefined
+    ];
+    const node: PH = { id: "x", name: "X", position: "a1" };
+    const t = treeModel.insertByPosition(tree, "p", node);
+    const parent = treeModel.find(t, "p");
+    expect(parent?.children).toBeUndefined();
+    expect(treeModel.find(t, "x")).toBeNull();
+    expect((parent as PH).hasChildren).toBe(true);
+  });
+
+  it("DOES insert under a genuinely-empty parent (children: [], hasChildren: false)", () => {
     const tree: PH[] = [
       { id: "p", name: "P", position: "a0", hasChildren: false, children: [] },
     ];
     const node: PH = { id: "x", name: "X", position: "a1" };
     const t = treeModel.insertByPosition(tree, "p", node);
-    // A loaded (empty) child list is complete, so the node IS inserted.
+    // No server children (`hasChildren: false`), so materializing the first child
+    // is correct — nothing is hidden.
+    expect(treeModel.find(t, "p")?.children?.map((n) => n.id)).toEqual(["x"]);
+  });
+
+  it("DOES insert under a genuinely-empty parent (children undefined, hasChildren: false)", () => {
+    const tree: PH[] = [
+      { id: "p", name: "P", position: "a0", hasChildren: false }, // children: undefined
+    ];
+    const node: PH = { id: "x", name: "X", position: "a1" };
+    const t = treeModel.insertByPosition(tree, "p", node);
     expect(treeModel.find(t, "p")?.children?.map((n) => n.id)).toEqual(["x"]);
   });
 

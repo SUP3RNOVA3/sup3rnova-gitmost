@@ -281,10 +281,10 @@ const SpaceTree = forwardRef<SpaceTreeApi, SpaceTreeProps>(function SpaceTree(
       setOpenTreeNodes((prev) => ({ ...prev, [id]: isOpen }));
       if (isOpen) {
         const node = treeModel.find(data, id) as SpaceTreeNode | null;
-        if (
-          node?.hasChildren &&
-          (!node.children || node.children.length === 0)
-        ) {
+        // Same "unloaded branch" predicate the insert paths use (`isUnloadedBranch`)
+        // so the lazy-load gate and the realtime/DnD inserts can never disagree
+        // about what counts as unloaded (#525).
+        if (treeModel.isUnloadedBranch(node)) {
           const fetched = await fetchAllAncestorChildren({
             pageId: id,
             spaceId: node.spaceId,
