@@ -38,6 +38,25 @@ const CONNECT_TIMEOUT_MS = 25000;
 const PERSIST_TIMEOUT_MS = 20000;
 
 /**
+ * Marker property set on the Error thrown when the Hocuspocus handshake REJECTS
+ * our collab token (onAuthenticationFailed). The client wraps content writes so
+ * that on this specific failure it invalidates its cached collab token and
+ * retries once with a fresh one — symmetric to the HTTP-401 reauth path (#486).
+ * A plain message-match would be brittle; a tagged property is unambiguous and
+ * survives teardown (which rejects pending ops with this SAME error object).
+ */
+const COLLAB_AUTH_FAILED_MARKER = "collabAuthFailed";
+
+/** True when `e` is the tagged collab-WS auth-failure error (see marker above). */
+export function isCollabAuthFailedError(e: unknown): boolean {
+  return !!(
+    e &&
+    typeof e === "object" &&
+    (e as Record<string, unknown>)[COLLAB_AUTH_FAILED_MARKER] === true
+  );
+}
+
+/**
  * Tunables, read fresh from the environment on every acquire so tests (and a
  * live rollback) can change them without reloading the module. Mirrors how
  * http.ts parses MCP_SESSION_IDLE_MS.
@@ -302,10 +321,13 @@ export class CollabSession {
           this.openResolve?.();
         },
         onAuthenticationFailed: () => {
-          this.teardown(
-            new Error("Authentication failed for collaboration connection"),
-            true,
-          );
+          // Tag the error so the client can tell a REJECTED collab token apart
+          // from a generic disconnect and invalidate + refresh it (#486).
+          const err = new Error(
+            "Authentication failed for collaboration connection",
+          ) as Error & { [COLLAB_AUTH_FAILED_MARKER]?: boolean };
+          err[COLLAB_AUTH_FAILED_MARKER] = true;
+          this.teardown(err, true);
         },
       });
     });

@@ -19,7 +19,10 @@ import {
   assertYjsEncodable,
   MutationResult,
 } from "../lib/collaboration.js";
-import { acquireCollabSession } from "../lib/collab-session.js";
+import {
+  acquireCollabSession,
+  isCollabAuthFailedError,
+} from "../lib/collab-session.js";
 import { withPageLock, isUuid } from "../lib/page-lock.js";
 import { getCollabToken, performLogin } from "../lib/auth-utils.js";
 import { formatDocmostAxiosError } from "./errors.js";
@@ -493,6 +496,37 @@ export abstract class DocmostClientContext {
   }
 
   /**
+   * Run a collab write and, on a Hocuspocus HANDSHAKE auth failure, self-heal
+   * once (#486). Symmetric to the HTTP-401 path in getCollabTokenWithReauth: the
+   * REST interceptor and login() already drop the cached collab token on a 401/
+   * 403, but a rejected WEBSOCKET handshake left the stale token in the cache, so
+   * every subsequent mutation kept re-presenting the same bad token for up to the
+   * collab-token TTL (minutes) with no self-heal. Here, when the write rejects
+   * with the tagged collab-auth error, we invalidate the cached token and retry
+   * the write EXACTLY once with a force-refreshed token. Not a loop: a second
+   * failure (or any non-auth error) propagates unchanged.
+   *
+   * `write` receives the token to use, so the retry can hand it a genuinely fresh
+   * one rather than re-running with the same stale string.
+   */
+  protected async writeWithCollabAuthRetry<T>(
+    collabToken: string,
+    write: (token: string) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await write(collabToken);
+    } catch (e) {
+      if (!isCollabAuthFailedError(e)) throw e;
+      // The WS handshake rejected our token: drop it from the cache so it can't
+      // be reused for the rest of the TTL, mint a fresh one (forceRefresh bypasses
+      // the cache and re-invokes the provider/login), and retry the write once.
+      this.collabTokenCache = null;
+      const fresh = await this.getCollabTokenWithReauth(true);
+      return await write(fresh);
+    }
+  }
+
+  /**
    * Connect to the collaboration websocket, read the live doc, apply
    * `transform`, write the result, and wait for the server to persist it —
    * WITHOUT acquiring the per-page lock.
@@ -526,19 +560,24 @@ export abstract class DocmostClientContext {
     // unsyncedChanges/connectionLost ack logic live in CollabSession.mutate,
     // preserved verbatim from the old inline machine (incl. the #152 structural
     // diff that keeps a live editor's cursor anchored).
-    const session = await acquireCollabSession(pageId, collabToken, this.apiUrl, {
-      // Only the actual 25s collab connect timeout emits this — the connect-vs-
-      // unload signal; the other failure paths must NOT emit it.
-      onConnectTimeout: () =>
-        this.onMetricFn?.("collab_connect_timeouts_total", 1),
+    // Wrap in the collab-auth self-heal (#486): a rejected WS handshake drops the
+    // cached collab token and retries once with a fresh one (the retry passes the
+    // refreshed token down to acquireCollabSession via `token`).
+    return this.writeWithCollabAuthRetry(collabToken, async (token) => {
+      const session = await acquireCollabSession(pageId, token, this.apiUrl, {
+        // Only the actual 25s collab connect timeout emits this — the connect-vs-
+        // unload signal; the other failure paths must NOT emit it.
+        onConnectTimeout: () =>
+          this.onMetricFn?.("collab_connect_timeouts_total", 1),
+      });
+      try {
+        return await session.mutate(transform);
+      } catch (e) {
+        // Drop the session on any failure so the next call reconnects fresh.
+        session.destroy("mutate failed");
+        throw e;
+      }
     });
-    try {
-      return await session.mutate(transform);
-    } catch (e) {
-      // Drop the session on any failure so the next call reconnects fresh.
-      session.destroy("mutate failed");
-      throw e;
-    }
   }
 
   /**
@@ -667,7 +706,11 @@ export abstract class DocmostClientContext {
     transform: (doc: any) => any,
   ): Promise<{ doc?: any; verify?: any }> {
     const pageUuid = await this.resolvePageId(pageId);
-    return mutatePageContent(pageUuid, collabToken, apiUrl, transform);
+    // #486: on a rejected collab-WS handshake, invalidate + refresh the token and
+    // retry the write once (symmetric to the HTTP-401 reauth path).
+    return this.writeWithCollabAuthRetry(collabToken, (token) =>
+      mutatePageContent(pageUuid, token, apiUrl, transform),
+    );
   }
 
   /**
@@ -687,7 +730,11 @@ export abstract class DocmostClientContext {
     apiUrl: string,
   ): Promise<{ doc?: any; verify?: any }> {
     const pageUuid = await this.resolvePageId(pageId);
-    return replacePageContent(pageUuid, doc, collabToken, apiUrl);
+    // #486: on a rejected collab-WS handshake, invalidate + refresh the token and
+    // retry the write once (symmetric to the HTTP-401 reauth path).
+    return this.writeWithCollabAuthRetry(collabToken, (token) =>
+      replacePageContent(pageUuid, doc, token, apiUrl),
+    );
   }
 
   /**
