@@ -4,7 +4,6 @@ import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { DocmostClient, DocmostMcpConfig } from "./client.js";
-import { parseNodeArg } from "@docmost/prosemirror-markdown";
 import { searchShapes } from "./lib/drawio-shapes.js";
 import { getGuideSection } from "./lib/drawio-guide.js";
 import { SHARED_TOOL_SPECS, SharedToolSpec } from "./tool-specs.js";
