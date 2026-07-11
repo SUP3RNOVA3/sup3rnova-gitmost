@@ -94,6 +94,45 @@ describe("paragraph block-escape (git-sync round-trip)", () => {
     }
   });
 
+  it("a block trigger on a CONTINUATION line (after a hardBreak) is escaped too", async () => {
+    // A hardBreak serializes as `  \n`, so a trigger on the second line would,
+    // without a per-line escape, re-parse into another block. The worst case is
+    // `---`: a setext underline would turn the first line into a heading and LOSE
+    // the `---` text entirely. Each pair round-trips as ONE paragraph with the
+    // hardBreak and both texts preserved.
+    for (const [first, second] of [
+      ["a", "# b"],
+      ["a", "- b"],
+      ["a", "> b"],
+      ["a", "1. b"],
+      ["a", "| b |"],
+      ["a", "---"], // setext / thematic — the text-losing case
+    ]) {
+      const d = doc({
+        type: "paragraph",
+        content: [
+          { type: "text", text: first },
+          { type: "hardBreak" },
+          { type: "text", text: second },
+        ],
+      });
+      const back = await markdownToProseMirror(convertProseMirrorToMarkdown(d));
+      expect(back.content, `"${first}⏎${second}" should be one block`).toHaveLength(1);
+      expect(back.content[0].type).toBe("paragraph");
+      const texts = (back.content[0].content as any[])
+        .filter((n) => n.type === "text")
+        .map((n) => n.text);
+      const hasBreak = (back.content[0].content as any[]).some(
+        (n) => n.type === "hardBreak",
+      );
+      expect(hasBreak, `"${first}⏎${second}" should keep the hardBreak`).toBe(true);
+      expect(texts, `"${first}⏎${second}" should preserve both line texts`).toEqual([
+        first,
+        second,
+      ]);
+    }
+  });
+
   it("normal host-prefixed lines round-trip byte-exact (unaffected)", async () => {
     for (const line of [
       "You: hello there",

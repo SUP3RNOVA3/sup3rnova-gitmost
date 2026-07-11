@@ -235,12 +235,25 @@ export const blockTriggerLeadRunArb: fc.Arbitrary<any> = fc
   .map(([trigger, rest]) => ({ type: 'text', text: trigger + rest }));
 
 /**
+ * A hardBreak IMMEDIATELY followed by a block-trigger-leading run — a two-node
+ * segment. Because a hardBreak serializes as `  \n`, the trigger then sits at
+ * the START of a CONTINUATION line, exercising the serializer's PER-LINE block
+ * escape (not just the first line). #493 review: without this the fuzzer never
+ * placed a trigger after a hardBreak, so a single-line-only escape passed P1–P3.
+ */
+export const hardBreakThenTriggerArb: fc.Arbitrary<any[]> = fc
+  .tuple(hardBreakArb, blockTriggerLeadRunArb)
+  .map(([hb, trigger]) => [hb, trigger]);
+
+/**
  * Inline content for a paragraph: at least one marked text run, optionally with
  * inline atoms (math/mention) and hard breaks interspersed. The FIRST run is
  * usually an ordinary marked run, but sometimes a block-trigger-leading run
- * (blockTriggerLeadRunArb) so the paragraph OPENS with a markdown block trigger
- * — exercising the serializer's leading block-escape end-to-end. (Ported, with
- * the #493 leading-trigger dimension added.)
+ * (blockTriggerLeadRunArb) so the paragraph OPENS with a markdown block trigger;
+ * and a `hardBreak + trigger` segment can appear anywhere in the rest, so a
+ * trigger also lands at the start of a CONTINUATION line — both exercising the
+ * serializer's per-line block-escape end-to-end. (Ported, with the #493
+ * leading-trigger + post-hardBreak dimensions added.)
  */
 export const inlineContentArb: fc.Arbitrary<any[]> = fc
   .tuple(
@@ -250,15 +263,16 @@ export const inlineContentArb: fc.Arbitrary<any[]> = fc
     ),
     fc.array(
       fc.oneof(
-        { weight: 5, arbitrary: markedTextRunArb },
-        { weight: 1, arbitrary: mathInlineArb },
-        { weight: 1, arbitrary: mentionArb },
-        { weight: 1, arbitrary: hardBreakArb },
+        { weight: 5, arbitrary: markedTextRunArb.map((n) => [n]) },
+        { weight: 1, arbitrary: mathInlineArb.map((n) => [n]) },
+        { weight: 1, arbitrary: mentionArb.map((n) => [n]) },
+        { weight: 1, arbitrary: hardBreakArb.map((n) => [n]) },
+        { weight: 2, arbitrary: hardBreakThenTriggerArb },
       ),
       { minLength: 0, maxLength: 4 },
     ),
   )
-  .map(([first, rest]) => normalizeInline([first, ...rest]));
+  .map(([first, rest]) => normalizeInline([first, ...rest.flat()]));
 
 /**
  * Inline content for a HEADING — identical to a paragraph's, but WITHOUT hard

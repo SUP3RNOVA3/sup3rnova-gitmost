@@ -117,10 +117,12 @@ const LIST_MARKER_SEPARATOR = "<!-- -->";
  * NOT open a block — emphasis `**x**`, an inline code span, ordinary prose — is
  * returned verbatim, so there is no backslash churn for the common case.
  *
- * Applied ONLY to paragraph text: headings/lists/blockquotes legitimately open
- * with these markers and render them from their own cases. This is the single,
- * canonical fix for the class the client bridge worked around with a ZWSP
- * (`gitmost-recording.ts`) and the generative suite self-censored around
+ * Applied ONLY to paragraph text, once per `\n`-separated LINE (the paragraph
+ * case splits on `\n` — each hardBreak emits `  \n` — so a trigger on a
+ * continuation line is escaped too): headings/lists/blockquotes legitimately
+ * open with these markers and render them from their own cases. This is the
+ * single, canonical fix for the class the client bridge worked around with a
+ * ZWSP (`gitmost-recording.ts`) and the generative suite self-censored around
  * (`text-arbitraries.ts`) — both now removed.
  */
 function escapeLeadingBlockTrigger(line: string): string {
@@ -517,10 +519,17 @@ export function convertProseMirrorToMarkdown(
       }
 
       case "paragraph": {
-        // Escape a leading block trigger so a paragraph whose text opens with
-        // `#`/`-`/`>`/`1.`/`|`/a fence/`---` round-trips as a paragraph instead
-        // of silently re-parsing into another block on the next import.
-        const text = escapeLeadingBlockTrigger(renderInlineChildren(nodeContent));
+        // Escape a leading block trigger on EVERY line of the paragraph, not
+        // just the first: a hardBreak serializes as `  \n`, so a `#`/`-`/`>`/
+        // `1.`/`|`/fence/`---` at the start of a CONTINUATION line would also
+        // re-parse into another block on the next import (a heading/list/table/
+        // setext-`---`), and for the text-less thematic/setext case would LOSE
+        // that line's text entirely. Escaping each `\n`-separated line closes
+        // the class for multi-line paragraphs too.
+        const text = renderInlineChildren(nodeContent)
+          .split("\n")
+          .map(escapeLeadingBlockTrigger)
+          .join("\n");
         const align = node.attrs?.textAlign;
         // Non-default alignment round-trips as an ATTACHED HTML comment at the
         // END of the block line (#293 canon #9):
