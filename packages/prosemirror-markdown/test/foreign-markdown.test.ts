@@ -1,12 +1,12 @@
-import {
-  convertProseMirrorToMarkdown,
-  markdownToProseMirror,
-} from '@docmost/prosemirror-markdown';
-import { normalizeForeignMarkdown } from './foreign-markdown';
+import { describe, it, expect } from 'vitest';
+import { convertProseMirrorToMarkdown } from '../src/lib/markdown-converter.js';
+import { markdownToProseMirror } from '../src/lib/markdown-to-prosemirror.js';
+import { normalizeForeignMarkdown } from '../src/lib/foreign-markdown.js';
 
 /**
- * STEP 2 goldens for issue #345: the foreign-markdown normalizer that runs at the
- * import boundary BEFORE the strict canonical parser (`markdownToProseMirror`).
+ * STEP 2 goldens for issue #345 (moved into the package with the normalizer in
+ * #493): the foreign-markdown normalizer that runs at the import boundary BEFORE
+ * the strict canonical parser (`markdownToProseMirror`).
  *
  * Two layers:
  *  1. PURE string→string cases pinning the normalizer's own behavior (GFM

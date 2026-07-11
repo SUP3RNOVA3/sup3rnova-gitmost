@@ -1,7 +1,14 @@
 /**
  * Foreign-markdown normalizer — an input-liberal / output-canonical adapter that
  * runs at the IMPORT boundary, BEFORE the canonical parser
- * (`markdownToProseMirror` from `@docmost/prosemirror-markdown`).
+ * (`markdownToProseMirror`, this package).
+ *
+ * OWNED BY THIS PACKAGE (#493): the normalizer used to live only in
+ * apps/server's import path, so the MCP page-write path (`updatePageMarkdown` ->
+ * `markdownToProseMirrorCanonical`) handled the SAME foreign input differently
+ * (no front-matter strip, no `[^id]` reference-footnote rewrite) than the server
+ * importer. Moving it here — and calling it from `markdownToProseMirrorCanonical`
+ * — makes every canonical import boundary treat foreign markdown identically.
  *
  * The canonical parser is deliberately STRICT: it only understands Docmost's
  * canonical markdown surface (Obsidian-style `> [!type]` callouts, Pandoc/Obsidian

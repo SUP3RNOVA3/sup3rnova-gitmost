@@ -10,7 +10,10 @@ import { JSDOM } from "jsdom";
 // handled there). MCP consumes it directly instead of maintaining its own
 // drifted marked pipeline; only the collab/yjs write glue and the footnote
 // canonicalization wrapper stay mcp-side.
-import { markdownToProseMirror } from "@docmost/prosemirror-markdown";
+import {
+  markdownToProseMirror,
+  normalizeForeignMarkdown,
+} from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
 import {
@@ -97,6 +100,11 @@ global.WebSocket = WebSocket;
  * plain `markdownToProseMirror` (no canonicalization) — safe now because inline
  * `^[body]` footnotes carry their body at the reference point, so a comment can
  * no longer produce a reference-less footnote definition to be dropped.
+ *
+ * #493: `normalizeForeignMarkdown` runs FIRST, so an agent's `updatePageMarkdown`
+ * body is normalized exactly like the server import path — GFM `[^id]` reference
+ * footnotes become canonical inline `^[body]`, and a leading YAML front-matter
+ * block is stripped — instead of leaking through as literal text / a bogus link.
  */
 export async function markdownToProseMirrorCanonical(
   markdownContent: string,
@@ -105,7 +113,9 @@ export async function markdownToProseMirrorCanonical(
   // canonicalizing, so the canonicalizer re-hangs references and drops the
   // now-orphaned duplicate definitions.
   return canonicalizeFootnotes(
-    normalizeAndMergeFootnotes(await markdownToProseMirror(markdownContent)),
+    normalizeAndMergeFootnotes(
+      await markdownToProseMirror(normalizeForeignMarkdown(markdownContent)),
+    ),
   );
 }
 
