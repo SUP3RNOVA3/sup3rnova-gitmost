@@ -88,4 +88,26 @@ describe('executeTx post-commit hooks', () => {
     // The throwing hook is swallowed; a later hook still runs.
     expect(log).toEqual(['commit', 'second-hook-still-runs']);
   });
+
+  it('does NOT run afterCommit hooks when the transaction body throws (rollback)', async () => {
+    // The body rejects -> the fake transaction never pushes 'commit' and
+    // db.transaction().execute() rejects, mirroring a real rolled-back tx. The
+    // drain runs only AFTER the awaited (committed) transaction, so a rollback
+    // must leave every registered hook UN-run — otherwise a cache-bust / event
+    // would fire for a write that never landed.
+    const log: string[] = [];
+    const { db } = fakeDb(log);
+    const hook = jest.fn();
+
+    await expect(
+      executeTx(db, async (trx) => {
+        registerAfterCommit(trx, hook);
+        throw new Error('write failed -> rollback');
+      }),
+    ).rejects.toThrow('write failed -> rollback');
+
+    // No commit happened, and the post-commit hook never ran.
+    expect(log).toEqual([]); // no 'commit'
+    expect(hook).not.toHaveBeenCalled();
+  });
 });
