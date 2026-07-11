@@ -10,6 +10,7 @@ import {
   IconBrush,
   IconWorld,
   IconSparkles,
+  IconKey,
 } from "@tabler/icons-react";
 import { Link, useLocation } from "react-router-dom";
 import classes from "./settings.module.css";
@@ -45,6 +46,11 @@ const groupedData: DataGroup[] = [
         label: "Preferences",
         icon: IconBrush,
         path: "/settings/account/preferences",
+      },
+      {
+        label: "API keys",
+        icon: IconKey,
+        path: "/settings/account/api-keys",
       },
     ],
   },
