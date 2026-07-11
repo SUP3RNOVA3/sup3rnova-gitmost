@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   HttpException,
 } from '@nestjs/common';
 import { AiChatController } from './ai-chat.controller';
@@ -46,7 +47,13 @@ describe('#487 AiChatController.stream — gate + supersede', () => {
     return { req, res };
   }
 
-  function makeController(runServiceOverrides: Record<string, jest.Mock>) {
+  function makeController(
+    runServiceOverrides: Record<string, jest.Mock>,
+    // The chat assertOwnedChat resolves. Default: a chat OWNED by `user` (u1), so
+    // the ownership gate is transparent to the gate/CAS assertions below. Pass a
+    // foreign-owner (or undefined) chat to exercise the #487 owner rejection.
+    chat: { creatorId: string } | undefined = { creatorId: 'u1' },
+  ) {
     const aiChatService = {
       resolveRoleForRequest: jest.fn().mockResolvedValue(null),
       getChatModel: jest.fn().mockResolvedValue({}),
@@ -65,15 +72,16 @@ describe('#487 AiChatController.stream — gate + supersede', () => {
       requestStop: jest.fn(),
       ...runServiceOverrides,
     };
+    const aiChatRepo = { findById: jest.fn().mockResolvedValue(chat) };
     const controller = new AiChatController(
       aiChatService as never,
       aiChatRunService as never,
-      {} as never, // aiChatRepo
+      aiChatRepo as never, // aiChatRepo
       {} as never, // aiChatMessageRepo
       {} as never, // aiTranscription
       {} as never, // pageRepo
     );
-    return { controller, aiChatService, aiChatRunService };
+    return { controller, aiChatService, aiChatRunService, aiChatRepo };
   }
 
   const codeOf = (err: unknown) =>
@@ -111,6 +119,56 @@ describe('#487 AiChatController.stream — gate + supersede', () => {
         );
       });
     }
+  });
+
+  // #487 [security, F1]: stream() MUST owner-gate an existing chat exactly like its
+  // six sibling endpoints, BEFORE the supersede CAS. Otherwise a same-workspace
+  // non-owner could POST a supersede against another user's chat and (a) harvest
+  // that user's active runId from the 409 SUPERSEDE_TARGET_MISMATCH body, then (b)
+  // requestStop the foreign run. The gate must reject FIRST — no run lookup, no
+  // supersede, no stop, no runId leak.
+  describe('cross-user ownership gate (F1)', () => {
+    it('a non-owner streaming against someone else\'s chat is rejected (403) with NO runId leak and NO foreign requestStop', async () => {
+      // A live run exists on the victim's chat. Without the gate the supersede CAS
+      // would run and (faithful to the run service) return a MISMATCH carrying the
+      // victim's runId — the exact leak. With the gate it must never be reached.
+      const getActiveForChat = jest
+        .fn()
+        .mockResolvedValue({ id: 'run-victim', chatId: 'c-other' });
+      const supersede = jest
+        .fn()
+        .mockResolvedValue({ kind: 'mismatch', activeRunId: 'run-victim' });
+      const requestStop = jest.fn();
+      const { controller, aiChatService } = makeController(
+        { getActiveForChat, supersede, requestStop },
+        { creatorId: 'someone-else' }, // the chat is NOT owned by u1
+      );
+      const { req, res } = makeReqRes({
+        chatId: 'c-other',
+        supersede: { runId: 'guessed-uuid' },
+      });
+      let thrown: unknown;
+      try {
+        await controller.stream(req as never, res as never, user, wsWith(true));
+      } catch (e) {
+        thrown = e;
+      }
+      // Rejected by the ownership gate (403), the SAME shape the neighbors use.
+      expect(thrown).toBeInstanceOf(ForbiddenException);
+      expect((thrown as HttpException).getStatus()).toBe(403);
+      // Crucially NOT a 409 that would carry activeRunId — no runId is leaked.
+      const payload = JSON.stringify(
+        (thrown as HttpException).getResponse() ?? {},
+      );
+      expect(payload).not.toContain('run-victim');
+      expect(codeOf(thrown)).not.toBe('SUPERSEDE_TARGET_MISMATCH');
+      // The gate short-circuits BEFORE any run machinery runs.
+      expect(getActiveForChat).not.toHaveBeenCalled();
+      expect(supersede).not.toHaveBeenCalled();
+      expect(requestStop).not.toHaveBeenCalled();
+      expect(aiChatService.stream).not.toHaveBeenCalled();
+      expect(res.hijack).not.toHaveBeenCalled();
+    });
   });
 
   it('supersede MISMATCH -> 409 SUPERSEDE_TARGET_MISMATCH carrying the current runId', async () => {

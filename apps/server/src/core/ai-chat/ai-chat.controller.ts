@@ -418,6 +418,19 @@ export class AiChatController {
 
     const body = (req.body ?? {}) as AiChatStreamBody;
 
+    // #487 [security]: gate cross-user access to an EXISTING chat BEFORE anything
+    // reads its runs. Every sibling endpoint (getRun/stop/history/rename/delete/
+    // attachRunStream) owner-checks the chat via assertOwnedChat; stream() must too.
+    // Without this a same-workspace member who is NOT the chat owner could POST a
+    // supersede against another user's chat and (a) harvest that user's active runId
+    // out of the 409 SUPERSEDE_TARGET_MISMATCH body, then (b) requestStop the foreign
+    // run. Gate on the chatId the client sent, when present — a brand-new chat (no
+    // chatId) has no prior owner to check. Mirrors /stop's owner check (403 as the
+    // neighbors do), and runs pre-hijack so it returns clean JSON.
+    if (body.chatId) {
+      await this.assertOwnedChat(body.chatId, user, workspace);
+    }
+
     // Resolve the agent role for this turn BEFORE hijack: existing chats read it
     // from ai_chats.role_id (authoritative), a new chat from body.roleId. The
     // role drives both the persona and the optional model override below.
