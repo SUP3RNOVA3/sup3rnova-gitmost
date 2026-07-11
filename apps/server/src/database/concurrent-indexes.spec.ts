@@ -20,13 +20,20 @@ describe('ensureConcurrentIndexes', () => {
     rawMock.mockClear();
   });
 
-  it('runs every registered index CONCURRENTLY, IF NOT EXISTS, outside a transaction', async () => {
+  it('redefines the inlinable f_unaccent BEFORE building any index, then builds each CONCURRENTLY outside a transaction', async () => {
     const onLog = jest.fn();
     await ensureConcurrentIndexes(fakeDb, onLog);
 
-    expect(rawMock).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length);
-    for (const call of rawMock.mock.calls) {
-      const stmt = call[0] as string;
+    // One f_unaccent redefine + one statement per index.
+    expect(rawMock).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length + 1);
+    const statements = rawMock.mock.calls.map((c) => c[0] as string);
+    // ORDER: the f_unaccent redefine MUST be first — otherwise an existing
+    // tenant's old 2-arg f_unaccent makes every CONCURRENTLY build fail.
+    expect(statements[0]).toContain('CREATE OR REPLACE FUNCTION f_unaccent');
+    expect(statements[0]).toContain('SELECT public.unaccent($1)');
+    expect(statements[0]).not.toContain('CREATE INDEX');
+    // The rest are the CONCURRENTLY index builds.
+    for (const stmt of statements.slice(1)) {
       expect(stmt).toContain('CREATE INDEX CONCURRENTLY');
       expect(stmt).toContain('IF NOT EXISTS');
     }
@@ -34,12 +41,31 @@ describe('ensureConcurrentIndexes', () => {
     for (const call of execMock.mock.calls) {
       expect(call[0]).toBe(fakeDb);
     }
-    expect(onLog).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length);
+    expect(onLog).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length + 1);
+  });
+
+  it('still builds the indexes when the f_unaccent redefine fails (fresh DB, best-effort)', async () => {
+    // Redefine (first execute) throws; the index loop must still run.
+    execMock
+      .mockRejectedValueOnce(new Error('extension "unaccent" does not exist'))
+      .mockResolvedValue(undefined);
+    const onLog = jest.fn();
+
+    await expect(
+      ensureConcurrentIndexes(fakeDb, onLog),
+    ).resolves.toBeUndefined();
+
+    // 1 redefine attempt + one per index.
+    expect(execMock).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length + 1);
+    const errored = onLog.mock.calls.filter((c) => c[1] !== undefined);
+    expect(errored).toHaveLength(1);
+    expect(String(errored[0][1])).toContain('unaccent');
   });
 
   it('is best-effort: a failing index does not abort the rest and is reported', async () => {
-    // Fail the FIRST index; the remaining ones must still be attempted.
+    // Redefine ok; fail the FIRST index; the remaining ones must still be tried.
     execMock
+      .mockResolvedValueOnce(undefined) // f_unaccent redefine
       .mockRejectedValueOnce(new Error('relation "pages" does not exist'))
       .mockResolvedValue(undefined);
     const onLog = jest.fn();
@@ -48,8 +74,7 @@ describe('ensureConcurrentIndexes', () => {
       ensureConcurrentIndexes(fakeDb, onLog),
     ).resolves.toBeUndefined();
 
-    expect(execMock).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length);
-    // The failure surfaced with an error argument for the caller to log.
+    expect(execMock).toHaveBeenCalledTimes(CONCURRENT_INDEXES.length + 1);
     const errored = onLog.mock.calls.filter((c) => c[1] !== undefined);
     expect(errored).toHaveLength(1);
     expect(String(errored[0][1])).toContain('does not exist');
