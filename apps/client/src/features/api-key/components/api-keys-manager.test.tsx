@@ -33,6 +33,7 @@ import ApiKeysManager from "./api-keys-manager";
 
 const ISO_SOON = new Date(Date.now() + 10 * 864e5).toISOString();
 const ISO_FAR = new Date(Date.now() + 200 * 864e5).toISOString();
+const ISO_EXPIRED = new Date(Date.now() - 3 * 864e5).toISOString();
 
 // Dump the storage stub via the Web Storage API — its data lives in a closure
 // (see vitest.setup.ts), so JSON.stringify(localStorage) would be vacuous.
@@ -100,6 +101,17 @@ describe("ApiKeysManager — list rendering", () => {
     expect(screen.getAllByText(new RegExp(soonYear)).length).toBeGreaterThan(0);
     // Exactly one key is inside the 30-day warning window.
     expect(screen.getAllByText("Expiring soon")).toHaveLength(1);
+  });
+
+  it('shows "Expired" (not "Expiring soon") for an already-expired key', async () => {
+    vi.mocked(getApiKeys).mockResolvedValue([
+      makeKey({ id: "k-dead", name: "Dead key", expiresAt: ISO_EXPIRED }),
+    ]);
+    renderManager(UserRole.MEMBER);
+    await screen.findByText("Dead key");
+    // A past expiry is labelled "Expired", never the forward-looking badge.
+    expect(screen.getByText("Expired")).toBeDefined();
+    expect(screen.queryByText("Expiring soon")).toBeNull();
   });
 
   it('shows "Never" for an unlimited key and no highlight', async () => {
