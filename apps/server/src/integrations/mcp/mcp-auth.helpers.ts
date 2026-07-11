@@ -337,6 +337,104 @@ export function bindAccessJwtVerifier(
   return (token: string) => tokenService.verifyJwt(token, JwtType.ACCESS);
 }
 
+// The decoded payload shared by the /mcp Bearer allowlist. Carries the `type`
+// discriminator and the API-key `apiKeyId`, on top of the access-token fields.
+export interface McpBearerPayload {
+  type?: JwtType;
+  sub?: string;
+  email?: string;
+  workspaceId?: string;
+  sessionId?: string;
+  apiKeyId?: string;
+}
+
+// Minimal structural shape of the TokenService.verifyJwtOneOf method.
+export interface OneOfJwtVerifier {
+  verifyJwtOneOf: (
+    token: string,
+    allowed: JwtType[],
+  ) => Promise<McpBearerPayload>;
+}
+
+/**
+ * Bind a TokenService-like verifier into a one-arg `verifyJwtOneOf(token)` that
+ * pins the /mcp Bearer ALLOWLIST to exactly {ACCESS, API_KEY}. This REPLACES
+ * `bindAccessJwtVerifier` as the single place the /mcp Bearer path pins the token
+ * type: the /mcp Bearer slot now legitimately accepts either an ACCESS token (a
+ * human's session token) OR an API_KEY token (an agent's key), but NOTHING else
+ * (collab/exchange/attachment/etc. are rejected with the generic type error).
+ * The allowlist is fixed here rather than at the call site, and the signature is
+ * verified exactly once (see verifyMcpBearer).
+ */
+export function bindMcpBearerVerifier(
+  tokenService: OneOfJwtVerifier,
+): (token: string) => Promise<McpBearerPayload> {
+  return (token: string) =>
+    tokenService.verifyJwtOneOf(token, [JwtType.ACCESS, JwtType.API_KEY]);
+}
+
+// Deps for the /mcp Bearer router. `verifyJwtOneOf` is the one-arg verifier bound
+// above (allowlist {ACCESS, API_KEY}); the ACCESS-specific revocation/disabled
+// deps mirror BearerVerifyDeps; `validateApiKey` is the SHARED api-key row-check.
+export interface McpBearerDeps
+  extends Omit<BearerVerifyDeps, 'verifyJwt'> {
+  verifyJwtOneOf: (token: string) => Promise<McpBearerPayload>;
+  // Row-check for an API_KEY principal — the SAME validator REST uses. Throws
+  // UnauthorizedException on a definite deny; PROPAGATES an infra error (→ 5xx),
+  // never masking it as a 401. Not a login attempt: the Basic limiter is not
+  // involved on this path.
+  validateApiKey: (payload: McpBearerPayload) => Promise<unknown>;
+}
+
+/**
+ * Verify a /mcp Bearer token that may be an ACCESS token OR an API_KEY token, and
+ * route by type. The signature is verified EXACTLY ONCE (verifyJwtOneOf); the
+ * result is reused so the ACCESS branch does not re-verify.
+ *
+ *   - API_KEY -> bind to THIS instance's workspace FIRST (a token for another
+ *     workspace is rejected), THEN run the shared `validateApiKey` row-check.
+ *     No session/limiter involvement (an API key is not a login).
+ *   - ACCESS  -> the unchanged `verifyBearerAccess` (session-active + not-disabled
+ *     checks), fed a closure over the already-verified payload so "verify once"
+ *     and "helper unchanged" coexist.
+ *
+ * Throws UnauthorizedException on any auth failure (uniform generic message — no
+ * enumeration of why); propagates an infra error from `validateApiKey` as itself.
+ */
+export async function verifyMcpBearer(
+  token: string,
+  deps: McpBearerDeps,
+): Promise<{ sub?: string; email?: string }> {
+  const generic = 'Invalid or expired token';
+  const payload = await deps.verifyJwtOneOf(token);
+
+  if (payload.type === JwtType.API_KEY) {
+    if (!payload.sub || !payload.workspaceId) {
+      throw new UnauthorizedException(generic);
+    }
+    // Instance-binding (mirrors verifyBearerAccess): reject an API_KEY token
+    // minted for a different workspace before touching the DB.
+    if (
+      deps.expectedWorkspaceId &&
+      payload.workspaceId !== deps.expectedWorkspaceId
+    ) {
+      throw new UnauthorizedException(generic);
+    }
+    // Shared row-check. A definite deny throws Unauthorized; an infra error
+    // propagates (→ 5xx), which the caller must NOT convert to a 401.
+    await deps.validateApiKey(payload);
+    return { sub: payload.sub };
+  }
+
+  // ACCESS: reuse verifyBearerAccess WITHOUT re-verifying the signature.
+  return verifyBearerAccess(token, {
+    verifyJwt: async () => payload,
+    expectedWorkspaceId: deps.expectedWorkspaceId,
+    findUser: deps.findUser,
+    findActiveSession: deps.findActiveSession,
+  });
+}
+
 // Minimal shapes for the Bearer revocation/disabled check. Kept structural so
 // this module never imports the concrete repos/JwtPayload (heavy graph).
 export interface BearerVerifyDeps {
@@ -728,18 +826,24 @@ export async function resolveMcpSessionConfig(
     };
   }
 
-  // --- 2) fallback A: Bearer access-JWT (user-supplied token) ---
+  // --- 2) fallback A: Bearer JWT (user-supplied ACCESS or agent API_KEY) ---
   const bearer = extractBearer(authHeader);
   if (bearer) {
     let payload: { sub?: string; email?: string };
     try {
       payload = await deps.verifyAccessJwt(bearer);
     } catch (err) {
-      const message =
-        err instanceof Error && err.message
-          ? err.message
-          : 'Invalid or expired token';
-      throw new UnauthorizedException(message);
+      // Anti-enumeration (Bearer leg): EVERY auth failure surfaces the SAME
+      // generic 401 — expired/revoked/wrong-type/unknown are indistinguishable
+      // to the caller (its reaction is identical either way). But an UNEXPECTED
+      // (infra) error is NOT an auth verdict: rethrow it AS ITSELF so the surface
+      // maps it to 5xx (mapAuthResultToResponse), never masking a DB/Redis
+      // outage as a bad token. verifyMcpBearer throws UnauthorizedException on a
+      // definite deny and lets an infra error from validateApiKey propagate.
+      if (err instanceof UnauthorizedException) {
+        throw new UnauthorizedException('Invalid or expired token');
+      }
+      throw err;
     }
     return {
       config: { apiUrl, getToken: async () => bearer },

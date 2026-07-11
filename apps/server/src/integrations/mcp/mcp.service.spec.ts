@@ -6,6 +6,8 @@ import {
   isCredentialsFailure,
   isInitializeRequestBody,
   verifyBearerAccess,
+  verifyMcpBearer,
+  bindMcpBearerVerifier,
   sharedTokenMatches,
   clientIp,
   bindAccessJwtVerifier,
@@ -524,13 +526,28 @@ describe('resolveMcpSessionConfig', () => {
     expect(resolved.identity).toBe('bearer:user-9');
   });
 
-  it('Bearer invalid -> specific 401 from verifyAccessJwt', async () => {
+  it('Bearer invalid -> UNIFORM generic 401 (anti-enumeration, reason not leaked)', async () => {
+    // #501: the Bearer leg no longer surfaces the specific reason. Whether the
+    // token is expired, revoked, wrong-type or unknown, the caller sees ONE bare
+    // 'Invalid or expired token' — an agent's reaction is identical, and a leaked
+    // class would be an enumeration oracle.
     const verifyAccessJwt = jest
       .fn()
       .mockRejectedValue(new UnauthorizedException('jwt expired'));
     await expect(
       resolveMcpSessionConfig('Bearer expired', makeDeps({ verifyAccessJwt })),
-    ).rejects.toThrow('jwt expired');
+    ).rejects.toThrow('Invalid or expired token');
+  });
+
+  it('Bearer INFRA error -> propagates (NOT masked as 401)', async () => {
+    // A non-UnauthorizedException (e.g. a DB outage in the api-key row-check) is
+    // not an auth verdict: it must propagate so the surface maps it to 5xx.
+    const verifyAccessJwt = jest
+      .fn()
+      .mockRejectedValue(new Error('connection terminated'));
+    await expect(
+      resolveMcpSessionConfig('Bearer x', makeDeps({ verifyAccessJwt })),
+    ).rejects.toThrow('connection terminated');
   });
 
   it('no creds + env service account configured -> service-account config', async () => {
@@ -1046,6 +1063,107 @@ describe('bindAccessJwtVerifier enforces JwtType.ACCESS (item 3)', () => {
   });
 });
 
+describe('bindMcpBearerVerifier pins the {ACCESS, API_KEY} allowlist (#501)', () => {
+  it('calls verifyJwtOneOf with exactly [ACCESS, API_KEY]', async () => {
+    const verifyJwtOneOf = jest
+      .fn()
+      .mockResolvedValue({ type: JwtType.API_KEY, sub: 'u-1' });
+    await bindMcpBearerVerifier({ verifyJwtOneOf })('the.jwt');
+    expect(verifyJwtOneOf).toHaveBeenCalledWith('the.jwt', [
+      JwtType.ACCESS,
+      JwtType.API_KEY,
+    ]);
+    // Pin the concrete enum values too.
+    expect(verifyJwtOneOf.mock.calls[0][1]).toEqual(['access', 'api_key']);
+  });
+});
+
+describe('verifyMcpBearer routes by token type (#501)', () => {
+  const accessDeps = (over: any = {}) => ({
+    verifyJwtOneOf: jest.fn(),
+    expectedWorkspaceId: 'ws-1',
+    findUser: jest.fn().mockResolvedValue({ deactivatedAt: null }),
+    findActiveSession: jest
+      .fn()
+      .mockResolvedValue({ userId: 'u-1', workspaceId: 'ws-1' }),
+    validateApiKey: jest.fn(),
+    ...over,
+  });
+
+  it('API_KEY -> row-checks via validateApiKey and does NOT touch session/limiter', async () => {
+    const deps = accessDeps({
+      verifyJwtOneOf: jest.fn().mockResolvedValue({
+        type: JwtType.API_KEY,
+        sub: 'svc-1',
+        workspaceId: 'ws-1',
+        apiKeyId: 'k-1',
+      }),
+      validateApiKey: jest.fn().mockResolvedValue({ user: { id: 'svc-1' } }),
+    });
+    const res = await verifyMcpBearer('tok', deps);
+    expect(deps.validateApiKey).toHaveBeenCalledTimes(1);
+    // No session lookup on the api-key path (not a login).
+    expect(deps.findActiveSession).not.toHaveBeenCalled();
+    expect(res).toEqual({ sub: 'svc-1' });
+  });
+
+  it('API_KEY for ANOTHER workspace -> rejected before the row-check', async () => {
+    const deps = accessDeps({
+      verifyJwtOneOf: jest.fn().mockResolvedValue({
+        type: JwtType.API_KEY,
+        sub: 'svc-1',
+        workspaceId: 'ws-OTHER',
+        apiKeyId: 'k-1',
+      }),
+      validateApiKey: jest.fn(),
+    });
+    await expect(verifyMcpBearer('tok', deps)).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+    expect(deps.validateApiKey).not.toHaveBeenCalled();
+  });
+
+  it('API_KEY infra error from validateApiKey PROPAGATES (not masked)', async () => {
+    const boom = new Error('db down');
+    const deps = accessDeps({
+      verifyJwtOneOf: jest.fn().mockResolvedValue({
+        type: JwtType.API_KEY,
+        sub: 'svc-1',
+        workspaceId: 'ws-1',
+        apiKeyId: 'k-1',
+      }),
+      validateApiKey: jest.fn().mockRejectedValue(boom),
+    });
+    await expect(verifyMcpBearer('tok', deps)).rejects.toBe(boom);
+  });
+
+  it('ACCESS -> runs the session/disabled checks and does NOT call validateApiKey', async () => {
+    const deps = accessDeps({
+      verifyJwtOneOf: jest.fn().mockResolvedValue({
+        type: JwtType.ACCESS,
+        sub: 'u-1',
+        workspaceId: 'ws-1',
+        sessionId: 'sess-1',
+        email: 'u@e.com',
+      }),
+    });
+    const res = await verifyMcpBearer('tok', deps);
+    expect(deps.findActiveSession).toHaveBeenCalledWith('sess-1');
+    expect(deps.validateApiKey).not.toHaveBeenCalled();
+    expect(res).toEqual({ sub: 'u-1', email: 'u@e.com' });
+  });
+
+  it('verifies the signature exactly ONCE (single verifyJwtOneOf, no re-verify)', async () => {
+    const verifyJwtOneOf = jest.fn().mockResolvedValue({
+      type: JwtType.ACCESS,
+      sub: 'u-1',
+      workspaceId: 'ws-1',
+    });
+    await verifyMcpBearer('tok', accessDeps({ verifyJwtOneOf }));
+    expect(verifyJwtOneOf).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('decideBasicGate (pure SSO/MFA pre-token gate, refactor R1)', () => {
   // The pure decision extracted out of McpService.enforceBasicLoginGate. It is
   // tested WITHOUT ModuleRef and WITHOUT an on-disk EE MFA module: the SSO verdict
@@ -1191,6 +1309,7 @@ describe('McpService.onModuleDestroy — CollabSession teardown (#486)', () => {
     // The constructor only stores its deps and starts the (unref'd) sweep timer,
     // so bare stubs suffice. onModuleDestroy clears that timer, so no leak.
     return new McpService(
+      {} as any,
       {} as any,
       {} as any,
       {} as any,

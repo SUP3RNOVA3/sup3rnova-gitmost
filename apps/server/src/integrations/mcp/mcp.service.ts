@@ -14,16 +14,17 @@ import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { AuthService } from '../../core/auth/services/auth.service';
 import { TokenService } from '../../core/auth/services/token.service';
 import { validateSsoEnforcement } from '../../core/auth/auth.util';
-import { JwtPayload } from '../../core/auth/dto/jwt-payload';
+import { JwtApiKeyPayload } from '../../core/auth/dto/jwt-payload';
 import { Workspace } from '@docmost/db/types/entity.types';
+import { ApiKeyService } from '../../core/api-key/api-key.service';
 import {
   FailedLoginLimiter,
   resolveMcpSessionConfig,
-  verifyBearerAccess,
+  verifyMcpBearer,
   isInitializeRequestBody,
   sharedTokenMatches,
   clientIp,
-  bindAccessJwtVerifier,
+  bindMcpBearerVerifier,
   decideBasicGate,
   mapAuthResultToResponse,
   DocmostMcpConfig,
@@ -105,6 +106,10 @@ export class McpService implements OnModuleDestroy {
     private readonly userRepo: UserRepo,
     private readonly userSessionRepo: UserSessionRepo,
     private readonly moduleRef: ModuleRef,
+    // Shared api-key row-check for the /mcp API_KEY Bearer branch (same validator
+    // REST uses). Also lets an agent authenticate to /mcp with an api key instead
+    // of the bcrypt Basic path, so parallel reads stop starving the limiter.
+    private readonly apiKeyService: ApiKeyService,
     // Shared singleton in-RAM blob store backing the stash tool.
     private readonly sandboxStore: SandboxStore,
   ) {
@@ -194,37 +199,41 @@ export class McpService implements OnModuleDestroy {
     }
   }
 
-  // Bearer access-JWT verification for the /mcp token fallback. verifyJwt only
-  // checks signature/exp/type, but a logged-out (revoked) or disabled user can
-  // still hold an unexpired access JWT. JwtStrategy additionally checks the
-  // session is active and the user is not disabled; we mirror those exact checks
-  // here so the MCP Bearer path is not weaker than the normal cookie/header path.
+  // Bearer verification for the /mcp token path. The Bearer slot accepts EITHER
+  // an ACCESS token (a human session token) OR an API_KEY token (an agent's key)
+  // — the allowlist is pinned in bindMcpBearerVerifier. An ACCESS token is
+  // checked exactly as JwtStrategy does (signature/exp/type + session-active +
+  // not-disabled), so the MCP path is not weaker than the cookie/header path. An
+  // API_KEY token is HMAC-verified (microseconds) then row-checked via the shared
+  // ApiKeyService.validate — NOT a login attempt, so the Basic bcrypt path and
+  // its anti-brute-force limiter are never touched (the parallel-reads fix).
   private async verifyMcpBearer(
     token: string,
   ): Promise<{ sub?: string; email?: string }> {
-    // Resolve THIS instance's workspace so verifyBearerAccess can bind the
-    // token's `workspaceId` claim to it (mirrors JwtStrategy). The community
-    // build is single-workspace (findFirst), so this is the default workspace
-    // and the check is a no-op here; it only rejects a foreign-workspace token
-    // in a multi-workspace deployment. Undefined (no workspace configured) means
-    // no check — the credentials path would already have failed with no
-    // workspace, and an undefined here keeps the helper a no-op rather than
-    // rejecting every token.
+    // Resolve THIS instance's workspace so the router can bind the token's
+    // `workspaceId` claim to it (mirrors JwtStrategy). The community build is
+    // single-workspace (findFirst), so this is the default workspace and the
+    // check is a no-op here; it only rejects a foreign-workspace token in a
+    // multi-workspace deployment. Undefined (no workspace configured) means no
+    // check — the credentials path would already have failed with no workspace.
     const instanceWorkspace = await this.workspaceRepo.findFirst();
-    // The revocation/disabled decision logic lives in the framework-free
-    // verifyBearerAccess helper (unit-testable without the heavy auth graph);
-    // this method only wires in the concrete TokenService + repos.
-    return verifyBearerAccess(token, {
-      // The JwtType.ACCESS enforcement lives in bindAccessJwtVerifier (a pure,
-      // testable seam) so the type literal cannot silently drift to REFRESH.
-      verifyJwt: bindAccessJwtVerifier(this.tokenService) as (
-        t: string,
-      ) => Promise<JwtPayload>,
+    // The type-routing + revocation/disabled decision logic lives in the
+    // framework-free verifyMcpBearer helper (unit-testable without the heavy auth
+    // graph); this method only wires in the concrete TokenService + repos + the
+    // shared api-key validator.
+    return verifyMcpBearer(token, {
+      // The {ACCESS, API_KEY} allowlist enforcement lives in bindMcpBearerVerifier
+      // (a pure, testable seam) so the type set cannot silently drift.
+      verifyJwtOneOf: bindMcpBearerVerifier(this.tokenService),
       expectedWorkspaceId: instanceWorkspace?.id,
       findUser: (sub, workspaceId) =>
         this.userRepo.findById(sub, workspaceId),
       findActiveSession: (sessionId) =>
         this.userSessionRepo.findActiveById(sessionId),
+      // Shared with REST: a definite deny throws Unauthorized, an infra error
+      // propagates (→ 5xx). The /mcp bearer catch must preserve that distinction.
+      validateApiKey: (payload) =>
+        this.apiKeyService.validate(payload as JwtApiKeyPayload),
     });
   }
 
