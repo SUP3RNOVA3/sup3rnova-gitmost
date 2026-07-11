@@ -1,22 +1,42 @@
+import { useEffect, useRef } from "react";
+import { useLocation } from "react-router-dom";
 import { Button } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import i18n from "@/i18n.ts";
-import { hasAutoReloaded, markAutoReloaded } from "@/lib/reload-guard";
+import {
+  hasAutoReloaded,
+  markAutoReloaded,
+  recordReloadBreadcrumb,
+  takeReloadBreadcrumb,
+} from "@/lib/reload-guard";
 import { decideVersionAction } from "@/features/user/version-coherence";
 
 // Dirty shell around the pure `decideVersionAction`: it reads globals
-// (APP_VERSION, document.visibilityState), touches sessionStorage via the
-// shared reload-guard, and drives the Mantine notification. Kept separate from
-// the pure module so the decision stays unit-testable without a DOM.
+// (APP_VERSION), touches sessionStorage via the shared reload-guard, drives the
+// Mantine notification, and arms the router-navigation reload hook. Kept
+// separate from the pure module so the decision stays unit-testable without a
+// DOM.
 
 // One fixed id so repeated app-version signals (e.g. every reconnect) update a
 // single banner instead of stacking a new one each time.
 const BANNER_ID = "app-version-reload";
 
 // Module-level idempotency for the current tab-load: once a mismatch has been
-// handled we don't re-arm the visibility listener or re-show the banner on
+// handled we don't re-arm the navigation reload or re-show the banner on
 // subsequent app-version emits.
 let handled = false;
+
+// Variant C: on a real mismatch we do NOT reload the tab when it merely goes to
+// the background (that would silently drop a half-written comment/form). Instead
+// we arm a one-shot reload for the NEXT in-app router navigation — a point where
+// the user is already leaving the current page, so an in-app navigation would
+// discard that unsaved component-state anyway and the reload adds no extra loss.
+let pendingNavReload = false;
+
+// Remembered from the last detected mismatch for the pre-reload breadcrumb and
+// the (already-visible) banner.
+let lastServerVersion = "";
+let lastClientVersion = "";
 
 // Read the build version baked into THIS bundle. The `typeof` guard avoids a
 // ReferenceError where the `APP_VERSION` global is absent (e.g. under vitest,
@@ -35,6 +55,16 @@ function performAutoReload(): void {
     showReloadBanner();
     return;
   }
+  // Trace right before the reload (which clears the console): a persistent
+  // breadcrumb + a log line so the auto-reload is observable in a field report.
+  recordReloadBreadcrumb({
+    path: "proactive",
+    serverVersion: lastServerVersion,
+    clientVersion: lastClientVersion,
+  });
+  console.warn(
+    `[version-coherence] auto-reloading: client=${lastClientVersion} -> server=${lastServerVersion}`,
+  );
   window.location.reload();
 }
 
@@ -54,13 +84,15 @@ function showReloadBanner(): void {
 
 /**
  * Handle a server `app-version` announcement: compare it to this bundle's
- * version and, on a real mismatch, do a guarded reload.
+ * version and, on a real mismatch, show the banner and arm a guarded reload for
+ * the next in-app navigation (variant C).
  *
- * - hidden tab              → reload immediately (nobody is looking).
- * - visible tab             → show the banner AND self-reload the moment the
- *                             tab goes to the background (or on the button).
- * - auto-reload already used / storage error → banner only (no auto-reload),
- *   so there is at most one automatic reload per session (loop safety).
+ * - real mismatch (first this session) → banner + arm navigation reload. The
+ *   banner's "Update" button reloads immediately (same one-shot guard). The tab
+ *   is NOT reloaded on visibility change.
+ * - auto-reload already used / storage error → banner only (no arm), so there is
+ *   at most one automatic reload per session (loop safety).
+ * - in sync / unknown version → noop (fail-safe).
  */
 export function triggerGuardedReload(
   rawServerVersion: string | undefined | null,
@@ -79,10 +111,13 @@ export function triggerGuardedReload(
   });
   if (action === "noop") return;
 
-  // Idempotent per tab-load: don't stack banners or re-arm the listener across
-  // repeated emits (reconnects) once we've already acted.
+  // Idempotent per tab-load: don't re-arm or re-stack the banner across repeated
+  // emits (reconnects) once we've already acted.
   if (handled) return;
   handled = true;
+
+  lastServerVersion = serverVersion;
+  lastClientVersion = clientVersion;
 
   if (action === "banner") {
     // Entered banner-only (permanent skew, node oscillation, or spent
@@ -95,22 +130,58 @@ export function triggerGuardedReload(
     return;
   }
 
-  // action === "reload"
-  if (document.visibilityState === "hidden") {
-    // Covers tabs that are already backgrounded at the moment the signal
-    // arrives — reload them right away.
-    performAutoReload();
-    return;
-  }
-
+  // action === "reload" (variant C): show the banner and defer the auto-reload
+  // to the next in-app navigation instead of reloading now / on visibility.
   showReloadBanner();
-  const onHidden = () => {
-    if (document.visibilityState === "hidden") performAutoReload();
-  };
-  document.addEventListener("visibilitychange", onHidden, { once: true });
+  pendingNavReload = true;
 }
 
-// Test-only: reset the module-level idempotency latch between cases.
+/**
+ * Consume the armed one-shot navigation reload, if any. Called by
+ * `useVersionReloadOnNavigation` on each in-app router navigation.
+ */
+export function consumeNavigationReload(): void {
+  if (!pendingNavReload) return;
+  pendingNavReload = false;
+  performAutoReload();
+}
+
+/**
+ * Hook (mounted inside the Router) that fires the armed one-shot reload on the
+ * NEXT in-app router navigation after a version mismatch. Skips the initial
+ * render so it only reacts to real navigations, not the first location.
+ */
+export function useVersionReloadOnNavigation(): void {
+  const location = useLocation();
+  const firstRender = useRef(true);
+  useEffect(() => {
+    if (firstRender.current) {
+      firstRender.current = false;
+      return;
+    }
+    consumeNavigationReload();
+  }, [location.key]);
+}
+
+/**
+ * Surface (log once) the breadcrumb left by an auto-reload in the previous page
+ * load — the reload cleared the console, so this makes a "tab reloaded itself"
+ * report diagnosable. Call once on app startup.
+ */
+export function surfacePreviousReloadBreadcrumb(): void {
+  const crumb = takeReloadBreadcrumb();
+  if (!crumb) return;
+  console.info(
+    `[version-coherence] previous auto-reload: path=${crumb.path} ` +
+      `client=${crumb.clientVersion ?? ""} -> server=${crumb.serverVersion ?? ""} ` +
+      `at=${new Date(crumb.at).toISOString()}`,
+  );
+}
+
+// Test-only: reset module-level latches between cases.
 export function __resetGuardedReloadForTests(): void {
   handled = false;
+  pendingNavReload = false;
+  lastServerVersion = "";
+  lastClientVersion = "";
 }
