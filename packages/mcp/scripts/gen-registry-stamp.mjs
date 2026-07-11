@@ -1,60 +1,100 @@
 // Codegen: emit src/registry-stamp.generated.ts with a REGISTRY_STAMP hash of
-// the tool-specs REGISTRY CONTENT, so a build/ vs src/ skew (issue #447) is
-// detectable at runtime.
+// the ENTIRE src/ tree, so a build/ vs src/ skew (issue #447) is detectable at
+// runtime for ANY source file — not just tool-specs.ts.
 //
-// WHY hash the raw source text (not extracted structured data):
-// SHARED_TOOL_SPECS carries `buildShape` functions (the input SCHEMAS) which are
-// NOT serializable. The input schema is exactly one of the things that MUST stay
-// in sync between build/ and src/, so we cannot drop it from the hash. Rather
-// than probe zod with a fragile shim to reconstruct the schema shape, we hash the
-// STABLE, deterministic source TEXT of tool-specs.ts. That text fully captures
-// every field that must stay in sync — mcpName, inAppKey, description, tier,
-// catalogLine AND the buildShape bodies (input schemas) — with zero probing
-// fragility. Any edit to a spec (a renamed tool, a reworded description, a
-// changed schema field) changes the text and therefore the stamp.
+// WHY hash the whole src tree (not just tool-specs.ts): the runtime tools are
+// assembled from far more than the spec registry — client.ts, the client/*
+// domain modules, comment-signal.ts and the drawio-* helpers all ship in build/
+// and are loaded by the in-app server. Hashing ONLY tool-specs.ts meant an edit
+// to any of those (e.g. a behavioural fix in client.ts) left the stamp unchanged,
+// so a stale build/ served the OLD code silently (issue #486). Hashing every
+// src/**/*.ts closes that gap: any source edit changes the stamp.
 //
-// DETERMINISM: the hash is computed over the file bytes with line endings
-// normalized to LF and a single trailing newline stripped, so a CRLF checkout or
-// an editor's trailing-newline habit cannot make build/ and src/ disagree. No
-// Date.now / randomness. The loader's dev-only stale-check (docmost-client.loader.ts)
-// re-runs THIS SAME normalization + sha256 over src/tool-specs.ts and compares to
-// the built REGISTRY_STAMP; the two must compute identically.
+// WHY hash the raw source text (not extracted structured data): the tool input
+// SCHEMAS live as `buildShape` functions which are NOT serializable, so we cannot
+// reduce them to structured data without a fragile zod shim. Hashing the STABLE,
+// deterministic source TEXT captures every field that must stay in sync with zero
+// probing fragility. Any edit to any source file changes the text → the stamp.
+//
+// DETERMINISM: files are enumerated recursively, filtered to *.ts EXCLUDING
+// *.generated.ts (the codegen's OWN output — including it would create a
+// fixed-point cycle), and sorted by their POSIX-normalized path relative to src/
+// so the order is platform-independent. Each file contributes its relative path
+// AND its content with line endings normalized to LF and a single trailing
+// newline stripped, so a CRLF checkout or an editor's trailing-newline habit
+// cannot make build/ and src/ disagree. No Date.now / randomness. The loader's
+// dev-only stale-check (docmost-client.loader.ts) re-runs THIS SAME enumeration +
+// normalization + sha256 and compares to the built REGISTRY_STAMP; the two must
+// compute identically.
 //
 // This script runs from the `build` and `pretest` npm scripts BEFORE tsc, so
-// build/ always carries a stamp derived from the tool-specs.ts that was compiled.
+// build/ always carries a stamp derived from the src/ tree that was compiled.
 
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SRC_DIR = join(__dirname, '..', 'src');
-const TOOL_SPECS_PATH = join(SRC_DIR, 'tool-specs.ts');
 const OUT_PATH = join(SRC_DIR, 'registry-stamp.generated.ts');
 
 /**
- * Deterministic stamp of the tool-specs registry content. Kept as a plain
- * function (exported) so the algorithm has a single home; the loader duplicates
- * only the tiny normalize+sha256 steps because it lives in the CJS server build
- * and cannot import this ESM script. If you change the normalization here, mirror
- * it in apps/server/src/core/ai-chat/tools/docmost-client.loader.ts.
+ * Recursively enumerate every `*.ts` file under `dir`, EXCLUDING the codegen's
+ * own `*.generated.ts` output (a self-referential cycle otherwise). Returns
+ * absolute paths, unsorted (the caller sorts by relative path for determinism).
+ * Kept as a plain exported function so the algorithm has a single home; the
+ * loader duplicates it because it lives in the CJS server build and cannot import
+ * this ESM script. If you change the walk/filter here, mirror it in
+ * apps/server/src/core/ai-chat/tools/docmost-client.loader.ts.
  */
-export function computeRegistryStamp(toolSpecsSource) {
-  const normalized = toolSpecsSource.replace(/\r\n/g, '\n').replace(/\n$/, '');
-  return createHash('sha256').update(normalized, 'utf8').digest('hex');
+export function collectStampFiles(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) {
+      out.push(...collectStampFiles(full));
+    } else if (entry.endsWith('.ts') && !entry.endsWith('.generated.ts')) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+/**
+ * Deterministic stamp of the whole src/ tree. Enumerate + sort by POSIX-relative
+ * path, then fold each file's relative path AND normalized content into one
+ * sha256. MUST stay byte-for-byte identical to the loader's recompute.
+ */
+export function computeRegistryStamp(srcDir) {
+  const files = collectStampFiles(srcDir)
+    .map((abs) => ({
+      rel: relative(srcDir, abs).split(sep).join('/'),
+      abs,
+    }))
+    .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  const hash = createHash('sha256');
+  for (const { rel, abs } of files) {
+    const normalized = readFileSync(abs, 'utf8')
+      .replace(/\r\n/g, '\n')
+      .replace(/\n$/, '');
+    hash.update(rel, 'utf8');
+    hash.update('\0', 'utf8');
+    hash.update(normalized, 'utf8');
+    hash.update('\0', 'utf8');
+  }
+  return hash.digest('hex');
 }
 
 function main() {
-  const source = readFileSync(TOOL_SPECS_PATH, 'utf8');
-  const stamp = computeRegistryStamp(source);
+  const stamp = computeRegistryStamp(SRC_DIR);
   const out =
     '// AUTO-GENERATED by scripts/gen-registry-stamp.mjs — DO NOT EDIT BY HAND.\n' +
-    '// A deterministic hash of src/tool-specs.ts content (tool names, descriptions,\n' +
-    '// tiers, catalog lines and input schemas). Regenerated on every build/pretest\n' +
-    '// so build/ always matches the compiled src. The in-app loader recomputes this\n' +
-    '// from src and refuses to run on a mismatch (issue #447). This file is\n' +
-    '// gitignored and produced by the build — see .gitignore.\n' +
+    '// A deterministic hash of the whole src/ tree (every src/**/*.ts except\n' +
+    '// *.generated.ts). Regenerated on every build/pretest so build/ always\n' +
+    '// matches the compiled src. The in-app loader recomputes this from src and\n' +
+    '// refuses to run on a mismatch (issue #447/#486). This file is gitignored\n' +
+    '// and produced by the build — see .gitignore.\n' +
     `export const REGISTRY_STAMP = ${JSON.stringify(stamp)};\n`;
   writeFileSync(OUT_PATH, out, 'utf8');
   // eslint-disable-next-line no-console

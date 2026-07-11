@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { DocmostClient, SharedToolSpec } from '@docmost/mcp';
 
@@ -191,38 +191,75 @@ interface DocmostMcpModule {
  * present. Returns the stamp string, or `null` when the source is absent (a prod
  * image ships only build/, no src/). MUST stay byte-for-byte identical to
  * packages/mcp/scripts/gen-registry-stamp.mjs's `computeRegistryStamp` so the
- * build-time and src-time hashes agree: same input file (src/tool-specs.ts), same
- * normalization (CRLF -> LF, strip a single trailing newline), same sha256.
+ * build-time and src-time hashes agree: same file set (every src/**\/*.ts except
+ * *.generated.ts), same POSIX-relative sort, same per-file normalization (CRLF ->
+ * LF, strip a single trailing newline) with the same path+content framing, same
+ * sha256. Hashing the WHOLE src tree (not just tool-specs.ts) is #486: an edit to
+ * client.ts / a client/* module / comment-signal / drawio-* without a rebuild
+ * must also be caught, otherwise build/ silently serves the old code.
  *
  * DEV vs PROD detection is by FILE EXISTENCE, not NODE_ENV: we resolve the
  * package's own directory from `require.resolve('@docmost/mcp')` (which points at
- * build/index.js) and look for ../src/tool-specs.ts next to it. In a dev/test
- * worktree that file exists; in a prod image (build/ only, src/ stripped) it does
- * not, so this returns null and the caller skips the check. Any error (ENOENT, a
- * bad resolve) is swallowed to null — the stale-check must NEVER break startup.
+ * build/index.js) and look for ../src next to it. In a dev/test worktree that
+ * directory exists; in a prod image (build/ only, src/ stripped) it does not, so
+ * this returns null and the caller skips the check. Any error (ENOENT, a bad
+ * resolve) is swallowed to null — the stale-check must NEVER break startup.
  *
  * Exported for unit testing (docmost-client.loader.spec.ts): the export keyword
  * is behaviourally a no-op — the module-internal caller `loadDocmostMcp` is
  * unaffected. The test drives the null (no-src) path and asserts this
- * normalize+sha256 stays identical to the codegen's `computeRegistryStamp`.
+ * enumerate+normalize+sha256 stays identical to the codegen's
+ * `computeRegistryStamp`.
  */
 export function computeSrcRegistryStamp(packageEntry: string): string | null {
   try {
     // packageEntry is <pkg>/build/index.js; the source lives at <pkg>/src/.
-    const toolSpecsPath = join(
-      dirname(dirname(packageEntry)),
-      'src',
-      'tool-specs.ts',
-    );
-    if (!existsSync(toolSpecsPath)) return null; // prod: no src tree -> skip.
-    const source = readFileSync(toolSpecsPath, 'utf8');
-    const normalized = source.replace(/\r\n/g, '\n').replace(/\n$/, '');
-    return createHash('sha256').update(normalized, 'utf8').digest('hex');
+    const srcDir = join(dirname(dirname(packageEntry)), 'src');
+    if (!existsSync(srcDir)) return null; // prod: no src tree -> skip.
+    // Enumerate every src/**\/*.ts except the codegen's own *.generated.ts
+    // output (including it would be a fixed-point cycle). Sort by POSIX-relative
+    // path so ordering is platform-independent, then fold each file's relative
+    // path + normalized content into one hash — identical to the codegen.
+    const files = collectStampFiles(srcDir)
+      .map((abs) => ({
+        rel: relative(srcDir, abs).split(sep).join('/'),
+        abs,
+      }))
+      .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+    const hash = createHash('sha256');
+    for (const { rel, abs } of files) {
+      const normalized = readFileSync(abs, 'utf8')
+        .replace(/\r\n/g, '\n')
+        .replace(/\n$/, '');
+      hash.update(rel, 'utf8');
+      hash.update('\0', 'utf8');
+      hash.update(normalized, 'utf8');
+      hash.update('\0', 'utf8');
+    }
+    return hash.digest('hex');
   } catch {
     // Never let a resolution/read hiccup break server startup — treat as "no
     // src available" and skip the check (identical to the prod no-op path).
     return null;
   }
+}
+
+/**
+ * Recursively enumerate every `*.ts` under `dir`, EXCLUDING `*.generated.ts`.
+ * Mirror of the codegen's `collectStampFiles` (packages/mcp/scripts/
+ * gen-registry-stamp.mjs) — keep the two walk/filter rules identical.
+ */
+function collectStampFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    const full = join(dir, entry);
+    if (statSync(full).isDirectory()) {
+      out.push(...collectStampFiles(full));
+    } else if (entry.endsWith('.ts') && !entry.endsWith('.generated.ts')) {
+      out.push(full);
+    }
+  }
+  return out;
 }
 
 // TS with module:commonjs downlevels a literal `import()` to `require()`, which
