@@ -66,8 +66,9 @@ export function UserProvider({ children }: React.PropsWithChildren) {
     // Register the version-coherence listener SYNCHRONOUSLY, before the socket
     // connects: the server emits `app-version` immediately in handleConnection,
     // so a listener attached after connect would miss it on a fast localhost
-    // connect. On a version mismatch the client guard-reloads (banner on a
-    // visible tab, auto-reload on a hidden one) before it hits a stale chunk.
+    // connect. On a version mismatch the client shows a banner and defers the
+    // auto-reload to the next in-app navigation (variant C — avoids reloading a
+    // backgrounded tab that may hold unsaved input) before it hits a stale chunk.
     newSocket.on("app-version", (payload?: AppVersionSocketPayload) => {
       triggerGuardedReload(payload?.version);
     });
