@@ -336,6 +336,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A chat with one malformed message part no longer 500s on every turn, and a
+  failed send no longer duplicates the user's message.** Incoming client parts
+  are now whitelisted to `text` (a forged tool-result part can no longer reach
+  the persisted history or the model context), and the turn is converted BEFORE
+  the user row is inserted, so a mid-flight failure cannot leave a duplicate
+  user row that a retry then compounds. A single part that still fails to convert
+  degrades to a `[tool context omitted]` marker on that one row instead of
+  bricking the whole chat. (#489)
+- **A transport drop to an external MCP server now heals within the same turn.**
+  On an undici transport error, a read-only MCP tool reconnects its server and
+  retries once within the run; a write is never auto-retried (it may already have
+  applied). One flapping server no longer nulls the shared client cache, so other
+  servers' cached clients are untouched. The SSE transport also gets a raised
+  body-timeout so a legitimate >1-min idle between the model's tool calls no
+  longer breaks a long-lived SSE socket (new `AI_MCP_SSE_BODY_TIMEOUT_MS`, default
+  10 min; see `.env.example`). (#489)
+
 - **The server no longer runs out of heap during long autonomous agent runs.** A
   new pnpm patch on `ai@6.0.134` stops the SDK from building a cumulative
   snapshot of the ENTIRE turn text on every streamed text-delta when no output
