@@ -27,11 +27,17 @@ export {
 } from "./markdown-to-prosemirror.js";
 
 // Foreign-markdown normalizer (#493): the input-liberal pre-pass that rewrites
-// GFM `[^id]` reference footnotes to canonical inline `^[body]` and strips a
-// leading YAML front-matter block, run at every canonical IMPORT boundary
-// (server import + mcp `markdownToProseMirrorCanonical`) so foreign markdown is
-// normalized identically everywhere instead of only in apps/server.
-export { normalizeForeignMarkdown } from "./foreign-markdown.js";
+// GFM `[^id]` reference footnotes to canonical inline `^[body]`. Two variants:
+// `normalizeForeignMarkdown` (server FILE-import boundary) ALSO strips a leading
+// YAML front-matter block; `normalizeAgentMarkdown` (canonical AGENT-WRITE path,
+// mcp `markdownToProseMirrorCanonical`) does NOT — a full-body agent rewrite must
+// not lose a leading `---…---` horizontalRule to the front-matter strip (#493
+// review). The reference-footnote rewrite is shared so agent + import stay unified
+// where it matters, without the content-losing strip on the write path.
+export {
+  normalizeForeignMarkdown,
+  normalizeAgentMarkdown,
+} from "./foreign-markdown.js";
 
 // The Docmost tiptap schema mirror. Exposed so consumers (and the sync
 // engine's schema-validity regression tests) can build the exact ProseMirror

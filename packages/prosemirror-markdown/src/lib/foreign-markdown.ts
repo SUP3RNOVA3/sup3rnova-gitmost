@@ -254,11 +254,18 @@ function convertReferenceFootnotes(markdown: string): string {
 const YAML_FRONT_MATTER_RE = /^\uFEFF?---\n[\s\S]*?\n---\n?/;
 
 /**
- * Normalize a foreign markdown string into Docmost's canonical markdown surface
- * so the strict canonical parser accepts it losslessly: normalize line endings,
- * strip a leading YAML front-matter block, then rewrite GFM reference footnotes
- * into inline footnotes. Add further fixture-driven foreign-surface cases here as
- * they are found.
+ * Normalize a foreign markdown string from a FILE IMPORT into Docmost's canonical
+ * markdown surface so the strict canonical parser accepts it losslessly: normalize
+ * line endings, strip a leading YAML front-matter block, then rewrite GFM reference
+ * footnotes into inline footnotes. Add further fixture-driven foreign-surface cases
+ * here as they are found.
+ *
+ * FRONT-MATTER STRIP IS IMPORT-ONLY (#493 review): use this ONLY at the server
+ * file-import boundary, where a `.md` file really can open with an Obsidian/Hugo
+ * YAML header. Do NOT use it on the canonical AGENT-WRITE path — see
+ * {@link normalizeAgentMarkdown} for why a full-body agent rewrite must NOT strip
+ * a leading `---…---` (it is normally a horizontalRule the serializer emitted, and
+ * stripping it would silently drop the page's leading content).
  */
 export function normalizeForeignMarkdown(markdown: string): string {
   if (!markdown) return markdown;
@@ -270,4 +277,27 @@ export function normalizeForeignMarkdown(markdown: string): string {
   const src = markdown.replace(/\r\n/g, '\n');
   const withoutFrontMatter = src.replace(YAML_FRONT_MATTER_RE, '').trimStart();
   return convertReferenceFootnotes(withoutFrontMatter);
+}
+
+/**
+ * Canonical AGENT-WRITE normalization: normalize line endings and rewrite GFM
+ * `[^id]` reference footnotes to inline `^[body]` — but DELIBERATELY NOT strip a
+ * leading YAML front-matter block.
+ *
+ * WHY the split (#493 review): the reference-footnote rewrite is the drift the
+ * MCP page-write path (`updatePageMarkdown` -> `markdownToProseMirrorCanonical`)
+ * needed unified with the server import (an agent may paste GFM footnotes). The
+ * front-matter strip, however, is a FILE-import concern: on a full-body agent
+ * rewrite a leading `---…---` is (almost) always a `horizontalRule` the
+ * serializer emitted plus a later rule/heading — NOT a foreign YAML header — so
+ * `YAML_FRONT_MATTER_RE` would match it and SILENTLY DELETE the page's leading
+ * content (a page that starts with a horizontal rule and contains a second `---`
+ * lost everything up to it). Agent writes must never lose already-stored content,
+ * so this variant skips the strip. It IS a no-op on canonical serialized content
+ * (which never emits `[^id]:` reference-definition lines).
+ */
+export function normalizeAgentMarkdown(markdown: string): string {
+  if (!markdown) return markdown;
+  const src = markdown.replace(/\r\n/g, '\n');
+  return convertReferenceFootnotes(src);
 }

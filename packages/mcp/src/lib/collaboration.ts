@@ -12,7 +12,7 @@ import { JSDOM } from "jsdom";
 // canonicalization wrapper stay mcp-side.
 import {
   markdownToProseMirror,
-  normalizeForeignMarkdown,
+  normalizeAgentMarkdown,
 } from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
@@ -102,10 +102,14 @@ global.WebSocket = WebSocket;
  * `^[body]` footnotes carry their body at the reference point, so a comment can
  * no longer produce a reference-less footnote definition to be dropped.
  *
- * #493: `normalizeForeignMarkdown` runs FIRST, so an agent's `updatePageMarkdown`
- * body is normalized exactly like the server import path — GFM `[^id]` reference
- * footnotes become canonical inline `^[body]`, and a leading YAML front-matter
- * block is stripped — instead of leaking through as literal text / a bogus link.
+ * #493: `normalizeAgentMarkdown` runs FIRST, so an agent's `updatePageMarkdown`
+ * body gets the SAME GFM `[^id]` reference-footnote -> inline `^[body]` rewrite as
+ * the server import path (instead of the reference leaking as literal text / a
+ * bogus link). It DELIBERATELY does NOT strip a leading YAML front-matter block:
+ * a full-body agent rewrite that opens with a `---…---` is (almost) always a
+ * horizontalRule the serializer emitted, and stripping it would silently drop the
+ * page's leading content (#493 review). The front-matter strip stays on the
+ * server FILE-import boundary only (`normalizeForeignMarkdown`).
  */
 export async function markdownToProseMirrorCanonical(
   markdownContent: string,
@@ -115,7 +119,7 @@ export async function markdownToProseMirrorCanonical(
   // now-orphaned duplicate definitions.
   return canonicalizeFootnotes(
     normalizeAndMergeFootnotes(
-      await markdownToProseMirror(normalizeForeignMarkdown(markdownContent)),
+      await markdownToProseMirror(normalizeAgentMarkdown(markdownContent)),
     ),
   );
 }
