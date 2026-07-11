@@ -88,14 +88,14 @@ export const RUN_STREAM_RETAIN_FINISHED_MS = 30_000;
  * its persisted frontier come from the seed, not the ring). The ring stays bounded
  * because it rotates on every confirmed persist; this cap is only the ceiling for
  * the un-persisted tail between rotations. Env-tunable via
- * RUN_STREAM_MAX_BUFFER_BYTES (bytes); a 0/invalid value falls back to this.
+ * AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES (bytes); a 0/invalid value falls back to this.
  */
-export const RUN_STREAM_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+export const AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
 
 // 2× the ring cap: a just-written full-tail burst alone can never trip the
 // per-subscriber cap (see controller); only a genuinely stalled socket can. This
 // derivative relationship is preserved even when the ring cap is env-overridden.
-export const SUBSCRIBER_MAX_BUFFERED_BYTES = 2 * RUN_STREAM_MAX_BUFFER_BYTES;
+export const SUBSCRIBER_MAX_BUFFERED_BYTES = 2 * AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES;
 
 /**
  * A finish-step boundary frame is exactly `data: {"type":"finish-step"...}\n\n`
@@ -110,12 +110,12 @@ const FINISH_STEP_FRAME_PREFIX = 'data: {"type":"finish-step"';
 
 /** Resolve the ring cap from the environment, falling back to the default. */
 function resolveMaxBufferBytes(): number {
-  const raw = process.env.RUN_STREAM_MAX_BUFFER_BYTES;
-  if (!raw) return RUN_STREAM_MAX_BUFFER_BYTES;
+  const raw = process.env.AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES;
+  if (!raw) return AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES;
   const parsed = Number(raw);
   return Number.isFinite(parsed) && parsed > 0
     ? Math.floor(parsed)
-    : RUN_STREAM_MAX_BUFFER_BYTES;
+    : AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES;
 }
 
 export interface RunStreamCallbacks {
@@ -321,7 +321,11 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
   async attach(
     chatId: string,
     anchor: string | undefined,
-    n: number,
+    // The client's persisted step frontier. `null` = a NOT-tail-aware client (no
+    // `n` query param) — a legacy/parameterless tab that expects the old
+    // "finished -> 204 -> poll" contract; distinct from `0` (a tail-aware client
+    // with nothing persisted yet).
+    n: number | null,
     cb: RunStreamCallbacks,
   ): Promise<RunStreamAttachment | null> {
     const entry = this.entries.get(chatId);
@@ -329,14 +333,25 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
     // Invariant 6: cross-run replay is forbidden. Before bind, assistantMessageId
     // is undefined and mismatches any anchor -> 204 -> client restore+poll path.
     if (anchor && entry.assistantMessageId !== anchor) return null;
+    // #491 regression guard (#137/#161 dup): a NOT-tail-aware client (no `n`)
+    // resuming a FINISHED run must 204 and poll — the old `finished && !expectLive`
+    // gate. Without this, a missing `n` collapsing to frontier 0 would serve the
+    // WHOLE tail of a finished, NON-rotated run (coverageFloor 0), and a
+    // parameterless client that never stripped its transcript would APPEND that
+    // full replay onto the steps it already shows -> duplicated text. A tail-aware
+    // client (n present, incl. n=0) still gets the tail past its frontier.
+    if (entry.finished && n === null) return null;
     // A finished entry with NOTHING in the ring (aborted before the first frame,
     // or fully overflowed) has no tail to deliver -> 204 -> the client polls.
     if (entry.finished && entry.frames.length === 0) return null;
+    // A LIVE run with no `n` (legacy parameterless) replays from step 0 (the old
+    // behavior); a tail-aware client resumes from its frontier.
+    const frontier = n ?? 0;
     const floor = this.coverageFloor(entry);
-    if (floor > n) {
+    if (floor > frontier) {
       this.logger.warn(
         `run-stream attach gap for run=${entry.runId}: coverageFloor=${floor} ` +
-          `> client n=${n} -> 204 (client refetches + re-attaches)`,
+          `> client frontier=${frontier} -> 204 (client refetches + re-attaches)`,
       );
       return null;
     }
@@ -345,7 +360,7 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
     const sliceTail = (): string[] => {
       const out: string[] = [startFrame];
       for (let i = 0; i < entry.frames.length; i++) {
-        if (entry.stamps[i] >= n) out.push(entry.frames[i]);
+        if (entry.stamps[i] >= frontier) out.push(entry.frames[i]);
       }
       return out;
     };
@@ -368,7 +383,7 @@ export class AiChatStreamRegistryService implements OnModuleDestroy {
       pendingBytes: 0,
       overflowed: false,
       pendingEnd: false,
-      minStamp: n,
+      minStamp: frontier,
     };
     // Register + snapshot in the SAME synchronous block (invariant 4). No await
     // separates them, so a concurrently ingested frame cannot be lost/duplicated.

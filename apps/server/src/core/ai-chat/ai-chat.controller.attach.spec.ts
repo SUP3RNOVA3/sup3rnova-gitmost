@@ -182,7 +182,38 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     );
   });
 
-  it('floors n to 0 when the query is absent/invalid', async () => {
+  it('#491: an ABSENT/invalid n passes null (not 0) so a finished run 204s (not-tail-aware)', async () => {
+    // Distinguishing a MISSING `n` from `n=0` is the #137/#161 dup guard: a
+    // parameterless/legacy tab must be handed null (-> the registry 204s a finished
+    // run) rather than frontier 0 (which would serve a finished non-rotated run's
+    // whole tail). MUTATION-VERIFY: revert to `Number(n) || 0` and this asserts 0.
+    const { controller, streamRegistry } = makeController({
+      chat: owned,
+      attachment: null,
+    });
+    for (const bad of [undefined, '', 'abc']) {
+      streamRegistry.attach.mockClear();
+      const { res } = makeRawRes();
+      const { req } = makeReq();
+      await controller.attachRunStream(
+        'c1',
+        undefined,
+        bad,
+        req,
+        res,
+        user,
+        workspace,
+      );
+      expect(streamRegistry.attach).toHaveBeenCalledWith(
+        'c1',
+        undefined,
+        null,
+        expect.anything(),
+      );
+    }
+  });
+
+  it('#491: a PRESENT n=0 passes 0 (tail-aware, distinct from absent)', async () => {
     const { controller, streamRegistry } = makeController({
       chat: owned,
       attachment: null,
@@ -192,7 +223,7 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     await controller.attachRunStream(
       'c1',
       undefined,
-      undefined,
+      '0',
       req,
       res,
       user,

@@ -1,6 +1,6 @@
 import {
   AiChatStreamRegistryService,
-  RUN_STREAM_MAX_BUFFER_BYTES,
+  AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES,
   RUN_STREAM_RETAIN_FINISHED_MS,
   RunStreamCallbacks,
 } from './ai-chat-stream-registry.service';
@@ -377,7 +377,7 @@ describe('AiChatStreamRegistryService step-aligned retention (#491)', () => {
     const src = makePushStream();
     registry.bind(CHAT, 'run-1', 'assist-1', src.stream);
     // Step 0: a fat step that blows past the cap with NO persist confirmation.
-    const big = 'x'.repeat(Math.floor(RUN_STREAM_MAX_BUFFER_BYTES / 2));
+    const big = 'x'.repeat(Math.floor(AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES / 2));
     src.push(textDelta('t0', big)); // 0
     src.push(textDelta('t0', big)); // 0
     src.push(textDelta('t0', big)); // 0 -> overflow evicts stamp-0 frames
@@ -420,7 +420,7 @@ describe('AiChatStreamRegistryService step-aligned retention (#491)', () => {
     registry.open(CHAT, 'run-1');
     const src = makePushStream();
     registry.bind(CHAT, 'run-1', 'assist-1', src.stream);
-    const big = 'x'.repeat(Math.floor(RUN_STREAM_MAX_BUFFER_BYTES / 2));
+    const big = 'x'.repeat(Math.floor(AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES / 2));
     src.push(textDelta('t0', big)); // 0
     src.push(textDelta('t0', big)); // 0
     src.push(finishStep()); // 0 (still stamp 0)
@@ -458,6 +458,29 @@ describe('AiChatStreamRegistryService step-aligned retention (#491)', () => {
     expect(tail(att.replay)).toEqual([finish()]);
     // No subscriber registered for a finished run.
     expect(entryOf().subscribers.size).toBe(0);
+  });
+
+  it('#491 regression (#137/#161 dup): a PARAMETERLESS attach (n=null) to a finished NON-rotated run -> 204, but n=0 still gets the tail', async () => {
+    // A finished, non-rotated run: frames present, coverageFloor 0. A missing `n`
+    // (null — a legacy/parameterless tab that never stripped its transcript) must
+    // 204 -> poll, NOT receive the whole tail it would append (duplicate). A
+    // tail-aware client (n=0 present) still resumes.
+    registry.open(CHAT, 'run-1');
+    const src = makePushStream();
+    registry.bind(CHAT, 'run-1', 'assist-1', src.stream);
+    src.push(textDelta('t0', 'a')); // 0
+    src.push(finishStep()); // 0
+    src.push(finish()); // 1
+    src.close();
+    await flush();
+    // NOT rotated (no confirmPersistedStep) -> stamps[0]=0, coverageFloor=0.
+    // MUTATION-VERIFY: revert the `finished && n === null -> null` gate (default n
+    // to 0) and the parameterless attach below serves the full tail instead of 204.
+    expect(await registry.attach(CHAT, 'assist-1', null, collector().cb)).toBeNull();
+    // A tail-aware client at frontier 0 IS served (the distinction: null != 0).
+    const tailAware = await registry.attach(CHAT, 'assist-1', 0, collector().cb);
+    expect(tailAware).not.toBeNull();
+    expect(tailAware!.finished).toBe(true);
   });
 
   it('confirmPersistedStep is monotonic and identity-checked', async () => {

@@ -365,9 +365,17 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<void> {
     await this.assertOwnedChat(chatId, user, workspace); // same gate as getRun
-    // The client's persisted step frontier. A missing/invalid value floors to 0
-    // ("give me everything") which, past any rotation, safely 204s.
-    const frontier = Number.isFinite(Number(n)) ? Math.max(0, Number(n)) : 0;
+    // The client's persisted step frontier. #491: distinguish a MISSING/invalid `n`
+    // (null — a NOT-tail-aware, legacy/parameterless tab expecting the old
+    // "finished -> 204 -> poll" contract) from `n=0` (a tail-aware client with
+    // nothing persisted yet). Passing 0 for a missing `n` would serve a finished,
+    // non-rotated run's WHOLE tail and a parameterless client would append it onto
+    // the steps it already shows -> #137/#161 duplicate. null makes the registry
+    // 204 such a finished run (see attach); a tail-aware n=0 still resumes.
+    const frontier: number | null =
+      n === undefined || n === '' || !Number.isFinite(Number(n))
+        ? null
+        : Math.max(0, Number(n));
     // The per-subscriber backpressure cap tracks the (env-tunable) ring cap.
     const subscriberCap =
       this.streamRegistry?.subscriberMaxBufferedBytes ??

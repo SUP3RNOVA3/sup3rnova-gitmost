@@ -2748,34 +2748,6 @@ export function rowToUiMessage(row: AiChatMessage): Omit<UIMessage, 'id'> & {
 }
 
 /**
- * The persisted parts + step marker of a run's assistant row (#491). This is the
- * pure core of the `AiChatRunService.reconstructRunParts(runId)` contract — the
- * SINGLE interface for reading a LIVE run's output — given the already-resolved
- * row. Returns the `metadata.parts` (falling back to a single text part from
- * `content` for a pre-#183 row) and `stepsPersisted` — the count of FINISHED steps
- * whose parts are present, written atomically with the parts by
- * {@link flushAssistant}. A missing marker (an old row) reads as 0, so a consumer
- * treats it as "nothing confirmed" and stays safe (attach 204 / full seed). Pure.
- */
-export function reconstructPartsFromRow(
-  row: Pick<AiChatMessage, 'content' | 'metadata'> | null | undefined,
-): { parts: UIMessage['parts']; stepsPersisted: number } {
-  const meta = (row?.metadata ?? {}) as {
-    parts?: UIMessage['parts'];
-    stepsPersisted?: number;
-  };
-  const parts =
-    Array.isArray(meta.parts) && meta.parts.length > 0
-      ? meta.parts
-      : textPart(row?.content ?? '');
-  const stepsPersisted =
-    typeof meta.stepsPersisted === 'number' && meta.stepsPersisted >= 0
-      ? meta.stepsPersisted
-      : 0;
-  return { parts: parts as UIMessage['parts'], stepsPersisted };
-}
-
-/**
  * The persisted-row patch shape produced by {@link flushAssistant}. It is the
  * SAME shape the assistant repo insert/update consume (content + toolCalls +
  * metadata) plus the lifecycle `status` column added in #183.

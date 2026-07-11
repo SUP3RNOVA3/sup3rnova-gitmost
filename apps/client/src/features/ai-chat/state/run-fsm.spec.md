@@ -48,6 +48,7 @@ Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 | `RETRY` (manual, stalled banner) | stalled | polling(attach-none) **†** | `[armPoll]` |
 | `POLL_TERMINAL` (settled tail merged) | polling, reconnecting, stopping | idle | `[disarmPoll, cancelReconnect]`, runFact←null (I4) |
 | `POLL_IDLE_CAP` (inactivity cap) | polling, reconnecting | stalled | `[disarmPoll, cancelReconnect]` (commit 4a — no more silent) |
+| `POLL_IDLE_CAP` (inactivity cap) | stopping | idle | `[disarmPoll, cancelReconnect]`, runFact←null (Review #4: a Stop-armed poll with no SDK/terminal backstop gets a bounded exit — NOT `stalled`, Stop was already pressed so nothing to retry) |
 | `RUN_FACT{null}` (POST /run → null/terminal, 204) | reconnecting/attaching/polling/stopping | idle | `[cancelReconnect, disarmPoll]`, runFact←null (I3 fresh-negative gate) |
 | `RUN_FACT{runId}` | any | (same) | runFact←runId (pessimism toward an attempt) |
 | `STOP_REQUESTED` (user Stop) | streaming, reconnecting, polling | stopping **†** | `[stopRun, abortAttach, cancelReconnect, armPoll]` (poll drives the terminal — I4 exit by data) |
@@ -150,8 +151,12 @@ message. Sources, in the order they update `ctx.runFact`:
 3. **Attach outcomes:** `ATTACH_LIVE` (2xx) confirms active; a 204 on a non-stripped
    path is an authoritative NEGATIVE fact → the runtime dispatches `RUN_FACT{null}`,
    which cancels recovery (I3 fresh-negative gate).
-4. **Poll (future resume-stack iteration #491):** the delta will carry the run field;
-   until then the poll drives to a terminal ROW, dispatched as `POLL_TERMINAL`.
+4. **Poll (#491, implemented):** the degraded poll now hits the delta endpoint
+   (`POST /ai-chat/messages/delta`), which ALREADY carries the run fact
+   (`run: {id, status} | null`) alongside the changed rows. The client does NOT yet
+   consume that run field — it still drives to a terminal ROW (merged by id),
+   dispatched as `POLL_TERMINAL` — so the run field rides the wire for a future
+   client that settles straight off it.
 
 Pessimism rule: a stale-but-positive fact PERMITS entering recovery (attach); the
 204 then cuts it. A fresh negative fact gates recovery OUT immediately.

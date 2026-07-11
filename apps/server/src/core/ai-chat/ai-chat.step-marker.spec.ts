@@ -1,15 +1,11 @@
-import {
-  flushAssistant,
-  reconstructPartsFromRow,
-} from './ai-chat.service';
-import type { AiChatMessage } from '@docmost/db/types/entity.types';
+import { flushAssistant } from './ai-chat.service';
 
 /**
  * #491 STEP MARKER — `metadata.stepsPersisted` is written by the SAME flush that
  * builds `metadata.parts`, so the marker can never disagree with the persisted
  * parts (the step-alignment anchor the resume stack builds on). These are
  * PROPERTY tests: they assert the marker tracks the number of FINISHED steps for
- * every flush shape, and that `reconstructPartsFromRow` reads it back safely.
+ * every flush shape.
  */
 
 // A finished step carrying one line of text and one tool call/result.
@@ -65,40 +61,5 @@ describe('flushAssistant step marker (#491)', () => {
       finishReason: 'stop',
     });
     expect(f.metadata.stepsPersisted).toBe(3);
-  });
-});
-
-describe('reconstructPartsFromRow (#491)', () => {
-  const row = (metadata: unknown, content = ''): AiChatMessage =>
-    ({ content, metadata }) as unknown as AiChatMessage;
-
-  it('reads parts + stepsPersisted from metadata', () => {
-    const f = flushAssistant([step(0), step(1)], '', 'streaming');
-    const r = reconstructPartsFromRow(row(f.metadata, f.content));
-    expect(r.stepsPersisted).toBe(2);
-    expect(r.parts).toEqual(f.metadata.parts);
-  });
-
-  it('defaults stepsPersisted to 0 for a pre-#491 row with no marker (safe floor)', () => {
-    const r = reconstructPartsFromRow(
-      row({ parts: [{ type: 'text', text: 'x' }] }),
-    );
-    expect(r.stepsPersisted).toBe(0);
-    expect(r.parts).toEqual([{ type: 'text', text: 'x' }]);
-  });
-
-  it('falls back to a single text part from content when no metadata.parts', () => {
-    const r = reconstructPartsFromRow(row(null, 'plain content'));
-    expect(r.stepsPersisted).toBe(0);
-    expect(r.parts).toEqual([{ type: 'text', text: 'plain content' }]);
-  });
-
-  it('null/undefined row → no parts, marker 0 (safe empty floor)', () => {
-    // textPart('') is empty, matching rowToUiMessage's fallback for an empty row.
-    expect(reconstructPartsFromRow(null)).toEqual({
-      parts: [],
-      stepsPersisted: 0,
-    });
-    expect(reconstructPartsFromRow(undefined).stepsPersisted).toBe(0);
   });
 });

@@ -26,6 +26,15 @@ import { AiChatRunRepo } from './ai-chat-run.repo';
  *   4. the overlap GUARANTEES repeats across close polls — the contract behind the
  *      client's idempotent merge (mergeById).
  *
+ * INTEGRATION lane (`*.int-spec.ts`): runs under `test:int`, whose global-setup
+ * DROPS + RE-CREATES + MIGRATES `docmost_test`, so the real `ai_chat_messages` /
+ * `ai_chat_runs` tables EXIST here. (It was previously a `.spec.ts` defaulting to
+ * the UNmigrated dev `docmost`; in the CI unit lane — where `WAL_TEST_DATABASE_URL`
+ * is unset and only `test:int` migrates — that meant 5/6 ERROR
+ * `relation "ai_chat_messages" does not exist`, silently voiding coverage of the
+ * risky cursor/overlap logic. Renaming to `.int-spec.ts` + defaulting the DSN to
+ * `docmost_test` fixes the CI fidelity.)
+ *
  * FK triggers are bypassed (`session_replication_role = replica`) so synthetic
  * chat/workspace ids need no parent fixtures; a single pooled connection (max 1)
  * keeps that session setting for every query. SKIPS cleanly when the DB is
@@ -33,7 +42,8 @@ import { AiChatRunRepo } from './ai-chat-run.repo';
  */
 const CONN =
   process.env.WAL_TEST_DATABASE_URL ??
-  'postgresql://docmost:docmost_dev_pw@localhost:5432/docmost';
+  process.env.TEST_DATABASE_URL ??
+  'postgresql://docmost:docmost_dev_pw@localhost:5432/docmost_test';
 
 let db: Kysely<any>;
 let sqlClient: ReturnType<typeof postgres>;
