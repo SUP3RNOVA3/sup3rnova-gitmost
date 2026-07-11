@@ -246,6 +246,31 @@ export const hardBreakThenTriggerArb: fc.Arbitrary<any[]> = fc
   .map(([hb, trigger]) => [hb, trigger]);
 
 /**
+ * #493 (setext data-loss): a WHOLE-LINE setext underline landing on a
+ * continuation line. A setext underline is a line of ONLY `-` (any count) or
+ * ONLY `=` (any count) that FOLLOWS a paragraph line; on re-parse it turns the
+ * preceding line into a heading and DROPS its own text. The block-escape must
+ * neutralize it. Unlike blockTriggerLeadRunArb, the underline must occupy the
+ * whole line, so we sandwich it between two hardBreaks (underline on its own
+ * line, preceded by earlier paragraph content, followed by a trailing word so
+ * the closing hardBreak is not dropped by normalizeInline). Covers underlines
+ * of every length: `--` (the two-dash case the bullet/thematic arms miss), a
+ * lone `=`, `==`/`====` (neutralized by the inline `==` escape), and `---`/
+ * `----` (regression for the existing thematic case).
+ */
+export const hardBreakThenSetextArb: fc.Arbitrary<any[]> = fc
+  .tuple(
+    fc.constantFrom('--', '=', '==', '====', '---', '----'),
+    safeTextArb,
+  )
+  .map(([underline, rest]) => [
+    { type: 'hardBreak' },
+    { type: 'text', text: underline },
+    { type: 'hardBreak' },
+    { type: 'text', text: rest },
+  ]);
+
+/**
  * Inline content for a paragraph: at least one marked text run, optionally with
  * inline atoms (math/mention) and hard breaks interspersed. The FIRST run is
  * usually an ordinary marked run, but sometimes a block-trigger-leading run
@@ -268,6 +293,7 @@ export const inlineContentArb: fc.Arbitrary<any[]> = fc
         { weight: 1, arbitrary: mentionArb.map((n) => [n]) },
         { weight: 1, arbitrary: hardBreakArb.map((n) => [n]) },
         { weight: 2, arbitrary: hardBreakThenTriggerArb },
+        { weight: 2, arbitrary: hardBreakThenSetextArb },
       ),
       { minLength: 0, maxLength: 4 },
     ),

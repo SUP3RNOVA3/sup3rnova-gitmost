@@ -302,6 +302,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Markdown round-trips no longer silently drop a line that opens with a block
+  trigger.** When a document is exported to Markdown and re-imported (git-sync
+  stabilize, agent writes), a paragraph or continuation line (after a hard break)
+  that begins with a block marker — an ATX heading `#`, a blockquote/callout `>`,
+  a list marker (`-`/`*`/`+`/`N.`/`N)`), a code fence, a table `|`, a thematic
+  break (`---`), or a setext underline (`--`, `----`, or a lone `=`) — is now
+  backslash-escaped so it round-trips as text instead of being re-parsed into a
+  heading/list/quote/rule and losing its content. Front-matter stripping is
+  scoped to the import path only. (#493)
 - **The server no longer runs out of heap during long autonomous agent runs.** A
   new pnpm patch on `ai@6.0.134` stops the SDK from building a cumulative
   snapshot of the ENTIRE turn text on every streamed text-delta when no output

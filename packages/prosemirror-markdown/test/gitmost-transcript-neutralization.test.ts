@@ -106,7 +106,11 @@ describe("paragraph block-escape (git-sync round-trip)", () => {
       ["a", "> b"],
       ["a", "1. b"],
       ["a", "| b |"],
-      ["a", "---"], // setext / thematic — the text-losing case
+      ["a", "---"], // setext / thematic (3 dashes) — the text-losing case
+      ["a", "--"], // setext underline, EXACTLY two dashes (bullet/thematic miss it)
+      ["a", "----"], // setext / thematic (4 dashes)
+      ["a", "="], // setext H1 underline, a lone `=` (no other arm covers it)
+      ["a", "===="], // setext H1 underline, run of `=`
     ]) {
       const d = doc({
         type: "paragraph",

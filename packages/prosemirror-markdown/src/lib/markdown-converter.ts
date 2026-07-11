@@ -145,6 +145,20 @@ function escapeLeadingBlockTrigger(line: string): string {
   if (/^(?:`{3,}|~{3,})/.test(line)) return "\\" + line;
   // Thematic break: a WHOLE line of 3+ identical `-`/`*`/`_`, optionally spaced.
   if (/^([-*_])(?:\s*\1){2,}\s*$/.test(line)) return "\\" + line;
+  // Setext underline: a continuation line (after a hardBreak) that is ONLY `-`
+  // or ONLY `=` (any count, trailing spaces allowed). Under a paragraph line
+  // such a line re-parses as a SETEXT HEADING and SILENTLY DROPS its own text
+  // (`a\n--` -> heading "a", the `--` is LOST; `a\n=` -> heading "a", `=` LOST).
+  // The bullet arm above catches a lone `-` (via its `$`) and the thematic arm
+  // catches 3+ dashes, but exactly TWO dashes (`--`) fall through both; and no
+  // arm covers a lone `=` at all (a `==` pair is neutralized earlier by the
+  // inline `==`->`\=\=` escape, so only a single `=` line reaches here). Escaping
+  // the leading char (`\--`, `\=`) breaks the setext interpretation so the line
+  // round-trips as paragraph text. The WHOLE line must be the marker (anchored
+  // `^-+`/`^=+` to EOL), so a mid-content `-`/`=` is never spuriously escaped;
+  // and a `---`/`----` already handled by the thematic arm never reaches here,
+  // so there is no double-escape.
+  if (/^-+[ \t]*$/.test(line) || /^=+[ \t]*$/.test(line)) return "\\" + line;
   // GFM table row opener.
   if (line.startsWith("|")) return "\\" + line;
   return line;
