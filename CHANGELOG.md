@@ -304,6 +304,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer controls whether a turn is a run — it now governs **only** the
   browser-disconnect semantics (ON = detached/survives a disconnect; OFF = a
   disconnect stops the run). (#487)
+- **Vendor `ai` patch: upstream-tracking + version-alignment plan documented.**
+  The two local `ai@6.0.134` fixes (O(n²) `partialOutput` heap-OOM; the
+  `writeToServerResponse` drain-hang) and the hocuspocus connect-vs-unload race
+  now have explicit upstream-reporting and `ai`-version-alignment steps recorded
+  in `AGENTS.md` (client `ai@6.0.207` vs server `ai@6.0.134`-patched drift). The
+  patch bytes are unchanged — they feed the lockfile `patch_hash`, so the
+  alignment is called out as an install-gated plan rather than a bare version
+  bump. No runtime change.
 - **Client markdown paste/copy and AI-chat rendering now go through the canonical
   converter.** Pasting markdown into the editor, "Copy as markdown", the AI title
   generator, and the AI-chat markdown renderer all now use
