@@ -2722,6 +2722,34 @@ export function rowToUiMessage(row: AiChatMessage): Omit<UIMessage, 'id'> & {
 }
 
 /**
+ * The persisted parts + step marker of a run's assistant row (#491). This is the
+ * pure core of the `AiChatRunService.reconstructRunParts(runId)` contract — the
+ * SINGLE interface for reading a LIVE run's output — given the already-resolved
+ * row. Returns the `metadata.parts` (falling back to a single text part from
+ * `content` for a pre-#183 row) and `stepsPersisted` — the count of FINISHED steps
+ * whose parts are present, written atomically with the parts by
+ * {@link flushAssistant}. A missing marker (an old row) reads as 0, so a consumer
+ * treats it as "nothing confirmed" and stays safe (attach 204 / full seed). Pure.
+ */
+export function reconstructPartsFromRow(
+  row: Pick<AiChatMessage, 'content' | 'metadata'> | null | undefined,
+): { parts: UIMessage['parts']; stepsPersisted: number } {
+  const meta = (row?.metadata ?? {}) as {
+    parts?: UIMessage['parts'];
+    stepsPersisted?: number;
+  };
+  const parts =
+    Array.isArray(meta.parts) && meta.parts.length > 0
+      ? meta.parts
+      : textPart(row?.content ?? '');
+  const stepsPersisted =
+    typeof meta.stepsPersisted === 'number' && meta.stepsPersisted >= 0
+      ? meta.stepsPersisted
+      : 0;
+  return { parts: parts as UIMessage['parts'], stepsPersisted };
+}
+
+/**
  * The persisted-row patch shape produced by {@link flushAssistant}. It is the
  * SAME shape the assistant repo insert/update consume (content + toolCalls +
  * metadata) plus the lifecycle `status` column added in #183.
@@ -2891,6 +2919,18 @@ export function flushAssistant(
     // `parts`). Old rows have no marker and the legacy { output } shape; a
     // dual-shape query branches on this. Old rows are deliberately NOT migrated.
     toolTraceVersion: 2,
+    // #491 STEP MARKER: the number of FINISHED steps whose parts are in THIS row,
+    // written by the SAME flush that builds `parts` (atomically — they are both
+    // derived from `finished`, so the marker can NEVER disagree with the persisted
+    // parts). This is the step-alignment anchor the resume stack builds on:
+    // - the registry rotates its retention ring only on a CONFIRMED persist of
+    //   step N (commit 3);
+    // - attach slices the tail at "step > N" from the client's persisted seed.
+    // It is NOT `run.stepCount`: recordStep is fire-and-forget and NOT atomic with
+    // the parts write, so stepCount could race ahead of the persisted parts
+    // (seed↔marker drift). The in-progress trailing text (an error/abort partial,
+    // or a mid-stream flush) is NOT a finished step and is excluded from the count.
+    stepsPersisted: finished.length,
   };
   // finishReason: prefer an explicit one; else derive a sensible value from the
   // terminal status (so onError/onAbort records keep their historical reason).

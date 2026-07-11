@@ -1,6 +1,9 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { AiChatRunRepo } from '@docmost/db/repos/ai-chat/ai-chat-run.repo';
+import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
 import { AiChatRun } from '@docmost/db/types/entity.types';
+import { reconstructPartsFromRow } from './ai-chat.service';
+import type { UIMessage } from 'ai';
 import { isUniqueViolation, violatedConstraint } from '@docmost/db/utils';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 
@@ -212,6 +215,10 @@ export class AiChatRunService implements OnModuleInit {
   constructor(
     private readonly runRepo: AiChatRunRepo,
     private readonly environment: EnvironmentService,
+    // #491: OPTIONAL so the many 2-arg test constructions of this service compile
+    // unchanged; Nest always injects the real repo in production. Only touched by
+    // reconstructRunParts (the live-run read interface).
+    private readonly messageRepo?: AiChatMessageRepo,
   ) {}
 
   /**
@@ -782,6 +789,33 @@ export class AiChatRunService implements OnModuleInit {
    *  explicit stop targeting a runId. */
   getRun(runId: string, workspaceId: string): Promise<AiChatRun | undefined> {
     return this.runRepo.findById(runId, workspaceId);
+  }
+
+  /**
+   * #491 CONTRACT — the SINGLE interface for reading a LIVE run's output: resolve
+   * the run to its assistant-message projection (#183) and return its persisted
+   * `parts` plus `stepsPersisted` — the count of FINISHED steps confirmed on disk,
+   * written atomically with the parts (see {@link flushAssistant} / the step
+   * marker). Consumers: tail-only attach (commit 3 — slices at "step > N"), the
+   * degraded-poll delta (rows already carry the marker in metadata), and export.
+   *
+   * Returns `null` when the run does not exist, has no linked assistant row yet
+   * (the seed window), or the row was deleted — a consumer treats null as "nothing
+   * confirmed" and stays safe (attach 204 / full seed). `stepsPersisted` is 0 for a
+   * pre-#491 row with no marker, which is likewise the safe floor.
+   */
+  async reconstructRunParts(
+    runId: string,
+    workspaceId: string,
+  ): Promise<{ parts: UIMessage['parts']; stepsPersisted: number } | null> {
+    const run = await this.runRepo.findById(runId, workspaceId);
+    if (!run?.assistantMessageId || !this.messageRepo) return null;
+    const row = await this.messageRepo.findById(
+      run.assistantMessageId,
+      workspaceId,
+    );
+    if (!row) return null;
+    return reconstructPartsFromRow(row);
   }
 
   /** The active run on a chat, if any (used to reject a concurrent start with a

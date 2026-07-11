@@ -771,3 +771,76 @@ describe('#487 AiChatRunService.supersede (CAS)', () => {
     expect(svc.hasZombie('run-1')).toBe(false);
   });
 });
+
+describe('AiChatRunService.reconstructRunParts (#491)', () => {
+  const ws = 'ws-1';
+
+  function makeMsgRepo(row: unknown) {
+    return { findById: jest.fn(async () => row) };
+  }
+
+  it('resolves run -> assistant row -> { parts, stepsPersisted }', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({
+        id: 'run-1',
+        assistantMessageId: 'm1',
+      })),
+    });
+    const msgRepo = makeMsgRepo({
+      content: '',
+      metadata: {
+        parts: [{ type: 'text', text: 'hi' }],
+        stepsPersisted: 3,
+      },
+    });
+    const svc = new AiChatRunService(
+      repo as never,
+      makeEnv() as never,
+      msgRepo as never,
+    );
+    const res = await svc.reconstructRunParts('run-1', ws);
+    expect(res).toEqual({
+      parts: [{ type: 'text', text: 'hi' }],
+      stepsPersisted: 3,
+    });
+    expect(msgRepo.findById).toHaveBeenCalledWith('m1', ws);
+  });
+
+  it('returns null when the run has no linked assistant row yet (seed window)', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({ id: 'run-1', assistantMessageId: null })),
+    });
+    const msgRepo = makeMsgRepo({ content: 'x', metadata: null });
+    const svc = new AiChatRunService(
+      repo as never,
+      makeEnv() as never,
+      msgRepo as never,
+    );
+    expect(await svc.reconstructRunParts('run-1', ws)).toBeNull();
+    expect(msgRepo.findById).not.toHaveBeenCalled();
+  });
+
+  it('returns null when the run does not exist', async () => {
+    const repo = makeRepo({ findById: jest.fn(async () => undefined) });
+    const msgRepo = makeMsgRepo({});
+    const svc = new AiChatRunService(
+      repo as never,
+      makeEnv() as never,
+      msgRepo as never,
+    );
+    expect(await svc.reconstructRunParts('nope', ws)).toBeNull();
+  });
+
+  it('returns null when the linked assistant row was deleted', async () => {
+    const repo = makeRepo({
+      findById: jest.fn(async () => ({ id: 'run-1', assistantMessageId: 'm1' })),
+    });
+    const msgRepo = makeMsgRepo(undefined);
+    const svc = new AiChatRunService(
+      repo as never,
+      makeEnv() as never,
+      msgRepo as never,
+    );
+    expect(await svc.reconstructRunParts('run-1', ws)).toBeNull();
+  });
+});
