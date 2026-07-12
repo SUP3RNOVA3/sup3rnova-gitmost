@@ -1,6 +1,6 @@
-import { Group, Text, Box, Badge, Button } from "@mantine/core";
+import { Group, Text, Box } from "@mantine/core";
 import { AgentAvatarStack } from "@/components/ui/agent-avatar-stack.tsx";
-import React, { useMemo, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 import classes from "./comment.module.css";
 import { useAtom, useAtomValue } from "jotai";
 import { useTimeAgo } from "@/hooks/use-time-ago";
@@ -12,18 +12,11 @@ import CommentMenu from "@/features/comment/components/comment-menu";
 import ResolveComment from "@/features/comment/components/resolve-comment";
 import { useHover } from "@mantine/hooks";
 import {
-  useApplySuggestionMutation,
   useDeleteCommentMutation,
-  useDismissSuggestionMutation,
   useResolveCommentMutation,
   useUpdateCommentMutation,
 } from "@/features/comment/queries/comment-query";
 import { IComment } from "@/features/comment/types/comment.types";
-import {
-  canShowApply,
-  canShowDismiss,
-  computeSuggestionDiff,
-} from "@/features/comment/utils/suggestion";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useTranslation } from "react-i18next";
@@ -32,13 +25,21 @@ interface CommentListItemProps {
   comment: IComment;
   pageId: string;
   canComment: boolean;
-  // Real page-edit permission (page.permissions.canEdit) — gates the suggestion
-  // "Apply" button. Distinct from `canComment`, which may be looser (viewers
-  // allowed to comment cannot apply edits).
+  // Real page-edit permission (page.permissions.canEdit). Kept on the props for
+  // parity with the container's wiring even though the thread row itself no
+  // longer renders the suggestion Apply button (that moved to AgentEditCard).
   canEdit?: boolean;
   userSpaceRole?: string;
 }
 
+// Type B — the thread ROW. Renders a single human OR agent-without-edit comment
+// in the redesigned visual: provenance avatar, author + timeago, hover-revealed
+// resolve + edit/delete menu, the anchored selection quote, and the body through
+// the static CommentContentView (or the inline TipTap editor while editing). It
+// is used for both a top-level thread comment and, recursively, each reply row.
+// ALL wiring (update/delete/resolve mutations, owner/admin gate, anchor nav) is
+// the same logic the old row carried — only the presentation changed, and the
+// agent suggested-edit block was lifted out into AgentEditCard.
 function CommentListItem({
   comment,
   pageId,
@@ -55,29 +56,20 @@ function CommentListItem({
   const updateCommentMutation = useUpdateCommentMutation();
   const deleteCommentMutation = useDeleteCommentMutation(comment.pageId);
   const resolveCommentMutation = useResolveCommentMutation();
-  const applySuggestionMutation = useApplySuggestionMutation();
-  const dismissSuggestionMutation = useDismissSuggestionMutation();
   const [currentUser] = useAtom(currentUserAtom);
   const createdAtAgo = useTimeAgo(comment.createdAt);
 
-  // Intraline "before -> after" diff (#331) for a suggested edit: only the
-  // fragments that actually changed get emphasised inside the red/green block,
-  // instead of striking through / greening the whole line. Memoised on the
-  // (selection, suggestedText) pair so it recomputes only when they change.
-  const suggestionDiff = useMemo(
-    () =>
-      comment.suggestedText != null
-        ? computeSuggestionDiff(comment.selection ?? "", comment.suggestedText)
-        : null,
-    [comment.selection, comment.suggestedText],
-  );
+  // `canEdit`/`pageId` are threaded through for wiring parity with the container;
+  // the thread row does not itself gate on them (Apply lives on AgentEditCard).
+  void canEdit;
+  void pageId;
 
-  // Owner-or-space-admin gate (#338): mirrors the server authz for both the
-  // comment menu (edit/delete) and the suggestion Dismiss button, so we never
-  // render an action the server will 403.
+  // Owner-or-space-admin gate (#338): mirrors the server authz for the comment
+  // menu (edit/delete), so we never render an action the server will 403.
   const isOwnerOrAdmin =
     currentUser?.user?.id === comment.creatorId || userSpaceRole === "admin";
 
+  const isAgent = comment.createdSource === "agent" && !!comment.agent;
 
   async function handleUpdateComment() {
     try {
@@ -121,34 +113,9 @@ function CommentListItem({
     }
   }
 
-  async function handleApplySuggestion() {
-    try {
-      await applySuggestionMutation.mutateAsync({
-        commentId: comment.id,
-        pageId: comment.pageId,
-      });
-    } catch (error) {
-      // Errors surface via the mutation's onError notification (incl. 409).
-      console.error("Failed to apply suggestion:", error);
-    }
-  }
-
-  async function handleDismissSuggestion() {
-    try {
-      await dismissSuggestionMutation.mutateAsync({
-        commentId: comment.id,
-        pageId: comment.pageId,
-      });
-    } catch (error) {
-      // Idempotent races are reconciled to success in the mutation's onError;
-      // anything else surfaces there as a notification.
-      console.error("Failed to dismiss suggestion:", error);
-    }
-  }
-
-  function handleCommentClick(comment: IComment) {
+  function handleCommentClick(target: IComment) {
     const el = document.querySelector(
-      `.comment-mark[data-comment-id="${comment.id}"]`,
+      `.comment-mark[data-comment-id="${target.id}"]`,
     );
     if (el) {
       el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -169,10 +136,10 @@ function CommentListItem({
 
   return (
     <Box ref={ref} pb={6}>
-      <Group gap="xs">
-        {comment.createdSource === "agent" && comment.agent ? (
+      <Group gap="xs" wrap="nowrap" align="flex-start">
+        {isAgent ? (
           <AgentAvatarStack
-            agent={comment.agent}
+            agent={comment.agent!}
             launcher={comment.launcher}
             aiChatId={comment.aiChatId}
             showName={false}
@@ -185,13 +152,13 @@ function CommentListItem({
           />
         )}
 
-        <div style={{ flex: 1 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
           <Group justify="space-between" wrap="nowrap">
             <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-              {comment.createdSource === "agent" && comment.agent ? (
+              {isAgent ? (
                 <>
                   <Text size="xs" fw={600} lineClamp={1} lh={1.2}>
-                    {comment.agent.name}
+                    {comment.agent!.name}
                   </Text>
                   {comment.launcher && (
                     <>
@@ -262,87 +229,6 @@ function CommentListItem({
           </Box>
         )}
 
-        {/* Suggested-edit (#315): "было → стало" diff for a top-level comment
-            carrying a suggestion. Old text struck-through/red, new text green. */}
-        {!comment.parentCommentId && comment.suggestedText && (
-          <Box className={classes.suggestionBlock}>
-            {comment.selection && (
-              // Old line: read as removed as a whole (line-through/red); only the
-              // changed fragments carry the extra intraline emphasis.
-              <Text size="xs" className={classes.suggestionOld}>
-                {suggestionDiff?.old.map((segment, index) => (
-                  <span
-                    key={index}
-                    className={segment.changed ? classes.suggestionChanged : undefined}
-                  >
-                    {segment.text}
-                  </span>
-                ))}
-              </Text>
-            )}
-            <Text size="xs" className={classes.suggestionNew}>
-              {suggestionDiff?.new.map((segment, index) => (
-                <span
-                  key={index}
-                  className={segment.changed ? classes.suggestionChanged : undefined}
-                >
-                  {segment.text}
-                </span>
-              ))}
-            </Text>
-
-            {comment.suggestionAppliedAt ? (
-              <Badge
-                size="sm"
-                color="green"
-                variant="light"
-                mt={6}
-                aria-label={t("Applied")}
-              >
-                {t("Applied")}
-              </Badge>
-            ) : (
-              (canShowApply(comment, canEdit) ||
-                canShowDismiss(comment, canComment, isOwnerOrAdmin)) && (
-                <Group gap="xs" mt={6}>
-                  {canShowApply(comment, canEdit) && (
-                    <Button
-                      size="compact-xs"
-                      variant="light"
-                      color="green"
-                      onClick={handleApplySuggestion}
-                      loading={applySuggestionMutation.isPending}
-                      disabled={
-                        applySuggestionMutation.isPending ||
-                        dismissSuggestionMutation.isPending
-                      }
-                    >
-                      {t("Apply")}
-                    </Button>
-                  )}
-                  {/* Dismiss ("Не применять", #329): removes the suggestion
-                      without changing the page text. Gated on canComment. */}
-                  {canShowDismiss(comment, canComment, isOwnerOrAdmin) && (
-                    <Button
-                      size="compact-xs"
-                      variant="subtle"
-                      color="gray"
-                      onClick={handleDismissSuggestion}
-                      loading={dismissSuggestionMutation.isPending}
-                      disabled={
-                        applySuggestionMutation.isPending ||
-                        dismissSuggestionMutation.isPending
-                      }
-                    >
-                      {t("Dismiss")}
-                    </Button>
-                  )}
-                </Group>
-              )
-            )}
-          </Box>
-        )}
-
         {!isEditing ? (
           <CommentContentView content={comment.content} />
         ) : (
@@ -350,7 +236,9 @@ function CommentListItem({
             <CommentEditor
               defaultContent={comment.content}
               editable={true}
-              onUpdate={(newContent: any) => { editContentRef.current = newContent; }}
+              onUpdate={(newContent: any) => {
+                editContentRef.current = newContent;
+              }}
               onSave={handleUpdateComment}
               autofocus={true}
             />

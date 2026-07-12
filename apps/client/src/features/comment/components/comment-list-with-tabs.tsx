@@ -5,7 +5,7 @@ import {
   Center,
   Divider,
   Group,
-  Paper,
+  Box,
   Stack,
   Tabs,
   Badge,
@@ -14,6 +14,9 @@ import {
   Tooltip,
 } from "@mantine/core";
 import CommentListItem from "@/features/comment/components/comment-list-item";
+import AgentEditCard, {
+  RunHeader,
+} from "@/features/comment/components/agent-edit-card";
 import {
   useCommentsQuery,
   useCreateCommentMutation,
@@ -22,6 +25,10 @@ import CommentEditor from "@/features/comment/components/comment-editor";
 import CommentActions from "@/features/comment/components/comment-actions";
 import { useFocusWithin } from "@mantine/hooks";
 import { IComment } from "@/features/comment/types/comment.types.ts";
+import {
+  groupAgentRuns,
+  CommentRenderUnit,
+} from "@/features/comment/utils/group-agent-runs";
 import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import { extractPageSlugId } from "@/lib";
 import { useTranslation } from "react-i18next";
@@ -69,6 +76,32 @@ export function sortResolvedByResolvedAt(resolved: IComment[]): IComment[] {
   );
 }
 
+// The redesigned card shell: a rounded, bordered surface on the panel body. Both
+// a thread card and an agent-run group live inside one of these.
+function PanelCard({
+  children,
+  ...rest
+}: {
+  children: React.ReactNode;
+  [key: string]: unknown;
+}) {
+  return (
+    <Box
+      m="8px 10px"
+      p={0}
+      style={{
+        background: "var(--mantine-color-body)",
+        border: "1px solid var(--mantine-color-default-border)",
+        borderRadius: 10,
+        overflow: "hidden",
+      }}
+      {...rest}
+    >
+      {children}
+    </Box>
+  );
+}
+
 function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const { t } = useTranslation();
   const { pageSlug } = useParams();
@@ -89,6 +122,8 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const canComment =
     canEdit ||
     (space?.settings?.comments?.allowViewerComments === true);
+
+  const userSpaceRole = space?.membership?.role;
 
   // Separate active and resolved comments
   const { activeComments, resolvedComments } = useMemo(() => {
@@ -112,6 +147,17 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
       resolvedComments: sortResolvedByResolvedAt(resolved),
     };
   }, [comments]);
+
+  // Collapse each tab's top-level list into render units (a lone comment or a
+  // collapsed agent run). Purely visual — the underlying data is untouched.
+  const activeUnits = useMemo(
+    () => groupAgentRuns(activeComments),
+    [activeComments],
+  );
+  const resolvedUnits = useMemo(
+    () => groupAgentRuns(resolvedComments),
+    [resolvedComments],
+  );
 
   // Index replies by their parent once, instead of an O(n^2) filter per thread.
   // The map ref changes on any comments update, so MemoizedChildComments re-runs
@@ -168,54 +214,102 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
     [createCommentAsync, page?.id],
   );
 
-  const renderComments = useCallback(
-    (comment: IComment) => (
-      <Paper
-        shadow="sm"
-        radius="md"
-        p="xs"
-        mb="xs"
-        withBorder
-        key={comment.id}
-        data-comment-id={comment.id}
-      >
-        <div>
-          <CommentListItem
+  // The full subtree for ONE top-level comment: its head card (thread row or
+  // agent edit card), its nested replies, and a lazily-mounted reply editor.
+  // Shared by a standalone card and a card inside an agent-run group so the
+  // reply threading / lazy editor (#340) is wired identically in both.
+  const renderCommentSubtree = useCallback(
+    (comment: IComment, isEdit: boolean, showProvenance: boolean) => (
+      <>
+        {isEdit ? (
+          <AgentEditCard
             comment={comment}
-            pageId={page?.id}
             canComment={canComment}
             canEdit={canEdit}
-            userSpaceRole={space?.membership?.role}
+            userSpaceRole={userSpaceRole}
+            showProvenance={showProvenance}
           />
+        ) : (
+          <Box p="xs">
+            <CommentListItem
+              comment={comment}
+              pageId={page?.id}
+              canComment={canComment}
+              canEdit={canEdit}
+              userSpaceRole={userSpaceRole}
+            />
+          </Box>
+        )}
+
+        <Box px="xs">
           <MemoizedChildComments
             childrenByParent={childrenByParent}
             parentId={comment.id}
             pageId={page?.id}
             canComment={canComment}
             canEdit={canEdit}
-            userSpaceRole={space?.membership?.role}
+            userSpaceRole={userSpaceRole}
           />
-        </div>
+        </Box>
 
         {!comment.resolvedAt && canComment && (
-          <>
+          <Box px="xs" pb="xs">
             <Divider my={2} />
             <CommentEditorWithActions
               commentId={comment.id}
               onSave={handleAddReply}
             />
-          </>
+          </Box>
         )}
-      </Paper>
+      </>
     ),
     [
       childrenByParent,
       handleAddReply,
       page?.id,
-      space?.membership?.role,
+      userSpaceRole,
       canComment,
       canEdit,
     ],
+  );
+
+  // Render one collapsed unit: a standalone card (thread or lone edit) or an
+  // agent-run group (one RunHeader over N stacked edit cards).
+  const renderUnit = useCallback(
+    (unit: CommentRenderUnit) => {
+      if (unit.kind === "single") {
+        const c = unit.comment;
+        const isEdit =
+          c.createdSource === "agent" &&
+          c.suggestedText != null &&
+          !c.parentCommentId;
+        return (
+          <PanelCard key={c.id} data-comment-id={c.id}>
+            {renderCommentSubtree(c, isEdit, true)}
+          </PanelCard>
+        );
+      }
+
+      // A collapsed agent run: one header, then each edit card (provenance
+      // suppressed on the cards — the header carries the single provenance line).
+      return (
+        <PanelCard key={unit.key}>
+          <RunHeader comments={unit.comments} />
+          {unit.comments.map((c) => (
+            <Box
+              key={c.id}
+              data-comment-id={c.id}
+              style={{
+                borderTop: "1px solid var(--mantine-color-default-border)",
+              }}
+            >
+              {renderCommentSubtree(c, true, false)}
+            </Box>
+          ))}
+        </PanelCard>
+      );
+    },
+    [renderCommentSubtree],
   );
 
   if (isCommentsLoading) {
@@ -225,8 +319,6 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   if (isError) {
     return <div>{t("Error loading comments.")}</div>;
   }
-
-  const totalComments = activeComments.length + resolvedComments.length;
 
   const pageCommentInput = canComment ? (
     <PageCommentInput
@@ -328,7 +420,7 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
                   </Stack>
                 </Center>
               ) : (
-                activeComments.map(renderComments)
+                activeUnits.map(renderUnit)
               )}
             </Tabs.Panel>
 
@@ -347,7 +439,7 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
                   </Stack>
                 </Center>
               ) : (
-                resolvedComments.map(renderComments)
+                resolvedUnits.map(renderUnit)
               )}
             </Tabs.Panel>
           </div>
