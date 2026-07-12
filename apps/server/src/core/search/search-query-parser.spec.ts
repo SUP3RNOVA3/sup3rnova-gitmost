@@ -1,4 +1,8 @@
-import { parseSearchQuery, hasPositiveRecall } from './search-query-parser';
+import {
+  parseSearchQuery,
+  hasPositiveRecall,
+  MAX_PARSED_TERMS,
+} from './search-query-parser';
 
 describe('parseSearchQuery — tokenization & operators (A2)', () => {
   it('splits on whitespace into positive terms (OR recall)', () => {
@@ -111,5 +115,54 @@ describe('parseSearchQuery — reasons & recall', () => {
   it('mode flag flows through', () => {
     expect(parseSearchQuery('a b', { mode: 'and' }).mode).toBe('and');
     expect(parseSearchQuery('a b').mode).toBe('or');
+  });
+});
+
+describe('parseSearchQuery — term cap (stack-depth guard)', () => {
+  it('caps the total parsed terms at MAX_PARSED_TERMS without throwing', () => {
+    // A pasted text block: far more words than the cap. The parser must bound the
+    // SQL tsquery nesting depth (else Postgres blows its stack → HTTP 500).
+    const words = Array.from({ length: 5000 }, (_, i) => `w${i}`);
+    let p!: ReturnType<typeof parseSearchQuery>;
+    expect(() => {
+      p = parseSearchQuery(words.join(' '));
+    }).not.toThrow();
+    const total = p.positive.length + p.required.length + p.excluded.length;
+    expect(total).toBe(MAX_PARSED_TERMS);
+    // Stable order: the FIRST cap terms are kept.
+    expect(p.positive.slice(0, 3).map((t) => t.text)).toEqual(['w0', 'w1', 'w2']);
+    expect(p.positive[MAX_PARSED_TERMS - 1].text).toBe(`w${MAX_PARSED_TERMS - 1}`);
+  });
+
+  it('counts positive + required + excluded together toward the cap', () => {
+    // Interleave operators so overflow can fall on any bucket. Total must still
+    // never exceed the cap, and the first cap terms (in stable order) win.
+    const tokens: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      const op = i % 3 === 0 ? '+' : i % 3 === 1 ? '-' : '';
+      tokens.push(`${op}t${i}`);
+    }
+    const p = parseSearchQuery(tokens.join(' '));
+    const total = p.positive.length + p.required.length + p.excluded.length;
+    expect(total).toBe(MAX_PARSED_TERMS);
+    // t0 (+, required) and t1 (-, excluded) and t2 (bare, positive) are all within
+    // the first cap tokens → each bucket got its leading terms.
+    expect(p.required[0].text).toBe('t0');
+    expect(p.excluded[0].text).toBe('t1');
+    expect(p.positive[0].text).toBe('t2');
+  });
+
+  it('leaves a normal (<= cap) query completely unchanged', () => {
+    const p = parseSearchQuery('+кофейня -архив "воздушный шар" ресторан 10.31.41');
+    expect(p.required.map((t) => t.text)).toEqual(['кофейня']);
+    expect(p.excluded.map((t) => t.text)).toEqual(['архив']);
+    expect(p.positive.map((t) => t.text)).toEqual([
+      'воздушный шар',
+      'ресторан',
+      '10.31.41',
+    ]);
+    // Phrase / substring branch handling survives under the cap.
+    expect(p.positive[0].branch).toBe('phrase');
+    expect(p.positive[2].branch).toBe('substring');
   });
 });

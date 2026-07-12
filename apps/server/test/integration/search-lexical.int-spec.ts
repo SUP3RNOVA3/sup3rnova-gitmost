@@ -461,4 +461,152 @@ describe('SearchService #529 lexical overhaul [integration]', () => {
     // matchedTerms already echoed the required term; still true.
     expect(hit.matchedTerms).toContain('кофейня');
   });
+
+  // F1 — stack-depth guard: a pasted text block (thousands of FTS terms) used to
+  // nest the combined tsquery so deep that Postgres raised `stack depth limit
+  // exceeded` → HTTP 500 for the caller. The parser now caps terms at
+  // MAX_PARSED_TERMS, so a huge query returns 200 and the leading (in-cap) term
+  // still matches. Mutation: remove the cap → this reddens (500 / stack depth).
+  it('F1 a huge multi-term query returns 200, not a stack-depth 500', async () => {
+    const page = await insertPage({
+      title: 'qfonemarker заголовок',
+      textContent: 'тело страницы',
+    });
+    // Purely-alphabetic filler words → FTS branch (the branch that nests in
+    // combineTsq). A digit-bearing token would route to substring and not nest.
+    const alphaWord = (i: number): string => {
+      let s = '';
+      let n = i + 1;
+      while (n > 0) {
+        s = String.fromCharCode(97 + (n % 26)) + s;
+        n = Math.floor(n / 26);
+      }
+      return 'q' + s;
+    };
+    const words = [
+      'qfonemarker',
+      ...Array.from({ length: 5000 }, (_, i) => alphaWord(i)),
+    ];
+    const res = await search(buildService(), {
+      query: words.join(' '),
+      spaceId,
+    });
+    // Bounded nesting → no 500; the leading in-cap term still recalls the page.
+    expect(res.items.map((i: any) => i.id)).toContain(page);
+  });
+
+  // F2 — titleOnly leak-guard (restores coverage the deleted lookup spec gave).
+  // A term present ONLY in text_content must NOT match under titleOnly, and a
+  // title hit must carry NO body snippet. Uses match:'substring' because titleOnly
+  // gates the substring branch (the FTS `pages.tsv` already spans title+body).
+  it('F2 titleOnly does not match text_content and yields no body snippet', async () => {
+    // Marker lives only in the body, never in the title.
+    const bodyOnly = await insertPage({
+      title: 'нейтральный заголовок f2',
+      textContent: 'секрет titleonlybody конец',
+    });
+    const res = await search(buildService(), {
+      query: 'titleonlybody',
+      match: 'substring',
+      spaceId,
+      titleOnly: true,
+    });
+    // titleOnly must NOT leak a body-substring match.
+    expect(res.items.map((i: any) => i.id)).not.toContain(bodyOnly);
+
+    // Sanity: WITHOUT titleOnly the same term DOES find it via the body.
+    const resOpen = await search(buildService(), {
+      query: 'titleonlybody',
+      match: 'substring',
+      spaceId,
+    });
+    expect(resOpen.items.map((i: any) => i.id)).toContain(bodyOnly);
+
+    // A page that hits on its TITLE: the snippet must be empty (no body leaks in).
+    const titleHit = await insertPage({
+      title: 'titleonlytitle страница',
+      textContent: 'какой-то текст тела здесь для сниппета',
+    });
+    const res2 = await search(buildService(), {
+      query: 'titleonlytitle',
+      match: 'substring',
+      spaceId,
+      titleOnly: true,
+    });
+    const hit = res2.items.find((i: any) => i.id === titleHit);
+    expect(hit).toBeDefined();
+    expect(hit.snippet).toBe('');
+  });
+
+  // F3 — parentPageId subtree scoping (restores coverage the deleted lookup spec
+  // gave). Two sibling subtrees share one term; scoping to ONE root returns only
+  // that subtree's hits INCLUDING the root/parent page itself, and NONE of the
+  // sibling subtree. Mutation: drop the ANY(descendantIds) filter → this reddens.
+  it('F3 parentPageId scopes to one subtree incl. the parent, excludes siblings', async () => {
+    const rootA = await insertPage({
+      title: 'subtreeA корень',
+      textContent: 'f3marker в корне A',
+    });
+    const childA = await insertPage({
+      title: 'subtreeA потомок',
+      textContent: 'f3marker в потомке A',
+      parentPageId: rootA,
+    });
+    const rootB = await insertPage({
+      title: 'subtreeB корень',
+      textContent: 'f3marker в корне B',
+    });
+    const childB = await insertPage({
+      title: 'subtreeB потомок',
+      textContent: 'f3marker в потомке B',
+      parentPageId: rootB,
+    });
+    const res = await search(buildService(), {
+      query: 'f3marker',
+      spaceId,
+      parentPageId: rootA,
+    });
+    const ids = res.items.map((i: any) => i.id);
+    expect(ids).toContain(rootA); // the parent/root page itself
+    expect(ids).toContain(childA);
+    expect(ids).not.toContain(rootB); // sibling subtree cut off
+    expect(ids).not.toContain(childB);
+  });
+
+  // F4 — positive path + snippet content asserts (the #11c test only asserts what
+  // must NOT be in path). (a) a nested hit's path is root→parent ordered and a
+  // root-level hit's path is []; (b) a text-body hit returns a NON-empty snippet.
+  it('F4 path is root→parent ordered ([] at root) and body hits carry a snippet', async () => {
+    const root = await insertPage({ title: 'F4Root' });
+    const parent = await insertPage({ title: 'F4Parent', parentPageId: root });
+    const leaf = await insertPage({
+      title: 'f4leaf лист',
+      parentPageId: parent,
+      textContent: 'f4leafmarker тело с содержимым для сниппета',
+    });
+    const res = await search(buildService(), {
+      query: 'f4leafmarker',
+      spaceId,
+    });
+    const hit = res.items.find((i: any) => i.id === leaf);
+    expect(hit).toBeDefined();
+    // Positive ancestry: root → direct parent, hit's own title excluded.
+    expect(hit.path).toEqual(['F4Root', 'F4Parent']);
+    // Snippet content: a text-body hit returns a non-empty snippet with the term.
+    expect(hit.snippet.length).toBeGreaterThan(0);
+    expect(hit.snippet).toContain('f4leafmarker');
+
+    // A root-level hit (no parent) → empty path.
+    const rootHit = await insertPage({
+      title: 'f4rootlevel уникальный',
+      textContent: 'f4rootmarker в теле',
+    });
+    const res2 = await search(buildService(), {
+      query: 'f4rootmarker',
+      spaceId,
+    });
+    const hit2 = res2.items.find((i: any) => i.id === rootHit);
+    expect(hit2).toBeDefined();
+    expect(hit2.path).toEqual([]);
+  });
 });

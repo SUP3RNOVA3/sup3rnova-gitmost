@@ -20,9 +20,6 @@ import {
   hasPositiveRecall,
 } from './search-query-parser';
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const tsquery = require('pg-tsquery')();
-
 // The FTS text-search configuration used on BOTH the stored side (pages.tsv via
 // its trigger, see migration 20260707T130000) and the query side here. #529
 // acceptance #13 invariant: column config and query config always change as a
@@ -33,24 +30,6 @@ const TS_CONFIG = 'ru_en';
 // fuses RANKS (not raw scores) so the incomparable ts_rank_cd (lexical) and the
 // substring tier scales never need normalizing — that is the whole point.
 const RRF_K = 60;
-
-// Legacy prefix-tsquery builder (kept for the /suggest path + back-compat unit
-// tests). The #529 engine below no longer uses it — it parses the query into an
-// AST instead — but `buildTsQuery` remains exported and behaviour-identical.
-//
-// Strips everything that is not a letter/number/space BEFORE handing text to
-// pg-tsquery so adversarial to_tsquery operators degrade to a neutral query
-// instead of a 500.
-export function buildTsQuery(raw: string): string {
-  const cleaned = (raw ?? '')
-    .normalize('NFC')
-    .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!cleaned) return '';
-  return tsquery(cleaned + '*');
-}
 
 // Escape the LIKE metacharacters (`%`, `_`, `\`) so every character is matched
 // LITERALLY by a `col LIKE '%' || q || '%'` predicate. Without this a query of
@@ -65,13 +44,6 @@ export function escapeLikePattern(raw: string): string {
     .replace(/\\/g, '\\\\')
     .replace(/%/g, '\\%')
     .replace(/_/g, '\\_');
-}
-
-// Substring tier (highest first), used to rank the substring branch before RRF.
-export enum SearchLookupTier {
-  TITLE_EXACT = 3,
-  TITLE_SUBSTRING = 2,
-  TEXT = 1,
 }
 
 // Env-tunable fusion window: the top-N candidates (by RRF) that pagination can
@@ -533,7 +505,6 @@ export class SearchService {
         'pages.slugId as slugId',
         'pages.title as title',
         'pages.icon as icon',
-        'pages.parentPageId as parentPageId',
         'pages.creatorId as creatorId',
         'pages.spaceId as spaceId',
         'pages.createdAt as createdAt',

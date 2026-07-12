@@ -24,6 +24,17 @@
 export type SearchMatchMode = 'auto' | 'word' | 'prefix' | 'substring';
 export type SearchBooleanMode = 'or' | 'and';
 
+// Hard cap on the total number of parsed terms (positive + required + excluded).
+// SearchService folds each FTS term into a LEFT-NESTED SQL tsquery expression
+// `(((t1)||(t2))||(t3))…`, embedded several times per query — so nesting depth
+// grows with the term count. A pasted text block (thousands of words) would nest
+// deep enough to blow Postgres' `stack depth limit` → an ERROR → HTTP 500 for the
+// caller. Capping in the parser bounds that depth for EVERY consumer (web / MCP /
+// share), since they all route through here. 64 comfortably covers any real query
+// while keeping the SQL nesting shallow. Overflow terms (beyond the first 64, in
+// stable order) are dropped rather than throwing.
+export const MAX_PARSED_TERMS = 64;
+
 // How a single term is matched against the index.
 //   - 'fts'       : full-text lexeme, exact (no trailing prefix).
 //   - 'ftsPrefix' : full-text lexeme with a `:*` prefix match.
@@ -193,6 +204,13 @@ export function parseSearchQuery(
       usableText = tok.text.trim();
     }
     if (!usableText) continue;
+
+    // Stack-depth guard: stop after MAX_PARSED_TERMS surviving terms (positive +
+    // required + excluded, combined) so the SQL tsquery nesting stays shallow.
+    // The first 64 terms are kept in stable order; the rest are dropped.
+    if (positive.length + required.length + excluded.length >= MAX_PARSED_TERMS) {
+      break;
+    }
 
     const term: ParsedTerm = { text: usableText, branch };
 
