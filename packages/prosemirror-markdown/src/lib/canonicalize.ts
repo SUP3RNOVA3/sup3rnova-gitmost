@@ -25,13 +25,22 @@
  * drop any attr whose value equals its known schema default. A non-default
  * value (e.g. `orderedList.start: 5`) is NOT a default, so it is KEPT.
  *
- * Every entry below was read from `packages/docmost-client/src/lib/
+ * Every entry below — with the single documented exception of the `link.internal`
+ * marker (see its own bullet) — was read from `packages/docmost-client/src/lib/
  * docmost-schema.ts` (the line refs are the exact `default:` declarations) and
  * confirmed to be materialized by an export→import→export round-trip:
  *   - mark `link`    target / rel  — DocmostAttributes + StarterKit link.
  *       StarterKit's link extension defaults `target: "_blank"` and
  *       `rel: "noopener noreferrer nofollow"`; both materialize on import
  *       (empirically confirmed) even when the source had only `href`.
+ *   - mark `link`    internal (#522) — the ONE editor-sourced, NOT-import-
+ *       materialized default here. Its source is `editor-ext/src/lib/link.ts`
+ *       (default `internal: false`), not docmost-schema, and import does NOT
+ *       materialize it (an imported external link leaves `internal` absent/null,
+ *       never `false`). It is listed so that the editor's stored `internal:false`
+ *       normalizes to the same "external" canon as absent/null (`false ≡ absent`),
+ *       keeping a stored external link canonically equal to its re-import. The
+ *       load-bearing `internal:true` is NON-default and therefore KEPT.
  *   - mark `comment` resolved      — docmost-schema.ts L213-214 (`default: false`).
  *   - node `orderedList` start     — provided by StarterKit's orderedList
  *       (`default: 1`); materializes on import (empirically confirmed).
@@ -56,6 +65,14 @@ const KNOWN_DEFAULTS: Record<string, Record<string, unknown>> = {
   link: {
     target: "_blank",
     rel: "noopener noreferrer nofollow",
+    // Editor-authored EXTERNAL links store `internal: false` (editor-ext link
+    // default `packages/editor-ext/src/lib/link.ts`), while an imported external
+    // link leaves `internal` absent/null. Both mean "external", so `internal:
+    // false` must normalize away exactly like `null`/absent — otherwise a stored
+    // `internal:false` link diverges from its re-import under
+    // `docsCanonicallyEqual` (false !== null). The internal marker `internal:true`
+    // is NON-default, so it is KEPT and survives canonicalization (#522 §11).
+    internal: false,
   },
   comment: {
     resolved: false,
