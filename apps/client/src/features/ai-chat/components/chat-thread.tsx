@@ -81,6 +81,17 @@ const STREAM_THROTTLE_MS = 50;
 // THREAD now (the FSM owns polling->stalled); the window just polls while armed.
 const DEGRADED_POLL_IDLE_MAX_MS = 10 * 60_000;
 
+// #541: the bound on the persist re-seed (getRun) wait when ENTERING the reconnect
+// ladder after a live SSE drop. The axios client (lib/api-client.ts) sets NO request
+// timeout, and the stalled-idle cap only arms AFTER the FSM enters reconnecting/
+// polling — which never happens if getRun HANGS (connection established, no response).
+// Without this bound a live drop + a hung getRun sticks the FSM in `streaming` with
+// no banner and no poll until the browser socket timeout (minutes) — the silent-freeze
+// class #497 eliminates. This is a deliberate RECOVERY-START bound (drop the live
+// partial + enter the ladder so the poll/idle-cap arms), intentionally much shorter
+// than any network socket timeout — not a network read timeout.
+const RECONNECT_RESEED_TIMEOUT_MS = 4_000;
+
 /** The #487 active (non-terminal) run statuses — mirrors the server's
  *  ACTIVE_RUN_STATUSES. A run-fact is "active" only for these. */
 function isActiveRunStatus(status: string | null | undefined): boolean {
@@ -286,6 +297,9 @@ export default function ChatThread({
   // stalled inactivity cap. Cleared by the cancelReconnect effect / the cap effect.
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const idleCapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // #541: the persist re-seed (getRun) timeout race on the disconnect->reconnect
+  // entry. Held in a ref so unmount (DISPOSE cleanup) clears it — no dangling timer.
+  const reseedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // #491 tail-only: seed EVERY persisted row unchanged (no strip). The streaming
   // tail holds steps 0..N-1; the run-stream registry's tail (steps >= N) is APPENDED
@@ -748,36 +762,67 @@ export default function ChatThread({
           anchorRef.current = null;
         };
         if (cid) {
-          void getRun(cid)
-            .then((res) => {
-              if (!mountedRef.current) return;
-              const persisted = res.message;
-              if (persisted && persisted.role === "assistant") {
-                anchorRef.current = {
-                  id: persisted.id,
-                  stepsPersisted: stepsPersistedOf(persisted),
-                };
-                // Replace the live partial with the persisted row IN PLACE by id —
-                // the re-seed from persist. The attach's tail (steps >= N) then
-                // appends to a store holding EXACTLY steps 0..N-1: no duplication.
-                setMessages((prev) => mergeById(prev, rowToUiMessage(persisted)));
-              } else {
-                // No persisted assistant row (pre-first-frame break): drop the live
-                // partial + replay from start (no anchor/n) so nothing is duplicated.
-                dropLivePartialAndReplayFromStart();
-              }
-              enterReconnect(res.run?.id ?? runId);
-            })
-            .catch(() => {
-              if (!mountedRef.current) return;
-              // Persist read FAILED: we cannot re-seed from fresh persist, and a
-              // stale mount-time anchor over the live partial would tail-apply
-              // already-present steps -> duplication (a flaky-network blip:
-              // SSE + getRun both fail, network recovers in ~1s, the registry still
-              // covers from the mount frontier). Restore the removed-filter guarantee
-              // instead: drop the live partial + replay from start / 204 -> poll.
+          // #541: bound the persist re-seed wait with a timeout race. getRun goes
+          // through the axios client, which has NO request timeout; a HUNG getRun
+          // (connection open, no response) — distinct from a REJECT, which the
+          // `.catch` already handles — would otherwise never let us enter the ladder,
+          // leaving the FSM stuck in `streaming` with no banner and no poll until the
+          // browser socket timeout. `settled` makes the three branches (resolve /
+          // reject / timeout) mutually exclusive: whichever fires FIRST wins and the
+          // others become no-ops. So a LATE getRun resolve AFTER the timeout is fully
+          // ignored — it cannot (i) re-enter reconnect a second time, (ii) overwrite
+          // the timeout's replay-from-start with a stale re-seed, or (iii) re-arm any
+          // timer. On timeout we take the SAME fallback as the reject path (drop the
+          // live partial + enter the ladder, so the poll and the stalled-idle cap arm).
+          let settled = false;
+          const finishReseed = (apply: () => void): void => {
+            if (settled) return;
+            settled = true;
+            if (reseedTimerRef.current) {
+              clearTimeout(reseedTimerRef.current);
+              reseedTimerRef.current = null;
+            }
+            if (!mountedRef.current) return;
+            apply();
+          };
+          reseedTimerRef.current = setTimeout(() => {
+            finishReseed(() => {
               dropLivePartialAndReplayFromStart();
               enterReconnect(runId);
+            });
+          }, RECONNECT_RESEED_TIMEOUT_MS);
+          void getRun(cid)
+            .then((res) => {
+              finishReseed(() => {
+                const persisted = res.message;
+                if (persisted && persisted.role === "assistant") {
+                  anchorRef.current = {
+                    id: persisted.id,
+                    stepsPersisted: stepsPersistedOf(persisted),
+                  };
+                  // Replace the live partial with the persisted row IN PLACE by id —
+                  // the re-seed from persist. The attach's tail (steps >= N) then
+                  // appends to a store holding EXACTLY steps 0..N-1: no duplication.
+                  setMessages((prev) => mergeById(prev, rowToUiMessage(persisted)));
+                } else {
+                  // No persisted assistant row (pre-first-frame break): drop the live
+                  // partial + replay from start (no anchor/n) so nothing is duplicated.
+                  dropLivePartialAndReplayFromStart();
+                }
+                enterReconnect(res.run?.id ?? runId);
+              });
+            })
+            .catch(() => {
+              finishReseed(() => {
+                // Persist read FAILED: we cannot re-seed from fresh persist, and a
+                // stale mount-time anchor over the live partial would tail-apply
+                // already-present steps -> duplication (a flaky-network blip:
+                // SSE + getRun both fail, network recovers in ~1s, the registry still
+                // covers from the mount frontier). Restore the removed-filter guarantee
+                // instead: drop the live partial + replay from start / 204 -> poll.
+                dropLivePartialAndReplayFromStart();
+                enterReconnect(runId);
+              });
             });
         } else {
           dropLivePartialAndReplayFromStart();
@@ -903,6 +948,12 @@ export default function ChatThread({
     }
     return () => {
       mountedRef.current = false;
+      // #541: clear the in-flight persist re-seed timeout (not an FSM effect timer,
+      // so DISPOSE does not touch it) — no dangling setTimeout after unmount.
+      if (reseedTimerRef.current) {
+        clearTimeout(reseedTimerRef.current);
+        reseedTimerRef.current = null;
+      }
       dispatch({ type: "DISPOSE" }); // aborts attach + timers, bumps epoch (I5)
     };
     // Mount-only by design; the parent remounts per chat via `key`.
