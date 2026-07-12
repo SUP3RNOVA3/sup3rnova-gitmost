@@ -1,5 +1,6 @@
 import React, { useMemo } from "react";
 import {
+  Badge,
   Box,
   Button,
   Group,
@@ -222,6 +223,7 @@ function AgentEditCard({
   const isOwnerOrAdmin =
     currentUser?.user?.id === comment.creatorId || userSpaceRole === "admin";
 
+  const isApplied = comment.suggestionAppliedAt != null;
   const showApply = canShowApply(comment, canEdit);
   const showDismiss = canShowDismiss(comment, canComment, isOwnerOrAdmin);
   const pending =
@@ -263,6 +265,7 @@ function AgentEditCard({
       p="10px 12px"
       role="button"
       tabIndex={0}
+      aria-label={t("Jump to comment selection")}
       onClick={() => scrollToCommentMark(comment.id)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
@@ -313,6 +316,21 @@ function AgentEditCard({
             </Text>
           )}
           <Box style={{ flex: 1 }} />
+          {/* Applied state (#315): a suggestion that was applied but kept alive by
+              its replies (so #329 resolved instead of hard-deleting it) still
+              shows it was applied — the badge the pre-redesign card carried. A
+              childless applied suggestion is gone from the list entirely, so this
+              only renders in the Resolved tab. */}
+          {isApplied && (
+            <Badge
+              size="sm"
+              color="green"
+              variant="light"
+              aria-label={t("Applied")}
+            >
+              {t("Applied")}
+            </Badge>
+          )}
           {showDismiss && (
             <Button
               size="compact-sm"

@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
+import { createInstance } from "i18next";
+import { initReactI18next, I18nextProvider } from "react-i18next";
 import { IComment } from "@/features/comment/types/comment.types";
 
 // matchMedia (read by MantineProvider) is stubbed globally in vitest.setup.ts.
@@ -37,7 +39,7 @@ vi.mock("@/features/space/queries/space-query.ts", () => ({
   useGetSpaceBySlugQuery: () => ({ data: undefined }),
 }));
 
-import AgentEditCard from "./agent-edit-card";
+import AgentEditCard, { RunHeader } from "./agent-edit-card";
 
 const body = (text: string) =>
   JSON.stringify({
@@ -107,6 +109,18 @@ describe("AgentEditCard — suggested edit diff + Apply (#315)", () => {
   it("hides Apply once suggestionAppliedAt is set", () => {
     renderCard(edit({ suggestionAppliedAt: new Date() }), true);
     expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+  });
+
+  it("shows the Applied badge for an applied suggestion, not a pending one (F1)", () => {
+    // Pending: no Applied badge.
+    const { unmount } = renderCard(edit(), true);
+    expect(screen.queryByText("Applied")).toBeNull();
+    unmount();
+    // Applied (kept alive by replies -> resolved, #329): the badge is restored.
+    renderCard(edit({ suggestionAppliedAt: new Date() }), true);
+    expect(screen.getByText("Applied")).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
   });
 
   it("calls the apply mutation with {commentId, pageId} on click", () => {
@@ -184,4 +198,87 @@ describe("AgentEditCard — provenance", () => {
   // previous test's seed never leaks into the non-owner assertions above.
   beforeEach(() => localStorage.clear());
   afterEach(() => localStorage.clear());
+});
+
+// The RunHeader's "N edits · M major" is built with interpolated t() keys; the
+// default (uninitialized) react-i18next t returns the key verbatim WITHOUT
+// interpolating, so a numeric assertion needs a real, initialised i18n instance.
+// This isolated instance carries just the two count keys with escapeValue off so
+// "{{count}}" is substituted and the rendered numbers are assertable.
+const headerI18n = createInstance();
+headerI18n.use(initReactI18next).init({
+  lng: "en",
+  fallbackLng: "en",
+  resources: {
+    en: {
+      translation: {
+        "{{count}} edits": "{{count}} edits",
+        "{{count}} major": "{{count}} major",
+      },
+    },
+  },
+  interpolation: { escapeValue: false },
+});
+
+const runComment = (id: string, tag: string): IComment =>
+  edit({
+    id,
+    content: body(`${tag} some rationale`),
+  });
+
+function renderRunHeader(comments: IComment[]) {
+  return render(
+    <I18nextProvider i18n={headerI18n}>
+      <MantineProvider>
+        <RunHeader comments={comments} />
+      </MantineProvider>
+    </I18nextProvider>,
+  );
+}
+
+describe("RunHeader — agent-run series header (F3)", () => {
+  // 5 edits: 2 critical + 1 major + 1 minor + 1 unknown(verdict) => 3 "major".
+  const series = () => [
+    runComment("e1", "[Критично]"),
+    runComment("e2", "[Критично]"),
+    runComment("e3", "[Существенно]"),
+    runComment("e4", "[Незначительно]"),
+    runComment("e5", "[Неверно]"),
+  ];
+
+  it("shows the total edit count", () => {
+    renderRunHeader(series());
+    expect(screen.getByText(/5 edits/)).toBeDefined();
+  });
+
+  it("counts ONLY major+critical as major (not minor/unknown)", () => {
+    renderRunHeader(series());
+    // 2 critical + 1 major = 3; minor and the [Неверно] verdict are excluded.
+    expect(screen.getByText(/3 major/)).toBeDefined();
+    // Non-vacuous: the wrong tally (counting all 5, or 4) must NOT appear.
+    expect(screen.queryByText(/5 major/)).toBeNull();
+    expect(screen.queryByText(/4 major/)).toBeNull();
+  });
+
+  it("omits the major segment entirely when there are no significant edits", () => {
+    renderRunHeader([
+      runComment("e1", "[Незначительно]"),
+      runComment("e2", "[Неверно]"),
+    ]);
+    expect(screen.getByText(/2 edits/)).toBeDefined();
+    expect(screen.queryByText(/major/)).toBeNull();
+  });
+
+  it("renders the provenance line (agent role name)", () => {
+    renderRunHeader(series());
+    expect(screen.getAllByText("Corrector").length).toBeGreaterThan(0);
+  });
+
+  it("renders NO 'Accept all' control (rejected by product)", () => {
+    renderRunHeader(series());
+    expect(screen.queryByText(/accept all/i)).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /accept all/i }),
+    ).toBeNull();
+  });
 });
