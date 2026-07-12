@@ -987,9 +987,14 @@ export function convertProseMirrorToMarkdown(
         // like a paragraph followed by a list don't collide into "line1- a".
         // Then collapse newlines and escape pipes so a cell containing "|" or a
         // line break cannot corrupt the surrounding GFM row.
+        // #549: a GFM pipe cell is single-line — the generic `  \n`/newline
+        // collapse below flattens a hardBreak into a space, dropping it. Convert
+        // the two-space hardBreak marker to `<br>` FIRST (GFM cells allow inline
+        // `<br>`, which re-imports to a hardBreak) so intra-cell breaks survive.
         return nodeContent
           .map(processNode)
           .join(" ")
+          .replace(/ {2}\n/g, "<br>")
           .replace(/\r?\n/g, " ")
           .replace(/\|/g, "\\|");
       }
@@ -1336,6 +1341,27 @@ export function convertProseMirrorToMarkdown(
         /^[0-9]/.test(parts[i + 1] || "")
       ) {
         parts[i] = mathInlineHtml(nodes[i].attrs?.text || "");
+      }
+    }
+    // #549: position-aware hardBreak. The two-space `  \n` form (emitted by the
+    // processNode hardBreak case) only re-imports to a hardBreak when it is
+    // FOLLOWED by same-paragraph text. It is silently lost when the break is
+    // (a) the last inline child — the top-level `.trim()` strips the trailing
+    // `  \n`, and even a non-last paragraph's trailing break sits before the
+    // `\n\n` block gap — or (b) immediately followed by another hardBreak — the
+    // intervening whitespace-only line reads as a paragraph separator on
+    // re-parse, splitting the run. Emit `<br>` there instead: marked passes the
+    // inline HTML break through and generateJSON rebuilds a hardBreak in every
+    // position. A safe mid-paragraph break keeps the `  \n` form so the existing
+    // golden output stays byte-stable. Skipped inside footnote bodies, whose
+    // `^[…]` inline form collapses breaks to spaces (unchanged; already lossy).
+    if (!inFootnoteBody) {
+      for (let i = 0; i < nodes.length; i++) {
+        if (nodes[i]?.type !== "hardBreak") continue;
+        const next = nodes[i + 1];
+        if (!next || next.type === "hardBreak" || (parts[i + 1] ?? "") === "") {
+          parts[i] = "<br>";
+        }
       }
     }
     return parts.join("");

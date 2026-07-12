@@ -295,3 +295,44 @@ describe('git-sync converter: lose-prone atoms keep their VALUES across a round 
     expect(allText(src)).toContain('shared body');
   });
 });
+
+// ---------------------------------------------------------------------------
+// #549: hardBreak COUNT/position preservation across a pm -> md -> pm round
+// trip. The FIXTURES block above only proves a mid-paragraph hardBreak survives
+// as a node; these pin the three sub-cases whose `  \n` two-space form was
+// silently dropped on re-import (trailing / consecutive / table cell), plus a
+// mid-paragraph regression guard so the byte-stable `  \n` form is not lost.
+// ---------------------------------------------------------------------------
+describe('#549: hardBreak survives every round-trip position', () => {
+  const HB = { type: 'hardBreak' };
+  const countHardBreaks = (n: any): number => {
+    let c = n?.type === 'hardBreak' ? 1 : 0;
+    if (Array.isArray(n?.content)) for (const ch of n.content) c += countHardBreaks(ch);
+    return c;
+  };
+  const roundTripCount = async (d: any): Promise<number> =>
+    countHardBreaks(await markdownToProseMirror(convertProseMirrorToMarkdown(d)));
+
+  it('mid-paragraph break is still preserved (regression guard)', async () => {
+    expect(await roundTripCount(doc(P(T('a'), HB, T('b'))))).toBe(1);
+  });
+
+  it('(1) trailing break at the end of the last paragraph survives', async () => {
+    expect(await roundTripCount(doc(P(T('a'), HB)))).toBe(1);
+  });
+
+  it('(2) two consecutive breaks in one paragraph survive', async () => {
+    expect(await roundTripCount(doc(P(T('a'), HB, HB, T('b'))))).toBe(2);
+  });
+
+  it('(3) a break inside a table cell survives', async () => {
+    const table = doc({
+      type: 'table',
+      content: [
+        { type: 'tableRow', content: [{ type: 'tableHeader', content: [P(T('h'))] }] },
+        { type: 'tableRow', content: [{ type: 'tableCell', content: [P(T('a'), HB, T('b'))] }] },
+      ],
+    });
+    expect(await roundTripCount(table)).toBe(1);
+  });
+});
