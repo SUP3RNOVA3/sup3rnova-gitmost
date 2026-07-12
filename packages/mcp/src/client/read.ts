@@ -72,7 +72,7 @@ export interface IReadMixin {
   getTree(spaceId: string, rootPageId?: string, maxDepth?: number): any;
   getPageContext(pageId: string): any;
   listSidebarPages(spaceId: string, pageId?: string): any;
-  getPage(pageId: string): any;
+  getPage(pageId: string, format?: "markdown" | "text"): any;
   getPageJson(pageId: string): any;
   getOutline(pageId: string): any;
   getNode(pageId: string, nodeId: string, format?: "markdown" | "json"): any;
@@ -420,8 +420,34 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     return convertProseMirrorToMarkdown(content, options);
   }
 
-  async getPage(pageId: string) {
+  async getPage(pageId: string, format: "markdown" | "text" = "markdown") {
     await this.ensureAuthenticated();
+
+    // #502 `format:"text"`: a flat, deterministic, machine-diffable rendering
+    // (block-per-line, inline marks/comment anchors dropped, non-text nodes ->
+    // stable placeholders like `[image]` / `[table RxC]`). The server produces
+    // it via its `jsonToText` path (the SAME serializer that feeds search), so
+    // there is no second serializer here — we just request it and pass the
+    // string through. Distinct from the markdown default: no PM->markdown walk,
+    // no markdown conversion cache, and no `{{SUBPAGES}}` substitution (the text
+    // renderer emits no such placeholder). Use it to diff a page you wrote as a
+    // config/prose against what was stored.
+    if (format === "text") {
+      const textData = await this.getPageRaw(pageId, "text");
+      let subpages: any[] = [];
+      try {
+        subpages = await this.listSidebarPages(textData.spaceId, textData.id);
+      } catch (e: any) {
+        console.warn("Failed to fetch subpages:", e);
+      }
+      const textContent =
+        typeof textData.content === "string" ? textData.content : "";
+      return {
+        data: filterPage(textData, textContent, subpages),
+        success: true,
+      };
+    }
+
     const resultData = await this.getPageRaw(pageId);
 
     // Agent read: hide resolved-comment anchors so the agent sees only active

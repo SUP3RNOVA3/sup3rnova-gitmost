@@ -49,6 +49,7 @@ import { AddLabelsDto, RemoveLabelDto } from '../label/dto/label.dto';
 import {
   jsonToHtml,
   jsonToMarkdown,
+  jsonToText,
 } from '../../collaboration/collaboration.util';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import {
@@ -93,10 +94,16 @@ export class PageController {
     const permissions = { canEdit, hasRestriction };
 
     if (dto.format && dto.format !== 'json' && page.content) {
-      const contentOutput =
-        dto.format === 'markdown'
-          ? jsonToMarkdown(page.content)
-          : jsonToHtml(page.content);
+      let contentOutput: string;
+      if (dto.format === 'markdown') {
+        contentOutput = jsonToMarkdown(page.content);
+      } else if (dto.format === 'text') {
+        // #502: flat, deterministic, machine-diffable text (block-per-line,
+        // inline marks/anchors dropped, non-text nodes -> stable placeholders).
+        contentOutput = jsonToText(page.content, { deterministic: true });
+      } else {
+        contentOutput = jsonToHtml(page.content);
+      }
       return {
         ...page,
         content: contentOutput,

@@ -141,7 +141,57 @@ export function htmlToJson(html: string) {
   }
 }
 
-export function jsonToText(tiptapJson: JSONContent) {
+/**
+ * Deterministic text-serializer overrides for the `format:"text"` page read
+ * (#502). Non-text nodes render to a STABLE placeholder instead of their
+ * (structure-dependent) inner text, so a machine diff of two text reads is
+ * driven only by the page's actual prose — output stability across package
+ * versions IS the contract (pinned by a snapshot test). Returning a string from
+ * a `textSerializer` also stops `generateText` descending into the node, so a
+ * table renders as ONE token rather than its flattened cell text.
+ *
+ * Only nodes with no meaningful flat-text form are overridden; every other node
+ * (paragraph/heading/list/code/blockquote/callout/…) keeps its natural text so
+ * a config written as markdown reads back byte-identical.
+ */
+const TEXT_READ_SERIALIZERS: Record<string, (props: { node: any }) => string> =
+  {
+    // Image atom: no inner text -> a fixed placeholder.
+    image: () => '[image]',
+    // Table: `[table RxC]` where R = row count, C = the first row's cell count
+    // (a table's columns are uniform per the schema). Computed from the PM node,
+    // so it is independent of cell contents.
+    table: ({ node }) => {
+      const rows = node?.childCount ?? 0;
+      const cols = rows > 0 ? (node.child(0)?.childCount ?? 0) : 0;
+      return `[table ${rows}x${cols}]`;
+    },
+  };
+
+/**
+ * Serialize a ProseMirror/TipTap document to plain text.
+ *
+ * Default (no options): the long-standing search-index behavior — bare
+ * concatenated node text with `generateText`'s default `\n\n` block separator.
+ * This feeds the page `textContent` tsvector and MUST NOT change.
+ *
+ * `deterministic:true` (#502 `format:"text"` page read): a flat, machine-diffable
+ * rendering — one line per block (`\n` block separator; `hardBreak` already
+ * serializes to `\n`), inline marks/anchors/autoformat dropped, and non-text
+ * nodes replaced by the stable placeholders above (`[image]`, `[table RxC]`).
+ */
+export function jsonToText(
+  // `any` (like jsonToHtml/jsonToMarkdown) so a loosely-typed DB `page.content`
+  // (JsonValue) can be passed straight through, as the controller does.
+  tiptapJson: any,
+  options?: { deterministic?: boolean },
+) {
+  if (options?.deterministic) {
+    return generateText(tiptapJson, tiptapExtensions, {
+      blockSeparator: '\n',
+      textSerializers: TEXT_READ_SERIALIZERS,
+    });
+  }
   return generateText(tiptapJson, tiptapExtensions);
 }
 

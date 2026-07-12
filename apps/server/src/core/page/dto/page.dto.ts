@@ -8,7 +8,7 @@ import {
 } from 'class-validator';
 import { Transform } from 'class-transformer';
 
-import { ContentFormat } from './create-page.dto';
+import { PageReadFormat } from './create-page.dto';
 import { IsPageIdOrSlugId } from './page-identity.validator';
 
 export class PageIdDto {
@@ -43,8 +43,8 @@ export class PageInfoDto extends PageIdDto {
 
   @IsOptional()
   @Transform(({ value }) => value?.toLowerCase())
-  @IsIn(['json', 'markdown', 'html'])
-  format?: ContentFormat;
+  @IsIn(['json', 'markdown', 'html', 'text'])
+  format?: PageReadFormat;
 }
 
 export class DeletePageDto extends PageIdDto {

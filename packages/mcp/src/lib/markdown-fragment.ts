@@ -135,7 +135,17 @@ export interface MarkdownFragment {
 export async function importMarkdownFragment(
   markdown: string,
 ): Promise<MarkdownFragment> {
-  const doc = await markdownToProseMirror(markdown);
+  // #502: the fragment path is an MCP agent WRITE (patch_node/insert_node
+  // markdown), so it uses the SAME extensions-OFF importer options as the
+  // full-page write (markdownToProseMirrorCanonical): a `$…$` span stays literal
+  // and a schemeless domain/email is not autolinked. This keeps a block written
+  // via markdown canonically identical to the same content in a full-page write
+  // (no "second canon"). Explicit `https://…` links and block structure are
+  // unaffected.
+  const doc = await markdownToProseMirror(markdown, {
+    parseMath: false,
+    fuzzyLinkify: false,
+  });
   const content: any[] = Array.isArray(doc?.content) ? doc.content : [];
 
   const blocks: any[] = [];

@@ -913,28 +913,46 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'getPage',
     writeClass: 'readOnly',
     description:
-      'Fetch a single page as Markdown by its id. Returns the page title and ' +
-      'its Markdown content. The converter is canonical (round-trips text and ' +
-      'block structure), so this is sufficient for text edits; use the ' +
-      'page-JSON read tool only when you need what Markdown cannot carry. The ' +
-      'Markdown drops exactly: (1) block ids (not visible in Markdown); ' +
-      '(2) resolved-comment anchors (hidden here; only active <span ' +
-      'data-comment-id> anchors remain); (3) a fixed set of attributes with no ' +
-      'Markdown representation — table-cell colspan/rowspan/colwidth/' +
-      'backgroundColor/backgroundColorName, heading/paragraph indent, ' +
-      'callout.icon, orderedList.type, and link internal/target/rel/class. ' +
-      'Inline <span data-comment-id> tags in the markdown are comment highlight ' +
-      'anchors — treat them as markup, not page text.',
+      'Fetch a single page by its id. Returns the page title and its content. ' +
+      'format:"markdown" (DEFAULT) returns canonical Markdown (round-trips text ' +
+      'and block structure), sufficient for text edits; use the page-JSON read ' +
+      'tool only when you need what Markdown cannot carry. The Markdown drops ' +
+      'exactly: (1) block ids (not visible in Markdown); (2) resolved-comment ' +
+      'anchors (hidden here; only active <span data-comment-id> anchors remain); ' +
+      '(3) a fixed set of attributes with no Markdown representation — table-cell ' +
+      'colspan/rowspan/colwidth/backgroundColor/backgroundColorName, ' +
+      'heading/paragraph indent, callout.icon, orderedList.type, and link ' +
+      'internal/target/rel/class. Inline <span data-comment-id> tags in the ' +
+      'markdown are comment highlight anchors — treat them as markup, not page ' +
+      'text. format:"text" returns a FLAT, DETERMINISTIC plain-text rendering ' +
+      'for machine diffing: one line per block, ALL inline marks/formatting and ' +
+      'comment anchors dropped, a hardBreak is a newline, and non-text nodes ' +
+      'become STABLE placeholders — an image is "[image]" and a table is ' +
+      '"[table RxC]" (R rows x C columns). This output is stable across versions ' +
+      '(pinned by a snapshot test); use it to diff a config/prose you wrote ' +
+      'against what was stored (an empty diff means it was stored verbatim).',
     tier: 'core',
-    catalogLine: 'getPage — fetch a page as Markdown by its id.',
+    catalogLine:
+      'getPage — fetch a page by its id (format:"markdown" default, or "text" for a flat machine-diffable read).',
     // Reconciled: MCP's stricter .min(1) kept; in-app's more-informative
     // "(or slugId)" describe kept.
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('The id (or slugId) of the page.'),
+      format: z
+        .enum(['markdown', 'text'])
+        .optional()
+        .describe(
+          'Output format: "markdown" (default, canonical round-trippable) or ' +
+            '"text" (flat deterministic plain text for machine diffing).',
+        ),
     }),
     // MCP wraps the raw `{ data, success }` as JSON. The in-app host instead
     // projects a token-efficient `{ title, markdown }` (its long-standing shape).
-    execute: (client, { pageId }) => client.getPage(pageId as string),
+    execute: (client, { pageId, format }) =>
+      client.getPage(
+        pageId as string,
+        (format as 'markdown' | 'text' | undefined) ?? 'markdown',
+      ),
     inAppExecute: async (client, { pageId }) => {
       // getPage(pageId) -> { data: filterPage(page, markdown), success }.
       const result = (await client.getPage(pageId as string)) as {

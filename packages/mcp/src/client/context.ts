@@ -701,10 +701,20 @@ export abstract class DocmostClientContext {
   }
 
 
-  /** Raw page info including the ProseMirror JSON content and slugId. */
-  async getPageRaw(pageId: string) {
+  /**
+   * Raw page info including the ProseMirror JSON content and slugId.
+   *
+   * With `format:"text"` (#502) the server instead renders `content` as a flat,
+   * deterministic text string (its `jsonToText` path — the SAME serializer that
+   * feeds search), so the MCP text read reuses the server's ONE serializer
+   * rather than shipping a second one. Every other caller omits `format` and
+   * gets the JSON content unchanged.
+   */
+  async getPageRaw(pageId: string, format?: "text") {
     await this.ensureAuthenticated();
-    const response = await this.client.post("/pages/info", { pageId });
+    const body: Record<string, unknown> = { pageId };
+    if (format) body.format = format;
+    const response = await this.client.post("/pages/info", body);
     return response.data?.data ?? response.data;
   }
 

@@ -118,9 +118,22 @@ export async function markdownToProseMirrorCanonical(
   // #419: normalize + merge glyph-forked footnote definitions BEFORE
   // canonicalizing, so the canonicalizer re-hangs references and drops the
   // now-orphaned duplicate definitions.
+  //
+  // #502: this is THE page-markdown WRITE importer for every MCP agent write
+  // (createPage body, updatePageMarkdown, and — via importMarkdownFragment — the
+  // patch_node/insert_node markdown fragment path). Agents write plain prose /
+  // config, so the two layered markdown extensions are turned OFF here: a `$…$`
+  // span stays literal text (real math is authored via `update_page_json`'s
+  // `mathInline`/`mathBlock` nodes) and a SCHEMELESS `www.host`/email is NOT
+  // autolinked (an explicit `https://…` still links). This is the write path
+  // ONLY — the human editor, server file-import and git-sync importers keep the
+  // defaults (math + fuzzy autolink ON), so exported math round-trips losslessly.
   return canonicalizeFootnotes(
     normalizeAndMergeFootnotes(
-      await markdownToProseMirror(normalizeAgentMarkdown(markdownContent)),
+      await markdownToProseMirror(normalizeAgentMarkdown(markdownContent), {
+        parseMath: false,
+        fuzzyLinkify: false,
+      }),
     ),
   );
 }
