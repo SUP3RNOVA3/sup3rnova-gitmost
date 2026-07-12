@@ -553,6 +553,13 @@ export abstract class DocmostClientContext {
     try {
       return await write(collabToken);
     } catch (e) {
+      // INVARIANT (#494/#435): this auto-retry MUST stay auth-only. A collab
+      // write can fail INDETERMINATE — its update may already have reached and
+      // persisted on the server (e.g. an LRU eviction of a busy session, tagged
+      // via isCollabIndeterminateError). Blindly retrying such a write duplicates
+      // it (the #435 double-apply class). If this gate is ever widened to retry a
+      // broader error class, FIRST check `isCollabIndeterminateError(e)` and do
+      // NOT retry an indeterminate write — re-read and verify before any retry.
       if (!isCollabAuthFailedError(e)) throw e;
       // The WS handshake rejected our token: drop it from the cache so it can't
       // be reused for the rest of the TTL, mint a fresh one (forceRefresh bypasses

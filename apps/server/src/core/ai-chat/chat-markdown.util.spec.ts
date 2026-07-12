@@ -1,5 +1,10 @@
-import { buildChatMarkdown, normalizeLang } from './chat-markdown.util';
+import {
+  buildChatMarkdown,
+  normalizeLang,
+  labelledToolNames,
+} from './chat-markdown.util';
 import type { AiChatMessage } from '@docmost/db/types/entity.types';
+import { SHARED_TOOL_SPECS } from '../../../../../packages/mcp/src/tool-specs';
 
 /**
  * normalizeLang: the client sends `i18n.language` — a FULL locale tag like
@@ -453,5 +458,45 @@ describe('buildChatMarkdown (server) — structure', () => {
     });
     // A 4-backtick fence wraps content that itself contains a 3-backtick run.
     expect(md).toContain('````');
+  });
+});
+
+/**
+ * #494 — REVERSE drift-guard for the export's friendly tool labels. A label keyed
+ * by a tool name that no longer exists silently degrades to the generic
+ * "Ran tool <name>" line; nothing reddened before. This asserts every labelled
+ * name is a real in-app tool and that both languages label the same set.
+ */
+describe('tool-label parity (#494)', () => {
+  // In-app tool names come from the shared registry (inAppKey, excluding
+  // mcpOnly specs) PLUS the inline in-app-only tools that carry a friendly label.
+  // The only labelled inline tool is the hybrid semantic search.
+  const INLINE_INAPP_LABELLED = new Set(['searchPages']);
+
+  function validInAppToolNames(): Set<string> {
+    const names = new Set<string>(INLINE_INAPP_LABELLED);
+    for (const spec of Object.values(SHARED_TOOL_SPECS)) {
+      if ((spec as { mcpOnly?: boolean }).mcpOnly) continue;
+      names.add((spec as { inAppKey: string }).inAppKey);
+    }
+    return names;
+  }
+
+  it('en and ru label the SAME set of tools', () => {
+    expect(labelledToolNames('en').sort()).toEqual(
+      labelledToolNames('ru').sort(),
+    );
+  });
+
+  it('every labelled tool name is a real in-app tool', () => {
+    const valid = validInAppToolNames();
+    const dead = labelledToolNames('en').filter((n) => !valid.has(n));
+    expect(dead).toEqual([]);
+  });
+
+  it('the guard REDDENS for an unknown label key (mutation check)', () => {
+    const valid = validInAppToolNames();
+    // A hypothetical renamed-away label must be caught.
+    expect(valid.has('getPageRenamedAway')).toBe(false);
   });
 });

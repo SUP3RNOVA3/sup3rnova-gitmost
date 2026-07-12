@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import {
   acquireCollabSession,
   destroyAllSessions,
+  isCollabIndeterminateError,
   __setCollabProviderFactory,
   __sessionCountForTests,
 } from "../../build/lib/collab-session.js";
@@ -305,6 +306,134 @@ test("registry cap: least-recently-used session is destroy-evicted", async () =>
   assert.equal(await acquireCollabSession("page-1", "tok", "http://h/api"), s1);
   assert.equal(await acquireCollabSession("page-3", "tok", "http://h/api"), s3);
   assert.equal(FakeProvider.connectCount, 3, "no extra reconnects");
+});
+
+// #494 — the LRU cap must PREFER an idle victim: evicting a session with an
+// in-flight mutate (whose update may already be on the server) would reject that
+// write as a false failure → the agent retries → duplicate. Here the LRU (oldest)
+// session is BUSY and a younger one is idle; the busy one must be spared.
+test("#494: LRU eviction SKIPS a busy session and evicts a younger idle one instead", async () => {
+  process.env.MCP_COLLAB_SESSION_MAX_ENTRIES = "2";
+  __setCollabProviderFactory(factory({ unsynced: 1 })); // a mutate stays pending
+  // page-1 is the OLDEST (LRU). Start a mutate on it so it is BUSY (in-flight).
+  const s1 = await acquireCollabSession("page-1", "tok", "http://h/api");
+  const p1prov = FakeProvider.last();
+  const inflight = s1.mutate(() => docWith("in-flight write")); // pending (no ack)
+  // page-2 is younger and IDLE.
+  const s2 = await acquireCollabSession("page-2", "tok", "http://h/api");
+  const p2prov = FakeProvider.last();
+  assert.equal(__sessionCountForTests(), 2);
+
+  // page-3 forces an eviction (cap 2). The LRU is page-1, but it is BUSY, so the
+  // guard must skip it and evict the idle page-2 instead.
+  await acquireCollabSession("page-3", "tok", "http://h/api");
+  assert.equal(__sessionCountForTests(), 2);
+  assert.equal(
+    p1prov.destroyed,
+    false,
+    "the BUSY LRU session must be spared (its in-flight write may have landed)",
+  );
+  assert.equal(p2prov.destroyed, true, "the idle younger session was evicted");
+
+  // The spared write still completes normally once the server acks it — it was
+  // never rejected by the eviction.
+  p1prov._ack();
+  const r = await inflight;
+  assert.ok(r.doc, "the in-flight write on the spared session resolves on its ack");
+});
+
+// #494 — when EVERY cached session is busy, eviction is unavoidable; the victim's
+// in-flight write must reject as INDETERMINATE (verify-before-retry), NOT a plain
+// failure that invites a blind, duplicate retry.
+test("#494: evicting a busy session when all are busy rejects the write as INDETERMINATE", async () => {
+  process.env.MCP_COLLAB_SESSION_MAX_ENTRIES = "1";
+  __setCollabProviderFactory(factory({ unsynced: 1 }));
+  const s1 = await acquireCollabSession("page-1", "tok", "http://h/api");
+  const inflight = s1.mutate(() => docWith("maybe-persisted write")); // pending
+  assert.equal(__sessionCountForTests(), 1);
+
+  // page-2 needs the single slot; page-1 is the only (busy) candidate, so its
+  // eviction is unavoidable. Its in-flight write must reject with the tagged
+  // indeterminate error.
+  await acquireCollabSession("page-2", "tok", "http://h/api");
+
+  await assert.rejects(inflight, (err) => {
+    assert.ok(
+      isCollabIndeterminateError(err),
+      "the evicted busy write must carry the INDETERMINATE marker, not be a plain failure",
+    );
+    assert.match(err.message, /INDETERMINATE/);
+    assert.match(err.message, /verify|Do NOT blindly retry/i);
+    return true;
+  });
+});
+
+// #494 — a session whose open() has NOT resolved yet (state "connecting") sits in
+// the registry between `sessions.set(key)` and `await session.open()`, but it is
+// NOT an idle eviction victim: its write has not even started, and a parallel
+// acquire for a DIFFERENT page that interleaves across that await must not destroy
+// it (which would reject its pending open() as "evicted (LRU cap)" — a spurious
+// failure of a write that never began). Under saturation the connecting session is
+// spared; a genuinely-busy LRU session is evicted (INDETERMINATE) instead, and the
+// connecting session's open() still resolves.
+test("#494: a still-CONNECTING session is NOT evicted as an idle victim by a parallel acquire under saturation", async () => {
+  process.env.MCP_COLLAB_SESSION_MAX_ENTRIES = "2";
+
+  // A = the OLDEST (LRU) session, made BUSY by an in-flight (un-acked) mutate.
+  __setCollabProviderFactory(factory({ unsynced: 1 }));
+  const sA = await acquireCollabSession("page-1", "tok", "http://h/api");
+  const provA = FakeProvider.last();
+  const inflightA = sA.mutate(() => docWith("in-flight write")); // pending
+  // Attach a handler NOW so a later reject is never "unhandled"; capture it.
+  let inflightErr;
+  inflightA.catch((e) => {
+    inflightErr = e;
+  });
+
+  // B = a session still mid-handshake: open() never resolves under autoSync:false,
+  // so it stays "connecting". acquireCollabSession runs synchronously through
+  // `sessions.set(key)` and into open()'s executor (provider created) before it
+  // suspends at `await session.open()`, so B is already registered here.
+  __setCollabProviderFactory(factory({ autoSync: false }));
+  const pB = acquireCollabSession("page-2", "tok", "http://h/api"); // NOT awaited
+  const provB = FakeProvider.last();
+  assert.equal(__sessionCountForTests(), 2, "A (busy) + B (connecting) fill the cap");
+  assert.notEqual(provA, provB);
+
+  // C forces an eviction (cap 2). The idle-victim scan must treat B (connecting) as
+  // NON-idle and fall through to the busy LRU (A), evicting A as INDETERMINATE and
+  // SPARING the connecting B.
+  __setCollabProviderFactory(factory());
+  const sC = await acquireCollabSession("page-3", "tok", "http://h/api");
+  assert.equal(__sessionCountForTests(), 2);
+  assert.ok(sC);
+
+  assert.equal(
+    provB.destroyed,
+    false,
+    "the CONNECTING session must be spared — a parallel acquire must not evict a mid-handshake write",
+  );
+  assert.equal(
+    provA.destroyed,
+    true,
+    "the busy LRU session was the eviction victim instead",
+  );
+
+  // B's handshake completes -> its open() resolves and the acquire returns a live
+  // session (its write can now start), proving the eviction never touched it.
+  provB.config.onConnect?.();
+  provB.synced = true;
+  provB.config.onSynced?.();
+  const sB = await pB;
+  assert.ok(sB, "the spared connecting session's open() resolves normally");
+  assert.equal(provB.destroyed, false);
+
+  // The evicted busy write rejects as INDETERMINATE (verify-before-retry), not a
+  // plain failure — the existing all-busy guarantee still holds for A.
+  assert.ok(
+    isCollabIndeterminateError(inflightErr),
+    "the evicted busy write carries the INDETERMINATE marker",
+  );
 });
 
 test("MCP_COLLAB_SESSION_IDLE_MS=0 disables the cache (legacy provider-per-op)", async () => {

@@ -343,6 +343,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP write tools no longer report a false failure that provokes a duplicate
+  write.** `drawioCreate` used to throw when the diagram landed as a NESTED block
+  (anchored inside a callout or table cell) because there is no `#<index>` handle
+  for it — but the diagram was already written, so a retry-prone agent re-created
+  it and produced a duplicate. It now returns success with `nodeId: null` plus a
+  warning that explains the write landed and how to re-read it (via
+  `getOutline` / `getPageJson` by `attachmentId`). Separately, when the live
+  collaboration-session cache hits its LRU entry cap, evicting a session whose
+  write is still in flight no longer rejects that write as a hard failure — it is
+  reported as INDETERMINATE ("the update may already have persisted; verify
+  before retry") so the agent re-reads instead of blind-retrying, and a
+  still-connecting session is no longer picked as an idle eviction victim by a
+  parallel acquire. (#494)
 - **A chat with one malformed message part no longer 500s on every turn, and a
   failed send no longer duplicates the user's message.** Incoming client parts
   are now whitelisted to `text` (a forged tool-result part can no longer reach

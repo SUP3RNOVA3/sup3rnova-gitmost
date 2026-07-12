@@ -22,14 +22,14 @@
  * inline markdown (`**bold**`, `` `code` ``, `[t](u)`), the raw locator will not
  * match the document's plain text. Exactly like editPageText's json-edit
  * fallback, we first try the verbatim selection and, ONLY if it anchors nowhere
- * in the whole document, retry with `stripInlineMarkdown` applied. `canAnchorInDoc`,
- * `getAnchoredText` and `applyAnchorInDoc` share this decision via
- * `resolveAnchorSelection`. `countAnchorMatches` keeps its OWN parallel exact-wins
- * implementation (it needs a raw match COUNT, not a single resolved locator), kept
- * deliberately in sync with `resolveAnchorSelection`: raw match ⇒ use raw, else fall
- * back to the stripped count. All four therefore agree on which locator matched —
- * the suggestion-uniqueness gate depends on count and can/get never disagreeing, so
- * these two exact-wins implementations MUST stay in sync if either is changed.
+ * in the whole document, retry with `stripInlineMarkdown` applied. All four entry
+ * points — `canAnchorInDoc`, `getAnchoredText`, `applyAnchorInDoc` and
+ * `countAnchorMatches` — share this exact-wins / strip-fallback decision through the
+ * SINGLE resolver `resolveAnchorSelection`; there is no second copy of the control
+ * flow. `countAnchorMatches` just asks the resolver which selection form wins and
+ * returns the raw occurrence count of that winning form. Because count and anchor
+ * derive from the same resolver, the suggestion-uniqueness gate (which depends on
+ * count) can never disagree with what actually anchors.
  */
 
 import { stripInlineMarkdown } from "./text-normalize.js";
@@ -423,22 +423,23 @@ function rawCountAnchorMatches(doc: any, selection: string): number {
 }
 
 /**
- * Uniqueness gate for suggestions, with the SAME markdown-strip fallback as the
- * other entry points so count never disagrees with can/get/apply. EXACT WINS: if
- * the verbatim selection occurs at all, return its raw occurrence count (so a
- * selection that is unique raw stays unique — the fallback never runs and cannot
- * introduce a spurious second match). Only when the verbatim selection is absent
- * do we count occurrences of the markdown-stripped form.
+ * Uniqueness gate for suggestions. Delegates the exact-wins / markdown-strip
+ * FALLBACK DECISION to `resolveAnchorSelection` — the single resolver every
+ * other entry point (canAnchorInDoc / getAnchoredText / applyAnchorInDoc) shares
+ * — then counts occurrences of the resolved form. This removes the parallel
+ * exact-wins control flow (#494): counting can no longer drift from anchoring
+ * about WHICH selection form wins, because both ask the same resolver. Behaviour
+ * is unchanged: `resolveAnchorSelection` reports `found` iff the verbatim (else
+ * stripped) selection anchors — the same condition under which the old
+ * raw>0 / strippedCount>0 branches fired — and it returns the same winning form,
+ * whose raw occurrence count is what we return (EXACT WINS: a raw match yields the
+ * raw count, so a selection unique raw stays unique; only an absent verbatim
+ * selection falls back to the stripped form's count).
  */
 export function countAnchorMatches(doc: any, selection: string): number {
-  const raw = rawCountAnchorMatches(doc, selection);
-  if (raw > 0) return raw;
-  const stripped = stripInlineMarkdown(selection);
-  if (stripped !== selection) {
-    const strippedCount = rawCountAnchorMatches(doc, stripped);
-    if (strippedCount > 0) return strippedCount;
-  }
-  return 0;
+  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  if (!found) return 0;
+  return rawCountAnchorMatches(doc, effective);
 }
 
 /**

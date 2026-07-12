@@ -277,6 +277,40 @@ test("countAnchorMatches applies the same normalization as anchoring", () => {
   assert.equal(countAnchorMatches(doc, '"hi"'), 1);
 });
 
+// #494 — countAnchorMatches now delegates its exact-wins/strip-fallback DECISION
+// to the single resolver (resolveAnchorSelection) instead of a parallel copy.
+// This parity test REDDENS if the two ever disagree about whether — and in which
+// form — a selection anchors (e.g. if countAnchorMatches stops using the resolver
+// and the fallback logic drifts).
+test("#494: countAnchorMatches and resolveAnchorSelection agree across a corpus", () => {
+  const doc = paragraphDoc([
+    { type: "text", text: "say “hi” now and **bold** and plain hi" },
+  ]);
+  const corpus = [
+    '"hi"', // strip/normalize fallback (smart quotes)
+    "**bold**", // markdown-strip fallback (anchors as "bold")
+    "hi", // raw, multiple occurrences
+    "absent-string", // anchors nowhere
+    "plain hi", // raw, unique
+  ];
+  for (const sel of corpus) {
+    const count = countAnchorMatches(doc, sel);
+    const { found, selection: effective } = resolveAnchorSelection(doc, sel);
+    // found iff at least one match; and when found, the count is exactly the raw
+    // occurrence count of the resolver's WINNING form.
+    assert.equal(count > 0, found, `presence disagreement for ${JSON.stringify(sel)}`);
+    if (found) {
+      // Re-count the resolved form directly and require equality (proves the
+      // count is derived from the resolver's chosen form, not a parallel path).
+      assert.equal(
+        count,
+        countAnchorMatches(doc, effective),
+        `count/resolver form disagreement for ${JSON.stringify(sel)}`,
+      );
+    }
+  }
+});
+
 // -----------------------------------------------------------------------------
 // getAnchoredText: returns the RAW document substring the mark would cover (the
 // doc's original typographic characters), not the normalized ASCII selection.
