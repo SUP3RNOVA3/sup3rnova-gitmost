@@ -240,6 +240,107 @@ test("prepareModel: returns bbox, cellCount, hash and lints", () => {
   assert.equal(p.hash, mxHash(normalizeXml(VALID_MODEL)));
 });
 
+// --- comment auto-strip (issue #505) ---------------------------------------
+
+// The model organically inserts `<!-- ... -->` into diagram XML. prepareModel
+// (the shared path for drawioCreate/drawioUpdate/drawioEditCells) strips them
+// BEFORE the lint runs and reports the count as a non-blocking warning, so the
+// model never hits a hard [no-comments] error and never regenerates the diagram.
+test("prepareModel: strips XML comments, lint passes, warns with the count", () => {
+  const m =
+    '<mxGraphModel><root>' +
+    '<!-- header comment -->' +
+    '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+    '<mxCell id="2" value="Hello" vertex="1" parent="1">' +
+    '<!-- inline note -->' +
+    '<mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>' +
+    '</root></mxGraphModel>';
+  // Would fail [no-comments] if not stripped first.
+  const p = prepareModel(m);
+  // Comments are gone from the canonical model.
+  assert.ok(!p.modelXml.includes("<!--"));
+  assert.ok(!p.modelXml.includes("header comment"));
+  assert.ok(!p.modelXml.includes("inline note"));
+  // No [no-comments] error was raised (prepareModel returned instead of throwing).
+  // A single strip warning naming the count (2) is present.
+  assert.ok(p.warnings.includes("stripped 2 XML comment(s)"));
+});
+
+test("prepareModel: zero comments emits no strip warning", () => {
+  const p = prepareModel(VALID_MODEL);
+  assert.ok(!p.warnings.some((w) => w.startsWith("stripped")));
+});
+
+test("prepareModel: an entity-escaped <!-- inside a value is NOT stripped", () => {
+  const m =
+    '<mxGraphModel><root>' +
+    '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+    '<mxCell id="2" value="a &lt;!-- x --&gt; b" vertex="1" parent="1">' +
+    '<mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>' +
+    '</root></mxGraphModel>';
+  const p = prepareModel(m);
+  // Nothing was mistaken for a comment node.
+  assert.ok(!p.warnings.some((w) => w.startsWith("stripped")));
+  // The escaped sequence survives round-trip in the value.
+  const cell = p.cells.find((c) => c.id === "2");
+  assert.equal(cell.value, "a <!-- x --> b");
+});
+
+test("prepareModel: malformed input with a raw <!-- in a value is NOT stripped (no silent truncation)", () => {
+  // A literal, UNescaped `<!--` inside an attribute value makes the XML
+  // malformed (raw `<` is illegal in a value). The comment-strip is gated on
+  // well-formedness, so it must NOT touch this input — otherwise the author's
+  // label ` secret ` would be silently deleted and the corrupt diagram accepted.
+  // Instead lintModel's value-escaping / well-formed-xml rules must reject it.
+  const m =
+    '<mxGraphModel><root>' +
+    '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+    '<mxCell id="2" value="a <!-- secret --> b" vertex="1" parent="1">' +
+    '<mxGeometry x="0" y="0" width="10" height="10" as="geometry"/></mxCell>' +
+    '</root></mxGraphModel>';
+  const issues = issuesOf(() => prepareModel(m));
+  // Rejected (threw DrawioLintError) rather than silently accepted.
+  assert.ok(issues, "expected prepareModel to reject malformed input");
+  // By a real content rule, not swallowed by the strip.
+  assert.ok(
+    hasRule(issues, "value-escaping", "2") || hasRule(issues, "well-formed-xml"),
+    `expected value-escaping/well-formed-xml, got ${JSON.stringify(issues)}`,
+  );
+});
+
+test("prepareModel: a <!-- --> inside a CDATA section is NOT stripped (no silent corruption)", () => {
+  // A CDATA section is well-formed, so the well-formedness gate alone would let
+  // the regex delete a literal `<!-- x -->` living inside CDATA text — silent
+  // content loss with a false "stripped" success. The CDATA sub-gate must skip
+  // the strip; the model then hits the retained no-comments backstop (an explicit
+  // error) instead of being silently accepted with a strip warning.
+  const m =
+    '<mxGraphModel><root>' +
+    '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+    '<mxCell id="2" vertex="1" parent="1"><mxGeometry x="0" y="0" width="10" height="10" as="geometry"/>' +
+    '<foo><![CDATA[keep<!-- x -->keep]]></foo></mxCell>' +
+    '</root></mxGraphModel>';
+  const issues = issuesOf(() => prepareModel(m));
+  // Rejected (threw), not silently accepted with a strip warning.
+  assert.ok(issues, "expected prepareModel to reject rather than silently strip");
+  // The no-comments backstop caught the literal comment sequence.
+  assert.ok(
+    hasRule(issues, "no-comments"),
+    `expected no-comments backstop, got ${JSON.stringify(issues)}`,
+  );
+});
+
+test("no-comments rule still fires when a comment reaches the linter directly", () => {
+  // Defense-in-depth: prepareModel strips first, but lintModel itself (the
+  // backstop) must still reject a raw comment-bearing model.
+  const m =
+    '<mxGraphModel><root>' +
+    '<!-- unstripped --><mxCell id="0"/><mxCell id="1" parent="0"/>' +
+    '</root></mxGraphModel>';
+  const issues = issuesOf(() => lintModel(m));
+  assert.ok(hasRule(issues, "no-comments"));
+});
+
 // --- decode chain: plain -----------------------------------------------------
 
 test("decode chain (plain): buildDrawioSvg -> decodeDrawioSvg round-trips byte-stable", () => {

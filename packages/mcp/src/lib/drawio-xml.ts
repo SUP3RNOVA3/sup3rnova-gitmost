@@ -1080,8 +1080,43 @@ export interface PreparedModel {
  */
 export function prepareModel(inputXml: string): PreparedModel {
   const rawModel = normalizeInput(inputXml);
-  const { cells, warnings } = lintModel(rawModel);
-  const modelXml = normalizeXml(rawModel);
+  // Auto-strip XML comments before linting. The model routinely inserts
+  // `<!-- ... -->` into the diagram XML despite the prohibition in the tool
+  // description; a hard [no-comments] lint failure would force it to regenerate
+  // the whole diagram (a wasted tool call). Comments carry no diagram semantics,
+  // so stripping them is always safe. The linter's no-comments rule stays as a
+  // defense-in-depth backstop for any path that reaches it without this strip.
+  //
+  // The strip is GATED on two conditions so the regex only ever targets real
+  // comment nodes:
+  //   1. Well-formedness. Well-formed XML forbids a bare `<` inside an attribute
+  //      value (it must be entity-escaped, e.g. `&lt;!--`), so a literal `<!--`
+  //      cannot hide in a value. On MALFORMED input (e.g. a raw unescaped `<!--`
+  //      inside a value on the <mxGraphModel> create/update path, which
+  //      normalizeInput passes through unparsed) we must NOT strip: truncating
+  //      that value would silently corrupt the author's label. We leave it intact
+  //      and let lintModel's value-escaping / well-formed-xml rules reject it so
+  //      the author sees the real error.
+  //   2. No CDATA. A CDATA section is well-formed yet its text may contain a
+  //      literal `<!-- ... -->` that is NOT a comment node; stripping it would
+  //      silently delete author content. Real drawio labels live in `value=`
+  //      attributes (CDATA impossible), so excluding CDATA is free on legitimate
+  //      models; a CDATA-bearing model with a genuine comment then falls to the
+  //      retained no-comments lint backstop (an explicit error) rather than being
+  //      silently corrupted.
+  const { error: parseError } = parseXml(rawModel);
+  const hasCdata = rawModel.includes("<![CDATA[");
+  const commentMatches =
+    parseError === null && !hasCdata
+      ? (rawModel.match(/<!--[\s\S]*?-->/g) ?? [])
+      : [];
+  const commentCount = commentMatches.length;
+  const strippedModel =
+    commentCount > 0 ? rawModel.replace(/<!--[\s\S]*?-->/g, "") : rawModel;
+  const stripWarnings =
+    commentCount > 0 ? [`stripped ${commentCount} XML comment(s)`] : [];
+  const { cells, warnings } = lintModel(strippedModel);
+  const modelXml = normalizeXml(strippedModel);
   const bbox = computeBBox(cells);
   const cellCount = cells.filter((c) => c.id !== "0" && c.id !== "1").length;
   // Geometry quality warnings (non-blocking) are appended to any structural
@@ -1092,7 +1127,7 @@ export function prepareModel(inputXml: string): PreparedModel {
     cells,
     bbox,
     cellCount,
-    warnings: [...warnings, ...quality],
+    warnings: [...stripWarnings, ...warnings, ...quality],
     hash: mxHash(modelXml),
   };
 }
