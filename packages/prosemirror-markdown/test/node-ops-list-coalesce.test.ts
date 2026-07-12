@@ -158,6 +158,31 @@ describe("#535 list seam coalescing — markdown path (insertNodesRelative)", ()
     expect(out.content[2].attrs.id).toBe("E");
   });
 
+  it("crit4b: three-way with DIFFERING explicit ordered types does NOT transitively merge through a default-typed insertion", () => {
+    // [ol(type:"a")[1], ol(type:"i")[9]] + insert ol(type:null)[5] after A.
+    // The null-typed middle is pairwise-compatible with BOTH neighbours, but the
+    // neighbours are mutually incompatible ("a" vs "i"), so they must NOT
+    // collapse. The inserted list is absorbed by the LEFT survivor; the RIGHT
+    // list stays separate and keeps its roman numbering style.
+    const doc = {
+      type: "doc",
+      content: [orderedList("A", 1, "a", 1), orderedList("C", 9, "i", 9)],
+    };
+    const { doc: out } = insertNodeRelative(doc, orderedList("B", 5, null, 5), {
+      position: "after",
+      anchorNodeId: "A",
+    });
+    expect(out.content.length).toBe(2);
+    // Left survivor absorbs the inserted item.
+    expect(out.content[0].attrs.id).toBe("A");
+    expect(out.content[0].attrs.type).toBe("a");
+    expect(labels(out.content[0])).toEqual(["1", "5"]);
+    // Right list is untouched: its explicit style survives.
+    expect(out.content[1].attrs.id).toBe("C");
+    expect(out.content[1].attrs.type).toBe("i");
+    expect(labels(out.content[1])).toEqual(["9"]);
+  });
+
   it("crit6: before for orderedList{start:5} keeps start:5 (positional survivor = pre-existing)", () => {
     const doc = { type: "doc", content: [orderedList("A", 5, null, "a", "b")] };
     const { doc: out } = insertNodesRelative(
@@ -203,6 +228,27 @@ describe("#535 list seam coalescing — markdown path (insertNodesRelative)", ()
       { position: "append" },
     );
     expect(out.content.length).toBe(2);
+  });
+
+  it("footnotesList is NEVER structurally coalesced (allow-list excludes it, guarding against endsWith(\"List\"))", () => {
+    const fn = (id: string): any => ({
+      type: "footnotesList",
+      attrs: { id },
+      content: [
+        { type: "footnoteDefinition", attrs: { id: id + "d" }, content: [] },
+      ],
+    });
+    const doc = { type: "doc", content: [fn("A")] };
+    const { doc: out } = insertNodeRelative(doc, fn("B"), {
+      position: "append",
+    });
+    // Two footnotesLists must stay two separate blocks — merging them would
+    // corrupt footnotes.
+    expect(out.content.length).toBe(2);
+    expect(out.content.map((n: any) => n.type)).toEqual([
+      "footnotesList",
+      "footnotesList",
+    ]);
   });
 
   it("taskList next to taskList coalesces, item checked attrs move with items", () => {

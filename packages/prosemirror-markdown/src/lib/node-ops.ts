@@ -705,24 +705,42 @@ function coalesceSeams(parent: any[], i: number, j: number): void {
 
   // A seam fires only when the pre-existing neighbour and the inserted boundary
   // list are mergeable AND the inserted boundary list is non-empty.
+  const singleBlock = i === j - 1;
   const leftMergeable =
     i - 1 >= 0 &&
     listsMergeable(left, boundaryLeft) &&
     boundaryLeft.content.length > 0;
-  const rightMergeable =
+  let rightMergeable =
     j < n &&
     listsMergeable(boundaryRight, right) &&
     boundaryRight.content.length > 0;
 
-  // Three-way collision: a SINGLE inserted list (i === j-1) landed exactly
-  // between two pre-existing same-type lists. The LEFT pre-existing list wins:
-  // the inserted items then the right list's items fold into it, and both the
+  // Three-way collision: a SINGLE inserted list (singleBlock) landed exactly
+  // between two pre-existing lists. The LEFT pre-existing list wins: the
+  // inserted items then the right list's items fold into it, and both the
   // inserted wrapper and the right pre-existing list are deleted (the right
   // block id is NOT preserved — rare, documented).
-  if (i === j - 1 && leftMergeable && rightMergeable) {
+  //
+  // The `listsMergeable(left, right)` guard is REQUIRED: leftMergeable and
+  // rightMergeable only check each PRE-EXISTING list against the inserted one.
+  // A default-typed inserted orderedList is compatible with BOTH neighbours
+  // even when the neighbours carry explicit DIFFERENT numbering styles, so
+  // without this guard the two would collapse transitively through the middle
+  // and the right list's style would be silently lost. When it fails we fall
+  // through to the single-seam path below (never a transitive merge).
+  if (singleBlock && leftMergeable && rightMergeable && listsMergeable(left, right)) {
     left.content.push(...boundaryLeft.content, ...right.content);
     parent.splice(i, 2);
     return;
+  }
+
+  // A single inserted block can be absorbed by at most ONE neighbour. When both
+  // seams are individually valid but the neighbours are mutually incompatible
+  // (the three-way guard above failed), prefer the LEFT seam — consistent with
+  // the three-way survivor choice — and drop the right so the incompatible
+  // right list stays separate with its own style.
+  if (singleBlock && leftMergeable && rightMergeable) {
+    rightMergeable = false;
   }
 
   // Otherwise the two seams are independent. Process the RIGHT seam FIRST so its
