@@ -44,6 +44,12 @@ const AccountSettings = lazy(
 const AccountPreferences = lazy(
   () => import("@/pages/settings/account/account-preferences.tsx"),
 );
+// #506 — lazy leaf (own chunk): the API-keys management page is route-split so
+// its code (Mantine table/modals + the create/revoke flow) stays out of the
+// entry bundle (post-#342 bundle discipline).
+const AccountApiKeys = lazy(
+  () => import("@/pages/settings/account/account-api-keys.tsx"),
+);
 const WorkspaceSettings = lazy(
   () => import("@/pages/settings/workspace/workspace-settings"),
 );
@@ -105,6 +111,7 @@ export default function App() {
               path={"account/preferences"}
               element={<AccountPreferences />}
             />
+            <Route path={"account/api-keys"} element={<AccountApiKeys />} />
             <Route path={"workspace"} element={<WorkspaceSettings />} />
             <Route path={"ai"} element={<AiSettings />} />
             <Route path={"members"} element={<WorkspaceMembers />} />
