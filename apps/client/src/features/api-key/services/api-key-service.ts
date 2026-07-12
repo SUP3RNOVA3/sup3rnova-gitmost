@@ -6,8 +6,10 @@ import {
 } from "@/features/api-key/types/api-key.types";
 
 // Mint a new key. The response carries the token ONCE — the caller must move it
-// straight into the show-once modal's local state and never cache it (see
-// use-api-key-query / create-api-key-modal for the reset()-after-read pattern).
+// straight into the show-once modal's local state and never cache it. See
+// queries/api-key-query.ts (gcTime: 0 + query invalidation) and
+// components/api-keys-manager.tsx `handleCreate` (createMutation.reset() right
+// after reading the token) for the reset()-after-read pattern.
 export async function createApiKey(
   data: ICreateApiKey,
 ): Promise<ICreateApiKeyResponse> {
