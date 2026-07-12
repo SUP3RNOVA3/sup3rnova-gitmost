@@ -1,4 +1,4 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { Strategy } from 'passport-jwt';
 import { EnvironmentService } from '../../../integrations/environment/environment.service';
@@ -9,20 +9,18 @@ import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { SessionActivityService } from '../../session/session-activity.service';
 import { FastifyRequest } from 'fastify';
 import { extractBearerTokenFromHeader, isUserDisabled } from '../../../common/helpers';
-import { ModuleRef } from '@nestjs/core';
 import { resolveProvenance } from '../../../common/decorators/auth-provenance.decorator';
+import { ApiKeyService } from '../../api-key/api-key.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
-  private logger = new Logger('JwtStrategy');
-
   constructor(
     private userRepo: UserRepo,
     private workspaceRepo: WorkspaceRepo,
     private userSessionRepo: UserSessionRepo,
     private sessionActivityService: SessionActivityService,
     private readonly environmentService: EnvironmentService,
-    private moduleRef: ModuleRef,
+    private readonly apiKeyService: ApiKeyService,
   ) {
     super({
       jwtFromRequest: (req: FastifyRequest) => {
@@ -102,12 +100,17 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
   }
 
   private async validateApiKey(req: any, payload: JwtApiKeyPayload) {
-    const apiKeyService = this.resolveApiKeyService();
-    if (!apiKeyService) {
-      throw new UnauthorizedException('Enterprise API Key module missing');
-    }
+    // The fork ships the core `ApiKeyService` (the EE `ee/api-key` module is
+    // absent). `validate` throws a bare UnauthorizedException on any definite
+    // deny (missing/revoked/expired row, disabled user, kill-switch off) and
+    // propagates infra errors (→ 5xx) rather than masking them as a 401.
+    const result = await this.apiKeyService.validate(payload);
 
-    const result = await apiKeyService.validateApiKey(payload);
+    // Stamp the principal kind + key id so the /api-keys management surface can
+    // enforce "a token cannot manage tokens". Done in this branch because it
+    // returns before the shared ACCESS-path stamping below.
+    req.raw.authType = 'api_key';
+    req.raw.apiKeyId = payload.apiKeyId;
 
     // Stamp the agent-edit provenance for the API-KEY path too (#486). Unlike the
     // access-token path above, it CANNOT be resolved before this point: the
@@ -119,32 +122,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     // SERVER-SIDE user (never a client field), so an 'agent' badge is unspoofable
     // — mirroring the access-token path. Passing `null` for the claim means the
     // actor is decided solely by user.isAgent.
-    const provenance = resolveProvenance((result as any)?.user, null);
+    const provenance = resolveProvenance(result.user, null);
     req.raw.actor = provenance.actor;
     req.raw.aiChatId = provenance.aiChatId;
 
     return result;
-  }
-
-  /**
-   * Resolve the enterprise ApiKeyService, or `null` when the EE module is not
-   * bundled in this build (community build). Extracted as an overridable seam so
-   * the API-key provenance stamping can be unit-tested without the EE package
-   * present (docmost is OSS + a separate EE bundle; `require` of the EE path
-   * throws here). Any load/resolve error is treated as "module missing".
-   */
-  protected resolveApiKeyService(): {
-    validateApiKey: (payload: JwtApiKeyPayload) => Promise<unknown>;
-  } | null {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const ApiKeyModule = require('./../../../ee/api-key/api-key.service');
-      return this.moduleRef.get(ApiKeyModule.ApiKeyService, { strict: false });
-    } catch (err) {
-      this.logger.debug(
-        'API Key module requested but enterprise module not bundled in this build',
-      );
-      return null;
-    }
   }
 }

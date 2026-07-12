@@ -22,6 +22,7 @@
     "@casl/react": "5.0.1",
     "@docmost/editor-ext": "workspace:*",
     "@docmost/prosemirror-markdown": "workspace:*",
+    "@docmost/token-estimate": "workspace:*",
     "@excalidraw/excalidraw": "0.18.0-3a5ef40",
     "@mantine/core": "8.3.18",
     "@mantine/dates": "8.3.18",

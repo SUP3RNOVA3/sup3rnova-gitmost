@@ -19,6 +19,9 @@ import {
   SERVER_INSTRUCTIONS,
   ROUTING_PROSE,
   buildToolInventoryLines,
+  registeredMcpToolNames,
+  unregisteredProseToolMentions,
+  PROSE_NON_TOOL_TERMS,
 } from "../../build/server-instructions.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -130,6 +133,45 @@ test("SERVER_INSTRUCTIONS keeps the routing prose and the generated inventory", 
     assert.ok(
       SERVER_INSTRUCTIONS.includes(family),
       `routing prose lost its ${family} section`,
+    );
+  }
+});
+
+// #494 — REVERSE drift-guard: every camelCase tool reference in the routing prose
+// must be a tool the MCP host actually registers. The forward direction (every
+// registered tool is listed) is guarded by the generated inventory above; this
+// closes the reverse, where the prose could previously name a nonexistent/renamed
+// tool with nothing reddening.
+test("#494: ROUTING_PROSE names no unregistered tool", () => {
+  const dangling = unregisteredProseToolMentions();
+  assert.deepEqual(
+    dangling,
+    [],
+    `routing prose references unregistered tool(s): ${dangling.join(", ")} — ` +
+      `rename/remove the reference, or add a genuine non-tool term to PROSE_NON_TOOL_TERMS`,
+  );
+});
+
+test("#494: the reverse guard REDDENS on a dead tool reference (mutation check)", () => {
+  // A prose that mentions a plausible-looking but nonexistent camelCase tool must
+  // be flagged — proving the guard is not vacuous.
+  const prose = "EDIT: rewrite a block -> getPageContentz (renamed away).";
+  assert.deepEqual(unregisteredProseToolMentions(prose), ["getPageContentz"]);
+  // A real registered tool in the same shape is NOT flagged.
+  assert.deepEqual(
+    unregisteredProseToolMentions("use getPageJson to read the raw tree"),
+    [],
+  );
+});
+
+test("#494: PROSE_NON_TOOL_TERMS holds no actually-registered tool name", () => {
+  // A term parked in the allowlist that is really a registered tool would MASK a
+  // dead reference to that tool — keep the two disjoint.
+  const registered = registeredMcpToolNames();
+  for (const term of PROSE_NON_TOOL_TERMS) {
+    assert.ok(
+      !registered.has(term),
+      `${term} is a registered tool and must not be in PROSE_NON_TOOL_TERMS`,
     );
   }
 });

@@ -4,6 +4,7 @@ import { promises as fs } from 'fs';
 import { Migrator, FileMigrationProvider } from 'kysely';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { ensureConcurrentIndexes } from '@docmost/db/concurrent-indexes';
 
 @Injectable()
 export class MigrationService {
@@ -12,6 +13,16 @@ export class MigrationService {
   constructor(@InjectKysely() private readonly db: KyselyDB) {}
 
   async migrateToLatest(): Promise<void> {
+    // Build write-blocking trigram indexes CONCURRENTLY (no transaction) BEFORE
+    // the migrator runs, so the corresponding in-migration `CREATE INDEX IF NOT
+    // EXISTS` no-ops instead of taking a SHARE lock on `pages` during deploy
+    // (#495). Best-effort: on a fresh DB (no `pages`/`f_unaccent` yet) this is a
+    // no-op and the migrations build the index normally.
+    await ensureConcurrentIndexes(this.db, (message, error) => {
+      if (error) this.logger.warn(`${message}: ${String(error)}`);
+      else this.logger.log(message);
+    });
+
     const migrator = new Migrator({
       db: this.db,
       provider: new FileMigrationProvider({

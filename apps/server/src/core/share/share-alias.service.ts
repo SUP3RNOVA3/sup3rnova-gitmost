@@ -7,7 +7,8 @@ import {
 import { ShareAliasRepo } from '@docmost/db/repos/share-alias/share-alias.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { ShareService } from './share.service';
-import { Page, ShareAlias } from '@docmost/db/types/entity.types';
+import { PageAccessService } from '../page/page-access/page-access.service';
+import { Page, ShareAlias, User } from '@docmost/db/types/entity.types';
 import { isValidShareAlias, normalizeShareAlias } from './share-alias.util';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
@@ -43,6 +44,7 @@ export class ShareAliasService {
     private readonly shareAliasRepo: ShareAliasRepo,
     private readonly pageRepo: PageRepo,
     private readonly shareService: ShareService,
+    private readonly pageAccessService: PageAccessService,
     @InjectKysely() private readonly db: KyselyDB,
   ) {}
 
@@ -55,9 +57,13 @@ export class ShareAliasService {
    *     `/l/<old>` link survives
    *   - name already points at pageId    -> no-op (idempotent)
    *   - name points at ANOTHER page      -> the "swap". Without confirmReassign
-   *     we throw 409 carrying the current target so the client can confirm;
-   *     with it we UPDATE the single row's page_id (every /l/<alias> link
-   *     follows the 302 to the new page instantly — no stale cache).
+   *     we throw 409 so the client can confirm. SECURITY (#495): the 409 reveals
+   *     the current target's title ONLY when `user` may VIEW that page, and never
+   *     its id — otherwise any member with one editable+shared page could iterate
+   *     alias names with confirmReassign=false and map them to (id, title) of
+   *     pages they cannot see. With confirmReassign we UPDATE the single row's
+   *     page_id (every /l/<alias> link follows the 302 to the new page instantly
+   *     — no stale cache).
    *
    * To keep the invariant self-healing we DELETE every other alias row still
    * pointing at this page (a legacy duplicate, or the target page's own former
@@ -77,8 +83,12 @@ export class ShareAliasService {
     creatorId: string;
     alias: string;
     confirmReassign?: boolean;
+    // The requesting user — used ONLY to gate whether the reassign 409 may reveal
+    // the current target page's title (view-permission check). Not an authz gate
+    // for the write itself (the controller already validated edit on `pageId`).
+    user: User;
   }): Promise<ShareAlias> {
-    const { workspaceId, pageId, creatorId, confirmReassign } = opts;
+    const { workspaceId, pageId, creatorId, confirmReassign, user } = opts;
     const alias = normalizeShareAlias(opts.alias);
     if (!isValidShareAlias(alias)) {
       throw new BadRequestException(
@@ -97,14 +107,30 @@ export class ShareAliasService {
         // The name is occupied by a DIFFERENT (or dangling) target page.
         if (byName && byName.pageId !== pageId) {
           if (!confirmReassign) {
+            // SECURITY (#495): only disclose the current target's TITLE, and only
+            // when the requester may VIEW that page. Never disclose its id (the
+            // client's confirm-reassign UX doesn't use it, and it is an enumerable
+            // identity). A member with one editable+shared page must NOT be able to
+            // iterate alias names and map them to (id, title) of pages they cannot
+            // see. When view is denied (or the alias is dangling) the 409 is the
+            // bare "occupied" fact — the client still shows a generic confirm modal.
             const currentPage = byName.pageId
               ? await this.pageRepo.findById(byName.pageId)
               : null;
+            let currentPageTitle: string | null = null;
+            if (currentPage) {
+              try {
+                await this.pageAccessService.validateCanView(currentPage, user);
+                currentPageTitle = currentPage.title ?? null;
+              } catch {
+                // No view permission on the target -> do not reveal its title.
+                currentPageTitle = null;
+              }
+            }
             throw new ConflictException({
               message: 'Alias already in use',
               code: 'ALIAS_REASSIGN_REQUIRED',
-              currentPageId: byName.pageId,
-              currentPageTitle: currentPage?.title ?? null,
+              currentPageTitle,
             });
           }
           // Confirmed swap. ORDER MATTERS: the partial unique index on
@@ -223,21 +249,27 @@ export class ShareAliasService {
     alias: string;
     valid: boolean;
     available: boolean;
-    currentPageId: string | null;
   }> {
     const alias = normalizeShareAlias(rawAlias);
     if (!isValidShareAlias(alias)) {
-      return { alias, valid: false, available: false, currentPageId: null };
+      return { alias, valid: false, available: false };
     }
     const existing = await this.shareAliasRepo.findByAliasAndWorkspace(
       alias,
       workspaceId,
     );
+    // SECURITY (#495): return ONLY the boolean availability. The previous shape
+    // leaked `currentPageId` — the id of whatever page the alias already targets —
+    // to ANY authenticated workspace member, with no view-permission check on that
+    // page. An attacker could enumerate alias names and map them to page ids they
+    // have no access to. The taken/free bit is all the "is this address free"
+    // probe needs. The reassign flow (setAlias 409) may surface the target's
+    // TITLE, but only behind a `validateCanView` on that page (see setAlias); it
+    // never returns the page id.
     return {
       alias,
       valid: true,
       available: !existing,
-      currentPageId: existing?.pageId ?? null,
     };
   }
 

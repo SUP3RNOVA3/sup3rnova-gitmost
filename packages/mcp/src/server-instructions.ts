@@ -47,6 +47,83 @@ export const ROUTING_PROSE =
   "HISTORY: review what changed -> diffPageVersions (a historyId vs current, or two versions). List saved versions -> listPageHistory. Undo a bad edit -> restorePageVersion (writes a past version back as current; itself revertible). Export a page to self-contained Docmost Markdown (with comment anchors) -> exportPageMarkdown.";
 
 /**
+ * Non-tool camelCase identifiers that legitimately appear in ROUTING_PROSE:
+ * parameter names, helper names, and type fragments. The REVERSE drift-guard
+ * (`unregisteredProseToolMentions`) subtracts these before checking that every
+ * remaining multi-word (camelCase) token in the prose is a REGISTERED tool — so a
+ * rename/removal that leaves a DEAD tool reference in the prose reddens, while an
+ * ordinary parameter mention does not. The generated <tool_inventory> already
+ * guards the FORWARD direction (every registered tool appears); this closes the
+ * reverse (the prose could previously name a nonexistent tool and nothing
+ * reddened). A new non-tool term in the prose is a loud one-line addition here.
+ */
+export const PROSE_NON_TOOL_TERMS: ReadonlySet<string> = new Set([
+  // tool PARAMETERS mentioned in the routing hints
+  "spaceId",
+  "parentPageId",
+  "titleOnly",
+  "pageId",
+  "rootPageId",
+  "maxDepth",
+  "hasChildren",
+  "sameLayerAs",
+  "baseHash",
+  "dryRun",
+  "parentCommentId",
+  "suggestedText",
+  "historyId",
+  // helper / value fragments
+  "orderedList", // "orderedList.type" (a dropped attr, not a tool)
+  "mxGraph", // "mxGraph XML"
+  "commentsToFootnotes", // a docmostTransform ctx helper, not a tool
+  // camelCase tokenizer artifact: "ProseMirror" -> "rose" + "Mirror"
+  "roseMirror",
+]);
+
+/**
+ * The set of tool names the MCP host actually registers: every shared-registry
+ * spec that is NOT `inAppOnly` (its `mcpName`) PLUS every inline MCP-only tool.
+ * This is the authority the reverse prose-guard checks against.
+ */
+export function registeredMcpToolNames(
+  specs: Record<string, SharedToolSpec> = SHARED_TOOL_SPECS,
+  inline: ToolInventoryLine[] = INLINE_MCP_INVENTORY,
+): Set<string> {
+  const names = new Set<string>();
+  for (const spec of Object.values(specs)) {
+    if (spec.inAppOnly) continue; // not registered on the MCP host
+    names.add(spec.mcpName);
+  }
+  for (const l of inline) names.add(l.name);
+  return names;
+}
+
+/**
+ * REVERSE drift-guard (#494): return the multi-word (camelCase) tokens in the
+ * routing prose that look like a tool name but are NOT registered and are NOT a
+ * known non-tool term. An empty result means the prose references only real
+ * tools. A non-empty result is a dead/renamed reference (a token like
+ * `getPageContent` after `getPageJson` was the real name) OR a new parameter that
+ * belongs in PROSE_NON_TOOL_TERMS. Scoped to camelCase tokens on purpose:
+ * single-word names (`search`) are indistinguishable from English words, and the
+ * forward inventory already lists every registered tool.
+ */
+export function unregisteredProseToolMentions(
+  prose: string = ROUTING_PROSE,
+  specs: Record<string, SharedToolSpec> = SHARED_TOOL_SPECS,
+  inline: ToolInventoryLine[] = INLINE_MCP_INVENTORY,
+): string[] {
+  const registered = registeredMcpToolNames(specs, inline);
+  const tokens = new Set(prose.match(/[a-z][a-zA-Z0-9]+/g) ?? []);
+  return [...tokens].filter(
+    (t) =>
+      /[A-Z]/.test(t) && // multi-word camelCase only
+      !registered.has(t) &&
+      !PROSE_NON_TOOL_TERMS.has(t),
+  );
+}
+
+/**
  * A single generated inventory line: the tool's registered NAME + a one-line
  * purpose. For a registry tool the purpose is its `catalogLine` (falling back
  * to the first sentence of its description); for an inline MCP-only tool it is

@@ -28,6 +28,7 @@ import {
   IAiMcpServerCreate,
   IAiMcpServerUpdate,
 } from "@/features/workspace/services/ai-mcp-server-service.ts";
+import { resolveToolAllowlist } from "./ai-mcp-server-form.utils.ts";
 
 const formSchema = z.object({
   name: z.string().min(1),
@@ -121,13 +122,20 @@ export default function AiMcpServerForm({
   async function handleSubmit(values: FormValues) {
     const headers = resolveHeaders();
 
+    // An empty tag field means "no restriction" (sent as null) — since #476 the
+    // server persists a literal `[]` as deny-all (zero tools). But a server that
+    // was ALREADY deny-all loads into an empty field too; sending null there
+    // would silently widen it to allow-all on a routine edit, so preserve `[]`.
+    // See resolveToolAllowlist for the full rationale.
+    const toolAllowlist = resolveToolAllowlist(values.toolAllowlist, server);
+
     if (isEdit && server) {
       const payload: IAiMcpServerUpdate = {
         id: server.id,
         name: values.name,
         transport: values.transport,
         url: values.url,
-        toolAllowlist: values.toolAllowlist,
+        toolAllowlist,
         // Always sent: a blank value clears the stored guidance (server -> null).
         instructions: values.instructions,
         enabled: values.enabled,
@@ -140,7 +148,7 @@ export default function AiMcpServerForm({
         name: values.name,
         transport: values.transport,
         url: values.url,
-        toolAllowlist: values.toolAllowlist,
+        toolAllowlist,
         // Blank => server stores null (no guidance).
         instructions: values.instructions,
         enabled: values.enabled,

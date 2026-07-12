@@ -193,6 +193,137 @@ dump/restore, существующий каталог данных переис�
 > неизменным и бэкапьте вместе с базой данных.
 
 
+## Локальный сервер эмбеддингов
+
+Семантическому (RAG) поиску AI-агента нужна **модель эмбеддингов**. Вместо оплаты облачного
+провайдера (например, OpenAI `text-embedding-3-*`) за эмбеддинг каждой страницы можно запустить
+небольшую open-weights модель у себя через Hugging Face
+[Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference) (TEI) — он
+отдаёт OpenAI-совместимый эндпоинт `/v1/embeddings`. Хороший дефолт — `intfloat/multilingual-e5-small`:
+многоязычная, 384-мерная, комфортно работает на CPU (~1–2 ГБ RAM, 1–2 vCPU). Пропишите её в
+**Настройки воркспейса → AI → Эмбеддинги**.
+
+### Вариант A — локально (та же Docker-сеть, что и Gitmost)
+
+Запустите TEI контейнером в той же сети, где уже работает Gitmost. Порт наружу не публикуется,
+поэтому эндпоинт остаётся внутренним и не требует авторизации.
+
+```yaml
+services:
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9   # pin version; use a cuda-* tag for GPU
+    container_name: embeddings
+    restart: unless-stopped
+    networks:
+      - gitmost_net          # same network Gitmost is on
+    command:
+      - "--model-id"
+      - "intfloat/multilingual-e5-small"
+      - "--auto-truncate"    # clamp over-long inputs instead of returning 413
+    volumes:
+      - tei-models:/data     # weights are downloaded once and cached here
+
+networks:
+  gitmost_net:
+    external: true           # the network Gitmost already uses
+
+volumes:
+  tei-models:
+```
+
+Настройки Gitmost (**Настройки воркспейса → AI → Эмбеддинги**):
+
+| Поле              | Значение                          |
+|-------------------|-----------------------------------|
+| Model             | `intfloat/multilingual-e5-small`  |
+| Base URL          | `http://embeddings:80/v1/`        |
+| Embedding API key | — (оставить пустым)               |
+
+> `embeddings` — имя контейнера, Gitmost резолвит его по DNS внутри Docker-сети.
+> Наружу порт не публикуется, эндпоинт доступен только контейнерам этой сети, поэтому
+> авторизация не нужна.
+
+### Вариант B — на отдельном хосте (наружу через Traefik + Let's Encrypt)
+
+Предполагается, что на хосте уже есть Traefik с ACME-резолвером (в примере ниже — `letsEncrypt`,
+entrypoint `websecure`, общая сеть `docker_main_net`). Замените домен / сеть / резолвер на свои.
+
+**DNS:** заведите A-запись `embeddings.example.com` → IP хоста с Traefik (тот же challenge / порт 80,
+что и у остальных сайтов).
+
+```yaml
+services:
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9   # pin version; cuda-* tag for GPU
+    container_name: embeddings
+    restart: unless-stopped
+    networks:
+      - docker_main_net      # the network Traefik is attached to
+    command:
+      - "--model-id"
+      - "intfloat/multilingual-e5-small"
+      - "--auto-truncate"
+      - "--api-key"
+      - "sk-emb-REPLACE_WITH_YOUR_KEY"
+    volumes:
+      - tei-models:/data
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.embeddings.rule: "Host(`embeddings.example.com`)"
+      traefik.http.routers.embeddings.entrypoints: "websecure"
+      traefik.http.routers.embeddings.tls: "true"
+      traefik.http.routers.embeddings.tls.certresolver: "letsEncrypt"
+      traefik.http.routers.embeddings.service: "embeddings"
+      traefik.http.services.embeddings.loadbalancer.server.port: "80"
+      # TEI enforces the Bearer key itself; Traefik only rate-limits to protect the CPU
+      traefik.http.routers.embeddings.middlewares: "embeddings-rl"
+      traefik.http.middlewares.embeddings-rl.ratelimit.average: "20"
+      traefik.http.middlewares.embeddings-rl.ratelimit.burst: "40"
+      traefik.http.middlewares.embeddings-rl.ratelimit.period: "1s"
+
+networks:
+  docker_main_net:
+    external: true
+
+volumes:
+  tei-models:
+```
+
+Настройки Gitmost (**Настройки воркспейса → AI → Эмбеддинги**):
+
+| Поле              | Значение                              |
+|-------------------|---------------------------------------|
+| Model             | `intfloat/multilingual-e5-small`      |
+| Base URL          | `https://embeddings.example.com/v1/`  |
+| Embedding API key | ваш `sk-emb-…`                        |
+
+Проверка снаружи:
+
+```bash
+curl -s https://embeddings.example.com/v1/embeddings \
+  -H "Authorization: Bearer sk-emb-REPLACE_WITH_YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"intfloat/multilingual-e5-small","input":"query: hello"}' \
+  | python3 -c 'import sys,json;print("dims:",len(json.load(sys.stdin)["data"][0]["embedding"]))'
+# -> dims: 384
+```
+
+### Заметки про сервер эмбеддингов
+
+- **Размерность вектора — 384.** Если раньше этот Gitmost эмбеддился другой моделью
+  (например, `text-embedding-3-large` = 3072-dim), старые строки в pgvector не совпадут по
+  размерности — очистите существующие эмбеддинги / переиндексируйте перед переключением. Gitmost
+  сравнивает только вектора одной размерности, поэтому строки другой размерности не участвуют в
+  поиске, а не ломают его.
+- **Первый старт тянет веса** (сотни МБ) с `huggingface.co` в том `tei-models`; дальше — из тома.
+- **Пин версии.** Пиньте образ, а при желании и модель: добавьте в `command` `--revision <commit-sha>`
+  (sha берётся со страницы модели на Hugging Face).
+- **Без egress (air-gapped):** засейте том `tei-models` заранее и добавьте
+  `environment: [HF_HUB_OFFLINE=1]`.
+- **GPU:** возьмите cuda-тег того же релиза (например,
+  `ghcr.io/huggingface/text-embeddings-inference:cuda-1.9`) и запустите контейнер с `gpus: all`.
+
+
 ## Возможности
 
 - Совместная работа в реальном времени

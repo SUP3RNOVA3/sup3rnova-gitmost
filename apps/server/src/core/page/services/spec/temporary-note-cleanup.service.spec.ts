@@ -1,19 +1,38 @@
 import { TemporaryNoteCleanupService } from '../temporary-note-cleanup.service';
 
 /**
- * Chainable Kysely stub that records every `.where(...)` call so the test can
- * assert the sweep only selects armed, expired, not-yet-trashed notes. The
- * terminal `.execute()` resolves the configured expired rows (the batch SELECT);
- * `.executeTakeFirst()` resolves the per-row deadline re-read done just before
- * each `removePage`. By default the re-read reports the note as still armed and
- * still expired (epoch deadline < now), so the sweep proceeds to delete it;
- * tests override `reReadFirst` to simulate a concurrent "Make permanent".
+ * Chainable Kysely stub for the temporary-note sweep.
+ *
+ * `this.db` serves the non-locking candidate SELECT (selectFrom/select/where/
+ * limit/execute -> the configured expired rows) AND `.transaction().execute(cb)`,
+ * which runs `cb` with a separate `trx` builder. The `trx` builder serves the
+ * per-row LOCKED re-check (selectFrom/select/where/forUpdate/skipLocked/
+ * executeTakeFirst). `lockedRows` drives what that locked re-check returns per
+ * candidate — an id/creator/workspace row means "still expired, delete it";
+ * `undefined` means the predicate no longer matched (made permanent / re-armed /
+ * already trashed) or the row was SKIP-LOCKED by another worker, so it is skipped.
  */
-function makeDbStub(expiredRows: any[]) {
+function makeDbStub(expiredRows: any[], lockedRows?: any[]) {
   const whereCalls: any[][] = [];
-  const reReadFirst = jest
-    .fn()
-    .mockResolvedValue({ temporaryExpiresAt: new Date(0), deletedAt: null });
+  const locked = [
+    ...(lockedRows ??
+      expiredRows.map((r) => ({
+        id: r.id,
+        creatorId: r.creatorId,
+        workspaceId: r.workspaceId,
+      }))),
+  ];
+  const lockedTakeFirst = jest.fn(() => Promise.resolve(locked.shift()));
+  const forUpdate = jest.fn(() => trxBuilder);
+  const skipLocked = jest.fn(() => trxBuilder);
+  const trxBuilder: any = {
+    selectFrom: jest.fn(() => trxBuilder),
+    select: jest.fn(() => trxBuilder),
+    where: jest.fn(() => trxBuilder),
+    forUpdate,
+    skipLocked,
+    executeTakeFirst: lockedTakeFirst,
+  };
   const builder: any = {
     selectFrom: jest.fn(() => builder),
     select: jest.fn(() => builder),
@@ -23,9 +42,11 @@ function makeDbStub(expiredRows: any[]) {
     }),
     limit: jest.fn(() => builder),
     execute: jest.fn().mockResolvedValue(expiredRows),
-    executeTakeFirst: reReadFirst,
+    transaction: jest.fn(() => ({
+      execute: (cb: (trx: any) => Promise<any>) => Promise.resolve(cb(trxBuilder)),
+    })),
   };
-  return { builder, whereCalls, reReadFirst };
+  return { builder, whereCalls, lockedTakeFirst, forUpdate, skipLocked };
 }
 
 describe('TemporaryNoteCleanupService.sweepExpiredTemporaryNotes', () => {
@@ -52,20 +73,36 @@ describe('TemporaryNoteCleanupService.sweepExpiredTemporaryNotes', () => {
     expect(builder.limit.mock.calls[0][0]).toBeGreaterThan(0);
   });
 
-  it('soft-deletes each expired note via removePage, attributed to its creator', async () => {
+  it('soft-deletes each expired note via removePage under a row lock, attributed to its creator', async () => {
     const expired = [
       { id: 'p1', creatorId: 'u1', workspaceId: 'w1' },
       { id: 'p2', creatorId: 'u2', workspaceId: 'w1' },
     ];
-    const { builder } = makeDbStub(expired);
+    const { builder, forUpdate, skipLocked } = makeDbStub(expired);
     const pageRepo = { removePage: jest.fn().mockResolvedValue(undefined) } as any;
     const service = new TemporaryNoteCleanupService(builder, pageRepo);
 
     await service.sweepExpiredTemporaryNotes();
 
     expect(pageRepo.removePage).toHaveBeenCalledTimes(2);
-    expect(pageRepo.removePage).toHaveBeenNthCalledWith(1, 'p1', 'u1', 'w1');
-    expect(pageRepo.removePage).toHaveBeenNthCalledWith(2, 'p2', 'u2', 'w1');
+    // The 4th arg is the locking transaction — the delete runs inside it.
+    expect(pageRepo.removePage).toHaveBeenNthCalledWith(
+      1,
+      'p1',
+      'u1',
+      'w1',
+      expect.anything(),
+    );
+    expect(pageRepo.removePage).toHaveBeenNthCalledWith(
+      2,
+      'p2',
+      'u2',
+      'w1',
+      expect.anything(),
+    );
+    // The re-check acquired a FOR UPDATE SKIP LOCKED lock (once per candidate).
+    expect(forUpdate).toHaveBeenCalledTimes(2);
+    expect(skipLocked).toHaveBeenCalledTimes(2);
   });
 
   it('continues past a failing note (one bad removePage does not abort the sweep)', async () => {
@@ -86,60 +123,29 @@ describe('TemporaryNoteCleanupService.sweepExpiredTemporaryNotes', () => {
       service.sweepExpiredTemporaryNotes(),
     ).resolves.toBeUndefined();
     expect(pageRepo.removePage).toHaveBeenCalledTimes(2);
-    expect(pageRepo.removePage).toHaveBeenNthCalledWith(2, 'good', 'u2', 'w1');
+    expect(pageRepo.removePage).toHaveBeenNthCalledWith(
+      2,
+      'good',
+      'u2',
+      'w1',
+      expect.anything(),
+    );
   });
 
-  it('does NOT trash a note made permanent in the race window', async () => {
-    // The batch SELECT saw the note as expired, but before its turn in the loop
-    // the user clicked "Make permanent" (temporary_expires_at -> null). The
-    // deadline re-read must catch this and skip the delete so the keep wins.
+  it('does NOT trash a note made permanent / re-armed / already trashed (locked re-check returns nothing)', async () => {
+    // The batch SELECT saw the note as expired, but by the time the LOCKED
+    // re-check runs the row no longer matches the still-armed+expired+not-trashed
+    // predicate (make-permanent, re-arm to a future deadline, or already trashed),
+    // OR another worker holds the row (SKIP LOCKED). In every case the locked
+    // SELECT returns nothing and the delete is skipped so the keep/other worker wins.
     const expired = [{ id: 'p1', creatorId: 'u1', workspaceId: 'w1' }];
-    const { builder, reReadFirst } = makeDbStub(expired);
-    reReadFirst.mockResolvedValueOnce({
-      temporaryExpiresAt: null,
-      deletedAt: null,
-    });
+    const { builder, lockedTakeFirst } = makeDbStub(expired, [undefined]);
     const pageRepo = { removePage: jest.fn() } as any;
     const service = new TemporaryNoteCleanupService(builder, pageRepo);
 
     await service.sweepExpiredTemporaryNotes();
 
-    expect(reReadFirst).toHaveBeenCalledTimes(1);
-    expect(pageRepo.removePage).not.toHaveBeenCalled();
-  });
-
-  it('skips a note already trashed since the batch SELECT', async () => {
-    const expired = [{ id: 'p1', creatorId: 'u1', workspaceId: 'w1' }];
-    const { builder, reReadFirst } = makeDbStub(expired);
-    reReadFirst.mockResolvedValueOnce({
-      temporaryExpiresAt: new Date(0),
-      deletedAt: new Date(),
-    });
-    const pageRepo = { removePage: jest.fn() } as any;
-    const service = new TemporaryNoteCleanupService(builder, pageRepo);
-
-    await service.sweepExpiredTemporaryNotes();
-
-    expect(pageRepo.removePage).not.toHaveBeenCalled();
-  });
-
-  it('does NOT trash a note re-armed to a future deadline in the race window', async () => {
-    // The batch SELECT saw the note as expired, but before its turn in the loop
-    // the user disarmed it and re-armed it to a fresh, still-future deadline
-    // (temporary_expires_at -> now + 1h). The deadline re-read must catch that
-    // the note is no longer expired and skip the delete so the keep wins.
-    const expired = [{ id: 'p1', creatorId: 'u1', workspaceId: 'w1' }];
-    const { builder, reReadFirst } = makeDbStub(expired);
-    reReadFirst.mockResolvedValueOnce({
-      temporaryExpiresAt: new Date(Date.now() + 60 * 60 * 1000),
-      deletedAt: null,
-    });
-    const pageRepo = { removePage: jest.fn() } as any;
-    const service = new TemporaryNoteCleanupService(builder, pageRepo);
-
-    await service.sweepExpiredTemporaryNotes();
-
-    expect(reReadFirst).toHaveBeenCalledTimes(1);
+    expect(lockedTakeFirst).toHaveBeenCalledTimes(1);
     expect(pageRepo.removePage).not.toHaveBeenCalled();
   });
 
@@ -150,5 +156,32 @@ describe('TemporaryNoteCleanupService.sweepExpiredTemporaryNotes', () => {
 
     await service.sweepExpiredTemporaryNotes();
     expect(pageRepo.removePage).not.toHaveBeenCalled();
+  });
+
+  it('sweeps once on application bootstrap (catches notes expired during downtime)', async () => {
+    const expired = [{ id: 'p1', creatorId: 'u1', workspaceId: 'w1' }];
+    const { builder } = makeDbStub(expired);
+    const pageRepo = { removePage: jest.fn().mockResolvedValue(undefined) } as any;
+    const service = new TemporaryNoteCleanupService(builder, pageRepo);
+
+    await service.onApplicationBootstrap();
+
+    expect(pageRepo.removePage).toHaveBeenCalledTimes(1);
+    expect(pageRepo.removePage).toHaveBeenCalledWith(
+      'p1',
+      'u1',
+      'w1',
+      expect.anything(),
+    );
+  });
+
+  it('a startup-sweep failure never blocks application boot', async () => {
+    const { builder } = makeDbStub([]);
+    // Make the candidate SELECT throw to simulate a boot-time DB hiccup.
+    builder.execute.mockRejectedValueOnce(new Error('db not ready'));
+    const pageRepo = { removePage: jest.fn() } as any;
+    const service = new TemporaryNoteCleanupService(builder, pageRepo);
+
+    await expect(service.onApplicationBootstrap()).resolves.toBeUndefined();
   });
 });

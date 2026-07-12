@@ -1963,13 +1963,17 @@ export const SHARED_TOOL_SPECS = {
       'value escaping) — a violation returns a structured error naming the rule ' +
       'and cellId so you can fix and retry. `where` positions the block like ' +
       'insertNode: position before/after (with exactly one of anchorNodeId or ' +
-      'anchorText) or append. Returns { nodeId, attachmentId, warnings }. The ' +
-      'returned `nodeId` is an index-based "#<index>" handle (drawio nodes carry ' +
-      'no attrs.id): it addresses the new top-level block and can be fed straight ' +
-      'back into drawioGet / drawioUpdate for THIS document. It is positional, ' +
-      'so if you add or remove blocks before it, re-resolve via getOutline. The ' +
-      'diagram is editable in the draw.io editor and can be re-read with ' +
-      'drawioGet.' +
+      'anchorText) or append. Returns { nodeId, attachmentId, warnings }. On a ' +
+      'top-level insert the returned `nodeId` is an index-based "#<index>" handle ' +
+      '(drawio nodes carry no attrs.id): it addresses the new block and can be fed ' +
+      'straight back into drawioGet / drawioUpdate for THIS document. It is ' +
+      'positional, so if you add or remove blocks before it, re-resolve via ' +
+      'getOutline. When the block lands NESTED (e.g. anchored inside a callout or ' +
+      'table cell), "#<index>" cannot address it, so `nodeId` is `null` — the ' +
+      'write STILL SUCCEEDED (success:true, a warning explains this); do NOT ' +
+      're-create it. Re-read or edit that nested diagram by locating it via ' +
+      'getOutline / getPageJson using the returned attachmentId. The diagram is ' +
+      'editable in the draw.io editor and can be re-read with drawioGet.' +
       DRAWIO_HARD_RULES,
     tier: 'deferred',
     catalogLine:
@@ -2433,3 +2437,48 @@ export function assertEverySpecDeclaresWriteClass(): void {
 
 // Enforce at module load (registration time) on both hosts.
 assertEverySpecDeclaresWriteClass();
+
+/**
+ * Registration-time assert (#494): every spec that a host registers through the
+ * shared-registry loop MUST carry a callable execute path for THAT host. On the
+ * MCP host (index.ts) the loop runs `mcpExecute` else `spec.execute!` — a spec
+ * with neither throws a TypeError at CALL time (fires only once the model picks
+ * that tool, in production, on the MCP host). On the in-app host
+ * (ai-chat-tools.service.ts) the loop does `inAppExecute ?? execute`, then
+ * `if (!run) continue` — a spec with neither is SILENTLY dropped, so the tool
+ * simply vanishes from the agent with no error at all. A `// mirror this` comment
+ * is not a guard; this closes the mirror with a real structural check that fires
+ * at module load on BOTH hosts (both import this file), turning a latent runtime
+ * TypeError / silent-drop into a loud startup failure.
+ *
+ * `inlineBothHosts` specs are exempt: both hosts register them inline with a
+ * hand-wired handler and they deliberately carry no execute (their backing helper
+ * cannot cross into this zod-agnostic file). A spec that is `inAppOnly` need not
+ * satisfy the MCP-host arm (that host skips it) and vice-versa for `mcpOnly`.
+ */
+export function assertEverySpecIsRegisterable(
+  specs: Record<string, SharedToolSpec> = SHARED_TOOL_SPECS,
+): void {
+  for (const [key, spec] of Object.entries(specs)) {
+    if (spec.inlineBothHosts) continue;
+    // MCP host registers the spec unless it is inAppOnly; its handler calls
+    // `mcpExecute` when present, otherwise `execute!`.
+    if (!spec.inAppOnly && !spec.execute && !spec.mcpExecute) {
+      throw new Error(
+        `tool-specs: spec "${key}" is registered on the MCP host but carries ` +
+          `neither execute nor mcpExecute`,
+      );
+    }
+    // In-app host registers it unless it is mcpOnly; its loop runs
+    // `inAppExecute ?? execute`.
+    if (!spec.mcpOnly && !spec.execute && !spec.inAppExecute) {
+      throw new Error(
+        `tool-specs: spec "${key}" is registered on the in-app host but carries ` +
+          `neither execute nor inAppExecute`,
+      );
+    }
+  }
+}
+
+// Enforce at module load (registration time) on both hosts.
+assertEverySpecIsRegisterable();

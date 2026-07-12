@@ -11,9 +11,10 @@ import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.t
 
 /**
  * A STREAMING tail: the last persisted row is an assistant row still marked
- * `status === 'streaming'`. Such a tail is stripped from the seed and rebuilt by
- * the replay (`expect=live`), since the SDK's `text-start` always pushes a new
- * part and replaying over a seeded in-progress row would duplicate its text.
+ * `status === 'streaming'`. #491 (tail-only): such a tail is seeded UNCHANGED —
+ * it carries the persisted steps 0..N-1 — and the run-stream registry's tail
+ * (frames for steps >= N) is APPENDED to it by the SDK's `readUIMessageStream`
+ * continuation. Only the presence of this tail decides WHETHER to attach.
  */
 export function isStreamingTail(rows: IAiChatMessageRow[]): boolean {
   const tail = rows[rows.length - 1];
@@ -32,15 +33,61 @@ export function isSettledAssistantTail(rows: IAiChatMessageRow[]): boolean {
 }
 
 /**
- * Seed rows for `useChat`: return the rows unchanged, or without the last row when
- * `strip` is set (the streaming tail is stripped so the live replay rebuilds it
- * without duplicating parts).
+ * #491 tail-only anchor: the count of FINISHED steps whose parts are persisted in
+ * THIS assistant row (`metadata.stepsPersisted`), written atomically with `parts`
+ * server-side. The resume client reads it as its persisted step frontier N — the
+ * tail-only attach asks the run-stream registry for the frames of step N onward
+ * (the seed already carries steps 0..N-1). Absent on pre-#491 rows => 0.
  */
-export function seedRows(
+export function stepsPersistedOf(
+  row: IAiChatMessageRow | null | undefined,
+): number {
+  const n = row?.metadata?.stepsPersisted;
+  return typeof n === "number" && n >= 0 ? Math.floor(n) : 0;
+}
+
+/** One page of the messages infinite-query cache (`{ items, meta }`). */
+export interface IMessagePage {
+  items: IAiChatMessageRow[];
+  meta: unknown;
+}
+
+/**
+ * #491 delta-poll merge: upsert the delta poll's `rows` into the messages
+ * infinite-query page structure IDEMPOTENTLY by id. The delta endpoint's overlap
+ * window GUARANTEES occasional REPEATS, so this MUST converge: a row already
+ * present is REPLACED IN PLACE (per-step growth of an in-progress row), a new row
+ * is APPENDED to the last page in chronological order (the server returns delta
+ * rows oldest-first). Applying the same delta twice equals applying it once. Never
+ * mutates the input pages (returns fresh page objects with cloned item arrays).
+ */
+export function mergeDeltaRowsIntoPages(
+  pages: IMessagePage[],
   rows: IAiChatMessageRow[],
-  strip: boolean,
-): IAiChatMessageRow[] {
-  return strip ? rows.slice(0, -1) : rows;
+): IMessagePage[] {
+  if (rows.length === 0) return pages;
+  const next: IMessagePage[] = pages.map((p) => ({
+    ...p,
+    items: p.items.slice(),
+  }));
+  const locate = (id: string): [number, number] | null => {
+    for (let pi = 0; pi < next.length; pi++) {
+      const ii = next[pi].items.findIndex((it) => it.id === id);
+      if (ii !== -1) return [pi, ii];
+    }
+    return null;
+  };
+  for (const row of rows) {
+    const at = locate(row.id);
+    if (at) {
+      next[at[0]].items[at[1]] = row; // replace in place — idempotent by id
+    } else if (next.length > 0) {
+      next[next.length - 1].items.push(row); // append chronologically
+    } else {
+      next.push({ items: [row], meta: undefined });
+    }
+  }
+  return next;
 }
 
 /**

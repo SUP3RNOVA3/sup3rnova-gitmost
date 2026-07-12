@@ -53,8 +53,10 @@ import {
   extractPageSlugId,
 } from '../../../integrations/export/utils';
 import { canonicalizeFootnotes } from '@docmost/editor-ext';
-import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
-import { normalizeForeignMarkdown } from '../../../integrations/import/utils/foreign-markdown';
+import {
+  markdownToProseMirror,
+  normalizeForeignMarkdown,
+} from '@docmost/prosemirror-markdown';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';

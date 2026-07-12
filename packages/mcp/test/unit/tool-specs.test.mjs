@@ -7,6 +7,7 @@ import {
   SHARED_TOOL_WRITE_CLASS,
   isRetryableWriteClass,
   assertEverySpecDeclaresWriteClass,
+  assertEverySpecIsRegisterable,
 } from "../../build/tool-specs.js";
 
 // The shared registry is consumed by BOTH the zod-v3 MCP server and the zod-v4
@@ -81,6 +82,99 @@ test("#489: representative reads are readOnly and representative writes are writ
   for (const name of ["patchNode", "createPage", "deletePage", "createComment", "drawioCreate"]) {
     assert.equal(SHARED_TOOL_SPECS[name].writeClass, "write", `${name} should be write`);
   }
+});
+
+// #494 — every non-inline spec MUST carry a callable execute path for each host
+// that registers it, or the MCP host throws a call-time TypeError (`execute!`)
+// and the in-app host silently drops the tool. A registration-time assert closes
+// this mirror. These tests REDDEN if the guard is weakened/removed.
+test("#494: assertEverySpecIsRegisterable does not throw for the shipped registry", () => {
+  assert.doesNotThrow(() => assertEverySpecIsRegisterable());
+  // Sanity: the shipped registry really does satisfy the invariant per-spec.
+  for (const [key, spec] of Object.entries(SHARED_TOOL_SPECS)) {
+    if (spec.inlineBothHosts) continue;
+    if (!spec.inAppOnly) {
+      assert.ok(
+        spec.execute || spec.mcpExecute,
+        `${key}: MCP-host spec missing execute/mcpExecute`,
+      );
+    }
+    if (!spec.mcpOnly) {
+      assert.ok(
+        spec.execute || spec.inAppExecute,
+        `${key}: in-app-host spec missing execute/inAppExecute`,
+      );
+    }
+  }
+});
+
+test("#494: a non-inline spec with no execute/mcpExecute is rejected (MCP-host arm)", () => {
+  // A shared spec (registered on BOTH hosts) with no execute at all.
+  const bad = {
+    lonely: {
+      mcpName: "lonely",
+      inAppKey: "lonely",
+      writeClass: "readOnly",
+      description: "no execute anywhere",
+      tier: "core",
+      catalogLine: "lonely — nothing",
+    },
+  };
+  assert.throws(
+    () => assertEverySpecIsRegisterable(bad),
+    /lonely.*neither execute nor mcpExecute/,
+  );
+});
+
+test("#494: an inAppOnly spec with no execute/inAppExecute is rejected (in-app-host arm)", () => {
+  const bad = {
+    lonely: {
+      mcpName: "lonely",
+      inAppKey: "lonely",
+      writeClass: "readOnly",
+      description: "in-app only, but no runner",
+      tier: "core",
+      catalogLine: "lonely — nothing",
+      inAppOnly: true,
+    },
+  };
+  assert.throws(
+    () => assertEverySpecIsRegisterable(bad),
+    /lonely.*neither execute nor inAppExecute/,
+  );
+});
+
+test("#494: an mcpExecute-only spec passes the MCP arm; an inAppExecute-only spec passes the in-app arm", () => {
+  // mcpOnly spec with only mcpExecute — the MCP arm is satisfied, the in-app arm
+  // is skipped (mcpOnly), so it must NOT throw.
+  const mcpOnly = {
+    t: {
+      mcpName: "t", inAppKey: "t", writeClass: "readOnly",
+      description: "x", tier: "core", catalogLine: "t — x",
+      mcpOnly: true, mcpExecute: async () => ({}),
+    },
+  };
+  assert.doesNotThrow(() => assertEverySpecIsRegisterable(mcpOnly));
+  // inAppOnly spec with only inAppExecute — symmetric.
+  const inAppOnly = {
+    t: {
+      mcpName: "t", inAppKey: "t", writeClass: "readOnly",
+      description: "x", tier: "core", catalogLine: "t — x",
+      inAppOnly: true, inAppExecute: async () => ({}),
+    },
+  };
+  assert.doesNotThrow(() => assertEverySpecIsRegisterable(inAppOnly));
+});
+
+test("#494: an inlineBothHosts spec is exempt from the execute requirement", () => {
+  const inline = {
+    t: {
+      mcpName: "t", inAppKey: "t", writeClass: "readOnly",
+      description: "x", tier: "core", catalogLine: "t — x",
+      inlineBothHosts: true, // no execute — registered inline by both hosts
+    },
+  };
+  assert.doesNotThrow(() => assertEverySpecIsRegisterable(inline));
 });
 
 test("buildShape (when present) returns a usable ZodRawShape with a real zod", () => {

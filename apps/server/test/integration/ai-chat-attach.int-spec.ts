@@ -30,11 +30,13 @@ import {
  * tees the SSE frames into it via `consumeSseStream` while stamping the DB row id
  * via `generateMessageId` (both gated on runId + the resumable flag).
  *
- * Proven here: a finished run's replay is the full frame sequence incl `[DONE]`
- * with `start.messageId` == the seeded DB row id; the anchor check (invariant 6);
- * an attach opened BEFORE the first frame follows the live stream from frame 0; an
- * explicit stop surfaces `{"type":"abort"}` + `[DONE]` + end to the subscriber;
- * and the legacy (non-run) path tees nothing.
+ * Proven here (tail-only #491): a finished run attached at its persisted frontier
+ * N_final delivers only the TAIL past N (a synthetic `start` carrying the run-fact
+ * + the terminal `finish`/`[DONE]`) — the step content below N lives in the seeded
+ * DB row, NOT the ring; the anchor check (invariant 6); an attach opened BEFORE the
+ * first frame follows the live stream from frame 0; an explicit stop surfaces
+ * `{"type":"abort"}` + `[DONE]` + end to the subscriber; and the legacy (non-run)
+ * path tees nothing.
  */
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -133,14 +135,16 @@ function liveSink(): {
   };
 }
 
-// The SSE `start` frame carries the message id; pull it out of a `data: {...}`.
-function parseStartMessageId(frames: string[]): string | undefined {
+// Parse the first `start` frame's JSON out of a `data: {...}` sequence.
+function parseStartFrame(
+  frames: string[],
+): { messageId?: string; messageMetadata?: any } | undefined {
   for (const f of frames) {
     const m = /^data: (\{.*\})\s*$/m.exec(f.trim());
     if (!m) continue;
     try {
       const json = JSON.parse(m[1]);
-      if (json.type === 'start') return json.messageId;
+      if (json.type === 'start') return json;
     } catch {
       /* not this frame */
     }
@@ -270,7 +274,7 @@ describe('AiChatService run-stream attach [integration]', () => {
     await destroyTestDb();
   });
 
-  it('run-wrapped: replay is the full frame sequence incl [DONE], start.messageId == the seeded DB row id', async () => {
+  it('run-wrapped, tail-only: a finished run at N_final delivers the run-fact start + finish/[DONE]; the step content lives in the seeded row', async () => {
     const chatId = (await createChat(db, { workspaceId, creatorId: userId })).id;
     const registry = new AiChatStreamRegistryService();
     const runService = new AiChatRunService(runRepo, {
@@ -300,27 +304,37 @@ describe('AiChatService run-stream attach [integration]', () => {
         );
       });
       const rowId = await assistantRowId(chatId);
+      // The client reads its persisted step frontier N from the seeded row.
+      const row: any = await msgRepo.findById(rowId, workspaceId);
+      const nFinal = row.metadata.stepsPersisted as number;
+      expect(nFinal).toBe(1); // a single finished step
+      // The step content is in the SEEDED row (parts/content), not the ring.
+      expect(JSON.stringify(row.metadata.parts)).toContain('Hello');
 
-      // Finished-run replay with expect=live + the correct anchor.
+      // Attach at N_final with the correct anchor: the tail past step 1 is just
+      // the terminal frames; step 0's 'Hello' is BELOW the frontier (seeded).
       const sink = liveSink();
-      const att = await registry.attach(chatId, true, rowId, sink.cb);
+      const att = await registry.attach(chatId, rowId, nFinal, sink.cb);
       expect(att).not.toBeNull();
       expect(att!.finished).toBe(true);
-      // The tee captured frames (consumeSseStream was wired).
-      expect(att!.replay.length).toBeGreaterThan(0);
-      // generateMessageId stamped the DB row id onto the streamed start frame.
-      expect(parseStartMessageId(att!.replay)).toBe(rowId);
-      // The full sequence includes the streamed text and the terminal marker.
-      const joined = att!.replay.join('');
-      expect(joined).toContain('Hello');
+      // The synthetic start frame carries the run-fact (runId/chatId), the source
+      // of the run-fact on re-attach.
+      const start = parseStartFrame(att!.replay);
+      expect(start?.messageMetadata).toMatchObject({
+        runId: box.runId,
+        chatId,
+      });
+      // The terminal marker is delivered so the client's SDK closes the stream.
       expect(att!.replay.some((f) => f.includes('[DONE]'))).toBe(true);
+      // 'Hello' (step 0, below the frontier) is NOT re-streamed — it is seeded.
+      expect(att!.replay.some((f) => f.includes('Hello'))).toBe(false);
     } finally {
       registry.onModuleDestroy();
       await cleanup();
     }
   });
 
-  it('anchor mismatch with expect=live returns null (invariant 6)', async () => {
+  it('anchor mismatch returns null (invariant 6)', async () => {
     const chatId = (await createChat(db, { workspaceId, creatorId: userId })).id;
     const registry = new AiChatStreamRegistryService();
     const runService = new AiChatRunService(runRepo, {
@@ -347,7 +361,7 @@ describe('AiChatService run-stream attach [integration]', () => {
       const sink = liveSink();
       // A foreign anchor must NOT replay this run's transcript.
       expect(
-        await registry.attach(chatId, true, 'a-different-run-row', sink.cb),
+        await registry.attach(chatId, 'a-different-run-row', 1, sink.cb),
       ).toBeNull();
     } finally {
       registry.onModuleDestroy();
@@ -376,8 +390,11 @@ describe('AiChatService run-stream attach [integration]', () => {
     try {
       // Attach while the entry exists (opened at begin) but before any frame.
       const sink = liveSink();
-      const att = (await registry.attach(chatId, false, undefined, sink.cb))!;
-      expect(att.replay).toEqual([]); // nothing streamed yet -> replay from 0
+      const att = (await registry.attach(chatId, undefined, 0, sink.cb))!;
+      // Nothing streamed yet -> the tail is just the synthetic start frame; the
+      // whole live stream (start..DONE) follows via onFrame after start().
+      expect(att.replay).toHaveLength(1);
+      expect(att.replay[0]).toContain('"type":"start"');
       att.start(); // go live (drains nothing, then follows)
 
       // Now emit the whole turn.
@@ -448,7 +465,7 @@ describe('AiChatService run-stream attach [integration]', () => {
     });
     try {
       const sink = liveSink();
-      const att = (await registry.attach(chatId, false, undefined, sink.cb))!;
+      const att = (await registry.attach(chatId, undefined, 0, sink.cb))!;
       att.start();
 
       // Give streamText a beat to begin consuming the partial output.
@@ -526,7 +543,9 @@ describe('AiChatService run-stream attach [integration]', () => {
       expect(entry).toBeDefined();
       expect(entry.finished).toBe(true);
       const sink = liveSink();
-      expect(await registry.attach(chatId, false, undefined, sink.cb)).toBeNull();
+      // Finished with an EMPTY ring (aborted before any frame) -> null -> the
+      // client degrades to poll instead of hanging on an empty stream.
+      expect(await registry.attach(chatId, undefined, 0, sink.cb)).toBeNull();
     } finally {
       registry.onModuleDestroy();
       await cleanup();
@@ -556,8 +575,8 @@ describe('AiChatService run-stream attach [integration]', () => {
       });
       const sink = liveSink();
       // No entry was ever opened; attach always yields null.
-      expect(await registry.attach(chatId, false, undefined, sink.cb)).toBeNull();
-      expect(await registry.attach(chatId, true, 'anything', sink.cb)).toBeNull();
+      expect(await registry.attach(chatId, undefined, 0, sink.cb)).toBeNull();
+      expect(await registry.attach(chatId, 'anything', 1, sink.cb)).toBeNull();
     } finally {
       registry.onModuleDestroy();
       await cleanup();

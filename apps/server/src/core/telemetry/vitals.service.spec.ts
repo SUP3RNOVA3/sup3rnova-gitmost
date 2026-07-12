@@ -90,6 +90,44 @@ describe('VitalsService.buildRows', () => {
     expect(rows[0].attr).toHaveLength(MAX_ATTR_LENGTH);
   });
 
+  it('keeps a known route template but DROPS an unknown/free-text route (#495)', () => {
+    const rows = svc.buildRows(
+      {
+        events: [
+          { name: 'INP', value: 1, route: '/s/:space/p/:slug' }, // known
+          { name: 'INP', value: 2, route: '/s/acme-corp/p/secret-slug' }, // raw path (slugs) — not a template
+          { name: 'INP', value: 3, route: 'DROP TABLE client_metrics;--' }, // injected free text
+          { name: 'INP', value: 4, route: '/home' }, // known static
+        ],
+      },
+      WS,
+    );
+    expect(rows.map((r) => r.route)).toEqual([
+      '/s/:space/p/:slug',
+      null, // raw path dropped
+      null, // free text dropped
+      '/home',
+    ]);
+  });
+
+  it('DROPS an attr that is not a CSS-selector-shaped string (#495)', () => {
+    const rows = svc.buildRows(
+      {
+        events: [
+          { name: 'INP', value: 1, attr: 'div#app>button.cta' }, // valid selector
+          { name: 'INP', value: 2, attr: 'user@example.com wrote a note' }, // free text / PII
+          { name: 'INP', value: 3, attr: '<script>alert(1)</script>' }, // markup
+        ],
+      },
+      WS,
+    );
+    expect(rows.map((r) => r.attr)).toEqual([
+      'div#app>button.cta',
+      null,
+      null,
+    ]);
+  });
+
   it('caps the batch at 50 events', () => {
     const events = Array.from({ length: 200 }, () => ({ name: 'CLS', value: 1 }));
     const rows = svc.buildRows({ events }, WS);

@@ -155,6 +155,17 @@ function toolLabel(name: string, lang: ExportLang): string {
 }
 
 /**
+ * The tool names that carry a hand-written friendly export label, per language.
+ * Exported for the drift-guard (#494): a label keyed by a tool name that no
+ * longer exists is a DEAD entry (the tool was renamed and now silently falls back
+ * to the generic `ranTool(name)` line). The guard asserts every key here is a
+ * real in-app tool AND that the two languages label the SAME set of tools.
+ */
+export function labelledToolNames(lang: ExportLang): string[] {
+  return Object.keys(LABELS[lang].tools);
+}
+
+/**
  * Stringify an arbitrary tool input/output value for a fenced block. Strings
  * pass through as-is; everything else is pretty-printed JSON, falling back to
  * `String(value)` if serialization throws (e.g. a circular structure).

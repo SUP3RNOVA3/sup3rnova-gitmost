@@ -1,17 +1,28 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { RedisService } from '@nestjs-labs/nestjs-ioredis';
+import { randomUUID } from 'node:crypto';
 import type { Redis } from 'ioredis';
 
 /**
  * Live progress of an in-flight workspace embeddings reindex run.
  * `total` is the number of pages the run will process, `done` how many it has
  * already processed (success OR handled failure), `startedAt` the epoch-ms the
- * record was created.
+ * record was created, and `runId` a per-run identity minted at `start()`.
+ *
+ * `runId` gives each reindex run a stable identity so a poller can tell "same
+ * run I've been watching" from "a NEW run started" WITHOUT guessing from the
+ * progress counters (the ambiguity that a stale pre-reindex snapshot vs a fresh
+ * run otherwise causes — the bug class fixed twice under #262). It is best-
+ * effort like the rest of this record: a record written before this field
+ * existed (or a Redis hiccup) yields an empty `runId`, which the client must
+ * treat as "no identity available" and degrade to its prior behaviour, never
+ * break.
  */
 export interface ReindexProgress {
   total: number;
   done: number;
   startedAt: number;
+  runId: string;
 }
 
 /** Redis key namespace for the per-workspace reindex-progress record. */
@@ -86,12 +97,18 @@ export class EmbeddingReindexProgressService {
   ): Promise<void> {
     const key = this.key(workspaceId);
     try {
+      // A fresh identity per run so the client poll can key on it: a changed
+      // runId means a genuinely NEW run (reset any latched per-run poll state),
+      // the same runId means the run the client is already watching. Best-effort
+      // like the counters — never surfaced to the user, only used to disambiguate.
+      const runId = randomUUID();
       await this.redis
         .multi()
         .hset(key, {
           total: String(total),
           done: '0',
           startedAt: String(Date.now()),
+          runId,
         })
         .expire(key, ttlSeconds)
         .exec();
@@ -150,7 +167,15 @@ export class EmbeddingReindexProgressService {
       const done = Number(data.done);
       const startedAt = Number(data.startedAt);
       if (!Number.isFinite(total) || !Number.isFinite(done)) return null;
-      return { total, done, startedAt: Number.isFinite(startedAt) ? startedAt : 0 };
+      // `runId` degrades gracefully: a pre-existing record (written before this
+      // field) or a stripped value reads as '' — the client treats that as "no
+      // identity" and keeps its prior behaviour rather than breaking the poll.
+      return {
+        total,
+        done,
+        startedAt: Number.isFinite(startedAt) ? startedAt : 0,
+        runId: typeof data.runId === 'string' ? data.runId : '',
+      };
     } catch (err) {
       this.logger.warn(
         `reindex-progress read failed for workspace ${workspaceId}; ` +

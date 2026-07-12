@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { templateRoute } from "./route-template";
+import { templateRoute, KNOWN_ROUTE_TEMPLATES } from "./route-template";
 
 describe("templateRoute", () => {
   it("templates a space page path (never leaks slugs)", () => {
@@ -31,5 +31,31 @@ describe("templateRoute", () => {
   it("collapses unknown paths to 'other' (bounded cardinality)", () => {
     expect(templateRoute("/weird/unknown/thing")).toBe("other");
     expect(templateRoute("/s/team/p/slug/extra/segments")).toBe("other");
+  });
+
+  // The server's /api/telemetry/vitals mirror (ALLOWED_ROUTE_TEMPLATES) drops any
+  // route outside KNOWN_ROUTE_TEMPLATES, so templateRoute must NEVER emit a label
+  // that is not in that dictionary — otherwise legit client metrics get dropped.
+  it("only ever emits labels contained in KNOWN_ROUTE_TEMPLATES (#495)", () => {
+    const samples = [
+      "/",
+      "/home",
+      "/settings/members",
+      "/settings/groups/g-1",
+      "/s/team",
+      "/s/team/trash",
+      "/s/team/p/slug",
+      "/p/slug",
+      "/share/abc",
+      "/share/abc/p/slug",
+      "/share/p/slug",
+      "/labels/urgent",
+      "/invites/inv-1",
+      "/weird/unknown/thing", // -> "other"
+      "/deep/unmatched/x/y/z", // -> "other"
+    ];
+    for (const path of samples) {
+      expect(KNOWN_ROUTE_TEMPLATES.has(templateRoute(path))).toBe(true);
+    }
   });
 });

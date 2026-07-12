@@ -21,7 +21,10 @@ import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs
 // The REAL shared tracker factory, imported from source (same cross-boundary
 // approach the tool-specs spec uses) so the in-app wiring is exercised against
 // exactly the watermark/debounce/injection-safe logic the package ships.
-import { createCommentSignalTracker } from '../../../../../../packages/mcp/src/comment-signal';
+import {
+  createCommentSignalTracker,
+  createListCommentsProbe,
+} from '../../../../../../packages/mcp/src/comment-signal';
 // The REAL client-side citation extractor: proves that the passive signal does
 // NOT strip a tool's citations (the #417 in-app regression this spec guards).
 import { toolCitations } from '../../../../../../apps/client/src/features/ai-chat/utils/tool-parts';
@@ -284,9 +287,13 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
         return fakeClient as DocmostClientLike;
       } as unknown as loader.DocmostClientCtor,
       sharedToolSpecs: SHARED_TOOL_SPECS as unknown as Record<string, loader.SharedToolSpec>,
-      // Wire the REAL factory so the in-app path is exercised end to end.
+      // Wire the REAL factories so the in-app path is exercised end to end —
+      // including the shared count-source probe (#494) the service now builds the
+      // tracker's `probe` from.
       createCommentSignalTracker:
         createCommentSignalTracker as unknown as loader.CommentSignalTrackerFactory,
+      createListCommentsProbe:
+        createListCommentsProbe as unknown as loader.CreateListCommentsProbeFn,
       // Pure no-network draw.io helpers (#424) — required on the loader return;
       // this comment-signal test doesn't exercise them, so no-op stubs suffice.
       searchShapes: (() => []) as unknown as loader.SearchShapesFn,

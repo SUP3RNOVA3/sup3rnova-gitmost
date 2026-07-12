@@ -24,6 +24,54 @@ export const ALLOWED_RATINGS = new Set<string>([
   'poor',
 ]);
 
+// The ONLY route labels accepted. The endpoint is anonymous, so an un-checked
+// `route` is a free-text write surface (arbitrary high-cardinality strings /
+// injected text into the metrics table). The client only ever sends a label from
+// a finite template dictionary (`templateRoute`), so we drop anything not in it.
+//
+// PARITY: this MUST mirror `KNOWN_ROUTE_TEMPLATES` in the client's
+// `apps/client/src/lib/telemetry/route-template.ts` (the canonical source). A
+// drift means legit client routes get dropped — keep the two in lockstep; the
+// client self-consistency test asserts `templateRoute` only emits these values.
+export const ALLOWED_ROUTE_TEMPLATES = new Set<string>([
+  '/',
+  'other',
+  // Static routes.
+  '/home',
+  '/spaces',
+  '/favorites',
+  '/login',
+  '/forgot-password',
+  '/password-reset',
+  '/setup/register',
+  '/settings/account/profile',
+  '/settings/account/preferences',
+  '/settings/workspace',
+  '/settings/ai',
+  '/settings/members',
+  '/settings/groups',
+  '/settings/spaces',
+  '/settings/sharing',
+  // Dynamic templates (slugs/ids are already collapsed to `:param`).
+  '/share/:shareId/p/:slug',
+  '/share/p/:slug',
+  '/share/:shareId',
+  '/p/:slug',
+  '/s/:space/p/:slug',
+  '/s/:space/trash',
+  '/s/:space',
+  '/labels/:label',
+  '/invites/:invitationId',
+  '/settings/groups/:groupId',
+]);
+
+// `attr` is a web-vitals attribution TARGET: a CSS-selector-ish string (an
+// element path like `html>body>div#app>button.cta`), never free prose. Constrain
+// it to a conservative CSS-selector charset so the anonymous endpoint cannot be
+// used to write arbitrary text / PII / markup into the metrics table. A value
+// containing anything outside this set is DROPPED (-> null); the event is kept.
+export const ATTR_ALLOWED_CHARSET = /^[A-Za-z0-9#.\-_> :()[\]="'*+~,]+$/;
+
 // Max events accepted per batch; the rest are ignored.
 export const MAX_EVENTS_PER_BATCH = 50;
 
@@ -77,14 +125,20 @@ export function sanitizeVitalEvent(
       ? e.rating
       : null;
 
+  // route: accept ONLY a known template label (dictionary check), else drop to
+  // null. The length cap stays as a cheap pre-guard before the Set lookup.
   let route: string | null = null;
   if (typeof e.route === 'string' && e.route.length > 0) {
-    route = e.route.slice(0, MAX_ROUTE_LENGTH);
+    const candidate = e.route.slice(0, MAX_ROUTE_LENGTH);
+    route = ALLOWED_ROUTE_TEMPLATES.has(candidate) ? candidate : null;
   }
 
+  // attr: truncate, then accept ONLY if it is a CSS-selector-shaped string
+  // (charset whitelist); anything with characters outside the set is dropped.
   let attr: string | null = null;
   if (typeof e.attr === 'string' && e.attr.length > 0) {
-    attr = e.attr.slice(0, MAX_ATTR_LENGTH);
+    const candidate = e.attr.slice(0, MAX_ATTR_LENGTH);
+    attr = ATTR_ALLOWED_CHARSET.test(candidate) ? candidate : null;
   }
 
   let docSize: number | null = null;
