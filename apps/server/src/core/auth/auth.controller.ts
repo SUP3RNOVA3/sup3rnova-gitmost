@@ -207,8 +207,20 @@ export class AuthController {
   async collabToken(
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
+    @Req() req: FastifyRequest,
   ) {
-    return this.authService.getCollabToken(user, workspace.id);
+    // Thread the api-key origin (#501): when the requester authenticated with an
+    // api key (jwt.strategy stamped req.raw.authType/apiKeyId), the minted collab
+    // token carries principal='api_key' + apiKeyId so a later revoke of the key
+    // rejects NEW collab connections. A normal session request mints a
+    // principal='session' token. Reading the SIGNED-derived req.raw fields (never
+    // a client body) keeps it unspoofable.
+    const raw = req.raw as { authType?: string; apiKeyId?: string };
+    const apiKey =
+      raw.authType === 'api_key' && raw.apiKeyId
+        ? { apiKeyId: raw.apiKeyId }
+        : undefined;
+    return this.authService.getCollabToken(user, workspace.id, apiKey);
   }
 
   @SkipThrottle({ [AUTH_THROTTLER]: true })
