@@ -10,7 +10,6 @@ import {
   bindMcpBearerVerifier,
   sharedTokenMatches,
   clientIp,
-  bindAccessJwtVerifier,
   extractBearer,
   decideBasicGate,
   mapAuthResultToResponse,
@@ -1015,51 +1014,6 @@ describe('clientIp (XFF-fallback precedence, item 5)', () => {
     ).toBe('unknown');
     // An empty XFF string is ignored too.
     expect(clientIp({ headers: { 'x-forwarded-for': '' } })).toBe('unknown');
-  });
-});
-
-describe('bindAccessJwtVerifier enforces JwtType.ACCESS (item 3)', () => {
-  it('calls TokenService.verifyJwt with JwtType.ACCESS as the second argument', async () => {
-    // Mock TokenService: assert the type literal is pinned to ACCESS so swapping
-    // to REFRESH (or omitting the type) breaks this test.
-    const verifyJwt = jest
-      .fn()
-      .mockResolvedValue({ sub: 'user-1', workspaceId: 'ws-1' });
-    const verify = bindAccessJwtVerifier({ verifyJwt });
-
-    await verify('the.access.jwt');
-
-    expect(verifyJwt).toHaveBeenCalledTimes(1);
-    expect(verifyJwt).toHaveBeenCalledWith('the.access.jwt', JwtType.ACCESS);
-    // Pin the real enum value too, so renaming/repointing the enum member is caught.
-    expect(verifyJwt.mock.calls[0][1]).toBe('access');
-  });
-
-  it('passes through the verified payload', async () => {
-    const payload = { sub: 'user-9', email: 'u@e.com', workspaceId: 'ws-1' };
-    const verifyJwt = jest.fn().mockResolvedValue(payload);
-    await expect(
-      bindAccessJwtVerifier({ verifyJwt })('t'),
-    ).resolves.toBe(payload);
-  });
-
-  // The Bearer revocation/disabled checks (verifyBearerAccess) are covered above;
-  // this binds the ACCESS-type enforcement that verifyMcpBearer wires in.
-  it('feeds verifyBearerAccess so the whole Bearer chain enforces ACCESS', async () => {
-    const verifyJwt = jest.fn().mockResolvedValue({
-      sub: 'user-1',
-      workspaceId: 'ws-1',
-      sessionId: 'sess-1',
-    });
-    const res = await verifyBearerAccess('t', {
-      verifyJwt: bindAccessJwtVerifier({ verifyJwt }),
-      findUser: jest.fn().mockResolvedValue({ deactivatedAt: null }),
-      findActiveSession: jest
-        .fn()
-        .mockResolvedValue({ userId: 'user-1', workspaceId: 'ws-1' }),
-    });
-    expect(verifyJwt).toHaveBeenCalledWith('t', JwtType.ACCESS);
-    expect(res).toEqual({ sub: 'user-1', email: undefined });
   });
 });
 

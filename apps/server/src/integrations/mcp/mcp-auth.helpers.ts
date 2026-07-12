@@ -304,39 +304,6 @@ export function clientIp(req: ClientIpRequest): string {
   return 'unknown';
 }
 
-// Minimal structural shape of the TokenService.verifyJwt method we depend on,
-// so this module never imports the concrete TokenService (heavy graph).
-export interface AccessJwtVerifier {
-  verifyJwt: (
-    token: string,
-    type: JwtType,
-  ) => Promise<{
-    sub?: string;
-    email?: string;
-    workspaceId?: string;
-    sessionId?: string;
-  }>;
-}
-
-/**
- * Bind a TokenService-like verifier into a one-arg `verifyJwt(token)` that
- * ALWAYS enforces `JwtType.ACCESS`. This is the single place where the /mcp
- * Bearer path pins the token type: a Bearer access token must be verified AS an
- * access token (not refresh/exchange/collab/etc.), so the type literal is fixed
- * here rather than at the call site. McpService.verifyMcpBearer delegates to
- * this, keeping the `JwtType.ACCESS` choice testable without the heavy graph.
- */
-export function bindAccessJwtVerifier(
-  tokenService: AccessJwtVerifier,
-): (token: string) => Promise<{
-  sub?: string;
-  email?: string;
-  workspaceId?: string;
-  sessionId?: string;
-}> {
-  return (token: string) => tokenService.verifyJwt(token, JwtType.ACCESS);
-}
-
 // The decoded payload shared by the /mcp Bearer allowlist. Carries the `type`
 // discriminator and the API-key `apiKeyId`, on top of the access-token fields.
 export interface McpBearerPayload {
@@ -358,9 +325,9 @@ export interface OneOfJwtVerifier {
 
 /**
  * Bind a TokenService-like verifier into a one-arg `verifyJwtOneOf(token)` that
- * pins the /mcp Bearer ALLOWLIST to exactly {ACCESS, API_KEY}. This REPLACES
- * `bindAccessJwtVerifier` as the single place the /mcp Bearer path pins the token
- * type: the /mcp Bearer slot now legitimately accepts either an ACCESS token (a
+ * pins the /mcp Bearer ALLOWLIST to exactly {ACCESS, API_KEY}. This is the single
+ * place the /mcp Bearer path pins the token type: the /mcp Bearer slot
+ * legitimately accepts either an ACCESS token (a
  * human's session token) OR an API_KEY token (an agent's key), but NOTHING else
  * (collab/exchange/attachment/etc. are rejected with the generic type error).
  * The allowlist is fixed here rather than at the call site, and the signature is
