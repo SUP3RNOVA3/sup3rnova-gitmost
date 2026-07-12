@@ -1121,8 +1121,34 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         chatId,
         workspace.id,
       );
+      // #492: HYDRATE needy assistant rows from the steps table BEFORE the replay
+      // map. A #492 mid-run assistant row carries only a step marker
+      // (metadata.parts:[]); its real per-step parts live in `ai_chat_run_steps`.
+      // The graceful terminal callbacks (onFinish/onError/onAbort -> flushAssistant)
+      // assemble the full inline parts, so a normally-ended turn already has them.
+      // But a HARD crash mid-run (SIGKILL/OOM) fires NO terminal callback, so the
+      // row stays parts:[]; without this, rowToUiMessage falls back to an empty
+      // text part and the partial tool-calls/results/text — durable in the steps
+      // table — would DROP OUT of the model's replay context (regressing #183
+      // step-granular durability for the model consumer). Mirrors the controller's
+      // withReconstructedParts EXACTLY (same needy predicate + hydration helper).
+      // Guarded on the optional repo: absent (positional test builds) degrades to
+      // the current behavior rather than crashing.
+      let replayHistory = oldHistory;
+      if (this.aiChatRunStepRepo) {
+        const needy = oldHistory.filter(
+          (r) => r.role === 'assistant' && !rowHasInlineParts(r),
+        );
+        if (needy.length > 0) {
+          const stepsByMessage = await this.aiChatRunStepRepo.findByMessageIds(
+            needy.map((r) => r.id),
+            workspace.id,
+          );
+          replayHistory = hydrateAssistantParts(oldHistory, stepsByMessage);
+        }
+      }
       const uiMessages: Array<Omit<UIMessage, 'id'> & { id: string }> = [
-        ...oldHistory.map(rowToUiMessage),
+        ...replayHistory.map(rowToUiMessage),
         {
           id: 'pending-user',
           role: 'user',
@@ -1161,7 +1187,9 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // hint — confirm it against the persisted history (the preceding assistant
       // turn must really be aborted/streaming) so a spoofed flag cannot inject the
       // interrupt note onto an ordinary turn. The partial output the model needs is
-      // already in `messages` (the aborted assistant row replays via findRecent).
+      // already in `messages`: a #492 mid-run row's per-step parts live only in the
+      // `ai_chat_run_steps` table and were hydrated into the replay history above,
+      // so the aborted assistant turn replays WITH its partial parts intact.
       // Append the new user turn (shape-only) so index -2 is the prior assistant.
       const interrupted = isInterruptResume(
         [...oldHistory, { role: 'user', status: null, metadata: null }],

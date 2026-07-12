@@ -1,6 +1,5 @@
 import { Injectable } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
-import { sql } from 'kysely';
 import { KyselyDB, KyselyTransaction } from '../../types/kysely.types';
 import { dbOrTx } from '../../utils';
 import { AiChatRunStep } from '@docmost/db/types/entity.types';
@@ -92,20 +91,5 @@ export class AiChatRunStepRepo {
       else byMessage.set(row.messageId, [row]);
     }
     return byMessage;
-  }
-
-  /**
-   * How many steps are persisted for a message (its step-marker floor). Exposed
-   * for the reconstruct contract (`reconstructRunParts → { parts, stepsPersisted }`)
-   * so a caller can align a resume attach without materializing every step's parts.
-   */
-  async countByMessage(messageId: string, workspaceId: string): Promise<number> {
-    const row = await this.db
-      .selectFrom('aiChatRunSteps')
-      .select(sql<number>`count(*)::int`.as('n'))
-      .where('messageId', '=', messageId)
-      .where('workspaceId', '=', workspaceId)
-      .executeTakeFirst();
-    return row?.n ?? 0;
   }
 }

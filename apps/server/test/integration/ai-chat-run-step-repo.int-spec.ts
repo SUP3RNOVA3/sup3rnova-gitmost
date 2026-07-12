@@ -98,7 +98,6 @@ describe('AiChatRunStepRepo + reconstruct contract [integration]', () => {
 
     const steps = await stepRepo.findByMessage(row.id, workspaceId);
     expect(steps.map((s) => s.stepIndex)).toEqual([0, 1]);
-    expect(await stepRepo.countByMessage(row.id, workspaceId)).toBe(2);
 
     // Batch fetch groups by message id in step order.
     const map = await stepRepo.findByMessageIds([row.id], workspaceId);
