@@ -60,7 +60,7 @@ export default function WorkTimeStat({ pageId }: Props) {
         opened={opened}
         onClose={close}
         title={t("Time worked on this article")}
-        size="lg"
+        size="46rem"
       >
         <WorkTimePunchCard data={data} />
       </Modal>
