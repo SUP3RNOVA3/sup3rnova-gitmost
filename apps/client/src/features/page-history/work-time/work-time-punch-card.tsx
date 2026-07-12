@@ -1,97 +1,86 @@
-import { Group, Stack, Text } from "@mantine/core";
+// #566 — redesigned "Time worked" body: daily time-of-day timelines. Each day is
+// a 24h track showing WHEN the work happened — a sticky 00/06/12/18/24 hour axis,
+// shaded night hours, per-block hover tooltip ("start – end · duration"), and a
+// "now" boundary on today's row. Presentation ported from NewDesign/TimeWorkedModal;
+// all data comes through the pure adapter over the real IPageWorkTime (zero backend
+// change). Positioning math, empty-run collapsing and the formatters are reused.
+import { Box, Group, ScrollArea, Stack, Text, Tooltip } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { useMemo } from "react";
-import { IPageWorkTime, IPerDay, IDayWindow } from "./work-time.types";
+import { IPageWorkTime } from "./work-time.types";
+import { formatGapMinutes } from "./format-work-time";
 import {
-  formatDayTotal,
-  formatGapMinutes,
-  formatHeadline,
-} from "./format-work-time";
+  buildRows,
+  formatBlockTooltip,
+  summaryLabels,
+  TimelineBlock,
+  TimelineDay,
+} from "./work-time-adapter";
 import classes from "./work-time.module.css";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
-// Collapse a run of this many (or more) consecutive edit-free days into a single
-// "× N days" separator (§6.2 long-range) — the row is still always one day.
-const EMPTY_RUN_COLLAPSE = 8;
+// Minimum visible width so a very short session neither vanishes nor fakes dense
+// work (§6.2); kept from the original punch-card.
+const MIN_BLOCK_WIDTH_PCT = 0.6;
 
-type Row =
-  | { type: "day"; day: IPerDay }
-  | { type: "gap"; count: number };
-
-function collapseEmptyRuns(perDay: IPerDay[]): Row[] {
-  const rows: Row[] = [];
-  let emptyRun: IPerDay[] = [];
-  const flush = () => {
-    if (emptyRun.length >= EMPTY_RUN_COLLAPSE) {
-      rows.push({ type: "gap", count: emptyRun.length });
-    } else {
-      for (const d of emptyRun) rows.push({ type: "day", day: d });
-    }
-    emptyRun = [];
-  };
-  for (const d of perDay) {
-    if (d.activeMs === 0 && d.agentMs === 0) {
-      emptyRun.push(d);
-    } else {
-      flush();
-      rows.push({ type: "day", day: d });
-    }
-  }
-  flush();
-  return rows;
-}
-
-function dayHeading(day: number): string {
-  return new Date(day).toLocaleDateString(undefined, {
-    weekday: "short",
-    day: "numeric",
-    month: "short",
-  });
+function ActivityBlock({
+  block,
+  tz,
+  locale,
+}: {
+  block: TimelineBlock;
+  tz: string;
+  locale: string;
+}) {
+  const { t } = useTranslation();
+  const left = (block.start / 24) * 100;
+  const width = Math.max(((block.end - block.start) / 24) * 100, MIN_BLOCK_WIDTH_PCT);
+  const cls = [
+    classes.window,
+    block.kind === "work" ? classes.windowWork : classes.windowAgent,
+  ].join(" ");
+  return (
+    <Tooltip
+      label={formatBlockTooltip(block, tz, locale, t)}
+      withArrow
+      openDelay={120}
+      fz={11}
+    >
+      <div className={cls} style={{ left: `${left}%`, width: `${width}%` }} />
+    </Tooltip>
+  );
 }
 
 function DayTrack({
   day,
-  pSingle,
+  tz,
+  locale,
 }: {
-  day: IPerDay;
-  pSingle: number;
+  day: TimelineDay;
+  tz: string;
+  locale: string;
 }) {
-  const { t } = useTranslation();
-  const ticks = [6, 12, 18];
   return (
     <div className={classes.row}>
-      <span className={classes.dayLabel}>{dayHeading(day.day)}</span>
-      <div className={classes.track}>
-        {ticks.map((h) => (
-          <div
-            key={h}
-            className={classes.hourTick}
-            style={{ left: `${(h / 24) * 100}%` }}
-          />
+      <span className={classes.dayLabel}>{day.label}</span>
+      <div className={`${classes.track} ${day.isEmpty ? classes.trackEmpty : ""}`}>
+        {[25, 50, 75].map((p) => (
+          <div key={p} className={classes.hourTick} style={{ left: `${p}%` }} />
         ))}
-        {day.windows.map((w: IDayWindow, i) => {
-          const leftPct = ((w.start - day.day) / DAY_MS) * 100;
-          const widthPct = ((w.end - w.start) / DAY_MS) * 100;
-          const isSingle = w.end - w.start <= pSingle;
-          const cls = [
-            classes.window,
-            w.class === "work" ? classes.windowWork : classes.windowAgent,
-            isSingle ? classes.windowSingle : "",
-          ].join(" ");
-          return (
-            <div
-              key={i}
-              className={cls}
-              style={{
-                left: `${Math.max(0, Math.min(100, leftPct))}%`,
-                width: `${Math.max(0, Math.min(100, widthPct))}%`,
-              }}
-            />
-          );
-        })}
+        {day.blocks.map((b, i) => (
+          <ActivityBlock key={i} block={b} tz={tz} locale={locale} />
+        ))}
+        {day.isToday && day.nowFraction != null && (
+          <div
+            className={classes.nowLine}
+            style={{ left: `${day.nowFraction * 100}%` }}
+          />
+        )}
       </div>
-      <span className={classes.daySum}>
-        {formatDayTotal(day.activeMs, t)}
+      <span
+        className={classes.daySum}
+        data-empty={day.totalLabel === "—" ? true : undefined}
+      >
+        {day.totalLabel}
       </span>
     </div>
   );
@@ -102,8 +91,16 @@ interface Props {
 }
 
 export default function WorkTimePunchCard({ data }: Props) {
-  const { t } = useTranslation();
-  const rows = useMemo(() => collapseEmptyRuns(data.perDay), [data.perDay]);
+  const { t, i18n } = useTranslation();
+  const locale = i18n.language;
+  const now = Date.now();
+  const rows = useMemo(
+    () => buildRows(data.perDay, t, now),
+    // `now` intentionally re-read on each open; excluded so the memo tracks data.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [data.perDay, t],
+  );
+  const { total, agent } = summaryLabels(data, t);
   const gapMin = formatGapMinutes(data.config.tGap);
 
   if (data.workMs <= 0 && data.agentOnlyMs <= 0) {
@@ -116,17 +113,19 @@ export default function WorkTimePunchCard({ data }: Props) {
 
   return (
     <Stack gap="xs">
-      <Group gap="lg">
-        <Text size="sm" fw={500}>
-          {formatHeadline(data.workMs, t)}
+      {/* summary */}
+      <Group align="baseline" gap="md">
+        <Text fz={22} fw={700}>
+          {total}
         </Text>
-        {data.agentOnlyMs > 0 && (
+        {agent && (
           <Text size="xs" c="dimmed">
-            {t("agent: {{value}}", { value: formatHeadline(data.agentOnlyMs, t) })}
+            {t("agent: {{value}}", { value: agent })}
           </Text>
         )}
       </Group>
 
+      {/* legend */}
       <Group gap="md">
         <Text size="xs" c="dimmed">
           <span
@@ -144,21 +143,47 @@ export default function WorkTimePunchCard({ data }: Props) {
         </Text>
       </Group>
 
-      <div>
+      {/* sticky hour axis */}
+      <div className={`${classes.row} ${classes.axisRow}`}>
+        <span />
+        <div className={classes.axis}>
+          {[
+            ["0%", "00", "start"],
+            ["25%", "06", "center"],
+            ["50%", "12", "center"],
+            ["75%", "18", "center"],
+            ["100%", "24", "end"],
+          ].map(([l, label, align]) => (
+            <span
+              key={label}
+              className={classes.axisTick}
+              data-align={align}
+              style={{ left: l }}
+            >
+              {label}
+            </span>
+          ))}
+        </div>
+        <span />
+      </div>
+
+      {/* day rows */}
+      <ScrollArea.Autosize mah="60vh" type="hover">
         {rows.map((row, i) =>
           row.type === "day" ? (
             <DayTrack
-              key={row.day.dayISO}
+              key={row.day.key}
               day={row.day}
-              pSingle={data.config.pSingle}
+              tz={data.tz}
+              locale={locale}
             />
           ) : (
-            <div key={`gap-${i}`} className={classes.gapRow}>
+            <Box key={`gap-${i}`} className={classes.gapRow}>
               {t("× {{count}} days without edits", { count: row.count })}
-            </div>
+            </Box>
           ),
         )}
-      </div>
+      </ScrollArea.Autosize>
 
       <Text size="xs" c="dimmed" mt="xs">
         {t("Estimate · timezone {{tz}} · inactivity gap {{gap}} min", {
