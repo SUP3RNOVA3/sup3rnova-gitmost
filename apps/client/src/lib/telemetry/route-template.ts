@@ -44,6 +44,22 @@ const STATIC_ROUTES = new Set<string>([
   '/settings/sharing',
 ]);
 
+/**
+ * The COMPLETE, finite vocabulary `templateRoute` can ever emit: the two
+ * synthetic labels (`/` and `other`), the static routes, and the dynamic
+ * templates. Exported so the public `/api/telemetry/vitals` endpoint can reject
+ * any `route` outside this dictionary server-side (the endpoint is anonymous, so
+ * an un-checked `route` is a free-text write surface). The server keeps a mirror
+ * (`ALLOWED_ROUTE_TEMPLATES` in client-metrics.constants.ts) — this is the
+ * canonical source; keep them in lockstep.
+ */
+export const KNOWN_ROUTE_TEMPLATES: ReadonlySet<string> = new Set<string>([
+  '/',
+  'other',
+  ...STATIC_ROUTES,
+  ...ROUTE_PATTERNS.map((p) => p.template),
+]);
+
 export function templateRoute(pathname: string): string {
   // Normalise a trailing slash (except root).
   const path =

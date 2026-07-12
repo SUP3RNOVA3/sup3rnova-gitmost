@@ -49,9 +49,11 @@ export const treeModel = {
   // resetting collapsed branches), NOT `children: undefined` — so a predicate that
   // only checks `=== undefined` misses the real case and materializes a misleading
   // partial list (#525). This is the SINGLE source of truth for "should a
-  // fetch/materialize be deferred?", shared by the lazy-load gate (`handleToggle`),
-  // the realtime insert path (`insertByPosition`) and the DnD move guard, so they
-  // can never drift apart again. A parent WITHOUT `hasChildren` is genuinely empty
+  // fetch/materialize be deferred?", shared by the lazy-load gate (`handleToggle`)
+  // and the realtime insert paths (`insertByPosition` / `placeByPosition`), so they
+  // can never drift apart again. (The local raw `insert` primitive and its DnD/
+  // create-page callers do NOT yet route through this predicate — see #525
+  // follow-up.) A parent WITHOUT `hasChildren` is genuinely empty
   // (no server children) — inserting its first child is correct, not deferred.
   isUnloadedBranch<T extends object>(
     node: TreeNode<T> | null | undefined,

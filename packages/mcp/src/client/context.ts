@@ -24,6 +24,7 @@ import {
   isCollabAuthFailedError,
 } from "../lib/collab-session.js";
 import { withPageLock, isUuid } from "../lib/page-lock.js";
+import type { PageId } from "../lib/page-id.js";
 import { getCollabToken, performLogin } from "../lib/auth-utils.js";
 import { formatDocmostAxiosError } from "./errors.js";
 import { GetPageConversionCache } from "./getpage-cache.js";
@@ -553,6 +554,13 @@ export abstract class DocmostClientContext {
     try {
       return await write(collabToken);
     } catch (e) {
+      // INVARIANT (#494/#435): this auto-retry MUST stay auth-only. A collab
+      // write can fail INDETERMINATE — its update may already have reached and
+      // persisted on the server (e.g. an LRU eviction of a busy session, tagged
+      // via isCollabIndeterminateError). Blindly retrying such a write duplicates
+      // it (the #435 double-apply class). If this gate is ever widened to retry a
+      // broader error class, FIRST check `isCollabIndeterminateError(e)` and do
+      // NOT retry an indeterminate write — re-read and verify before any retry.
       if (!isCollabAuthFailedError(e)) throw e;
       // The WS handshake rejected our token: drop it from the cache so it can't
       // be reused for the rest of the TTL, mint a fresh one (forceRefresh bypasses
@@ -715,10 +723,18 @@ export abstract class DocmostClientContext {
    * once via getPageRaw and cached (both slugId->uuid and uuid->uuid), so
    * repeated edits on the same page add no extra request.
    */
-  protected async resolvePageId(pageId: string): Promise<string> {
-    if (isUuid(pageId)) return pageId;
+  protected async resolvePageId(pageId: string): Promise<PageId> {
+    // This is the ONE canonicalization seam, so it is where the `PageId` brand
+    // is minted (#435). The value is validated here — a UUID input by isUuid, a
+    // resolved id as the server's own page.id — so the downstream write path
+    // (withPageLock / mutatePageContent) can require the brand and reject any
+    // unresolved raw id at compile time. The brand is a pure compile-time marker
+    // applied by cast (no runtime guard): the guarantee is that this seam is the
+    // only place a `PageId` is produced, so every branded value went through the
+    // UUID/resolve check above.
+    if (isUuid(pageId)) return pageId as PageId;
     const cached = this.pageIdCache.get(pageId);
-    if (cached) return cached;
+    if (cached) return cached as PageId;
     const data = await this.getPageRaw(pageId);
     const uuid = data?.id;
     if (typeof uuid !== "string" || !uuid) {
@@ -727,7 +743,7 @@ export abstract class DocmostClientContext {
       );
     }
     this.pageIdCache.set(pageId, uuid);
-    return uuid;
+    return uuid as PageId;
   }
 
 

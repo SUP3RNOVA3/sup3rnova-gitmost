@@ -78,7 +78,9 @@ export class AiMcpServerRepo {
         headersEnc: values.headersEnc ?? null,
         // jsonb column: the postgres driver would otherwise encode a JS array as
         // a Postgres array literal. Bind the JSON text and cast it to jsonb.
-        toolAllowlist: jsonbBind(values.toolAllowlist),
+        // preserveEmpty (#476): `[]` is a real value here (deny-all), distinct
+        // from null ("no restriction") — it must round-trip as `[]`, not null.
+        toolAllowlist: jsonbBind(values.toolAllowlist, { preserveEmpty: true }),
         // Plain text column: blank/whitespace-only guidance is stored as null.
         instructions: blankToNull(values.instructions),
         enabled: values.enabled ?? true,
@@ -111,7 +113,10 @@ export class AiMcpServerRepo {
     if (patch.url !== undefined) set.url = patch.url;
     if (patch.headersEnc !== undefined) set.headersEnc = patch.headersEnc;
     if (patch.toolAllowlist !== undefined) {
-      set.toolAllowlist = jsonbBind(patch.toolAllowlist);
+      // preserveEmpty (#476): see insert — `[]` (deny-all) must not become null.
+      set.toolAllowlist = jsonbBind(patch.toolAllowlist, {
+        preserveEmpty: true,
+      });
     }
     if (patch.instructions !== undefined) {
       // Blank/whitespace-only guidance clears the column (stored as null).
@@ -158,7 +163,9 @@ export function blankToNull(value: string | null | undefined): string | null {
  * fix), so the driver hands back a string like `'["a","b"]'` rather than an
  * array. Be tolerant: normalize a JSON string to its value, then accept it only
  * if it is an array of strings; null / a non-array / unparseable value / an
- * array with a non-string element all become null (unrestricted).
+ * array with a non-string element all become null. NOTE: null here only means
+ * "could not parse" — the null-vs-deny-all policy decision lives in
+ * normalizeRow (#476: present-but-corrupt fails CLOSED to `[]`).
  */
 export function parseToolAllowlist(value: unknown): string[] | null {
   // Shape guard only; the legacy double-encoding self-heal lives in
@@ -173,17 +180,20 @@ export function parseToolAllowlist(value: unknown): string[] | null {
 /**
  * Normalize a DB row so `toolAllowlist` is always `string[] | null`.
  *
- * FAIL-OPEN logging: a stored value that is present but cannot be parsed into a
- * string[] (corrupt JSON, a non-array, non-string elements) degrades to `null` =
- * "no restriction", so the agent silently gets ALL of the server's tools. Log
- * one line (server id only, never the contents) so that widening is not silent.
+ * FAIL-CLOSED (#476): a stored value that is PRESENT but cannot be parsed into
+ * a string[] (corrupt JSON, a non-array, non-string elements) degrades to `[]`
+ * = deny-all, so a corrupted allowlist can never silently widen to "the agent
+ * gets ALL of the server's tools" (the old fail-open null). An error line is
+ * logged (server id only, never the contents) so the admin can repair the row.
+ * A column that is truly NULL/absent stays `null` = "no restriction".
  */
 function normalizeRow(row: AiMcpServer): AiMcpServer {
   const parsed = parseToolAllowlist(row.toolAllowlist);
   if (parsed === null && row.toolAllowlist != null) {
-    logger.warn(
-      `Corrupt tool_allowlist for MCP server ${row.id}; ignoring it (no tool restriction applied)`,
+    logger.error(
+      `Corrupt tool_allowlist for MCP server ${row.id}; failing closed (NO tools allowed) — re-save the server's allowlist to repair it`,
     );
+    return { ...row, toolAllowlist: [] };
   }
   return { ...row, toolAllowlist: parsed };
 }

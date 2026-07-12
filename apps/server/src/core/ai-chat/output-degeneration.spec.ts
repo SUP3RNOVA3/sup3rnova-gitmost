@@ -9,8 +9,72 @@ import {
   DEGENERATION_CHECK_STEP,
   REPEATED_LINES_THRESHOLD,
   MIN_PERIOD_REPEATS,
+  degenerationThresholds,
 } from './output-degeneration';
 import { AiChatService } from './ai-chat.service';
+
+// Part A (#495 iter10): the detector thresholds are env-tunable. These drive the
+// resolver against real repeat-count shapes and mutation-verify that the env
+// override actually changes the trigger point (not a vacuous read).
+describe('degeneration thresholds are env-configurable', () => {
+  const VARS = [
+    'AI_CHAT_DEGENERATION_REPEATED_LINES',
+    'AI_CHAT_DEGENERATION_PERIOD_MAX_LEN',
+    'AI_CHAT_DEGENERATION_PERIOD_MIN_REPEATS',
+    'AI_CHAT_DEGENERATION_CHECK_STEP',
+  ];
+  const saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    for (const v of VARS) saved[v] = process.env[v];
+  });
+  afterEach(() => {
+    for (const v of VARS) {
+      if (saved[v] === undefined) delete process.env[v];
+      else process.env[v] = saved[v];
+    }
+  });
+
+  it('defaults to the compiled constants when unset', () => {
+    for (const v of VARS) delete process.env[v];
+    expect(degenerationThresholds()).toEqual({
+      repeatedLines: REPEATED_LINES_THRESHOLD,
+      maxPeriodLen: 150,
+      minPeriodRepeats: MIN_PERIOD_REPEATS,
+      checkStep: DEGENERATION_CHECK_STEP,
+    });
+  });
+
+  it('falls back to the default on blank / invalid / non-positive values', () => {
+    for (const bad of ['', '  ', 'abc', '0', '-3', '1.5']) {
+      process.env.AI_CHAT_DEGENERATION_REPEATED_LINES = bad;
+      // '1.5' floors to 1 (still ≥1, valid); every other bad value → default.
+      const expected = bad === '1.5' ? 1 : REPEATED_LINES_THRESHOLD;
+      expect(degenerationThresholds().repeatedLines).toBe(expected);
+    }
+  });
+
+  it('a RAISED check-step suppresses a burst the default would have flagged', () => {
+    // A ~3.3KB periodic burst is periodic-degenerate, but shouldCheckDegeneration
+    // is the throttle gate. Default checkStep=2000 arms on it; raising the step
+    // above the burst size means the throttle never re-fires for it.
+    const burstLen = 'loadTools.\n'.repeat(300).length; // ~3300
+    delete process.env.AI_CHAT_DEGENERATION_CHECK_STEP;
+    expect(shouldCheckDegeneration(burstLen, 0)).toBe(true); // default 2000
+    process.env.AI_CHAT_DEGENERATION_CHECK_STEP = String(burstLen + 1);
+    expect(shouldCheckDegeneration(burstLen, 0)).toBe(false); // raised gate
+  });
+
+  it('a LOWERED repeated-lines threshold trips on a shorter identical-line run', () => {
+    // 8 identical lines: below the default 25 (rule 1) and below the periodic
+    // rule's 20 repeats — so isDegenerateOutput is false by default.
+    const shortRun = 'x\n'.repeat(8);
+    delete process.env.AI_CHAT_DEGENERATION_REPEATED_LINES;
+    expect(isDegenerateOutput(shortRun)).toBe(false);
+    // Lower rule 1 to 5 → the 8-line run now trips.
+    process.env.AI_CHAT_DEGENERATION_REPEATED_LINES = '5';
+    expect(isDegenerateOutput(shortRun)).toBe(true);
+  });
+});
 
 // Mock ONLY streamText so we can capture the onChunk/onStepFinish callbacks the
 // service registers and drive them by hand; every other `ai` export the service

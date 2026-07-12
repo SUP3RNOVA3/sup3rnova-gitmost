@@ -124,9 +124,17 @@ jobs:
           exit "$FAILED"
 
       # A GENUINE counterexample: fast-check printed a shrunk minimal case and its
-      # reproducing seed into property-output.txt. File a dedup-guarded issue whose
-      # title prefix is UNIQUE to counterexamples, so an infra failure (handled by
-      # the next step under a different title) can never poison this dedup.
+      # reproducing seed into property-output.txt. File a dedup-guarded issue.
+      #
+      # Dedup is keyed on a HASH of the SHRUNK COUNTEREXAMPLE (the minimal failing
+      # input), NOT on the issue title prefix. Keying on the prefix would let a
+      # single open issue swallow every OTHER counterexample (a different bug B whose
+      # title shares the prefix would be treated as a duplicate and stay silent until
+      # the first issue is closed). Hashing the shrunk example instead means two
+      # DIFFERENT counterexamples get two DIFFERENT issues, while a re-find of the
+      # SAME counterexample still dedupes onto the existing one. The infra-failure
+      # step (below) still keys on its own distinct title, so it can never poison
+      # this dedup either.
       - name: File counterexample issue
         # always() is REQUIRED: the fuzz step exits nonzero on a failing shard,
         # so a bare `if:` (implicitly success() && ...) would skip this step
@@ -146,25 +154,48 @@ jobs:
             echo "No fast-check counterexample signature — infra failure, handled by the next step."
             exit 0
           fi
-          TITLE="${TITLE_PREFIX} (seed=${FAIL_SEED})"
+          # Extract the SHRUNK counterexample block: the "Counterexample:" line(s)
+          # up to (but excluding) the "Shrunk N time(s)" / "Got error" line. This is
+          # the minimal failing INPUT and is STABLE across the different seeds/paths
+          # that reach the same bug — unlike the seed, path, or shrink count (which
+          # precede/follow this block and vary run-to-run) and unlike the whole
+          # output (which embeds those varying parts). Hashing THIS is what makes the
+          # dedup identity the bug itself rather than an incidental run detail.
+          CE_TEXT=$(awk '/Counterexample:/{c=1} /Shrunk [0-9]+ time|Got error/{c=0} c{print}' property-output.txt)
+          if [ -z "$CE_TEXT" ]; then
+            # No parseable shrunk block (unexpected — the signature check above
+            # already confirmed fast-check output). Fall back to the reproducing
+            # seed so we still emit a stable identity instead of silently deduping.
+            CE_TEXT="seed:${FAIL_SEED}"
+          fi
+          # Stable short id: first 12 hex chars of sha256 over the counterexample.
+          CE_HASH=$(printf '%s' "$CE_TEXT" | sha256sum | cut -c1-12)
+          # Machine-readable marker embedded in the issue body; the open-issue search
+          # below matches on it (and on the hash in the title) so identity travels
+          # with the issue regardless of any human title edits.
+          CE_MARKER="<!-- counterexample-hash: ${CE_HASH} -->"
+          export CE_HASH CE_MARKER
+          TITLE="${TITLE_PREFIX} [${CE_HASH}] (seed=${FAIL_SEED})"
 
-          # Best-effort dedup: skip if an open issue with the counterexample title
-          # prefix already exists. A failure of this check must NOT block creation.
+          # Dedup on the counterexample hash: skip only if an OPEN issue already
+          # carries this exact hash (in its title or its body marker). A different
+          # counterexample has a different hash and is NOT deduped. A failure of this
+          # check must NOT block creation.
           EXISTING=""
           if EXISTING=$(curl -sS \
               -H "Authorization: token ${GITHUB_TOKEN}" \
               "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues?state=open&limit=100"); then
             if printf '%s' "$EXISTING" \
-                | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let a;try{a=JSON.parse(s)}catch{process.exit(1)}if(!Array.isArray(a))process.exit(1);const p=process.env.TITLE_PREFIX;process.exit(a.some(i=>typeof i.title==="string"&&i.title.startsWith(p))?0:1)})'; then
-              echo "An open '${TITLE_PREFIX}' issue already exists — skipping creation."
+                | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let a;try{a=JSON.parse(s)}catch{process.exit(1)}if(!Array.isArray(a))process.exit(1);const h=process.env.CE_HASH,m=process.env.CE_MARKER;process.exit(a.some(i=>(typeof i.title==="string"&&i.title.includes(h))||(typeof i.body==="string"&&i.body.includes(m)))?0:1)})'; then
+              echo "An open issue for counterexample ${CE_HASH} already exists — skipping creation."
               exit 0
             fi
           fi
 
           # Build the JSON body with the test output SAFELY escaped (never hand-
           # interpolate the counterexample into JSON).
-          BODY_TEXT=$(printf 'A nightly property fuzz SHARD failed with a fast-check counterexample.\n\n- failing shard seed: `%s`\n- NUM_RUNS (per shard): `%s`\n- run: %s\n\nReproduce locally:\n\n```\nPROPERTY_SEED=%s PROPERTY_NUM_RUNS=%s pnpm --filter @docmost/prosemirror-markdown exec vitest run test/generative/\n```\n\nfast-check shrinks the failure to a minimal counterexample. Commit it as a permanent fixture under `packages/prosemirror-markdown/test/fixtures/counterexamples/` + a case in `counterexamples.test.ts`, then FIX the converter (do not weaken a property). See `packages/prosemirror-markdown/README.md`.\n\nTail of the test output (contains the shrunk counterexample):\n\n```\n%s\n```\n' \
-            "$FAIL_SEED" "$NUM_RUNS" "$RUN_URL" "$FAIL_SEED" "$NUM_RUNS" "$(tail -n 120 property-output.txt)")
+          BODY_TEXT=$(printf 'A nightly property fuzz SHARD failed with a fast-check counterexample.\n\n- counterexample hash: `%s`\n- failing shard seed: `%s`\n- NUM_RUNS (per shard): `%s`\n- run: %s\n\nReproduce locally:\n\n```\nPROPERTY_SEED=%s PROPERTY_NUM_RUNS=%s pnpm --filter @docmost/prosemirror-markdown exec vitest run test/generative/\n```\n\nfast-check shrinks the failure to a minimal counterexample. Commit it as a permanent fixture under `packages/prosemirror-markdown/test/fixtures/counterexamples/` + a case in `counterexamples.test.ts`, then FIX the converter (do not weaken a property). See `packages/prosemirror-markdown/README.md`.\n\nTail of the test output (contains the shrunk counterexample):\n\n```\n%s\n```\n\n%s\n' \
+            "$CE_HASH" "$FAIL_SEED" "$NUM_RUNS" "$RUN_URL" "$FAIL_SEED" "$NUM_RUNS" "$(tail -n 120 property-output.txt)" "$CE_MARKER")
 
           jq -n --arg title "$TITLE" --arg body "$BODY_TEXT" \
             '{title: $title, body: $body}' > payload.json

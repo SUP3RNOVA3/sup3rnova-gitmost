@@ -56,6 +56,12 @@ import {
 } from './tools/current-page.util';
 import { roleModelOverride } from './roles/role-model-config';
 import {
+  resolveReplayBudget,
+  resolveEffectiveReplayThreshold,
+  isContextOverflowError,
+  trimHistoryForReplay,
+} from './history-budget';
+import {
   startSseHeartbeat,
   stripStreamingHopByHopHeaders,
 } from './sse-resilience';
@@ -117,15 +123,29 @@ const FINAL_STEP_NUDGE =
 // NO text at all (#444, mitigates the "empty turn" the lockdown used to prevent
 // when the toggle is OFF). Makes the exhausted-without-answer state explicit to
 // the user and, on replay, to the model on the next turn.
+// The persisted content is the app's base locale (en-US) — which is ALSO the
+// i18n key the client localizes through `t()` — instead of a hardcoded Russian
+// string (it used to render Russian for every locale, and fed Russian back to
+// the model on replay). Keep it a plain, model-readable English sentence so the
+// next turn's replay reads cleanly; the client resolves the locale.
 const STEP_LIMIT_NO_ANSWER_MARKER =
-  '(Достигнут лимит шагов — итоговый ответ не сформулирован; работа могла ' +
-  'остаться незавершённой. Напишите «продолжай», чтобы агент продолжил.)';
+  '(Step limit reached — no final answer was produced; the work may be ' +
+  'unfinished. Reply "continue" to let the agent carry on.)';
 
 // Reason recorded in ai_chat_runs.error / the assistant row when the token-
 // degeneration detector (#444) aborts a run. Distinct from a user Stop (no error)
 // and from a server restart ('streaming' -> swept to 'aborted' with no message).
 const OUTPUT_DEGENERATION_ERROR =
   'Output degeneration detected (repeated token loop)';
+
+// Prefix recorded on the assistant row when the provider rejected the turn for
+// CONTEXT OVERFLOW (#490): the replayed history exceeded the model's window. The
+// row is ALSO stamped `metadata.replayOverflow` so the NEXT turn's budgeter trims
+// aggressively (the reactive recovery — the overflowing turn had no usage signal
+// to trigger preventive trimming, so the classified 400 is what un-bricks it).
+export const CONTEXT_OVERFLOW_ERROR_PREFIX =
+  'Диалог превысил контекстное окно модели; история будет агрессивно ' +
+  'сокращена на следующем ходу.';
 
 /**
  * Compute the step-budget warning text (#444), or '' when this step is outside
@@ -882,6 +902,21 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       const freshPage = await this.pageRepo.findById(pageId);
       // Page deleted during the turn (or somehow foreign) => don't write.
       if (!freshPage || freshPage.workspaceId !== workspace.id) return;
+      // Fast-path (#490): if a snapshot already exists at THIS page version
+      // (same updated_at instant), its content is already current — skip the full
+      // Markdown export + upsert entirely. A turn that did NOT touch the open page
+      // (the common case) thus does no snapshot work. This mirrors the read-side
+      // fast path in detectPageChange (sameInstant): both trust that a page edit
+      // bumps updated_at. When the agent (or a human) DID edit the page this turn,
+      // updated_at advanced, so this does not match and we re-export as before.
+      const existing = await this.aiChatPageSnapshotRepo.findByChatPage(
+        chatId,
+        pageId,
+        workspace.id,
+      );
+      if (existing && sameInstant(existing.pageUpdatedAt, freshPage.updatedAt)) {
+        return;
+      }
       const currentMd = await this.tools.exportPageMarkdown(
         user,
         sessionId,
@@ -921,10 +956,17 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
     // supplied or the supplied one does not belong to this workspace.
     let isNewChat = false;
     let chatId = body.chatId;
+    // Persisted chat-level metadata bag (#490): read once here so the deferred-tool
+    // activation set can be seeded from the previous turn. Undefined for a new chat.
+    let chatMetadata: Record<string, unknown> | undefined;
     if (chatId) {
       const existing = await this.aiChatRepo.findById(chatId, workspace.id);
       if (!existing) {
         chatId = undefined;
+      } else {
+        chatMetadata = (existing.metadata ?? undefined) as
+          | Record<string, unknown>
+          | undefined;
       }
     }
     // The open page the client sent is attacker-controllable — BOTH its id and
@@ -1086,7 +1128,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // per-row conversion and degraded to plain text with a "[tool context
       // omitted]" marker rather than 500-ing the whole turn (silent loss of tool
       // context is not acceptable — the model must see the truncation).
-      const messages = await convertHistoryResilient(uiMessages, (index, err) =>
+      let messages = await convertHistoryResilient(uiMessages, (index, err) =>
         this.logger.warn(
           `Degraded unconvertible history row ${index} on chat ${chatId} to text: ${
             err instanceof Error ? err.message : 'unknown error'
@@ -1134,6 +1176,56 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // The model is resolved by the controller before hijack (clean 503 path).
       // Here we only need the admin-configured system prompt.
       const resolved = await this.aiSettings.resolve(workspace.id);
+
+      // History-replay token budget (#490). The full conversation is replayed to
+      // the provider every turn, so a long chat eventually 400s on the context
+      // window — forever. Bound the REPLAYED history (never the persisted rows).
+      // PRIMARY signal is the provider's own fact: the last turn's contextTokens.
+      const replayBudget = resolveReplayBudget(resolved?.chatContextWindowRaw);
+      if (replayBudget.usedDefault) {
+        // The default fires precisely for installs with NO configured window —
+        // the ones that hit terminal overflow. Warn so it is observable.
+        this.logger.warn(
+          `AI chat (chat ${chatId}): no chatContextWindow configured; ` +
+            `applying the default replay budget (${replayBudget.thresholdTokens} tokens).`,
+        );
+      }
+      // Last turn's provider-reported context size (authoritative when present).
+      const priorContextTokens = lastAssistantContextTokens(oldHistory);
+      // Reactive recovery (#490): if the LAST turn was rejected for context
+      // overflow (stamped by onError), trim AGGRESSIVELY this turn — the
+      // overflowing turn produced no usage signal, so a normal-threshold trim may
+      // not shrink enough to fit. This is what un-bricks a chat that just 400'd.
+      const priorOverflowed = lastAssistantReplayOverflow(oldHistory);
+      const effectiveThreshold = resolveEffectiveReplayThreshold(
+        replayBudget.thresholdTokens,
+        priorOverflowed,
+      );
+      if (priorOverflowed) {
+        this.logger.warn(
+          `AI chat (chat ${chatId}): previous turn hit context overflow; ` +
+            `applying aggressive replay budget (${effectiveThreshold} tokens).`,
+        );
+      }
+      const preTrim = trimHistoryForReplay(
+        messages,
+        effectiveThreshold,
+        // A prior OVERFLOW means the provider count is stale/absent — force the
+        // char-estimate path by ignoring priorContextTokens on recovery.
+        priorOverflowed ? undefined : priorContextTokens,
+      );
+      messages = preTrim.messages;
+      // Observability (#490): record the budgeter's decision on the turn so the UI
+      // can surface "replay truncated at N tokens". Threaded into flushAssistant.
+      let replayTrimmedToTokens: number | undefined = preTrim.trimmed
+        ? preTrim.estimatedTokens
+        : undefined;
+      if (preTrim.trimmed) {
+        this.logger.log(
+          `AI chat (chat ${chatId}): replay history trimmed to ~${preTrim.estimatedTokens} ` +
+            `tokens (budget ${replayBudget.thresholdTokens}).`,
+        );
+      }
 
       // Build the external MCP toolset FIRST so the system prompt can carry each
       // connected server's admin-authored guidance (#180). Merge in admin-
@@ -1326,9 +1418,18 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       //    tools + ALL external MCP tools), computed from the ACTUAL toolset so an
       //    external tool is loadable by its namespaced name. loadTools rejects any
       //    name outside this set.
-      const activatedTools = new Set<string>();
       const validDeferredNames = new Set<string>(
         Object.keys(baseTools).filter((k) => !CORE_TOOL_SET.has(k)),
+      );
+      // #490: seed the activation set from the chat's PERSISTED set so the model
+      // does not re-run loadTools every turn to re-activate the same tools. Only
+      // when deferred loading is enabled, and ALWAYS intersected with the CURRENT
+      // valid deferred names — an allowlist/role change must never resurrect a tool
+      // that no longer exists (prepareAgentStep would get a phantom active name).
+      const activatedTools = new Set<string>(
+        deferredEnabled
+          ? seedActivatedTools(chatMetadata, validDeferredNames)
+          : [],
       );
       // Add the loadTools meta-tool ONLY when the feature is enabled; when off the
       // toolset and behavior are exactly as before.
@@ -1339,6 +1440,39 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           }
         : baseTools;
 
+      // #490: persist the (deterministically ordered) activation set back onto the
+      // chat metadata at turn end, so the NEXT turn seeds from it. Once-guarded and
+      // skipped when nothing new was activated (the set equals its seed) so an
+      // ordinary turn adds no extra write. Preserves other metadata keys.
+      let activatedToolsPersisted = false;
+      const persistActivatedTools = async (): Promise<void> => {
+        if (!deferredEnabled || activatedToolsPersisted || !chatId) return;
+        activatedToolsPersisted = true;
+        const current = [...activatedTools].sort();
+        const seeded = seedActivatedTools(chatMetadata, validDeferredNames).sort();
+        if (current.length === 0 || current.join(' ') === seeded.join(' ')) {
+          return; // nothing new activated -> no write
+        }
+        try {
+          await this.aiChatRepo.update(
+            chatId,
+            {
+              metadata: {
+                ...(chatMetadata ?? {}),
+                activatedTools: current,
+              },
+            } as never,
+            workspace.id,
+          );
+        } catch (err) {
+          this.logger.warn(
+            `Failed to persist activated tools (chat ${chatId}): ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          );
+        }
+      };
+
       // Accumulate the turn's streamed output so a provider error / disconnect can
       // persist the PARTIAL answer the user already saw — the SDK's onError/onAbort
       // callbacks don't hand us the in-progress text. `capturedSteps` holds finished
@@ -1346,6 +1480,11 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // the CURRENT, not-yet-finished step, reset whenever a step finishes.
       const capturedSteps: StepLike[] = [];
       let inProgressText = '';
+
+      // Per-turn step->parts memo (#490): shared across every flushAssistant call
+      // this turn so each finished step's (large) output is JSON-stringified ONCE,
+      // not re-stringified on every subsequent onStepFinish flush (was O(N²)).
+      const partsCache: StepPartsCache = new WeakMap();
 
       // Token-degeneration guard (#444). When the final-step lockdown is OFF, a
       // runaway repetition loop (the 255KB "loadTools." incident) is aborted via
@@ -1416,7 +1555,10 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           await this.aiChatMessageRepo.update(
             assistantId,
             workspace.id,
-            flushAssistant(capturedSteps, '', 'streaming', { pageChanged }),
+            flushAssistant(capturedSteps, '', 'streaming', {
+              pageChanged,
+              partsCache,
+            }),
             { onlyIfStreaming: true },
           );
         } catch (err) {
@@ -1514,6 +1656,13 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           system,
           messages,
           tools,
+          // Pin the AI SDK per-request retry budget explicitly instead of relying
+          // on its default (which is also 2). Connection arithmetic per turn:
+          // (1 + maxRetries=2) × (1 + AI_STREAM_PRE_RESPONSE_RETRIES) network
+          // connects worst-case — the two retry layers compose, so making the SDK
+          // side explicit keeps that ceiling visible and pinned against SDK-default
+          // drift.
+          maxRetries: 2,
           // No maxOutputTokens cap on the agent: tool-call arguments (e.g. a full
           // page body for the write tools) are emitted as OUTPUT tokens, so a fixed
           // cap would truncate complex tool calls mid-argument. Let the model use its
@@ -1649,6 +1798,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 // closure scope here). Omitted/0 = no limit.
                 maxContextTokens: resolved?.chatContextWindow,
                 pageChanged,
+                partsCache,
+                replayTrimmedToTokens,
               }),
             );
             // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
@@ -1673,6 +1824,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // own edits are baked in — and this also SEEDS the snapshot on the first
             // turn. Runs once across every terminal path (see snapshotTurnEnd).
             await snapshotTurnEnd();
+            // #490: persist the deferred-tool activation set for the next turn.
+            await persistActivatedTools();
 
             // Generate the chat title for a freshly created chat AFTER the stream's
             // provider call has completed — NOT concurrently with it. The z.ai coding
@@ -1696,7 +1849,16 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // object, so the actual provider cause is clearly logged. Reuse the
             // shared formatter so provider error formatting stays unified.
             const e = error as { stack?: string };
-            const errorText = describeProviderError(error, String(error));
+            // #490 reactive branch: classify a CONTEXT-OVERFLOW rejection (the
+            // replayed history exceeded the model window). The overflowing turn had
+            // no prior usage to trigger preventive trimming, so we record a clear,
+            // distinguishable cause AND stamp the row so the NEXT turn's budgeter
+            // trims aggressively — the reactive recovery that un-bricks the chat.
+            const overflow = isContextOverflowError(error);
+            const providerError = describeProviderError(error, String(error));
+            const errorText = overflow
+              ? `${CONTEXT_OVERFLOW_ERROR_PREFIX} (${providerError})`
+              : providerError;
             this.logger.error(`AI chat stream error: ${errorText}`, e?.stack);
             // DIAGNOSTIC (Safari stream-drop investigation) — temporary: timing of
             // an error-terminated stream.
@@ -1714,6 +1876,9 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
               flushAssistant(capturedSteps, inProgressText, 'error', {
                 error: errorText,
                 pageChanged,
+                partsCache,
+                replayTrimmedToTokens,
+                replayOverflow: overflow || undefined,
               }),
             );
             // #184: settle the RUN as failed, carrying the provider/transport cause.
@@ -1723,6 +1888,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // committed before the error must be baked into the snapshot, or the
             // next turn would mis-report it as a user edit.
             await snapshotTurnEnd();
+            // #490: persist the deferred-tool activation set for the next turn.
+            await persistActivatedTools();
           },
           onAbort: async ({ steps }) => {
             // #444: distinguish a degeneration abort (our internal controller) from
@@ -1737,6 +1904,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 flushAssistant(capturedSteps, truncated, 'error', {
                   error: OUTPUT_DEGENERATION_ERROR,
                   pageChanged,
+                  partsCache,
                 }),
               );
               if (runId)
@@ -1747,6 +1915,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 );
               await closeExternalClients();
               await snapshotTurnEnd();
+              // #490: persist the deferred-tool activation set for the next turn.
+              await persistActivatedTools();
               return;
             }
             const partialChars =
@@ -1771,6 +1941,7 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             await finalizeAssistant(
               flushAssistant(capturedSteps, inProgressText, 'aborted', {
                 pageChanged,
+                partsCache,
               }),
             );
             // #184: settle the RUN as aborted (an explicit user stop reached the
@@ -1781,6 +1952,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             // committed before the client disconnect / stop() must be baked into the
             // snapshot, or the next turn would mis-report it as a user edit.
             await snapshotTurnEnd();
+            // #490: persist the deferred-tool activation set for the next turn.
+            await persistActivatedTools();
           },
         });
 
@@ -2091,6 +2264,70 @@ export function chatStreamMetadata(
   return undefined;
 }
 
+/**
+ * The provider-reported context size of the most recent assistant turn, read from
+ * its persisted `metadata.contextTokens` (#490 replay budgeter's PRIMARY signal —
+ * the provider's own fact, not an estimate). Returns undefined for a chat with no
+ * assistant turn yet, or one whose last turn recorded no usage (e.g. it errored),
+ * in which case the budgeter falls back to the char-estimate.
+ */
+export function lastAssistantContextTokens(
+  history: ReadonlyArray<AiChatMessage>,
+): number | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const row = history[i];
+    if (row.role !== 'assistant') continue;
+    const meta = (row.metadata ?? {}) as { contextTokens?: unknown };
+    const n = meta.contextTokens;
+    return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Seed the per-turn deferred-tool activation set from a chat's persisted metadata
+ * (#490), INTERSECTED with the current valid deferred names. Persisting the set
+ * across turns saves the model re-running loadTools every turn to re-activate the
+ * same tools; intersecting on load means a changed allowlist / role can never
+ * resurrect a tool that no longer exists (which would hand prepareAgentStep a
+ * phantom active name). Tolerant of any stored shape — a non-array is ignored.
+ */
+export function seedActivatedTools(
+  metadata: Record<string, unknown> | undefined,
+  validDeferredNames: ReadonlySet<string>,
+): string[] {
+  const stored = metadata?.activatedTools;
+  if (!Array.isArray(stored)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const name of stored) {
+    if (typeof name === 'string' && validDeferredNames.has(name) && !seen.has(name)) {
+      seen.add(name);
+      out.push(name);
+    }
+  }
+  return out;
+}
+
+/**
+ * Whether the most recent assistant turn was rejected for CONTEXT OVERFLOW
+ * (#490): its row carries `metadata.replayOverflow` (stamped by the stream's
+ * onError). The next turn's budgeter reads this to trim aggressively — the
+ * reactive recovery. Only the LAST assistant turn matters (an older overflow was
+ * already recovered), so we stop at the first assistant row scanning backwards.
+ */
+export function lastAssistantReplayOverflow(
+  history: ReadonlyArray<AiChatMessage>,
+): boolean {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const row = history[i];
+    if (row.role !== 'assistant') continue;
+    const meta = (row.metadata ?? {}) as { replayOverflow?: unknown };
+    return meta.replayOverflow === true;
+  }
+  return false;
+}
+
 /** The last message with role 'user' from a useChat payload, if any. */
 function lastUserMessage(
   messages: UIMessage[] | undefined,
@@ -2151,6 +2388,15 @@ export function sanitizeUserParts(
 
 /** Marker for a history row whose tool parts could not be replayed (#489). */
 export const TOOL_CONTEXT_OMITTED_MARKER = '[tool context omitted]';
+
+/**
+ * Synthetic error text for a tool call that neither returned a result nor threw
+ * a `tool-error` — i.e. it was interrupted mid-step (an abort / server restart).
+ * Shared by `assistantParts` (the replayed `output-error` part) and
+ * `serializeSteps` (the `{ kind: 'interrupted' }` trace element) so the replay
+ * text and the trace stay in lockstep (#490).
+ */
+export const TOOL_CALL_INCOMPLETE_TEXT = 'Tool call did not complete.';
 
 /**
  * Convert persisted UI history to model messages, tolerating a single poisoned
@@ -2359,71 +2605,97 @@ function normalizeToolError(error: unknown): string {
  */
 // Exported only so the unit tests can import these pure helpers; exporting
 // them does not change runtime behavior.
+/**
+ * Per-turn memo for {@link assistantParts}: a step's rebuilt parts keyed by the
+ * step OBJECT's identity (#490). A finished step in `capturedSteps` keeps a stable
+ * reference across every mid-stream flush, and `compactToolOutput` inside it does a
+ * `JSON.stringify` of the whole (often 50–200 KB) output — so without a memo each
+ * `onStepFinish` re-stringifies EVERY prior step's output (O(N²) stringify over a
+ * turn). Keyed by step identity => one stringify per step per turn. WeakMap so a
+ * turn's steps are GC'd with the turn.
+ */
+export type StepPartsCache = WeakMap<object, Array<Record<string, unknown>>>;
+
+/** Build the parts for ONE step (text + a part per tool call). Pure. */
+function buildStepParts(step: StepLike): Array<Record<string, unknown>> {
+  const parts: Array<Record<string, unknown>> = [];
+  if (step.text) {
+    parts.push({ type: 'text', text: step.text });
+  }
+  // Index this step's results by tool call id to pair calls with outputs.
+  const resultsById = new Map<string, unknown>();
+  for (const r of step.toolResults ?? []) {
+    if (r.toolCallId) resultsById.set(r.toolCallId, r.output);
+  }
+  // Index this step's THROWN tool failures (ai@6 `tool-error` content parts)
+  // by tool call id, so a call that failed replays with its real error text.
+  const errorsById = new Map<string, unknown>();
+  for (const part of step.content ?? []) {
+    if (part.type === 'tool-error' && part.toolCallId) {
+      errorsById.set(part.toolCallId, part.error);
+    }
+  }
+  for (const call of step.toolCalls ?? []) {
+    if (!call.toolName || !call.toolCallId) continue;
+    const hasResult = resultsById.has(call.toolCallId);
+    if (hasResult) {
+      // output-available: the tool returned; the next turn replays its result.
+      parts.push({
+        type: `tool-${call.toolName}`,
+        toolCallId: call.toolCallId,
+        state: 'output-available',
+        input: call.input,
+        output: compactToolOutput(resultsById.get(call.toolCallId)),
+      });
+    } else if (errorsById.has(call.toolCallId)) {
+      // The tool THREW: replay the REAL error so the model on the next turn
+      // knows WHY the call failed (and does not blindly repeat it). An
+      // output-error round-trips through convertToModelMessages as a balanced
+      // tool-call + tool-result, keeping the rebuilt history valid.
+      parts.push({
+        type: `tool-${call.toolName}`,
+        toolCallId: call.toolCallId,
+        state: 'output-error',
+        input: call.input,
+        errorText: normalizeToolError(errorsById.get(call.toolCallId)),
+      });
+    } else {
+      // No paired result AND no tool-error (e.g. aborted mid-step). Persisting
+      // a bare tool-call (input-available) would replay as an unpaired call and
+      // throw MissingToolResultsError on the next turn (convertToModelMessages
+      // emits no tool-result for it). Emit a SYNTHETIC paired result instead:
+      // an output-error round-trips through convertToModelMessages as a
+      // balanced tool-call + tool-result, keeping the rebuilt history valid.
+      parts.push({
+        type: `tool-${call.toolName}`,
+        toolCallId: call.toolCallId,
+        state: 'output-error',
+        input: call.input,
+        errorText: TOOL_CALL_INCOMPLETE_TEXT,
+      });
+    }
+  }
+  return parts;
+}
+
 export function assistantParts(
   steps: ReadonlyArray<StepLike> | undefined,
   fallbackText: string,
+  cache?: StepPartsCache,
 ): UIMessage['parts'] {
   const parts: Array<Record<string, unknown>> = [];
-  let sawText = false;
   for (const step of steps ?? []) {
-    if (step.text) {
-      parts.push({ type: 'text', text: step.text });
-      sawText = true;
+    // Memoize per step object (#490): a finished step is immutable and keeps its
+    // reference across flushes, so its parts (and the costly output stringify) are
+    // built exactly once per turn. A cache miss (or no cache) just rebuilds.
+    let stepParts = cache?.get(step as object);
+    if (!stepParts) {
+      stepParts = buildStepParts(step);
+      cache?.set(step as object, stepParts);
     }
-    // Index this step's results by tool call id to pair calls with outputs.
-    const resultsById = new Map<string, unknown>();
-    for (const r of step.toolResults ?? []) {
-      if (r.toolCallId) resultsById.set(r.toolCallId, r.output);
-    }
-    // Index this step's THROWN tool failures (ai@6 `tool-error` content parts)
-    // by tool call id, so a call that failed replays with its real error text.
-    const errorsById = new Map<string, unknown>();
-    for (const part of step.content ?? []) {
-      if (part.type === 'tool-error' && part.toolCallId) {
-        errorsById.set(part.toolCallId, part.error);
-      }
-    }
-    for (const call of step.toolCalls ?? []) {
-      if (!call.toolName || !call.toolCallId) continue;
-      const hasResult = resultsById.has(call.toolCallId);
-      if (hasResult) {
-        // output-available: the tool returned; the next turn replays its result.
-        parts.push({
-          type: `tool-${call.toolName}`,
-          toolCallId: call.toolCallId,
-          state: 'output-available',
-          input: call.input,
-          output: compactToolOutput(resultsById.get(call.toolCallId)),
-        });
-      } else if (errorsById.has(call.toolCallId)) {
-        // The tool THREW: replay the REAL error so the model on the next turn
-        // knows WHY the call failed (and does not blindly repeat it). An
-        // output-error round-trips through convertToModelMessages as a balanced
-        // tool-call + tool-result, keeping the rebuilt history valid.
-        parts.push({
-          type: `tool-${call.toolName}`,
-          toolCallId: call.toolCallId,
-          state: 'output-error',
-          input: call.input,
-          errorText: normalizeToolError(errorsById.get(call.toolCallId)),
-        });
-      } else {
-        // No paired result AND no tool-error (e.g. aborted mid-step). Persisting
-        // a bare tool-call (input-available) would replay as an unpaired call and
-        // throw MissingToolResultsError on the next turn (convertToModelMessages
-        // emits no tool-result for it). Emit a SYNTHETIC paired result instead:
-        // an output-error round-trips through convertToModelMessages as a
-        // balanced tool-call + tool-result, keeping the rebuilt history valid.
-        parts.push({
-          type: `tool-${call.toolName}`,
-          toolCallId: call.toolCallId,
-          state: 'output-error',
-          input: call.input,
-          errorText: 'Tool call did not complete.',
-        });
-      }
-    }
+    parts.push(...stepParts);
   }
+  const sawText = parts.some((p) => p.type === 'text');
   if (!sawText && fallbackText) {
     // No per-step text (e.g. a single final block): append the final text after
     // any tool parts so the natural call -> result -> answer order is preserved.
@@ -2586,6 +2858,16 @@ export function flushAssistant(
     maxContextTokens?: number;
     error?: string;
     pageChanged?: { title: string; diff: string } | null;
+    // Per-turn step->parts memo (#490): pass the SAME cache on every flush of a
+    // turn so each finished step's output is stringified once, not once per flush.
+    partsCache?: StepPartsCache;
+    // #490 observability: when the replay budgeter trimmed this turn's history,
+    // the (estimated) token size it trimmed to — the UI can show "replay truncated
+    // at N tokens". Omitted when nothing was trimmed.
+    replayTrimmedToTokens?: number;
+    // #490 reactive branch: set when the provider rejected this turn for context
+    // overflow. Stamped into metadata so the NEXT turn's budgeter trims aggressively.
+    replayOverflow?: boolean;
   },
 ): AssistantFlush {
   const finished = capturedSteps ?? [];
@@ -2595,13 +2877,20 @@ export function flushAssistant(
   // in-progress step's text (the partial answer cut off by an error/abort, or
   // simply not yet flushed mid-stream) as the last text part so the persisted
   // parts match what streamed to the client.
-  const parts = assistantParts(finished, '') as unknown as Array<
-    Record<string, unknown>
-  >;
+  const parts = assistantParts(
+    finished,
+    '',
+    extra?.partsCache,
+  ) as unknown as Array<Record<string, unknown>>;
   if (trailing) parts.push({ type: 'text', text: trailing });
 
   const metadata: Record<string, unknown> = {
     parts: parts as unknown as UIMessage['parts'],
+    // Era marker for the `tool_calls` trace shape (#490): v2 stores outcome flags
+    // ({ ok } / { error, kind }) and NO tool output (the output lives once in
+    // `parts`). Old rows have no marker and the legacy { output } shape; a
+    // dual-shape query branches on this. Old rows are deliberately NOT migrated.
+    toolTraceVersion: 2,
   };
   // finishReason: prefer an explicit one; else derive a sensible value from the
   // terminal status (so onError/onAbort records keep their historical reason).
@@ -2617,6 +2906,9 @@ export function flushAssistant(
   if (extra?.contextTokens) metadata.contextTokens = extra.contextTokens;
   if (extra?.maxContextTokens)
     metadata.maxContextTokens = extra.maxContextTokens;
+  if (extra?.replayTrimmedToTokens)
+    metadata.replayTrimmedToTokens = extra.replayTrimmedToTokens;
+  if (extra?.replayOverflow) metadata.replayOverflow = true;
   if (extra?.error) metadata.error = extra.error;
   // Persist the page-change diff the agent saw this turn (#274 observability),
   // so history / the Markdown export can show what the user changed. Only when
@@ -2642,42 +2934,85 @@ export function flushAssistant(
 
 /**
  * Reduce SDK step objects to a compact, JSON-serializable trace for the
- * `tool_calls` column. Stores only what the UI action-log and history need —
- * never raw provider payloads or keys.
+ * `tool_calls` column — trace format **v2** (#490).
+ *
+ * v2 stores, per call, ONLY the metadata a queryable trace needs — never the
+ * tool OUTPUT. Before #490 each output was persisted TWICE: once here (compacted)
+ * and once in `metadata.parts` (via `assistantParts`), so a 50-step run with
+ * 50–200 KB outputs wrote hundreds of MB per turn (each `onStepFinish` rewrote
+ * the whole row). The parts copy is the one the model replays and the UI/Markdown
+ * export render, so the trace copy of the output was pure duplication. v2 keeps
+ * the output ONLY in parts and reduces the trace to outcome flags.
+ *
+ * Element shapes (paired per call, in order):
+ *  - `{ toolName, input }`                       — the call
+ *  - `{ toolName, ok: true }`                     — it returned a result (success)
+ *  - `{ toolName, error, kind: 'thrown' }`        — it threw a `tool-error`
+ *  - `{ toolName, error, kind: 'interrupted' }`   — no result and no throw (an
+ *      abort / server restart mid-step). `kind` is MANDATORY: without it a
+ *      synthetic "Tool call did not complete." is indistinguishable from a real
+ *      hard-fail and pollutes any error-rate scan. The distinction is STRUCTURAL
+ *      (an `errorsById` hit vs the synthetic fallback branch), NOT a per-tool
+ *      classifier — soft failures stay OUT of the trace (they live in
+ *      `metadata.parts` outputs; a per-tool mirror would persist its own bugs).
+ *
+ * Rows carry `metadata.toolTraceVersion: 2` (set by {@link flushAssistant}) so a
+ * dual-shape query can branch on the era. Old rows are NOT migrated (rewriting
+ * giant jsonb is the very WAL churn this removes); see docs/reading-ai-logs.md.
  */
 export function serializeSteps(
   steps: ReadonlyArray<{
-    toolCalls?: ReadonlyArray<{ toolName?: string; input?: unknown }>;
-    toolResults?: ReadonlyArray<{ toolName?: string; output?: unknown }>;
+    toolCalls?: ReadonlyArray<{
+      toolCallId?: string;
+      toolName?: string;
+      input?: unknown;
+    }>;
+    toolResults?: ReadonlyArray<{ toolCallId?: string; toolName?: string }>;
     content?: ReadonlyArray<{
       type?: string;
+      toolCallId?: string;
       toolName?: string;
       error?: unknown;
     }>;
   }>,
 ): unknown {
-  const calls: Array<{
-    toolName?: string;
-    input?: unknown;
-    output?: unknown;
-    error?: string;
-  }> = [];
+  const calls: Array<
+    | { toolName?: string; input?: unknown }
+    | { toolName?: string; ok: true }
+    | { toolName?: string; error: string; kind: 'thrown' | 'interrupted' }
+  > = [];
   for (const step of steps ?? []) {
+    // Index this step's results + thrown errors by tool call id, so each call is
+    // paired with its outcome (mirrors assistantParts' pairing exactly).
+    const resultIds = new Set<string>();
+    for (const r of step.toolResults ?? []) {
+      if (r.toolCallId) resultIds.add(r.toolCallId);
+    }
+    const errorsById = new Map<string, unknown>();
+    for (const part of step.content ?? []) {
+      if (part.type === 'tool-error' && part.toolCallId) {
+        errorsById.set(part.toolCallId, part.error);
+      }
+    }
     for (const call of step.toolCalls ?? []) {
       calls.push({ toolName: call.toolName, input: call.input });
-    }
-    for (const r of step.toolResults ?? []) {
-      calls.push({ toolName: r.toolName, output: compactToolOutput(r.output) });
-    }
-    // ai@6 surfaces a THROWN tool failure as a `tool-error` content part, NOT as
-    // a `toolResults` entry. Record it as its own paired element (mirroring how a
-    // successful result is appended) so the failure and its reason survive in the
-    // trace instead of leaving an orphaned call with no result.
-    for (const part of step.content ?? []) {
-      if (part.type === 'tool-error') {
+      if (call.toolCallId && resultIds.has(call.toolCallId)) {
+        // Success: the output itself lives in metadata.parts, not here.
+        calls.push({ toolName: call.toolName, ok: true });
+      } else if (call.toolCallId && errorsById.has(call.toolCallId)) {
+        // Hard fail: the tool threw. Persist the real (bounded) reason.
         calls.push({
-          toolName: part.toolName,
-          error: normalizeToolError(part.error),
+          toolName: call.toolName,
+          error: normalizeToolError(errorsById.get(call.toolCallId)),
+          kind: 'thrown',
+        });
+      } else {
+        // Neither a result nor a throw: interrupted mid-step (abort/restart).
+        // Marked structurally so it never inflates a thrown-error count.
+        calls.push({
+          toolName: call.toolName,
+          error: TOOL_CALL_INCOMPLETE_TEXT,
+          kind: 'interrupted',
         });
       }
     }

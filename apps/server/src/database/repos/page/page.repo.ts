@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB, KyselyTransaction } from '../../types/kysely.types';
-import { dbOrTx, executeTx } from '../../utils';
+import { dbOrTx, executeTx, registerAfterCommit } from '../../utils';
 import {
   InsertablePage,
   Page,
@@ -349,14 +349,23 @@ export class PageRepo {
     pageId: string,
     deletedById: string,
     workspaceId: string,
+    // Optional caller transaction. When passed, the reads + soft-delete run in
+    // THAT transaction (so a caller holding a `FOR UPDATE` lock on the row — e.g.
+    // the temporary-note sweeper — can delete under the lock without deadlocking
+    // on a nested independent transaction) and the PAGE_SOFT_DELETED broadcast is
+    // deferred to the caller's COMMIT via registerAfterCommit (so a rolled-back
+    // delete never broadcasts). With no trx the behaviour is unchanged: own
+    // transaction, broadcast right after it commits.
+    existingTrx?: KyselyTransaction,
   ): Promise<void> {
     const currentDate = new Date();
+    const readDb = dbOrTx(this.db, existingTrx);
 
     // Read the root snapshot up front so PAGE_SOFT_DELETED can carry it without
     // a post-commit DB read (variant A). Only the root of the deleted subtree is
     // needed for the tree broadcast — the client `treeModel.remove` drops all
     // descendants, so we don't snapshot/broadcast every descendant.
-    const rootSnapshot = await this.db
+    const rootSnapshot = await readDb
       .selectFrom('pages')
       .select([
         'id',
@@ -371,7 +380,7 @@ export class PageRepo {
       .where('deletedAt', 'is', null)
       .executeTakeFirst();
 
-    const descendants = await this.db
+    const descendants = await readDb
       .withRecursive('page_descendants', (db) =>
         db
           .selectFrom('pages')
@@ -393,39 +402,60 @@ export class PageRepo {
     const pageIds = descendants.map((d) => d.id);
 
     if (pageIds.length > 0) {
-      await executeTx(this.db, async (trx) => {
-        await trx
-          .updateTable('pages')
-          .set({
-            deletedById: deletedById,
-            deletedAt: currentDate,
-          })
-          .where('id', 'in', pageIds)
-          .where('deletedAt', 'is', null)
-          .execute();
+      // Reuse the caller's transaction when given (executeTx passes it straight
+      // through), else own a fresh one.
+      await executeTx(
+        this.db,
+        async (trx) => {
+          await trx
+            .updateTable('pages')
+            .set({
+              deletedById: deletedById,
+              deletedAt: currentDate,
+            })
+            .where('id', 'in', pageIds)
+            .where('deletedAt', 'is', null)
+            .execute();
 
-        await trx.deleteFrom('shares').where('pageId', 'in', pageIds).execute();
-      });
+          await trx
+            .deleteFrom('shares')
+            .where('pageId', 'in', pageIds)
+            .execute();
+        },
+        existingTrx,
+      );
 
-      this.eventEmitter.emit(EventName.PAGE_SOFT_DELETED, {
-        pageIds: pageIds,
-        workspaceId,
-        // Root-only snapshot: one `deleteTreeNode` is enough, the client removes
-        // the whole subtree. Skip if the root vanished between the two reads.
-        pages: rootSnapshot
-          ? [
-              {
-                id: rootSnapshot.id,
-                slugId: rootSnapshot.slugId,
-                title: rootSnapshot.title,
-                icon: rootSnapshot.icon,
-                position: rootSnapshot.position,
-                spaceId: rootSnapshot.spaceId,
-                parentPageId: rootSnapshot.parentPageId,
-              },
-            ]
-          : [],
-      });
+      const emitSoftDeleted = () => {
+        this.eventEmitter.emit(EventName.PAGE_SOFT_DELETED, {
+          pageIds: pageIds,
+          workspaceId,
+          // Root-only snapshot: one `deleteTreeNode` is enough, the client
+          // removes the whole subtree. Skip if the root vanished between reads.
+          pages: rootSnapshot
+            ? [
+                {
+                  id: rootSnapshot.id,
+                  slugId: rootSnapshot.slugId,
+                  title: rootSnapshot.title,
+                  icon: rootSnapshot.icon,
+                  position: rootSnapshot.position,
+                  spaceId: rootSnapshot.spaceId,
+                  parentPageId: rootSnapshot.parentPageId,
+                },
+              ]
+            : [],
+        });
+      };
+
+      if (existingTrx) {
+        // Inside a caller transaction: the delete above is NOT committed yet.
+        // Defer the tree broadcast to the caller's commit so a rolled-back delete
+        // never broadcasts a phantom removal.
+        registerAfterCommit(existingTrx, emitSoftDeleted);
+      } else {
+        // Own transaction already committed above — broadcast now.
+        emitSoftDeleted();
+      }
     }
   }
 

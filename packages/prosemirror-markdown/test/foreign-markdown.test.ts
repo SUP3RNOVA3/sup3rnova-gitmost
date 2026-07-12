@@ -1,12 +1,15 @@
+import { describe, it, expect } from 'vitest';
+import { convertProseMirrorToMarkdown } from '../src/lib/markdown-converter.js';
+import { markdownToProseMirror } from '../src/lib/markdown-to-prosemirror.js';
 import {
-  convertProseMirrorToMarkdown,
-  markdownToProseMirror,
-} from '@docmost/prosemirror-markdown';
-import { normalizeForeignMarkdown } from './foreign-markdown';
+  normalizeForeignMarkdown,
+  normalizeAgentMarkdown,
+} from '../src/lib/foreign-markdown.js';
 
 /**
- * STEP 2 goldens for issue #345: the foreign-markdown normalizer that runs at the
- * import boundary BEFORE the strict canonical parser (`markdownToProseMirror`).
+ * STEP 2 goldens for issue #345 (moved into the package with the normalizer in
+ * #493): the foreign-markdown normalizer that runs at the import boundary BEFORE
+ * the strict canonical parser (`markdownToProseMirror`).
  *
  * Two layers:
  *  1. PURE string→string cases pinning the normalizer's own behavior (GFM
@@ -214,5 +217,55 @@ describe('foreign markdown import acceptance (normalizer + canonical parser)', (
     expect(
       doc.content.filter((n: any) => n.type === 'footnotesList'),
     ).toHaveLength(1);
+  });
+});
+
+describe('normalizeAgentMarkdown vs normalizeForeignMarkdown — front-matter strip is IMPORT-only (#493 review)', () => {
+  // A page that OPENS with a horizontalRule and contains a later `---` serializes
+  // to a `---…---`-shaped body. On a full-body AGENT rewrite this must NOT be
+  // mistaken for YAML front-matter and stripped — that silently dropped the
+  // page's leading content.
+  const rulePage = '---\n\nIntro\n\nMore\n\n---\n\nRest';
+
+  it('normalizeAgentMarkdown does NOT strip a leading ---…--- (no content loss)', () => {
+    expect(normalizeAgentMarkdown(rulePage)).toBe(rulePage);
+  });
+
+  it('normalizeForeignMarkdown (file import) STILL strips a real leading YAML front-matter block', () => {
+    const withYaml = '---\ntitle: My Page\ntags: [a, b]\n---\n\nBody here.';
+    const out = normalizeForeignMarkdown(withYaml);
+    expect(out).toBe('Body here.');
+    // And the horizontalRule-shaped body IS stripped on the import path (its
+    // documented file-import behavior) — the two variants differ ONLY here.
+    expect(normalizeForeignMarkdown(rulePage)).not.toContain('Intro');
+  });
+
+  it('agent-write round-trip keeps a horizontalRule-led doc with a second rule intact', async () => {
+    // Simulate the serializer output for [horizontalRule, para, para, horizontalRule, para].
+    const doc = {
+      type: 'doc',
+      content: [
+        { type: 'horizontalRule' },
+        { type: 'paragraph', content: [{ type: 'text', text: 'Intro' }] },
+        { type: 'paragraph', content: [{ type: 'text', text: 'More' }] },
+        { type: 'horizontalRule' },
+        { type: 'paragraph', content: [{ type: 'text', text: 'Rest' }] },
+      ],
+    };
+    const body = convertProseMirrorToMarkdown(doc);
+    // The agent-write normalization must NOT eat the head; re-import keeps every
+    // paragraph's text.
+    const back = await markdownToProseMirror(normalizeAgentMarkdown(body));
+    const texts = JSON.stringify(back);
+    for (const t of ['Intro', 'More', 'Rest']) expect(texts).toContain(t);
+    // Both horizontal rules survive.
+    expect(back.content.filter((n: any) => n.type === 'horizontalRule')).toHaveLength(2);
+  });
+
+  it('agent-write STILL rewrites GFM reference footnotes (the shared drift-fix)', () => {
+    const gfm = 'See[^1].\n\n[^1]: the note.';
+    const out = normalizeAgentMarkdown(gfm);
+    expect(out).toContain('^[the note.]');
+    expect(out).not.toMatch(/\[\^1\]:/);
   });
 });

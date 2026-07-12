@@ -8,6 +8,8 @@
  * failure) before it runs. Different pages never block each other.
  */
 
+import type { PageId } from "./page-id.js";
+
 const chains = new Map<string, Promise<unknown>>();
 
 // Canonical UUID shape (versions 1–8, matching the `uuid` package's `validate`
@@ -28,11 +30,14 @@ export function isUuid(value: string): boolean {
 // awaited/handled by the caller; only the internal chaining tail swallows
 // errors (purely to gate ordering).
 export function withPageLock<T>(
-  pageId: string,
+  pageId: PageId,
   fn: () => Promise<T>,
 ): Promise<T> {
-  // STRUCTURAL INVARIANT (issue #449, "resolve-then-lock"): the mutex key MUST
-  // be the canonical page UUID, never a raw slugId. The whole write path relies
+  // STRUCTURAL INVARIANT (issue #449/#435, "resolve-then-lock"): the mutex key
+  // MUST be the canonical page UUID, never a raw slugId. The `PageId` brand now
+  // enforces this at COMPILE time (a raw string / slugId no longer type-checks
+  // as a key); the runtime assert below stays as a backstop for untyped (JS)
+  // callers and the http/stdio transports. The whole write path relies
   // on the lock key AND the CollabSession cache key being the resolved UUID
   // (#260) — if a future write method forgot to call resolvePageId and locked
   // under a slugId, two writes to the same page would take DIFFERENT mutex keys
