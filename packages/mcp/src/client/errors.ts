@@ -90,7 +90,14 @@ export function formatSpaceNotAccessible(
   if (listed.length > budget) {
     listed = listed.slice(0, Math.max(0, budget - 1)) + "…";
   }
-  return `${prefix}${listed}${suffix}`;
+  const message = `${prefix}${listed}${suffix}`;
+  // Unconditional final backstop (mirrors formatDocmostAxiosError): the list
+  // cap above assumes a well-formed prefix, but a pathologically long
+  // agent-supplied spaceId lives in the prefix and would otherwise blow past the
+  // budget. Cap the WHOLE message so nothing bloats the model context.
+  return message.length > ERROR_MESSAGE_CAP
+    ? message.slice(0, ERROR_MESSAGE_CAP - 1) + "…"
+    : message;
 }
 
 // Keep ONLY the pathname of a request (no host, no query string, no fragment)
