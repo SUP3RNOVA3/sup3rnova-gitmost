@@ -61,11 +61,48 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
       if (!source) return;
       const oldParentId = source.parentPageId ?? null;
 
-      // optimistic apply with the new position from the payload
-      let optimistic = treeModel.update(after, sourceId, {
-        position: payload.position,
-        parentPageId: payload.parentPageId,
-      } as Partial<SpaceTreeNode>);
+      // Child-loss guard (#523, twin of #525's realtime `insertByPosition` fix).
+      // We no longer auto-expand the make-child target on drop, so the old
+      // `onToggle(target, true)` — which was ALSO the only trigger of the
+      // corrective lazy-load — is gone. `treeModel.move` materialized
+      // `target.children = [source]` (only the moved node); if the target is an
+      // UNLOADED branch (server has children but none are loaded here), keeping
+      // that partial `[source]` list would defeat the lazy-load gate and hide the
+      // target's OTHER server children (the #159 #1 data-loss class). So for an
+      // unloaded make-child target, build the optimistic tree WITHOUT
+      // materializing source under it: just remove source from its old parent and
+      // flag the target `hasChildren`. The gate stays armed and a later manual
+      // expand fetches the FULL set (incl. the moved page, which the awaited
+      // server move persists). Predicate is the gate's (`isUnloadedBranch`), NOT
+      // `insertByPosition`'s old `=== undefined` (canonical unloaded is `[]`).
+      const target =
+        op.kind === "make-child"
+          ? (treeModel.find(before, op.targetId) as SpaceTreeNode | null)
+          : null;
+      const unloadedMakeChild =
+        op.kind === "make-child" && treeModel.isUnloadedBranch(target);
+
+      let optimistic: SpaceTreeNode[];
+      if (unloadedMakeChild) {
+        // Do NOT materialize [source] into the unloaded target.
+        optimistic = treeModel.remove(before, sourceId);
+        optimistic = treeModel.update(optimistic, op.targetId, {
+          hasChildren: true,
+        } as Partial<SpaceTreeNode>);
+      } else {
+        // optimistic apply with the new position from the payload
+        optimistic = treeModel.update(after, sourceId, {
+          position: payload.position,
+          parentPageId: payload.parentPageId,
+        } as Partial<SpaceTreeNode>);
+        // For make-child onto a previously-childless (loaded) target: flip
+        // hasChildren on so the new parent shows its chevron.
+        if (op.kind === "make-child") {
+          optimistic = treeModel.update(optimistic, op.targetId, {
+            hasChildren: true,
+          } as Partial<SpaceTreeNode>);
+        }
+      }
 
       // If the old parent has no children left, mark hasChildren: false so the
       // chevron disappears. Without this, the empty parent keeps rendering an
@@ -77,14 +114,6 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
             hasChildren: false,
           } as Partial<SpaceTreeNode>);
         }
-      }
-
-      // For make-child onto a previously-childless target: flip hasChildren on
-      // so the new parent shows its chevron.
-      if (op.kind === "make-child") {
-        optimistic = treeModel.update(optimistic, op.targetId, {
-          hasChildren: true,
-        } as Partial<SpaceTreeNode>);
       }
 
       setData(optimistic);
