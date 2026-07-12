@@ -48,8 +48,11 @@ export class ApiKeyService {
    *      written (inert), so a half-created key cannot exist.
    *   3. insert the row last. A lost response leaves an orphaned row that is
    *      visible in `list` and self-heals (the user revokes it).
-   * The token is returned ONCE and never stored — the JWT is self-contained, so
-   * no token material lives in the table.
+   * No token material is ever stored — the JWT is self-contained (its `api_keys`
+   * row holds only metadata + lifetime, never the token). The token is returned
+   * here on create AND is re-obtainable any time by its owner via a deterministic
+   * re-mint under a password step-up (POST /api-keys/reveal); it is deterministic
+   * precisely because it carries no `iat`/`exp` (see TokenService).
    *
    * `expiresAt`: `undefined` -> default 1 year; `null` -> unlimited (explicit);
    * a Date -> that instant (a past date is rejected at the DTO layer).

@@ -98,7 +98,8 @@ export class ApiKeyController {
     });
     // Durable audit is via DatabaseAuditService (#496); this structured log is a
     // second, container-log trail. No token material — the JWT is only ever
-    // returned in the response.
+    // returned in a response body (here on create, or via /api-keys/reveal),
+    // never logged and never stored.
     this.logger.log(
       `API key created: id=${key.id} name=${JSON.stringify(
         key.name,
@@ -107,9 +108,9 @@ export class ApiKeyController {
       } ip=${this.clientIp(req)}`,
     );
 
-    // Return the token ONCE (never retrievable again) and the computed expiry so
-    // the caller/UI can surface "expires <date>" (the year-default time-bomb
-    // early-warning).
+    // Return the token (also re-obtainable later by the owner via
+    // /api-keys/reveal under a step-up) and the computed expiry so the caller/UI
+    // can surface "expires <date>" (the year-default time-bomb early-warning).
     return {
       token,
       apiKey: {

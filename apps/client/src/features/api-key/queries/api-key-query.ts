@@ -31,12 +31,12 @@ export function useApiKeysQuery(): UseQueryResult<IApiKey[], Error> {
 /**
  * Create mutation.
  *
- * SECURITY: the response contains the token exactly once. This hook deliberately
- * does NOT stash it anywhere — the caller reads it from `mutateAsync`'s resolved
- * value, moves it into the show-once modal's local state, then calls
- * `mutation.reset()` to purge react-query's own copy immediately. `gcTime: 0`
- * is a second belt so nothing lingers in the mutation cache after the observer
- * unmounts. The list is invalidated here (the list carries no token).
+ * SECURITY: the response contains the token. This hook deliberately does NOT
+ * stash it anywhere — the caller reads it from `mutateAsync`'s resolved value
+ * and immediately calls `mutation.reset()` to purge react-query's own copy (the
+ * create flow discards the token; it is re-obtainable later via the reveal/copy
+ * action). `gcTime: 0` is a second belt so nothing lingers in the mutation cache
+ * after the observer unmounts. The list is invalidated here (it carries no token).
  */
 export function useCreateApiKeyMutation() {
   const queryClient = useQueryClient();

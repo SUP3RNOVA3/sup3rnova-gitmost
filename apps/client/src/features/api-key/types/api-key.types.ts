@@ -31,7 +31,8 @@ export interface ICreateApiKey {
 }
 
 // The metadata half of the create response. The token itself is carried
-// separately (see ICreateApiKeyResponse) and is shown exactly once.
+// separately (see ICreateApiKeyResponse); it is re-obtainable later by its owner
+// via a deterministic re-mint under a step-up (POST /api-keys/reveal).
 export interface ICreatedApiKey {
   id: string;
   name: string;
