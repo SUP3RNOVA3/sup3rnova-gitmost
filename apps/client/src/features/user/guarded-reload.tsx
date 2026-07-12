@@ -87,11 +87,12 @@ function showReloadBanner(): void {
  * version and, on a real mismatch, show the banner and arm a guarded reload for
  * the next in-app navigation (variant C).
  *
- * - real mismatch (first this session) → banner + arm navigation reload. The
- *   banner's "Update" button reloads immediately (same one-shot guard). The tab
- *   is NOT reloaded on visibility change.
- * - auto-reload already used / storage error → banner only (no arm), so there is
- *   at most one automatic reload per session (loop safety).
+ * - real mismatch (window budget available) → banner + arm navigation reload.
+ *   The banner's "Update" button reloads immediately (same shared window guard).
+ *   The tab is NOT reloaded on visibility change.
+ * - auto-reload already used this window / storage error → banner only (no arm),
+ *   so there is at most one automatic reload per RELOAD_WINDOW_MS window (loop
+ *   safety).
  * - in sync / unknown version → noop (fail-safe).
  */
 export function triggerGuardedReload(
@@ -120,11 +121,11 @@ export function triggerGuardedReload(
   lastClientVersion = clientVersion;
 
   if (action === "banner") {
-    // Entered banner-only (permanent skew, node oscillation, or spent
-    // auto-reload). Log for diagnosability; show the manual banner.
+    // Entered banner-only (permanent skew, node oscillation, or the window's
+    // auto-reload budget already spent). Log for diagnosability; show the banner.
     console.warn(
       `[version-coherence] server=${serverVersion} client=${clientVersion}: ` +
-        "auto-reload already spent this session — showing manual banner",
+        "auto-reload budget already spent this window — showing manual banner",
     );
     showReloadBanner();
     return;

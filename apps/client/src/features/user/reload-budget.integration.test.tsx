@@ -119,6 +119,31 @@ describe("shared window-based reload budget (invariant a)", () => {
     expect(reload).toHaveBeenCalledTimes(1);
   });
 
+  it("reactive path fails closed when storage READS but cannot WRITE (quota / Safari private): no unguarded reload", () => {
+    // getItem→null makes hasAutoReloaded() report the budget as available, so
+    // handleError passes the first guard and reaches `if (!markAutoReloaded())
+    // return;`. setItem throws → the stamp cannot stick, so markAutoReloaded()
+    // returns false and that guard MUST bail — otherwise the reactive path would
+    // reload on every stale-chunk error with no persisted budget (an unguarded
+    // loop). This is the asymmetric gap: the proactive path's equivalent is
+    // covered by guarded-reload.test.tsx "does NOT reload when the flag write
+    // fails".
+    vi.stubGlobal("sessionStorage", {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error("quota exceeded");
+      },
+      removeItem: () => {},
+      clear: () => {},
+    });
+    try {
+      handleError(CHUNK_ERROR);
+      expect(reload).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("sessionStorage unavailable: neither path performs an unguarded reload", () => {
     // The real guard fails toward NOT reloading when storage throws.
     vi.stubGlobal("sessionStorage", {

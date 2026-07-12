@@ -10,9 +10,9 @@ export type AppVersionSocketPayload = { version: string };
  * All inputs are injected (no globals, no side effects) so it is unit-testable
  * without a DOM or the build-time `APP_VERSION` global (undefined under vitest).
  *
- * - `autoReloadUsed` = a session-wide automatic reload has already happened,
- *   so we must not auto-reload again (loop safety, shared with the reactive
- *   chunk-load boundary).
+ * - `autoReloadUsed` = an automatic reload has already happened within the
+ *   current ~5-min window, so we must not auto-reload again (loop safety,
+ *   shared window budget with the reactive chunk-load boundary).
  *
  * Returns:
  * - "noop"   — do nothing (unknown version on either side, or already in sync).
@@ -27,6 +27,6 @@ export function decideVersionAction(args: {
   const { serverVersion, clientVersion, autoReloadUsed } = args;
   if (!serverVersion || !clientVersion) return "noop"; // fail-safe: unknown version → never act
   if (serverVersion === clientVersion) return "noop"; // in sync
-  if (autoReloadUsed) return "banner"; // one auto-reload per session already spent
-  return "reload"; // real mismatch, first time this session
+  if (autoReloadUsed) return "banner"; // one auto-reload per RELOAD_WINDOW_MS window already spent
+  return "reload"; // real mismatch, window budget available
 }
