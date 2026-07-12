@@ -92,13 +92,23 @@
    wrapper, never in the document model) and is rendered inline at the start of
    the first content line via ::before. This keeps text and wrapped lines flush
    to the left margin — no hanging indent — while the editable contentDOM stays
-   the FIRST DOM child (#146). */
+   the FIRST DOM child (#146).
+
+   The rules below target `p:first-child`, NOT `> :first-child`: tiptap-react
+   wraps the NodeViewContent children in an extra block-level div
+   (`[data-node-view-content-react]`, style="white-space: inherit"), so
+   `.definitionContent`'s first child is that wrapper, not the paragraph. An
+   inline ::before on the block wrapper (whose child is a block <p>) drops onto
+   its own line above the text — the "+1 line" regression. `p:first-child`
+   reaches the real first paragraph so the number stays inline, and it works
+   whether or not the wrapper is present (definition content is `paragraph+`,
+   so there are no nested paragraphs to mis-match). */
 .definitionContent {
   flex: 1 1 auto;
   min-width: 0;
 }
 
-.definitionContent > :first-child::before {
+.definitionContent p:first-child::before {
   content: var(--footnote-number, "?") ". ";
   color: var(--mantine-color-dimmed);
   font-variant-numeric: tabular-nums;
@@ -108,12 +118,13 @@
 /* The inner editable paragraph inherits `.ProseMirror p { margin: 0.5em 0 }`.
    Drop the outer margins so the definition sits tight to the heading above and
    the ::before number aligns with the top of the row — same approach used for
-   callouts in core.css. */
-.definitionContent > :first-child {
+   callouts in core.css. Target the paragraphs directly (through the
+   tiptap-react content wrapper), same reasoning as the ::before rule above. */
+.definitionContent p:first-child {
   margin-top: 0;
 }
 
-.definitionContent > :last-child {
+.definitionContent p:last-child {
   margin-bottom: 0;
 }
 
