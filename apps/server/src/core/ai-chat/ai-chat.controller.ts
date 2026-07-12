@@ -35,6 +35,7 @@ import {
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
+import { AiChatRunStepRepo } from '@docmost/db/repos/ai-chat/ai-chat-run-step.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { UserThrottlerGuard } from '../../integrations/throttle/user-throttler.guard';
 import { AI_CHAT_THROTTLER } from '../../integrations/throttle/throttler-names';
@@ -43,6 +44,8 @@ import {
   AiChatRunHooks,
   AiChatService,
   AiChatStreamBody,
+  rowHasInlineParts,
+  hydrateAssistantParts,
 } from './ai-chat.service';
 import { AiChatRunService } from './ai-chat-run.service';
 import { AiTranscriptionService } from './ai-transcription.service';
@@ -129,7 +132,38 @@ export class AiChatController {
     // production. Only touched on the resumable-stream (flag-on) path.
     private readonly streamRegistry?: AiChatStreamRegistryService,
     private readonly environment?: EnvironmentService,
+    // #492: reconstruct a #492 mid-run record's parts from the steps table before
+    // returning rows to the client / export. OPTIONAL so positional controller
+    // specs compile unchanged; when absent, hydration is skipped (old-era rows
+    // already carry inline parts, so nothing to reconstruct).
+    private readonly aiChatRunStepRepo?: AiChatRunStepRepo,
   ) {}
+
+  /**
+   * Reconstruct parts for any assistant rows that don't carry them INLINE — a
+   * #492 mid-run record whose per-step parts live in `ai_chat_run_steps` (the
+   * append-persist backend). Every FINISHED row (old-era + #492) and every old-era
+   * streaming snapshot already has inline `metadata.parts`, so the common path
+   * fetches NOTHING and returns the rows untouched; only an actively-streaming
+   * new-style row triggers the batch step fetch. Consumers (seed/poll/export) read
+   * `metadata.parts` off the returned rows exactly as before — the era switch is
+   * invisible to them (reconstructRunParts contract).
+   */
+  private async withReconstructedParts(
+    rows: AiChatMessage[],
+    workspaceId: string,
+  ): Promise<AiChatMessage[]> {
+    if (!this.aiChatRunStepRepo) return rows;
+    const needy = rows.filter(
+      (r) => r.role === 'assistant' && !rowHasInlineParts(r),
+    );
+    if (needy.length === 0) return rows;
+    const stepsByMessage = await this.aiChatRunStepRepo.findByMessageIds(
+      needy.map((r) => r.id),
+      workspaceId,
+    );
+    return hydrateAssistantParts(rows, stepsByMessage);
+  }
 
   /** List the requesting user's chats in this workspace (paginated). */
   @HttpCode(HttpStatus.OK)
@@ -184,11 +218,17 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ) {
     await this.assertOwnedChat(dto.chatId, user, workspace);
-    return this.aiChatMessageRepo.findByChat(
+    const page = await this.aiChatMessageRepo.findByChat(
       dto.chatId,
       workspace.id,
       pagination,
     );
+    // #492: reconstruct parts for any active new-style row so the client seed sees
+    // `metadata.parts` unchanged (a no-op for the finished rows that fill a page).
+    return {
+      ...page,
+      items: await this.withReconstructedParts(page.items, workspace.id),
+    };
   }
 
   /**
@@ -225,7 +265,10 @@ export class AiChatController {
       workspace.id,
     );
     return {
-      rows,
+      // #492: the delta of an actively-streaming new-style row carries its parts
+      // reconstructed from the steps table, so the degraded poll shows persisted
+      // progress exactly as the pre-#492 full-row snapshot did.
+      rows: await this.withReconstructedParts(rows, workspace.id),
       cursor,
       run: run ? { id: run.id, status: run.status } : null,
     };
@@ -247,8 +290,10 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<{ markdown: string }> {
     const chat = await this.assertOwnedChat(dto.chatId, user, workspace);
-    const rows = await this.aiChatMessageRepo.findAllByChat(
-      dto.chatId,
+    const rows = await this.withReconstructedParts(
+      await this.aiChatMessageRepo.findAllByChat(dto.chatId, workspace.id),
+      // #492: an interrupted-but-still-active turn exports its persisted steps
+      // (reconstructed from the steps table) just like the pre-#492 full row did.
       workspace.id,
     );
     const markdown = buildChatMarkdown({
@@ -288,7 +333,13 @@ export class AiChatController {
           workspace.id,
         )
       : undefined;
-    return { run, message: message ?? null };
+    // #492: reconnect to an IN-FLIGHT run reconstructs the projection row's parts
+    // from the steps table (the row itself carries only the step marker mid-run);
+    // a finished run's row already has inline parts, so this is a no-op.
+    const [hydrated] = message
+      ? await this.withReconstructedParts([message], workspace.id)
+      : [undefined];
+    return { run, message: hydrated ?? null };
   }
 
   /**

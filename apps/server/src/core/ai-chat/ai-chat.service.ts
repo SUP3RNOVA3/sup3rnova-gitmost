@@ -22,6 +22,7 @@ import { AiSettingsService } from '../../integrations/ai/ai-settings.service';
 import { describeProviderError } from '../../integrations/ai/ai-error.util';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
+import { AiChatRunStepRepo } from '@docmost/db/repos/ai-chat/ai-chat-run-step.repo';
 import { AiChatPageSnapshotRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-snapshot.repo';
 import { AiAgentRoleRepo } from '@docmost/db/repos/ai-agent-roles/ai-agent-roles.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
@@ -518,6 +519,12 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
     // constructions compile unchanged; Nest always injects the real singleton, so
     // reconcile sees the SAME in-memory active/zombie maps the runner mutates.
     private readonly aiChatRunService?: AiChatRunService,
+    // #492 append-persist: per-step INSERT into the lightweight steps table (the
+    // O(Σ steps) replacement for the O(n²) full-row `metadata.parts` rewrite).
+    // OPTIONAL so existing positional constructions (int-specs) compile unchanged;
+    // Nest injects the real singleton. When ABSENT the per-step path falls back to
+    // the pre-#492 full-row flush (no regression, only no WAL win).
+    private readonly aiChatRunStepRepo?: AiChatRunStepRepo,
   ) {}
 
   // #487: periodic reconcile timer (single-process phase 1). Started in
@@ -1114,8 +1121,34 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         chatId,
         workspace.id,
       );
+      // #492: HYDRATE needy assistant rows from the steps table BEFORE the replay
+      // map. A #492 mid-run assistant row carries only a step marker
+      // (metadata.parts:[]); its real per-step parts live in `ai_chat_run_steps`.
+      // The graceful terminal callbacks (onFinish/onError/onAbort -> flushAssistant)
+      // assemble the full inline parts, so a normally-ended turn already has them.
+      // But a HARD crash mid-run (SIGKILL/OOM) fires NO terminal callback, so the
+      // row stays parts:[]; without this, rowToUiMessage falls back to an empty
+      // text part and the partial tool-calls/results/text — durable in the steps
+      // table — would DROP OUT of the model's replay context (regressing #183
+      // step-granular durability for the model consumer). Mirrors the controller's
+      // withReconstructedParts EXACTLY (same needy predicate + hydration helper).
+      // Guarded on the optional repo: absent (positional test builds) degrades to
+      // the current behavior rather than crashing.
+      let replayHistory = oldHistory;
+      if (this.aiChatRunStepRepo) {
+        const needy = oldHistory.filter(
+          (r) => r.role === 'assistant' && !rowHasInlineParts(r),
+        );
+        if (needy.length > 0) {
+          const stepsByMessage = await this.aiChatRunStepRepo.findByMessageIds(
+            needy.map((r) => r.id),
+            workspace.id,
+          );
+          replayHistory = hydrateAssistantParts(oldHistory, stepsByMessage);
+        }
+      }
       const uiMessages: Array<Omit<UIMessage, 'id'> & { id: string }> = [
-        ...oldHistory.map(rowToUiMessage),
+        ...replayHistory.map(rowToUiMessage),
         {
           id: 'pending-user',
           role: 'user',
@@ -1154,7 +1187,9 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       // hint — confirm it against the persisted history (the preceding assistant
       // turn must really be aborted/streaming) so a spoofed flag cannot inject the
       // interrupt note onto an ordinary turn. The partial output the model needs is
-      // already in `messages` (the aborted assistant row replays via findRecent).
+      // already in `messages`: a #492 mid-run row's per-step parts live only in the
+      // `ai_chat_run_steps` table and were hydrated into the replay history above,
+      // so the aborted assistant turn replays WITH its partial parts intact.
       // Append the new user turn (shape-only) so index -2 is the prior assistant.
       const interrupted = isInterruptResume(
         [...oldHistory, { role: 'user', status: null, metadata: null }],
@@ -1559,17 +1594,57 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         // connection when finalize runs, so the SQL `WHERE status='streaming'`
         // (not this flag) is what prevents it clobbering the terminal row.
         if (finalized) return null;
-        // Build the flush ONCE so the returned count is EXACTLY the persisted
-        // `stepsPersisted` (both derive from capturedSteps.length at this instant).
-        const flushed = flushAssistant(capturedSteps, '', 'streaming', {
-          pageChanged,
-          partsCache,
-        });
-        const stepsPersisted = flushed.metadata.stepsPersisted as number;
+        // The count derives from capturedSteps.length at THIS instant, so the
+        // returned value is EXACTLY the persisted `stepsPersisted` the ring rotates
+        // on (whether we take the append-persist path or the legacy fallback).
+        const stepsPersisted = capturedSteps.length;
         try {
-          await this.aiChatMessageRepo.update(assistantId, workspace.id, flushed, {
-            onlyIfStreaming: true,
-          });
+          if (this.aiChatRunStepRepo) {
+            // #492 APPEND-PERSIST: write only THIS finished step's parts to the
+            // steps table (O(step) WAL), then bump the row's CHEAP step marker —
+            // NO growing `metadata.parts` blob (that O(n²) full-row rewrite is
+            // exactly what this removes). The full `metadata.parts` is assembled
+            // once at finalize; a mid-run resume seed is reconstructed from the
+            // step rows (reconstructRunParts). The INSERT is idempotent
+            // (ON CONFLICT DO NOTHING), so a re-fired step never doubles the parts.
+            const index = stepsPersisted - 1;
+            if (index >= 0) {
+              const stepParts = assistantParts(
+                [capturedSteps[index]],
+                '',
+                partsCache,
+              );
+              await this.aiChatRunStepRepo.insertStep(
+                assistantId,
+                workspace.id,
+                index,
+                stepParts,
+              );
+            }
+            // Marker UPDATE: advance stepsPersisted + keep the toolTrace era marker
+            // (bumps updatedAt so the delta poll observes the step, and carries the
+            // frontier a resuming client attaches from). Scoped onlyIfStreaming so a
+            // late marker never clobbers the terminal finalize.
+            await this.aiChatMessageRepo.update(
+              assistantId,
+              workspace.id,
+              { metadata: stepMarkerMetadata(stepsPersisted) },
+              { onlyIfStreaming: true },
+            );
+          } else {
+            // Legacy fallback (no steps table wired — positional test builds): the
+            // pre-#492 full-row flush, so parts still land inline on the row.
+            const flushed = flushAssistant(capturedSteps, '', 'streaming', {
+              pageChanged,
+              partsCache,
+            });
+            await this.aiChatMessageRepo.update(
+              assistantId,
+              workspace.id,
+              flushed,
+              { onlyIfStreaming: true },
+            );
+          }
           return stepsPersisted;
         } catch (err) {
           this.logger.warn(
@@ -2747,6 +2822,122 @@ export function rowToUiMessage(row: AiChatMessage): Omit<UIMessage, 'id'> & {
       ? meta.parts
       : textPart(row.content ?? '');
   return { id: row.id, role, parts: parts as UIMessage['parts'] };
+}
+
+/**
+ * Cheap step-marker metadata for the #492 per-step UPDATE. Advances
+ * `stepsPersisted` (the resume attach frontier) and keeps the `toolTraceVersion`
+ * era marker, WITHOUT the growing `parts` blob (those live in the steps table
+ * now; the full `metadata.parts` is assembled once at finalize by flushAssistant).
+ * `parts: []` is kept for shape stability — it reads as an empty inline-parts row,
+ * which is exactly the discriminator that routes reconstruction to the steps table.
+ */
+export function stepMarkerMetadata(
+  stepsPersisted: number,
+): Record<string, unknown> {
+  return { parts: [], toolTraceVersion: 2, stepsPersisted };
+}
+
+/**
+ * Whether an assistant row already carries its full UI parts INLINE on the row
+ * (`metadata.parts`). TRUE for every FINISHED row — old-era rows AND #492 rows,
+ * whose full parts are assembled once at finalize — and for old-era streaming
+ * snapshots (the pre-#492 per-step full-row flush). FALSE for a #492 MID-RUN
+ * record, whose per-step parts live in the `ai_chat_run_steps` table. This is the
+ * era discriminator the reconstruct seam branches on — no schema flag needed.
+ */
+export function rowHasInlineParts(row: { metadata?: unknown }): boolean {
+  const meta = (row.metadata ?? {}) as { parts?: unknown };
+  return Array.isArray(meta.parts) && meta.parts.length > 0;
+}
+
+/**
+ * Concatenate persisted per-step parts (in `stepIndex` order) into the turn's UI
+ * parts (#492). Reproduces EXACTLY what flushAssistant → assistantParts would have
+ * written to `metadata.parts` for those finished steps, since each step row stored
+ * `assistantParts([step])` at persist time.
+ */
+export function assembleStepParts(
+  stepRows: ReadonlyArray<{ stepIndex: number; parts: unknown }>,
+): UIMessage['parts'] {
+  const parts: Array<Record<string, unknown>> = [];
+  for (const step of [...stepRows].sort((a, b) => a.stepIndex - b.stepIndex)) {
+    if (Array.isArray(step.parts)) {
+      parts.push(...(step.parts as Array<Record<string, unknown>>));
+    }
+  }
+  return parts as UIMessage['parts'];
+}
+
+/**
+ * reconstructRunParts (#492) — the single backend-switch seam. Given an assistant
+ * ROW and its persisted step rows, return the turn's UI `parts` + the persisted
+ * step count, reading from the ROW when it already carries inline parts (old-era
+ * records AND every finished record) and from the STEPS TABLE otherwise (a #492
+ * mid-run record). The higher-level consumers (attach seed, delta poll, export)
+ * route their row→parts through this / {@link hydrateAssistantParts}, so old and
+ * new records reconstruct identically WITHOUT the consumers branching on the era.
+ */
+export function reconstructRunParts(
+  row: { metadata?: unknown; content?: string | null },
+  stepRows: ReadonlyArray<{ stepIndex: number; parts: unknown }>,
+): { parts: UIMessage['parts']; stepsPersisted: number } {
+  if (rowHasInlineParts(row)) {
+    const meta = row.metadata as {
+      parts: UIMessage['parts'];
+      stepsPersisted?: number;
+    };
+    return {
+      parts: meta.parts,
+      stepsPersisted:
+        typeof meta.stepsPersisted === 'number'
+          ? meta.stepsPersisted
+          : stepRows.length,
+    };
+  }
+  if (stepRows.length > 0) {
+    return {
+      parts: assembleStepParts(stepRows),
+      stepsPersisted: stepRows.length,
+    };
+  }
+  // No inline parts and no step rows: an old-era seed / empty streaming row. Fall
+  // back to a single text part from `content` (mirrors rowToUiMessage).
+  return {
+    parts: textPart(row.content ?? '') as UIMessage['parts'],
+    stepsPersisted: 0,
+  };
+}
+
+/**
+ * Fill each assistant row's `metadata.parts` from its step rows when the row does
+ * not already carry them inline (a #492 mid-run record), so a consumer that reads
+ * `metadata.parts` off the RAW row (the client seed/poll, the Markdown export)
+ * sees the reconstructed parts with NO change to itself. Rows that already have
+ * inline parts (old-era + finished) and non-assistant rows pass through untouched.
+ * Pure: returns new row objects, never mutates the inputs.
+ */
+export function hydrateAssistantParts<
+  T extends { id: string; role?: string; metadata?: unknown },
+>(
+  rows: ReadonlyArray<T>,
+  stepsByMessage: Map<
+    string,
+    ReadonlyArray<{ stepIndex: number; parts: unknown }>
+  >,
+): T[] {
+  return rows.map((row) => {
+    if (row.role !== 'assistant' || rowHasInlineParts(row)) return row;
+    const steps = stepsByMessage.get(row.id);
+    if (!steps || steps.length === 0) return row;
+    return {
+      ...row,
+      metadata: {
+        ...((row.metadata ?? {}) as Record<string, unknown>),
+        parts: assembleStepParts(steps),
+      },
+    };
+  });
 }
 
 /**
