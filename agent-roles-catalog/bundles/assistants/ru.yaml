@@ -345,6 +345,9 @@ roles:
         □ Working sections («Журнал», «Открытые вопросы», «Ревизия») are moved to
           an appendix at the end of the document or clearly separated from the
           report body.
+        □ Once the report is complete, call save_page_version to pin the finished
+          document as a restorable named version (a checkpoint the reader can
+          return to). A repeat call after no further edits is a harmless no-op.
       Be honest about gaps. If you couldn't find something, say so — don't disguise
       a guess as a fact.
     autoStart: false
@@ -441,6 +444,7 @@ roles:
       - **Язык конспекта = основной язык созвона.** Технические термины — в каноническом написании (обычно латиницей).
       - **Не оценивай участников** и не комментируй качество обсуждения.
       - На выходе — только конспект, без преамбул и мета-комментариев, кроме точечных пометок неуверенности.
+      - **Зафиксируй результат.** Когда конспект готов на странице, вызови save_page_version, чтобы сохранить его как именованную версию (точку восстановления). Повторный вызов без новых правок — безвредный no-op.
 
       ## Пример стиля (фрагмент)
 

@@ -139,7 +139,13 @@ export interface CollabProviderLike {
   unsyncedChanges: number;
   destroy(): void;
   on(event: "unsyncedChanges", handler: (data: { number: number }) => void): void;
+  on(event: "stateless", handler: (data: { payload: string }) => void): void;
   off(event: "unsyncedChanges", handler: (data: { number: number }) => void): void;
+  off(event: "stateless", handler: (data: { payload: string }) => void): void;
+  // Send a stateless (out-of-band, non-doc) message to the server. Used by the
+  // #370 explicit save-version path (payload `{type:'save-version'}`); the server
+  // replies with a broadcast `{type:'version.saved', …}` on the same channel.
+  sendStateless(payload: string): void;
 }
 
 /** The configuration object passed to the provider factory. */
@@ -561,6 +567,125 @@ export class CollabSession {
       if (process.env.DEBUG)
         console.error("Content written, waiting for server to persist...");
       waitForPersistence();
+    });
+  }
+
+  /**
+   * Send a stateless message over the live collaboration connection and resolve
+   * with the FIRST reply whose parsed payload satisfies `predicate`, rejecting on
+   * a bounded `timeoutMs`.
+   *
+   * Used by the #370 explicit save-version path: the client sends
+   * `{type:'save-version'}` and awaits the server's broadcast
+   * `{type:'version.saved', historyId, kind, alreadySaved}`. The stateless channel
+   * (not a REST read) is deliberate — the server versions the LIVE in-memory ydoc,
+   * which the up-to-10s-stale page row would not yet reflect.
+   *
+   * `predicate` receives each incoming stateless message (already JSON-parsed) and
+   * returns the resolved value for a match or `undefined` to keep waiting; a
+   * malformed / unrelated payload is ignored. The listener is registered BEFORE
+   * the send so a fast reply is never missed.
+   *
+   * Lifecycle mirrors mutate(): it registers through `inflightReject` so a
+   * disconnect/close/auth-failure/teardown rejects THIS wait with the same
+   * connection-loss error, refuses to run on a non-ready session, fails fast on a
+   * concurrent in-flight op (the caller MUST hold the per-page lock), and re-arms
+   * the idle TTL (or self-destroys an ephemeral session) on completion.
+   *
+   * NOTE: the server broadcast carries no request-correlation id, so under a
+   * genuinely concurrent save on the SAME page (e.g. a human Cmd+S racing the
+   * agent) this resolves on whichever `version.saved` arrives first. The per-page
+   * lock serializes THIS process's saves; a cross-client race is inherent to the
+   * broadcast design and is benign (the result still describes a real save of this
+   * page's current content, and the server's save is promote-not-duplicate).
+   */
+  sendStatelessAndAwait<T>(
+    payload: string,
+    predicate: (message: any) => T | undefined,
+    timeoutMs: number,
+  ): Promise<T> {
+    // Belt-and-suspenders (acquire already validated): refuse to send on a
+    // session that is not in a live, synced, ready state.
+    if (
+      this.dead ||
+      this.state !== "ready" ||
+      this.connectionLost ||
+      !this.provider ||
+      this.provider.synced !== true
+    ) {
+      return Promise.reject(
+        new Error("Collaboration session is not in a ready state"),
+      );
+    }
+
+    // Fail-fast on concurrent use: a second overlapping op would overwrite the
+    // first's inflightReject and hang it on disconnect (same guard as mutate).
+    if (this.inflightReject) {
+      return Promise.reject(
+        new Error(
+          "stateless op already in-flight; caller must serialize (hold the page lock)",
+        ),
+      );
+    }
+
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let statelessHandler: ((data: { payload: string }) => void) | undefined;
+
+      const localFinish = (err: Error | null, value?: T) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (statelessHandler && this.provider) {
+          try {
+            this.provider.off("stateless", statelessHandler);
+          } catch (e) {}
+        }
+        this.inflightReject = undefined;
+        if (err) reject(err);
+        else resolve(value as T);
+        // Post-settle lifecycle, identical to mutate's localFinish.
+        if (this.ephemeral) {
+          this.destroy("ephemeral op complete");
+        } else if (!this.dead) {
+          this.armIdle();
+        }
+      };
+
+      // Register so a disconnect/close/auth-failure/teardown rejects THIS op with
+      // the connection-loss error text (the `settled` guard makes a racing
+      // teardown + normal resolve safe — first one wins).
+      this.inflightReject = (e: Error) => localFinish(e);
+
+      // Register the reply listener BEFORE sending so a fast server broadcast is
+      // never missed.
+      statelessHandler = (data: { payload: string }) => {
+        if (settled) return;
+        let message: any;
+        try {
+          message = JSON.parse(data.payload);
+        } catch {
+          return; // unrelated / malformed stateless message — keep waiting
+        }
+        const matched = predicate(message);
+        if (matched !== undefined) localFinish(null, matched);
+      };
+      this.provider!.on("stateless", statelessHandler);
+
+      timer = setTimeout(() => {
+        localFinish(
+          new Error(
+            `Timeout waiting for a stateless reply from the collaboration server ${this.hint()}`,
+          ),
+        );
+      }, timeoutMs);
+
+      try {
+        this.provider!.sendStateless(payload);
+      } catch (e) {
+        localFinish(e instanceof Error ? e : new Error(String(e)));
+      }
     });
   }
 
