@@ -818,6 +818,11 @@ export class PageController {
       throw new NotFoundException('Page not found');
     }
 
+    // Target-only validateCanView is intentional: getPageBreadCrumbs returns
+    // the full ancestor chain WITHOUT per-ancestor permission filtering. Safe
+    // because page restrictions inherit down the tree, so any ancestor the
+    // caller could not view would already hide the target here — see the
+    // getPageBreadCrumbs docstring / #471.
     await this.pageAccessService.validateCanView(page, user);
 
     return this.pageService.getPageBreadCrumbs(page.id);

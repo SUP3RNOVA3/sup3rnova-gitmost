@@ -1071,6 +1071,29 @@ export class PageService {
     });
   }
 
+  /**
+   * Walk the ancestor chain of `childPageId` up to the space root, filtered
+   * ONLY by `deletedAt` (+ MAX_PAGE_TREE_DEPTH) — WITHOUT per-ancestor
+   * permission filtering. Callers that expose this to a user (the
+   * `/breadcrumbs` endpoint) validate `validateCanView` on the TARGET page
+   * only, then return the whole chain of ancestor titles (#471).
+   *
+   * This is safe — NOT a title leak — because page restrictions inherit DOWN
+   * the tree: to view a page the caller must hold permission on EVERY
+   * restricted ancestor (`validateCanView` -> `canUserAccessPage` checks the
+   * full ancestor chain — see page-access.service.ts / page-permission.repo.ts
+   * `canUserEditPage`). A restricted ancestor the caller may not see would
+   * therefore already hide the TARGET page itself, so every ancestor reachable
+   * here is one the caller is already entitled to view (content stays gated
+   * regardless — getPage/getNode re-check permissions).
+   *
+   * Note the guarantee is the narrow "may view a descendant => may view its
+   * ancestors", NOT "space membership sees every page" — restricted subtrees do
+   * hide pages from members. Per-ancestor permission filtering here was
+   * considered and declined as redundant given the inheritance invariant above
+   * (#471). The same chain feeds the web-UI breadcrumb bar under identical CASL
+   * scope.
+   */
   async getPageBreadCrumbs(childPageId: string, trx?: KyselyTransaction) {
     const ancestors = await dbOrTx(this.db, trx)
       .withRecursive('page_ancestors', (db) =>
