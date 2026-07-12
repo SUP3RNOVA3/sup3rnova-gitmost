@@ -491,6 +491,19 @@ export function useResolveCommentMutation() {
 
       // Reopen keeps the plain toast without an Undo.
       if (!variables.resolved) {
+        // Clear the inline mark ONLY after the server confirms the reopen, so a
+        // failed reopen never leaves an active highlight the panel still treats
+        // as resolved. Mirrors the 404 branch's editor-liveness guard/try-catch.
+        // The button-triggered reopen already set the mark, so this is an
+        // idempotent no-op there.
+        const ed = editorRef.current;
+        if (ed && !ed.isDestroyed) {
+          try {
+            ed.commands.setCommentResolved(variables.commentId, false);
+          } catch {
+            /* editor gone — server COMMENT_MARK_UPDATE converges it */
+          }
+        }
         notifications.show({ message: t("Comment re-opened successfully") });
         return;
       }
@@ -529,16 +542,9 @@ export function useResolveCommentMutation() {
                   pageId,
                   resolved: false,
                 });
-                // Clear the inline mark; guard isDestroyed because the toast
-                // lives 10s and the panel/page may have closed by now.
-                const ed = editorRef.current;
-                if (ed && !ed.isDestroyed) {
-                  try {
-                    ed.commands.setCommentResolved(commentId, false);
-                  } catch {
-                    /* editor gone — server COMMENT_MARK_UPDATE converges it */
-                  }
-                }
+                // The inline mark is cleared in the reopen mutation's onSuccess
+                // (bound to server confirmation), NOT here — clearing it eagerly
+                // would desync the doc from the panel if reopen then fails.
                 notifications.hide(notificationId);
               },
             },

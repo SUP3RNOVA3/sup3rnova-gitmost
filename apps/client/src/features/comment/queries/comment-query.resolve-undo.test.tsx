@@ -268,6 +268,68 @@ describe("useResolveCommentMutation — Undo toast (#542)", () => {
     expect(items(queryClient)[0].resolvedAt).toBeTruthy();
   });
 
+  it("reopen via Undo FAILS (non-404) → inline mark is NOT left cleared (doc↔panel stay consistent)", async () => {
+    // First resolve succeeds → produces the Undo toast (no mark change on resolve).
+    vi.mocked(resolveComment).mockResolvedValueOnce(
+      comment({ resolvedAt: new Date() as any }),
+    );
+    const { queryClient, wrapper } = seededClient(comment());
+    const { result } = renderHook(() => useResolveCommentMutation(), {
+      wrapper,
+    });
+
+    await result.current.mutateAsync({
+      commentId: "c-1",
+      pageId: PAGE_ID,
+      resolved: true,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Now the reopen fired by Undo fails with a 500.
+    vi.mocked(resolveComment).mockRejectedValue({ response: { status: 500 } });
+    const onClick = undoOnClickFromToast();
+    onClick();
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // Core F1 guarantee: the mark-clear now lives in the reopen onSuccess, so a
+    // FAILED reopen must never flip the inline mark to unresolved — otherwise the
+    // doc would show an active highlight the panel still treats as resolved and
+    // the collab mark would diverge with nothing committed on the server.
+    expect(
+      editorMock.current!.commands.setCommentResolved,
+    ).not.toHaveBeenCalledWith("c-1", false);
+    // Cache rolled back: the comment stays resolved and present.
+    expect(items(queryClient)).toHaveLength(1);
+    expect(items(queryClient)[0].resolvedAt).toBeTruthy();
+  });
+
+  it("reopen success with a null editorRef degrades gracefully (no throw, no-op)", async () => {
+    // Read-only view / panel closed: pageEditorAtom is null on the success path.
+    editorMock.current = null;
+    vi.mocked(resolveComment).mockResolvedValue(comment({ resolvedAt: null }));
+    const resolved = comment({ resolvedAt: new Date() as any });
+    const { queryClient, wrapper } = seededClient(resolved);
+    const { result } = renderHook(() => useResolveCommentMutation(), {
+      wrapper,
+    });
+
+    await result.current.mutateAsync({
+      commentId: "c-1",
+      pageId: PAGE_ID,
+      resolved: false,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // No crash from the reopen mark-clear; the plain reopen toast is still shown.
+    expect(notifications.show).toHaveBeenCalledWith({
+      message: "Comment re-opened successfully",
+    });
+    // Cache updated to reopened (resolvedAt cleared by the server payload).
+    expect(items(queryClient)).toHaveLength(1);
+    expect(items(queryClient)[0].resolvedAt).toBeFalsy();
+  });
+
   it("non-404 error on RESOLVE shows 'Failed to resolve comment' and rolls back", async () => {
     vi.mocked(resolveComment).mockRejectedValue({ response: { status: 500 } });
     const { queryClient, wrapper } = seededClient(comment());
