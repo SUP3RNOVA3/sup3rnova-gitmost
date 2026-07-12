@@ -1,7 +1,8 @@
-import { defineConfig, loadEnv } from "vite";
+import { defineConfig, loadEnv, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
 import { compression } from "vite-plugin-compression2";
 import * as path from "path";
+import * as fs from "node:fs";
 import { execSync } from "node:child_process";
 
 const envPath = path.resolve(process.cwd(), "..", "..");
@@ -24,7 +25,32 @@ function resolveAppVersion(cwd: string): string {
   }
 }
 
+// Emit <outDir>/version.json = { "version": appVersion } so the server can read
+// the exact same build id the bundle was compiled with. The value is the SAME
+// `appVersion` fed into `define.APP_VERSION`, so version.json and the baked-in
+// global are identical by construction — the single source of truth (no
+// runtime-env second copy that could drift and cause a false version mismatch).
+function versionJsonPlugin(version: string): Plugin {
+  let outDir = "dist";
+  return {
+    name: "emit-version-json",
+    apply: "build",
+    configResolved(config) {
+      outDir = config.build.outDir;
+    },
+    writeBundle() {
+      const root = path.resolve(process.cwd(), outDir);
+      fs.mkdirSync(root, { recursive: true });
+      fs.writeFileSync(
+        path.join(root, "version.json"),
+        JSON.stringify({ version }),
+      );
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
+  const appVersion = resolveAppVersion(envPath);
   const {
     APP_URL,
     FILE_UPLOAD_SIZE_LIMIT,
@@ -52,10 +78,11 @@ export default defineConfig(({ mode }) => {
         POSTHOG_HOST,
         POSTHOG_KEY,
       },
-      APP_VERSION: JSON.stringify(resolveAppVersion(envPath)),
+      APP_VERSION: JSON.stringify(appVersion),
     },
     plugins: [
       react(),
+      versionJsonPlugin(appVersion),
       // Emit .br and .gz next to every built asset so the server can serve the
       // precompressed copy (see @fastify/static preCompressed in static.module.ts).
       compression({

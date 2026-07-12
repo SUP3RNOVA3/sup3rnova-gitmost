@@ -142,6 +142,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshots switched from a fixed interval to a trailing idle-flush with a
   max-wait ceiling, and a boundary snapshot is pinned whenever the editing source
   changes (e.g. a person's edits followed by the AI agent). (#370)
+- **Open tabs pick up a new deploy on their own.** After the server is
+  redeployed while a tab is left open for hours, the tab now learns the new
+  build version over the existing WebSocket (announced per-connect, so a natural
+  reconnect delivers it) and shows a "A new version is available" banner with an
+  Update button. To avoid dropping a half-written comment or form, the tab is
+  not reloaded when you merely switch away from it; instead it auto-reloads at
+  the next safe point — the next in-app navigation (or immediately if you click
+  Update) — before it can hit a stale lazy-loaded chunk. At most one automatic
+  reload happens per 5-minute window, shared with the existing chunk-load
+  recovery, so a permanent version skew degrades to the banner rather than a
+  reload loop while a second deploy in the same tab still recovers. When the
+  build carries no version info the feature stays inert. (#481)
 
 - **Place several images side by side in a row.** A new "Inline (side by
   side)" alignment mode in the image bubble menu renders consecutive inline

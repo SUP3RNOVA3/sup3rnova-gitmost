@@ -13,6 +13,12 @@ import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import { Error404 } from "@/components/ui/error-404.tsx";
 import { queryClient } from "@/main.tsx";
 import { makeConnectHandler } from "@/features/user/connect-resync.ts";
+import {
+  triggerGuardedReload,
+  useVersionReloadOnNavigation,
+  surfacePreviousReloadBreadcrumb,
+} from "@/features/user/guarded-reload.tsx";
+import type { AppVersionSocketPayload } from "@/features/user/version-coherence.ts";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -21,6 +27,16 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setSocket] = useAtom(socketAtom);
   // fetch collab token on load
   const { data: collab } = useCollabToken();
+
+  // version-coherence: fire the armed one-shot reload on the next in-app
+  // navigation (variant C — a safe point, not on tab backgrounding).
+  useVersionReloadOnNavigation();
+
+  // Surface any breadcrumb left by an auto-reload in the previous page load
+  // (the reload cleared the console) so a field report stays diagnosable.
+  useEffect(() => {
+    surfacePreviousReloadBreadcrumb();
+  }, []);
 
   useEffect(() => {
     if (isLoading || isError) {
@@ -45,6 +61,16 @@ export function UserProvider({ children }: React.PropsWithChildren) {
     newSocket.on("connect", () => {
       console.log("ws connected");
       handleConnect();
+    });
+
+    // Register the version-coherence listener SYNCHRONOUSLY, before the socket
+    // connects: the server emits `app-version` immediately in handleConnection,
+    // so a listener attached after connect would miss it on a fast localhost
+    // connect. On a version mismatch the client shows a banner and defers the
+    // auto-reload to the next in-app navigation (variant C — avoids reloading a
+    // backgrounded tab that may hold unsaved input) before it hits a stale chunk.
+    newSocket.on("app-version", (payload?: AppVersionSocketPayload) => {
+      triggerGuardedReload(payload?.version);
     });
 
     return () => {
