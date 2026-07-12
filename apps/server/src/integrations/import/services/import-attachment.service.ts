@@ -8,6 +8,7 @@ import { createReadStream } from 'node:fs';
 import { promises as fs } from 'fs';
 import { Readable } from 'stream';
 import { getMimeType, sanitizeFileName } from '../../../common/helpers';
+import { htmlEscape } from '../../../common/helpers/html-escaper';
 import { v7 } from 'uuid';
 import { FileTask } from '@docmost/db/types/entity.types';
 import { getAttachmentFolderPath } from '../../../core/attachment/attachment.utils';
@@ -854,7 +855,7 @@ export class ImportAttachmentService {
       // (no UTF-8 step), turning every non-ASCII char (Cyrillic, ё, —) into
       // mojibake; the entity-encoded form is decoded by the DOM as UTF-8 and
       // opens intact. Docmost's own decoder reads both forms.
-      const drawioEscaped = this.xmlEscapeAttr(drawioContent);
+      const drawioEscaped = this.xmlEscapeContent(drawioContent);
 
       let imageElement = '';
       // If we have a PNG, include it in the SVG
@@ -891,14 +892,20 @@ export class ImportAttachmentService {
 
   /**
    * Escape a string so it is safe as the value of a double-quoted XML attribute
-   * (the `content=` payload of a `.drawio.svg`). Order matters: `&` first.
+   * (the `content=` payload of a `.drawio.svg`). The shared `htmlEscape` covers
+   * `& < > " '` (a strict superset of what this attribute needs; the extra `'`
+   * escape is harmless in a `"`-delimited value). On top of that, the numeric
+   * char-refs for tab/newline/CR are required: a literal tab/newline/CR inside
+   * an attribute value is collapsed to a single space by XML attribute-value
+   * normalization on DOM read (both our decoder and the real draw.io editor),
+   * silently flattening multi-line labels and tab-bearing values. Char-refs
+   * survive that normalization (#507).
    */
-  private xmlEscapeAttr(s: string): string {
-    return s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+  private xmlEscapeContent(s: string): string {
+    return htmlEscape(s)
+      .replace(/\t/g, '&#x9;')
+      .replace(/\n/g, '&#xa;')
+      .replace(/\r/g, '&#xd;');
   }
 
   private async uploadWithRetry(opts: {

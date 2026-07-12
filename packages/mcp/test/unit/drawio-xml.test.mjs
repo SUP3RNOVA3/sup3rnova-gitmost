@@ -435,3 +435,47 @@ test("#507 negative: non-ASCII in a cell value AND in the title round-trip clean
   assert.ok(nameMatch, "diagram name attribute present");
   assert.equal(unescapeAttr(nameMatch[1]), title);
 });
+
+// --- #507 F1: literal tab/newline/CR in an attribute value survive the
+// content= round-trip. The whole mxfile XML lives in one content="..." attr;
+// XML attribute-value normalization collapses a LITERAL tab/newline/CR to a
+// single space on DOM read, so the escape must emit numeric char-refs instead.
+const CTRL_MODEL =
+  "<mxGraphModel><root>" +
+  '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+  '<mxCell id="2" value="col1\tcol2" style="html=1;\nshadow=0" vertex="1" parent="1">' +
+  '<mxGeometry x="10" y="10" width="120" height="60" as="geometry"/></mxCell>' +
+  '<mxCell id="3" value="Line1\nLine2\rLine3" vertex="1" parent="1">' +
+  '<mxGeometry x="10" y="100" width="120" height="60" as="geometry"/></mxCell>' +
+  "</root></mxGraphModel>";
+
+test("#507 F1: literal tab/newline/CR in a value round-trip byte-stable (DOM decode)", () => {
+  const svg = buildDrawioSvg(CTRL_MODEL, "<g/>", { width: 200, height: 200 });
+  const content = /content="([^"]*)"/.exec(svg)[1];
+  // The tab/newline/CR must be emitted as numeric char-refs, never as literal
+  // control chars (which DOM attribute-value normalization would eat).
+  assert.ok(
+    !/[\t\n\r]/.test(content),
+    "no literal tab/newline/CR survive in the content= attribute",
+  );
+  assert.ok(
+    content.includes("&#x9;") &&
+      content.includes("&#xa;") &&
+      content.includes("&#xd;"),
+    "tab/newline/CR are emitted as numeric char-refs",
+  );
+  // Full DOM decode recovers the model byte-for-byte, control chars intact.
+  assert.equal(decodeDrawioSvg(svg), CTRL_MODEL);
+});
+
+test("#507 F1: regex fallback decodes tab/newline/CR char-refs (agrees with DOM path)", () => {
+  const svg = buildDrawioSvg(CTRL_MODEL, "<g/>", { width: 200, height: 200 });
+  const content = /content="([^"]*)"/.exec(svg)[1];
+  // A bare `&` makes the SVG wrapper malformed, forcing extractContentAttr onto
+  // its regex fallback branch. That branch must decode the tab/newline/CR
+  // char-refs exactly like the DOM path, or the two decoders diverge.
+  const malformedSvg = `<svg content="${content}">&</svg>`;
+  assert.equal(decodeDrawioSvg(malformedSvg), CTRL_MODEL);
+  // The well-formed (DOM) path yields the identical result.
+  assert.equal(decodeDrawioSvg(svg), CTRL_MODEL);
+});

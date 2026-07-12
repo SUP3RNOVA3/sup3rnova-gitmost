@@ -196,12 +196,23 @@ export function extractContentAttr(svg: string): string {
   // value itself never contains a double-quote (base64 / entity-encoded XML).
   const m = /content="([^"]*)"/.exec(svg);
   if (m) {
-    // Decode the handful of XML entities a raw regex would leave encoded.
+    // Decode the handful of XML entities a raw regex would leave encoded. The
+    // numeric char-refs for tab/newline/CR MUST be decoded here too: the DOM
+    // path above turns them back into the literal control chars, so this
+    // regex fallback has to agree or the two decode paths diverge (#507).
+    // `&amp;` is decoded last so an escaped `&amp;#x9;` reads back as the
+    // literal text `&#x9;`, not a tab.
     return m[1]
       .replace(/&lt;/g, "<")
       .replace(/&gt;/g, ">")
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'")
+      .replace(/&#x9;/gi, "\t")
+      .replace(/&#9;/g, "\t")
+      .replace(/&#xa;/gi, "\n")
+      .replace(/&#10;/g, "\n")
+      .replace(/&#xd;/gi, "\r")
+      .replace(/&#13;/g, "\r")
       .replace(/&amp;/g, "&");
   }
   throw new Error("drawio: SVG has no content= attribute to decode");
@@ -342,7 +353,15 @@ function xmlEscape(s: string): string {
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    // A literal tab/newline/CR inside an attribute value is collapsed to a
+    // single space by XML attribute-value normalization on DOM read (both jsdom
+    // here and the real draw.io editor), silently flattening multi-line labels
+    // and tab-bearing values. Numeric char-refs survive that normalization, so
+    // emit them the way draw.io's own native export does (#507).
+    .replace(/\t/g, "&#x9;")
+    .replace(/\n/g, "&#xa;")
+    .replace(/\r/g, "&#xd;");
 }
 
 // --- normalization + hash --------------------------------------------------

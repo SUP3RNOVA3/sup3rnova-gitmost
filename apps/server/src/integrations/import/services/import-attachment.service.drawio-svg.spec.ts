@@ -76,6 +76,41 @@ describe('ImportAttachmentService.createDrawioSvg (#507)', () => {
     expect(decoded).toBe(drawio);
   });
 
+  it('encodes literal tab/newline/CR as numeric char-refs, not literal control chars (#507 F1)', async () => {
+    // A literal tab/newline/CR inside the mxfile XML would be collapsed to a
+    // single space by XML attribute-value normalization when the draw.io editor
+    // reads content=, silently flattening multi-line labels and tab-bearing
+    // values. They must be emitted as numeric char-refs instead.
+    const drawio =
+      '<mxfile><diagram name="p">' +
+      '<mxGraphModel><root><mxCell id="0"/>' +
+      '<mxCell id="2" value="col1\tcol2" style="html=1;\nshadow=0" vertex="1" parent="0"/>' +
+      '<mxCell id="3" value="Line1\nLine2\rLine3" vertex="1" parent="0"/>' +
+      '</root></mxGraphModel></diagram></mxfile>';
+    const p = await writeDrawio('ctrl.drawio', drawio);
+
+    const svg = (await call(p)).toString('utf-8');
+    const content = /content="([^"]*)"/.exec(svg)?.[1];
+    expect(content).toBeDefined();
+    // No literal control chars survive in the attribute value.
+    expect(content).not.toMatch(/[\t\n\r]/);
+    // They round-trip as numeric char-refs.
+    expect(content).toContain('&#x9;');
+    expect(content).toContain('&#xa;');
+    expect(content).toContain('&#xd;');
+    // Decoding (char-refs back to literal, entities back) recovers the file.
+    const decoded = content!
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&#x9;/gi, '\t')
+      .replace(/&#xa;/gi, '\n')
+      .replace(/&#xd;/gi, '\r')
+      .replace(/&amp;/g, '&');
+    expect(decoded).toBe(drawio);
+  });
+
   it('escapes XML metacharacters in the drawio payload', async () => {
     const drawio = '<mxfile><diagram name="a &amp; b">"q" &lt;x&gt;</diagram></mxfile>';
     const p = await writeDrawio('meta.drawio', drawio);

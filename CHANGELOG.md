@@ -403,10 +403,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as XML-entity-escaped mxfile XML — draw.io's own native form, decoded by the
   DOM as UTF-8 — so labels open intact. The decoder reads both the new
   entity-encoded form and the old base64 form, so existing diagrams still open.
-  *Healing pre-fix diagrams:* any agent-created cyrillic diagram written before
-  this fix is repaired in place by `drawioGet` → `drawioUpdate` with the same
-  XML (rewrites the attachment in the new form); no migration script is needed.
-  (#507)
+  *Healing pre-fix diagrams:* only a diagram that still holds its original
+  (correct-UTF-8) base64 — i.e. one not yet opened/autosaved in the draw.io
+  editor — can be repaired in place by `drawioGet` → `drawioUpdate` with the
+  same XML (rewrites the attachment in the new form); no migration script is
+  needed. A diagram that was already opened in the editor persisted the
+  mojibake at rest, so `drawioGet` reads the already-corrupted text and
+  `drawioUpdate` faithfully rewrites it — that text is lost and is not
+  recoverable by a rewrite. (#507)
 - **A chat with one malformed message part no longer 500s on every turn, and a
   failed send no longer duplicates the user's message.** Incoming client parts
   are now whitelisted to `text` (a forged tool-result part can no longer reach
