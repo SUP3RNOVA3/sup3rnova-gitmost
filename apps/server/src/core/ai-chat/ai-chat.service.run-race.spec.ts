@@ -181,7 +181,7 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       {} as never, // pageAccess
       { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
     );
-    return { svc };
+    return { svc, aiChatMessageRepo };
   }
 
   const body = {
@@ -287,7 +287,7 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
   // Drive stream() to the point streamText is called, capturing the options object
   // (which carries onStepFinish/onFinish/onError/onAbort) and the run hooks.
   async function captureStreamCallbacks() {
-    const { svc } = makeService();
+    const { svc, aiChatMessageRepo } = makeService();
     let capturedOpts: any;
     streamTextMock.mockImplementation((opts: any) => {
       capturedOpts = opts;
@@ -314,7 +314,7 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       runHooks: runHooks as never,
     });
     expect(capturedOpts).toBeDefined();
-    return { capturedOpts, runHooks };
+    return { capturedOpts, runHooks, aiChatMessageRepo };
   }
 
   it('F9: onStepFinish bumps the run step count, onFinish settles the run "completed" (the dominant autonomous-run path)', async () => {
@@ -368,6 +368,51 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       'error',
       expect.stringContaining('provider exploded'),
     );
+  });
+
+  // #490 reactive branch: a provider CONTEXT-OVERFLOW 400 in onError is classified,
+  // records a distinguishable cause, and stamps metadata.replayOverflow so the NEXT
+  // turn's budgeter trims aggressively (the recovery that un-bricks the chat).
+  it('#490: a context-overflow 400 stamps replayOverflow on the finalized row', async () => {
+    jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined as never);
+    const { capturedOpts, aiChatMessageRepo } = await captureStreamCallbacks();
+
+    const overflow = Object.assign(new Error('too large'), {
+      statusCode: 400,
+      message:
+        "This model's maximum context length is 128000 tokens. However, your messages resulted in 214000 tokens. Please reduce the length.",
+    });
+    await capturedOpts.onError({ error: overflow });
+
+    // The seed row exists (finalizeOwner is the owner-write path).
+    expect(aiChatMessageRepo.finalizeOwner).toHaveBeenCalled();
+    const calls = aiChatMessageRepo.finalizeOwner.mock.calls as any[][];
+    const patch = calls[calls.length - 1][2] as {
+      status: string;
+      metadata: Record<string, unknown>;
+    };
+    expect(patch.status).toBe('error');
+    expect(patch.metadata.replayOverflow).toBe(true);
+    expect(patch.metadata.error).toContain('контекстное окно');
+  });
+
+  it('#490: a non-overflow error does NOT stamp replayOverflow', async () => {
+    jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined as never);
+    const { capturedOpts, aiChatMessageRepo } = await captureStreamCallbacks();
+    await capturedOpts.onError({ error: new Error('network reset') });
+    const calls = aiChatMessageRepo.finalizeOwner.mock.calls as any[][];
+    const patch = calls[calls.length - 1][2] as {
+      status: string;
+      metadata: Record<string, unknown>;
+    };
+    expect('replayOverflow' in patch.metadata).toBe(false);
   });
 });
 

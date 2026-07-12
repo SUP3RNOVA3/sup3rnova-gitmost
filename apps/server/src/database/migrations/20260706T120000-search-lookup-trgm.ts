@@ -26,13 +26,16 @@ import { type Kysely, sql } from 'kysely';
  *    to update than b-trees); on the small instances this fork targets that cost
  *    is acceptable and the read win on agent lookups is the priority.
  *
- * DEPLOY-TIME LOCK WARNING: plain (non-CONCURRENT) CREATE INDEX — Kysely runs
- * each migration in a transaction, so CONCURRENTLY is impossible. The build takes
- * a SHARE lock that BLOCKS writes on `pages` for its duration. The text_content
- * GIN build is the slow one and can take minutes on a large tenant. For large
- * installations, run this in a maintenance window or build the index out-of-band
- * with CREATE INDEX CONCURRENTLY before deploying (then `IF NOT EXISTS` no-ops
- * here). Small/typical tenants are unaffected.
+ * DEPLOY-TIME LOCK: this is a plain (non-CONCURRENT) CREATE INDEX — Kysely runs
+ * each migration in a transaction, so CONCURRENTLY is impossible HERE, and the
+ * build would take a SHARE lock that BLOCKS writes on `pages` for its duration
+ * (the text_content GIN build can take minutes on a large tenant). To avoid that,
+ * `ensureConcurrentIndexes` (database/concurrent-indexes.ts) now pre-builds this
+ * index with CREATE INDEX CONCURRENTLY (no transaction) BEFORE the migrator runs,
+ * so on an existing DB the `IF NOT EXISTS` below no-ops and no write lock is taken.
+ * On a fresh DB the pre-build is skipped and this builds it on an empty table
+ * where the lock is irrelevant. Keep this create in lockstep with the CANONICAL
+ * definition in CONCURRENT_INDEXES (same expression + opclass).
  */
 export async function up(db: Kysely<any>): Promise<void> {
   // The title predicate is served by #348's idx_pages_title_trgm — see header.

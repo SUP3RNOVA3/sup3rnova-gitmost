@@ -13,6 +13,7 @@ import {
   compactToolOutput,
   assistantParts,
   serializeSteps,
+  type StepPartsCache,
   rowToUiMessage,
   prepareAgentStep,
   stepBudgetWarning,
@@ -28,10 +29,14 @@ import {
   FINAL_STEP_NUDGE,
   STEP_LIMIT_NO_ANSWER_MARKER,
   OUTPUT_DEGENERATION_ERROR,
+  lastAssistantContextTokens,
+  lastAssistantReplayOverflow,
+  seedActivatedTools,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
 import type { McpClientsService } from './external-mcp/mcp-clients.service';
+import { resolveEffectiveReplayThreshold } from './history-budget';
 
 /**
  * Unit tests for compactToolOutput: the pure helper that shrinks tool outputs
@@ -113,6 +118,54 @@ describe('compactToolOutput', () => {
  */
 describe('assistantParts', () => {
   type AnyPart = Record<string, unknown>;
+
+  // #490 memoization: assistantParts builds each step's parts once and caches
+  // them by the step OBJECT's identity, so a mid-stream flush does not
+  // re-stringify every prior step's (large) output. Observable property: with a
+  // shared cache, the second call over the SAME step object returns the cached
+  // (identical) part array even if the step's underlying output was swapped —
+  // proving the work was memoized, not redone.
+  it('memoizes a step by identity (shared cache => one build per step)', () => {
+    const cache: StepPartsCache = new WeakMap();
+    const step = {
+      text: 'x',
+      toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: {} }],
+      toolResults: [{ toolCallId: 'c1', toolName: 'getPage', output: { v: 1 } }],
+    };
+    const first = assistantParts([step], '', cache) as AnyPart[];
+    expect((first.find((p) => p.type === 'tool-getPage')!.output as any).v).toBe(
+      1,
+    );
+    // Swap the output for a NEW value; a re-build would pick it up, a cache hit
+    // keeps the first result.
+    step.toolResults[0] = {
+      toolCallId: 'c1',
+      toolName: 'getPage',
+      output: { v: 2 },
+    };
+    const second = assistantParts([step], '', cache) as AnyPart[];
+    expect((second.find((p) => p.type === 'tool-getPage')!.output as any).v).toBe(
+      1,
+    );
+    // Same cached part objects are reused.
+    expect(second.find((p) => p.type === 'tool-getPage')).toBe(
+      first.find((p) => p.type === 'tool-getPage'),
+    );
+  });
+
+  it('without a cache, each call rebuilds (no stale memo)', () => {
+    const step = {
+      text: 'x',
+      toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: {} }],
+      toolResults: [{ toolCallId: 'c1', toolName: 'getPage', output: { v: 1 } }],
+    };
+    const first = assistantParts([step], '') as AnyPart[];
+    step.toolResults[0].output = { v: 2 };
+    const second = assistantParts([step], '') as AnyPart[];
+    expect((second.find((p) => p.type === 'tool-getPage')!.output as any).v).toBe(
+      2,
+    );
+  });
 
   it('emits output-available for a tool-call WITH a paired result', () => {
     const steps = [
@@ -231,60 +284,319 @@ describe('assistantParts', () => {
   });
 });
 
-describe('serializeSteps', () => {
+// #490 trace format v2: per call the trace stores { input } for the call and an
+// OUTCOME element — { ok: true } on success, { error, kind: 'thrown' } on a
+// thrown tool-error, { error, kind: 'interrupted' } on a mid-step abort. The tool
+// OUTPUT is no longer duplicated here (it lives once in metadata.parts).
+describe('serializeSteps (trace v2)', () => {
   it('returns null when there are no calls or results', () => {
     expect(serializeSteps([])).toBeNull();
   });
 
-  it('flattens calls and results into a compact trace', () => {
+  it('pairs a successful call with an { ok: true } outcome and NO output', () => {
     const trace = serializeSteps([
       {
-        toolCalls: [{ toolName: 'getPage', input: { id: 'p1' } }],
-        toolResults: [{ toolName: 'getPage', output: { title: 'T' } }],
+        toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: { id: 'p1' } }],
+        toolResults: [{ toolCallId: 'c1', toolName: 'getPage' }],
       },
     ]) as Array<Record<string, unknown>>;
     expect(trace).toHaveLength(2);
     expect(trace[0]).toEqual({ toolName: 'getPage', input: { id: 'p1' } });
-    expect(trace[1]).toEqual({ toolName: 'getPage', output: { title: 'T' } });
+    expect(trace[1]).toEqual({ toolName: 'getPage', ok: true });
+    // The output is NOT stored in the trace any more (dedup: it lives in parts).
+    expect(trace.some((e) => 'output' in e)).toBe(false);
   });
 
-  it('records a THROWN tool failure (tool-error part) with its error message', () => {
+  it('records a THROWN failure with { error, kind: "thrown" }', () => {
     const trace = serializeSteps([
       {
-        toolCalls: [{ toolName: 'editPageText', input: { id: 'p1' } }],
+        toolCalls: [
+          { toolCallId: 'c1', toolName: 'editPageText', input: { id: 'p1' } },
+        ],
         toolResults: [],
         content: [
           {
             type: 'tool-error',
+            toolCallId: 'c1',
             toolName: 'editPageText',
             error: new Error('page is locked'),
           },
         ],
       },
     ]) as Array<Record<string, unknown>>;
-    // The call element is followed by a paired error element (mirroring how a
-    // successful result is appended), so the failure survives in the trace.
     expect(trace).toHaveLength(2);
     expect(trace[0]).toEqual({ toolName: 'editPageText', input: { id: 'p1' } });
     expect(trace[1]).toEqual({
       toolName: 'editPageText',
       error: 'page is locked',
+      kind: 'thrown',
     });
   });
 
-  it('truncates a very long tool-error message to the tool-output limit', () => {
+  it('marks an interrupted call (no result, no throw) with kind "interrupted"', () => {
+    const trace = serializeSteps([
+      {
+        toolCalls: [
+          { toolCallId: 'c1', toolName: 'createComment', input: { x: 1 } },
+        ],
+        toolResults: [],
+        content: [],
+      },
+    ]) as Array<Record<string, unknown>>;
+    expect(trace).toHaveLength(2);
+    expect(trace[1]).toEqual({
+      toolName: 'createComment',
+      error: 'Tool call did not complete.',
+      kind: 'interrupted',
+    });
+    // Structurally distinct from a thrown hard-fail so it never inflates an
+    // error-rate scan.
+    expect((trace[1] as { kind: string }).kind).not.toBe('thrown');
+  });
+
+  it('truncates a very long thrown-error message to the tool-output limit', () => {
     const long = 'x'.repeat(5000);
     const trace = serializeSteps([
       {
-        toolCalls: [{ toolName: 'editPageText', input: {} }],
+        toolCalls: [{ toolCallId: 'c1', toolName: 'editPageText', input: {} }],
         toolResults: [],
-        content: [{ type: 'tool-error', toolName: 'editPageText', error: long }],
+        content: [
+          {
+            type: 'tool-error',
+            toolCallId: 'c1',
+            toolName: 'editPageText',
+            error: long,
+          },
+        ],
       },
     ]) as Array<Record<string, unknown>>;
     const errorText = trace[1].error as string;
-    // Truncated (not the full 5000 chars) and carries the omission marker.
     expect(errorText.length).toBeLessThan(long.length);
     expect(errorText).toContain('chars omitted');
+  });
+
+  it('pairs parallel calls in one step with their outcomes by id', () => {
+    const trace = serializeSteps([
+      {
+        toolCalls: [
+          { toolCallId: 'a', toolName: 'getPage', input: {} },
+          { toolCallId: 'b', toolName: 'searchPages', input: {} },
+        ],
+        toolResults: [{ toolCallId: 'b', toolName: 'searchPages' }],
+        content: [
+          { type: 'tool-error', toolCallId: 'a', toolName: 'getPage', error: 'nope' },
+        ],
+      },
+    ]) as Array<Record<string, unknown>>;
+    // call a, outcome a (thrown), call b, outcome b (ok)
+    expect(trace).toHaveLength(4);
+    expect(trace[1]).toEqual({ toolName: 'getPage', error: 'nope', kind: 'thrown' });
+    expect(trace[3]).toEqual({ toolName: 'searchPages', ok: true });
+  });
+});
+
+// #490: every assistant row flushAssistant writes carries the v2 era marker so a
+// dual-shape diagnostic query can branch on the trace shape without inspecting it.
+describe('toolTraceVersion era marker (#490)', () => {
+  it('stamps metadata.toolTraceVersion = 2 on every flushed row', () => {
+    const seed = flushAssistant([], '', 'streaming');
+    expect(seed.metadata.toolTraceVersion).toBe(2);
+    const done = flushAssistant(
+      [
+        {
+          text: 'ok',
+          toolCalls: [{ toolCallId: 'c1', toolName: 'getPage', input: {} }],
+          toolResults: [{ toolCallId: 'c1', toolName: 'getPage' }],
+        },
+      ],
+      '',
+      'completed',
+      { finishReason: 'stop' },
+    );
+    expect(done.metadata.toolTraceVersion).toBe(2);
+  });
+});
+
+// #490 replay-budget signal helpers over persisted history.
+describe('lastAssistantContextTokens', () => {
+  const row = (
+    role: string,
+    metadata: Record<string, unknown> | null,
+  ): AiChatMessage => ({ role, metadata }) as unknown as AiChatMessage;
+
+  it('reads the most recent assistant turn contextTokens (provider fact)', () => {
+    const hist = [
+      row('user', null),
+      row('assistant', { contextTokens: 12000 }),
+      row('user', null),
+      row('assistant', { contextTokens: 41000 }),
+    ];
+    expect(lastAssistantContextTokens(hist)).toBe(41000);
+  });
+
+  it('returns undefined when the last assistant turn recorded no usage', () => {
+    const hist = [row('assistant', { error: 'boom' }), row('user', null)];
+    expect(lastAssistantContextTokens(hist)).toBeUndefined();
+    expect(lastAssistantContextTokens([])).toBeUndefined();
+  });
+});
+
+// #490 snapshotOpenPage fast-path: skip the full Markdown export + upsert when a
+// snapshot already exists at the page's CURRENT version (same updated_at instant).
+describe('snapshotOpenPage fast-path (#490)', () => {
+  function makeSvc(existingSnapshot: unknown, pageUpdatedAt: Date) {
+    const exportPageMarkdown = jest.fn(async () => '# md');
+    const upsert = jest.fn(async () => undefined);
+    const findByChatPage = jest.fn(async () => existingSnapshot);
+    const pageRepo = {
+      findById: jest.fn(async () => ({
+        id: 'p1',
+        workspaceId: 'ws1',
+        updatedAt: pageUpdatedAt,
+      })),
+    };
+    const svc = new AiChatService(
+      {} as never, // ai
+      {} as never, // aiChatRepo
+      {} as never, // aiChatMessageRepo
+      { findByChatPage, upsert } as never, // aiChatPageSnapshotRepo
+      {} as never, // aiSettings
+      { exportPageMarkdown } as never, // tools
+      {} as never, // mcpClients
+      {} as never, // aiAgentRoleRepo
+      pageRepo as never, // pageRepo
+      {} as never, // pageAccess
+      {} as never, // environment
+    );
+    return { svc, exportPageMarkdown, upsert, findByChatPage };
+  }
+
+  const args = () =>
+    [
+      'chat1',
+      'p1',
+      { id: 'ws1' } as never,
+      { id: 'u1' } as never,
+      'sess',
+    ] as const;
+
+  it('skips export + upsert when the snapshot is already at this page version', async () => {
+    const t = new Date('2026-07-07T10:00:00Z');
+    const { svc, exportPageMarkdown, upsert } = makeSvc(
+      { pageUpdatedAt: t, contentMd: '# md' },
+      t,
+    );
+    await (svc as unknown as { snapshotOpenPage: (...a: unknown[]) => Promise<void> })
+      .snapshotOpenPage(...args());
+    expect(exportPageMarkdown).not.toHaveBeenCalled();
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  it('exports + upserts when the page advanced since the snapshot', async () => {
+    const { svc, exportPageMarkdown, upsert } = makeSvc(
+      { pageUpdatedAt: new Date('2026-07-07T10:00:00Z'), contentMd: 'old' },
+      new Date('2026-07-07T11:00:00Z'),
+    );
+    await (svc as unknown as { snapshotOpenPage: (...a: unknown[]) => Promise<void> })
+      .snapshotOpenPage(...args());
+    expect(exportPageMarkdown).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+
+  it('seeds (exports + upserts) on the first turn (no snapshot yet)', async () => {
+    const { svc, exportPageMarkdown, upsert } = makeSvc(
+      undefined,
+      new Date('2026-07-07T10:00:00Z'),
+    );
+    await (svc as unknown as { snapshotOpenPage: (...a: unknown[]) => Promise<void> })
+      .snapshotOpenPage(...args());
+    expect(exportPageMarkdown).toHaveBeenCalledTimes(1);
+    expect(upsert).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #490 deferred-tool activation persisted across turns.
+describe('seedActivatedTools', () => {
+  const valid = new Set(['Search_web', 'getPageJson', 'diffPageVersions']);
+
+  it('seeds from persisted metadata, intersected with current valid names', () => {
+    expect(
+      seedActivatedTools(
+        { activatedTools: ['Search_web', 'getPageJson'] },
+        valid,
+      ),
+    ).toEqual(['Search_web', 'getPageJson']);
+  });
+
+  it('drops a stored tool that is no longer valid (allowlist/role changed)', () => {
+    // 'Habr_publish' was activated before but is not in the current allowlist.
+    expect(
+      seedActivatedTools({ activatedTools: ['Search_web', 'Habr_publish'] }, valid),
+    ).toEqual(['Search_web']);
+  });
+
+  it('is empty/robust for missing, non-array, or unknown-shaped metadata', () => {
+    expect(seedActivatedTools(undefined, valid)).toEqual([]);
+    expect(seedActivatedTools({}, valid)).toEqual([]);
+    expect(seedActivatedTools({ activatedTools: 'nope' }, valid)).toEqual([]);
+    expect(
+      seedActivatedTools({ activatedTools: [1, 'getPageJson', null] }, valid),
+    ).toEqual(['getPageJson']);
+  });
+
+  it('de-duplicates stored names', () => {
+    expect(
+      seedActivatedTools(
+        { activatedTools: ['getPageJson', 'getPageJson'] },
+        valid,
+      ),
+    ).toEqual(['getPageJson']);
+  });
+});
+
+describe('lastAssistantReplayOverflow', () => {
+  const row = (
+    role: string,
+    metadata: Record<string, unknown> | null,
+  ): AiChatMessage => ({ role, metadata }) as unknown as AiChatMessage;
+
+  it('is true only when the LAST assistant turn overflowed', () => {
+    expect(
+      lastAssistantReplayOverflow([
+        row('assistant', { replayOverflow: true }),
+        row('user', null),
+      ]),
+    ).toBe(true);
+    // A recovered (later, non-overflow) assistant turn clears it.
+    expect(
+      lastAssistantReplayOverflow([
+        row('assistant', { replayOverflow: true }),
+        row('user', null),
+        row('assistant', { contextTokens: 5 }),
+      ]),
+    ).toBe(false);
+    expect(lastAssistantReplayOverflow([])).toBe(false);
+  });
+
+  // #490 reactive recovery: a prior turn stamped `replayOverflow` must make the
+  // NEXT turn's effective budget the AGGRESSIVE 0.5x cut — that harder trim is
+  // what un-bricks a chat that just 400'd on the context window. This exercises
+  // the exact wiring the service uses: read the stamp, then scale the threshold.
+  it('#490: a prior replayOverflow drives the next turn to the 0.5x aggressive budget', () => {
+    const history = [
+      row('assistant', { replayOverflow: true }),
+      row('user', null),
+    ];
+    const priorOverflowed = lastAssistantReplayOverflow(history);
+    expect(priorOverflowed).toBe(true);
+    // Base budget 100k -> aggressive recovery halves it to 50k this turn.
+    expect(resolveEffectiveReplayThreshold(100_000, priorOverflowed)).toBe(50_000);
+    // Odd base floors, not rounds.
+    expect(resolveEffectiveReplayThreshold(99_999, true)).toBe(49_999);
+    // No prior overflow -> the base budget is used verbatim (no aggressive cut).
+    expect(resolveEffectiveReplayThreshold(100_000, false)).toBe(100_000);
+    // An explicit off-switch (null) is never overridden, even on recovery.
+    expect(resolveEffectiveReplayThreshold(null, true)).toBeNull();
   });
 });
 
@@ -616,6 +928,23 @@ describe('flushAssistant', () => {
     expect(flushed.content).toBe('looked it up and then');
     expect(flushed.toolCalls).not.toBeNull();
     expect(flushed.metadata.error).toBe('boom');
+  });
+
+  // #490 observability: the replay budgeter's decision is stamped on the turn.
+  it('records replayTrimmedToTokens + replayOverflow when provided', () => {
+    const f = flushAssistant([], '', 'error', {
+      error: 'ctx',
+      replayTrimmedToTokens: 42_000,
+      replayOverflow: true,
+    });
+    expect(f.metadata.replayTrimmedToTokens).toBe(42_000);
+    expect(f.metadata.replayOverflow).toBe(true);
+  });
+
+  it('omits the replay metadata when not provided', () => {
+    const f = flushAssistant([], '', 'completed', { finishReason: 'stop' });
+    expect('replayTrimmedToTokens' in f.metadata).toBe(false);
+    expect('replayOverflow' in f.metadata).toBe(false);
   });
 
   // #274 observability: the page-change diff the agent saw this turn is persisted

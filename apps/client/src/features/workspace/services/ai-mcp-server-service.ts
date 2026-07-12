@@ -27,7 +27,9 @@ export interface IAiMcpServerCreate {
   // Auth headers map (e.g. { Authorization: 'Bearer ...' }). Encrypted on save;
   // never returned.
   headers?: Record<string, string>;
-  toolAllowlist?: string[];
+  // Omit/null => no restriction; `[]` is persisted verbatim and means
+  // deny-all (zero tools) since #476.
+  toolAllowlist?: string[] | null;
   // Admin-authored prompt guidance (#180). Blank => stored as null.
   instructions?: string;
   enabled?: boolean;
@@ -43,7 +45,9 @@ export interface IAiMcpServerUpdate {
   transport?: McpTransport;
   url?: string;
   headers?: Record<string, string>;
-  toolAllowlist?: string[];
+  // Absent => unchanged; null => no restriction; `[]` is persisted verbatim
+  // and means deny-all (zero tools) since #476.
+  toolAllowlist?: string[] | null;
   // Admin-authored prompt guidance (#180). Absent => unchanged; blank => cleared.
   instructions?: string;
   enabled?: boolean;

@@ -133,6 +133,9 @@ describe('ShareAliasController authz gates', () => {
         creatorId: 'u-1',
         alias: 'promo',
         confirmReassign: true,
+        // The requesting user is forwarded so setAlias can gate the reassign
+        // 409 title disclosure on target-page view permission (#495).
+        user,
       });
       expect(result).toEqual({ id: 'alias-1' });
     });

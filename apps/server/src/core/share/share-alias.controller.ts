@@ -79,6 +79,9 @@ export class ShareAliasController {
       creatorId: user.id,
       alias: dto.alias,
       confirmReassign: dto.confirmReassign,
+      // Gates whether the reassign 409 may reveal the current target's title
+      // (view-permission check on that page) — see setAlias (#495).
+      user,
     });
   }
 

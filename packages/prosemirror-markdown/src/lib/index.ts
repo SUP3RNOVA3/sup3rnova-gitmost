@@ -15,13 +15,29 @@ export {
 } from "./markdown-document.js";
 export type { DocmostMdMeta } from "./markdown-document.js";
 
-export { convertProseMirrorToMarkdown } from "./markdown-converter.js";
+export {
+  convertProseMirrorToMarkdown,
+  ConverterLossError,
+} from "./markdown-converter.js";
 export type { ConvertProseMirrorToMarkdownOptions } from "./markdown-converter.js";
 
 export {
   markdownToProseMirror,
   markdownToProseMirrorSync,
 } from "./markdown-to-prosemirror.js";
+
+// Foreign-markdown normalizer (#493): the input-liberal pre-pass that rewrites
+// GFM `[^id]` reference footnotes to canonical inline `^[body]`. Two variants:
+// `normalizeForeignMarkdown` (server FILE-import boundary) ALSO strips a leading
+// YAML front-matter block; `normalizeAgentMarkdown` (canonical AGENT-WRITE path,
+// mcp `markdownToProseMirrorCanonical`) does NOT — a full-body agent rewrite must
+// not lose a leading `---…---` horizontalRule to the front-matter strip (#493
+// review). The reference-footnote rewrite is shared so agent + import stay unified
+// where it matters, without the content-losing strip on the write path.
+export {
+  normalizeForeignMarkdown,
+  normalizeAgentMarkdown,
+} from "./foreign-markdown.js";
 
 // The Docmost tiptap schema mirror. Exposed so consumers (and the sync
 // engine's schema-validity regression tests) can build the exact ProseMirror
@@ -75,6 +91,17 @@ export type { OutlineEntry } from "./node-ops.js";
 // Normalize a ProseMirror node arg that the model may have serialized as a JSON
 // string (#414: single copy shared by mcp and the CommonJS server app).
 export { parseNodeArg } from "./parse-node-arg.js";
+
+// Locator markdown-stripping (#493 dedup): the single canonical copy of the
+// markdown-tolerant anchor-normalization primitives, imported by mcp's
+// text-normalize.ts instead of a forked duplicate. `stripInlineMarkdown` is the
+// lenient locator normalizer (trims stray decoration); `stripWrappersAndLinks`
+// is the strict balanced-wrapper/link primitive mcp builds `stripBalancedWrappers`
+// on top of.
+export {
+  stripInlineMarkdown,
+  stripWrappersAndLinks,
+} from "./text-normalize.js";
 
 // Inline-footnote authoring convention (#414: single copy, formerly the mcp
 // `footnote-authoring.ts` fork), shared with the importer's `assembleFootnotes`.

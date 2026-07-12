@@ -89,6 +89,23 @@ describe("describeChatError", () => {
     expect(view.title).not.toBe("AI provider not configured");
   });
 
+  it("classifies a token-degeneration abort under the SAME 'Response stopped.' marker the live view shows (#495)", () => {
+    // The exact reason the server persists in metadata.error on a degeneration
+    // abort (ai-chat.service OUTPUT_DEGENERATION_ERROR). Live, this event shows
+    // the neutral "Response stopped." notice; the persisted banner MUST match it
+    // so live and refetch never disagree.
+    const view = describeChatError(
+      "Output degeneration detected (repeated token loop)",
+      t,
+    );
+    expect(view.title).toBe("Response stopped.");
+    expect(view.detail).toBe(
+      "The answer was stopped automatically because the model fell into a repeated output loop.",
+    );
+    // Regression guard: it must NOT fall through to the generic heading.
+    expect(view.title).not.toBe("Something went wrong");
+  });
+
   it("classifies a dropped connection (ECONNRESET) as a lost-connection error", () => {
     expect(
       describeChatError("Cannot connect to API: read ECONNRESET", t).title,

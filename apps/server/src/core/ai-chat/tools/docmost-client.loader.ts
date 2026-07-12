@@ -150,6 +150,27 @@ export type CommentSignalTrackerFactory = (options: {
   debounceMs?: number;
 }) => CommentSignalTrackerLike;
 
+/**
+ * Local mirror of `@docmost/mcp`'s `createListCommentsProbe` (#494): the SHARED
+ * count-source probe both hosts use, so the in-app probe body is no longer a
+ * hand-copy of the standalone MCP one. Given a client with the light comment feed
+ * + raw-page-title reads, it returns the tracker's `probe` (count comments newer
+ * than the watermark, label a hit with the page title). Loosely typed at this
+ * cross-package boundary, like the rest of this loader.
+ */
+export type CreateListCommentsProbeFn = (client: {
+  listComments(
+    pageId: string,
+    includeResolved: boolean,
+  ): Promise<{ items: Array<{ createdAt?: string | null }> }>;
+  getPageRaw(
+    pageId: string,
+  ): Promise<{ title?: string | null } | null | undefined>;
+}) => (
+  pageId: string,
+  sinceMs: number,
+) => Promise<CommentSignalProbeResultLike>;
+
 // Pure, no-network draw.io helpers (#424). These are plain functions on the
 // module (NOT DocmostClient methods) — the in-app AI-SDK service calls them
 // directly to wire drawioShapes / drawioGuide, mirroring the MCP server.
@@ -170,6 +191,10 @@ interface DocmostMcpModule {
   // loader in unit tests. The in-app layer treats an absent factory as "signal
   // disabled" — a pure no-op that leaves tool results byte-identical.
   createCommentSignalTracker?: CommentSignalTrackerFactory;
+  // Optional (#494): the shared count-source probe factory. Absent on a pre-#494
+  // build or a mocked loader; the in-app layer only builds a probe when the
+  // signal factory above is also present.
+  createListCommentsProbe?: CreateListCommentsProbeFn;
   // Optional (#447): a deterministic hash of the tool-specs registry content,
   // generated into build/ by the package's build. Absent on a pre-#447 build (or
   // the mocked loader in unit tests) — the stale-check below is a NO-OP when it
@@ -284,6 +309,7 @@ export async function loadDocmostMcp(): Promise<{
   DocmostClient: DocmostClientCtor;
   sharedToolSpecs: Record<string, SharedToolSpec>;
   createCommentSignalTracker?: CommentSignalTrackerFactory;
+  createListCommentsProbe?: CreateListCommentsProbeFn;
   searchShapes: SearchShapesFn;
   getGuideSection: GetGuideSectionFn;
 }> {
@@ -331,6 +357,9 @@ export async function loadDocmostMcp(): Promise<{
     // Optional: forwarded when present so the in-app layer can build the passive
     // comment signal (#417); undefined on a stale build => signal disabled.
     createCommentSignalTracker: mod.createCommentSignalTracker,
+    // Optional (#494): the shared count-source probe factory; undefined on a
+    // stale build => the in-app layer falls back to no signal.
+    createListCommentsProbe: mod.createListCommentsProbe,
     // Pure no-network draw.io helpers (#424); not client methods.
     searchShapes: mod.searchShapes,
     getGuideSection: mod.getGuideSection,

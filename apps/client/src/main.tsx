@@ -3,6 +3,7 @@ import "@mantine/spotlight/styles.css";
 import "@mantine/notifications/styles.css";
 import '@mantine/dates/styles.css';
 import "@/styles/a11y-overrides.css";
+import "@/styles/notification-overrides.css";
 
 import ReactDOM from "react-dom/client";
 import App from "./App.tsx";
@@ -47,7 +48,15 @@ function renderApp() {
       <MantineProvider theme={theme} cssVariablesResolver={mantineCssResolver}>
         <ModalsProvider>
           <QueryClientProvider client={queryClient}>
-            <Notifications position="bottom-center" limit={3} zIndex={10000} />
+            {/* top-center: toasts sit in the top of the viewport, in the line
+                of sight, and no longer cover centered content (e.g. "Load
+                more"). The below-chrome vertical offset is applied via a
+                position-scoped CSS rule in notification-overrides.css (NOT an
+                inline `style`): Mantine renders all six position containers at
+                once and an inline root style would land on every one, giving the
+                bottom-* containers both top+bottom → full-viewport transparent
+                overlays that swallow clicks. */}
+            <Notifications position="top-center" limit={3} zIndex={10000} />
             <HelmetProvider>
               {/* Root boundary above every lazy route's Suspense: a stale-chunk
                   404 after a deploy is caught and recovered here instead of

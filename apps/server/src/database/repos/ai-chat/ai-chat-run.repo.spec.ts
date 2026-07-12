@@ -62,10 +62,17 @@ describe('AiChatRunRepo.sweepRunning', () => {
     // ...but a fresh 'running' run (updatedAt = now) must NOT be skipped: no
     // updatedAt predicate at all on the boot path.
     expect(rec.wheres.some(([col]) => col === 'updatedAt')).toBe(false);
-    // It flips to 'aborted' and stamps finishedAt.
-    expect(rec.set).toEqual(
-      expect.objectContaining({ status: 'aborted', finishedAt: expect.any(Date) }),
-    );
+    // It flips to 'aborted' and stamps finishedAt + updatedAt. #491: the stamps
+    // are now DB-clock `sql now()` expressions (raw builders), NOT app-clock
+    // `new Date()`, so the run row shares the delta poll's single now() cursor axis
+    // — assert they are present and are the sql raw-builder objects (not a Date,
+    // not undefined).
+    expect(rec.set?.status).toBe('aborted');
+    for (const stamp of ['finishedAt', 'updatedAt'] as const) {
+      expect(rec.set?.[stamp]).toBeDefined();
+      expect(rec.set?.[stamp]).not.toBeInstanceOf(Date);
+      expect(typeof rec.set?.[stamp]).toBe('object');
+    }
   });
 
   it('phase-2 path: an explicit staleMs reintroduces the updatedAt window', async () => {

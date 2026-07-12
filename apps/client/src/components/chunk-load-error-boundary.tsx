@@ -2,7 +2,25 @@ import { ReactNode } from "react";
 import { ErrorBoundary } from "react-error-boundary";
 import { Button, Center, Stack, Text } from "@mantine/core";
 
-const RELOAD_FLAG = "chunk-reload-attempted";
+// sessionStorage key holding the epoch-ms timestamp of the last automatic reload.
+const RELOAD_AT_KEY = "chunk-reload-at";
+// Allow at most one automatic reload per this window. A stale-deploy 404 is cured
+// by a single reload, so anything inside the window is treated as a reload loop
+// (permanently-broken chunk) and falls through to the manual UI. A window (rather
+// than a one-shot flag) lets a SECOND deploy in the same tab's lifetime recover too.
+const RELOAD_WINDOW_MS = 5 * 60 * 1000;
+
+// Pure window decision, unit-tested in isolation: auto-reload only if we have never
+// auto-reloaded (lastReloadAt null/NaN) or the last one was strictly older than the
+// window. Anything inside the window is suppressed to break an infinite reload loop.
+export function shouldAutoReload(
+  now: number,
+  lastReloadAt: number | null,
+  windowMs: number,
+): boolean {
+  if (lastReloadAt === null || Number.isNaN(lastReloadAt)) return true;
+  return now - lastReloadAt > windowMs;
+}
 
 // Heuristic detection of a failed dynamic import. Since the code-splitting work,
 // every route (plus Aside / AiChatWindow) is React.lazy: when a new deploy
@@ -24,12 +42,16 @@ export function isChunkLoadError(error: unknown): boolean {
 function handleError(error: unknown) {
   if (!isChunkLoadError(error)) return;
   // A stale-chunk 404 is cured by a full reload that re-fetches index.html and
-  // the new chunk manifest. Auto-reload once, guarding against a reload loop
-  // (e.g. a genuinely missing chunk) with a one-shot sessionStorage flag. If the
-  // flag is already set we fall through to the manual recovery UI below.
+  // the new chunk manifest. Auto-reload at most once per RELOAD_WINDOW_MS: this
+  // recovers across multiple deploys in a single tab's lifetime, yet a
+  // permanently-broken lazy chunk (which would loop) is stopped after the first
+  // reload and falls through to the manual recovery UI below.
   try {
-    if (sessionStorage.getItem(RELOAD_FLAG)) return;
-    sessionStorage.setItem(RELOAD_FLAG, "1");
+    const raw = sessionStorage.getItem(RELOAD_AT_KEY);
+    const lastReloadAt = raw === null ? null : Number.parseInt(raw, 10);
+    const now = Date.now();
+    if (!shouldAutoReload(now, lastReloadAt, RELOAD_WINDOW_MS)) return;
+    sessionStorage.setItem(RELOAD_AT_KEY, String(now));
   } catch {
     // sessionStorage unavailable (private mode / disabled): skip the automatic
     // reload rather than risk an unguarded loop; the fallback UI still recovers.

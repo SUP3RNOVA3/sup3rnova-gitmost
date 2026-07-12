@@ -434,6 +434,71 @@ async function main() {
       }
     }
 
+    // 6h. markdown converter fixpoint (#476): pins the converter fixpoint
+    // THROUGH the live server/collab path, not just the package tests. The
+    // unit corpus (docmost-md-roundtrip) proves the converter alone is a
+    // fixpoint; this asserts the property survives the real pipeline — export
+    // (REST read, PM -> MD) -> import (MD -> PM -> collab replace -> server
+    // persistence) -> export — where the server schema, the Yjs structural
+    // diff or the collab write path could still mangle the doc while every
+    // unit test stays green. importPageMarkdown is the designed inverse of
+    // exportPageMarkdown (the self-contained envelope with meta/comments
+    // blocks); updatePageMarkdown (client.updatePage) takes plain authoring
+    // markdown and would re-import the envelope blocks as literal content.
+    {
+      const FIXMD = [
+        "# Fixpoint heading",
+        "",
+        "Paragraph with **bold**, *italic* and a [link](https://example.com).",
+        "",
+        "## Second level",
+        "",
+        "- bullet one",
+        "- bullet two",
+        "",
+        "1. ordered one",
+        "2. ordered two",
+        "",
+        "```js",
+        "const answer = 42; // code block must survive byte-identically",
+        "```",
+        "",
+        "| A | B |",
+        "| --- | --- |",
+        "| one | two |",
+        "",
+        ":::info",
+        "Callout body.",
+        ":::",
+      ].join("\n");
+      const fx = await client.createPage("E2E md fixpoint " + Date.now(), FIXMD, spaceId);
+      const fxid = fx.data.id;
+      try {
+        const md1 = await client.exportPageMarkdown(fxid);
+        await client.importPageMarkdown(fxid, md1);
+        await new Promise((r) => setTimeout(r, 16000)); // wait for server persistence
+        const md2 = await client.exportPageMarkdown(fxid);
+        // On failure, name the first diverging line of the two exports.
+        const firstDiff = (a, b) => {
+          const al = a.split("\n");
+          const bl = b.split("\n");
+          for (let i = 0; i < Math.max(al.length, bl.length); i++) {
+            if (al[i] !== bl[i]) {
+              return `first diff at line ${i + 1}: ${JSON.stringify(al[i] ?? "<EOF>")} -> ${JSON.stringify(bl[i] ?? "<EOF>")}`;
+            }
+          }
+          return "same lines, different bytes (line endings?)";
+        };
+        check(
+          "markdown fixpoint: export -> import -> export is byte-identical",
+          md1 === md2,
+          md1 === md2 ? "" : firstDiff(md1, md2),
+        );
+      } finally {
+        try { await client.deletePage(fxid); } catch {}
+      }
+    }
+
     // 7. shares: create (idempotent), public access, list, unshare
     const share = await client.sharePage(pageId);
     check("sharePage: returns public URL", share.publicUrl?.startsWith(`${APP}/share/`), share.publicUrl);
