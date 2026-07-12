@@ -115,12 +115,18 @@ function DiffLine({
             <Box
               key={i}
               component="mark"
-              px={3}
               fw={600}
               style={{
                 background: markBg,
                 color: markFg,
-                borderRadius: 3,
+                borderRadius: 2,
+                // Snug intra-word highlight: a hair of horizontal padding keeps
+                // the mark background slightly wider than the glyph, canceled by
+                // an equal negative margin so neighbouring letters are NOT pushed
+                // apart. The old px={3} padding made single-letter edits (е→ё,
+                // х→е) look like they had spaces around the changed character.
+                padding: "0 1px",
+                margin: "0 -1px",
                 textDecoration: isDel ? "line-through" : "none",
               }}
             >
