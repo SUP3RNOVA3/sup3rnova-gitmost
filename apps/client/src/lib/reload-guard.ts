@@ -3,7 +3,7 @@
 // Both auto-reload paths — the reactive chunk-load-error-boundary (recovers
 // AFTER a stale lazy chunk 404s) and the proactive version-coherence feature
 // (reloads BEFORE the tab hits a stale chunk) — go through these functions so
-// they share ONE session-scoped reload budget: at most a single automatic
+// they share ONE window-scoped reload budget: at most a single automatic
 // reload per RELOAD_WINDOW_MS across BOTH paths. A window (rather than a
 // permanent one-shot flag) lets a SECOND deploy in the same tab's lifetime
 // recover too, while a permanent skew, node oscillation, or a genuinely-missing
@@ -57,7 +57,7 @@ export function hasAutoReloaded(now: number = Date.now()): boolean {
 
 /**
  * Stamp the shared window as consumed now — record that an automatic reload is
- * being performed this session.
+ * being performed within the current RELOAD_WINDOW_MS window.
  *
  * Returns whether the write succeeded. A `false` return (storage unavailable)
  * means the caller MUST NOT reload — otherwise the stamp would never stick and
