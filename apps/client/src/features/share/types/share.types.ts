@@ -108,7 +108,6 @@ export interface IShareAliasAvailability {
   alias: string;
   valid: boolean;
   available: boolean;
-  currentPageId: string | null;
 }
 
 export interface ISharedPageTree {

@@ -371,6 +371,12 @@ export class AiSettingsService {
       totalPages,
       // Optional hint for the client: a reindex run is currently in progress.
       reindexing: progress != null,
+      // Per-run identity so the client can key its poll on a stable run id and
+      // reset its per-run state when a NEW run starts. Present only while a run
+      // is active; `runId` may be '' for a legacy/degraded record (the client
+      // treats that as "no identity").
+      runId: progress?.runId,
+      reindexStartedAt: progress?.startedAt,
     };
   }
 

@@ -6,6 +6,8 @@ import {
   nextReindexPollInterval,
   isReindexComplete,
   isReindexButtonLoading,
+  reindexRunKey,
+  isNewReindexRun,
 } from './ai-provider-settings';
 
 describe('resolveCardStatus', () => {
@@ -217,6 +219,128 @@ describe('isReindexComplete', () => {
         { reindexing: false, indexedPages: 478, totalPages: 478 },
         false,
       ),
+    ).toBe(false);
+  });
+});
+
+describe('reindexRunKey', () => {
+  it('is null when the status carries no run identity', () => {
+    expect(reindexRunKey(undefined)).toBeNull();
+    expect(
+      reindexRunKey({ reindexing: false, indexedPages: 5, totalPages: 5 }),
+    ).toBeNull();
+  });
+
+  it('is null for a legacy/degraded record with an empty runId', () => {
+    // The server sends runId='' for a record written before the field existed;
+    // the client must treat that as "no identity" (fall back to prior behaviour).
+    expect(
+      reindexRunKey({
+        reindexing: true,
+        indexedPages: 0,
+        totalPages: 10,
+        runId: '',
+        reindexStartedAt: 1000,
+      }),
+    ).toBeNull();
+  });
+
+  it('folds runId and startedAt into one stable key', () => {
+    expect(
+      reindexRunKey({
+        reindexing: true,
+        indexedPages: 0,
+        totalPages: 10,
+        runId: 'run-a',
+        reindexStartedAt: 1000,
+      }),
+    ).toBe('run-a:1000');
+  });
+
+  it('changes when the runId changes for the same startedAt', () => {
+    const a = reindexRunKey({
+      reindexing: true,
+      indexedPages: 0,
+      totalPages: 10,
+      runId: 'run-a',
+      reindexStartedAt: 1000,
+    });
+    const b = reindexRunKey({
+      reindexing: true,
+      indexedPages: 0,
+      totalPages: 10,
+      runId: 'run-b',
+      reindexStartedAt: 1000,
+    });
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the same runId restarts at a new startedAt', () => {
+    const a = reindexRunKey({
+      reindexing: true,
+      indexedPages: 0,
+      totalPages: 10,
+      runId: 'run-a',
+      reindexStartedAt: 1000,
+    });
+    const b = reindexRunKey({
+      reindexing: true,
+      indexedPages: 0,
+      totalPages: 10,
+      runId: 'run-a',
+      reindexStartedAt: 2000,
+    });
+    expect(a).not.toBe(b);
+  });
+});
+
+describe('isNewReindexRun (poll keying on runId)', () => {
+  // Derive the status shape from the helper itself so the test needs no export
+  // of the component-internal ReindexStatus type.
+  type ReindexStatusLike = NonNullable<Parameters<typeof reindexRunKey>[0]>;
+  const run = (runId: string, startedAt: number): ReindexStatusLike => ({
+    reindexing: true,
+    indexedPages: 0,
+    totalPages: 10,
+    runId,
+    reindexStartedAt: startedAt,
+  });
+
+  it('first identity after none latched is a NEW run', () => {
+    expect(isNewReindexRun(null, run('run-a', 1000))).toBe(true);
+  });
+
+  it('the SAME identity is not a new run (same run being watched)', () => {
+    const key = reindexRunKey(run('run-a', 1000));
+    expect(isNewReindexRun(key, run('run-a', 1000))).toBe(false);
+  });
+
+  it('a DIFFERENT runId is a new run (reset per-run poll state)', () => {
+    const key = reindexRunKey(run('run-a', 1000));
+    expect(isNewReindexRun(key, run('run-b', 1000))).toBe(true);
+  });
+
+  it('an identity-less poll (no runId / cleared record) is never a new run', () => {
+    const key = reindexRunKey(run('run-a', 1000));
+    expect(
+      isNewReindexRun(key, {
+        reindexing: false,
+        indexedPages: 10,
+        totalPages: 10,
+      }),
+    ).toBe(false);
+  });
+
+  it('a legacy empty-runId poll does not spuriously reset a latched run', () => {
+    const key = reindexRunKey(run('run-a', 1000));
+    expect(
+      isNewReindexRun(key, {
+        reindexing: true,
+        indexedPages: 3,
+        totalPages: 10,
+        runId: '',
+        reindexStartedAt: 1000,
+      }),
     ).toBe(false);
   });
 });

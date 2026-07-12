@@ -149,4 +149,14 @@ export interface MaskedAiSettings {
   // True while a full workspace reindex is actively running (the counts above
   // then reflect the live run progress rather than the steady-state DB count).
   reindexing?: boolean;
+  // Identity of the ACTIVE reindex run (present only while `reindexing`). The
+  // client keys its poll on `runId`: a changed value means a NEW run (reset the
+  // per-run poll state it latched), the same value means the run it is already
+  // watching — removing the "same run or a fresh one?" ambiguity a stale
+  // pre-reindex snapshot otherwise causes. Absent/empty degrades gracefully.
+  runId?: string;
+  // Epoch-ms the active run started (present only while `reindexing`). Paired
+  // with `runId` so a run that restarts with the same (recycled) id is still
+  // seen as new.
+  reindexStartedAt?: number;
 }

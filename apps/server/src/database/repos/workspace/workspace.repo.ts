@@ -3,7 +3,7 @@ import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB, KyselyTransaction } from '../../types/kysely.types';
-import { dbOrTx } from '../../utils';
+import { dbOrTx, registerAfterCommit } from '../../utils';
 import {
   InsertableWorkspace,
   UpdatableWorkspace,
@@ -80,16 +80,30 @@ export class WorkspaceRepo {
    */
   private async bustWorkspaceCache(
     workspace?: Pick<Workspace, 'hostname'> | undefined,
+    trx?: KyselyTransaction,
   ): Promise<void> {
-    try {
-      await this.cacheManager.del(CacheKey.WORKSPACE_SELF_HOSTED);
-      if (workspace?.hostname) {
-        await this.cacheManager.del(
-          CacheKey.WORKSPACE_BY_HOST(workspace.hostname),
-        );
+    const del = async () => {
+      try {
+        await this.cacheManager.del(CacheKey.WORKSPACE_SELF_HOSTED);
+        if (workspace?.hostname) {
+          await this.cacheManager.del(
+            CacheKey.WORKSPACE_BY_HOST(workspace.hostname),
+          );
+        }
+      } catch {
+        // cache is best-effort; TTL is the backstop
       }
-    } catch {
-      // cache is best-effort; TTL is the backstop
+    };
+    if (trx) {
+      // Inside a caller transaction the write is NOT yet committed: busting now
+      // opens a repopulation window (a concurrent reader reloads the cache with
+      // the pre-commit / stale row, which then survives until TTL). Defer the del
+      // to the transaction's commit (drained by the owning executeTx) (#495).
+      registerAfterCommit(trx, del);
+    } else {
+      // No transaction: the mutation above already auto-committed, so this del is
+      // already post-commit.
+      await del();
     }
   }
 
@@ -180,7 +194,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -195,7 +209,7 @@ export class WorkspaceRepo {
       .returning(this.baseFields)
       .executeTakeFirst();
     // Bust the cached "not found" so a fresh install / new tenant is seen at once.
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -249,7 +263,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -271,7 +285,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -326,7 +340,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -354,7 +368,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -376,7 +390,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 
@@ -398,7 +412,7 @@ export class WorkspaceRepo {
       .where('id', '=', workspaceId)
       .returning(this.baseFields)
       .executeTakeFirst();
-    await this.bustWorkspaceCache(workspace);
+    await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
 

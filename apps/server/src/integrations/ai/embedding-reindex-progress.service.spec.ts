@@ -48,17 +48,36 @@ describe('EmbeddingReindexProgressService', () => {
   }
 
   describe('get', () => {
-    it('maps a valid hash to a ReindexProgress object', async () => {
+    it('maps a valid hash to a ReindexProgress object (incl. the run identity)', async () => {
       const { redis, hgetall } = makeRedis();
-      hgetall.mockResolvedValue({ total: '478', done: '120', startedAt: '1000' });
+      hgetall.mockResolvedValue({
+        total: '478',
+        done: '120',
+        startedAt: '1000',
+        runId: 'run-xyz',
+      });
       const service = makeService(redis);
 
       await expect(service.get(WORKSPACE_ID)).resolves.toEqual({
         total: 478,
         done: 120,
         startedAt: 1000,
+        runId: 'run-xyz',
       });
       expect(hgetall).toHaveBeenCalledWith(KEY);
+    });
+
+    it('degrades a missing runId to an empty string (legacy/partial record)', async () => {
+      const { redis, hgetall } = makeRedis();
+      // A record written before runId existed: get() must still succeed and
+      // report runId='' so the client treats it as "no identity", never breaks.
+      hgetall.mockResolvedValue({ total: '10', done: '3', startedAt: '5' });
+      await expect(makeService(redis).get(WORKSPACE_ID)).resolves.toEqual({
+        total: 10,
+        done: 3,
+        startedAt: 5,
+        runId: '',
+      });
     });
 
     it('returns null for an empty hash (no record)', async () => {
@@ -87,11 +106,17 @@ describe('EmbeddingReindexProgressService', () => {
 
     it('coerces a non-finite startedAt to 0', async () => {
       const { redis, hgetall } = makeRedis();
-      hgetall.mockResolvedValue({ total: '10', done: '2', startedAt: 'nope' });
+      hgetall.mockResolvedValue({
+        total: '10',
+        done: '2',
+        startedAt: 'nope',
+        runId: 'run-1',
+      });
       await expect(makeService(redis).get(WORKSPACE_ID)).resolves.toEqual({
         total: 10,
         done: 2,
         startedAt: 0,
+        runId: 'run-1',
       });
     });
 
@@ -113,6 +138,21 @@ describe('EmbeddingReindexProgressService', () => {
       );
       expect(multiObj.expire).toHaveBeenCalledWith(KEY, expect.any(Number));
       expect(multiObj.exec).toHaveBeenCalledTimes(1);
+    });
+
+    it('mints a fresh non-empty runId into the record on each start', async () => {
+      const { redis, multiObj } = makeRedis();
+      const service = makeService(redis);
+      await service.start(WORKSPACE_ID, 1);
+      await service.start(WORKSPACE_ID, 1);
+
+      const firstRunId = multiObj.hset.mock.calls[0][1].runId;
+      const secondRunId = multiObj.hset.mock.calls[1][1].runId;
+      expect(typeof firstRunId).toBe('string');
+      expect(firstRunId).not.toBe('');
+      // Each run gets its OWN identity so the client can tell a re-trigger apart
+      // from the run it is already watching.
+      expect(secondRunId).not.toBe(firstRunId);
     });
 
     it('defaults the expire TTL to the full 1h record TTL', async () => {

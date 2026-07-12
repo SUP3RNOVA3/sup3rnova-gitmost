@@ -13,6 +13,7 @@ import { JSDOM } from "jsdom";
 import { markdownToProseMirror } from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
+import type { PageId } from "./page-id.js";
 import {
   sanitizeForYjs,
   findUnstorableAttr,
@@ -250,7 +251,10 @@ export function assertYjsEncodable(doc: any): void {
  * read->write window, and it never throws (it can NEVER break a write).
  */
 export async function mutatePageContent(
-  pageId: string,
+  // Canonical UUID only (#260/#435): the brand forces every caller to
+  // resolvePageId() BEFORE this seam so the lock + CollabSession key can never
+  // be a raw slugId.
+  pageId: PageId,
   collabToken: string,
   baseUrl: string,
   transform: (liveDoc: any) => any | null,
@@ -300,7 +304,7 @@ export async function mutatePageContent(
  * mutatePageContent.
  */
 export async function replacePageContent(
-  pageId: string,
+  pageId: PageId,
   prosemirrorDoc: any,
   collabToken: string,
   baseUrl: string,
@@ -332,7 +336,7 @@ export async function replacePageContent(
  * Tables and :::callout::: blocks survive thanks to the full schema.
  */
 export async function updatePageContentRealtime(
-  pageId: string,
+  pageId: PageId,
   markdownContent: string,
   collabToken: string,
   baseUrl: string,

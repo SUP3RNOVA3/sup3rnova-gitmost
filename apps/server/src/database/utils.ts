@@ -6,16 +6,76 @@ import { KyselyDB, KyselyTransaction } from './types/kysely.types';
  * If an existing transaction is provided, it directly executes the callback with it.
  * Otherwise, it starts a new transaction using the provided database instance and executes the callback within that transaction.
  */
+/**
+ * Post-commit side-effect hooks, keyed by the transaction they were registered
+ * against. A WeakMap so an abandoned/never-drained transaction's entry is GC'd
+ * with the trx object (no leak). Used by {@link registerAfterCommit} /
+ * {@link executeTx}.
+ */
+const afterCommitHooks = new WeakMap<
+  KyselyTransaction,
+  Array<() => Promise<void> | void>
+>();
+
+/**
+ * Register a side effect to run ONLY AFTER the transaction that owns `trx`
+ * commits. THE fix for "bust the cache inside the open transaction" bugs: a
+ * cache-invalidation (or any read-your-write-visible side effect) done while the
+ * writing transaction is still open opens a window where a concurrent reader
+ * repopulates the cache with the PRE-COMMIT (stale) row, so after commit the
+ * cache holds the old value until its TTL. Deferring the effect to post-commit
+ * closes that window.
+ *
+ * The hook is drained by the OUTERMOST {@link executeTx} that actually owns
+ * (created) this transaction — so registering against a passed-through
+ * `existingTrx` still fires at the real commit boundary, not at the inner call.
+ * NOTE: a hook registered against a transaction that was NOT created via
+ * `executeTx` (untracked) will never be drained — always create transactions
+ * through `executeTx` when you rely on post-commit hooks.
+ */
+export function registerAfterCommit(
+  trx: KyselyTransaction,
+  hook: () => Promise<void> | void,
+): void {
+  const existing = afterCommitHooks.get(trx);
+  if (existing) existing.push(hook);
+  else afterCommitHooks.set(trx, [hook]);
+}
+
 export async function executeTx<T>(
   db: KyselyDB,
   callback: (trx: KyselyTransaction) => Promise<T>,
   existingTrx?: KyselyTransaction,
 ): Promise<T> {
   if (existingTrx) {
-    return await callback(existingTrx); // Execute callback with existing transaction
-  } else {
-    return await db.transaction().execute((trx) => callback(trx)); // Start new transaction and execute callback
+    // Reuse the caller's transaction. Any post-commit hooks registered here are
+    // drained by the OUTER executeTx that created `existingTrx`, at the true
+    // commit boundary — so we must NOT drain them now.
+    return await callback(existingTrx);
   }
+  // We OWN this transaction: run the body, then (only once it has COMMITTED)
+  // drain the post-commit hooks registered against it during the body.
+  let ownTrx: KyselyTransaction | undefined;
+  const result = await db.transaction().execute((trx) => {
+    ownTrx = trx;
+    return callback(trx);
+  });
+  if (ownTrx) {
+    const hooks = afterCommitHooks.get(ownTrx);
+    if (hooks) {
+      afterCommitHooks.delete(ownTrx);
+      for (const hook of hooks) {
+        // Best-effort: a failed side effect (e.g. a cache del) must not fail the
+        // already-committed transaction.
+        try {
+          await hook();
+        } catch {
+          // swallow — the durable write already committed
+        }
+      }
+    }
+  }
+  return result;
 }
 
 /*

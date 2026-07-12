@@ -173,8 +173,42 @@ export function resolveKeyField(
 // Subset of the status payload that drives the reindex poll decisions.
 type ReindexStatus = Pick<
   IAiSettings,
-  "reindexing" | "indexedPages" | "totalPages"
+  "reindexing" | "indexedPages" | "totalPages" | "runId" | "reindexStartedAt"
 >;
+
+/**
+ * A stable per-RUN key for the reindex poll: `runId:startedAt`, or `null` when
+ * the status carries no run identity (no active run, or a legacy/degraded
+ * server record with an empty runId). Two polls of the SAME run share a key; a
+ * new run mints a fresh runId and so a different key.
+ *
+ * This is the single place the client turns the server's run identity into the
+ * value it keys on — it removes the "is this the same run I've been watching or
+ * a brand-new one?" ambiguity that made a class of reindex-status bugs (a stale
+ * pre-reindex snapshot vs a fresh run) get fixed twice (#262). `startedAt` is
+ * folded in so a run that somehow reuses a runId but restarted is still new.
+ */
+export function reindexRunKey(status: ReindexStatus | undefined): string | null {
+  const runId = status?.runId;
+  if (!runId) return null;
+  return `${runId}:${status?.reindexStartedAt ?? ""}`;
+}
+
+/**
+ * Decide whether the latest poll represents a NEW reindex run relative to the
+ * run key the client last latched (`prevKey`, `null` if none yet). True only
+ * when the status carries an identity AND it differs from the latched one — the
+ * signal to reset any per-run poll state (the "seen active" latch / progress the
+ * UI held). The same identity (or no identity) is NOT a new run, so an unchanged
+ * or identity-less poll never resets mid-run.
+ */
+export function isNewReindexRun(
+  prevKey: string | null,
+  status: ReindexStatus | undefined,
+): boolean {
+  const key = reindexRunKey(status);
+  return key !== null && key !== prevKey;
+}
 
 /**
  * Decide the TanStack Query `refetchInterval` while a reindex may be running.
@@ -320,6 +354,13 @@ export default function AiProviderSettings() {
   // counter at 0 until a manual reload. A ref (not state) because it must not
   // trigger a render and is only ever read where `reindexing` is already false.
   const reindexSeenActiveRef = useRef(false);
+  // The run identity (runId:startedAt) the current poll window is keyed on. When
+  // a poll reports a DIFFERENT runId the server has started a NEW run, so we
+  // re-latch to it and reset `reindexSeenActiveRef` — a fresh run must never
+  // inherit the previous run's "seen active"/completion state (which would stop
+  // polling immediately or read the old run's counters as this run's). null =
+  // no run keyed yet (steady state, or a legacy record without a runId).
+  const reindexRunKeyRef = useRef<string | null>(null);
 
   // Only admins may read the (masked) AI settings; the server enforces this too.
   const { data: settings, isLoading } = useAiSettingsQuery(isAdmin, (query) =>
@@ -336,6 +377,14 @@ export default function AiProviderSettings() {
   // unmount because the deadline state goes away with the component.
   useEffect(() => {
     if (reindexDeadline === null) return;
+    // Key the poll on the run identity: if this poll carries a runId different
+    // from the one we latched, the server started a NEW run, so adopt it and
+    // drop the per-run "seen active" latch (a fresh run must not inherit the
+    // previous run's completion state). Same runId => same run, leave it alone.
+    if (isNewReindexRun(reindexRunKeyRef.current, settings)) {
+      reindexRunKeyRef.current = reindexRunKey(settings);
+      reindexSeenActiveRef.current = false;
+    }
     // Latch "we have seen the active run" the moment a poll reports it, so the
     // completion check below (and the refetchInterval's) only fires once the run
     // has genuinely started — never on the stale pre-reindex snapshot.
@@ -1220,6 +1269,10 @@ export default function AiProviderSettings() {
                   // immediately.
                   onSuccess: () => {
                     reindexSeenActiveRef.current = false;
+                    // Forget the previous run's identity so the first poll of
+                    // this window (carrying the new run's runId) is recognized
+                    // as a new run and keyed afresh.
+                    reindexRunKeyRef.current = null;
                     setReindexDeadline(Date.now() + REINDEX_POLL_CAP_MS);
                   },
                 })

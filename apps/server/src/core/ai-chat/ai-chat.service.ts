@@ -117,9 +117,14 @@ const FINAL_STEP_NUDGE =
 // NO text at all (#444, mitigates the "empty turn" the lockdown used to prevent
 // when the toggle is OFF). Makes the exhausted-without-answer state explicit to
 // the user and, on replay, to the model on the next turn.
+// The persisted content is the app's base locale (en-US) — which is ALSO the
+// i18n key the client localizes through `t()` — instead of a hardcoded Russian
+// string (it used to render Russian for every locale, and fed Russian back to
+// the model on replay). Keep it a plain, model-readable English sentence so the
+// next turn's replay reads cleanly; the client resolves the locale.
 const STEP_LIMIT_NO_ANSWER_MARKER =
-  '(Достигнут лимит шагов — итоговый ответ не сформулирован; работа могла ' +
-  'остаться незавершённой. Напишите «продолжай», чтобы агент продолжил.)';
+  '(Step limit reached — no final answer was produced; the work may be ' +
+  'unfinished. Reply "continue" to let the agent carry on.)';
 
 // Reason recorded in ai_chat_runs.error / the assistant row when the token-
 // degeneration detector (#444) aborts a run. Distinct from a user Stop (no error)
@@ -1514,6 +1519,13 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           system,
           messages,
           tools,
+          // Pin the AI SDK per-request retry budget explicitly instead of relying
+          // on its default (which is also 2). Connection arithmetic per turn:
+          // (1 + maxRetries=2) × (1 + AI_STREAM_PRE_RESPONSE_RETRIES) network
+          // connects worst-case — the two retry layers compose, so making the SDK
+          // side explicit keeps that ceiling visible and pinned against SDK-default
+          // drift.
+          maxRetries: 2,
           // No maxOutputTokens cap on the agent: tool-call arguments (e.g. a full
           // page body for the write tools) are emitted as OUTPUT tokens, so a fixed
           // cap would truncate complex tool calls mid-argument. Let the model use its
