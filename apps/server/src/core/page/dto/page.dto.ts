@@ -47,6 +47,16 @@ export class PageInfoDto extends PageIdDto {
   format?: ContentFormat;
 }
 
+export class PageWorkTimeDto extends PageIdDto {
+  // Viewer IANA timezone for the per-day punch-card buckets (§6.3). Optional —
+  // falls back to UTC server-side. Length-capped so a bogus value cannot bloat
+  // the request; the value is only ever handed to Intl.DateTimeFormat, which
+  // throws on an unknown zone (caught by the controller → 400).
+  @IsOptional()
+  @IsString()
+  tz?: string;
+}
+
 export class DeletePageDto extends PageIdDto {
   @IsOptional()
   @IsBoolean()

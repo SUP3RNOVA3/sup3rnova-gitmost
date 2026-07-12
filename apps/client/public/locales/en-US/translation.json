@@ -1427,5 +1427,20 @@
   "Boundary": "Boundary",
   "Autosave": "Autosave",
   "Only versions": "Only versions",
-  "No saved versions yet.": "No saved versions yet."
+  "No saved versions yet.": "No saved versions yet.",
+  "Time worked on this article": "Time worked on this article",
+  "Show time worked on this page": "Show time worked on this page",
+  "Estimated time worked (inactivity gap {{gap}} min)": "Estimated time worked (inactivity gap {{gap}} min)",
+  "Estimate · timezone {{tz}} · inactivity gap {{gap}} min": "Estimate · timezone {{tz}} · inactivity gap {{gap}} min",
+  "No editing activity recorded yet.": "No editing activity recorded yet.",
+  "× {{count}} days without edits": "× {{count}} days without edits",
+  "agent: {{value}}": "agent: {{value}}",
+  "Work": "Work",
+  "Agent": "Agent",
+  "≈ {{hours}}h {{minutes}}m": "≈ {{hours}}h {{minutes}}m",
+  "≈ {{hours}}h": "≈ {{hours}}h",
+  "≈ {{minutes}}m": "≈ {{minutes}}m",
+  "{{hours}}h {{minutes}}m": "{{hours}}h {{minutes}}m",
+  "{{hours}}h": "{{hours}}h",
+  "{{minutes}}m": "{{minutes}}m"
 }

@@ -1442,5 +1442,20 @@
   "Boundary": "Граница",
   "Autosave": "Автосейв",
   "Only versions": "Только версии",
-  "No saved versions yet.": "Пока нет сохранённых версий."
+  "No saved versions yet.": "Пока нет сохранённых версий.",
+  "Time worked on this article": "Время работы над статьёй",
+  "Show time worked on this page": "Показать время работы над страницей",
+  "Estimated time worked (inactivity gap {{gap}} min)": "Оценка времени работы (порог паузы {{gap}} мин)",
+  "Estimate · timezone {{tz}} · inactivity gap {{gap}} min": "Оценка · таймзона {{tz}} · порог паузы {{gap}} мин",
+  "No editing activity recorded yet.": "Правок пока нет.",
+  "× {{count}} days without edits": "× {{count}} дн. без правок",
+  "agent: {{value}}": "агент: {{value}}",
+  "Work": "Работа",
+  "Agent": "Агент",
+  "≈ {{hours}}h {{minutes}}m": "≈ {{hours}} ч {{minutes}} мин",
+  "≈ {{hours}}h": "≈ {{hours}} ч",
+  "≈ {{minutes}}m": "≈ {{minutes}} мин",
+  "{{hours}}h {{minutes}}m": "{{hours}} ч {{minutes}} м",
+  "{{hours}}h": "{{hours}} ч",
+  "{{minutes}}m": "{{minutes}} м"
 }

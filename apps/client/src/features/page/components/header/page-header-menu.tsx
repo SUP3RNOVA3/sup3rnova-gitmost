@@ -51,6 +51,7 @@ import {
 import { formattedDate } from "@/lib/time.ts";
 import { PageEditModeToggle } from "@/features/user/components/page-state-pref.tsx";
 import MovePageModal from "@/features/page/components/move-page-modal.tsx";
+import WorkTimeStat from "@/features/page-history/work-time/work-time-stat.tsx";
 import { useTimeAgo } from "@/hooks/use-time-ago.tsx";
 import {
   useFavoriteIds,
@@ -265,6 +266,8 @@ function PageActionMenu({ readOnly, onSaveVersion }: PageActionMenuProps) {
 
   return (
     <>
+      {page?.id && <WorkTimeStat pageId={page.id} />}
+
       <Menu
         shadow="xl"
         position="bottom-end"

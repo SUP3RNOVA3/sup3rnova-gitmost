@@ -157,6 +157,44 @@ export class PageHistoryRepo {
     return { ...result, items: result.items.map(attachPageHistoryAgent) };
   }
 
+  /**
+   * #395 — cheap projection of a page's FULL history timeline for the work-time
+   * estimate: only the columns the sessionizer needs, no heavy `content`, sorted
+   * oldest→newest. The secondary `id` tie-break keeps rows sharing a `createdAt`
+   * (e.g. a synchronous pre-agent boundary row + the immediate agent snapshot)
+   * in a deterministic order.
+   */
+  async findTimelineByPageId(
+    pageId: string,
+    trx?: KyselyTransaction,
+  ): Promise<
+    Array<
+      Pick<
+        PageHistory,
+        | 'createdAt'
+        | 'lastUpdatedById'
+        | 'lastUpdatedSource'
+        | 'lastUpdatedAiChatId'
+        | 'kind'
+      >
+    >
+  > {
+    const db = dbOrTx(this.db, trx);
+    return db
+      .selectFrom('pageHistory')
+      .select([
+        'createdAt',
+        'lastUpdatedById',
+        'lastUpdatedSource',
+        'lastUpdatedAiChatId',
+        'kind',
+      ])
+      .where('pageId', '=', pageId)
+      .orderBy('createdAt', 'asc')
+      .orderBy('id', 'asc')
+      .execute();
+  }
+
   async findPageLastHistory(
     pageId: string,
     opts?: {
