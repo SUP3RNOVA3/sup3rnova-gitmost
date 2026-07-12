@@ -1,7 +1,7 @@
 import { EditorContent, ReactNodeViewRenderer, useEditor } from "@tiptap/react";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { StarterKit } from "@tiptap/starter-kit";
-import { Mention, LinkExtension } from "@docmost/editor-ext";
+import { Mention, LinkExtension, Code } from "@docmost/editor-ext";
 import classes from "./comment.module.css";
 import { useFocusWithin } from "@mantine/hooks";
 import clsx from "clsx";
@@ -44,7 +44,12 @@ const CommentEditor = forwardRef(
           gapcursor: false,
           dropcursor: false,
           link: false,
+          // #515: use the shared editor-ext `Code` (excludes: "") instead of
+          // StarterKit's excluding one, so inline code in a comment can carry
+          // other marks and does not drop them when the comment is edited.
+          code: false,
         }),
+        Code,
         Placeholder.configure({
           placeholder: placeholder || t("Reply..."),
         }),

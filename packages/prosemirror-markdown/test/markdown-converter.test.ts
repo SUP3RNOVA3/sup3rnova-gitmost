@@ -59,22 +59,21 @@ describe('convertProseMirrorToMarkdown', () => {
       ).toBe('`x`');
     });
 
-    it('code + another mark emits the backtick code form (code wins)', () => {
-      // The schema's `code` mark excludes all other marks, so the editor can
-      // never produce code+bold on one run and import always drops the co-mark.
-      // The lossless, byte-stable behavior is to emit ONLY the backtick code
-      // span and ignore the co-occurring mark.
+    it('code + bold nests the backtick span inside the emphasis (#515)', () => {
+      // #515: the `code` mark no longer excludes other marks (`excludes: ""`), so
+      // a run can carry code+bold. CommonMark nests them (`<strong><code>`), so
+      // the code span is emitted innermost and the bold delimiters wrap it.
       const out = convertProseMirrorToMarkdown(
         doc(para(text('x', [{ type: 'bold' }, { type: 'code' }]))),
       );
-      expect(out).toBe('`x`');
+      expect(out).toBe('**`x`**');
     });
 
-    it('code + strike combo emits the backtick code form (code wins)', () => {
+    it('code + strike nests the backtick span inside the emphasis (#515)', () => {
       const out = convertProseMirrorToMarkdown(
         doc(para(text('x', [{ type: 'strike' }, { type: 'code' }]))),
       );
-      expect(out).toBe('`x`');
+      expect(out).toBe('~~`x`~~');
     });
   });
 

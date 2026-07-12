@@ -16,6 +16,7 @@
  * `@docmost/editor-ext` before updating the snapshot.
  */
 import StarterKit from "@tiptap/starter-kit";
+import { Code } from "@tiptap/extension-code";
 import Image from "@tiptap/extension-image";
 import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
@@ -1481,7 +1482,20 @@ export const docmostExtensions = [
     codeBlock: {},
     heading: {},
     link: { openOnClick: false },
+    // #515: disable StarterKit's bundled inline `code` mark so it can be replaced
+    // by the local override below. StarterKit's `code` inherits tiptap's
+    // `excludes: "_"`, which strips every co-occurring mark on HTML->PM import
+    // (`generateJSON`) — so `` **`--flag`** `` lost its bold. This mirror is a
+    // DELIBERATE standalone copy (it must not pull @docmost/editor-ext into the
+    // node import runtime — that would drag in React/node-views; see #293), so
+    // the `excludes: ""` override is declared LOCALLY here and kept in lockstep
+    // with the canonical `Code` in @docmost/editor-ext by a parity test.
+    code: false,
   }),
+  // #515: inline code that COMBINES with other marks (CommonMark-consistent).
+  // `excludes: ""` means the mark excludes nothing, so bold/italic/strike/… may
+  // co-occur with `code` and survive import.
+  Code.extend({ excludes: "" }),
   // Preserve image width/height as the AUTHORED string. Without an explicit
   // parseHTML the stock Image node attribute falls back to tiptap core's
   // `fromString`, which coerces a numeric width like "320" into the number 320

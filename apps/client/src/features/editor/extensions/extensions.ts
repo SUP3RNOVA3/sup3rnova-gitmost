@@ -1,6 +1,5 @@
 import { markInputRule } from "@tiptap/core";
 import { StarterKit } from "@tiptap/starter-kit";
-import { Code } from "@tiptap/extension-code";
 import { TextAlign } from "@tiptap/extension-text-align";
 import { TaskList, TaskItem } from "@tiptap/extension-list";
 import { Placeholder, CharacterCount, UndoRedo } from "@tiptap/extensions";
@@ -67,6 +66,7 @@ import {
   FootnoteReference,
   FootnotesList,
   FootnoteDefinition,
+  Code,
 } from "@docmost/editor-ext";
 import {
   randomElement,
@@ -153,6 +153,10 @@ export const mainExtensions = [
     codeBlock: false,
     code: false,
   }),
+  // Base `Code` comes from @docmost/editor-ext, which overrides `excludes: ""`
+  // (#515) so inline code can co-occur with bold/italic/… — the SINGLE shared
+  // source also used by the collab server and comment editor. Here we keep the
+  // existing client-only behavior on top of it:
   // Override TipTap's Code extension to fix the inline code input rule.
   // The upstream regex /(^|[^`])`([^`]+)`(?!`)$/ captures the character
   // before the opening backtick as part of the match, causing markInputRule

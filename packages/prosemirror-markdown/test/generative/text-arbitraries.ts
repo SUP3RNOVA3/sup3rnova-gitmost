@@ -11,9 +11,11 @@
  *
  * The corpus deliberately spans the CommonMark / canon hostile alphabet
  * (`* _ [ ] ( ) { } | < > & # ! ~ = + -`), unicode / emoji / RTL, and the legal
- * mark combinations on runs (including the `code` mark, which the schema's
- * `excludes: "_"` makes suppress every co-occurring mark — so it is never
- * combined with another mark in the byte-stable space).
+ * mark combinations on runs. As of #515 the `code` mark no longer excludes other
+ * marks (`excludes: ""`), so the corpus ALSO combines `code` with bold / italic /
+ * strike / highlight — exercising both the HOMOGENEOUS run factoring (adjacent
+ * code+bold spans -> `` **`a` `b`** ``) and the HETEROGENEOUS anti-collision
+ * fallback (`[code,bold]` next to `[italic]` -> schema-HTML, never `` `a`***b* ``).
  */
 import fc from 'fast-check';
 
@@ -106,16 +108,16 @@ export const urlArb: fc.Arbitrary<string> = fc
 /**
  * A text run with an OPTIONAL single non-code formatting mark (bold/italic/
  * strike/underline/superscript/subscript/spoiler), or a SOLE `code` mark, or a
- * link, or an inline comment anchor. `code` is NEVER combined with another mark
- * in the byte-stable space (that combination is a documented converter
- * limitation — the schema's `code` mark declares `excludes: "_"`). Marks wrap
- * `safeTextArb`, which stays stable even when it contains isolated specials.
+ * `code` mark COMBINED with a bare-delimiter emphasis mark (#515), or a link, or
+ * an inline comment anchor. Marks wrap `safeTextArb`, which stays stable even
+ * when it contains isolated specials.
  *
- * The mark set here is broadened past the sibling test's {bold,italic,strike}
- * to also cover underline / superscript / subscript / spoiler / textStyle /
- * highlight (all single, non-code marks), so the marks-on-text generator
- * exercises every mark the schema declares except the deliberately-excluded
- * `code`+other combination.
+ * The mark set here is broadened past the sibling test's {bold,italic,strike} to
+ * also cover underline / superscript / subscript / spoiler / textStyle /
+ * highlight (all single, non-code marks). As of #515 it ALSO emits `code`
+ * combined with bold/italic/strike, so the assembled inline content exercises the
+ * converter's code-emphasis run detection (adjacent combos -> homogeneous
+ * factoring or heterogeneous HTML fallback, both lossless).
  */
 export const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // Plain text.
@@ -138,6 +140,25 @@ export const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // Sole code mark (backtick span). safeTextArb is backtick-free, so the span
   // content cannot contain an inner backtick.
   safeTextArb.map((t) => ({ type: 'text', text: t, marks: [{ type: 'code' }] })),
+  // #515: code COMBINED with a bare-delimiter emphasis mark. The converter nests
+  // the backtick span inside the emphasis delimiters (`` **`x`** ``) and, when
+  // such runs sit adjacent, factors a shared mark or falls back to schema-HTML.
+  // Mark order here is `[emphasis, code]` — the order the HTML->PM import yields
+  // for bold/italic/strike specifically (code last). This is NOT universal: the
+  // `==`-highlight case below imports code FIRST — so match each case to its own
+  // imported order for the order-exact P1 round-trip (do not assume a fixed order).
+  fc
+    .tuple(safeTextArb, fc.constantFrom('bold', 'italic', 'strike'))
+    .map(([t, m]) => ({ type: 'text', text: t, marks: [{ type: m }, { type: 'code' }] })),
+  // #515: code combined with an UNCOLORED highlight (also a bare-delimiter mark,
+  // `==…==`), so the highlight+code delimiter interaction is covered too. Import
+  // yields `[code, highlight]` here (the `==` inline extension nests code first),
+  // so the generator matches that order for the order-exact P1 round-trip.
+  safeTextArb.map((t) => ({
+    type: 'text',
+    text: t,
+    marks: [{ type: 'code' }, { type: 'highlight' }],
+  })),
   // Link with safe text, a paren/space-free href, optionally a letter-bearing
   // title (a purely numeric title is coerced to a number and dropped).
   fc

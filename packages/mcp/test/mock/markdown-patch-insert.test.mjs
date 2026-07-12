@@ -108,6 +108,17 @@ async function spawnCollabStack(seedDoc) {
   return { state, baseURL };
 }
 
+// y-prosemirror stores an OVERLAPPING mark (one whose type does not exclude
+// itself — e.g. `comment`, and since #515 `code` with `excludes: ""`) under a
+// HASHED Yjs attribute key `name--<8-char hash>` so several may coexist on a
+// range. The real read path (yDocToProsemirrorJSON) strips that suffix back to
+// the bare mark name via this exact regex; mirror it here so this minimal decoder
+// reports the same mark names Docmost actually returns (without it an overlapping
+// `code` would leak as `code--<hash>`).
+const hashedMarkNameRegex = /(.*)(--[a-zA-Z0-9+/=]{8})$/;
+const yattr2markname = (attrName) =>
+  hashedMarkNameRegex.exec(attrName)?.[1] ?? attrName;
+
 // Minimal XmlFragment -> ProseMirror JSON decode, mirroring the shape Docmost
 // stores. Reads element name as node type, attributes as attrs, and recurses into
 // children; text nodes carry their string.
@@ -121,8 +132,8 @@ function fragmentToJson(frag) {
         if (d.attributes && Object.keys(d.attributes).length) {
           node.marks = Object.entries(d.attributes).map(([type, attrs]) =>
             attrs && typeof attrs === "object" && Object.keys(attrs).length
-              ? { type, attrs }
-              : { type },
+              ? { type: yattr2markname(type), attrs }
+              : { type: yattr2markname(type) },
           );
         }
         return node;
