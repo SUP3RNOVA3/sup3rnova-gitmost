@@ -93,6 +93,7 @@ export type DocmostClientLike = Pick<
   | 'sharePage'
   | 'unsharePage'
   | 'restorePageVersion'
+  | 'savePageVersion'
   | 'stashPage'
   | 'insertFootnote'
   | 'insertImage'
@@ -741,6 +742,28 @@ export const SHARED_TOOL_SPECS = {
     }),
     execute: (client, { historyId }) =>
       client.restorePageVersion(historyId as string),
+  },
+
+  savePageVersion: {
+    mcpName: 'savePageVersion',
+    inAppKey: 'savePageVersion',
+    writeClass: 'write',
+    description:
+      'Save an intentional, NAMED version (kind=agent) of the page\'s CURRENT ' +
+      'live content — a restorable checkpoint pinned into its history. Call it ' +
+      'when you have FINISHED a coherent editing pass (not after every small ' +
+      'edit), so the reader can see and roll back to the state you left. The ' +
+      'version type is derived SERVER-SIDE from your signed agent identity (you ' +
+      'cannot mislabel it); a save whose content is IDENTICAL to the last saved ' +
+      'version is promoted/no-op\'d server-side, so a redundant call is harmless ' +
+      'and never duplicates a version. Returns { historyId, kind, alreadySaved }.',
+    tier: 'deferred',
+    catalogLine:
+      'savePageVersion — pin the page\'s current content as a named agent version (restorable checkpoint).',
+    buildShape: (z) => ({
+      pageId: z.string().min(1),
+    }),
+    execute: (client, { pageId }) => client.savePageVersion(pageId as string),
   },
 
   // --- markdown round-trip ---

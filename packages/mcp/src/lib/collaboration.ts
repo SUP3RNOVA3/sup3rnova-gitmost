@@ -325,6 +325,76 @@ export async function mutatePageContent(
 }
 
 /**
+ * Stateless-channel message types for the #370 explicit save-version handshake.
+ * These MUST match the server constants in
+ * apps/server/src/collaboration/extensions/persistence.extension.ts
+ * (SAVE_VERSION_MESSAGE_TYPE / the 'version.saved' broadcast) — the mcp package
+ * cannot import server code, so the literals are duplicated here with this note.
+ */
+const SAVE_VERSION_MESSAGE_TYPE = "save-version";
+const VERSION_SAVED_MESSAGE_TYPE = "version.saved";
+
+/**
+ * Bounded wait for the server's `version.saved` broadcast after we ask it to save
+ * a version. The server flushes the live ydoc through its store path and writes a
+ * history row inside a DB transaction before broadcasting, so allow the same
+ * headroom as a persistence ack; reject (do NOT hang) past it.
+ */
+const SAVE_VERSION_ACK_TIMEOUT_MS = 20000;
+
+/** The resolved shape of an explicit save-version, surfaced to the tool caller. */
+export interface SaveVersionResult {
+  historyId: string;
+  kind: string;
+  alreadySaved: boolean;
+}
+
+/**
+ * Save an intentional version of a page's CURRENT live collaboration content
+ * (#370). Runs under the per-page lock, acquires the SAME cached CollabSession the
+ * content writes use (#400) — so it authenticates with the caller's agent collab
+ * token, and the server derives kind='agent' from that signed actor — then sends a
+ * `{type:'save-version'}` stateless message and awaits the server's
+ * `{type:'version.saved', …}` reply on the same channel.
+ *
+ * Deliberately does NOT read `pages.content` over REST: the versioned content is
+ * the live in-memory ydoc, which the debounced (up-to-10s-stale) page row would
+ * not yet reflect. The stateless round-trip is what makes the save exact.
+ *
+ * On any failure the session is destroyed so the next call reconnects fresh, and
+ * the error propagates. A save is safe to retry — the server promotes-not-
+ * duplicates an identical latest version — so the caller (and its agent) may
+ * re-issue it without risking a duplicate heavy history row.
+ */
+export async function savePageVersionRealtime(
+  pageId: PageId,
+  collabToken: string,
+  baseUrl: string,
+): Promise<SaveVersionResult> {
+  return withPageLock(pageId, async () => {
+    const session = await acquireCollabSession(pageId, collabToken, baseUrl);
+    try {
+      return await session.sendStatelessAndAwait<SaveVersionResult>(
+        JSON.stringify({ type: SAVE_VERSION_MESSAGE_TYPE }),
+        (message) =>
+          message && message.type === VERSION_SAVED_MESSAGE_TYPE
+            ? {
+                historyId: String(message.historyId),
+                kind: String(message.kind),
+                alreadySaved: !!message.alreadySaved,
+              }
+            : undefined,
+        SAVE_VERSION_ACK_TIMEOUT_MS,
+      );
+    } catch (e) {
+      // Drop the session on any failure so the next call reconnects fresh.
+      session.destroy("save-version failed");
+      throw e;
+    }
+  });
+}
+
+/**
  * Replace the live content of a page over the collaboration websocket.
  * Accepts a ready ProseMirror JSON document; the caller controls whether
  * it was produced from markdown (ids regenerate) or edited in place

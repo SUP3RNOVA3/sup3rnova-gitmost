@@ -106,6 +106,7 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.sharePage(s, true);
   void client.unsharePage(s);
   void client.restorePageVersion(s);
+  void client.savePageVersion(s);
   void client.transformPage(s, s, { dryRun: true });
   void client.stashPage(s);
   // --- write (image / footnote), in-app since #410 ---

@@ -11,6 +11,7 @@ import {
   markdownToProseMirror,
   markdownToProseMirrorCanonical,
   mutatePageContent,
+  savePageVersionRealtime,
   assertYjsEncodable,
   MutationResult,
 } from "../lib/collaboration.js";
@@ -55,6 +56,7 @@ export interface IPagesMixin {
   listPageHistory(pageId: string, cursor?: string): any;
   getPageHistory(historyId: string): any;
   restorePageVersion(historyId: string): any;
+  savePageVersion(pageId: string): any;
   diffPageVersions(pageId: string, from?: string, to?: string): any;
 }
 
@@ -585,6 +587,22 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       restoredFrom: historyId,
       verify: mutation.verify,
     };
+  }
+
+  /**
+   * Save an intentional NAMED version of a page's CURRENT live content (#370).
+   * The write goes over the same agent-authenticated collab session content edits
+   * use, so the server derives kind='agent' from the signed actor. Returns the
+   * created (or promoted) history id, its kind, and whether it was already saved.
+   */
+  async savePageVersion(pageId: string) {
+    const collabToken = await this.getCollabTokenWithReauth();
+    const pageUuid = await this.resolvePageId(pageId);
+    // Self-heal a rejected WS handshake once (#486): re-mint the collab token and
+    // retry, symmetric to the content-write path.
+    return this.writeWithCollabAuthRetry(collabToken, (token) =>
+      savePageVersionRealtime(pageUuid, token, this.apiUrl),
+    );
   }
 
   /**
