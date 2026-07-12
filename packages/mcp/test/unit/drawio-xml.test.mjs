@@ -51,6 +51,14 @@ const hasRule = (issues, rule, cellId) =>
     (i) => i.rule === rule && (cellId === undefined || i.cellId === cellId),
   );
 
+// Reverse the attribute-value XML escaping used in the `content=` payload.
+const unescapeAttr = (s) =>
+  s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&");
+
 // --- style parsing ---------------------------------------------------------
 
 test("parseStyle: base stylename + key=value pairs", () => {
@@ -335,16 +343,20 @@ test("encode/build: a title with < > \" & round-trips without corrupting the SVG
 
   // The outer content="..." attribute must not be broken by the title: the raw
   // title metacharacters never appear literally in the SVG markup (they are
-  // base64-encoded inside content=, and escaped inside the file XML).
+  // entity-escaped inside content=, doubly so where the file XML already escaped
+  // them inside name="...").
   const contentMatch = /content="([^"]*)"/.exec(svg);
   assert.ok(contentMatch, "SVG has a single well-formed content= attribute");
 
   // The diagram model still decodes losslessly despite the exotic title.
   assert.equal(decodeDrawioSvg(svg), model);
 
+  // content= is now entity-encoded XML (draw.io's native form), never base64.
+  assert.match(contentMatch[1], /^&lt;mxfile/);
+
   // The file XML is well-formed: the title lives in name="..." as escaped
   // entities, so unescaping recovers the original title byte-for-byte.
-  const fileXml = Buffer.from(contentMatch[1], "base64").toString("utf-8");
+  const fileXml = unescapeAttr(contentMatch[1]);
   const nameMatch = /<diagram id="[^"]*" name="([^"]*)">/.exec(fileXml);
   assert.ok(nameMatch, "the diagram name attribute is intact and quote-safe");
   const decodedTitle = nameMatch[1]
@@ -357,4 +369,113 @@ test("encode/build: a title with < > \" & round-trips without corrupting the SVG
   // encodeDrawioFile alone produces the same escaped, well-formed envelope.
   const file = encodeDrawioFile(model, title);
   assert.match(file, /name="A &lt; B &gt; C &quot; D &amp; E">/);
+});
+
+// --- #507: content= is entity-encoded XML, never base64 --------------------
+
+// A model whose cell values carry Cyrillic, ё and an em dash — exactly the
+// characters draw.io's Latin-1 atob mangles when content= is base64.
+const CYRILLIC_MODEL =
+  "<mxGraphModel><root>" +
+  '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+  '<mxCell id="2" value="Старт-бит — ёж" style="rounded=1;html=1;" vertex="1" parent="1">' +
+  '<mxGeometry x="100" y="100" width="120" height="60" as="geometry"/></mxCell>' +
+  "</root></mxGraphModel>";
+
+test("#507: buildDrawioSvg writes content= as entity-encoded XML (not base64)", () => {
+  const model = normalizeXml(CYRILLIC_MODEL);
+  const svg = buildDrawioSvg(model, "<g/>", { width: 200, height: 120 }, "Диаграмма");
+
+  const contentMatch = /content="([^"]*)"/.exec(svg);
+  assert.ok(contentMatch, "SVG has a single well-formed content= attribute");
+  const content = contentMatch[1];
+
+  // The content= value is the entity-encoded mxfile XML — starts with `&lt;mxfile`.
+  assert.match(content, /^&lt;mxfile/, "content= is entity-encoded mxfile XML");
+  // It must NOT be a base64 blob: base64 has no XML entities and no literal `<`.
+  assert.ok(content.includes("&lt;"), "content= carries XML entities, not base64");
+
+  // Cyrillic / ё / — survive verbatim in the attribute (raw UTF-8, not atob-mangled).
+  assert.ok(content.includes("Старт-бит — ёж"), "non-ASCII value is raw UTF-8 in content=");
+  assert.ok(content.includes("Диаграмма"), "non-ASCII title is raw UTF-8 in content=");
+  // The mojibake that base64+atob would have produced must be absent.
+  assert.ok(!content.includes("Ð"), "no Latin-1 mojibake in content=");
+});
+
+test("#507: Cyrillic model round-trips byte-stable through buildDrawioSvg -> decodeDrawioSvg", () => {
+  const model = normalizeXml(CYRILLIC_MODEL);
+  const svg = buildDrawioSvg(model, "<g/>", { width: 200, height: 120 }, "Заголовок — ё");
+  assert.equal(decodeDrawioSvg(svg), model);
+});
+
+test("#507 back-compat: an OLD base64-form .drawio.svg still decodes losslessly", () => {
+  const model = normalizeXml(CYRILLIC_MODEL);
+  // Reproduce the pre-fix write path: encodeDrawioFile -> base64 in content=.
+  const file = encodeDrawioFile(model, "Старая диаграмма");
+  const base64 = Buffer.from(file, "utf-8").toString("base64");
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" content="${base64}"><g/></svg>`;
+  // No XML entities, purely base64 alphabet — this is the legacy form.
+  assert.ok(!base64.includes("<") && !base64.includes("&"));
+  assert.equal(decodeDrawioSvg(svg), model);
+});
+
+test("#507 negative: non-ASCII in a cell value AND in the title round-trip clean", () => {
+  const model = normalizeXml(CYRILLIC_MODEL);
+  const title = "Тест — ёмкость № 5";
+  const svg = buildDrawioSvg(model, "<g/>", { width: 200, height: 120 }, title);
+
+  // Model recovered byte-for-byte.
+  assert.equal(decodeDrawioSvg(svg), model);
+
+  // Title lands in the <diagram name="..."> of the decoded file XML, intact.
+  const content = /content="([^"]*)"/.exec(svg)[1];
+  const fileXml = unescapeAttr(content);
+  const nameMatch = /<diagram id="[^"]*" name="([^"]*)">/.exec(fileXml);
+  assert.ok(nameMatch, "diagram name attribute present");
+  assert.equal(unescapeAttr(nameMatch[1]), title);
+});
+
+// --- #507 F1: literal tab/newline/CR in an attribute value survive the
+// content= round-trip. The whole mxfile XML lives in one content="..." attr;
+// XML attribute-value normalization collapses a LITERAL tab/newline/CR to a
+// single space on DOM read, so the escape must emit numeric char-refs instead.
+const CTRL_MODEL =
+  "<mxGraphModel><root>" +
+  '<mxCell id="0"/><mxCell id="1" parent="0"/>' +
+  '<mxCell id="2" value="col1\tcol2" style="html=1;\nshadow=0" vertex="1" parent="1">' +
+  '<mxGeometry x="10" y="10" width="120" height="60" as="geometry"/></mxCell>' +
+  '<mxCell id="3" value="Line1\nLine2\rLine3" vertex="1" parent="1">' +
+  '<mxGeometry x="10" y="100" width="120" height="60" as="geometry"/></mxCell>' +
+  "</root></mxGraphModel>";
+
+test("#507 F1: literal tab/newline/CR in a value round-trip byte-stable (DOM decode)", () => {
+  const svg = buildDrawioSvg(CTRL_MODEL, "<g/>", { width: 200, height: 200 });
+  const content = /content="([^"]*)"/.exec(svg)[1];
+  // The tab/newline/CR must be emitted as numeric char-refs, never as literal
+  // control chars (which DOM attribute-value normalization would eat).
+  assert.ok(
+    !/[\t\n\r]/.test(content),
+    "no literal tab/newline/CR survive in the content= attribute",
+  );
+  assert.ok(
+    content.includes("&#x9;") &&
+      content.includes("&#xa;") &&
+      content.includes("&#xd;"),
+    "tab/newline/CR are emitted as numeric char-refs",
+  );
+  // Full DOM decode recovers the model byte-for-byte, control chars intact.
+  assert.equal(decodeDrawioSvg(svg), CTRL_MODEL);
+});
+
+test("#507 F1: regex fallback decodes tab/newline/CR char-refs (agrees with DOM path)", () => {
+  const svg = buildDrawioSvg(CTRL_MODEL, "<g/>", { width: 200, height: 200 });
+  const content = /content="([^"]*)"/.exec(svg)[1];
+  // A bare `&` makes the SVG wrapper malformed, forcing extractContentAttr onto
+  // its regex fallback branch. That branch must decode the tab/newline/CR
+  // char-refs exactly like the DOM path, or the two decoders diverge.
+  const malformedSvg = `<svg content="${content}">&</svg>`;
+  assert.equal(decodeDrawioSvg(malformedSvg), CTRL_MODEL);
+  // The well-formed (DOM) path yields the identical result.
+  assert.equal(decodeDrawioSvg(svg), CTRL_MODEL);
 });
