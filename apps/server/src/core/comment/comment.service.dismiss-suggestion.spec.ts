@@ -107,11 +107,21 @@ describe('CommentService — dismissSuggestion', () => {
       'page-1',
       expect.objectContaining({ operation: 'commentDeleted', commentId: 'c-1' }),
     );
+    // #496: the row is hard-deleted, so the audit payload must carry the
+    // decision's substance (what was suggested, the anchored text, who authored
+    // it, who decided) — it is the only surviving record.
     expect(auditService.log).toHaveBeenCalledWith(
       expect.objectContaining({
         event: AuditEvent.COMMENT_SUGGESTION_DISMISSED,
         resourceType: AuditResource.COMMENT,
         resourceId: 'c-1',
+        metadata: expect.objectContaining({
+          pageId: 'page-1',
+          suggestedText: 'new text',
+          selection: 'old text',
+          commentAuthor: 'user-1',
+          decidedBy: 'user-1',
+        }),
       }),
     );
     expect(result.outcome).toBe('deleted');
