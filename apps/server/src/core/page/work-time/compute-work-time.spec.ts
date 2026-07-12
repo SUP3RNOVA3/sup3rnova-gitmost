@@ -159,6 +159,29 @@ describe('computeWorkTime', () => {
     expect(r.agentOnlyMs).toBe(18 * MIN);
   });
 
+  it('a USER-sourced idle breaks an agent burst → session is work, not agent_only', () => {
+    // A human supervision idle inherits source=user (aiChatId:null) and must NOT
+    // be swallowed into the agent burst. Δ=3m is within the default agentTGap so
+    // the two samples stay one session — but its class flips to `work`.
+    const rows = [
+      s('2026-07-04T10:00:00', { source: 'agent', chat: 'c1', kind: 'agent' }),
+      s('2026-07-04T10:03:00', { source: 'user', chat: null, kind: 'idle' }),
+    ];
+    const r = computeWorkTime(rows);
+    expect(r.sessions).toHaveLength(1);
+    expect(r.sessions[0].class).toBe('work');
+    expect(r.workMs).toBeGreaterThan(0);
+    // The human idle is NOT captured as agent_only time.
+    expect(r.agentOnlyMs).toBe(0);
+    // Σ over `work` sessions == workMs and Σ over `agent_only` == agentOnlyMs.
+    const sum = (cls: string) =>
+      r.sessions
+        .filter((x) => x.class === cls)
+        .reduce((acc, x) => acc + (x.end - x.start), 0);
+    expect(sum('work')).toBe(r.workMs);
+    expect(sum('agent_only')).toBe(r.agentOnlyMs);
+  });
+
   it('idle pulse keeps a human writing session visible (not excluded)', () => {
     const rows = [
       s('2026-07-04T10:00:00'),

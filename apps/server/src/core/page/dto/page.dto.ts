@@ -5,6 +5,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  MaxLength,
 } from 'class-validator';
 import { Transform } from 'class-transformer';
 
@@ -54,6 +55,7 @@ export class PageWorkTimeDto extends PageIdDto {
   // throws on an unknown zone (caught by the controller → 400).
   @IsOptional()
   @IsString()
+  @MaxLength(64)
   tz?: string;
 }
 

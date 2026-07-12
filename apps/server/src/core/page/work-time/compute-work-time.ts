@@ -81,8 +81,9 @@ function normalize(
  * dense burst (8 snapshots in 7 minutes) contributes its wall-clock, not a count
  * × block. A burst is broken by any sample NOT continuing the same aiChatId
  * agent run: a non-agent sample, a `boundary` (actor transition), or a DIFFERENT
- * aiChatId. An `idle` pulse with the SAME or a null aiChatId continues the burst
- * (its label lags the real edit ≤ maxWait, well within rounding).
+ * aiChatId. Only an AGENT-sourced `idle` pulse with the SAME or a null aiChatId
+ * continues the burst (its label lags the real edit ≤ maxWait, well within
+ * rounding); a user-sourced `idle` (a human supervision pulse) breaks it.
  */
 function collapse(samples: NormSample[], config: WorkTimeConfig): Segment[] {
   const segments: Segment[] = [];
@@ -100,8 +101,15 @@ function collapse(samples: NormSample[], config: WorkTimeConfig): Segment[] {
   };
 
   for (const s of samples) {
-    // idle pulse continuing the current agent burst (same or null run id).
-    if (burst && s.kind === 'idle' && (s.aiChatId === burst.chatId || s.aiChatId == null)) {
+    // An agent-sourced idle pulse continues the current agent burst (same or
+    // null run id). A user-sourced idle (human supervision) must NOT be swallowed
+    // here — it falls through to the human branch so the session flips to `work`.
+    if (
+      burst &&
+      s.kind === 'idle' &&
+      s.isAgent &&
+      (s.aiChatId === burst.chatId || s.aiChatId == null)
+    ) {
       burst.tEnd = s.t;
       continue;
     }
