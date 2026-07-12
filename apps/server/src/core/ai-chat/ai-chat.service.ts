@@ -189,10 +189,11 @@ export function stepBudgetWarning(stepNumber: number): string {
 //
 // `system` is the in-scope system prompt; we CONCATENATE so the original
 // persona/context is preserved — a bare `system` override would REPLACE the
-// whole system prompt for the step. `activatedTools` is PER-TURN mutable state
-// owned by the streaming loop (a closure Set grown by loadTools); it is passed
-// in (not module-global, not persisted) so this stays a pure function of its
-// arguments.
+// whole system prompt for the step. `activatedTools` is a closure Set grown by
+// loadTools and owned by the streaming loop; the caller seeds it from and
+// persists it to the chat's metadata across turns (#490), but this function only
+// READS the Set it is handed, so it stays a pure function of its arguments (not
+// module-global).
 //
 // NOTE: at AI SDK v7 the per-step `system` field is renamed to `instructions`.
 // On v6 (`^6.0.134`) `system` is the correct field — adjust when bumping.
@@ -1410,10 +1411,11 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       const baseTools = { ...external.tools, ...docmostTools };
 
       // Deferred tool loading state (#332), scoped to THIS streaming loop:
-      //  - `activatedTools` is per-TURN mutable state — a fresh closure Set created
-      //    per streamText call, NOT module-global and NOT persisted, so a new turn
-      //    starts cold. loadTools.execute adds to it; prepareAgentStep reads it to
-      //    widen `activeTools` on the NEXT step.
+      //  - `activatedTools` is a fresh closure Set per streamText call (not
+      //    module-global), SEEDED from the chat's persisted metadata.activatedTools
+      //    (#490, just below) so activation carries across turns. loadTools.execute
+      //    adds to it; prepareAgentStep reads it to widen `activeTools` on the NEXT
+      //    step; turn end persists it back.
       //  - `validDeferredNames` = every tool that is NOT core (the in-app deferred
       //    tools + ALL external MCP tools), computed from the ACTUAL toolset so an
       //    external tool is loadable by its namespaced name. loadTools rejects any

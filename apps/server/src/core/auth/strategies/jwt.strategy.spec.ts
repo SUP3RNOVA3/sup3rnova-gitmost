@@ -22,7 +22,8 @@ describe('JwtStrategy — provenance derivation', () => {
     const userSessionRepo: any = { findActiveById: jest.fn() };
     const sessionActivityService: any = { trackActivity: jest.fn() };
     const environmentService: any = { getAppSecret: () => 'test-secret' };
-    const moduleRef: any = {};
+    // ACCESS-path tests never touch the api-key seam; a bare stub suffices.
+    const apiKeyService: any = { validate: jest.fn() };
 
     const strategy = new JwtStrategy(
       userRepo,
@@ -30,7 +31,7 @@ describe('JwtStrategy — provenance derivation', () => {
       userSessionRepo,
       sessionActivityService,
       environmentService,
-      moduleRef,
+      apiKeyService,
     );
     return { strategy, userRepo };
   }
@@ -122,25 +123,29 @@ describe('JwtStrategy — provenance derivation', () => {
 });
 
 /**
- * Provenance derivation on the API-KEY path (jwt.strategy.validateApiKey, #486).
+ * Provenance derivation on the API-KEY path (jwt.strategy.validateApiKey, #486
+ * + #501).
  *
  * The access-token path stamped provenance; the API-key path returned early
  * WITHOUT it, so an is_agent API key's REST writes recorded no 'agent' marker.
  * The API-key payload carries no signed claim, so provenance is resolved from the
- * SERVER-SIDE user returned by ApiKeyService.validateApiKey: isAgent -> 'agent',
+ * SERVER-SIDE user returned by ApiKeyService.validate: isAgent -> 'agent',
  * otherwise 'user'; aiChatId is always null (an API key has no ai_chats row).
  *
- * The enterprise ApiKeyService is not bundled in the OSS build, so the strategy
- * loads it through an overridable `resolveApiKeyService` seam that we stub here.
+ * #501 wires the CORE ApiKeyService (the EE `ee/api-key` module is absent in the
+ * fork) directly into the strategy — no dynamic require. The strategy also stamps
+ * `req.raw.authType='api_key'` + `req.raw.apiKeyId` for the "a token cannot manage
+ * tokens" guard on the /api-keys surface.
  */
-describe('JwtStrategy — API-key provenance derivation (#486)', () => {
-  function makeApiKeyStrategy(validateApiKeyImpl: (p: any) => Promise<any>) {
+describe('JwtStrategy — API-key provenance derivation (#486/#501)', () => {
+  function makeApiKeyStrategy(validateImpl: (p: any) => Promise<any>) {
     const userRepo: any = { findById: jest.fn() };
     const workspaceRepo: any = { findById: jest.fn() };
     const userSessionRepo: any = { findActiveById: jest.fn() };
     const sessionActivityService: any = { trackActivity: jest.fn() };
     const environmentService: any = { getAppSecret: () => 'test-secret' };
-    const moduleRef: any = {};
+    const validate = jest.fn(validateImpl);
+    const apiKeyService: any = { validate };
 
     const strategy = new JwtStrategy(
       userRepo,
@@ -148,14 +153,9 @@ describe('JwtStrategy — API-key provenance derivation (#486)', () => {
       userSessionRepo,
       sessionActivityService,
       environmentService,
-      moduleRef,
+      apiKeyService,
     );
-    // Stub the EE ApiKeyService seam (the real module is not in the OSS build).
-    const validateApiKey = jest.fn(validateApiKeyImpl);
-    jest
-      .spyOn(strategy as any, 'resolveApiKeyService')
-      .mockReturnValue({ validateApiKey });
-    return { strategy, validateApiKey };
+    return { strategy, validate };
   }
 
   const makeReq = () => ({ raw: {} as Record<string, any> });
@@ -166,22 +166,23 @@ describe('JwtStrategy — API-key provenance derivation (#486)', () => {
     type: JwtType.API_KEY,
   });
 
-  it("stamps actor='agent' for an is_agent API key (from the validated user)", async () => {
+  it("stamps actor='agent' + authType/apiKeyId for an is_agent API key", async () => {
     const validated = {
       user: { id: 'svc-1', isAgent: true },
       workspace: { id: 'ws-1' },
     };
-    const { strategy, validateApiKey } = makeApiKeyStrategy(
-      async () => validated,
-    );
+    const { strategy, validate } = makeApiKeyStrategy(async () => validated);
     const req = makeReq();
 
     const result = await strategy.validate(req, apiKeyPayload() as any);
 
-    expect(validateApiKey).toHaveBeenCalledTimes(1);
+    expect(validate).toHaveBeenCalledTimes(1);
     expect(req.raw.actor).toBe('agent');
     // API keys carry no internal ai_chats row -> null.
     expect(req.raw.aiChatId).toBeNull();
+    // Principal-kind markers for the management-surface guard.
+    expect(req.raw.authType).toBe('api_key');
+    expect(req.raw.apiKeyId).toBe('key-1');
     // The validated auth object is returned unchanged (req.user shape preserved).
     expect(result).toBe(validated);
   });
@@ -197,25 +198,19 @@ describe('JwtStrategy — API-key provenance derivation (#486)', () => {
 
     expect(req.raw.actor).toBe('user');
     expect(req.raw.aiChatId).toBeNull();
+    expect(req.raw.authType).toBe('api_key');
   });
 
-  it('throws Unauthorized (and stamps nothing) when the EE module is missing', async () => {
-    const userRepo: any = { findById: jest.fn() };
-    const strategy = new JwtStrategy(
-      userRepo,
-      { findById: jest.fn() } as any,
-      { findActiveById: jest.fn() } as any,
-      { trackActivity: jest.fn() } as any,
-      { getAppSecret: () => 'test-secret' } as any,
-      {} as any,
-    );
-    // EE not bundled: the seam returns null.
-    jest.spyOn(strategy as any, 'resolveApiKeyService').mockReturnValue(null);
+  it('propagates a validate() rejection and stamps nothing', async () => {
+    const { strategy } = makeApiKeyStrategy(async () => {
+      throw new UnauthorizedException();
+    });
     const req = makeReq();
 
     await expect(
       strategy.validate(req, apiKeyPayload() as any),
     ).rejects.toThrow(UnauthorizedException);
     expect(req.raw.actor).toBeUndefined();
+    expect(req.raw.authType).toBeUndefined();
   });
 });

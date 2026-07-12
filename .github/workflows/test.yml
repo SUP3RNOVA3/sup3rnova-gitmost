@@ -159,6 +159,14 @@ jobs:
       - name: Build prosemirror-markdown
         run: pnpm --filter @docmost/prosemirror-markdown build
 
+      # @docmost/token-estimate is a shared workspace package the client vitest
+      # suite resolves via its dist build (main: ./dist/index.js); dist/ is
+      # gitignored and `pnpm -r test` does NOT honour nx `dependsOn: ^build`, so
+      # build it before the recursive test run or the client suite fails with
+      # "Failed to resolve import '@docmost/token-estimate'" (#490).
+      - name: Build token-estimate
+        run: pnpm --filter @docmost/token-estimate build
+
       - name: Run unit tests
         run: pnpm -r test
 
