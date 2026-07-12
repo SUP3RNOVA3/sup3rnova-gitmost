@@ -39,7 +39,18 @@ const RevisionRow = memo(function RevisionRow({
       px={12}
       data-testid="revision-row"
       data-day={row.dayISO}
+      // Keyboard-accessible (F3 a11y): a focusable button-role row activated by
+      // Enter/Space, not just a mouse onClick.
+      role="button"
+      tabIndex={0}
+      aria-pressed={selected}
       onClick={() => onSelect(row.id)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(row.id);
+        }
+      }}
       onMouseEnter={() => onHover?.(row.id)}
       onMouseLeave={onHoverEnd}
       className={clsx(classes.revisionRow, {

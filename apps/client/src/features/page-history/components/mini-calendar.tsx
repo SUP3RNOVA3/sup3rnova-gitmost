@@ -152,12 +152,36 @@ export default function MiniCalendar({
           const count = counts.get(cell.dayISO) ?? 0;
           const level = cell.inMonth ? heatLevel(count) : 0;
           const selected = cell.inMonth && cell.dayISO === selectedDayISO;
+          // Non-color cue (F3 a11y): the count is announced, not conveyed by the
+          // heat color alone — e.g. "12 Jul: 3 versions".
+          const dayLabel = new Intl.DateTimeFormat(undefined, {
+            timeZone: tz,
+            day: "numeric",
+            month: "short",
+          }).format(cell.date);
+          const ariaLabel = t("{{date}}: {{count}} versions", {
+            date: dayLabel,
+            count,
+          });
           return (
             <Box
               key={cell.dayISO}
               data-testid="calendar-day"
               data-day={cell.dayISO}
+              // Only in-month cells are interactive → focusable buttons with a
+              // title/aria-label and Enter/Space activation; outside cells inert.
+              role={cell.inMonth ? "button" : undefined}
+              tabIndex={cell.inMonth ? 0 : undefined}
+              aria-label={cell.inMonth ? ariaLabel : undefined}
+              aria-pressed={cell.inMonth ? selected : undefined}
+              title={cell.inMonth ? ariaLabel : undefined}
               onClick={() => cell.inMonth && onPickDay(cell.dayISO)}
+              onKeyDown={(e) => {
+                if (cell.inMonth && (e.key === "Enter" || e.key === " ")) {
+                  e.preventDefault();
+                  onPickDay(cell.dayISO);
+                }
+              }}
               className={clsx(
                 classes.calDay,
                 classes[`calHeat${level}` as keyof typeof classes],

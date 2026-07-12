@@ -1491,5 +1491,14 @@
   "≈ {{minutes}}m": "≈ {{minutes}} мин",
   "{{hours}}h {{minutes}}m": "{{hours}} ч {{minutes}} м",
   "{{hours}}h": "{{hours}} ч",
-  "{{minutes}}m": "{{minutes}} м"
+  "{{minutes}}m": "{{minutes}} м",
+  "Selected version": "Выбранная версия",
+  "via": "через",
+  "of": "из",
+  "Previous change": "Предыдущее изменение",
+  "Next change": "Следующее изменение",
+  "Previous month": "Предыдущий месяц",
+  "Next month": "Следующий месяц",
+  "No revisions found for that day": "Нет ревизий за этот день",
+  "{{date}}: {{count}} versions": "{{date}}: версий — {{count}}"
 }

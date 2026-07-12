@@ -2,6 +2,7 @@ import {
   ActionIcon,
   Box,
   Button,
+  Center,
   Divider,
   Group,
   ScrollArea,
@@ -72,8 +73,14 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
   const { currentChangeIndex, handlePrevChange, handleNextChange } =
     useDiffNavigation(scrollViewportRef);
 
-  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } =
-    usePageHistoryListQuery(pageId);
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isError,
+    isLoading,
+  } = usePageHistoryListQuery(pageId);
   const historyItems = useMemo(
     () => data?.pages.flatMap((page) => page.items) ?? [],
     [data],
@@ -206,6 +213,7 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
           fetchNextPage={fetchNextPage}
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
+          isError={isError}
           counts={counts}
           selectedDayISO={selectedRow?.dayISO ?? null}
           tz={tz}
@@ -218,9 +226,26 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
           viewportRef={scrollViewportRef}
           scrollbarSize={5}
         >
-          <Box p="26px 0" maw={720} mx="auto">
-            {activeHistoryId && <HistoryView />}
-          </Box>
+          {/* F1 — the right pane mirrors the list state instead of going blank:
+              error on a failed history query, an empty state for a page with no
+              revisions, otherwise the rendered version. */}
+          {isError ? (
+            <Center h="100%" p={40}>
+              <Text size="sm" c="dimmed" ta="center">
+                {t("Error fetching page data.")}
+              </Text>
+            </Center>
+          ) : !isLoading && historyItems.length === 0 ? (
+            <Stack align="center" justify="center" h="100%" gap={6} p={40}>
+              <Text fw={600} fz="sm">
+                {t("No page history saved yet.")}
+              </Text>
+            </Stack>
+          ) : (
+            <Box p="26px 0" maw={720} mx="auto">
+              {activeHistoryId && <HistoryView />}
+            </Box>
+          )}
         </ScrollArea>
       </div>
     </div>

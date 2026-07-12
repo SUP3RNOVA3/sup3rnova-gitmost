@@ -53,4 +53,57 @@ describe("MiniCalendar (#568 heatmap)", () => {
     fireEvent.click(today);
     expect(onPickDay).toHaveBeenCalledWith(todayISO);
   });
+
+  it("Enter/Space activates a focusable day cell (F3 keyboard)", () => {
+    const { todayISO, onPickDay } = renderCal(new Map());
+    const today = screen
+      .getAllByTestId("calendar-day")
+      .find((c) => c.getAttribute("data-day") === todayISO)!;
+    // In-month cells are focusable buttons.
+    expect(today.getAttribute("role")).toBe("button");
+    expect(today.getAttribute("tabindex")).toBe("0");
+    fireEvent.keyDown(today, { key: "Enter" });
+    fireEvent.keyDown(today, { key: " " });
+    expect(onPickDay).toHaveBeenCalledTimes(2);
+  });
+
+  it("day cells carry a non-color aria/title cue for the count (F3)", () => {
+    const day = isoDayInTz(new Date(), TZ);
+    renderCal(new Map([[day, 3]]));
+    const today = screen
+      .getAllByTestId("calendar-day")
+      .find((c) => c.getAttribute("data-day") === day)!;
+    // A non-color cue is wired (the interpolated count is filled by the real
+    // i18next instance in-app; the test's key-fallback t returns the template).
+    const label = today.getAttribute("aria-label") ?? "";
+    expect(label).toContain("versions");
+    // The same text is mirrored to the native tooltip.
+    expect(today.getAttribute("title")).toBe(label);
+    // Outside-month cells are inert (no aria-label / not focusable).
+    const outside = screen
+      .getAllByTestId("calendar-day")
+      .find((c) => c.getAttribute("role") !== "button");
+    expect(outside?.getAttribute("aria-label")).toBeNull();
+  });
+
+  it("maps count tiers to heat classes at the prototype boundaries", () => {
+    const cases: Array<[number, string]> = [
+      [0, "calHeat0"],
+      [2, "calHeat1"],
+      [3, "calHeat2"],
+      [4, "calHeat2"],
+      [5, "calHeat3"],
+    ];
+    for (const [count, cls] of cases) {
+      const day = isoDayInTz(new Date(), TZ);
+      const { unmount } = renderCal(
+        count > 0 ? new Map([[day, count]]) : new Map(),
+      );
+      const today = screen
+        .getAllByTestId("calendar-day")
+        .find((c) => c.getAttribute("data-day") === day)!;
+      expect(today.className).toContain(cls);
+      unmount();
+    }
+  });
 });

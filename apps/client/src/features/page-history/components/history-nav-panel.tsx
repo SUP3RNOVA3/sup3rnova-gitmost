@@ -29,6 +29,7 @@ interface Props {
   fetchNextPage: FetchNextPage;
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
+  isError: boolean;
   counts: Map<string, number>;
   selectedDayISO: string | null;
   tz: string;
@@ -51,6 +52,7 @@ export default function HistoryNavPanel({
   fetchNextPage,
   hasNextPage,
   isFetchingNextPage,
+  isError,
   counts,
   selectedDayISO,
   tz,
@@ -156,14 +158,25 @@ export default function HistoryNavPanel({
       />
 
       <ScrollArea style={{ flex: 1 }} viewportRef={viewportRef} scrollbarSize={5}>
-        {onlyVersions && groups.length === 0 && (
-          <Center py="md">
-            <Text size="sm" c="dimmed">
-              {t("No saved versions yet.")}
+        {/* F1 — explicit error/empty states instead of a blank panel. The
+            heatmap fails open independently; the list keeps its own states. */}
+        {isError ? (
+          <Center py="md" px="sm">
+            <Text size="sm" c="dimmed" ta="center">
+              {t("Error loading page history.")}
             </Text>
           </Center>
-        )}
-        {groups.map((group) => (
+        ) : groups.length === 0 ? (
+          <Center py="md" px="sm">
+            <Text size="sm" c="dimmed" ta="center">
+              {onlyVersions
+                ? t("No saved versions yet.")
+                : t("No page history saved yet.")}
+            </Text>
+          </Center>
+        ) : null}
+        {!isError &&
+          groups.map((group) => (
           <Box key={group.dayISO}>
             <Text
               className={classes.dayHeading}
