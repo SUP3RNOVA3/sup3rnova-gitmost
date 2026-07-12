@@ -100,7 +100,8 @@ export class McpServersService {
       transport: dto.transport,
       url: dto.url,
       headersEnc,
-      // undefined => unchanged; [] / value handled by repo (empty => null).
+      // undefined => unchanged; null => no restriction; `[]` is persisted
+      // verbatim and means deny-all (#476).
       toolAllowlist: dto.toolAllowlist,
       // undefined => unchanged; blank => cleared (null) by the repo.
       instructions: dto.instructions,

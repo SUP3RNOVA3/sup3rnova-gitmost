@@ -1,5 +1,6 @@
 import { Kysely, sql } from 'kysely';
 import { randomUUID } from 'node:crypto';
+import { Logger } from '@nestjs/common';
 import { AiMcpServerRepo } from '@docmost/db/repos/ai-chat/ai-mcp-server.repo';
 import { getTestDb, destroyTestDb, createWorkspace } from './db';
 
@@ -54,7 +55,11 @@ describe('AiMcpServerRepo tool_allowlist jsonb round-trip [integration]', () => 
     expect(Array.isArray(found?.toolAllowlist)).toBe(true);
   });
 
-  it('an empty allowlist is normalized to null (no restriction), not []', async () => {
+  // #476 (deliberate behaviour change): an empty allowlist used to be
+  // normalized to SQL NULL, which downstream means "no restriction" — so an
+  // admin's deny-all `[]` silently became allow-all. It must now round-trip as
+  // a real jsonb `[]` (deny-all), distinct from NULL.
+  it('an empty allowlist round-trips as jsonb [] (deny-all), not null (#476)', async () => {
     const row = await repo.insert({
       workspaceId: ws,
       name: `srv-${randomUUID()}`,
@@ -62,7 +67,27 @@ describe('AiMcpServerRepo tool_allowlist jsonb round-trip [integration]', () => 
       url: 'https://example.com/mcp',
       toolAllowlist: [],
     });
-    // The column is SQL NULL, so jsonb_typeof returns SQL NULL (JS null).
+    // The column holds a real (empty) jsonb ARRAY, not SQL NULL.
+    expect(await jsonbTypeof(row.id)).toBe('array');
+    expect((await repo.findById(row.id, ws))?.toolAllowlist).toEqual([]);
+  });
+
+  it('update to [] persists jsonb [] and update to null clears to SQL NULL (#476)', async () => {
+    const row = await repo.insert({
+      workspaceId: ws,
+      name: `srv-${randomUUID()}`,
+      transport: 'http',
+      url: 'https://example.com/mcp',
+      toolAllowlist: ['search'],
+    });
+
+    // Deny-all via update: [] must survive as a real jsonb array.
+    await repo.update(row.id, ws, { toolAllowlist: [] });
+    expect(await jsonbTypeof(row.id)).toBe('array');
+    expect((await repo.findById(row.id, ws))?.toolAllowlist).toEqual([]);
+
+    // Explicit clear (null) still means "no restriction" = SQL NULL.
+    await repo.update(row.id, ws, { toolAllowlist: null });
     expect(await jsonbTypeof(row.id)).toBeNull();
     expect((await repo.findById(row.id, ws))?.toolAllowlist).toBeNull();
   });
@@ -92,23 +117,60 @@ describe('AiMcpServerRepo tool_allowlist jsonb round-trip [integration]', () => 
     expect(healed?.toolAllowlist).toEqual(['alpha', 'beta']);
   });
 
-  it('FAIL-OPEN: a present-but-corrupt tool_allowlist reads back as null (no restriction)', async () => {
-    // #185 re-review pt 8: normalizeRow's fail-open branch — the column is
-    // PRESENT but does not parse into a string[] (here a jsonb string scalar
-    // holding non-array JSON). The read must degrade to `null` ("no restriction"),
-    // not crash. (A warn is logged with the server id; not asserted here.)
-    const id = randomUUID();
-    await sql`
-      INSERT INTO ai_mcp_servers (id, workspace_id, name, transport, url, tool_allowlist)
-      VALUES (
-        ${id}, ${ws}, ${`srv-${id}`}, 'http', 'https://example.com/mcp',
-        to_jsonb(${'{"not":"an array"}'}::text)
-      )
-    `.execute(db);
-    // Sanity: the column is present (a jsonb string scalar), not SQL NULL.
-    expect(await jsonbTypeof(id)).toBe('string');
-    // ...yet the read degrades to null (fail-open).
-    expect((await repo.findById(id, ws))?.toolAllowlist).toBeNull();
+  // #476 (deliberate behaviour change, replaces the old FAIL-OPEN pin): a
+  // present-but-corrupt tool_allowlist used to degrade to null ("no
+  // restriction"), silently handing the agent ALL of the server's tools. It
+  // must now FAIL CLOSED to `[]` (deny-all) and log an error.
+  it('FAIL-CLOSED: a present-but-corrupt tool_allowlist reads back as [] (deny-all) + error log (#476)', async () => {
+    const errorSpy = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+    try {
+      // The column is PRESENT but does not parse into a string[] — a jsonb
+      // string scalar holding unparseable text (a truncated legacy write).
+      const id = randomUUID();
+      await sql`
+        INSERT INTO ai_mcp_servers (id, workspace_id, name, transport, url, tool_allowlist)
+        VALUES (
+          ${id}, ${ws}, ${`srv-${id}`}, 'http', 'https://example.com/mcp',
+          to_jsonb(${'{oops'}::text)
+        )
+      `.execute(db);
+      // Sanity: the column is present (a jsonb string scalar), not SQL NULL.
+      expect(await jsonbTypeof(id)).toBe('string');
+      // ...and the read degrades to [] (fail-closed deny-all), not null.
+      expect((await repo.findById(id, ws))?.toolAllowlist).toEqual([]);
+      // The narrowing is not silent: an error names the server id (never the
+      // corrupt contents).
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining(`Corrupt tool_allowlist for MCP server ${id}`),
+      );
+      expect(
+        errorSpy.mock.calls.some((c) => String(c[0]).includes('{oops')),
+      ).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('FAIL-CLOSED: corrupt non-array JSON (an object) also reads back as [] (#476)', async () => {
+    const errorSpy = jest
+      .spyOn(Logger.prototype, 'error')
+      .mockImplementation(() => undefined);
+    try {
+      const id = randomUUID();
+      await sql`
+        INSERT INTO ai_mcp_servers (id, workspace_id, name, transport, url, tool_allowlist)
+        VALUES (
+          ${id}, ${ws}, ${`srv-${id}`}, 'http', 'https://example.com/mcp',
+          to_jsonb(${'{"not":"an array"}'}::text)
+        )
+      `.execute(db);
+      expect(await jsonbTypeof(id)).toBe('string');
+      expect((await repo.findById(id, ws))?.toolAllowlist).toEqual([]);
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
 

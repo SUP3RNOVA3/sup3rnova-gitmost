@@ -138,18 +138,30 @@ export function violatedConstraint(err: unknown): string | undefined {
  * verbatim); `::jsonb` then parses it into a real array/object. Read-side
  * parsers repair rows written the old buggy way without a migration.
  *
- * Returns `null` for null/undefined and for "empty" values (an empty array, or
- * an object with no own enumerable keys) — callers treat empty as "clear/unset",
- * so an empty allowlist/config never round-trips as `[]`/`{}`.
+ * Returns `null` for null/undefined. By default it ALSO returns `null` for
+ * "empty" values (an empty array, or an object with no own enumerable keys) —
+ * most callers treat empty as "clear/unset", so an empty config never
+ * round-trips as `[]`/`{}`.
+ *
+ * `preserveEmpty` (issue #476) opts a column OUT of that empty-to-null
+ * normalization so `[]`/`{}` are persisted as real jsonb values. Needed where
+ * empty and null mean DIFFERENT things: an empty `tool_allowlist` is
+ * deny-all ("zero tools allowed"), while null is "no restriction" — collapsing
+ * `[]` to null silently widened deny-all to allow-all. Deliberately an opt-in
+ * flag, NOT a global change: the other jsonb callers (model_config, source)
+ * keep the empty-means-unset contract.
  */
 export function jsonbBind<T>(
   value: T | null | undefined,
+  opts?: { preserveEmpty?: boolean },
 ): RawBuilder<T> | null {
   if (value === null || value === undefined) return null;
-  if (Array.isArray(value)) {
-    if (value.length === 0) return null;
-  } else if (typeof value === 'object') {
-    if (Object.keys(value as object).length === 0) return null;
+  if (!opts?.preserveEmpty) {
+    if (Array.isArray(value)) {
+      if (value.length === 0) return null;
+    } else if (typeof value === 'object') {
+      if (Object.keys(value as object).length === 0) return null;
+    }
   }
   return sql<T>`${JSON.stringify(value)}::text::jsonb`;
 }

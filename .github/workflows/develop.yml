@@ -62,6 +62,38 @@ jobs:
     needs: [test, e2e-server, e2e-mcp, build]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Image boot-smoke (issue #476): every other job tests code from the working
+    # tree, but the :develop IMAGE that watchtower pulls was never actually
+    # started anywhere (incident classes #353/#452/#361-boot: startup-migrator
+    # crash-loop, runtime module missing from the image, wrong static-asset
+    # headers). The services below back a smoke boot of the exact image right
+    # before it is pushed; a smoke failure blocks the push.
+    services:
+      postgres:
+        # via mirror.gcr.io (Docker Hub pull-through cache; avoids Hub anonymous
+        # pull rate-limit that randomly fails on shared GitHub runner IPs).
+        image: mirror.gcr.io/pgvector/pgvector:pg18
+        env:
+          POSTGRES_DB: docmost
+          POSTGRES_USER: docmost
+          POSTGRES_PASSWORD: docmost
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U docmost"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        # via mirror.gcr.io (see postgres note above).
+        image: mirror.gcr.io/library/redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,6 +113,37 @@ jobs:
       - name: Resolve version
         id: version
         run: echo "value=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
+
+      # Load the image into the local docker daemon so it can be booted (the
+      # push step below exports straight to the registry and leaves nothing
+      # runnable locally). CONVENTION: build-args here must stay TEXTUALLY
+      # IDENTICAL to the push step's build-args — same cache scope + same args
+      # means the layers are reused and the image we smoke IS the image we push.
+      - name: Build image for smoke (load, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.value }}
+            AI_AGENT_ROLES_CATALOG_URL=https://raw.githubusercontent.com/vvzvlad/gitmost/develop/agent-roles-catalog
+          load: true
+          push: false
+          tags: gitmost:smoke
+          cache-from: type=gha,scope=develop-amd64
+
+      # Boot-smoke the exact image against the job services (see the comment on
+      # `services:` above): health (startup migrator), auth/setup, client dist
+      # served, immutable + brotli asset headers. Fails the job (and therefore
+      # the push) on any miss.
+      - name: Smoke the built image
+        run: bash scripts/ci/image-smoke.sh gitmost:smoke
+
+      # The smoke script leaves the container running on failure precisely so
+      # the boot error (migration mismatch, stack trace) is diagnosable here.
+      - name: Dump smoke container log on failure
+        if: failure()
+        run: docker logs gitmost-smoke 2>&1 | tail -200 || true
 
       - name: Build and push develop image
         uses: docker/build-push-action@v6

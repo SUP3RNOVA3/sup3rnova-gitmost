@@ -519,6 +519,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through that exact share (its own share or an ancestor `includeSubPages`
   share); any other value now returns the generic "not found" instead of
   serving the page. (#218)
+- **MCP tool-allowlist semantics flipped: an empty `[]` now means deny-all
+  (previously it was coerced to "no restrictions").** For an external MCP server,
+  a stored `tool_allowlist` of `[]` now denies **every** tool of that server
+  (zero tools reach the agent) instead of being treated as an empty/unset filter
+  that allowed all of them. A corrupt or non-array stored value now **fails
+  closed** to deny-all rather than silently allowing everything. The admin form
+  no longer silently widens an existing deny-all server: leaving its tag field
+  empty preserves `[]` (deny-all) on save instead of NULL-ing the column to
+  allow-all, so a routine rename/toggle can no longer grant the agent every tool.
+  "No restrictions" is still expressible — a genuinely unrestricted server stores
+  NULL, and clearing the field on such a server keeps it NULL. Operationally
+  significant: audit any server that was created or left with a literal `[]`, as
+  it now exposes no tools until an explicit allowlist (or NULL) is set. (#476)
 
 - **Tool and provider error text no longer leaks to anonymous readers in the
   public-share AI chat.** A failing tool's raw error (which could carry an
