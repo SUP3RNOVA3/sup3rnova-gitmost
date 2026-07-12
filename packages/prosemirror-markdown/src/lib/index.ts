@@ -25,6 +25,7 @@ export {
   markdownToProseMirror,
   markdownToProseMirrorSync,
 } from "./markdown-to-prosemirror.js";
+export type { MarkdownImportOptions } from "./markdown-to-prosemirror.js";
 
 // Foreign-markdown normalizer (#493): the input-liberal pre-pass that rewrites
 // GFM `[^id]` reference footnotes to canonical inline `^[body]`. Two variants:

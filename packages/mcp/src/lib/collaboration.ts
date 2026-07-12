@@ -14,6 +14,7 @@ import {
   markdownToProseMirror,
   normalizeAgentMarkdown,
 } from "@docmost/prosemirror-markdown";
+import type { MarkdownImportOptions } from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
 import type { PageId } from "./page-id.js";
@@ -111,16 +112,31 @@ global.WebSocket = WebSocket;
  * horizontalRule the serializer emitted, and stripping it would silently drop the
  * page's leading content (#493 review). The front-matter strip stays on the
  * server FILE-import boundary only (`normalizeForeignMarkdown`).
+ *
+ * #502 IMPORTANT — the two layered markdown extensions (`$…$` math, schemeless
+ * fuzzy autolink) are NOT decided here; they are the CALLER's choice via
+ * `options`, because the two callers of this wrapper need OPPOSITE behavior:
+ *   - AGENT-authored plain markdown (`updatePageMarkdown`) → both OFF, so a
+ *     `$…$` config span stays literal and a bare `www.host` is not autolinked
+ *     (real math is authored via `update_page_json`).
+ *   - FULL-FILE round-trip import (`import_page_markdown`, #328 lossless) →
+ *     DEFAULTS (both ON), because the exporter serializes a math node as readable
+ *     `$x^2$`; re-importing with math OFF would degrade it to literal text and
+ *     BREAK the lossless export→import pair.
+ * So `options` DEFAULTS to `undefined` → the package importer's defaults (ON),
+ * which is the safe round-trip behavior; the agent-write caller opts OUT
+ * explicitly. (The fragment path `importMarkdownFragment` opts out on its own.)
  */
 export async function markdownToProseMirrorCanonical(
   markdownContent: string,
+  options?: MarkdownImportOptions,
 ): Promise<any> {
   // #419: normalize + merge glyph-forked footnote definitions BEFORE
   // canonicalizing, so the canonicalizer re-hangs references and drops the
   // now-orphaned duplicate definitions.
   return canonicalizeFootnotes(
     normalizeAndMergeFootnotes(
-      await markdownToProseMirror(normalizeAgentMarkdown(markdownContent)),
+      await markdownToProseMirror(normalizeAgentMarkdown(markdownContent), options),
     ),
   );
 }
@@ -358,7 +374,17 @@ export async function updatePageContentRealtime(
 ): Promise<MutationResult> {
   // PAGE write: canonicalize footnotes (markdown import builds the bottom list in
   // definition order; numbering is reference-ordered).
-  const tiptapJson = await markdownToProseMirrorCanonical(markdownContent);
+  //
+  // #502: this is the AGENT-authored `updatePageMarkdown` body — plain prose /
+  // config — so the two layered markdown extensions are turned OFF: a `$…$` span
+  // stays literal text (real math via `update_page_json`) and a SCHEMELESS
+  // `www.host`/email is not autolinked (an explicit `https://…` still links).
+  // Contrast `import_page_markdown`, which keeps DEFAULTS for the #328 lossless
+  // round-trip.
+  const tiptapJson = await markdownToProseMirrorCanonical(markdownContent, {
+    parseMath: false,
+    fuzzyLinkify: false,
+  });
   return await mutatePageContent(
     pageId,
     collabToken,

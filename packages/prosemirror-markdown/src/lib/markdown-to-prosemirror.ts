@@ -7,7 +7,7 @@
  * natively through the collab gateway, so no websocket/Yjs write-path lives
  * here.
  */
-import { Marked } from "marked";
+import { Marked, Tokenizer } from "marked";
 import { parseHtmlDocument, generateJsonWith } from "./dom-parser.js";
 import type { TokenizerExtension, RendererExtension } from "marked";
 import { docmostExtensions } from "./docmost-schema.js";
@@ -231,19 +231,88 @@ function escapeFootnoteAttr(value: string): string {
   return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }
 
-// Dedicated marked instance: default (GFM) options plus the `==` highlight
-// inline extension, the `$…$` / `$$…$$` math extensions (#293 canon #6), and the
-// `^[…]` inline-footnote extension (#293 canon #2). Constructed once at module
-// load so the extensions are registered exactly once and never mutate the global
-// `marked` singleton.
-const markedInstance = new Marked().use({
-  extensions: [
+/**
+ * Options controlling which of the two *layered* markdown extensions the
+ * canonical importer applies. Both default to `true`, so the human editor,
+ * file-import and git-sync paths keep their existing behavior byte-for-byte;
+ * ONLY the MCP markdown-write path opts OUT (see #502).
+ *
+ * The extensions are optional because they are the SOURCE of two silent
+ * corruptions when an AGENT writes plain prose/config as markdown:
+ *   - `parseMath`: a `$…$` span becomes a `mathInline` node. An agent writing a
+ *     config like `export A=$FOO and B=$BAR` gets `$FOO and B=$` silently turned
+ *     into a formula. With `parseMath:false` the `$` stays literal text (real
+ *     formulas go through `update_page_json` with `mathInline`/`mathBlock`).
+ *   - `fuzzyLinkify`: marked's GFM autolinker turns a SCHEMELESS `www.foo.com`
+ *     (and email) into a link. With `fuzzyLinkify:false` a schemeless domain
+ *     stays literal text; an EXPLICIT `https://…` STILL becomes a link (only the
+ *     fuzzy, schemeless autolink is suppressed).
+ */
+export interface MarkdownImportOptions {
+  /** Apply the `$…$` / `$$…$$` math extensions (default true). */
+  parseMath?: boolean;
+  /** Apply marked's GFM schemeless (fuzzy) autolinker (default true). */
+  fuzzyLinkify?: boolean;
+}
+
+/**
+ * `fuzzyLinkify:false` override of marked's built-in GFM `url` inline tokenizer.
+ *
+ * The stock tokenizer autolinks THREE shapes: a schemeless `www.host` domain, a
+ * bare email, and an EXPLICIT `scheme://…` URL. #502 wants only the last kept —
+ * a schemeless domain/email an agent typed as prose must stay literal text, but
+ * a deliberate `https://…` still links. We delegate to the original tokenizer
+ * and, when it matched, DROP the token (returning `undefined`, so the run stays
+ * literal text) unless the matched RAW text carries an explicit `scheme:` prefix.
+ * `www.`/email matches have no scheme in their raw text, so they are dropped;
+ * `https://…`/`ftp://…` keep their link.
+ */
+const SCHEME_PREFIX_RE = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
+const noFuzzyUrlTokenizer = {
+  url(this: any, src: string) {
+    const token = Tokenizer.prototype.url.call(this, src) as any;
+    if (!token) return token;
+    // Keep only explicit-scheme URLs; schemeless `www.`/email matches -> literal.
+    return SCHEME_PREFIX_RE.test(token.raw) ? token : undefined;
+  },
+};
+
+/**
+ * Build a dedicated `marked` instance for a given extension combination: default
+ * (GFM) options plus the `==` highlight and `^[…]` footnote inline extensions
+ * ALWAYS, the `$…$`/`$$…$$` math extensions only when `parseMath`, and the
+ * schemeless-autolink suppressor only when `!fuzzyLinkify`. Built on a private
+ * `Marked` instance so nothing leaks into the global `marked` singleton.
+ */
+function buildMarkedInstance(parseMath: boolean, fuzzyLinkify: boolean): Marked {
+  const extensions: (TokenizerExtension & RendererExtension)[] = [
     highlightMarkExtension,
-    mathInlineExtension,
-    mathBlockExtension,
     footnoteInlineExtension,
-  ],
-});
+  ];
+  if (parseMath) {
+    extensions.push(mathInlineExtension, mathBlockExtension);
+  }
+  const instance = new Marked().use({ extensions });
+  if (!fuzzyLinkify) {
+    instance.use({ tokenizer: noFuzzyUrlTokenizer as any });
+  }
+  return instance;
+}
+
+// Memoize one instance per (parseMath, fuzzyLinkify) combination so the
+// extensions are registered exactly once per combo (never on the global
+// singleton). The default `(true, true)` instance preserves the pre-#502
+// behavior exactly for the editor/file-import/git-sync paths.
+const markedInstanceCache = new Map<string, Marked>();
+function getMarkedInstance(parseMath: boolean, fuzzyLinkify: boolean): Marked {
+  const key = `${parseMath}:${fuzzyLinkify}`;
+  let instance = markedInstanceCache.get(key);
+  if (!instance) {
+    instance = buildMarkedInstance(parseMath, fuzzyLinkify);
+    markedInstanceCache.set(key, instance);
+  }
+  return instance;
+}
 
 // NOTE: this module no longer installs a module-level `global.window`/`document`
 // jsdom shim. The HTML->DOM passes below (bridgeTaskLists / applyCommentDirectives
@@ -302,7 +371,7 @@ const CODE_FENCE_RE = /^(\s*)(`{3,}|~{3,})/;
 // preprocess is sync. Keeping it sync lets a sync converter entry
 // (`markdownToProseMirrorSync`, used by the client's chat renderer which must
 // stay synchronous) share this exact logic with the async entry.
-function preprocessCallouts(markdown: string): string {
+function preprocessCallouts(markdown: string, markedInstance: Marked): string {
   // Defensive cap: skip preprocessing for pathologically large inputs.
   if (markdown.length > MAX_CALLOUT_PREPROCESS_BYTES) {
     return markdown;
@@ -956,7 +1025,7 @@ function applyCommentDirectives(html: string): string {
 // sups stay inert) rather than hang.
 const MAX_FOOTNOTE_ROUNDS = 10000;
 
-function assembleFootnotes(html: string): string {
+function assembleFootnotes(html: string, markedInstance: Marked): string {
   // Cheap early-out: nothing carries a footnote body -> nothing to assemble.
   if (!html.includes("data-fn-text")) return html;
   const document = parseHtmlDocument(html);
@@ -1082,8 +1151,18 @@ function stripEmptyParagraphs(node: any): any {
  * for every existing Node consumer). A sync entry is REQUIRED by the client's
  * chat renderer, which runs inside a React render/useMemo and cannot await.
  */
-export function markdownToProseMirrorSync(markdownContent: string): any {
-  const withCallouts = preprocessCallouts(markdownContent);
+export function markdownToProseMirrorSync(
+  markdownContent: string,
+  options?: MarkdownImportOptions,
+): any {
+  // Select the marked instance for this call's extension combination. Defaults
+  // (math + fuzzy autolink ON) preserve the editor/file-import/git-sync paths;
+  // the MCP markdown-write path passes both false (#502).
+  const markedInstance = getMarkedInstance(
+    options?.parseMath ?? true,
+    options?.fuzzyLinkify ?? true,
+  );
+  const withCallouts = preprocessCallouts(markdownContent, markedInstance);
   const html = markedInstance.parse(withCallouts) as string;
   // Materialize comment directives (#293 #9 attached textAlign; #5 standalone
   // subpages/pageBreak) while the comment nodes still exist, before generateJSON
@@ -1092,7 +1171,7 @@ export function markdownToProseMirrorSync(markdownContent: string): any {
   // #293 canon #2: assemble the doc-level footnote list from the `<sup
   // data-fn-text>` markers (from `^[…]` or the raw-HTML column form) before
   // generateJSON, so references + definitions materialize into the schema model.
-  const withFootnotes = assembleFootnotes(withAttrs);
+  const withFootnotes = assembleFootnotes(withAttrs, markedInstance);
   const bridged = bridgeTaskLists(withFootnotes);
   const doc = generateJsonWith(bridged, docmostExtensions);
   // Promote unambiguously-internal wiki-page links (`[t](/s/<space>/p/<slug>)`)
@@ -1110,6 +1189,7 @@ export function markdownToProseMirrorSync(markdownContent: string): any {
  */
 export async function markdownToProseMirror(
   markdownContent: string,
+  options?: MarkdownImportOptions,
 ): Promise<any> {
-  return markdownToProseMirrorSync(markdownContent);
+  return markdownToProseMirrorSync(markdownContent, options);
 }
