@@ -624,6 +624,23 @@ export function convertProseMirrorToMarkdown(
           // escape. A real footnoteReference node emits `^[body]` from its own
           // case, never through here.
           textContent = textContent.replace(/\^\[/g, "^\\[");
+          // #554: a LITERAL inline-HTML break tag typed as prose text (`<br>`,
+          // `<br/>`, `<br />`, case-insensitive / optional whitespace) would be
+          // parsed by marked as an inline-HTML line break on re-import, silently
+          // turning the user's literal text into a hardBreak node. HTML-entity-
+          // encode only the angle brackets of a break-tag sequence so it lands
+          // in the markdown as `&lt;br&gt;`: marked passes the entities through
+          // and the importer decodes them back to the literal characters `<br>`,
+          // so the run round-trips as text and NEVER materializes a hardBreak.
+          // Scoped strictly to the `<br…>` pattern (not every `<`/`>`), so stray
+          // angle brackets in ordinary prose (`a < b > c`) are untouched. This
+          // is the text-content path ONLY; a real hardBreak node serializes from
+          // its own case (`  \n`, or `<br>` via inlineToHtml on the raw-HTML
+          // path), so the serializer's own emitted breaks are never escaped.
+          textContent = textContent.replace(
+            /<(\s*br\s*\/?\s*)>/gi,
+            "&lt;$1&gt;",
+          );
         }
         // Apply marks (bold, italic, code, etc.)
         if (node.marks) {
