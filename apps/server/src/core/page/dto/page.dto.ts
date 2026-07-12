@@ -5,6 +5,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  MaxLength,
 } from 'class-validator';
 import { Transform } from 'class-transformer';
 
@@ -45,6 +46,17 @@ export class PageInfoDto extends PageIdDto {
   @Transform(({ value }) => value?.toLowerCase())
   @IsIn(['json', 'markdown', 'html', 'text'])
   format?: PageReadFormat;
+}
+
+export class PageWorkTimeDto extends PageIdDto {
+  // Viewer IANA timezone for the per-day punch-card buckets (§6.3). Optional —
+  // falls back to UTC server-side. Length-capped so a bogus value cannot bloat
+  // the request; the value is only ever handed to Intl.DateTimeFormat, which
+  // throws on an unknown zone (caught by the controller → 400).
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  tz?: string;
 }
 
 export class DeletePageDto extends PageIdDto {

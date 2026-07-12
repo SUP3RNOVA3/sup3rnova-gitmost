@@ -21,6 +21,7 @@ import {
   PageHistoryIdDto,
   PageIdDto,
   PageInfoDto,
+  PageWorkTimeDto,
 } from './dto/page.dto';
 import { PageHistoryService } from './services/page-history.service';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
@@ -529,6 +530,32 @@ export class PageController {
     await this.pageAccessService.validateCanView(page, user);
 
     return this.pageHistoryService.findHistoryByPageId(page.id, pagination);
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('/history/time')
+  async getPageWorkTime(
+    @Body() dto: PageWorkTimeDto,
+    @AuthUser() user: User,
+  ) {
+    const page = await this.pageRepo.findById(dto.pageId);
+    if (!page) {
+      throw new NotFoundException('Page not found');
+    }
+
+    // Same view gate as /history and /history/info.
+    await this.pageAccessService.validateCanView(page, user);
+
+    try {
+      return await this.pageHistoryService.computeWorkTime(page.id, dto.tz);
+    } catch (e) {
+      // Intl.DateTimeFormat throws RangeError on an unknown IANA zone; surface
+      // it as a 400 rather than a 500.
+      if (e instanceof RangeError) {
+        throw new BadRequestException('Invalid timezone');
+      }
+      throw e;
+    }
   }
 
   @HttpCode(HttpStatus.OK)
