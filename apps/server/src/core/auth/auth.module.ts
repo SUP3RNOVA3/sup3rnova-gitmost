@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { forwardRef, Module } from '@nestjs/common';
 import { AuthController } from './auth.controller';
 import { AuthService } from './services/auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
@@ -10,8 +10,9 @@ import { ApiKeyModule } from '../api-key/api-key.module';
 @Module({
   // ApiKeyModule supplies ApiKeyService, injected into JwtStrategy so an
   // api_key Bearer/cookie token is validated directly (replacing the absent EE
-  // `ee/api-key` dynamic require).
-  imports: [TokenModule, WorkspaceModule, ApiKeyModule],
+  // `ee/api-key` dynamic require). forwardRef: ApiKeyModule imports AuthModule
+  // back (for the reveal step-up), so the two form a cycle.
+  imports: [TokenModule, WorkspaceModule, forwardRef(() => ApiKeyModule)],
   controllers: [AuthController],
   providers: [AuthService, SignupService, JwtStrategy],
   exports: [SignupService, AuthService],

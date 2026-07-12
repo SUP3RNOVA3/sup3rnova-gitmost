@@ -14,3 +14,19 @@ export function execCommandCopy(text: string): void {
   document.execCommand("copy");
   document.body.removeChild(textarea);
 }
+
+// Stateless one-shot copy: write `text` to the clipboard without ever storing it
+// in React state (unlike useClipboard, which keeps a `copied` flag AND holds the
+// last value). Used by the api-key reveal/copy flow, where the secret must touch
+// nothing but the clipboard — no component state, no cache, no localStorage.
+export async function copyToClipboard(text: string): Promise<void> {
+  if (typeof navigator !== "undefined" && "clipboard" in navigator) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Fall through to the execCommand fallback (e.g. insecure context).
+    }
+  }
+  execCommandCopy(text);
+}

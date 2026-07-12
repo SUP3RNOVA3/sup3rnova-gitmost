@@ -39,10 +39,20 @@ export interface ICreatedApiKey {
   createdAt: string;
 }
 
-// Response of `POST /api/api-keys/create`. `token` is the ONLY time the secret
-// is ever returned — it must live only in the show-once modal's local state and
-// must never be cached, persisted or logged.
+// Response of `POST /api/api-keys/create`. `token` is returned on create; it is
+// ALSO retrievable later via reveal (deterministic re-mint under a step-up), so
+// it is no longer "show once". It must never be cached, persisted or logged —
+// the create flow discards it (the user copies via the per-row Copy action).
 export interface ICreateApiKeyResponse {
   token: string;
   apiKey: ICreatedApiKey;
+}
+
+// Payload for `POST /api/api-keys/reveal`: the key id + the caller's current
+// password (step-up). The response is `{ token }` — a re-minted, byte-identical
+// copy of the key's token, which must be written straight to the clipboard and
+// never held in state, cache or storage.
+export interface IRevealApiKey {
+  id: string;
+  password: string;
 }

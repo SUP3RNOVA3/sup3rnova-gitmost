@@ -1,4 +1,8 @@
-import { UnauthorizedException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ApiKeyService } from './api-key.service';
 import { JwtType } from '../auth/dto/jwt-payload';
 
@@ -15,8 +19,6 @@ import { JwtType } from '../auth/dto/jwt-payload';
  *  - Expiry is read from the ROW, never a JWT exp claim.
  *  - No validate cache (each call re-reads the row → immediate revocation).
  */
-
-const APP_SECRET = 'secret';
 
 function makeDeps(over: Partial<Record<string, any>> = {}) {
   const apiKeyRepo = {
@@ -38,20 +40,13 @@ function makeDeps(over: Partial<Record<string, any>> = {}) {
     generateApiToken: jest.fn().mockResolvedValue('minted.jwt.token'),
     ...(over.tokenService ?? {}),
   };
-  const environmentService = {
-    isApiKeysEnabled: jest.fn().mockReturnValue(true),
-    getApiKeysEnabledRaw: jest.fn().mockReturnValue(undefined),
-    getAppSecret: jest.fn().mockReturnValue(APP_SECRET),
-    ...(over.environmentService ?? {}),
-  };
   const service = new (ApiKeyService as unknown as new (...a: any[]) => ApiKeyService)(
     apiKeyRepo,
     userRepo,
     workspaceRepo,
     tokenService,
-    environmentService,
   );
-  return { service, apiKeyRepo, userRepo, workspaceRepo, tokenService, environmentService };
+  return { service, apiKeyRepo, userRepo, workspaceRepo, tokenService };
 }
 
 const payload = (over: Record<string, any> = {}) => ({
@@ -149,10 +144,6 @@ describe('ApiKeyService.validate', () => {
       },
     ],
     [
-      'kill-switch OFF',
-      (d) => d.environmentService.isApiKeysEnabled.mockReturnValue(false),
-    ],
-    [
       'malformed payload (missing apiKeyId)',
       () => undefined,
     ],
@@ -175,14 +166,16 @@ describe('ApiKeyService.validate', () => {
     },
   );
 
-  it('kill-switch OFF denies BEFORE any DB read', async () => {
-    const { service, apiKeyRepo, environmentService } = makeDeps();
-    environmentService.isApiKeysEnabled.mockReturnValue(false);
+  // --- Kill-switch removed: keys work with no env variable ------------------
+  it('validates with no API_KEYS_ENABLED env (kill-switch fully removed)', async () => {
+    // The service no longer takes EnvironmentService — there is no env gate left.
+    const { service, apiKeyRepo, userRepo } = makeDeps();
+    apiKeyRepo.findById.mockResolvedValue(activeRow());
+    userRepo.findById.mockResolvedValue(activeUser());
 
-    await expect(service.validate(payload() as any)).rejects.toBeInstanceOf(
-      UnauthorizedException,
-    );
-    expect(apiKeyRepo.findById).not.toHaveBeenCalled();
+    await expect(service.validate(payload() as any)).resolves.toMatchObject({
+      user: { id: 'u-1' },
+    });
   });
 
   // --- Infra error propagates (5xx), NOT masked as 401 ---------------------
@@ -295,5 +288,92 @@ describe('ApiKeyService.create (mint-then-insert, no exp)', () => {
 
     await expect(service.create(user, 'k')).rejects.toThrow('mint failed');
     expect(apiKeyRepo.insert).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * ApiKeyService.reveal — the KEY-STATE gate for the copyable-key flow. Owner-only
+ * (even for an admin), and EVERY negative is a uniform NotFoundException so there
+ * is no existence/state oracle. Re-mint is deterministic (delegated to
+ * TokenService); here we only assert the gate + normalization.
+ */
+describe('ApiKeyService.reveal', () => {
+  const caller = (over: Record<string, any> = {}) =>
+    ({ id: 'u-1', email: 'u@x.io', workspaceId: 'ws-1', ...over }) as any;
+
+  it('re-mints and returns the token for a live key owned by the caller', async () => {
+    const { service, apiKeyRepo, tokenService } = makeDeps();
+    apiKeyRepo.findById.mockResolvedValue(activeRow());
+    tokenService.generateApiToken.mockResolvedValue('remint.tok');
+
+    const token = await service.reveal({
+      apiKeyId: 'key-1',
+      user: caller(),
+      workspaceId: 'ws-1',
+    });
+
+    expect(token).toBe('remint.tok');
+    // Re-mints against the SAME id + the caller (== creator) so the value matches.
+    expect(tokenService.generateApiToken).toHaveBeenCalledWith({
+      apiKeyId: 'key-1',
+      user: expect.objectContaining({ id: 'u-1' }),
+      workspaceId: 'ws-1',
+    });
+  });
+
+  it('404 for a missing/revoked key (findById returns undefined)', async () => {
+    const { service, apiKeyRepo, tokenService } = makeDeps();
+    apiKeyRepo.findById.mockResolvedValue(undefined);
+
+    await expect(
+      service.reveal({ apiKeyId: 'key-1', user: caller(), workspaceId: 'ws-1' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    // No re-mint on any negative.
+    expect(tokenService.generateApiToken).not.toHaveBeenCalled();
+  });
+
+  it("404 for another user's key — owner-only, even for an admin", async () => {
+    const { service, apiKeyRepo, tokenService } = makeDeps();
+    // The caller is a workspace admin (irrelevant here — reveal ignores CASL).
+    apiKeyRepo.findById.mockResolvedValue(activeRow({ creatorId: 'someone-else' }));
+
+    await expect(
+      service.reveal({ apiKeyId: 'key-1', user: caller(), workspaceId: 'ws-1' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(tokenService.generateApiToken).not.toHaveBeenCalled();
+  });
+
+  it('404 for an expired key (expiry read from the row) — no dead token issued', async () => {
+    const { service, apiKeyRepo, tokenService } = makeDeps();
+    apiKeyRepo.findById.mockResolvedValue(
+      activeRow({ expiresAt: new Date(Date.now() - 1000) }),
+    );
+
+    await expect(
+      service.reveal({ apiKeyId: 'key-1', user: caller(), workspaceId: 'ws-1' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+    expect(tokenService.generateApiToken).not.toHaveBeenCalled();
+  });
+
+  it('normalizes a disabled-creator ForbiddenException (403) to a uniform 404', async () => {
+    const { service, apiKeyRepo, tokenService } = makeDeps();
+    apiKeyRepo.findById.mockResolvedValue(activeRow());
+    // generateApiToken throws ForbiddenException when isUserDisabled(user).
+    tokenService.generateApiToken.mockRejectedValue(new ForbiddenException());
+
+    await expect(
+      service.reveal({ apiKeyId: 'key-1', user: caller(), workspaceId: 'ws-1' }),
+    ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('propagates an UNEXPECTED re-mint error (not masked as 404)', async () => {
+    const { service, apiKeyRepo, tokenService } = makeDeps();
+    apiKeyRepo.findById.mockResolvedValue(activeRow());
+    const boom = new Error('signer exploded');
+    tokenService.generateApiToken.mockRejectedValue(boom);
+
+    await expect(
+      service.reveal({ apiKeyId: 'key-1', user: caller(), workspaceId: 'ws-1' }),
+    ).rejects.toBe(boom);
   });
 });

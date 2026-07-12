@@ -1,7 +1,8 @@
 import {
+  ForbiddenException,
   Injectable,
   Logger,
-  OnModuleInit,
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { v7 as uuid7 } from 'uuid';
@@ -9,7 +10,6 @@ import { ApiKeyRepo } from '@docmost/db/repos/api-key/api-key.repo';
 import { UserRepo } from '@docmost/db/repos/user/user.repo';
 import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
 import { TokenService } from '../auth/services/token.service';
-import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { JwtApiKeyPayload } from '../auth/dto/jwt-payload';
 import { ApiKey, User, Workspace } from '@docmost/db/types/entity.types';
 import { isUserDisabled } from '../../common/helpers';
@@ -31,7 +31,7 @@ const LAST_USED_THROTTLE_MS = 60 * 60 * 1000;
  * key's lifetime and revocation — never the JWT, which carries no `exp` claim.
  */
 @Injectable()
-export class ApiKeyService implements OnModuleInit {
+export class ApiKeyService {
   private readonly logger = new Logger(ApiKeyService.name);
 
   constructor(
@@ -39,19 +39,7 @@ export class ApiKeyService implements OnModuleInit {
     private readonly userRepo: UserRepo,
     private readonly workspaceRepo: WorkspaceRepo,
     private readonly tokenService: TokenService,
-    private readonly environmentService: EnvironmentService,
   ) {}
-
-  onModuleInit() {
-    // Boot log so the kill-switch state after each deploy is verifiable in logs.
-    const enabled = this.environmentService.isApiKeysEnabled();
-    const raw = this.environmentService.getApiKeysEnabledRaw();
-    this.logger.log(
-      `API keys: ${enabled ? 'ENABLED' : 'DISABLED'} (API_KEYS_ENABLED=${
-        raw ?? 'unset'
-      })`,
-    );
-  }
 
   /**
    * Mint a new key for `user`. mint-then-insert ordering (R1):
@@ -101,8 +89,8 @@ export class ApiKeyService implements OnModuleInit {
    * path returns) so the AuthUser/AuthWorkspace decorators and MCP identity work
    * unchanged.
    *
-   * Failure semantics (R4, anti-enumeration): a DEFINITE negative fact — feature
-   * disabled, missing/revoked/expired row, workspace mismatch, disabled user —
+   * Failure semantics (R4, anti-enumeration): a DEFINITE negative fact —
+   * missing/revoked/expired row, workspace mismatch, disabled user —
    * throws a bare `UnauthorizedException` (a single generic 401 for every case;
    * an agent cannot distinguish expired from revoked, and its reaction is
    * identical). An UNEXPECTED (infra) error is NOT caught here: it propagates so
@@ -114,12 +102,6 @@ export class ApiKeyService implements OnModuleInit {
   async validate(
     payload: JwtApiKeyPayload,
   ): Promise<{ user: User; workspace: Workspace }> {
-    // Kill-switch OFF: deny unconditionally (same generic 401). Note the
-    // endpoints additionally 404 at the controller; here we deny the token.
-    if (!this.environmentService.isApiKeysEnabled()) {
-      throw new UnauthorizedException();
-    }
-
     if (!payload?.apiKeyId || !payload?.sub || !payload?.workspaceId) {
       throw new UnauthorizedException();
     }
@@ -172,6 +154,67 @@ export class ApiKeyService implements OnModuleInit {
    */
   async revoke(id: string, workspaceId: string): Promise<void> {
     await this.apiKeyRepo.softDelete(id, workspaceId);
+  }
+
+  /**
+   * Re-mint (reveal) the token for an EXISTING key so its owner can copy it again.
+   * The token material is never stored, so "reveal" = re-generate the same value:
+   * generateApiToken is deterministic (no `iat`/`exp`, fixed payload), so the
+   * re-minted token is byte-identical to the original for the same key.
+   *
+   * Authorization/step-up (principal rejection + password) is the caller's job
+   * (the controller). This method owns the KEY-STATE gate and the re-mint. Every
+   * negative is a UNIFORM `NotFoundException` — there is NO existence/state oracle:
+   * a caller cannot tell "absent" from "revoked" from "expired" from "another
+   * user's key" from "creator disabled". Only a live key owned by `user` re-mints.
+   *
+   * `user` is the authenticated caller AND (after the owner check) the key's
+   * creator, so the re-minted token's `sub` matches the original mint — passing
+   * `user` directly avoids re-fetching the creator row.
+   */
+  async reveal(opts: {
+    apiKeyId: string;
+    user: User;
+    workspaceId: string;
+  }): Promise<string> {
+    const { apiKeyId, user, workspaceId } = opts;
+
+    const row = await this.apiKeyRepo.findById(apiKeyId, workspaceId);
+    // Absent = revoked (soft-deleted), orphaned, or never existed -> uniform 404.
+    if (!row) {
+      throw new NotFoundException();
+    }
+
+    // Owner-only, EVEN for an admin: a working revealed token is an impersonation
+    // of the creator, so unlike list/revoke, admin must NOT reveal others' keys.
+    // Someone else's key looks exactly like a missing one -> uniform 404.
+    if (row.creatorId !== user.id) {
+      throw new NotFoundException();
+    }
+
+    // Expiry is read from the ROW (findById filters only deletedAt, so an expired
+    // row is still returned). A dead key must not hand out a working token, and a
+    // uniform 404 keeps the anti-enumeration property.
+    if (row.expiresAt && row.expiresAt.getTime() <= Date.now()) {
+      throw new NotFoundException();
+    }
+
+    try {
+      // Deterministic re-mint (byte-identical to the original for this key).
+      return await this.tokenService.generateApiToken({
+        apiKeyId: row.id,
+        user,
+        workspaceId,
+      });
+    } catch (err) {
+      // A disabled creator makes generateApiToken throw ForbiddenException (403).
+      // Normalize to the SAME 404 so reveal never leaks "user is blocked" vs "key
+      // does not exist". Unexpected errors propagate (5xx), never masked.
+      if (err instanceof ForbiddenException) {
+        throw new NotFoundException();
+      }
+      throw err;
+    }
   }
 
   // Throttled best-effort last_used_at bump: skip if it was touched within the

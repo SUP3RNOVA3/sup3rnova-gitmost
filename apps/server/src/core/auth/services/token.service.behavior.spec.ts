@@ -306,6 +306,41 @@ describe('TokenService.generateApiToken (no exp claim ever)', () => {
     });
   });
 
+  // #557: the copyable-key contract. noTimestamp suppresses `iat`, so the token
+  // is a pure deterministic function of (payload, secret) — re-minting the SAME
+  // key yields a BYTE-IDENTICAL value, which is what makes "reveal" a safe
+  // re-mint rather than a stored secret.
+  it('mints an api-key JWT with NEITHER exp NOR iat (deterministic)', async () => {
+    const { service } = makeRealSignerService();
+
+    const token = await service.generateApiToken({
+      apiKeyId: 'key-1',
+      user: user as never,
+      workspaceId: 'ws-1',
+    });
+
+    const decoded = jwt.decode(token) as Record<string, unknown>;
+    expect(decoded.exp).toBeUndefined();
+    expect(decoded.iat).toBeUndefined();
+  });
+
+  it('two mints of the SAME key are byte-identical (re-mint = reveal)', async () => {
+    const { service } = makeRealSignerService();
+    const opts = {
+      apiKeyId: 'key-1',
+      user: user as never,
+      workspaceId: 'ws-1',
+    };
+
+    const first = await service.generateApiToken(opts);
+    // A different time (and a fresh signer instance) must not change the bytes.
+    await new Promise((r) => setTimeout(r, 1100));
+    const { service: service2 } = makeRealSignerService();
+    const second = await service2.generateApiToken(opts);
+
+    expect(second).toBe(first);
+  });
+
   it('demonstrates the live bug it guards: the SHARED signer WOULD add exp', () => {
     const { JwtService } = require('@nestjs/jwt');
     const sharedJwt = new JwtService({

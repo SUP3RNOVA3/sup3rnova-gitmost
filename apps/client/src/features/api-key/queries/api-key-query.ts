@@ -9,12 +9,14 @@ import { useTranslation } from "react-i18next";
 import {
   createApiKey,
   getApiKeys,
+  revealApiKey,
   revokeApiKey,
 } from "@/features/api-key/services/api-key-service";
 import {
   IApiKey,
   ICreateApiKey,
   ICreateApiKeyResponse,
+  IRevealApiKey,
 } from "@/features/api-key/types/api-key.types";
 
 export const API_KEYS_QUERY_KEY = ["api-keys"];
@@ -44,6 +46,23 @@ export function useCreateApiKeyMutation() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: API_KEYS_QUERY_KEY });
     },
+  });
+}
+
+/**
+ * Reveal (copy) mutation.
+ *
+ * SECURITY (mirrors useCreateApiKeyMutation): the resolved value is the raw
+ * token. This hook deliberately stashes it NOWHERE — the caller reads it from
+ * `mutateAsync`, writes it straight to the clipboard, then calls
+ * `mutation.reset()` to purge react-query's own copy. `gcTime: 0` is the second
+ * belt so nothing lingers in the mutation cache after the observer unmounts.
+ * There is no `onSuccess` list invalidation: reveal does not change the list.
+ */
+export function useRevealApiKeyMutation() {
+  return useMutation<string, Error, IRevealApiKey>({
+    mutationFn: (data) => revealApiKey(data),
+    gcTime: 0,
   });
 }
 

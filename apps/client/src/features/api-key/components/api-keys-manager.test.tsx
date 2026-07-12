@@ -20,12 +20,14 @@ vi.mock("@/features/api-key/services/api-key-service", () => ({
   getApiKeys: vi.fn(),
   createApiKey: vi.fn(),
   revokeApiKey: vi.fn(),
+  revealApiKey: vi.fn(),
 }));
 
 import {
   getApiKeys,
   createApiKey,
   revokeApiKey,
+  revealApiKey,
 } from "@/features/api-key/services/api-key-service";
 import ApiKeysManager from "./api-keys-manager";
 
@@ -181,9 +183,9 @@ describe("ApiKeysManager — revoke (acceptance #4)", () => {
   });
 });
 
-describe("ApiKeysManager — show-once token (acceptance #1 & #2)", () => {
-  it("shows the token once, then discards it from the UI, localStorage and query cache", async () => {
-    const SECRET = "gm_secret-token-value-xyz";
+describe("ApiKeysManager — create no longer shows the token (copy replaces show-once)", () => {
+  it("create closes the modal + toasts without ever rendering the token", async () => {
+    const SECRET = "gm_secret-created-value";
     vi.mocked(getApiKeys).mockResolvedValue([]);
     vi.mocked(createApiKey).mockResolvedValue({
       token: SECRET,
@@ -198,7 +200,6 @@ describe("ApiKeysManager — show-once token (acceptance #1 & #2)", () => {
     const { queryClient } = renderManager(UserRole.MEMBER);
     await screen.findByText("No API keys yet");
 
-    // Open create modal (use the header CTA), fill the name, submit.
     fireEvent.click(
       screen.getAllByRole("button", { name: "Create API key" })[0],
     );
@@ -206,22 +207,13 @@ describe("ApiKeysManager — show-once token (acceptance #1 & #2)", () => {
     fireEvent.change(nameInput, { target: { value: "My key" } });
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
-    // Token is shown exactly once in the show-once modal.
-    const tokenEl = await screen.findByTestId("api-key-token");
-    expect(tokenEl.textContent).toBe(SECRET);
+    await waitFor(() => expect(createApiKey).toHaveBeenCalled());
+    // The token is never rendered (no more show-once modal).
+    expect(screen.queryByTestId("api-key-token")).toBeNull();
+    expect(screen.queryByText(SECRET)).toBeNull();
 
-    // Close the modal → token discarded from the DOM.
-    fireEvent.click(screen.getByRole("button", { name: "Done" }));
-    await waitFor(() =>
-      expect(screen.queryByTestId("api-key-token")).toBeNull(),
-    );
-
-    // Acceptance #2: the secret is nowhere in localStorage or the react-query
-    // caches (query cache never carried it; the mutation copy was reset()).
-    // Non-vacuous: currentUser IS in storage, so the dump is exercised.
-    const dump = storageDump();
-    expect(dump).toContain("currentUser");
-    expect(dump).not.toContain(SECRET);
+    // The created token never lands in localStorage or the react-query caches.
+    expect(storageDump()).not.toContain(SECRET);
     const cacheDump = JSON.stringify(
       queryClient.getQueryCache().getAll().map((q) => q.state.data),
     );
@@ -230,5 +222,75 @@ describe("ApiKeysManager — show-once token (acceptance #1 & #2)", () => {
       queryClient.getMutationCache().getAll().map((m) => m.state.data),
     );
     expect(mutationDump).not.toContain(SECRET);
+  });
+});
+
+describe("ApiKeysManager — copy under step-up (acceptance #9)", () => {
+  it("copies a re-minted token to the clipboard and leaks it nowhere else", async () => {
+    const SECRET = "gm_revealed-token-value-xyz";
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    // jsdom has no clipboard; install a stub the copy helper will use.
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+
+    vi.mocked(getApiKeys).mockResolvedValue([makeKey({ id: "k1", name: "CI token" })]);
+    vi.mocked(revealApiKey).mockResolvedValue(SECRET);
+
+    const { queryClient } = renderManager(UserRole.MEMBER);
+    await screen.findByText("CI token");
+
+    // Click the per-row Copy action → password step-up modal.
+    fireEvent.click(screen.getByLabelText("Copy CI token"));
+    const pwInput = await screen.findByLabelText("Password");
+    fireEvent.change(pwInput, { target: { value: "hunter2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Copy to clipboard" }));
+
+    // The reveal request carried the id + password; the token was written to the
+    // clipboard and NOWHERE else.
+    await waitFor(() =>
+      expect(revealApiKey).toHaveBeenCalledWith({
+        id: "k1",
+        password: "hunter2",
+      }),
+    );
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(SECRET));
+
+    // The revealed secret is never in the DOM, localStorage, or either cache.
+    expect(screen.queryByText(SECRET)).toBeNull();
+    expect(storageDump()).not.toContain(SECRET);
+    const cacheDump = JSON.stringify(
+      queryClient.getQueryCache().getAll().map((q) => q.state.data),
+    );
+    expect(cacheDump).not.toContain(SECRET);
+    const mutationDump = JSON.stringify(
+      queryClient.getMutationCache().getAll().map((m) => m.state.data),
+    );
+    expect(mutationDump).not.toContain(SECRET);
+  });
+
+  it("a wrong password keeps the modal open and does not copy", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    vi.mocked(getApiKeys).mockResolvedValue([makeKey({ id: "k1", name: "CI token" })]);
+    // Server returns a 401 for a wrong step-up password.
+    vi.mocked(revealApiKey).mockRejectedValue({ response: { status: 401 } });
+
+    renderManager(UserRole.MEMBER);
+    await screen.findByText("CI token");
+
+    fireEvent.click(screen.getByLabelText("Copy CI token"));
+    const pwInput = await screen.findByLabelText("Password");
+    fireEvent.change(pwInput, { target: { value: "wrong" } });
+    fireEvent.click(screen.getByRole("button", { name: "Copy to clipboard" }));
+
+    await waitFor(() => expect(revealApiKey).toHaveBeenCalled());
+    // Nothing copied; the password field is still on screen for a retry.
+    expect(writeText).not.toHaveBeenCalled();
+    expect(await screen.findByLabelText("Password")).toBeDefined();
   });
 });

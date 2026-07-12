@@ -3,6 +3,7 @@ import {
   IApiKey,
   ICreateApiKey,
   ICreateApiKeyResponse,
+  IRevealApiKey,
 } from "@/features/api-key/types/api-key.types";
 
 // Mint a new key. The response carries the token ONCE — the caller must move it
@@ -27,4 +28,14 @@ export async function getApiKeys(): Promise<IApiKey[]> {
 // Revocation is server-side immediate; the caller drops the row on success.
 export async function revokeApiKey(id: string): Promise<void> {
   await api.post("/api-keys/revoke", { id });
+}
+
+// Reveal (re-mint) an existing key's token under a password step-up. Returns the
+// bare token string — the SECURITY contract (mirrors create): the caller must
+// write it straight to the clipboard and never stash it in state, the query
+// cache or localStorage. See useRevealApiKeyMutation (gcTime: 0 + reset-after-
+// read) and api-keys-manager.tsx `handleCopy`.
+export async function revealApiKey(data: IRevealApiKey): Promise<string> {
+  const res = await api.post<{ token: string }>("/api-keys/reveal", data);
+  return (res.data as { token: string }).token;
 }

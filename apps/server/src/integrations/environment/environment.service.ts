@@ -70,23 +70,6 @@ export class EnvironmentService {
     return this.configService.get<string>('JWT_TOKEN_EXPIRES_IN', '90d');
   }
 
-  // Kill-switch for the agent API-key feature. Default ON (unset -> enabled): a
-  // deploy that never sets the variable must NOT silently kill every agent. The
-  // parse is STRICT — the value is validated by environment.validation to be
-  // exactly 'true' or 'false' (or absent), so a typo like `=0`/`=off`/`=False`
-  // fails at boot rather than being read as "enabled" (which would leave an
-  // operator who yanked the switch during an incident with it still on). When
-  // OFF: validate() denies every api-key token and the issuance endpoints 404.
-  isApiKeysEnabled(): boolean {
-    return this.configService.get<string>('API_KEYS_ENABLED', 'true') !== 'false';
-  }
-
-  // Raw value (or undefined) for the boot log, so the state after each deploy is
-  // verifiable in container logs: `API keys: ENABLED/DISABLED (API_KEYS_ENABLED=...)`.
-  getApiKeysEnabledRaw(): string | undefined {
-    return this.configService.get<string>('API_KEYS_ENABLED');
-  }
-
   getCookieExpiresIn(): Date {
     const expiresInStr = this.getJwtTokenExpiresIn();
     let msUntilExpiry: number;
