@@ -24,7 +24,10 @@ export function isChunkLoadError(error: unknown): boolean {
   );
 }
 
-function handleError(error: unknown) {
+// Exported for tests: the reactive chunk-load reload decision, so the shared
+// window budget (invariant: ≤1 auto-reload per window across this path AND the
+// proactive version-coherence path) can be exercised against the real guard.
+export function handleError(error: unknown) {
   if (!isChunkLoadError(error)) return;
   // A stale-chunk 404 is cured by a full reload that re-fetches index.html and
   // the new chunk manifest. Auto-reload at most once per window via the SHARED

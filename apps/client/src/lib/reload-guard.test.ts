@@ -2,11 +2,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import {
   hasAutoReloaded,
   markAutoReloaded,
+  shouldAutoReload,
   recordReloadBreadcrumb,
   takeReloadBreadcrumb,
+  RELOAD_WINDOW_MS,
 } from "./reload-guard";
 
-const FLAG = "chunk-reload-attempted";
+// The shared budget is a single sessionStorage timestamp keyed here; both the
+// reactive chunk-load boundary and the proactive version-coherence path read and
+// stamp it, so at most one auto-reload happens per RELOAD_WINDOW_MS across BOTH.
+const RELOAD_AT_KEY = "chunk-reload-at";
+const NOW = 1_000_000_000_000;
 
 describe("reload-guard", () => {
   beforeEach(() => {
@@ -19,12 +25,20 @@ describe("reload-guard", () => {
     vi.restoreAllMocks();
   });
 
-  it("hasAutoReloaded is false before any reload, true after mark", () => {
-    expect(hasAutoReloaded()).toBe(false);
-    expect(markAutoReloaded()).toBe(true);
-    expect(hasAutoReloaded()).toBe(true);
-    // Uses the same key the reactive chunk-load boundary reads.
-    expect(sessionStorage.getItem(FLAG)).toBe("1");
+  it("hasAutoReloaded is false before any reload, true within the window after mark", () => {
+    expect(hasAutoReloaded(NOW)).toBe(false);
+    expect(markAutoReloaded(NOW)).toBe(true);
+    // Same key both paths share; stores the reload timestamp, not a flag.
+    expect(sessionStorage.getItem(RELOAD_AT_KEY)).toBe(String(NOW));
+    // Inside the window → budget spent → true (fall through to manual UI).
+    expect(hasAutoReloaded(NOW)).toBe(true);
+    expect(hasAutoReloaded(NOW + RELOAD_WINDOW_MS)).toBe(true);
+  });
+
+  it("hasAutoReloaded is false again once the window has elapsed (a later deploy recovers)", () => {
+    markAutoReloaded(NOW);
+    // Strictly older than the window → a new deploy's mismatch may reload again.
+    expect(hasAutoReloaded(NOW + RELOAD_WINDOW_MS + 1)).toBe(false);
   });
 
   it("hasAutoReloaded returns true when reading storage throws (fail toward not reloading)", () => {
@@ -41,6 +55,11 @@ describe("reload-guard", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("hasAutoReloaded treats an unparseable stored timestamp as never-reloaded", () => {
+    sessionStorage.setItem(RELOAD_AT_KEY, "not-a-number");
+    expect(hasAutoReloaded(NOW)).toBe(false);
   });
 
   it("markAutoReloaded returns false when writing storage throws", () => {
@@ -93,5 +112,34 @@ describe("reload-guard", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// The pure window gate replaces the old one-shot flag: it must permit recovery
+// across several deploys in one tab (each > window apart) while still stopping an
+// infinite reload loop when a lazy chunk is permanently broken (a second failure
+// < window). Moved here from the chunk-load boundary now that it is the shared
+// guard both paths route through.
+describe("shouldAutoReload", () => {
+  const WINDOW = RELOAD_WINDOW_MS;
+
+  it("allows a reload when we have never auto-reloaded", () => {
+    expect(shouldAutoReload(NOW, null, WINDOW)).toBe(true);
+  });
+
+  it("allows a reload when the last one was 6 minutes ago (outside the window)", () => {
+    expect(shouldAutoReload(NOW, NOW - 6 * 60 * 1000, WINDOW)).toBe(true);
+  });
+
+  it("blocks a reload when the last one was 1 minute ago (inside the window)", () => {
+    expect(shouldAutoReload(NOW, NOW - 1 * 60 * 1000, WINDOW)).toBe(false);
+  });
+
+  it("blocks a reload exactly at the window boundary (not strictly older)", () => {
+    expect(shouldAutoReload(NOW, NOW - WINDOW, WINDOW)).toBe(false);
+  });
+
+  it("allows a reload when the stored timestamp is unparseable (NaN)", () => {
+    expect(shouldAutoReload(NOW, NaN, WINDOW)).toBe(true);
   });
 });
