@@ -1474,5 +1474,13 @@
   "≈ {{minutes}}m": "≈ {{minutes}}m",
   "{{hours}}h {{minutes}}m": "{{hours}}h {{minutes}}m",
   "{{hours}}h": "{{hours}}h",
-  "{{minutes}}m": "{{minutes}}m"
+  "{{minutes}}m": "{{minutes}}m",
+  "Selected version": "Selected version",
+  "via": "via",
+  "of": "of",
+  "Previous change": "Previous change",
+  "Next change": "Next change",
+  "Previous month": "Previous month",
+  "Next month": "Next month",
+  "No revisions found for that day": "No revisions found for that day"
 }

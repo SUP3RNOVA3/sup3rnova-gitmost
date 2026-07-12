@@ -18,6 +18,7 @@ import { UpdatePageDto } from './dto/update-page.dto';
 import { MovePageDto, MovePageToSpaceDto } from './dto/move-page.dto';
 import {
   DeletePageDto,
+  PageHistoryDayCountsDto,
   PageHistoryIdDto,
   PageIdDto,
   PageInfoDto,
@@ -551,6 +552,33 @@ export class PageController {
     } catch (e) {
       // Intl.DateTimeFormat throws RangeError on an unknown IANA zone; surface
       // it as a 400 rather than a 500.
+      if (e instanceof RangeError) {
+        throw new BadRequestException('Invalid timezone');
+      }
+      throw e;
+    }
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('/history/day-counts')
+  async getPageHistoryDayCounts(
+    @Body() dto: PageHistoryDayCountsDto,
+    @AuthUser() user: User,
+  ) {
+    const page = await this.pageRepo.findById(dto.pageId);
+    if (!page) {
+      throw new NotFoundException('Page not found');
+    }
+
+    // #568 — same view gate as /history and /history/time: never expose a page's
+    // revision counts (even without content) to a non-viewer.
+    await this.pageAccessService.validateCanView(page, user);
+
+    try {
+      return await this.pageHistoryService.computeDayCounts(page.id, dto.tz);
+    } catch (e) {
+      // Intl.DateTimeFormat throws RangeError on an unknown IANA zone; surface
+      // it as a 400 rather than a 500 (same contract as /history/time).
       if (e instanceof RangeError) {
         throw new BadRequestException('Invalid timezone');
       }

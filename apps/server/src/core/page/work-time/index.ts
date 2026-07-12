@@ -1,5 +1,7 @@
 export { computeWorkTime } from './compute-work-time';
-export { bucketByDay, zonedDayStart } from './bucket-by-day';
+export { bucketByDay, zonedDayStart, isoDay } from './bucket-by-day';
+export { countRevisionsByDay } from './day-counts';
+export type { DayCount } from './day-counts';
 export {
   DEFAULT_WORK_TIME_CONFIG,
   resolveWorkTimeConfig,

@@ -16,27 +16,13 @@ import { memo, useCallback } from "react";
 import { useSetAtom } from "jotai";
 import { useTranslation } from "react-i18next";
 import { historyAtoms } from "@/features/page-history/atoms/history-atoms.ts";
+// #568 — historyKindMeta moved to a pure module; re-exported here so existing
+// importers (history-list, this file) keep their import path unchanged.
+import { historyKindMeta } from "@/features/page-history/utils/history-kind-meta";
+
+export { historyKindMeta };
 
 const MAX_VISIBLE_AVATARS = 5;
-
-/**
- * #370 — map a snapshot's intentionality tier to its badge. `version: true`
- * marks the intentional points (manual / agent); autosaves (boundary / idle /
- * legacy null) are non-versions and get dimmed in the list.
- */
-type HistoryKindMeta = { labelKey: string; color: string; version: boolean };
-export function historyKindMeta(kind?: string | null): HistoryKindMeta {
-  switch (kind) {
-    case "manual":
-      return { labelKey: "Saved", color: "blue", version: true };
-    case "agent":
-      return { labelKey: "Agent version", color: "violet", version: true };
-    case "boundary":
-      return { labelKey: "Boundary", color: "gray", version: false };
-    default: // "idle" | null | undefined (legacy autosave)
-      return { labelKey: "Autosave", color: "gray", version: false };
-  }
-}
 
 interface HistoryItemProps {
   historyItem: IPageHistory;

@@ -1,7 +1,7 @@
 import { Modal, Text } from "@mantine/core";
 import { useAtom } from "jotai";
 import { historyAtoms } from "@/features/page-history/atoms/history-atoms";
-import HistoryModalBody from "@/features/page-history/components/history-modal-body";
+import HistoryModalDesktop from "@/features/page-history/components/history-modal-desktop";
 import HistoryModalMobile from "@/features/page-history/components/history-modal-mobile";
 import { useTranslation } from "react-i18next";
 import { useMediaQuery } from "@mantine/hooks";
@@ -45,6 +45,9 @@ export default function HistoryModal({ pageId, pageTitle }: Props) {
     );
   }
 
+  // #568 — the redesigned desktop window carries its OWN single-row header
+  // (title + selected label + diff nav + Restore + close), so the Modal chrome is
+  // dropped for desktop and the body renders edge-to-edge.
   return (
     <Modal.Root
       size={1400}
@@ -54,16 +57,11 @@ export default function HistoryModal({ pageId, pageTitle }: Props) {
     >
       <Modal.Overlay />
       <Modal.Content style={{ overflow: "hidden" }}>
-        <Modal.Header>
-          <Modal.Title>
-            <Text size="md" fw={500}>
-              {t("Page history")}
-            </Text>
-          </Modal.Title>
-          <Modal.CloseButton aria-label={t("Close")} />
-        </Modal.Header>
-        <Modal.Body>
-          <HistoryModalBody pageId={pageId} />
+        <Modal.Body p={0}>
+          <HistoryModalDesktop
+            pageId={pageId}
+            onClose={() => setModalOpen(false)}
+          />
         </Modal.Body>
       </Modal.Content>
     </Modal.Root>
