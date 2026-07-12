@@ -58,6 +58,7 @@ type DocmostClientMethod =
   | 'sharePage'
   | 'unsharePage'
   | 'restorePageVersion'
+  | 'savePageVersion'
   | 'transformPage'
   | 'stashPage'
   // --- write (image / footnote), in-app since #410 ---
