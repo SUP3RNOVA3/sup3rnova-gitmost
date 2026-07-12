@@ -127,6 +127,67 @@ describe('mention round-trip', () => {
   });
 });
 
+describe('#554 literal <br> in text is not converted to a hardBreak', () => {
+  // Count hardBreak nodes anywhere in a doc tree.
+  const countHardBreaks = (n: any): number => {
+    if (!n) return 0;
+    let c = n.type === 'hardBreak' ? 1 : 0;
+    for (const ch of n.content || []) c += countHardBreaks(ch);
+    return c;
+  };
+  // Concatenate every text run's content in a doc tree.
+  const collectText = (n: any): string => {
+    if (!n) return '';
+    if (n.type === 'text') return n.text || '';
+    let s = '';
+    for (const ch of n.content || []) s += collectText(ch);
+    return s;
+  };
+
+  // Each literal break-tag variant a user could TYPE into prose. On import
+  // marked would otherwise parse these as an inline-HTML line break, silently
+  // turning the typed text into a hardBreak node and dropping the text.
+  for (const literal of ['a<br>b', 'a<br/>b', 'a<br />b']) {
+    it(`"${literal}" round-trips as literal text with ZERO hardBreaks`, async () => {
+      const source = para(text(literal));
+      const { md1, doc2, md2 } = await roundTrip(source);
+
+      // The break tag's angle brackets are HTML-entity-encoded in the markdown
+      // so marked passes them through as literal text instead of a break.
+      expect(md1).toContain('&lt;br');
+      expect(md1).not.toMatch(/<\s*br/i);
+      // Byte-stable second export.
+      expect(md2).toBe(md1);
+
+      // The re-imported doc has NO hardBreak and its text still contains the
+      // literal `<br>` the user typed.
+      expect(countHardBreaks(doc2)).toBe(0);
+      expect(collectText(doc2)).toContain('<br');
+    });
+  }
+
+  it('a real hardBreak node still serializes and re-imports as a hardBreak', async () => {
+    const source = para(text('a'), { type: 'hardBreak' }, text('b'));
+    const { md1, doc2, md2 } = await roundTrip(source);
+
+    // The hardBreak case emits the two-space markdown form, NOT a `<br>`, so
+    // the literal-text escaping above never touches the serializer's own break.
+    expect(md1).toBe('a  \nb');
+    expect(md2).toBe(md1);
+    expect(countHardBreaks(doc2)).toBe(1);
+  });
+
+  it('ordinary stray angle brackets in prose are left untouched (no over-escape)', async () => {
+    const source = para(text('a < b > c'));
+    const { md1, doc2, md2 } = await roundTrip(source);
+
+    // Only the `<br…>` pattern is escaped; a lone `<`/`>` is not.
+    expect(md1).toBe('a < b > c');
+    expect(md2).toBe(md1);
+    expect(collectText(doc2)).toContain('a < b > c');
+  });
+});
+
 describe('details open-attribute round-trip', () => {
   it('the markdown details fence never carries an open flag and stays byte-stable', async () => {
     // Source details is OPEN (attrs.open: ''), but the top-level markdown path

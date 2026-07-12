@@ -1,13 +1,145 @@
 import type { ModelMessage } from 'ai';
 import {
   resolveReplayBudget,
+  resolveEffectiveReplayThreshold,
   isContextOverflowError,
   estimateMessagesTokens,
   trimHistoryForReplay,
   REPLAY_BUDGET_DEFAULT_TOKENS,
+  REPLAY_BUDGET_WINDOW_FRACTION,
+  REPLAY_MIN_FLOOR_TOKENS,
   REPLAY_TRUNCATION_MARKER,
   REPLAY_TURN_COLLAPSED_MARKER,
 } from './history-budget';
+
+describe('resolveEffectiveReplayThreshold (#520 iterative escalation)', () => {
+  // The escalation table: each consecutive overflow (k) deepens the cut by 0.5×.
+  it('scales the base by 0.5**k, flooring (not rounding) fractional tokens', () => {
+    const base = 100_000;
+    expect(resolveEffectiveReplayThreshold(base, 0)).toBe(base); // k=0: unchanged
+    expect(resolveEffectiveReplayThreshold(base, 1)).toBe(50_000); // 0.5×
+    expect(resolveEffectiveReplayThreshold(base, 2)).toBe(25_000); // 0.25×
+    expect(resolveEffectiveReplayThreshold(base, 3)).toBe(12_500); // 0.125×
+    // Floors, not rounds.
+    expect(resolveEffectiveReplayThreshold(99_999, 1)).toBe(49_999);
+  });
+
+  it('passes a null base (trimming OFF) through unchanged for any k', () => {
+    for (const k of [0, 1, 2, 5, 100]) {
+      expect(resolveEffectiveReplayThreshold(null, k)).toBeNull();
+    }
+  });
+
+  // The crux of #520: convergence. A large k is clamped at REPLAY_MIN_FLOOR_TOKENS,
+  // so the escalation CONVERGES to a small-but-usable budget instead of trimming to
+  // zero — and, unlike the old fixed 0.5× that stuck at 50k, it drops far enough to
+  // fit a small real model window.
+  it('clamps a large k at the floor (converges, never below)', () => {
+    const base = 100_000;
+    for (const k of [4, 6, 10, 50, 200]) {
+      const t = resolveEffectiveReplayThreshold(base, k) as number;
+      expect(t).toBe(REPLAY_MIN_FLOOR_TOKENS);
+      expect(t).toBeGreaterThanOrEqual(REPLAY_MIN_FLOOR_TOKENS);
+    }
+  });
+
+  // Residual-brick regression (#520): flat-default base 100k, real window ~40k. The
+  // OLD fixed single 0.5× stuck at 50k > 40k forever (re-overflows every turn — the
+  // brick). The iterative cut drops BELOW 40k after a couple more consecutive
+  // overflows, so the history finally fits and the chat un-bricks.
+  it('un-bricks: escalation drops below a small real window the fixed 0.5× never could', () => {
+    const base = 100_000;
+    const realWindow = 40_000;
+    // The old terminal state: 0.5× = 50k, still above the window.
+    expect(resolveEffectiveReplayThreshold(base, 1)).toBeGreaterThan(realWindow);
+    // Escalation converges under the window.
+    const converged = [2, 3, 4, 5].some(
+      (k) => (resolveEffectiveReplayThreshold(base, k) as number) < realWindow,
+    );
+    expect(converged).toBe(true);
+    // MUTATION SENTINEL: reverting `** k` to `** 1` (fixed 0.5×) makes every k yield
+    // 50k, so `converged` above would be FALSE and this test reddens. Removing the
+    // floor reddens the clamp test instead.
+  });
+
+  // "Don't INFLATE above itself" is still an invariant: the floor never RAISES a
+  // legitimately small configured budget above itself (that would re-overflow the
+  // very window it was set for). Under #520 Option B the floor is min(FLOOR,
+  // floor(0.5×base)), so for a base BELOW the floor recovery MAY cut it further —
+  // down to floor(0.5×base), i.e. AT LEAST the old single 0.5× cut — but never above.
+  it('never inflates a small configured budget above itself (may cut below it, #520 Option B)', () => {
+    const small = 5_000; // below REPLAY_MIN_FLOOR_TOKENS
+    const floor = Math.min(REPLAY_MIN_FLOOR_TOKENS, Math.floor(small * 0.5)); // 2500
+    expect(resolveEffectiveReplayThreshold(small, 0)).toBe(small); // k=0 unchanged
+    for (const k of [1, 2, 3, 10]) {
+      const t = resolveEffectiveReplayThreshold(small, k) as number;
+      // Invariant: never RAISED above the configured budget.
+      expect(t).toBeLessThanOrEqual(small);
+      // Option B: never trimmed below the absolute floor (converges).
+      expect(t).toBeGreaterThanOrEqual(floor);
+    }
+    // The old single 0.5× cut is reached (and pinned) — recovery is never WORSE than
+    // before, and DOES cut below the configured budget on overflow (Option B). Under
+    // the old floor==budget behavior this would be `small` (5000), not `floor`.
+    expect(resolveEffectiveReplayThreshold(small, 1)).toBe(floor);
+  });
+
+  // #520 Option B: with a configured window (NOT the flat default), repeated overflow
+  // escalates the replay budget BELOW the configured budget, down to the absolute
+  // floor — the chat must not brick even when the configured window is too large for
+  // the model. A CLEAN turn (k back to 0) restores the full configured budget.
+  it('escalates below the configured budget down to the floor, and resets on a clean turn', () => {
+    // Configured context window 8000 -> budget = floor(0.7 × 8000) = 5600 (the code's
+    // window->budget ratio; compute it, do not hardcode).
+    const window = 8_000;
+    const budget = resolveReplayBudget(window).thresholdTokens as number;
+    expect(budget).toBe(Math.floor(REPLAY_BUDGET_WINDOW_FRACTION * window)); // 5600
+
+    // The absolute floor for this budget = min(FLOOR, floor(0.5 × budget)) = 2800
+    // (a "small window": 0.5×budget < REPLAY_MIN_FLOOR_TOKENS), which is BELOW the
+    // 5600 configured budget.
+    const floor = Math.min(
+      REPLAY_MIN_FLOOR_TOKENS,
+      Math.floor(budget * 0.5),
+    ); // 2800
+    expect(floor).toBe(2_800);
+    expect(floor).toBeLessThan(budget); // below the configured budget
+
+    // k=0 -> full configured budget (no overflow yet).
+    expect(resolveEffectiveReplayThreshold(budget, 0)).toBe(budget);
+    // k=1 -> cut BELOW the configured budget to the 0.5× floor (2800). This is the
+    // MUTATION SENTINEL: with the OLD floor==configured-budget behavior this would be
+    // max(2800, 5600) = 5600 (never below budget), so the assertion reddens.
+    expect(resolveEffectiveReplayThreshold(budget, 1)).toBe(floor);
+    expect(resolveEffectiveReplayThreshold(budget, 1)).toBeLessThan(budget);
+    // k>=2 stays at the floor (converges, never below it).
+    for (const k of [2, 3, 5, 20]) {
+      expect(resolveEffectiveReplayThreshold(budget, k)).toBe(floor);
+    }
+
+    // A CLEAN turn resets k to 0 -> the full configured budget is restored (recovery
+    // is not sticky; it only bites while the provider keeps proving non-fit).
+    expect(resolveEffectiveReplayThreshold(budget, 0)).toBe(budget);
+  });
+
+  // #520 Option B, LARGE window: a big configured budget escalates in DISTINCT steps
+  // below itself, converging to the fixed absolute floor REPLAY_MIN_FLOOR_TOKENS.
+  it('a large configured budget escalates below itself down to REPLAY_MIN_FLOOR_TOKENS', () => {
+    const budget = resolveReplayBudget(200_000).thresholdTokens as number; // 140000
+    // The floor for a large window is the fixed REPLAY_MIN_FLOOR_TOKENS (8k), well
+    // BELOW the configured budget.
+    expect(
+      Math.min(REPLAY_MIN_FLOOR_TOKENS, Math.floor(budget * 0.5)),
+    ).toBe(REPLAY_MIN_FLOOR_TOKENS);
+    const seq = [0, 1, 2, 3, 4, 5, 6].map(
+      (k) => resolveEffectiveReplayThreshold(budget, k) as number,
+    );
+    expect(seq).toEqual([140_000, 70_000, 35_000, 17_500, 8_750, 8_000, 8_000]);
+    // Every escalated step (k>=1) is below the configured budget; convergence floor.
+    for (const t of seq.slice(1)) expect(t).toBeLessThan(budget);
+    expect(seq[seq.length - 1]).toBe(REPLAY_MIN_FLOOR_TOKENS);
+  });
+});
 
 describe('resolveReplayBudget', () => {
   it('uses floor(0.7 x window) for a configured window (no cap)', () => {
