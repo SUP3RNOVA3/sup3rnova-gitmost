@@ -118,7 +118,10 @@ All 41 tools, grouped by what you'd reach for them.
 - **`getPage`** — A page's content as clean **Markdown** (canonical for text; drops only
   block ids, resolved-comment anchors, and a fixed no-Markdown-representation attr set —
   table spans/colwidth/background, indent, `callout.icon`, `orderedList.type`, and link
-  `internal`/`target`/`rel`/`class`; use `getPageJson` when you need those).
+  `internal`/`target`/`rel`/`class`; use `getPageJson` when you need those). Pass
+  `format:"text"` for a flat, deterministic plain-text rendering (one line per block,
+  marks dropped, stable `[image]`/`[table RxC]` placeholders) to machine-diff what you
+  wrote against what was stored.
 - **`getPageJson`** — A page's **lossless ProseMirror/TipTap JSON**, including every
   block's `attrs.id` and the `slugId` used in URLs. This is what the per-block editing
   tools consume.

@@ -469,7 +469,11 @@ export const SHARED_TOOL_SPECS = {
       '(markdown). The fragment may be SEVERAL blocks (a "1 → N" splice: rewrite a ' +
       'whole section in one call) — the first block inherits this block id, the ' +
       'rest get fresh ids. `^[...]` footnotes are supported (their definitions ' +
-      "merge into the page's footnote list). REJECTED when the target is a table " +
+      "merge into the page's footnote list). Markdown is taken LITERALLY — " +
+      '`$...$`/`$$...$$` are NOT parsed as math and schemeless `www.host` / bare ' +
+      'emails are NOT auto-linked (an explicit `https://` URL still links); for a ' +
+      'real formula pass a `mathInline`/`mathBlock` ProseMirror node via `node` ' +
+      '(or updatePageJson). REJECTED when the target is a table ' +
       'cell with attributes markdown cannot represent (merged/colored/fixed-width) ' +
       '— use the table tools or `node`. ' +
       '`node` (for precise attr/mark work): a raw ProseMirror node, e.g. a ' +
@@ -535,6 +539,10 @@ export const SHARED_TOOL_SPECS = {
       'Provide EXACTLY ONE of `markdown` or `node`. ' +
       '`markdown` (RECOMMENDED): a canonical markdown fragment — may be SEVERAL ' +
       'blocks, inserted in order at the anchor; `^[...]` footnotes supported. ' +
+      'Markdown is taken LITERALLY — `$...$`/`$$...$$` are NOT parsed as math and ' +
+      'schemeless `www.host` / bare emails are NOT auto-linked (an explicit ' +
+      '`https://` URL still links); for a real formula pass a ' +
+      '`mathInline`/`mathBlock` ProseMirror node via `node` (or updatePageJson). ' +
       '`node` (for precise attr/mark work OR table structure): a raw ProseMirror ' +
       'node. Table structure is JSON-only (not expressible in markdown): to add a ' +
       'tableRow, pass a tableRow node with position before/after and anchor INSIDE ' +
@@ -1095,8 +1103,12 @@ export const SHARED_TOOL_SPECS = {
     description:
       'Create a new page with a Markdown body in a space, optionally under a ' +
       'parent page (omit parentPageId to create at the space root). Returns ' +
-      'the new page id and title. Reversible: a page can be moved to trash ' +
-      'later.',
+      'the new page id and title. Body text is taken LITERALLY — ' +
+      '`$...$`/`$$...$$` are NOT parsed into a math formula and schemeless ' +
+      '`www.host` / bare emails are NOT auto-linked (an explicit `https://` URL ' +
+      'still links); for a real formula use updatePageJson with ' +
+      '`mathInline`/`mathBlock` nodes instead. Reversible: a page can be moved ' +
+      'to trash later.',
     tier: 'deferred',
     catalogLine: 'createPage — create a new page with a Markdown body in a space.',
     // Reconciled schema DRIFT: the MCP copy pinned `content` to .min(1) while
@@ -1355,7 +1367,11 @@ export const SHARED_TOOL_SPECS = {
       'title). The whole body is re-imported from the markdown (block ids ' +
       'regenerate — for surgical or id-preserving edits use the find/replace, ' +
       'node-patch or page-JSON tools instead). Docmost-flavoured markdown is ' +
-      'parsed, including `^[...]` inline footnotes. Reversible: the previous ' +
+      'parsed, including `^[...]` inline footnotes. Text is taken LITERALLY — ' +
+      '`$...$`/`$$...$$` are NOT parsed into a math formula and schemeless ' +
+      '`www.host` / bare emails are NOT auto-linked (an explicit `https://` URL ' +
+      'still links); for a real formula use updatePageJson with ' +
+      '`mathInline`/`mathBlock` nodes instead. Reversible: the previous ' +
       'version is kept in page history.',
     tier: 'deferred',
     catalogLine:
