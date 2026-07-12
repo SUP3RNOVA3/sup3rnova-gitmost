@@ -22,10 +22,12 @@ import { v7 } from 'uuid';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { FileTask, InsertablePage } from '@docmost/db/types/entity.types';
 import { canonicalizeFootnotes } from '@docmost/editor-ext';
-import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
+import {
+  markdownToProseMirror,
+  normalizeForeignMarkdown,
+} from '@docmost/prosemirror-markdown';
 import { getProsemirrorContent } from '../../../common/helpers/prosemirror/utils';
 import { formatImportHtml } from '../utils/import-formatter';
-import { normalizeForeignMarkdown } from '../utils/foreign-markdown';
 import {
   buildAttachmentCandidates,
   collectMarkdownAndHtmlFiles,

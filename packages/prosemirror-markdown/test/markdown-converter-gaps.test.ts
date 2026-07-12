@@ -430,7 +430,7 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
   });
 });
 
-describe('converter gap coverage — documented round-trip data loss (specs 12–14)', () => {
+describe('converter gap coverage — formerly-lossy round-trips, now closed (specs 12–14)', () => {
   // 12. A 3-backtick fence inside a codeBlock body is now lengthened: the outer
   //     fence widens to (longest inner run + 1) backticks per CommonMark, so the
   //     inner ``` is treated as content and the block survives as ONE node.
@@ -460,25 +460,24 @@ describe('converter gap coverage — documented round-trip data loss (specs 12�
     expect(docsCanonicallyEqual(d, doc2)).toBe(false);
   });
 
-  // 13. A leading ordered-list marker in paragraph text is NOT escaped, so a
-  //     plain paragraph silently becomes an orderedList on re-import.
-  it('a paragraph starting with "1. " is promoted to an orderedList on re-import', async () => {
+  // 13. #493 commit 1: a leading ordered-list marker in paragraph text is now
+  //     BLOCK-ESCAPED, so the paragraph round-trips as a paragraph instead of
+  //     silently becoming an orderedList (was documented data loss, now closed).
+  it('a paragraph starting with "1. " is block-escaped and stays a paragraph', async () => {
     const d = doc({
       type: 'paragraph',
       content: [{ type: 'text', text: '1. not a list' }],
     });
     const md1 = convertProseMirrorToMarkdown(d);
-    expect(md1).toBe('1. not a list'); // no backslash escape
+    expect(md1).toBe('1\\. not a list'); // the ordered-list delimiter is escaped
 
     const doc2 = await markdownToProseMirror(md1);
-    expect(doc2.content?.[0]?.type).toBe('orderedList');
-    const li = doc2.content[0].content?.[0];
-    expect(li?.type).toBe('listItem');
-    expect(li.content?.[0]?.content?.[0]).toMatchObject({
+    expect(doc2.content?.[0]?.type).toBe('paragraph');
+    expect(doc2.content[0].content?.[0]).toMatchObject({
       type: 'text',
-      text: 'not a list', // the "1. " was consumed as a list marker
+      text: '1. not a list', // the escape decodes back to the literal text
     });
-    expect(docsCanonicallyEqual(d, doc2)).toBe(false);
+    expect(docsCanonicallyEqual(d, doc2)).toBe(true);
   });
 
   // 14. #293 canon #4: the image title now round-trips via the attached

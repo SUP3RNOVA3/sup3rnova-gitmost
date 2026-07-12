@@ -7,13 +7,12 @@
  * it is never applied to replacement text or inserted node content, so no
  * formatting is ever lost.
  *
- * Scope note (#414): this package-local copy exists so `node-ops.ts` — which
- * lives here now (the single canonical copy) — can resolve its markdown-tolerant
- * anchor fallback without a circular dependency back on `@docmost/mcp`. It
- * intentionally carries ONLY `stripInlineMarkdown` (the primitive `node-ops`
- * needs); the mcp-side `text-normalize.ts` (which additionally serves
- * `json-edit.ts` via `stripBalancedWrappers`) is the subject of a separate
- * dedup task and is left untouched here.
+ * CANONICAL HOME (#414/#493): this is the single source of truth for locator
+ * markdown-stripping. `node-ops.ts` (which lives here) uses it directly, and the
+ * mcp-side `text-normalize.ts` now IMPORTS `stripInlineMarkdown` and the shared
+ * `stripWrappersAndLinks` primitive from here (via `@docmost/prosemirror-markdown`)
+ * instead of keeping a drifting copy — mcp only adds its own thin
+ * `stripBalancedWrappers`/`closestBlockHint` on top.
  */
 
 /** Maximum unwrap passes, so pathological/nested input cannot loop forever. */
@@ -44,7 +43,7 @@ const LINK_IMAGE_RE = /!?\[([^\]]*)\]\([^)]*\)/g;
  * Does NOT trim decoration, does NOT guard against an empty result — it returns
  * exactly the transformed string.
  */
-function stripWrappersAndLinks(s: string): string {
+export function stripWrappersAndLinks(s: string): string {
   // 1. Links/images -> their visible text.
   let out = s.replace(LINK_IMAGE_RE, "$1");
 

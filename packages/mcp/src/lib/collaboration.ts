@@ -10,7 +10,10 @@ import { JSDOM } from "jsdom";
 // handled there). MCP consumes it directly instead of maintaining its own
 // drifted marked pipeline; only the collab/yjs write glue and the footnote
 // canonicalization wrapper stay mcp-side.
-import { markdownToProseMirror } from "@docmost/prosemirror-markdown";
+import {
+  markdownToProseMirror,
+  normalizeAgentMarkdown,
+} from "@docmost/prosemirror-markdown";
 import { docmostExtensions, docmostSchema } from "./docmost-schema.js";
 import { withPageLock } from "./page-lock.js";
 import type { PageId } from "./page-id.js";
@@ -21,6 +24,7 @@ import {
 } from "@docmost/prosemirror-markdown";
 import { canonicalizeFootnotes } from "./footnote-canonicalize.js";
 import { normalizeAndMergeFootnotes } from "./footnote-normalize-merge.js";
+import { regraftResolvedComments } from "./comment-anchor.js";
 import { VerifyReport } from "./diff.js";
 import { acquireCollabSession } from "./collab-session.js";
 
@@ -98,6 +102,15 @@ global.WebSocket = WebSocket;
  * plain `markdownToProseMirror` (no canonicalization) — safe now because inline
  * `^[body]` footnotes carry their body at the reference point, so a comment can
  * no longer produce a reference-less footnote definition to be dropped.
+ *
+ * #493: `normalizeAgentMarkdown` runs FIRST, so an agent's `updatePageMarkdown`
+ * body gets the SAME GFM `[^id]` reference-footnote -> inline `^[body]` rewrite as
+ * the server import path (instead of the reference leaking as literal text / a
+ * bogus link). It DELIBERATELY does NOT strip a leading YAML front-matter block:
+ * a full-body agent rewrite that opens with a `---…---` is (almost) always a
+ * horizontalRule the serializer emitted, and stripping it would silently drop the
+ * page's leading content (#493 review). The front-matter strip stays on the
+ * server FILE-import boundary only (`normalizeForeignMarkdown`).
  */
 export async function markdownToProseMirrorCanonical(
   markdownContent: string,
@@ -106,7 +119,9 @@ export async function markdownToProseMirrorCanonical(
   // canonicalizing, so the canonicalizer re-hangs references and drops the
   // now-orphaned duplicate definitions.
   return canonicalizeFootnotes(
-    normalizeAndMergeFootnotes(await markdownToProseMirror(markdownContent)),
+    normalizeAndMergeFootnotes(
+      await markdownToProseMirror(normalizeAgentMarkdown(markdownContent)),
+    ),
   );
 }
 
@@ -348,6 +363,12 @@ export async function updatePageContentRealtime(
     pageId,
     collabToken,
     baseUrl,
-    () => tiptapJson,
+    // #493: an agent read HIDES resolved-comment anchors (#337), so the markdown
+    // it sends here no longer carries them — a naive full rewrite would erase
+    // every resolved comment mark. Re-graft the resolved marks from the LIVE doc
+    // onto the matching text in the freshly-imported body. Active comments are
+    // untouched (they ride through the markdown themselves); a resolved span whose
+    // text the agent changed simply does not re-anchor and is dropped.
+    (liveDoc) => regraftResolvedComments(liveDoc, tiptapJson),
   );
 }
