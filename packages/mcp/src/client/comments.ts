@@ -725,10 +725,15 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
     // The subtree scope (parentPageId given) already INCLUDES the root node
     // itself: /pages/tree seeds getPageAndDescendants with id = parentPageId, so
     // no separate getPageRaw fetch for the parent is needed.
-    const { pages: pagesInScope, truncated } = await this.enumerateSpacePages(
-      spaceId,
-      parentPageId,
-    );
+    // #534: the enumerateSpacePages seed (`/pages/tree`) 404s for a bad or
+    // inaccessible spaceId; wrap it so that 404 becomes an actionable "spaceId
+    // not accessible" hint instead of the opaque "Space permissions not found".
+    // Only the whole enumeration is wrapped (the only 404 source here) — see the
+    // wrap-allowlist invariant on withSpaceAccessDiagnostics.
+    const { pages: pagesInScope, truncated } =
+      await this.withSpaceAccessDiagnostics(spaceId, "checkNewComments", () =>
+        this.enumerateSpacePages(spaceId, parentPageId),
+      );
 
     // 2. Fetch comments for each page, keep ones created after since. Runs with
     // bounded concurrency (#490) instead of one-at-a-time — the per-page reads are

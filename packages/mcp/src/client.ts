@@ -31,7 +31,11 @@ import { TransformsMixin, type ITransformsMixin } from "./client/transforms.js";
 // existing importer (index.ts, http.ts, stdio.ts, the in-app host) keeps working
 // with ZERO changes.
 export type { DocmostMcpConfig, SandboxPut } from "./client/context.js";
-export { formatDocmostAxiosError, assertFullUuid } from "./client/errors.js";
+export {
+  formatDocmostAxiosError,
+  assertFullUuid,
+  formatSpaceNotAccessible,
+} from "./client/errors.js";
 
 // Branded canonical page-identity type (#435): the internal page UUID is a
 // distinct nominal type so an unresolved raw/slug string can't be swapped into

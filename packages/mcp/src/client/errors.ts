@@ -46,6 +46,60 @@ export function assertFullUuid(
   }
 }
 
+// Max number of accessible spaces to enumerate inline in the "space not
+// accessible" message (issue #534) before collapsing the rest into a "(+N ещё)"
+// tail, so a workspace with many spaces cannot blow up the model context.
+const SPACE_LIST_CAP = 10;
+
+/**
+ * Compose the model-facing "spaceId is not accessible" message (issue #534).
+ * This is FACT text about the supplied spaceId that REPLACES the opaque server
+ * string ("Space permissions not found") on the enrich-on-404 path — it names
+ * the exact bad id, lists the spaces the token can actually see (id + name, so
+ * the agent can copy the right id verbatim), and points at `listSpaces`.
+ *
+ * Deliberately Russian: like the other agent-facing tool guidance in this repo,
+ * this is the message the acting agent reads to self-correct.
+ */
+export function formatSpaceNotAccessible(
+  mcpName: string,
+  spaceId: string,
+  spaces: { id: string; name: string }[],
+): string {
+  // No accessible spaces at all — a distinct diagnosis (token has no space
+  // access), not "you picked the wrong one from this list".
+  if (!Array.isArray(spaces) || spaces.length === 0) {
+    return `${mcpName}: spaceId "${spaceId}" недоступен, и доступных тебе спейсов нет — проверь доступ токена / вызови listSpaces.`;
+  }
+
+  const shown = spaces.slice(0, SPACE_LIST_CAP);
+  const remaining = spaces.length - shown.length;
+  const tail =
+    remaining > 0 ? ` (+${remaining} ещё, см. listSpaces)` : "";
+
+  // Cap the whole message at ERROR_MESSAGE_CAP (same budget as
+  // formatDocmostAxiosError) so ~10 long space names cannot blow up the model
+  // context. Truncate ONLY the interpolated space LIST — the fixed prefix (which
+  // carries the bad spaceId) and the fixed suffix (the "…из listSpaces"
+  // instruction) are always kept intact, so the actionable parts survive even
+  // when the list is trimmed.
+  const prefix = `${mcpName}: spaceId "${spaceId}" не найден среди доступных тебе спейсов. Доступные: `;
+  const suffix = ` — скопируй нужный id дословно из listSpaces.`;
+  let listed = shown.map((s) => `${s.id} (${s.name})`).join(", ") + tail;
+  const budget = ERROR_MESSAGE_CAP - prefix.length - suffix.length;
+  if (listed.length > budget) {
+    listed = listed.slice(0, Math.max(0, budget - 1)) + "…";
+  }
+  const message = `${prefix}${listed}${suffix}`;
+  // Unconditional final backstop (mirrors formatDocmostAxiosError): the list
+  // cap above assumes a well-formed prefix, but a pathologically long
+  // agent-supplied spaceId lives in the prefix and would otherwise blow past the
+  // budget. Cap the WHOLE message so nothing bloats the model context.
+  return message.length > ERROR_MESSAGE_CAP
+    ? message.slice(0, ERROR_MESSAGE_CAP - 1) + "…"
+    : message;
+}
+
 // Keep ONLY the pathname of a request (no host, no query string, no fragment)
 // so the message never leaks a host or query params. Resolves a relative
 // config.url against config.baseURL, then discards everything but the path.
