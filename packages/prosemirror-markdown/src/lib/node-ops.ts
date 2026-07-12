@@ -633,6 +633,130 @@ function findAnchorChain(
   return null;
 }
 
+// ===========================================================================
+// List seam coalescing (#535)
+//
+// When a markdown/JSON insert places a list block directly next to an existing
+// sibling list of the SAME node type, the two must become ONE list (items
+// appended/prepended) rather than two adjacent lists — otherwise the serializer
+// correctly emits a `<!-- -->` separator between them (that separator is right
+// for two genuinely-separate lists; the bug is that the extra sibling was ever
+// created). Coalescing is STRICTLY LOCAL to the two seams of the active
+// insertion — never a global "collapse all adjacent lists" normalization, which
+// would destroy intentionally-separate lists elsewhere.
+// ===========================================================================
+
+/**
+ * The three list container types we structurally coalesce at an insertion seam.
+ * Deliberately an explicit set, NOT a `type.endsWith("List")` test — that also
+ * matches `footnotesList`, which must NEVER be structurally merged.
+ */
+function isCoalescibleList(n: any): boolean {
+  return (
+    isObject(n) &&
+    (n.type === "bulletList" ||
+      n.type === "orderedList" ||
+      n.type === "taskList")
+  );
+}
+
+/**
+ * True when two adjacent list nodes may have their ITEMS merged into one list.
+ * Requires identical node type and, for orderedList, a compatible numbering
+ * style: a missing/null `attrs.type` counts as the default, and the merge is
+ * blocked ONLY when both lists carry an explicit, differing `attrs.type`.
+ */
+function listsMergeable(a: any, b: any): boolean {
+  if (!isCoalescibleList(a) || !isCoalescibleList(b)) return false;
+  if (a.type !== b.type) return false;
+  if (!Array.isArray(a.content) || !Array.isArray(b.content)) return false;
+  if (a.type === "orderedList") {
+    const ta = a.attrs?.type ?? null;
+    const tb = b.attrs?.type ?? null;
+    if (ta != null && tb != null && ta !== tb) return false;
+  }
+  return true;
+}
+
+/**
+ * Coalesce list seams around a freshly inserted run occupying indices `[i, j)`
+ * in `parent`. At MOST the left seam (`parent[i-1]` ↔ `parent[i]`) and the right
+ * seam (`parent[j-1]` ↔ `parent[j]`) are merged, each AT MOST ONCE — never a
+ * `while (neighbours same type) merge` loop, which would swallow a further-out
+ * intentionally-separate list. Mutates `parent` in place.
+ *
+ * Survivor choice is POSITIONAL, never by id: the neighbour OUTSIDE the `[i, j)`
+ * range is pre-existing (the survivor, keeping its block id and list-level
+ * attrs); the boundary block INSIDE the range is the freshly inserted list,
+ * whose items move into the survivor and whose wrapper is then deleted
+ * (appended when the survivor is on the left, prepended when on the right).
+ *
+ * Empty inserted list: if the inserted boundary list has zero items, its seam is
+ * NOT coalesced — the block is left exactly as inserted.
+ */
+function coalesceSeams(parent: any[], i: number, j: number): void {
+  if (!Array.isArray(parent)) return;
+  const n = parent.length;
+
+  const left = parent[i - 1];
+  const boundaryLeft = parent[i];
+  const boundaryRight = parent[j - 1];
+  const right = parent[j];
+
+  // A seam fires only when the pre-existing neighbour and the inserted boundary
+  // list are mergeable AND the inserted boundary list is non-empty.
+  const singleBlock = i === j - 1;
+  const leftMergeable =
+    i - 1 >= 0 &&
+    listsMergeable(left, boundaryLeft) &&
+    boundaryLeft.content.length > 0;
+  let rightMergeable =
+    j < n &&
+    listsMergeable(boundaryRight, right) &&
+    boundaryRight.content.length > 0;
+
+  // Three-way collision: a SINGLE inserted list (singleBlock) landed exactly
+  // between two pre-existing lists. The LEFT pre-existing list wins: the
+  // inserted items then the right list's items fold into it, and both the
+  // inserted wrapper and the right pre-existing list are deleted (the right
+  // block id is NOT preserved — rare, documented).
+  //
+  // The `listsMergeable(left, right)` guard is REQUIRED: leftMergeable and
+  // rightMergeable only check each PRE-EXISTING list against the inserted one.
+  // A default-typed inserted orderedList is compatible with BOTH neighbours
+  // even when the neighbours carry explicit DIFFERENT numbering styles, so
+  // without this guard the two would collapse transitively through the middle
+  // and the right list's style would be silently lost. When it fails we fall
+  // through to the single-seam path below (never a transitive merge).
+  if (singleBlock && leftMergeable && rightMergeable && listsMergeable(left, right)) {
+    left.content.push(...boundaryLeft.content, ...right.content);
+    parent.splice(i, 2);
+    return;
+  }
+
+  // A single inserted block can be absorbed by at most ONE neighbour. When both
+  // seams are individually valid but the neighbours are mutually incompatible
+  // (the three-way guard above failed), prefer the LEFT seam — consistent with
+  // the three-way survivor choice — and drop the right so the incompatible
+  // right list stays separate with its own style.
+  if (singleBlock && leftMergeable && rightMergeable) {
+    rightMergeable = false;
+  }
+
+  // Otherwise the two seams are independent. Process the RIGHT seam FIRST so its
+  // deletion at the higher indices cannot shift the left seam's [i-1, i].
+  if (rightMergeable) {
+    // Survivor is the pre-existing right neighbour; PREPEND the inserted items.
+    right.content.unshift(...boundaryRight.content);
+    parent.splice(j - 1, 1);
+  }
+  if (leftMergeable) {
+    // Survivor is the pre-existing left neighbour; APPEND the inserted items.
+    left.content.push(...boundaryLeft.content);
+    parent.splice(i, 1);
+  }
+}
+
 /** Options controlling where `insertNodeRelative` places the new node. */
 export interface InsertOptions {
   position: "before" | "after" | "append";
@@ -685,7 +809,10 @@ export function insertNodeRelative(
     }
     if (isObject(out)) {
       if (!Array.isArray(out.content)) out.content = [];
+      const at = out.content.length;
       out.content.push(fresh);
+      // Coalesce the left seam with the prior tail block (#535).
+      coalesceSeams(out.content, at, out.content.length);
       return { doc: out, inserted: true };
     }
     return { doc: out, inserted: false };
@@ -737,40 +864,19 @@ export function insertNodeRelative(
     return { doc: out, inserted: true };
   }
 
-  // Resolve by id anywhere in the tree: splice into the parent content array.
-  if (opts.anchorNodeId != null) {
-    let inserted = false;
-    const walkContent = (content: any[]): void => {
-      for (let i = 0; i < content.length; i++) {
-        const child = content[i];
-        if (matchesId(child, opts.anchorNodeId as string)) {
-          content.splice(i + offset, 0, fresh);
-          inserted = true;
-          return;
-        }
-        if (isObject(child) && Array.isArray(child.content)) {
-          walkContent(child.content);
-          if (inserted) return;
-        }
-      }
-    };
-    if (isObject(out) && Array.isArray(out.content)) {
-      walkContent(out.content);
-    }
-    return { doc: out, inserted };
-  }
-
-  // Resolve by text: only top-level doc.content blocks are scanned. Exact
-  // match wins; a markdown-stripped fallback is tried only on a miss.
-  if (opts.anchorText != null && isObject(out) && Array.isArray(out.content)) {
-    const i = findAnchorTextIndex(out.content, opts.anchorText);
-    if (i !== -1) {
-      out.content.splice(i + offset, 0, fresh);
-      return { doc: out, inserted: true };
-    }
-  }
-
-  return { doc: out, inserted: false };
+  // before/after (non-structural): resolve the anchor's ancestor chain and
+  // splice into the anchor's IMMEDIATE parent, so seam coalescing runs against
+  // the ACTUAL parent array (also correctly handling a list nested in a callout
+  // / table cell). The first-match / top-level-only semantics of anchorNodeId /
+  // anchorText are preserved by findAnchorChain (identical to the old walk).
+  const chain = findAnchorChain(out, opts);
+  if (chain == null || chain.length < 2) return { doc: out, inserted: false };
+  const parent = chain[chain.length - 2].node.content;
+  if (!Array.isArray(parent)) return { doc: out, inserted: false };
+  const at = chain[chain.length - 1].index + offset;
+  parent.splice(at, 0, fresh);
+  coalesceSeams(parent, at, at + 1);
+  return { doc: out, inserted: true };
 }
 
 /**
@@ -811,7 +917,11 @@ export function insertNodesRelative(
   if (opts.position === "append") {
     if (isObject(out)) {
       if (!Array.isArray(out.content)) out.content = [];
+      const at = out.content.length;
       out.content.push(...fresh);
+      // Coalesce the left seam with the prior tail block; the run's right side
+      // has no neighbour at the top level (#535).
+      coalesceSeams(out.content, at, out.content.length);
       return { doc: out, inserted: true };
     }
     return { doc: out, inserted: false };
@@ -819,40 +929,19 @@ export function insertNodesRelative(
 
   const offset = opts.position === "after" ? 1 : 0;
 
-  // Resolve by id anywhere in the tree: splice the whole array into the parent.
-  if (opts.anchorNodeId != null) {
-    let inserted = false;
-    const walkContent = (content: any[]): void => {
-      for (let i = 0; i < content.length; i++) {
-        const child = content[i];
-        if (matchesId(child, opts.anchorNodeId as string)) {
-          content.splice(i + offset, 0, ...fresh);
-          inserted = true;
-          return;
-        }
-        if (isObject(child) && Array.isArray(child.content)) {
-          walkContent(child.content);
-          if (inserted) return;
-        }
-      }
-    };
-    if (isObject(out) && Array.isArray(out.content)) {
-      walkContent(out.content);
-    }
-    return { doc: out, inserted };
-  }
-
-  // Resolve by text: only top-level doc.content blocks are scanned. Exact match
-  // wins; a markdown-stripped fallback is tried only on a miss.
-  if (opts.anchorText != null && isObject(out) && Array.isArray(out.content)) {
-    const i = findAnchorTextIndex(out.content, opts.anchorText);
-    if (i !== -1) {
-      out.content.splice(i + offset, 0, ...fresh);
-      return { doc: out, inserted: true };
-    }
-  }
-
-  return { doc: out, inserted: false };
+  // before/after: resolve the anchor's ancestor chain and splice the whole run
+  // into the anchor's IMMEDIATE parent, then coalesce ONLY the run's two
+  // boundary seams (inner blocks are untouched). Converting to findAnchorChain
+  // makes coalescing run against the ACTUAL parent array (incl. lists nested in
+  // callouts / table cells); first-match / top-level-only semantics preserved.
+  const chain = findAnchorChain(out, opts);
+  if (chain == null || chain.length < 2) return { doc: out, inserted: false };
+  const parent = chain[chain.length - 2].node.content;
+  if (!Array.isArray(parent)) return { doc: out, inserted: false };
+  const at = chain[chain.length - 1].index + offset;
+  parent.splice(at, 0, ...fresh);
+  coalesceSeams(parent, at, at + fresh.length);
+  return { doc: out, inserted: true };
 }
 
 // ===========================================================================
