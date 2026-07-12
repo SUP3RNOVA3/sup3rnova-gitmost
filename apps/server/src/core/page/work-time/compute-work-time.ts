@@ -167,8 +167,10 @@ function unionDuration(intervals: Array<[number, number]>): number {
  * over all segments (threshold depends on the pair: both-agent → agentTGap, else
  * tGap; the last session is ALWAYS closed after the loop) → class per finished
  * session (all-agent → agent_only, else work) → pad each session (multi-sample
- * → [first−P_in, last+P_out]; lone scalar → [t−P_single, t]) → metrics are the
- * union wall-clock within each class (union, not Σ, so overlaps never double).
+ * → [first−P_in, last+P_out]; lone scalar → [t−P_single, t]) → clip padding of
+ * adjacent DIFFERENT-class sessions at the raw-gap midpoint (so work/agent_only
+ * never overlap) → metrics are the union wall-clock within each class (union, not
+ * Σ, so overlaps never double, and cross-class-disjoint by the clip above).
  */
 export function computeWorkTime(
   rows: TimelineSample[],
@@ -196,29 +198,70 @@ export function computeWorkTime(
   }
   if (cur != null) rawSessions.push(cur); // MUST close the last session (§5, §9#1)
 
-  const sessions: WorkSession[] = [];
-  const workIvs: Array<[number, number]> = [];
-  const agentIvs: Array<[number, number]> = [];
+  // A finished session with BOTH its raw (unpadded) span and its padded bounds.
+  // `rawSessions` are already in ascending time order, so `built` is too.
+  interface BuiltSession {
+    rawStart: number;
+    rawEnd: number;
+    padStart: number;
+    padEnd: number;
+    cls: WorkSession['class'];
+  }
+  const built: BuiltSession[] = [];
 
   for (const segs of rawSessions) {
     const first = segs[0];
     const last = segs[segs.length - 1];
     const cls = segs.every((s) => s.isAgent) ? 'agent_only' : 'work';
 
-    let start: number;
-    let end: number;
+    let padStart: number;
+    let padEnd: number;
     if (segs.length === 1 && first.tStart === first.tEnd) {
       // Lone single-instant session (one scalar, or a one-snapshot agent run):
       // pre-roll only, no invented "future" work (§5).
-      start = first.tStart - cfg.pSingle;
-      end = first.tStart;
+      padStart = first.tStart - cfg.pSingle;
+      padEnd = first.tStart;
     } else {
-      start = first.tStart - cfg.pIn;
-      end = last.tEnd + cfg.pOut;
+      padStart = first.tStart - cfg.pIn;
+      padEnd = last.tEnd + cfg.pOut;
     }
 
-    sessions.push({ start, end, class: cls });
-    (cls === 'work' ? workIvs : agentIvs).push([start, end]);
+    built.push({
+      rawStart: first.tStart,
+      rawEnd: last.tEnd,
+      padStart,
+      padEnd,
+      cls,
+    });
+  }
+
+  // Clip cross-class padding so a `work` and an `agent_only` session that abut
+  // never claim the same wall-clock. For each ADJACENT pair of DIFFERENT classes,
+  // cap the earlier session's trailing pad and the later session's leading pad at
+  // the MIDPOINT of the raw (unpadded) inactivity gap between them: the earlier
+  // padded interval then ends ≤ midpoint and the later one starts ≥ midpoint, so
+  // the two are disjoint (they touch at most at the midpoint). This makes the
+  // per-class unions (workMs / agentOnlyMs) cross-class-disjoint BY CONSTRUCTION
+  // — closing the double-count where a work session ending in an agent segment
+  // and a nearby agent_only session (gap in (agentTGap, pIn+pOut]) overlapped and
+  // were counted into both metrics (§5, §9). Within-class adjacency is left
+  // untouched: `unionDuration` already dedups it, and clipping there could perturb
+  // the per-class metric value.
+  for (let i = 1; i < built.length; i++) {
+    const a = built[i - 1];
+    const b = built[i];
+    if (a.cls === b.cls) continue;
+    const midpoint = (a.rawEnd + b.rawStart) / 2;
+    if (a.padEnd > midpoint) a.padEnd = midpoint;
+    if (b.padStart < midpoint) b.padStart = midpoint;
+  }
+
+  const sessions: WorkSession[] = [];
+  const workIvs: Array<[number, number]> = [];
+  const agentIvs: Array<[number, number]> = [];
+  for (const s of built) {
+    sessions.push({ start: s.padStart, end: s.padEnd, class: s.cls });
+    (s.cls === 'work' ? workIvs : agentIvs).push([s.padStart, s.padEnd]);
   }
 
   sessions.sort((a, b) => a.start - b.start);

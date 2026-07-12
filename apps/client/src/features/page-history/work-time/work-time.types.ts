@@ -3,12 +3,6 @@
 
 export type WorkSessionClass = "work" | "agent_only";
 
-export interface IWorkSession {
-  start: number;
-  end: number;
-  class: WorkSessionClass;
-}
-
 export interface IDayWindow {
   start: number;
   end: number;
@@ -37,7 +31,6 @@ export interface IWorkTimeConfig {
 export interface IPageWorkTime {
   workMs: number;
   agentOnlyMs: number;
-  sessions: IWorkSession[];
   perDay: IPerDay[];
   config: IWorkTimeConfig;
   tz: string;

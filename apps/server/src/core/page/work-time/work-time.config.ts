@@ -52,10 +52,20 @@ void IDLE_MAX_WAIT_USER;
 void IDLE_MAX_WAIT_AGENT;
 
 /**
- * Fill a partial config with defaults and validate it. `tGap ≥ pIn + pOut` is
- * NOT required for the §6.3 per-day invariant (union takes care of that), but is
- * RECOMMENDED and enforced: otherwise the P-padding of adjacent sessions of
- * DIFFERENT classes could overlap and be counted into both metrics (§5, §10).
+ * Fill a partial config with defaults and validate it. Cross-class metric
+ * disjointness is guaranteed jointly by `computeWorkTime`'s adjacent-pair padding
+ * clip (it caps the padding of adjacent DIFFERENT-class sessions at the raw-gap
+ * midpoint) AND the two bounds enforced below (§5):
+ *   - `tGap ≥ pIn + pOut`: a session's own padding never exceeds its inactivity
+ *     window.
+ *   - `2·agentTGap ≥ pIn + pOut`: makes the adjacent-only clip provably COMPLETE.
+ *     A NON-adjacent (i, i+2) cross-class overlap could only arise from two
+ *     same-class sessions separated by a full intervening session of the other
+ *     class; that separation spans at least two inter-session gaps, each strictly
+ *     `> agentTGap`, so it is `> 2·agentTGap`. Requiring `2·agentTGap ≥ pIn + pOut`
+ *     means even the widest padded reach (pIn + pOut) cannot bridge it — so the
+ *     only cross-class overlaps possible are between ADJACENT sessions, which the
+ *     clip handles. `workMs`/`agentOnlyMs` are therefore disjoint by construction.
  */
 export function resolveWorkTimeConfig(
   partial?: Partial<WorkTimeConfig>,
@@ -80,7 +90,12 @@ export function resolveWorkTimeConfig(
   }
   if (config.tGap < config.pIn + config.pOut) {
     throw new Error(
-      'work-time config: tGap must be ≥ pIn + pOut so work/agent_only metrics cannot overlap',
+      "work-time config: tGap must be ≥ pIn + pOut (a session's padding may not exceed its inactivity window)",
+    );
+  }
+  if (2 * config.agentTGap < config.pIn + config.pOut) {
+    throw new Error(
+      'work-time config: 2·agentTGap must be ≥ pIn + pOut (so non-adjacent cross-class padding cannot overlap)',
     );
   }
   return config;

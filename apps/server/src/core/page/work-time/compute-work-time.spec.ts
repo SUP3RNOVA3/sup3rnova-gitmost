@@ -1,7 +1,32 @@
 import { computeWorkTime } from './compute-work-time';
-import { TimelineSample } from './work-time.types';
+import { bucketByDay } from './bucket-by-day';
+import { TimelineSample, WorkSession } from './work-time.types';
 
 const MIN = 60 * 1000;
+
+/** Union wall-clock of a set of intervals (touching intervals merge). */
+function unionMs(intervals: Array<[number, number]>): number {
+  if (intervals.length === 0) return 0;
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let [cs, ce] = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    const [s, e] = sorted[i];
+    if (s <= ce) {
+      if (e > ce) ce = e;
+    } else {
+      total += ce - cs;
+      cs = s;
+      ce = e;
+    }
+  }
+  return total + (ce - cs);
+}
+
+const ivsOf = (sessions: WorkSession[], cls?: string): Array<[number, number]> =>
+  sessions
+    .filter((x) => cls == null || x.class === cls)
+    .map((x) => [x.start, x.end] as [number, number]);
 
 function s(
   iso: string,
@@ -215,5 +240,119 @@ describe('computeWorkTime', () => {
         pOut: 5 * MIN,
       }),
     ).toThrow(/tGap/);
+  });
+
+  it('rejects an invalid config (2·agentTGap < pIn + pOut)', () => {
+    // tGap (default 15m) still ≥ pIn+pOut, so only the 2·agentTGap guard trips.
+    // Without it a short session of one class between two of the other could
+    // produce a NON-adjacent cross-class overlap the adjacent-only clip misses.
+    expect(() =>
+      computeWorkTime([s('2026-07-04T10:00:00')], {
+        agentTGap: 2 * MIN,
+        pIn: 5 * MIN,
+        pOut: 5 * MIN,
+      }),
+    ).toThrow(/agentTGap/);
+  });
+
+  // F1 — cross-class double-count. On the DEFAULT config agentTGap (7m) < pIn+pOut
+  // (10m), so a `work` session ending in an agent segment and a nearby separate
+  // `agent_only` run (gap in (7m,10m]) used to produce OVERLAPPING padded
+  // intervals — the same wall-clock counted into BOTH workMs and agentOnlyMs. The
+  // cross-class padding clip must make the two per-class unions disjoint.
+  it('does NOT double-count wall-clock across work/agent_only (§F1)', () => {
+    // user@0s ; agent(chatX)@60s (breaks into a work session with the human) ;
+    // agent(chatY)@560s,590s (a separate agent_only run). Raw gap between the work
+    // session (ends 60s) and the agent run (starts 560s) is 500s ∈ (agentTGap,
+    // pIn+pOut] once padded — the classic overlap window.
+    const rows: TimelineSample[] = [
+      s('2026-07-04T00:00:00'), // user @ 0s
+      s('2026-07-04T00:01:00', { source: 'agent', chat: 'cX', kind: 'agent' }), // @ 60s
+      s('2026-07-04T00:09:20', { source: 'agent', chat: 'cY', kind: 'agent' }), // @ 560s
+      s('2026-07-04T00:09:50', { source: 'agent', chat: 'cY', kind: 'agent' }), // @ 590s
+    ];
+    const r = computeWorkTime(rows); // DEFAULT config
+
+    // Both classes present.
+    expect(r.workMs).toBeGreaterThan(0);
+    expect(r.agentOnlyMs).toBeGreaterThan(0);
+
+    // Per-class metrics are exactly their own union (union, not Σ).
+    expect(r.workMs).toBe(unionMs(ivsOf(r.sessions, 'work')));
+    expect(r.agentOnlyMs).toBe(unionMs(ivsOf(r.sessions, 'agent_only')));
+
+    // The F1 invariant: work-union and agent-union are cross-class-disjoint, so
+    // the union of ALL padded intervals equals workMs + agentOnlyMs (no overlap).
+    // With the clip disabled this fails (union < sum by the 100s overlap).
+    expect(unionMs(ivsOf(r.sessions))).toBe(r.workMs + r.agentOnlyMs);
+  });
+
+  // F1 property/fuzz — random timelines across several timezones must uphold the
+  // work-time invariants. Backs the (corrected) PR claim of a real fuzz test.
+  it('property: random timelines uphold union & cross-class-disjoint invariants', () => {
+    // Deterministic LCG (numerical-recipes constants) so a failure is reproducible.
+    let seed = 0x9e3779b9 >>> 0;
+    const rand = () => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 0x100000000;
+    };
+    const pick = <T>(arr: T[]): T => arr[Math.floor(rand() * arr.length)];
+
+    const tzs = [
+      'UTC',
+      'America/New_York',
+      'Europe/Moscow',
+      'Australia/Lord_Howe', // 30-min DST offset — a nasty bucket stress
+    ];
+    const base = Date.UTC(2026, 5, 1, 0, 0, 0); // 2026-06-01Z
+    const chats = ['c1', 'c2', 'c3'];
+
+    for (let iter = 0; iter < 250; iter++) {
+      const tz = pick(tzs);
+      const n = 2 + Math.floor(rand() * 18); // 2..19 rows
+      const rows: TimelineSample[] = [];
+      // Walk time forward by a random inter-sample gap. The gap distribution is
+      // centred on the DANGEROUS band — a bit under to a bit over pIn+pOut (10m)
+      // AND straddling agentTGap (7m) — so adjacent samples routinely split into
+      // separate sessions whose ±P padding would overlap if a class boundary sits
+      // there. Mixing user/agent classes at these gaps reliably manufactures the
+      // work-ending-in-agent → agent_only cross-class boundary F1 is about, plus
+      // dense within-class runs (occasional 0–2m gaps) that exercise the union.
+      let t = base + Math.floor(rand() * 60 * MIN);
+      for (let i = 0; i < n; i++) {
+        const roll = rand();
+        const gap =
+          roll < 0.25
+            ? Math.floor(rand() * 2 * MIN) // dense burst (same-class union)
+            : roll < 0.85
+              ? 5 * MIN + Math.floor(rand() * 8 * MIN) // 5–13m: the split band
+              : 20 * MIN + Math.floor(rand() * 40 * MIN); // long idle → new day-ish
+        t += gap;
+        const iso = new Date(t).toISOString().slice(0, 19); // 'YYYY-MM-DDTHH:MM:SS'
+        const isAgent = rand() < 0.5;
+        rows.push(
+          isAgent
+            ? s(iso, { source: 'agent', chat: pick(chats), kind: 'agent' })
+            : s(iso, { source: 'user', kind: rand() < 0.3 ? 'idle' : 'manual' }),
+        );
+      }
+
+      const r = computeWorkTime(rows); // DEFAULT config
+
+      const workIvs = ivsOf(r.sessions, 'work');
+      const agentIvs = ivsOf(r.sessions, 'agent_only');
+
+      // (1) each metric is exactly its per-class union (catches a union→Σ regress).
+      expect(r.workMs).toBe(unionMs(workIvs));
+      expect(r.agentOnlyMs).toBe(unionMs(agentIvs));
+
+      // (2) NO cross-class overlap: union(all) == workMs + agentOnlyMs (F1).
+      expect(unionMs(ivsOf(r.sessions))).toBe(r.workMs + r.agentOnlyMs);
+
+      // (3) bucket invariant: Σ per-day activeMs == workMs (§6.3).
+      const perDay = bucketByDay(r.sessions, tz);
+      const sumActive = perDay.reduce((a, d) => a + d.activeMs, 0);
+      expect(sumActive).toBe(r.workMs);
+    }
   });
 });

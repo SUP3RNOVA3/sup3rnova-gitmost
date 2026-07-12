@@ -14,17 +14,23 @@ interface Props {
  * #395 — the clickable "time worked on this article" headline (§6.1). Renders
  * the `work` estimate with a "≈" sign and the inactivity threshold in a tooltip
  * (it is an estimate, not a stopwatch). Clicking opens the daily punch-card
- * (§6.2). Renders nothing until there is a non-zero estimate, so a brand-new /
- * never-edited page shows no widget.
+ * (§6.2). Renders nothing until there is a non-zero human OR agent estimate, so a
+ * brand-new / never-edited page shows no widget. For an agent-only-edited page
+ * (workMs===0, agentOnlyMs>0) the headline shows the agent estimate (labelled
+ * `agent:`, matching the punch-card) so the punch-card stays reachable (#395:
+ * "how much a HUMAN and separately the AGENT").
  */
 export default function WorkTimeStat({ pageId }: Props) {
   const { t } = useTranslation();
   const [opened, { open, close }] = useDisclosure(false);
   const { data } = usePageWorkTime(pageId);
 
-  if (!data || data.workMs <= 0) return null;
+  if (!data || (data.workMs <= 0 && data.agentOnlyMs <= 0)) return null;
 
-  const label = formatHeadline(data.workMs, t);
+  const agentOnly = data.workMs <= 0;
+  const label = agentOnly
+    ? t("agent: {{value}}", { value: formatHeadline(data.agentOnlyMs, t) })
+    : formatHeadline(data.workMs, t);
   const gapMin = formatGapMinutes(data.config.tGap);
 
   return (

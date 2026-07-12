@@ -9,13 +9,11 @@ import {
   DEFAULT_WORK_TIME_CONFIG,
   WorkTimeConfig,
   PerDay,
-  WorkSession,
 } from '../work-time';
 
 export interface PageWorkTime {
   workMs: number;
   agentOnlyMs: number;
-  sessions: WorkSession[];
   perDay: PerDay[];
   /** the config actually used, so the UI can show "≈" + the T_gap threshold. */
   config: WorkTimeConfig;
@@ -60,11 +58,12 @@ export class PageHistoryService {
     const rows = await this.pageHistoryRepo.findTimelineByPageId(pageId);
     const result = computeWorkTime(rows, config);
     const usedConfig: WorkTimeConfig = { ...DEFAULT_WORK_TIME_CONFIG, ...config };
+    // `bucketByDay` consumes the pure core's un-bucketed sessions here; the
+    // full session list is NOT shipped on the response (no client reads it).
     const perDay = bucketByDay(result.sessions, tz);
     return {
       workMs: result.workMs,
       agentOnlyMs: result.agentOnlyMs,
-      sessions: result.sessions,
       perDay,
       config: usedConfig,
       tz,

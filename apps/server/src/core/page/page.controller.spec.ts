@@ -1,4 +1,8 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { PageController } from './page.controller';
 
 // Direct instantiation with stub deps. The Test.createTestingModule form failed
@@ -72,6 +76,23 @@ describe('PageController', () => {
       expect(validate).toHaveBeenCalledWith({ id: 'pg' }, user);
       expect(compute).toHaveBeenCalledWith('pg', 'Europe/Moscow');
       expect(out).toEqual({ workMs: 42 });
+    });
+
+    it('propagates a denied view gate and does NOT reach compute (security)', async () => {
+      // If validateCanView is moved AFTER computeWorkTime, the timeline of a page
+      // the caller may not see would be read/estimated before the gate — this
+      // locks the order: a rejecting gate must short-circuit before any compute.
+      const validate = jest.fn().mockRejectedValue(new ForbiddenException());
+      const compute = jest.fn().mockResolvedValue({ workMs: 1 });
+      const { c, pageHistoryService } = build({
+        page: { id: 'pg' },
+        validate,
+        compute,
+      });
+      await expect(
+        c.getPageWorkTime({ pageId: 'pg' } as any, user),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(pageHistoryService.computeWorkTime).not.toHaveBeenCalled();
     });
 
     it('maps an unknown-timezone RangeError to a 400', async () => {
