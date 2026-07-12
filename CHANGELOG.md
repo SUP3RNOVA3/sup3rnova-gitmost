@@ -129,6 +129,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A drifted comment suggestion can be re-synced instead of failing forever
+  with a 409.** A suggestion whose stored anchor no longer matched the live
+  document used to reject every apply attempt with an unrecoverable conflict; a
+  new resync path re-reads the live anchor so the suggestion applies against the
+  current text, and orphaned anchors (whose marked run was deleted) are
+  reconciled rather than left blocking. (#496)
 - **Save intentional page versions.** Press `Cmd/Ctrl+S` (or use the page menu)
   to save a named version of a page. The history panel now distinguishes
   intentional versions (a "Saved" / "Agent version" badge) from automatic
@@ -360,7 +366,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body-timeout so a legitimate >1-min idle between the model's tool calls no
   longer breaks a long-lived SSE socket (new `AI_MCP_SSE_BODY_TIMEOUT_MS`, default
   10 min; see `.env.example`). (#489)
-
+- **Decisions on comment suggestions now leave a durable audit record.**
+  Applying or dismissing a comment suggestion hard-deletes the (childless)
+  subject comment, so the only surviving trace of who decided what is the audit
+  event — but the audit trail was wired to a Noop service that silently
+  swallowed every event. The trail is now DB-backed, so
+  `comment.suggestion_applied` / `comment.suggestion_dismissed` (and the other
+  comment-decision events) persist to the `audit` table and can be reviewed
+  after the comment is gone. A persistence failure is still swallowed with a
+  warning so it never breaks the originating request. (#496)
+- **Applying a comment suggestion no longer strips the replaced run's inline
+  formatting.** The suggested text was re-inserted carrying only the comment
+  anchor mark, silently dropping bold/italic/code/link on the affected run; the
+  prevailing formatting of the replaced run is now carried onto the applied
+  text. (#496)
 - **The server no longer runs out of heap during long autonomous agent runs.** A
   new pnpm patch on `ai@6.0.134` stops the SDK from building a cumulative
   snapshot of the ENTIRE turn text on every streamed text-delta when no output
