@@ -6,6 +6,9 @@ export interface IShare {
   pageId: string;
   includeSubPages: boolean;
   searchIndexing: boolean;
+  // #370 Stage B — 'live' serves the current draft; 'approved' serves the last
+  // manually-saved version. Mutually exclusive with includeSubPages.
+  publishedMode: "live" | "approved";
   creatorId: string;
   spaceId: string;
   workspaceId: string;
@@ -75,6 +78,7 @@ export interface ICreateShare {
   pageId?: string;
   includeSubPages?: boolean;
   searchIndexing?: boolean;
+  publishedMode?: "live" | "approved";
 }
 
 export type IUpdateShare = ICreateShare & { shareId: string; pageId?: string };

@@ -219,6 +219,36 @@ export class PageHistoryRepo {
       .executeTakeFirst();
   }
 
+  /**
+   * #370 Stage B — resolve the latest snapshot of a page at a given
+   * intentionality tier. Used by the "approved" share mode to serve the last
+   * manually-saved version (`kind='manual'`) to public readers instead of the
+   * live draft. Modeled on `findPageLastHistory` with an added `kind` filter and
+   * the same deterministic `(createdAt desc, id desc)` tie-break, so two rows
+   * sharing a createdAt still resolve to a single stable "latest".
+   */
+  async findLatestByPageIdAndKind(
+    pageId: string,
+    kind: PageHistoryKind,
+    opts?: {
+      includeContent?: boolean;
+      trx?: KyselyTransaction;
+    },
+  ) {
+    const db = dbOrTx(this.db, opts?.trx);
+
+    return await db
+      .selectFrom('pageHistory')
+      .select(this.baseFields)
+      .$if(opts?.includeContent, (qb) => qb.select('content'))
+      .where('pageId', '=', pageId)
+      .where('kind', '=', kind)
+      .limit(1)
+      .orderBy('createdAt', 'desc')
+      .orderBy('id', 'desc')
+      .executeTakeFirst();
+  }
+
   withLastUpdatedBy(eb: ExpressionBuilder<DB, 'pageHistory'>) {
     return jsonObjectFrom(
       eb
