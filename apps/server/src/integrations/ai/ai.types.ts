@@ -105,6 +105,10 @@ export interface ResolvedAiConfig extends Partial<AiProviderSettings> {
   // Max context window in tokens; surfaced to the chat header badge as the
   // "current / max" denominator. 0/unset = no limit.
   chatContextWindow?: number;
+  // RAW stored context window (::text), BEFORE parsePositiveInt collapses `0` and
+  // unset to `undefined`. The #490 replay budgeter needs the raw value to honor an
+  // explicit `0` off-switch distinctly from "unset -> flat default".
+  chatContextWindowRaw?: string | number;
   // Cheap model id for the public-share assistant; reuses the chat creds.
   publicShareChatModel?: string;
   // Agent-role id whose persona the public-share assistant adopts (empty/unset

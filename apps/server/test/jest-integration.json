@@ -22,6 +22,7 @@
     "^@docmost/db/(.*)$": "<rootDir>/src/database/$1",
     "^@docmost/transactional/(.*)$": "<rootDir>/src/integrations/transactional/$1",
     "^@docmost/ee/(.*)$": "<rootDir>/src/ee/$1",
+    "^@docmost/token-estimate$": "<rootDir>/../../packages/token-estimate/src/index.ts",
     "^src/(.*)$": "<rootDir>/src/$1"
   }
 }

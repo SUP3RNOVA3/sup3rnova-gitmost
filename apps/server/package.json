@@ -23,7 +23,7 @@
     "migration:reset": "tsx src/database/migrate.ts down-to NO_MIGRATIONS",
     "migration:codegen": "kysely-codegen --dialect=postgres --camel-case --env-file=../../.env --out-file=./src/database/types/db.d.ts",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
-    "pretest": "pnpm --filter @docmost/editor-ext build && pnpm --filter @docmost/prosemirror-markdown build",
+    "pretest": "pnpm --filter @docmost/editor-ext build && pnpm --filter @docmost/prosemirror-markdown build && pnpm --filter @docmost/token-estimate build",
     "test": "jest",
     "test:int": "jest --config test/jest-integration.json",
     "test:watch": "jest --watch",
@@ -44,6 +44,7 @@
     "@docmost/mcp": "workspace:*",
     "@docmost/pdf-inspector": "1.9.6",
     "@docmost/prosemirror-markdown": "workspace:*",
+    "@docmost/token-estimate": "workspace:*",
     "@fastify/compress": "^9.0.0",
     "@fastify/cookie": "^11.0.2",
     "@fastify/multipart": "^10.0.0",
@@ -206,6 +207,7 @@
       "^@docmost/db/(.*)$": "<rootDir>/database/$1",
       "^@docmost/transactional/(.*)$": "<rootDir>/integrations/transactional/$1",
       "^@docmost/ee/(.*)$": "<rootDir>/ee/$1",
+      "^@docmost/token-estimate$": "<rootDir>/../../../packages/token-estimate/src/index.ts",
       "^src/(.*)$": "<rootDir>/$1",
       "^@tiptap/react$": "<rootDir>/../test/stubs/tiptap-react.js"
     }
