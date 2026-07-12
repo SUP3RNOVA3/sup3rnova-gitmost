@@ -53,6 +53,22 @@ export function buildChildrenByParent(
   return m;
 }
 
+// Sort the Resolved tab by resolve time, newest first, on a COPY (never mutate
+// the react-query cache array). `resolvedAt` is typed `Date` but at runtime it
+// is an ISO STRING (from the axios-JSON onSuccess and the WS subscription) — a
+// real Date only during the optimistic onMutate window — so it MUST be coerced
+// with `new Date(...)` before `.getTime()`, or a raw `.getTime()` on the string
+// throws / yields NaN. ES2019's stable sort preserves order for equal
+// timestamps. Callers pass a list already filtered to a truthy `resolvedAt`, so
+// the non-null assertion is safe.
+// Exported for unit testing.
+export function sortResolvedByResolvedAt(resolved: IComment[]): IComment[] {
+  return [...resolved].sort(
+    (a, b) =>
+      new Date(b.resolvedAt!).getTime() - new Date(a.resolvedAt!).getTime(),
+  );
+}
+
 function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   const { t } = useTranslation();
   const { pageSlug } = useParams();
@@ -91,7 +107,10 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
       (comment: IComment) => comment.resolvedAt,
     );
 
-    return { activeComments: active, resolvedComments: resolved };
+    return {
+      activeComments: active,
+      resolvedComments: sortResolvedByResolvedAt(resolved),
+    };
   }, [comments]);
 
   // Index replies by their parent once, instead of an O(n^2) filter per thread.

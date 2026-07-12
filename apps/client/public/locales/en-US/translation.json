@@ -239,6 +239,8 @@
   "Comment re-opened successfully": "Comment re-opened successfully",
   "Comment unresolved successfully": "Comment unresolved successfully",
   "Failed to resolve comment": "Failed to resolve comment",
+  "Failed to re-open comment": "Failed to re-open comment",
+  "Comment no longer exists": "Comment no longer exists",
   "Resolve comment": "Resolve comment",
   "Unresolve comment": "Unresolve comment",
   "Resolve Comment Thread": "Resolve Comment Thread",

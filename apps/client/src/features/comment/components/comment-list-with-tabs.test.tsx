@@ -27,10 +27,14 @@ vi.mock("@/features/space/queries/space-query.ts", () => ({
 import {
   buildChildrenByParent,
   CommentEditorWithActions,
+  sortResolvedByResolvedAt,
 } from "./comment-list-with-tabs";
 
 const c = (id: string, parentCommentId: string | null = null): IComment =>
   ({ id, parentCommentId }) as IComment;
+
+const resolvedAtComment = (id: string, resolvedAt: unknown): IComment =>
+  ({ id, resolvedAt }) as unknown as IComment;
 
 describe("buildChildrenByParent (childrenByParent grouping)", () => {
   it("returns an empty map for undefined or empty input", () => {
@@ -68,6 +72,48 @@ describe("buildChildrenByParent (childrenByParent grouping)", () => {
       c("d", "p1"),
     ]);
     expect(map.get("p1")?.map((x) => x.id)).toEqual(["a", "b", "d"]);
+  });
+});
+
+describe("sortResolvedByResolvedAt (Resolved tab order, #542)", () => {
+  it("orders by resolvedAt DESC — newest resolve first — with ISO-STRING values", () => {
+    // At runtime resolvedAt is an ISO string (axios JSON / WS subscription), so
+    // the sort must coerce with new Date(...) before .getTime().
+    const older = resolvedAtComment("older", "2026-07-10T10:00:00.000Z");
+    const newest = resolvedAtComment("newest", "2026-07-12T10:00:00.000Z");
+    const middle = resolvedAtComment("middle", "2026-07-11T10:00:00.000Z");
+
+    const out = sortResolvedByResolvedAt([older, newest, middle]);
+    expect(out.map((x) => x.id)).toEqual(["newest", "middle", "older"]);
+  });
+
+  it("also handles Date instances (optimistic onMutate window)", () => {
+    const older = resolvedAtComment("older", new Date("2026-01-01T00:00:00Z"));
+    const newer = resolvedAtComment("newer", new Date("2026-06-01T00:00:00Z"));
+    expect(sortResolvedByResolvedAt([older, newer]).map((x) => x.id)).toEqual([
+      "newer",
+      "older",
+    ]);
+  });
+
+  it("does not mutate the input array", () => {
+    const a = resolvedAtComment("a", "2026-01-01T00:00:00.000Z");
+    const b = resolvedAtComment("b", "2026-02-01T00:00:00.000Z");
+    const input = [a, b];
+    sortResolvedByResolvedAt(input);
+    expect(input.map((x) => x.id)).toEqual(["a", "b"]);
+  });
+
+  it("keeps stable order for equal resolvedAt timestamps", () => {
+    const ts = "2026-03-03T03:03:03.000Z";
+    const x = resolvedAtComment("x", ts);
+    const y = resolvedAtComment("y", ts);
+    const z = resolvedAtComment("z", ts);
+    expect(sortResolvedByResolvedAt([x, y, z]).map((c) => c.id)).toEqual([
+      "x",
+      "y",
+      "z",
+    ]);
   });
 });
 

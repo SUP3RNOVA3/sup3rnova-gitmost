@@ -20,11 +20,18 @@ import {
   ISuggestionOutcome,
 } from "@/features/comment/types/comment.types";
 import { notifications } from "@mantine/notifications";
+import { Button, Group, Text } from "@mantine/core";
 import { IPagination } from "@/lib/types.ts";
 import { useTranslation } from "react-i18next";
-import { useEffect, useMemo } from "react";
+import React, { useEffect, useMemo, useRef } from "react";
+import { useAtomValue } from "jotai";
+import { pageEditorAtom } from "@/features/editor/atoms/editor-atoms";
 
 export const RQ_KEY = (pageId: string) => ["comments", pageId];
+
+// How long the resolve success toast (with its inline Undo) stays up before it
+// auto-closes. Policy constant — no env override.
+export const RESOLVE_UNDO_AUTOCLOSE_MS = 10000;
 
 export function useCommentsQuery(params: ICommentParams) {
   const query = useInfiniteQuery({
@@ -376,7 +383,25 @@ export function useResolveCommentMutation() {
   const queryClient = useQueryClient();
   const { t } = useTranslation();
 
-  return useMutation({
+  // Keep the live editor in a ref: the toast's Undo (and the 404 branch) must
+  // clear the inline comment mark AFTER the originating CommentListItem has
+  // unmounted (resolving pulls the comment out of the Open list, so its item is
+  // already gone by the time the 10s toast is clicked). In read-only view
+  // pageEditorAtom is null and the mark converges via the server's
+  // COMMENT_MARK_UPDATE job instead.
+  const editor = useAtomValue(pageEditorAtom);
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
+
+  // Self-reference the mutation so the toast's Undo can re-invoke it (reopen)
+  // long after the triggering component unmounted. Declared BEFORE useMutation
+  // and assigned AFTER; the onClick reads mutationRef.current at CALL time, not
+  // definition time, so there is no initialization cycle.
+  const mutationRef = useRef<{
+    mutate: (vars: IResolveComment) => void;
+  } | null>(null);
+
+  const mutation = useMutation({
     mutationFn: (data: IResolveComment) => resolveComment(data),
     onMutate: async (variables) => {
       await queryClient.cancelQueries({ queryKey: RQ_KEY(variables.pageId) });
@@ -401,7 +426,39 @@ export function useResolveCommentMutation() {
 
       return { previousCache };
     },
-    onError: (_err, variables, context) => {
+    onError: (err: any, variables, context) => {
+      // Terminal 404: the comment was really deleted (missing comment or deleted
+      // page — access denial is 403, resolve is idempotent so no 400). Do NOT
+      // roll back (that would resurrect a phantom row in Resolved); instead drop
+      // it from the cache and clear its now-orphaned inline mark. Mirrors
+      // handleDeleteComment and the dismiss-mutation 404 branch.
+      if (err?.response?.status === 404) {
+        const cache = queryClient.getQueryData(RQ_KEY(variables.pageId)) as
+          | InfiniteData<IPagination<IComment>>
+          | undefined;
+        if (cache) {
+          queryClient.setQueryData(
+            RQ_KEY(variables.pageId),
+            removeCommentFromCache(cache, variables.commentId),
+          );
+        }
+        const ed = editorRef.current;
+        if (ed && !ed.isDestroyed) {
+          try {
+            ed.commands.unsetComment(variables.commentId);
+          } catch {
+            /* editor gone / mark already removed */
+          }
+        }
+        notifications.show({
+          message: t("Comment no longer exists"),
+          color: "red",
+        });
+        return;
+      }
+
+      // Generic failure: roll back the optimistic update and show a DIRECTIONAL
+      // error (resolve vs. reopen), not always "resolve".
       if (context?.previousCache) {
         queryClient.setQueryData(
           RQ_KEY(variables.pageId),
@@ -409,7 +466,9 @@ export function useResolveCommentMutation() {
         );
       }
       notifications.show({
-        message: t("Failed to resolve comment"),
+        message: variables.resolved
+          ? t("Failed to resolve comment")
+          : t("Failed to re-open comment"),
         color: "red",
       });
     },
@@ -430,11 +489,66 @@ export function useResolveCommentMutation() {
         );
       }
 
+      // Reopen keeps the plain toast without an Undo.
+      if (!variables.resolved) {
+        notifications.show({ message: t("Comment re-opened successfully") });
+        return;
+      }
+
+      // Resolve: attach an inline Undo (reopen) to the success toast. Built with
+      // React.createElement because this is a .ts module (no JSX).
+      const { commentId, pageId } = variables;
+      const notificationId = `resolve-undo-${commentId}`;
+      // Double-click guard: notifications.hide is NOT synchronous, so the button
+      // stays clickable for a frame or two — without this a fast double-click
+      // would fire reopen twice.
+      let done = false;
       notifications.show({
-        message: variables.resolved
-          ? t("Comment resolved successfully")
-          : t("Comment re-opened successfully"),
+        id: notificationId,
+        autoClose: RESOLVE_UNDO_AUTOCLOSE_MS,
+        message: React.createElement(
+          Group,
+          { justify: "space-between", wrap: "nowrap", gap: "md" },
+          React.createElement(
+            Text,
+            { size: "sm" },
+            t("Comment resolved successfully"),
+          ),
+          React.createElement(
+            Button,
+            {
+              variant: "subtle",
+              size: "compact-sm",
+              onClick: () => {
+                if (done) return;
+                done = true;
+                // Reopen via the SAME mutation (read at click time — the
+                // originating item is already unmounted).
+                mutationRef.current?.mutate({
+                  commentId,
+                  pageId,
+                  resolved: false,
+                });
+                // Clear the inline mark; guard isDestroyed because the toast
+                // lives 10s and the panel/page may have closed by now.
+                const ed = editorRef.current;
+                if (ed && !ed.isDestroyed) {
+                  try {
+                    ed.commands.setCommentResolved(commentId, false);
+                  } catch {
+                    /* editor gone — server COMMENT_MARK_UPDATE converges it */
+                  }
+                }
+                notifications.hide(notificationId);
+              },
+            },
+            t("Undo"),
+          ),
+        ),
       });
     },
   });
+
+  mutationRef.current = mutation;
+  return mutation;
 }
