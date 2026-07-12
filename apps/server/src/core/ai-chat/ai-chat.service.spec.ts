@@ -30,13 +30,16 @@ import {
   STEP_LIMIT_NO_ANSWER_MARKER,
   OUTPUT_DEGENERATION_ERROR,
   lastAssistantContextTokens,
-  lastAssistantReplayOverflow,
+  lastAssistantReplayOverflowCount,
   seedActivatedTools,
 } from './ai-chat.service';
 import type { AiChatMessage, Workspace } from '@docmost/db/types/entity.types';
 import { buildSystemPrompt } from './ai-chat.prompt';
 import type { McpClientsService } from './external-mcp/mcp-clients.service';
-import { resolveEffectiveReplayThreshold } from './history-budget';
+import {
+  resolveEffectiveReplayThreshold,
+  REPLAY_MIN_FLOOR_TOKENS,
+} from './history-budget';
 
 /**
  * Unit tests for compactToolOutput: the pure helper that shrinks tool outputs
@@ -554,49 +557,123 @@ describe('seedActivatedTools', () => {
   });
 });
 
-describe('lastAssistantReplayOverflow', () => {
+describe('lastAssistantReplayOverflowCount', () => {
   const row = (
     role: string,
     metadata: Record<string, unknown> | null,
   ): AiChatMessage => ({ role, metadata }) as unknown as AiChatMessage;
 
-  it('is true only when the LAST assistant turn overflowed', () => {
+  it('reads the consecutive-overflow count from the LAST assistant turn', () => {
     expect(
-      lastAssistantReplayOverflow([
-        row('assistant', { replayOverflow: true }),
+      lastAssistantReplayOverflowCount([
+        row('assistant', { replayOverflowCount: 3 }),
         row('user', null),
       ]),
-    ).toBe(true);
-    // A recovered (later, non-overflow) assistant turn clears it.
+    ).toBe(3);
+    // A recovered (later, non-overflow) assistant turn resets it to 0 — the read
+    // stops at the most recent assistant row, which carries no count.
     expect(
-      lastAssistantReplayOverflow([
-        row('assistant', { replayOverflow: true }),
+      lastAssistantReplayOverflowCount([
+        row('assistant', { replayOverflowCount: 3 }),
         row('user', null),
         row('assistant', { contextTokens: 5 }),
       ]),
-    ).toBe(false);
-    expect(lastAssistantReplayOverflow([])).toBe(false);
+    ).toBe(0);
+    expect(lastAssistantReplayOverflowCount([])).toBe(0);
   });
 
-  // #490 reactive recovery: a prior turn stamped `replayOverflow` must make the
-  // NEXT turn's effective budget the AGGRESSIVE 0.5x cut — that harder trim is
-  // what un-bricks a chat that just 400'd on the context window. This exercises
-  // the exact wiring the service uses: read the stamp, then scale the threshold.
-  it('#490: a prior replayOverflow drives the next turn to the 0.5x aggressive budget', () => {
+  // BACK-COMPAT (#520): an in-flight row written by the pre-#520 boolean stamp
+  // (`replayOverflow: true`, no count) reads as k=1 — the old single 0.5× behavior —
+  // so a chat mid-recovery across the deploy does not regress.
+  it('#520 back-compat: a legacy boolean replayOverflow reads as k=1', () => {
+    expect(
+      lastAssistantReplayOverflowCount([
+        row('assistant', { replayOverflow: true }),
+        row('user', null),
+      ]),
+    ).toBe(1);
+    // A legacy row with the flag absent/false is k=0.
+    expect(
+      lastAssistantReplayOverflowCount([row('assistant', { contextTokens: 5 })]),
+    ).toBe(0);
+  });
+
+  // A corrupt/negative persisted count never yields a negative k.
+  it('clamps a corrupt negative count to 0', () => {
+    expect(
+      lastAssistantReplayOverflowCount([
+        row('assistant', { replayOverflowCount: -4 }),
+      ]),
+    ).toBe(0);
+  });
+
+  // #490/#520 reactive recovery: the prior consecutive-overflow count `k` drives
+  // the next turn's effective budget to an ESCALATING cut (0.5**k) — each further
+  // consecutive 400 tightens it, which is what un-bricks a chat that keeps
+  // overflowing. This exercises the exact wiring the service uses: read the count,
+  // then scale the threshold.
+  it('#490/#520: the prior count drives the next turn to the escalating aggressive budget', () => {
     const history = [
-      row('assistant', { replayOverflow: true }),
+      row('assistant', { replayOverflowCount: 1 }),
       row('user', null),
     ];
-    const priorOverflowed = lastAssistantReplayOverflow(history);
-    expect(priorOverflowed).toBe(true);
-    // Base budget 100k -> aggressive recovery halves it to 50k this turn.
-    expect(resolveEffectiveReplayThreshold(100_000, priorOverflowed)).toBe(50_000);
+    const k = lastAssistantReplayOverflowCount(history);
+    expect(k).toBe(1);
+    // Base budget 100k -> first-overflow recovery halves it to 50k this turn.
+    expect(resolveEffectiveReplayThreshold(100_000, k)).toBe(50_000);
+    // A second consecutive overflow (k=2) quarters it.
+    expect(resolveEffectiveReplayThreshold(100_000, 2)).toBe(25_000);
     // Odd base floors, not rounds.
-    expect(resolveEffectiveReplayThreshold(99_999, true)).toBe(49_999);
-    // No prior overflow -> the base budget is used verbatim (no aggressive cut).
-    expect(resolveEffectiveReplayThreshold(100_000, false)).toBe(100_000);
+    expect(resolveEffectiveReplayThreshold(99_999, 1)).toBe(49_999);
+    // No prior overflow (k=0) -> the base budget is used verbatim (no cut).
+    expect(resolveEffectiveReplayThreshold(100_000, 0)).toBe(100_000);
     // An explicit off-switch (null) is never overridden, even on recovery.
-    expect(resolveEffectiveReplayThreshold(null, true)).toBeNull();
+    expect(resolveEffectiveReplayThreshold(null, 3)).toBeNull();
+  });
+
+  // #520 escalation table + convergence: the cut deepens each consecutive overflow
+  // and is CLAMPED at the floor so it converges (un-bricks even against a small
+  // real window), instead of the old fixed single 0.5× that stuck at 50k forever.
+  it('#520: escalates and converges to the floor, un-bricking a small real window', () => {
+    const base = 100_000;
+    expect(resolveEffectiveReplayThreshold(base, 0)).toBe(base);
+    expect(resolveEffectiveReplayThreshold(base, 1)).toBe(50_000);
+    expect(resolveEffectiveReplayThreshold(base, 2)).toBe(25_000);
+    expect(resolveEffectiveReplayThreshold(base, 3)).toBe(12_500);
+
+    // Residual-brick regression (#520): with the flat-default base (100k) and a real
+    // model window of ~40k, the OLD fixed 0.5× stuck at 50k forever (> 40k -> 400s
+    // again, never recovers). The escalating cut drops BELOW 40k after enough
+    // consecutive overflows -> the history finally fits -> the chat un-bricks.
+    const realWindow = 40_000;
+    // k=1 (50k) still exceeds the window — the old behavior's terminal state.
+    expect(resolveEffectiveReplayThreshold(base, 1)).toBeGreaterThan(realWindow);
+    // But escalation converges under the window within a couple more turns.
+    const converged = [2, 3, 4, 5].some(
+      (k) => (resolveEffectiveReplayThreshold(base, k) as number) < realWindow,
+    );
+    expect(converged).toBe(true);
+
+    // Convergence is bounded BELOW by the floor: a large k never trims below it.
+    for (const k of [4, 8, 20, 100]) {
+      expect(resolveEffectiveReplayThreshold(base, k)).toBe(REPLAY_MIN_FLOOR_TOKENS);
+      expect(
+        resolveEffectiveReplayThreshold(base, k) as number,
+      ).toBeGreaterThanOrEqual(REPLAY_MIN_FLOOR_TOKENS);
+    }
+  });
+
+  // The floor never RAISES a legitimately small configured budget above itself —
+  // that would re-overflow the very window it was configured for.
+  it('#520: never inflates a small configured budget above itself', () => {
+    const small = 5_000; // below the floor
+    expect(resolveEffectiveReplayThreshold(small, 0)).toBe(small);
+    // Even under escalation the effective threshold never exceeds the base.
+    for (const k of [1, 2, 3, 10]) {
+      expect(
+        resolveEffectiveReplayThreshold(small, k) as number,
+      ).toBeLessThanOrEqual(small);
+    }
   });
 });
 
@@ -930,21 +1007,29 @@ describe('flushAssistant', () => {
     expect(flushed.metadata.error).toBe('boom');
   });
 
-  // #490 observability: the replay budgeter's decision is stamped on the turn.
-  it('records replayTrimmedToTokens + replayOverflow when provided', () => {
+  // #490/#520 observability: the replay budgeter's decision is stamped on the turn,
+  // now including the consecutive-overflow COUNTER (#520) the next turn escalates on.
+  it('records replayTrimmedToTokens + replayOverflowCount when provided', () => {
     const f = flushAssistant([], '', 'error', {
       error: 'ctx',
       replayTrimmedToTokens: 42_000,
-      replayOverflow: true,
+      replayOverflowCount: 2,
     });
     expect(f.metadata.replayTrimmedToTokens).toBe(42_000);
-    expect(f.metadata.replayOverflow).toBe(true);
+    expect(f.metadata.replayOverflowCount).toBe(2);
   });
 
   it('omits the replay metadata when not provided', () => {
     const f = flushAssistant([], '', 'completed', { finishReason: 'stop' });
     expect('replayTrimmedToTokens' in f.metadata).toBe(false);
-    expect('replayOverflow' in f.metadata).toBe(false);
+    expect('replayOverflowCount' in f.metadata).toBe(false);
+  });
+
+  // A clean finalize (no overflow -> count 0/omitted) leaves NO counter, which the
+  // next turn reads as k=0 — the reset that ends a recovery streak.
+  it('omits replayOverflowCount for a zero/absent count (reset semantics)', () => {
+    const zero = flushAssistant([], '', 'completed', { replayOverflowCount: 0 });
+    expect('replayOverflowCount' in zero.metadata).toBe(false);
   });
 
   // #274 observability: the page-change diff the agent saw this turn is persisted

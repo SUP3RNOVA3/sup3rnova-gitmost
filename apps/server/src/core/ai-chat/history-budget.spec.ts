@@ -1,13 +1,78 @@
 import type { ModelMessage } from 'ai';
 import {
   resolveReplayBudget,
+  resolveEffectiveReplayThreshold,
   isContextOverflowError,
   estimateMessagesTokens,
   trimHistoryForReplay,
   REPLAY_BUDGET_DEFAULT_TOKENS,
+  REPLAY_MIN_FLOOR_TOKENS,
   REPLAY_TRUNCATION_MARKER,
   REPLAY_TURN_COLLAPSED_MARKER,
 } from './history-budget';
+
+describe('resolveEffectiveReplayThreshold (#520 iterative escalation)', () => {
+  // The escalation table: each consecutive overflow (k) deepens the cut by 0.5×.
+  it('scales the base by 0.5**k, flooring (not rounding) fractional tokens', () => {
+    const base = 100_000;
+    expect(resolveEffectiveReplayThreshold(base, 0)).toBe(base); // k=0: unchanged
+    expect(resolveEffectiveReplayThreshold(base, 1)).toBe(50_000); // 0.5×
+    expect(resolveEffectiveReplayThreshold(base, 2)).toBe(25_000); // 0.25×
+    expect(resolveEffectiveReplayThreshold(base, 3)).toBe(12_500); // 0.125×
+    // Floors, not rounds.
+    expect(resolveEffectiveReplayThreshold(99_999, 1)).toBe(49_999);
+  });
+
+  it('passes a null base (trimming OFF) through unchanged for any k', () => {
+    for (const k of [0, 1, 2, 5, 100]) {
+      expect(resolveEffectiveReplayThreshold(null, k)).toBeNull();
+    }
+  });
+
+  // The crux of #520: convergence. A large k is clamped at REPLAY_MIN_FLOOR_TOKENS,
+  // so the escalation CONVERGES to a small-but-usable budget instead of trimming to
+  // zero — and, unlike the old fixed 0.5× that stuck at 50k, it drops far enough to
+  // fit a small real model window.
+  it('clamps a large k at the floor (converges, never below)', () => {
+    const base = 100_000;
+    for (const k of [4, 6, 10, 50, 200]) {
+      const t = resolveEffectiveReplayThreshold(base, k) as number;
+      expect(t).toBe(REPLAY_MIN_FLOOR_TOKENS);
+      expect(t).toBeGreaterThanOrEqual(REPLAY_MIN_FLOOR_TOKENS);
+    }
+  });
+
+  // Residual-brick regression (#520): flat-default base 100k, real window ~40k. The
+  // OLD fixed single 0.5× stuck at 50k > 40k forever (re-overflows every turn — the
+  // brick). The iterative cut drops BELOW 40k after a couple more consecutive
+  // overflows, so the history finally fits and the chat un-bricks.
+  it('un-bricks: escalation drops below a small real window the fixed 0.5× never could', () => {
+    const base = 100_000;
+    const realWindow = 40_000;
+    // The old terminal state: 0.5× = 50k, still above the window.
+    expect(resolveEffectiveReplayThreshold(base, 1)).toBeGreaterThan(realWindow);
+    // Escalation converges under the window.
+    const converged = [2, 3, 4, 5].some(
+      (k) => (resolveEffectiveReplayThreshold(base, k) as number) < realWindow,
+    );
+    expect(converged).toBe(true);
+    // MUTATION SENTINEL: reverting `** k` to `** 1` (fixed 0.5×) makes every k yield
+    // 50k, so `converged` above would be FALSE and this test reddens. Removing the
+    // floor reddens the clamp test instead.
+  });
+
+  // The floor never RAISES a legitimately small configured budget above itself
+  // (min(floor, base)); doing so would re-overflow the very small window it was set
+  // for. So a base BELOW the floor is passed through unchanged and never inflated.
+  it('never inflates a small configured budget above itself', () => {
+    const small = 5_000; // below REPLAY_MIN_FLOOR_TOKENS
+    expect(resolveEffectiveReplayThreshold(small, 0)).toBe(small);
+    for (const k of [1, 2, 3, 10]) {
+      const t = resolveEffectiveReplayThreshold(small, k) as number;
+      expect(t).toBeLessThanOrEqual(small);
+    }
+  });
+});
 
 describe('resolveReplayBudget', () => {
   it('uses floor(0.7 x window) for a configured window (no cap)', () => {
