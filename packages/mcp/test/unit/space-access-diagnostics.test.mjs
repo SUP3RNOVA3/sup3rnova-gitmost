@@ -31,22 +31,25 @@ const BAD = "99999999-9999-4999-8999-999999999999";
 
 // Build an AxiosError shaped exactly as the response interceptor would hand it
 // on a 404 — status readable, axios.isAxiosError() true.
-function make404(url = "/pages/tree") {
+function makeAxiosErr(status, url = "/pages/tree", message = "boom") {
   const config = { method: "post", url, baseURL: "http://host.example/api" };
   const response = {
-    status: 404,
-    statusText: "Not Found",
-    data: { message: "Space permissions not found" },
+    status,
+    statusText: String(status),
+    data: { message },
     headers: {},
     config,
   };
   return new AxiosError(
-    "Request failed with status code 404",
+    `Request failed with status code ${status}`,
     "ERR_BAD_REQUEST",
     config,
     {},
     response,
   );
+}
+function make404(url = "/pages/tree") {
+  return makeAxiosErr(404, url, "Space permissions not found");
 }
 
 // A client whose token is pre-set (so ensureAuthenticated never hits the
@@ -163,6 +166,51 @@ test("search WITHOUT spaceId is inert (raw error propagates, no /spaces sweep)",
     },
   );
   assert.equal(c._spacesFetches, 0, "no /spaces sweep without a spaceId");
+});
+
+// --- Fail-open: a NON-404 error is never enriched (regression guard) --------
+test("a non-404 error (500) on a wrapped call propagates unchanged, with NO /spaces sweep", async () => {
+  const c = makeClient();
+  // A real server failure — must surface as-is, never be swallowed by the
+  // enrichment path or reformatted into a "not found among your spaces" message.
+  c.enumerateSpacePages = async () => {
+    throw makeAxiosErr(500, "/pages/tree", "Internal Server Error");
+  };
+  await assert.rejects(
+    () => c.getTree(BAD),
+    (e) => {
+      assert.equal(e.response?.status, 500, "the original 500 propagates");
+      assert.ok(
+        !/не найден среди/.test(e.message ?? ""),
+        "a non-404 is NOT rewritten",
+      );
+      return true;
+    },
+  );
+  assert.equal(c._spacesFetches, 0, "no /spaces sweep for a non-404");
+});
+
+// --- Fail-open: 404 when the spaceId IS accessible -> not about the space ----
+test("a 404 when the spaceId IS in the accessible index fails open (the 404 is about something else)", async () => {
+  const c = makeClient();
+  // The wrapped call 404s, but the spaceId is genuinely accessible — the 404
+  // must be about some OTHER resource, so the original error propagates and is
+  // NOT falsely rewritten to "spaceId not found among your spaces".
+  c.enumerateSpacePages = async () => {
+    throw make404();
+  };
+  await assert.rejects(
+    () => c.getTree(SPACES[0].id),
+    (e) => {
+      assert.equal(e.response?.status, 404, "original 404 preserved");
+      assert.ok(
+        !/не найден среди/.test(e.message ?? ""),
+        "no false 'not found' when the space is accessible",
+      );
+      return true;
+    },
+  );
+  assert.equal(c._spacesFetches, 1, "the index WAS consulted to make this call");
 });
 
 // --- Criterion 5: incomplete listing -> fail open ---------------------------
@@ -342,13 +390,34 @@ test("createPage with an inaccessible spaceId returns the server error as-is (NO
 
 // --- formatSpaceNotAccessible unit shape ------------------------------------
 test("formatSpaceNotAccessible caps the inline list at 10 and appends a (+N ещё) tail", () => {
+  // Short ids/names so the whole message stays under the length cap and the full
+  // list-cap behaviour (first 10 shown, rest collapsed) is observable intact.
   const many = Array.from({ length: 13 }, (_, i) => ({
-    id: `id-${i}`,
-    name: `Space ${i}`,
+    id: `s${i}`,
+    name: `${i}`,
   }));
   const msg = formatSpaceNotAccessible("getTree", BAD, many);
-  assert.ok(msg.includes("id-0 (Space 0)"));
-  assert.ok(msg.includes("id-9 (Space 9)"), "10th entry (index 9) is shown");
-  assert.ok(!msg.includes("id-10 (Space 10)"), "the 11th is collapsed");
+  assert.ok(msg.includes("s0 (0)"));
+  assert.ok(msg.includes("s9 (9)"), "10th entry (index 9) is shown");
+  assert.ok(!msg.includes("s10 (10)"), "the 11th is collapsed");
   assert.ok(msg.includes("(+3 ещё, см. listSpaces)"), "tail counts the remainder");
+  assert.ok(msg.length <= 300, `short-name message stays under the cap (${msg.length})`);
+});
+
+test("formatSpaceNotAccessible caps the assembled message at ERROR_MESSAGE_CAP (300)", () => {
+  // 10 spaces with long names would, uncapped, produce a message several times
+  // over the 300-char budget. The cap must keep it compact while still carrying
+  // the bad spaceId and the listSpaces pointer.
+  const longName = "X".repeat(120);
+  const spaces = Array.from({ length: 10 }, (_, i) => ({
+    id: `id-${i}`,
+    name: `${longName}-${i}`,
+  }));
+  const msg = formatSpaceNotAccessible("getTree", BAD, spaces);
+  assert.ok(
+    msg.length <= 300,
+    `message must be <= 300 chars, got ${msg.length}`,
+  );
+  assert.ok(msg.includes(BAD), "the bad spaceId survives the cap");
+  assert.ok(msg.includes("listSpaces"), "the listSpaces pointer survives the cap");
 });

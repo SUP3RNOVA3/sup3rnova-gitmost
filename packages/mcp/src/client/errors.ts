@@ -73,11 +73,24 @@ export function formatSpaceNotAccessible(
   }
 
   const shown = spaces.slice(0, SPACE_LIST_CAP);
-  const listed = shown.map((s) => `${s.id} (${s.name})`).join(", ");
   const remaining = spaces.length - shown.length;
   const tail =
     remaining > 0 ? ` (+${remaining} ещё, см. listSpaces)` : "";
-  return `${mcpName}: spaceId "${spaceId}" не найден среди доступных тебе спейсов. Доступные: ${listed}${tail} — скопируй нужный id дословно из listSpaces.`;
+
+  // Cap the whole message at ERROR_MESSAGE_CAP (same budget as
+  // formatDocmostAxiosError) so ~10 long space names cannot blow up the model
+  // context. Truncate ONLY the interpolated space LIST — the fixed prefix (which
+  // carries the bad spaceId) and the fixed suffix (the "…из listSpaces"
+  // instruction) are always kept intact, so the actionable parts survive even
+  // when the list is trimmed.
+  const prefix = `${mcpName}: spaceId "${spaceId}" не найден среди доступных тебе спейсов. Доступные: `;
+  const suffix = ` — скопируй нужный id дословно из listSpaces.`;
+  let listed = shown.map((s) => `${s.id} (${s.name})`).join(", ") + tail;
+  const budget = ERROR_MESSAGE_CAP - prefix.length - suffix.length;
+  if (listed.length > budget) {
+    listed = listed.slice(0, Math.max(0, budget - 1)) + "…";
+  }
+  return `${prefix}${listed}${suffix}`;
 }
 
 // Keep ONLY the pathname of a request (no host, no query string, no fragment)
