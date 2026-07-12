@@ -9,10 +9,14 @@ import {
   docsCanonicallyEqual,
 } from '../src/lib/canonicalize.js';
 
-// The server's canonical INTERNAL_LINK_REGEX
-// (apps/server/src/integrations/export/utils.ts). `isInternalPagePath` MUST be a
-// strict subset: everything it accepts must also match this. We assert the
-// subset relation directly so drift is caught mechanically.
+// A LOCAL, illustrative copy of the server's INTERNAL_LINK_REGEX
+// (apps/server/src/integrations/export/utils.ts) used only to document the
+// subset boundary WITHIN this package (this layer cannot import the server).
+// It is NOT the cross-package drift guard: a hand copy can silently go stale if
+// the server regex is later narrowed. The real, mechanical drift guard lives in
+// the top layer, `apps/server/src/integrations/export/internal-link-parity.spec.ts`,
+// which imports BOTH the LIVE server `INTERNAL_LINK_REGEX` and the LIVE
+// `isInternalPagePath` and reddens if the client ever ceases to be a subset.
 const SERVER_INTERNAL_LINK_REGEX =
   /^(https?:\/\/)?([^\/]+)?(\/s\/([^\/]+)\/)?p\/([a-zA-Z0-9-]+)\/?$/;
 
@@ -55,6 +59,18 @@ describe('isInternalPagePath', () => {
     '/s/a/b/p/abc', // space contains slash -> extra segment
     '',
   ];
+  // Structurally VALID `/s/<space>/p/<slug>` shapes whose ONLY defect is a
+  // forbidden character in the slug segment. These pin the slug charset
+  // `[a-zA-Z0-9-]` itself (not just the surrounding structure): drop them and a
+  // mutation widening the charset (e.g. adding `.`) survives the suite. Each is
+  // ALSO rejected by the server regex — documenting that the subset boundary
+  // holds precisely on the charset, not just on structure.
+  const REJECT_SLUG_CHARSET = [
+    '/s/eng/p/abc.def', // dot
+    '/s/eng/p/abc_def', // underscore
+    '/s/eng/p/abc%20', // percent-encoded space
+    '/s/eng/p/abc~x', // tilde
+  ];
 
   it('accepts the space-qualified root-relative page path (+trailing slash)', () => {
     for (const href of ACCEPT)
@@ -64,6 +80,19 @@ describe('isInternalPagePath', () => {
   it('rejects external URLs, ambiguous, and non-page forms', () => {
     for (const href of REJECT)
       expect(isInternalPagePath(href), href).toBe(false);
+  });
+
+  it('rejects a correctly-shaped path with a forbidden slug character', () => {
+    // Pins the slug charset itself: a mutation widening `[a-zA-Z0-9-]` reddens.
+    for (const href of REJECT_SLUG_CHARSET)
+      expect(isInternalPagePath(href), href).toBe(false);
+  });
+
+  it('the forbidden-slug-char paths are rejected by the server regex too', () => {
+    // The subset boundary holds on the charset, not just the structure: none of
+    // these match the server regex, so the client must not accept them either.
+    for (const href of REJECT_SLUG_CHARSET)
+      expect(SERVER_INTERNAL_LINK_REGEX.test(href), href).toBe(false);
   });
 
   it('rejects non-string input (fail-toward-external)', () => {
