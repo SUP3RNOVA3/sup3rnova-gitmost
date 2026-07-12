@@ -103,6 +103,15 @@ export class EnvironmentVariables {
   @IsString()
   TYPESENSE_LOCALE: string;
 
+  // Agent API-key kill-switch. Optional (absent -> default ON). STRICT: only the
+  // literals 'true'/'false' are accepted, so `=0`/`=off`/`=False` fail at boot
+  // instead of being silently read as "enabled" — the switch must actually flip
+  // when an operator flips it. See EnvironmentService.isApiKeysEnabled.
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  @IsString()
+  API_KEYS_ENABLED: string;
+
   @IsOptional()
   @ValidateIf((obj) => obj.AI_DRIVER)
   @IsIn(['openai', 'openai-compatible', 'gemini', 'ollama'])

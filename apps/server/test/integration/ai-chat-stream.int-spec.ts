@@ -322,20 +322,21 @@ describe('AiChatService.stream [integration]', () => {
   });
 
   /**
-   * #332 deferred tool loading, the ON path. The riskiest property is that the
-   * per-turn `activatedTools` Set is created FRESH inside each stream() call, so a
-   * tool a previous turn activated via loadTools is NOT still active when the next
-   * turn starts — the new turn begins "cold" (CORE + loadTools only). The unit
-   * tests only exercise pure prepareAgentStep with hand-fed Sets; this pins the
-   * real wiring end-to-end (loadTools.execute -> activatedTools -> prepareStep ->
-   * per-step activeTools) against the real streamText loop, and proves there is no
-   * cross-turn leak. We drive a MockLanguageModelV3 whose step 1 calls
-   * loadTools(['createPage']) and assert, via the model's recorded per-step
-   * CallOptions.tools (the AI SDK filters the provider tool list by activeTools),
-   * that the deferred tool becomes active on the SAME turn's next step but NOT on a
-   * fresh turn's first step.
+   * #332 + #490 deferred tool loading, the ON path. Turn 1 starts COLD (CORE +
+   * loadTools only) and activates a deferred tool via loadTools; that activation
+   * is PERSISTED into the chat's metadata.activatedTools (#490) so the NEXT turn
+   * SEEDS from it and the tool is active from the fresh turn's FIRST step — the
+   * model never re-runs loadTools to re-activate the same tool. The unit tests
+   * only exercise pure prepareAgentStep with hand-fed Sets; this pins the real
+   * wiring end-to-end (loadTools.execute -> activatedTools -> persist -> next-turn
+   * seed -> prepareStep -> per-step activeTools) against the real streamText loop.
+   * We drive a MockLanguageModelV3 whose step 1 calls loadTools(['createPage'])
+   * and assert, via the model's recorded per-step CallOptions.tools (the AI SDK
+   * filters the provider tool list by activeTools), that the deferred tool becomes
+   * active on the SAME turn's next step AND, seeded from metadata, on the next
+   * turn's first step.
    */
-  describe('deferred tool loading ON — per-turn activation, no leak (#332)', () => {
+  describe('deferred tool loading ON — cross-turn activation persistence (#332 + #490)', () => {
     // A stub deferred (non-core) tool the agent can activate. Its execute is never
     // called — the model only needs to SEE it become active — but it must be a
     // valid AI-SDK tool so the SDK includes it in a step's tool list once active.
@@ -451,7 +452,7 @@ describe('AiChatService.stream [integration]', () => {
       } as any);
     }
 
-    it('activates a deferred tool for the SAME turn, and a NEW turn starts cold (no leak)', async () => {
+    it('activates a deferred tool for the SAME turn, and a NEW turn SEEDS it from persisted chat metadata (#490)', async () => {
       const chatId = (await createChat(db, { workspaceId, creatorId: userId })).id;
 
       // --- Turn 1: loadTools(createPage) on step 1, then answer on step 2. ---
@@ -474,7 +475,7 @@ describe('AiChatService.stream [integration]', () => {
       // Step 2 of the SAME turn sees the just-activated deferred tool.
       expect(step2Tools).toContain('createPage');
 
-      // --- Turn 2 on the SAME chat: must start cold again. ---
+      // --- Turn 2 on the SAME chat: seeds the persisted activation (#490). ---
       const model2 = new MockLanguageModelV3({
         doStream: async () => ({ stream: successStream() }),
       } as any);
@@ -485,9 +486,10 @@ describe('AiChatService.stream [integration]', () => {
 
       const nextTurnFirstStep = toolNames(model2.doStreamCalls[0]);
       expect(nextTurnFirstStep).toContain('loadTools');
-      // The activated set is per-turn: the prior turn's createPage did NOT leak,
-      // so the fresh turn's first step sees it deferred again.
-      expect(nextTurnFirstStep).not.toContain('createPage');
+      // #490: activation PERSISTS across turns — turn 1 wrote createPage into the
+      // chat's metadata.activatedTools, so the next turn seeds from it and the
+      // deferred tool is active from the FIRST step (no need to re-run loadTools).
+      expect(nextTurnFirstStep).toContain('createPage');
     });
   });
 });
