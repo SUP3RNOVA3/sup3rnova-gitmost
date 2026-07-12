@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
-import { sql } from 'kysely';
+import { RawBuilder, sql } from 'kysely';
 import * as pgvector from 'pgvector';
 import { KyselyDB, KyselyTransaction } from '../../types/kysely.types';
 import { dbOrTx } from '../../utils';
@@ -35,6 +35,9 @@ export interface PageEmbeddingChunkRow {
   content: string;
   modelName: string;
   modelDimensions: number;
+  // #530 PR-1: the active embedding fingerprint (see computeEmbeddingFingerprint).
+  // null only when no provider resolves (the indexer no-ops in that case).
+  fingerprint: string | null;
   embedding: number[];
 }
 
@@ -120,11 +123,88 @@ export class PageEmbeddingRepo {
           content: row.content,
           modelName: row.modelName,
           modelDimensions: row.modelDimensions,
+          fingerprint: row.fingerprint,
           // pgvector.toSql -> '[1,2,3]'; cast the bound literal to vector.
           embedding: sql`${pgvector.toSql(row.embedding)}::vector`,
         })),
       )
       .execute();
+  }
+
+  /**
+   * #530: build the VECTOR candidate arm for SearchService's fused RRF union — a
+   * page-level nearest-neighbour sub-select. Returns a `sql` fragment (not an
+   * executed query) so the caller can UNION ALL it with the lexical arm inside a
+   * single ranked-ids query.
+   *
+   * SCALING BOUNDARY: the column is dimension-agnostic, so it carries NO ANN
+   * index — this is a brute-force O(N) KNN seq scan with `<=>`. Accepted for the
+   * small-tenant / homelab fork target (ANN + a pinned-dimension column are
+   * deferred). It is NOT unbounded, though: the caller (SearchService) runs this
+   * fused query under a per-statement timeout (SEARCH_VECTOR_STATEMENT_TIMEOUT_MS)
+   * and DEGRADES to lexical-only on a 57014 cancellation, so a pathological scan
+   * can never hang the interactive search request.
+   *
+   * The arm collapses a page's chunks to its best (MIN) cosine distance:
+   *   SELECT pages.id, NULL fts_score, NULL sub_tier,
+   *          MIN(pe.embedding <=> $qvec) AS vec_distance
+   *   FROM page_embeddings pe JOIN pages ON pages.id = pe.page_id
+   *   WHERE <scope> AND pe.model_dimensions = $dim AND pe.fingerprint = $fp
+   *   GROUP BY pages.id ORDER BY vec_distance LIMIT $limit
+   *
+   * `scope` is SearchService's shared scope predicate (workspace + space/id set +
+   * creator + descendants + deleted_at), referencing the `pages` table — it must
+   * be spliced verbatim so the vector candidate set mirrors the lexical scope
+   * EXACTLY, minus the lexical text predicate (vector candidates need not match
+   * text). The vector is bound via pgvector's `toSql(...)::vector`, and both the
+   * dimension and the ACTIVE fingerprint are filtered so `<=>` only ever compares
+   * compatible, same-generation vectors (pgvector errors on a dimension
+   * mismatch; a fingerprint mismatch would fuse incomparable vectors).
+   *
+   * `workspaceId` is ALSO filtered directly on `page_embeddings` — not only via
+   * the pages join. It is IMMUTABLE (there are no cross-workspace page moves), so
+   * an embedding row's workspace_id always matches its page's, and this drops NO
+   * legitimate hit; it lets the composite index idx_page_embeddings_ws_space_fp_dim
+   * (workspace_id, space_id, fingerprint, model_dimensions) bite from its LEADING
+   * column, and workspace-scopes candidates at the embedding level (defense in
+   * depth).
+   *
+   * SPACE is deliberately NOT filtered on page_embeddings: `page_embeddings.space_id`
+   * is stamped at index time and is NOT updated when a page is MOVED between spaces
+   * (movePageToSpace does not reindex, and PAGE_MOVED_TO_SPACE has no reindex
+   * consumer), so a moved page's rows carry the OLD space until the next reindex. A
+   * `page_embeddings.space_id = ANY(scope)` predicate would then wrongly drop a
+   * legitimate vector hit for a page moved INTO the searched space. Space scoping
+   * is therefore enforced ONLY by the join to `pages` (pages.space_id ∈ scope,
+   * always current) — the same way the lexical arm scopes, so no space leak.
+   *
+   * The NULL fts_score / sub_tier columns keep the arm UNION-compatible with the
+   * lexical arm's column list.
+   */
+  vectorCandidateArm(params: {
+    queryEmbedding: number[];
+    dimensions: number;
+    fingerprint: string;
+    scope: RawBuilder<unknown>;
+    limit: number;
+    workspaceId: string;
+  }): RawBuilder<unknown> {
+    const qvec = sql`${pgvector.toSql(params.queryEmbedding)}::vector`;
+    return sql`
+      SELECT pages.id AS id,
+             NULL::float AS fts_score,
+             NULL::int AS sub_tier,
+             MIN(page_embeddings.embedding <=> ${qvec}) AS vec_distance
+      FROM page_embeddings
+      JOIN pages ON pages.id = page_embeddings.page_id
+      WHERE ${params.scope}
+        AND page_embeddings.workspace_id = ${params.workspaceId}
+        AND page_embeddings.model_dimensions = ${params.dimensions}
+        AND page_embeddings.fingerprint = ${params.fingerprint}
+      GROUP BY pages.id
+      ORDER BY vec_distance ASC
+      LIMIT ${params.limit}
+    `;
   }
 
   /**

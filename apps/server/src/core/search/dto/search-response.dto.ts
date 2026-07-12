@@ -32,10 +32,27 @@ export class SearchResultDto {
   matchedTerms: string[];
 }
 
-// The paginated envelope (A5). `total` is the EXACT permission-filtered count of
-// pages matching the positive lexical query (fail-closed). `hasMore` is true when
-// more results exist WITHIN the fusion window; `truncatedAtCap` signals the match
-// set exceeded CANDIDATE_CAP and the tail is unreachable by pagination.
+// #530 Phase B — the semantic (vector) layer's per-request status.
+//  - `state`: 'full' when a provider resolved and the vector arm ran this
+//    request; 'off' otherwise (kill-switch, no provider, or a degrade).
+//  - `available`: whether the vector arm actually contributed this request.
+//  - `reason`: why the arm did NOT run — 'no-provider' (no embedding provider
+//    resolved) or 'degraded' (sidecar down / query embed timed out).
+//  - `indexed`/`total`: reserved for PR-2 coverage reporting (unused in PR-1).
+export class SearchSemanticDto {
+  state: 'full' | 'off';
+  available: boolean;
+  reason?: 'no-provider' | 'degraded';
+  indexed?: number;
+  total?: number;
+}
+
+// The paginated envelope (A5). `total` is the permission-filtered count of the
+// candidate UNION (lexical ∪ vector top-N, fail-closed) — a deliberate, #530
+// documented change from Phase A's exact-lexical count (on a semantic degrade it
+// falls back to exactly that lexical count). `hasMore` is true when more results
+// exist WITHIN the fusion window; `truncatedAtCap` signals the match set exceeded
+// CANDIDATE_CAP and the tail is unreachable by pagination.
 export class SearchResponseDto {
   items: SearchResultDto[];
   total: number;
@@ -53,4 +70,7 @@ export class SearchResponseDto {
     mode: 'or' | 'and';
     match: string;
   };
+  // Absent on the early-exit paths (empty/garbage query); present once search
+  // actually runs. Optional so those short-circuit responses stay valid.
+  semantic?: SearchSemanticDto;
 }

@@ -108,6 +108,23 @@ export function isUniqueViolation(err: unknown): boolean {
   return (err as { code?: unknown } | null | undefined)?.code === PG_UNIQUE_VIOLATION;
 }
 
+/** Postgres `query_canceled` SQLSTATE — raised when statement_timeout fires. */
+const PG_QUERY_CANCELED = '57014';
+
+/**
+ * Whether `err` is a Postgres statement-timeout cancellation (SQLSTATE `57014`).
+ * Used by #530 semantic search to degrade a slow vector scan to lexical-only
+ * instead of hanging/500-ing. Matches on the SQLSTATE (the driver surfaces it as
+ * `.code`), with a message fallback for any wrapper that drops the code.
+ */
+export function isStatementTimeout(err: unknown): boolean {
+  if ((err as { code?: unknown } | null | undefined)?.code === PG_QUERY_CANCELED) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : '';
+  return /canceling statement due to statement timeout/i.test(msg);
+}
+
 /**
  * The name of the UNIQUE index/constraint a `23505` error violated, or
  * undefined. The `kysely-postgres-js` / `postgres@3.x` driver surfaces it as
