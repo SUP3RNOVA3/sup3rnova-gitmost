@@ -32,6 +32,14 @@ describe('EmbeddingIndexerService.reindexWorkspace fail-fast', () => {
     const pageEmbeddingRepo = {};
     const aiService = {
       getEmbeddingModel: jest.fn().mockResolvedValue('some-model'),
+      // #530: reindexWorkspace's pre-check now resolves the provider (workspace
+      // or global). Resolve it so the batch control flow under test proceeds.
+      resolveEmbeddingProvider: jest.fn().mockResolvedValue({
+        model: 'some-model',
+        queryPrefix: '',
+        docPrefix: '',
+        fingerprint: 'fp-test',
+      }),
     };
     // Progress is a best-effort cosmetic store; mock its async methods so the
     // batch control flow can be tested without Redis.
@@ -108,6 +116,14 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
     const pageEmbeddingRepo = {};
     const aiService = {
       getEmbeddingModel: jest.fn().mockResolvedValue('some-model'),
+      // #530: reindexWorkspace's pre-check now resolves the provider (workspace
+      // or global). Resolve it so the batch control flow under test proceeds.
+      resolveEmbeddingProvider: jest.fn().mockResolvedValue({
+        model: 'some-model',
+        queryPrefix: '',
+        docPrefix: '',
+        fingerprint: 'fp-test',
+      }),
     };
     const reindexProgress = {
       start: jest.fn().mockResolvedValue(undefined),
@@ -174,7 +190,7 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
     const { service, aiService, reindexProgress } = makeService();
     // Embeddings not configured: reindexWorkspace returns early WITHOUT starting
     // a fresh record, but the finally must still clear the enqueue-time seed.
-    aiService.getEmbeddingModel = jest
+    aiService.resolveEmbeddingProvider = jest
       .fn()
       .mockRejectedValue(new AiEmbeddingNotConfiguredException());
 
@@ -185,5 +201,89 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
     expect(reindexProgress.start).not.toHaveBeenCalled();
     expect(reindexProgress.clear).toHaveBeenCalledTimes(1);
     expect(reindexProgress.clear).toHaveBeenCalledWith(WORKSPACE_ID);
+  });
+});
+
+/**
+ * #530 PR-1: reindexPage must (a) prepend the provider's DOC prefix to each chunk
+ * BEFORE embedding (so stored vectors live in the same prefixed space as a
+ * prefixed query), and (b) stamp the ACTIVE fingerprint on every inserted row (so
+ * search only fuses same-generation vectors). Uses lightweight mocks; the tx is
+ * stubbed to run its callback inline.
+ */
+describe('EmbeddingIndexerService.reindexPage doc-prefix + fingerprint (#530)', () => {
+  const WORKSPACE_ID = 'ws-1';
+  const SPACE_ID = 'space-1';
+  const PAGE_ID = 'page-1';
+
+  function makeService(docPrefix: string) {
+    const pageRepo = {
+      findById: jest.fn().mockResolvedValue({
+        id: PAGE_ID,
+        workspaceId: WORKSPACE_ID,
+        spaceId: SPACE_ID,
+        title: 'Заголовок',
+        // No ProseMirror content -> the plain-text fallback path (single chunk).
+        content: null,
+        textContent: 'простой текст страницы',
+        deletedAt: null,
+      }),
+    };
+    const insertChunks = jest.fn().mockResolvedValue(undefined);
+    const pageEmbeddingRepo = {
+      deleteByPage: jest.fn().mockResolvedValue(undefined),
+      insertChunks,
+    };
+    const embedWithModel = jest.fn().mockResolvedValue([[0.1, 0.2, 0.3]]);
+    const aiService = {
+      resolveEmbeddingProvider: jest.fn().mockResolvedValue({
+        model: { modelId: 'e5-small' },
+        queryPrefix: 'query: ',
+        docPrefix,
+        fingerprint: 'fp-gen-1',
+      }),
+      embedWithModel,
+    };
+    const reindexProgress = {};
+    // Stub the tx so executeTx runs its callback inline against a fake trx.
+    const db = {
+      transaction: () => ({ execute: (cb: any) => cb({}) }),
+    };
+    const service = new EmbeddingIndexerService(
+      pageRepo as unknown as PageRepo,
+      pageEmbeddingRepo as unknown as PageEmbeddingRepo,
+      aiService as unknown as AiService,
+      reindexProgress as unknown as EmbeddingReindexProgressService,
+      db as unknown as KyselyDB,
+    );
+    return { service, embedWithModel, insertChunks };
+  }
+
+  it('prepends the doc prefix to each chunk and stamps the fingerprint on rows', async () => {
+    const { service, embedWithModel, insertChunks } = makeService('passage: ');
+    await service.reindexPage(PAGE_ID);
+
+    // Embedded values are DOC-prefixed; the model is the resolved provider model.
+    expect(embedWithModel).toHaveBeenCalledTimes(1);
+    const [modelArg, wsArg, valuesArg] = embedWithModel.mock.calls[0];
+    expect(modelArg).toEqual({ modelId: 'e5-small' });
+    expect(wsArg).toBe(WORKSPACE_ID);
+    expect(valuesArg).toEqual(['passage: простой текст страницы']);
+
+    // Inserted rows carry the active fingerprint and the ORIGINAL (un-prefixed)
+    // content (the prefix is an embedding-space artifact, not stored text).
+    expect(insertChunks).toHaveBeenCalledTimes(1);
+    const rows = insertChunks.mock.calls[0][0];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].fingerprint).toBe('fp-gen-1');
+    expect(rows[0].content).toBe('простой текст страницы');
+    expect(rows[0].modelName).toBe('e5-small');
+  });
+
+  it('does not prefix when the provider has an empty doc prefix', async () => {
+    const { service, embedWithModel } = makeService('');
+    await service.reindexPage(PAGE_ID);
+    const [, , valuesArg] = embedWithModel.mock.calls[0];
+    expect(valuesArg).toEqual(['простой текст страницы']);
   });
 });

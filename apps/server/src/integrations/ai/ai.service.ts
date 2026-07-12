@@ -23,6 +23,50 @@ import {
 import { AiProviderCredentialsRepo } from '@docmost/db/repos/ai-chat/ai-provider-credentials.repo';
 import { SecretBoxService } from '../crypto/secret-box';
 import { AiDriver } from './ai.types';
+import { createHash } from 'node:crypto';
+
+/**
+ * A resolved embedding provider for #530 semantic search. `model` is the AI SDK
+ * embedding model; `queryPrefix`/`docPrefix` are prepended to a query / a stored
+ * chunk respectively (e5-style `"query: "` / `"passage: "`, empty for a non-e5
+ * provider); `fingerprint` is the deterministic id of the whole configuration.
+ */
+export interface ResolvedEmbeddingProvider {
+  model: EmbeddingModel;
+  queryPrefix: string;
+  docPrefix: string;
+  fingerprint: string;
+}
+
+/**
+ * Deterministic embedding FINGERPRINT (#530). Encodes model id + revision +
+ * prefix scheme + dimensions so that ANY of them changing (a revision bump, a
+ * prefix toggle) yields a DIFFERENT fingerprint even when the bare model name and
+ * dimension are unchanged. Deliberately NOT the bare model name: two rows from
+ * the same model but a different revision/prefix must not be fused together.
+ *
+ * Exported as a pure function so it can be unit-tested in isolation and reused by
+ * the indexer without a service instance.
+ */
+export function computeEmbeddingFingerprint(parts: {
+  modelId: string;
+  revision: string;
+  queryPrefix: string;
+  docPrefix: string;
+  dimensions: number | null;
+}): string {
+  // The two prefixes are SEPARATE keys (not a concatenated string): JSON.stringify
+  // escapes each independently, so the prefix scheme ("a","") is distinct from
+  // ("","a") with no separator/collision hazard even if a prefix contains spaces.
+  const canonical = JSON.stringify({
+    m: parts.modelId,
+    r: parts.revision,
+    q: parts.queryPrefix,
+    d: parts.docPrefix,
+    dim: parts.dimensions ?? 0,
+  });
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+}
 
 /**
  * Optional chat-model override carried by an agent role (`ai_agent_roles.
@@ -362,11 +406,112 @@ export class AiService {
   async embedTexts(workspaceId: string, texts: string[]): Promise<number[][]> {
     if (texts.length === 0) return [];
     const model = await this.getEmbeddingModel(workspaceId);
-    // Bound the embedding call: a slow/hung embeddings endpoint must fail loudly
-    // (and let the caller move on to the next page) instead of blocking forever.
-    // The single signal caps the WHOLE call, including the SDK's internal
-    // retries/backoff (embedMany defaults to maxRetries: 2).
-    const timeoutMs = AiService.embeddingTimeoutMs();
+    return this.embedWithModel(model, workspaceId, texts);
+  }
+
+  /**
+   * #530: resolve the embedding provider for a workspace. Prefers the workspace's
+   * own configured embedding provider; falls back to the GLOBAL env provider (a
+   * TEI sidecar via the OpenAI-compatible path) when the workspace has none.
+   * Returns the model + the query/doc prefixes + the config fingerprint. Throws
+   * AiEmbeddingNotConfiguredException when NEITHER resolves, so callers can drive
+   * a `no-provider` degrade path.
+   */
+  async resolveEmbeddingProvider(
+    workspaceId: string,
+  ): Promise<ResolvedEmbeddingProvider> {
+    // 1. Per-workspace provider (uses the workspace's own creds/endpoint). When
+    //    it is not configured getEmbeddingModel throws the not-configured
+    //    exception; we swallow ONLY that and fall through to the global provider.
+    try {
+      const model = await this.getEmbeddingModel(workspaceId);
+      const modelId =
+        typeof model === 'string' ? model : (model.modelId ?? 'unknown');
+      // A per-workspace (typically non-e5) provider gets no e5-style prefixes.
+      return {
+        model,
+        queryPrefix: '',
+        docPrefix: '',
+        fingerprint: computeEmbeddingFingerprint({
+          modelId,
+          revision: 'workspace',
+          queryPrefix: '',
+          docPrefix: '',
+          dimensions: null,
+        }),
+      };
+    } catch (err) {
+      if (!(err instanceof AiEmbeddingNotConfiguredException)) throw err;
+    }
+
+    // 2. Global env provider (TEI sidecar). TEI is OpenAI-compatible, so reuse
+    //    the existing openai path — no new SDK. A dummy key is fine for a
+    //    keyless self-hosted sidecar.
+    const endpoint = process.env.EMBEDDING_ENDPOINT?.trim();
+    const globalModel = process.env.EMBEDDING_MODEL?.trim();
+    if (endpoint && globalModel) {
+      const model = createOpenAI({
+        baseURL: endpoint,
+        apiKey: process.env.EMBEDDING_API_KEY || 'unused',
+      }).textEmbeddingModel(globalModel);
+      const queryPrefix = process.env.EMBEDDING_QUERY_PREFIX ?? '';
+      const docPrefix = process.env.EMBEDDING_DOC_PREFIX ?? '';
+      const dimRaw = Number(process.env.EMBEDDING_DIMENSIONS);
+      const dimensions = Number.isFinite(dimRaw) && dimRaw > 0 ? dimRaw : null;
+      return {
+        model,
+        queryPrefix,
+        docPrefix,
+        fingerprint: computeEmbeddingFingerprint({
+          modelId: globalModel,
+          revision: process.env.EMBEDDING_REVISION ?? '',
+          queryPrefix,
+          docPrefix,
+          dimensions,
+        }),
+      };
+    }
+
+    // Neither resolved -> drives semantic.reason=no-provider.
+    throw new AiEmbeddingNotConfiguredException();
+  }
+
+  /**
+   * #530: embed a SEARCH QUERY. Resolves the provider, prepends its query prefix,
+   * and embeds the single value under its OWN short timeout
+   * (SEARCH_EMBED_TIMEOUT_MS, default 800ms) — NOT the long batch-indexing
+   * timeout — so a slow/hung sidecar degrades search fast. Throws on
+   * timeout/error (the caller degrades to the lexical-only path). Returns the
+   * vector plus the active fingerprint used to filter candidate rows.
+   */
+  async embedQuery(
+    workspaceId: string,
+    text: string,
+  ): Promise<{ vector: number[]; fingerprint: string }> {
+    const provider = await this.resolveEmbeddingProvider(workspaceId);
+    const [vector] = await this.embedWithModel(
+      provider.model,
+      workspaceId,
+      [provider.queryPrefix + text],
+      AiService.searchEmbedTimeoutMs(),
+    );
+    return { vector, fingerprint: provider.fingerprint };
+  }
+
+  /**
+   * Embed values with an EXPLICIT model, bounded by `timeoutMs` (default: the
+   * batch-indexing timeout). Shared core of embedTexts / embedQuery: a slow/hung
+   * embeddings endpoint must fail loudly instead of blocking forever. The single
+   * signal caps the WHOLE call, including the SDK's internal retries/backoff
+   * (embedMany defaults to maxRetries: 2).
+   */
+  async embedWithModel(
+    model: EmbeddingModel,
+    workspaceId: string,
+    texts: string[],
+    timeoutMs: number = AiService.embeddingTimeoutMs(),
+  ): Promise<number[][]> {
+    if (texts.length === 0) return [];
     const signal = AbortSignal.timeout(timeoutMs);
     try {
       const { embeddings } = await embedMany({
@@ -391,8 +536,8 @@ export class AiService {
       if (signal.aborted && abortLike) {
         throw new Error(
           `Embedding request timed out after ${timeoutMs}ms ` +
-            `(workspace ${workspaceId}, ${texts.length} chunk(s)). ` +
-            `Increase AI_EMBEDDING_TIMEOUT_MS or check the embeddings endpoint.`,
+            `(workspace ${workspaceId}, ${texts.length} value(s)). ` +
+            `Increase the embedding timeout or check the embeddings endpoint.`,
         );
       }
       throw err;
@@ -406,6 +551,16 @@ export class AiService {
   private static embeddingTimeoutMs(): number {
     const raw = Number(process.env.AI_EMBEDDING_TIMEOUT_MS);
     return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+  }
+
+  /**
+   * #530: per-call timeout for the interactive SEARCH query embed. Much shorter
+   * than the batch-indexing timeout (a search request cannot wait 2 minutes on
+   * the sidecar). Configurable via SEARCH_EMBED_TIMEOUT_MS; default 800ms.
+   */
+  private static searchEmbedTimeoutMs(): number {
+    const raw = Number(process.env.SEARCH_EMBED_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 800;
   }
 
   // Build a tiny valid WAV (mono, 16-bit PCM, 16 kHz, ~1s of silence), used only
