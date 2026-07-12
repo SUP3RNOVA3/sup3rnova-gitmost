@@ -691,6 +691,22 @@ export interface AiChatRuns {
   updatedAt: Generated<Timestamp>;
 }
 
+// Append-only per-step persistence for an assistant turn (#492). Mirrors
+// migration 20260708T120000-ai-chat-run-steps.ts. Each finished agent step's UI
+// `parts` are INSERTed as their own row (instead of rewriting the message row's
+// growing `metadata.parts` jsonb every step — an O(n²) WAL/TOAST churn). The full
+// `metadata.parts` is assembled once at finalize; mid-run a resuming client's seed
+// is rebuilt by concatenating these rows in `stepIndex` order. Cascades with the
+// assistant message row it projects.
+export interface AiChatRunSteps {
+  id: Generated<string>;
+  messageId: string;
+  workspaceId: string;
+  stepIndex: number;
+  parts: Json;
+  createdAt: Generated<Timestamp>;
+}
+
 // Per-(chat,page) snapshot of the open page's Markdown at the END of the agent's
 // previous turn (#274). Mirrors migration 20260702T120000-ai-chat-page-snapshot.ts.
 // The next turn diffs the CURRENT Markdown against `contentMd` to surface edits a
@@ -728,6 +744,7 @@ export interface DB {
   aiChats: AiChats;
   aiChatMessages: AiChatMessages;
   aiChatRuns: AiChatRuns;
+  aiChatRunSteps: AiChatRunSteps;
   aiChatPageSnapshots: AiChatPageSnapshots;
   apiKeys: ApiKeys;
   attachments: Attachments;

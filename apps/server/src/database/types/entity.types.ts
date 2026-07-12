@@ -4,6 +4,7 @@ import {
   AiChats,
   AiChatMessages,
   AiChatRuns,
+  AiChatRunSteps,
   AiChatPageSnapshots,
   Attachments,
   Comments,
@@ -63,6 +64,12 @@ export type InsertableAiChatMessage = Omit<Insertable<AiChatMessages>, 'tsv'>;
 // detached from the HTTP request / browser window.
 export type AiChatRun = Selectable<AiChatRuns>;
 export type InsertableAiChatRun = Insertable<AiChatRuns>;
+
+// AI Chat Run Step (#492): append-only per-step parts persistence. Each finished
+// agent step's UI parts are stored as their own row; the full turn's parts are
+// assembled from these (in stepIndex order) for a mid-run resume seed.
+export type AiChatRunStep = Selectable<AiChatRunSteps>;
+export type InsertableAiChatRunStep = Insertable<AiChatRunSteps>;
 
 // AI Chat Page Snapshot (#274): per-(chat,page) Markdown snapshot taken at the
 // end of the agent's previous turn, diffed against the current page next turn to
