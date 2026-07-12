@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import type { UIMessage } from "@ai-sdk/react";
 import ToolCallCard from "@/features/ai-chat/components/tool-call-card.tsx";
 import ReasoningBlock from "@/features/ai-chat/components/reasoning-block.tsx";
+import { StreamingMarkdownText } from "@/features/ai-chat/components/streaming-markdown-text.tsx";
 import ChatErrorAlert from "@/features/ai-chat/components/chat-error-alert.tsx";
 import ChatStoppedNotice from "@/features/ai-chat/components/chat-stopped-notice.tsx";
 import { ToolUiPart, isToolPart } from "@/features/ai-chat/utils/tool-parts.tsx";
@@ -86,17 +87,39 @@ interface MessageItemProps {
  * One assistant text part rendered as sanitized markdown. Memoized on its inputs
  * so a finalized text part is NOT re-parsed on every streamed delta: during a
  * turn only the actively-growing tail part changes its `text`, so every earlier
- * part hits the memo and skips the expensive marked + DOMPurify pass. Props are
- * primitives, so React.memo's default shallow compare is exactly right (the
- * `text` string is compared by value).
+ * part hits the memo and skips the expensive canonical parse + DOMPurify pass.
+ * Props are primitives, so React.memo's default shallow compare is exactly right
+ * (the `text` string is compared by value).
+ *
+ * Streaming gate (#492) — mirrors ReasoningBlock:
+ *  - `streaming` (this is the live, actively-growing tail part of an in-flight
+ *    turn): render incrementally via StreamingMarkdownText — the stabilized blocks
+ *    go through the canonical pipeline (each parsed ONCE, memoized) and only the
+ *    live tail is cheap plain text. This makes the per-tick cost O(new blocks),
+ *    not the pre-#492 O(ticks) whole-answer re-parse on every ~20Hz delta.
+ *  - finalized (the common case, and the turn-end flip): render the WHOLE text
+ *    through ONE canonical pass — byte-identical to the pre-#492 output (visual
+ *    parity). The row re-renders on the streaming→done flip because
+ *    `messageSignature` tracks each part's `state` (and `turnStreaming` flips at
+ *    turn end), so the incremental view always converges to this single render.
  */
 const MarkdownPart = memo(function MarkdownPart({
   text,
   neutralizeInternalLinks,
+  streaming,
 }: {
   text: string;
   neutralizeInternalLinks: boolean;
+  streaming: boolean;
 }) {
+  if (streaming) {
+    return (
+      <StreamingMarkdownText
+        text={text}
+        neutralizeInternalLinks={neutralizeInternalLinks}
+      />
+    );
+  }
   const html = renderChatMarkdown(text, { neutralizeInternalLinks });
   if (html) {
     return (
@@ -179,47 +202,10 @@ function MessageItem({
         {resolveAssistantName(assistantName) ?? t("AI agent")}
       </Text>
       {message.parts.map((part, index) => {
-        if (part.type === "reasoning") {
-          // Reasoning ("thinking") -> a collapsible block with its own token
-          // count. Empty/whitespace reasoning with no authoritative count carries
-          // nothing to show, so skip it (avoids an empty 0-token block).
-          const text = (part as { text?: string }).text ?? "";
-          if (!text.trim() && !(reasoningTokens && reasoningTokens > 0))
-            return null;
-          // Absent state (persisted rows) and "done" both mean finalized.
-          // `messageSignature` already includes each part's `state`, so the
-          // streaming→done flip changes the row signature and re-renders this
-          // row — which is what lets ReasoningBlock switch from chunked plain
-          // text to its one-time markdown parse (see reasoning-block.tsx).
-          // ALSO require the turn to be live: a part stranded at
-          // `state:"streaming"` after the turn ended (no `reasoning-end` — see
-          // the `turnStreaming` prop doc) must still finalize and parse.
-          const streaming =
-            turnStreaming && (part as { state?: string }).state === "streaming";
-          return (
-            <ReasoningBlock
-              key={index}
-              text={text}
-              tokens={reasoningTokens}
-              streaming={streaming}
-            />
-          );
-        }
-
-        if (part.type === "text") {
-          // Skip empty/whitespace-only text parts (a streaming message often
-          // starts with an empty text part before the first token arrives); the
-          // typing indicator covers that gap until real content streams in.
-          if (!part.text.trim()) return null;
-          return (
-            <MarkdownPart
-              key={index}
-              text={part.text}
-              neutralizeInternalLinks={neutralizeInternalLinks}
-            />
-          );
-        }
-
+        // Tool parts (`tool-*` / `dynamic-tool`) are template-literal kinds, so
+        // they cannot be a `switch` case; the runtime guard handles them, and the
+        // switch below covers every CLOSED (literal-typed) part kind with a
+        // compile-time exhaustiveness check in its default.
         if (isToolPart(part.type)) {
           return (
             <ToolCallCard
@@ -232,7 +218,76 @@ function MessageItem({
           );
         }
 
-        return null;
+        switch (part.type) {
+          case "reasoning": {
+            // Reasoning ("thinking") -> a collapsible block with its own token
+            // count. Empty/whitespace reasoning with no authoritative count
+            // carries nothing to show, so skip it (avoids an empty 0-token block).
+            const text = part.text ?? "";
+            if (!text.trim() && !(reasoningTokens && reasoningTokens > 0))
+              return null;
+            // Absent state (persisted rows) and "done" both mean finalized.
+            // `messageSignature` already includes each part's `state`, so the
+            // streaming→done flip changes the row signature and re-renders this
+            // row — which is what lets ReasoningBlock switch from chunked plain
+            // text to its one-time markdown parse (see reasoning-block.tsx).
+            // ALSO require the turn to be live: a part stranded at
+            // `state:"streaming"` after the turn ended (no `reasoning-end` — see
+            // the `turnStreaming` prop doc) must still finalize and parse.
+            const streaming = turnStreaming && part.state === "streaming";
+            return (
+              <ReasoningBlock
+                key={index}
+                text={text}
+                tokens={reasoningTokens}
+                streaming={streaming}
+              />
+            );
+          }
+
+          case "text": {
+            // Skip empty/whitespace-only text parts (a streaming message often
+            // starts with an empty text part before the first token arrives); the
+            // typing indicator covers that gap until real content streams in.
+            if (!part.text.trim()) return null;
+            // The live, actively-growing tail part of the in-flight turn renders
+            // incrementally (see MarkdownPart); a finalized part (persisted, or
+            // the turn-end flip) renders the whole text through one canonical
+            // pass. Same liveness rule as the reasoning branch above.
+            const streaming = turnStreaming && part.state === "streaming";
+            return (
+              <MarkdownPart
+                key={index}
+                text={part.text}
+                neutralizeInternalLinks={neutralizeInternalLinks}
+                streaming={streaming}
+              />
+            );
+          }
+
+          case "source-url":
+          case "source-document":
+          case "file":
+          case "step-start":
+            // Not surfaced in the chat bubble (v1) — same as the pre-#492 default.
+            return null;
+
+          default: {
+            // Compile-time exhaustiveness over the CLOSED union members: every
+            // literal-typed part kind is handled above, so the only kinds that
+            // can reach here are the OPEN template-literal ones (`tool-*` — caught
+            // by the guard at runtime — and `data-*`) plus `dynamic-tool`. Adding
+            // a NEW closed part kind to UIMessagePart makes this assignment fail
+            // to compile, forcing it to be handled instead of silently ignored
+            // (this replaces the pre-#492 fall-through `return null` + WARNING).
+            const _exhaustive:
+              | `tool-${string}`
+              | "dynamic-tool"
+              | `data-${string}` = part.type;
+            void _exhaustive;
+            return null;
+          }
+        }
       })}
       {/* A persisted turn error (server stored it in metadata.error). Rendered
           here so it survives a thread remount and shows in reopened history. */}

@@ -27,6 +27,7 @@ vi.mock("@/features/ai-chat/utils/markdown.ts", async () => {
 
 import MessageItem from "./message-item";
 import { messageSignature } from "@/features/ai-chat/utils/message-signature.ts";
+import { splitPlainChunks } from "./streaming-plain-text";
 
 // matchMedia (read by MantineProvider) is stubbed globally in vitest.setup.ts.
 
@@ -112,5 +113,91 @@ describe("MessageItem markdown memoization", () => {
     // The grown text now renders (the memo did NOT freeze the empty mount).
     expect(callsFor("streamed answer")).toBe(1);
     expect(queryByText("streamed answer")).not.toBeNull();
+  });
+});
+
+// PERF SMOKE (#492): the whole point of the incremental streaming render is that
+// the ANSWER path costs O(number of markdown blocks), NOT O(number of throttled
+// ~20Hz ticks). Pre-#492 the finalized MarkdownPart re-parsed the WHOLE growing
+// answer on every delta — a synthetic ~100 KB stream measured 394 renderChatMarkdown
+// calls (one per tick). With the incremental render each STABILIZED block is parsed
+// exactly once (memoized in MarkdownChunk) and the live tail is cheap plain text, so
+// the call count collapses to ~= the block count regardless of tick granularity.
+describe("MessageItem streaming answer render is O(blocks), not O(ticks)", () => {
+  // ~100 KB answer. Each section is a heading + a paragraph — TWO blank-line
+  // delimited markdown blocks — so the safe-cut block count is ~2× the section
+  // count. The perf claim is about the BLOCK count (the memoization granularity),
+  // measured directly with splitPlainChunks below, not the section count.
+  const buildAnswer = () => {
+    const SECTIONS = 100;
+    const paragraphs: string[] = [];
+    for (let i = 0; i < SECTIONS; i++) {
+      paragraphs.push(`## Section ${i}\n\n` + "lorem ipsum dolor ".repeat(55));
+    }
+    const full = paragraphs.join("\n\n");
+    // The number of memoized markdown blocks the incremental render splits into
+    // (all but the live tail are parsed once each).
+    return { full, blocks: splitPlainChunks(full).length };
+  };
+
+  const streamMsg = (text: string, state: "streaming" | "done"): UIMessage =>
+    ({
+      id: "m1",
+      role: "assistant",
+      parts: [{ type: "text", text, state }],
+    }) as UIMessage;
+
+  it("parses each block ~once over a 100KB stream (≈blocks, ≪ ticks)", () => {
+    renderChatMarkdownSpy.mockClear();
+    const { full, blocks } = buildAnswer();
+    const CHUNK = 128; // a realistic ~20Hz throttled delta size
+    const ticks = Math.ceil(full.length / CHUNK);
+
+    let msg = streamMsg(full.slice(0, CHUNK), "streaming");
+    const { rerender } = render(
+      <MantineProvider>
+        <MessageItem
+          message={msg}
+          signature={messageSignature(msg)}
+          turnStreaming
+        />
+      </MantineProvider>,
+    );
+    for (let end = 2 * CHUNK; end < full.length; end += CHUNK) {
+      msg = streamMsg(full.slice(0, end), "streaming");
+      rerender(
+        <MantineProvider>
+          <MessageItem
+            message={msg}
+            signature={messageSignature(msg)}
+            turnStreaming
+          />
+        </MantineProvider>,
+      );
+    }
+    // Finalize: the streaming→done flip renders the whole answer through ONE
+    // canonical pass (visual parity), so the finished DOM matches the pre-#492
+    // output. This is the single extra parse on top of the per-block ones.
+    const done = streamMsg(full, "done");
+    rerender(
+      <MantineProvider>
+        <MessageItem message={done} signature={messageSignature(done)} />
+      </MantineProvider>,
+    );
+
+    const calls = renderChatMarkdownSpy.mock.calls.length;
+    // Sanity: the stream really had far more ticks than blocks (else the test is
+    // vacuous — the point is that calls scale with blocks, not ticks).
+    expect(ticks).toBeGreaterThan(blocks * 3);
+    // O(blocks): each stabilized block parsed once + the single final whole-text
+    // parse. A small constant absorbs the finalize render and the live-tail block;
+    // the load-bearing claim is the bound below.
+    expect(calls).toBeLessThanOrEqual(blocks + 2);
+    // ≪ ticks — and, non-vacuously, the blocks WERE parsed (not skipped entirely).
+    expect(calls).toBeLessThan(ticks / 3);
+    expect(calls).toBeGreaterThan(blocks / 2);
+    // MUTATION-VERIFY (documented, not run here): dropping the `memo()` wrapper on
+    // MarkdownChunk (so every stable block re-parses each tick) drives `calls`
+    // toward `ticks` (~394), reddening both upper-bound assertions above.
   });
 });
