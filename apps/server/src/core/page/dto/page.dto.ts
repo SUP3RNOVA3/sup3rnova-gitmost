@@ -9,10 +9,16 @@ import {
 import { Transform } from 'class-transformer';
 
 import { ContentFormat } from './create-page.dto';
+import { IsPageIdOrSlugId } from './page-identity.validator';
 
 export class PageIdDto {
   @IsString()
   @IsNotEmpty()
+  // Format-validate the double identity (#435): accept only a page UUID or a
+  // 10-char slugId so a malformed / swapped identity is rejected at the boundary
+  // rather than passed to the repo as a bare string. Base for PageInfoDto,
+  // DeletePageDto, BacklinksListDto, AddLabelsDto/RemoveLabelDto, etc.
+  @IsPageIdOrSlugId()
   pageId: string;
 }
 

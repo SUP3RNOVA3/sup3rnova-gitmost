@@ -82,17 +82,19 @@ describe("applyMoveTreeNode", () => {
     ]);
   });
 
-  it("does NOT create a partial child list when the destination is loaded-but-collapsed (children unloaded) — keeps it lazy-loadable (#159)", () => {
-    // `dstCollapsed` is in the tree but its children were never lazy-loaded
-    // (children === undefined). The OLD behavior inserted `src` as the ONLY
-    // child ([src]), which defeated the lazy-load gate and HID the parent's
-    // other real children. Now the move leaves children unloaded (so expanding
-    // fetches the FULL set, including src) and just flags hasChildren.
+  it("does NOT create a partial child list when the destination is loaded-but-collapsed (children unloaded) — keeps it lazy-loadable (#159 #525)", () => {
+    // `dstCollapsed` is in the tree but its children were never lazy-loaded. The
+    // CANONICAL unloaded form here is `hasChildren: true` + `children: []` (from
+    // `pageToTreeNode` / `pruneCollapsedChildren`), NOT `children: undefined`.
+    // The pre-#525 predicate (`children === undefined`) missed this form and
+    // inserted `src` as the ONLY child ([src]), defeating the lazy-load gate and
+    // HIDING the parent's other real children. Now the move leaves children
+    // unloaded (so expanding fetches the FULL set, including src).
     const tree: SpaceTreeNode[] = [
       node("dstCollapsed", {
         position: "a0",
-        hasChildren: false,
-        children: undefined as unknown as SpaceTreeNode[],
+        hasChildren: true,
+        children: [],
       }),
       node("src", { position: "a9" }),
     ];
@@ -105,9 +107,10 @@ describe("applyMoveTreeNode", () => {
       pageData: {},
     });
     const dst = treeModel.find(next, "dstCollapsed");
-    // Children stay unloaded -> the lazy-load gate fetches the FULL set (incl.
-    // src) on expand, rather than showing a misleading partial [src] list.
-    expect(dst?.children).toBeUndefined();
+    // Children stay unloaded ([] not materialized to [src]) -> the lazy-load gate
+    // fetches the FULL set (incl. src) on expand. MUTATION: the pre-#525
+    // `=== undefined` predicate would insert [src] here and redden this.
+    expect(dst?.children).toEqual([]);
     expect(dst?.hasChildren).toBe(true);
     // src moved away from its old root slot (it lives under dstCollapsed
     // server-side and reappears when the parent is expanded/loaded).

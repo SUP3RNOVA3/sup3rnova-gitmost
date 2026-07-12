@@ -9,7 +9,7 @@ import { Italic } from "@tiptap/extension-italic";
 import { Link } from "@tiptap/extension-link";
 import { gitmostInsertTranscriptIntoEditor } from "./gitmost-recording.ts";
 
-const ZWSP = "​"; // U+200B, the helper's block-trigger neutralizer
+const ZWSP = "​"; // U+200B — asserted ABSENT (the block-escape lives in the serializer now)
 
 /**
  * #377 — the web-side bridge must append the native host's transcript below the
@@ -18,8 +18,9 @@ const ZWSP = "​"; // U+200B, the helper's block-trigger neutralizer
  * regression would be caught), asserting the resulting document rather than
  * mocking the editor: transcript present -> "Transcript" heading + one paragraph
  * per non-empty line; content is inserted as LITERAL TEXT (no HTML/markdown
- * parsing); col-0 markdown block triggers are neutralized so git-sync keeps them
- * paragraphs; absent/empty/non-string -> no-op.
+ * parsing); col-0 markdown block triggers are stored verbatim (the git-sync
+ * serializer block-escapes them, so no client-side ZWSP is needed);
+ * absent/empty/non-string -> no-op.
  */
 describe("gitmostInsertTranscriptIntoEditor", () => {
   const makeEditor = () =>
@@ -91,19 +92,22 @@ describe("gitmostInsertTranscriptIntoEditor", () => {
     editor.destroy();
   });
 
-  it("neutralizes col-0 markdown block triggers with a leading ZWSP (git-sync safety)", () => {
+  it("inserts col-0 markdown block triggers as verbatim paragraph text (no ZWSP workaround)", () => {
     const editor = makeEditor();
-    // Trigger lines (some with a leaked indent) + a normal prefixed line.
+    // Trigger lines (some with a leaked indent) + a normal prefixed line. The
+    // git-sync serializer now block-escapes a leading trigger itself, so the
+    // bridge inserts each line's TEXT byte-exact (only the leaked indent is
+    // trimmed) — no invisible ZWSP is prepended anymore.
     const inserted = gitmostInsertTranscriptIntoEditor(
       editor,
       [
         "- dash",
-        "  > quote", // leading indent must be trimmed then neutralized
+        "  > quote", // leading indent is trimmed, text otherwise verbatim
         "# hash",
         "1. one",
         "> [!info] note",
         "```js",
-        "---", // solid thematic break -> horizontalRule (text-losing) if unneutralized
+        "---",
         "***",
         "___",
         "You: normal line",
@@ -116,20 +120,23 @@ describe("gitmostInsertTranscriptIntoEditor", () => {
       .map((n: any) => n.content?.[0]?.text)
       .filter((t: any) => typeof t === "string") as string[];
 
-    // Every block-trigger line is prefixed with the invisible ZWSP (indent
-    // trimmed first); the normal `You:` line is left byte-exact.
+    // Each trigger line is stored as its own byte-exact text (indent trimmed);
+    // the git-sync round-trip keeps it a paragraph via the serializer's
+    // block-escape, so no ZWSP is needed here.
     expect(texts).toEqual([
-      ZWSP + "- dash",
-      ZWSP + "> quote",
-      ZWSP + "# hash",
-      ZWSP + "1. one",
-      ZWSP + "> [!info] note",
-      ZWSP + "```js",
-      ZWSP + "---",
-      ZWSP + "***",
-      ZWSP + "___",
+      "- dash",
+      "> quote",
+      "# hash",
+      "1. one",
+      "> [!info] note",
+      "```js",
+      "---",
+      "***",
+      "___",
       "You: normal line",
     ]);
+    // Guard: no invisible ZWSP leaked into any inserted line.
+    for (const t of texts) expect(t).not.toContain(ZWSP);
 
     editor.destroy();
   });

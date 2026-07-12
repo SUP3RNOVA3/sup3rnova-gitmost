@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   createCommentSignalTracker,
+  createListCommentsProbe,
   buildCommentSignalLine,
   defangCommentSignalTitle,
   withCommentSignal,
@@ -24,6 +25,64 @@ test("buildCommentSignalLine: count + pageId + title only, camelCase hint", () =
     buildCommentSignalLine(1, "p1"),
     "[signal] new comments: 1 on page p1 — call listComments(pageId) for details",
   );
+});
+
+// #494 — the SHARED count-source probe both hosts use. These reddens if the
+// counting/title/best-effort logic is broken or drifts from this contract.
+test("#494: createListCommentsProbe counts only comments newer than the watermark", async () => {
+  const client = {
+    async listComments(pageId, includeResolved) {
+      // Reads the FULL feed (incl. resolved).
+      assert.equal(includeResolved, true);
+      return {
+        items: [
+          { createdAt: new Date(1000).toISOString() }, // older -> excluded
+          { createdAt: new Date(3000).toISOString() }, // newer -> counted
+          { createdAt: new Date(4000).toISOString() }, // newer -> counted
+          { createdAt: null }, // no timestamp -> excluded
+          {}, // missing field -> excluded
+        ],
+      };
+    },
+    async getPageRaw() {
+      return { title: "Page T" };
+    },
+  };
+  const probe = createListCommentsProbe(client);
+  const res = await probe("p1", 2000);
+  assert.equal(res.count, 2);
+  assert.equal(res.title, "Page T"); // title fetched on a hit
+});
+
+test("#494: createListCommentsProbe skips the title read when count is 0", async () => {
+  let titleReads = 0;
+  const probe = createListCommentsProbe({
+    async listComments() {
+      return { items: [{ createdAt: new Date(500).toISOString() }] };
+    },
+    async getPageRaw() {
+      titleReads += 1;
+      return { title: "unused" };
+    },
+  });
+  const res = await probe("p1", 2000); // the single comment predates the watermark
+  assert.equal(res.count, 0);
+  assert.equal(res.title, undefined);
+  assert.equal(titleReads, 0); // no-signal path never pays for the title
+});
+
+test("#494: createListCommentsProbe is best-effort on a title fault (count still returned)", async () => {
+  const probe = createListCommentsProbe({
+    async listComments() {
+      return { items: [{ createdAt: new Date(9000).toISOString() }] };
+    },
+    async getPageRaw() {
+      throw new Error("page gone");
+    },
+  });
+  const res = await probe("p1", 1000);
+  assert.equal(res.count, 1);
+  assert.equal(res.title, undefined); // fault swallowed, title omitted
 });
 
 test("defangCommentSignalTitle strips forge/sandwich-break characters", () => {

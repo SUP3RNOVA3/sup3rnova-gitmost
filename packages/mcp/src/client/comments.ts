@@ -59,6 +59,39 @@ import {
   mergeFootnoteDefinitions,
 } from "../lib/transforms.js";
 
+// Max concurrent per-page comment fetches in checkNewComments (#490). The scan is
+// O(N) independent REST reads over the working set; running them one-at-a-time made
+// a large space linear in round-trips. A small cap parallelizes without hammering
+// the server (or exhausting sockets). 6 is a conservative middle of the 5–8 band.
+const COMMENT_SCAN_CONCURRENCY = 6;
+
+/**
+ * Map `items` through `fn` with at most `limit` in flight, preserving INPUT ORDER
+ * in the returned array. A tiny bounded pool (no p-limit dependency): `limit`
+ * workers pull the next index off a shared cursor until the list is drained.
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  };
+  const workers = Array.from(
+    { length: Math.max(1, Math.min(limit, items.length)) },
+    () => worker(),
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 // Public method surface of CommentsMixin (issue #450) — a NAMED type so the factory
 // return type is expressible in the emitted .d.ts (the anonymous mixin class
 // carries the base's protected shared state, which would otherwise trip TS4094).
@@ -450,6 +483,12 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
     // can surface the closest-block / spans-multiple-blocks hint built from the
     // LIVE document (the pre-check page is not in scope there).
     let liveNotFoundError: Error | null = null;
+    // #496: the RAW substring the mark actually covers in the LIVE doc. The
+    // stored selection (payload.selection) came from a DEBOUNCED REST snapshot,
+    // which can differ from the live doc — and apply compares the marked live
+    // text to the stored selection strictly, so a stale snapshot 409s on EVERY
+    // apply. Captured here (same doc version the mark is set in) and synced below.
+    let liveAnchoredSelection: string | null = null;
     try {
       const collabToken = await this.getCollabTokenWithReauth();
       // Open the collab doc by the canonical UUID, never the slugId (#260). The
@@ -489,6 +528,12 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
           }
           if (applyAnchorInDoc(doc, selection as string, newCommentId)) {
             anchored = true;
+            // For a suggestion, re-read the exact substring now under the mark
+            // (the mark is an attribute, so it does not change the raw text) to
+            // sync as the stored expectedText after the mutation resolves.
+            if (hasSuggestion) {
+              liveAnchoredSelection = getAnchoredText(doc, selection as string);
+            }
             return doc;
           }
           // Selection text not found in the LIVE document: abort the write. The
@@ -525,6 +570,36 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
           "createComment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
         )
       );
+    }
+
+    // #496: sync the stored selection (== apply-time expectedText) to the RAW
+    // substring the mark actually covers in the LIVE doc when it diverged from
+    // the debounced REST snapshot we stored at create time. Without this, apply
+    // strictly compares the marked live text to a stale stored selection and
+    // 409s every time. Best-effort: the comment is already correctly anchored, so
+    // a resync failure must NOT roll it back — it only risks a later apply 409,
+    // which we surface as a soft warning.
+    if (
+      hasSuggestion &&
+      liveAnchoredSelection != null &&
+      liveAnchoredSelection !== payload.selection
+    ) {
+      try {
+        await this.client.post("/comments/resync-suggestion-anchor", {
+          commentId: newCommentId,
+          selection: liveAnchoredSelection,
+        });
+        // Reflect the corrected anchor in the returned comment.
+        if (result.data) result.data.selection = liveAnchoredSelection;
+      } catch (e) {
+        if (process.env.DEBUG) {
+          console.error("Failed to resync suggestion anchor:", e);
+        }
+        result.warning =
+          "The suggestion was anchored, but its stored selection could not be " +
+          "synced to the live document; applying it may report a conflict if the " +
+          "text changed. Re-create the suggestion if Apply fails.";
+      }
     }
 
     // Soft warning (like editPageText): the selection only matched after
@@ -660,27 +735,32 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
         this.enumerateSpacePages(spaceId, parentPageId),
       );
 
-    // 2. Fetch comments for each page, keep ones created after since
-    const results: any[] = [];
-    for (const page of pagesInScope) {
-      try {
-        // Full feed (incl. resolved): a "new comments since" scan reports all
-        // recent activity; the active-only filter is scoped to listComments.
-        const comments = (await this.listComments(page.id, true)).items;
-        const newComments = comments.filter(
-          (c: any) => new Date(c.createdAt) > sinceDate,
-        );
-        if (newComments.length > 0) {
-          results.push({
-            pageId: page.id,
-            pageTitle: page.title,
-            comments: newComments,
-          });
+    // 2. Fetch comments for each page, keep ones created after since. Runs with
+    // bounded concurrency (#490) instead of one-at-a-time — the per-page reads are
+    // independent, so a large working set no longer costs O(N) serial round-trips.
+    // Order is preserved (mapWithConcurrency keeps input order), so the output is
+    // deterministic regardless of which fetch finishes first.
+    const perPage = await mapWithConcurrency(
+      pagesInScope,
+      COMMENT_SCAN_CONCURRENCY,
+      async (page: any) => {
+        try {
+          // Full feed (incl. resolved): a "new comments since" scan reports all
+          // recent activity; the active-only filter is scoped to listComments.
+          const comments = (await this.listComments(page.id, true)).items;
+          const newComments = comments.filter(
+            (c: any) => new Date(c.createdAt) > sinceDate,
+          );
+          return newComments.length > 0
+            ? { pageId: page.id, pageTitle: page.title, comments: newComments }
+            : null;
+        } catch (e: any) {
+          // Skip pages with errors (e.g. deleted between calls)
+          return null;
         }
-      } catch (e: any) {
-        // Skip pages with errors (e.g. deleted between calls)
-      }
-    }
+      },
+    );
+    const results: any[] = perPage.filter((r): r is any => r !== null);
 
     const totalNewComments = results.reduce(
       (sum, r) => sum + r.comments.length,

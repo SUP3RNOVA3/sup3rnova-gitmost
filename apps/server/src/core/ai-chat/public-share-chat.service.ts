@@ -307,6 +307,10 @@ export class PublicShareChatService {
         system,
         messages: modelMessages,
         tools,
+        // Pin the AI SDK per-request retry budget explicitly (matches the SDK
+        // default of 2). Connection arithmetic: (1 + maxRetries) × (1 +
+        // AI_STREAM_PRE_RESPONSE_RETRIES) worst-case connects per turn.
+        maxRetries: 2,
         // Bound the agent loop for anonymous callers.
         stopWhen: stepCountIs(5),
         // Cap per-request output so one anonymous call cannot run up the provider

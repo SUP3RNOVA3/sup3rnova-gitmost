@@ -375,10 +375,20 @@ export class AuthService {
     }
   }
 
-  async getCollabToken(user: User, workspaceId: string) {
+  async getCollabToken(
+    user: User,
+    workspaceId: string,
+    // Origin of the request minting this collab token (#501). When the caller is
+    // an api-key principal, its apiKeyId is threaded into the token so the collab
+    // seam can re-check the key on connect (closing api-key -> long-lived-collab
+    // laundering). Absent for a normal session/human request.
+    apiKey?: { apiKeyId: string },
+  ) {
     const token = await this.tokenService.generateCollabToken(
       user,
       workspaceId,
+      undefined,
+      apiKey,
     );
     return { token };
   }

@@ -44,6 +44,55 @@ export type CommentSignalProbe = (
   sinceMs: number,
 ) => Promise<CommentSignalProbeResult>;
 
+/**
+ * The minimal client surface the shared count-source probe needs: the full
+ * comment feed for a page, and the LIGHT raw page info (title only). Both the
+ * standalone MCP client and the in-app loopback client satisfy this.
+ */
+export interface CommentSignalProbeClient {
+  listComments(
+    pageId: string,
+    includeResolved: boolean,
+  ): Promise<{ items: Array<{ createdAt?: string | null }> }>;
+  getPageRaw(pageId: string): Promise<{ title?: string | null } | null | undefined>;
+}
+
+/**
+ * The canonical count-source probe BOTH hosts use (#494). Counts comments on
+ * `pageId` created strictly after `sinceMs`, reading the FULL feed (incl.
+ * resolved) so a human's comment on any thread is seen; then — ONLY on a hit —
+ * fetches the page's title via the LIGHT `getPageRaw` (not the heavy `getPage`,
+ * which also renders Markdown + subpages) to LABEL the signal, so the no-signal
+ * path never pays for it. Extracted so the standalone MCP host (index.ts) and the
+ * in-app host (ai-chat-tools.service.ts) share ONE probe body instead of two
+ * hand-mirrored copies that could silently drift (e.g. one counting resolved
+ * comments and the other not, or one using the heavy page read). Best-effort
+ * title: a `getPageRaw` fault leaves the title undefined and never throws.
+ */
+export function createListCommentsProbe(
+  client: CommentSignalProbeClient,
+): CommentSignalProbe {
+  return async (pageId, sinceMs) => {
+    const { items } = await client.listComments(pageId, true);
+    const count = (items as Array<{ createdAt?: string | null }>).filter((c) => {
+      const created = c && c.createdAt ? new Date(c.createdAt).getTime() : NaN;
+      return Number.isFinite(created) && created > sinceMs;
+    }).length;
+    let title: string | undefined;
+    if (count > 0) {
+      try {
+        const page = (await client.getPageRaw(pageId)) as {
+          title?: string | null;
+        } | null;
+        title = page?.title ?? undefined;
+      } catch {
+        // Title is optional — omit it when the page can't be fetched.
+      }
+    }
+    return { count, title };
+  };
+}
+
 export interface CommentSignalTrackerOptions {
   probe: CommentSignalProbe;
   /** Clock injection for tests. Defaults to Date.now. */

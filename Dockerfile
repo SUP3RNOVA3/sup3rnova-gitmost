@@ -59,6 +59,14 @@ COPY --from=builder /app/packages/mcp/data /app/packages/mcp/data
 COPY --from=builder /app/packages/prosemirror-markdown/build /app/packages/prosemirror-markdown/build
 COPY --from=builder /app/packages/prosemirror-markdown/package.json /app/packages/prosemirror-markdown/package.json
 
+# apps/server imports @docmost/token-estimate (workspace:*) at runtime
+# (history-budget.ts, #490). tsc emits only dist/ and dist/ is gitignored, so the
+# prod install would resolve a broken workspace symlink and the server would die
+# with ERR_MODULE_NOT_FOUND on the first history-budget call. Ship the built
+# package + its manifest, mirroring prosemirror-markdown above.
+COPY --from=builder /app/packages/token-estimate/dist /app/packages/token-estimate/dist
+COPY --from=builder /app/packages/token-estimate/package.json /app/packages/token-estimate/package.json
+
 # Copy root package files
 COPY --from=builder /app/package.json /app/package.json
 COPY --from=builder /app/pnpm*.yaml /app/

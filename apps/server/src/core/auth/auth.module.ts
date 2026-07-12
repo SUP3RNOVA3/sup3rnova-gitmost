@@ -5,9 +5,13 @@ import { JwtStrategy } from './strategies/jwt.strategy';
 import { WorkspaceModule } from '../workspace/workspace.module';
 import { SignupService } from './services/signup.service';
 import { TokenModule } from './token.module';
+import { ApiKeyModule } from '../api-key/api-key.module';
 
 @Module({
-  imports: [TokenModule, WorkspaceModule],
+  // ApiKeyModule supplies ApiKeyService, injected into JwtStrategy so an
+  // api_key Bearer/cookie token is validated directly (replacing the absent EE
+  // `ee/api-key` dynamic require).
+  imports: [TokenModule, WorkspaceModule, ApiKeyModule],
   controllers: [AuthController],
   providers: [AuthService, SignupService, JwtStrategy],
   exports: [SignupService, AuthService],

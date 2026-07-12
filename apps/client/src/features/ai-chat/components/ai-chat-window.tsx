@@ -58,8 +58,11 @@ import ConversationList from "@/features/ai-chat/components/conversation-list.ts
 import ChatThread from "@/features/ai-chat/components/chat-thread.tsx";
 import {
   exportAiChat,
+  getAiChatMessagesDelta,
   stopRun,
 } from "@/features/ai-chat/services/ai-chat-service.ts";
+import { mergeDeltaRowsIntoPages } from "@/features/ai-chat/utils/resume-helpers.ts";
+import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.ts";
 import { useChatSession } from "@/features/ai-chat/hooks/use-chat-session.ts";
 import {
   shouldCollapseOnOutsidePointer,
@@ -269,16 +272,63 @@ export default function AiChatWindow() {
   const { data: messageRows, isLoading: messagesLoading } =
     useAiChatMessagesQuery(
       activeChatId ?? undefined,
-      // DELIBERATELY DUMB: poll every 2.5s WHILE ARMED, otherwise off. NO error
-      // checks (TanStack resets fetchFailureCount each fetch; the poll must survive
-      // a server restart), NO tail checks, NO cap here — the settled/stalled/idle-cap
-      // semantics all live in ChatThread's FSM, which disarms via onResumeFallback.
-      () => (degradedPoll === true ? 2500 : false),
-      // #344: gate on windowOpen too — no message history is fetched (and no
-      // degraded poll runs) while the window is closed; it loads when the window
-      // opens with an active chat.
+      // #491: the full infinite-query no longer POLLS. It seeds the thread ONCE; the
+      // degraded fallback now runs a DELTA poller (below) that augments THIS cache
+      // idempotently, instead of refetching every page (with full parts) every 2.5s.
+      false,
+      // #344: gate on windowOpen too — no message history is fetched while the window
+      // is closed; it loads when the window opens with an active chat.
       windowOpen,
     );
+
+  // #491 degraded DELTA poll. While armed (degradedPoll) and the window is open on a
+  // chat, poll POST /ai-chat/messages/delta every 2.5s: it returns only the rows
+  // CHANGED since the previous cursor (+ the run fact) in ONE round-trip. We merge
+  // those rows into the SAME infinite-query cache the thread reads (idempotently by
+  // id — the delta's overlap window re-delivers rows), so the thread's reconcile
+  // effect follows the detached run to its terminal row from a fraction of the wire
+  // cost. The run-fact settle stays the thread FSM's job (row-status reconcile), so
+  // we do NOT double-poll /run here. Cursor resets when the chat changes / disarms.
+  const deltaCursorRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    deltaCursorRef.current = undefined;
+  }, [activeChatId, degradedPoll]);
+  useEffect(() => {
+    if (!degradedPoll || !windowOpen || !activeChatId) return;
+    const chatId = activeChatId;
+    let cancelled = false;
+    const tick = async (): Promise<void> => {
+      try {
+        const res = await getAiChatMessagesDelta(chatId, deltaCursorRef.current);
+        if (cancelled) return;
+        deltaCursorRef.current = res.cursor;
+        if (res.rows.length > 0) {
+          queryClient.setQueryData(
+            AI_CHAT_MESSAGES_RQ_KEY(chatId),
+            (
+              old:
+                | {
+                    pages: { items: IAiChatMessageRow[]; meta: unknown }[];
+                    pageParams: unknown[];
+                  }
+                | undefined,
+            ) =>
+              old
+                ? { ...old, pages: mergeDeltaRowsIntoPages(old.pages, res.rows) }
+                : old,
+          );
+        }
+      } catch {
+        // Transient failure (e.g. a server restart mid-run): swallow and retry on
+        // the next tick — the poll must survive a bounce, like the old dumb refetch.
+      }
+    };
+    const id = setInterval(() => void tick(), 2500);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [degradedPoll, windowOpen, activeChatId, queryClient]);
 
   // #184 reconnect-and-live-follow. Whether detached agent runs are enabled for
   // this workspace. When the feature is off no runs are ever created, so the

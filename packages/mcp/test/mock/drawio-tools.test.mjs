@@ -170,6 +170,65 @@ test("drawioCreate: before/after requires exactly one anchor", async () => {
   );
 });
 
+// #494 — a NESTED insert (anchored inside a callout/table cell) lands a write
+// that "#<index>" cannot address. The tool used to THROW here even though the
+// diagram was already committed, so a retry-prone agent re-created a DUPLICATE.
+// It must now report SUCCESS (nodeId:null + a warning) so the agent never
+// blind-retries a landed write. This REDDENS if the throw is restored (the
+// assert.doesNotReject + success asserts would fail).
+test("drawioCreate: a NESTED insert succeeds with nodeId:null + a warning (no throw, no duplicate)", async () => {
+  const pageDoc = {
+    type: "doc",
+    content: [
+      {
+        type: "callout",
+        attrs: { id: "co1" },
+        content: [
+          {
+            type: "paragraph",
+            attrs: { id: "inner" },
+            content: [{ type: "text", text: "hello inner" }],
+          },
+        ],
+      },
+    ],
+  };
+  const { client, calls } = makeClient({ pageDoc });
+
+  let res;
+  await assert.doesNotReject(async () => {
+    res = await client.drawioCreate(
+      "page1",
+      { position: "after", anchorNodeId: "inner" },
+      MODEL,
+    );
+  });
+
+  // The write is acknowledged as a SUCCESS...
+  assert.equal(res.success, true);
+  // ...but with NO addressable "#<index>" handle (it is nested).
+  assert.equal(res.nodeId, null);
+  assert.equal(res.attachmentId, "att-1");
+  // A warning tells the agent it is saved (do not re-create) and how to re-read.
+  assert.ok(
+    res.warnings.some((w) => /NESTED|do NOT re-create/i.test(w)),
+    "missing the nested-write warning",
+  );
+
+  // The diagram was written EXACTLY ONCE, nested inside the callout (not a
+  // top-level block) — proving it really landed (so a retry would duplicate).
+  assert.equal(calls.uploads.length, 1);
+  assert.equal(calls.mutations.length, 1);
+  const topLevel = calls.mutations[0].doc.content;
+  assert.ok(
+    !topLevel.some((b) => b && b.type === "drawio"),
+    "the diagram must be nested, not a top-level block",
+  );
+  const nested = findDrawio(calls.mutations[0].doc);
+  assert.equal(nested.length, 1, "exactly one diagram written");
+  assert.equal(nested[0].attrs.attachmentId, "att-1");
+});
+
 // --- drawioGet ------------------------------------------------------------
 
 test("drawioGet: decodes the model and returns meta with a hash", async () => {

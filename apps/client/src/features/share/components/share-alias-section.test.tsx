@@ -13,8 +13,7 @@ let currentAlias: IShareAlias | null = null;
 let availabilityResult: {
   valid: boolean;
   available: boolean;
-  currentPageId: string | null;
-} = { valid: true, available: true, currentPageId: null };
+} = { valid: true, available: true };
 
 vi.mock("@/features/share/queries/share-query.ts", () => ({
   useShareAliasForPageQuery: () => ({ data: currentAlias }),
@@ -56,7 +55,7 @@ describe("ShareAliasSection — taken-name handling is never a dead end", () => 
   beforeEach(() => {
     setMutateAsync.mockReset();
     currentAlias = null;
-    availabilityResult = { valid: true, available: true, currentPageId: null };
+    availabilityResult = { valid: true, available: true };
   });
 
   it("shows a 'will move it here' HINT (not a terminal error) when the name belongs to another page, and keeps Save enabled", async () => {
@@ -65,7 +64,6 @@ describe("ShareAliasSection — taken-name handling is never a dead end", () => 
     availabilityResult = {
       valid: true,
       available: false,
-      currentPageId: "page-X",
     };
 
     renderSection("page-Y");
@@ -97,7 +95,6 @@ describe("ShareAliasSection — taken-name handling is never a dead end", () => 
     availabilityResult = {
       valid: true,
       available: false,
-      currentPageId: "page-X",
     };
     // The server rejects the un-confirmed save asking the client to confirm.
     setMutateAsync.mockRejectedValueOnce({
@@ -106,7 +103,6 @@ describe("ShareAliasSection — taken-name handling is never a dead end", () => 
         status: 409,
         data: {
           code: "ALIAS_REASSIGN_REQUIRED",
-          currentPageId: "page-X",
           currentPageTitle: "Alias Test Page X",
         },
       },

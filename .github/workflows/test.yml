@@ -25,37 +25,65 @@ jobs:
   # filename sorts BEFORE migrations already applied on the target branch (and
   # thus in prod). The Kysely startup migrator rejects that as "corrupted
   # migrations" and crash-loops the app on boot (incident #361). This gate fails
-  # the PR so the migration is renamed to a current timestamp before merge. Only
-  # runs for pull_request events (needs a base branch to diff against).
+  # the PR so the migration is renamed to a current timestamp before merge.
+  # Runs for pull_request (diff against the base branch) AND for push (#476
+  # retrospective: a DIRECT push to develop used to bypass this PR-only gate
+  # entirely — now the push is diffed against its `before` SHA; workflow_call
+  # from develop.yml inherits the caller's push event). workflow_dispatch has
+  # nothing to diff against and still skips the job.
   migration-order:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout (full history for the base-branch diff)
+      - name: Checkout (full history for the base diff)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Added migrations must sort after the newest on the base branch
+      - name: Added migrations must sort after the newest on the base
         env:
           TARGET_BRANCH: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           MIG_DIR="apps/server/src/database/migrations"
-          # checkout above already did fetch-depth:0 (full history). Fetch the base
-          # WITHOUT --depth (a shallow graft would truncate the base history and
-          # break the merge-base when the base has moved ahead of the PR merge —
-          # exactly the long-branch-vs-moving-base case this gate guards, #361).
-          git fetch --no-tags origin "$TARGET_BRANCH"
-          newest_on_target=$(git ls-tree -r --name-only "origin/${TARGET_BRANCH}" "$MIG_DIR" | sort | tail -1)
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            # checkout above already did fetch-depth:0 (full history). Fetch the base
+            # WITHOUT --depth (a shallow graft would truncate the base history and
+            # break the merge-base when the base has moved ahead of the PR merge —
+            # exactly the long-branch-vs-moving-base case this gate guards, #361).
+            git fetch --no-tags origin "$TARGET_BRANCH"
+            BASE="origin/${TARGET_BRANCH}"
+          else
+            # push event: compare against the pre-push tip of the branch.
+            if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              echo "::notice::branch creation push — nothing to compare"
+              exit 0
+            fi
+            if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              # The before-SHA is not in the clone (a force-push rewrote history).
+              # One recovery attempt — refresh every remote head (cheap: the
+              # checkout is already fetch-depth:0); a fetch failure aborts via
+              # `set -e`, which is fail-closed too.
+              git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+            fi
+            if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+              # FAIL-CLOSED: without the before-SHA there is no base to prove the
+              # ordering against, and a gate whose job is to BLOCK must not guess.
+              echo "::error::force-push detected — verify migration order manually, then re-run via workflow_dispatch"
+              exit 1
+            fi
+            BASE="$BEFORE_SHA"
+          fi
+          newest_on_target=$(git ls-tree -r --name-only "$BASE" "$MIG_DIR" | sort | tail -1)
           # NO `|| true`: a diff failure (e.g. an unresolved merge-base) must fail
           # the job CLOSED — a gate whose job is to BLOCK must never pass on error.
           # `set -e` above already aborts on a non-zero diff exit.
-          added=$(git diff --diff-filter=A --name-only "origin/${TARGET_BRANCH}...HEAD" -- "$MIG_DIR")
+          added=$(git diff --diff-filter=A --name-only "${BASE}...HEAD" -- "$MIG_DIR")
           bad=0
           for f in $added; do
             if [[ "$f" < "$newest_on_target" || "$f" == "$newest_on_target" ]]; then
-              echo "::error::Migration $f sorts at or before the newest on ${TARGET_BRANCH} ($newest_on_target) — rename it with a CURRENT timestamp before merge (do not change its contents). See incident #361."
+              echo "::error::Migration $f sorts at or before the newest on the base ($newest_on_target) — rename it with a CURRENT timestamp before merge (do not change its contents). See incident #361."
               bad=1
             fi
           done
@@ -130,6 +158,14 @@ jobs:
       # unless it is built first. Build it before the recursive test run.
       - name: Build prosemirror-markdown
         run: pnpm --filter @docmost/prosemirror-markdown build
+
+      # @docmost/token-estimate is a shared workspace package the client vitest
+      # suite resolves via its dist build (main: ./dist/index.js); dist/ is
+      # gitignored and `pnpm -r test` does NOT honour nx `dependsOn: ^build`, so
+      # build it before the recursive test run or the client suite fails with
+      # "Failed to resolve import '@docmost/token-estimate'" (#490).
+      - name: Build token-estimate
+        run: pnpm --filter @docmost/token-estimate build
 
       - name: Run unit tests
         run: pnpm -r test

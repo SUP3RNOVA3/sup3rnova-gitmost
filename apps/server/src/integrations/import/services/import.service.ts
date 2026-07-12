@@ -18,8 +18,10 @@ import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import * as Y from 'yjs';
 import { canonicalizeFootnotes } from '@docmost/editor-ext';
-import { markdownToProseMirror } from '@docmost/prosemirror-markdown';
-import { normalizeForeignMarkdown } from '../utils/foreign-markdown';
+import {
+  markdownToProseMirror,
+  normalizeForeignMarkdown,
+} from '@docmost/prosemirror-markdown';
 import {
   FileTaskStatus,
   FileTaskType,

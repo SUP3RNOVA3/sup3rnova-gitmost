@@ -245,6 +245,9 @@ export class AiSettingsService {
       // Max context window for the chat header badge denominator. Stored as
       // ::text; 0/unset/invalid = no limit (undefined).
       chatContextWindow: parsePositiveInt(provider.chatContextWindow),
+      // RAW stored value (#490): the replay budgeter reads this to distinguish an
+      // explicit `0` (off-switch) from unset, which parsePositiveInt cannot.
+      chatContextWindowRaw: provider.chatContextWindow,
       // Plain passthrough; getChatModel defaults unset to 'openai-compatible'.
       chatApiStyle: provider.chatApiStyle,
       // Cheap model id for the anonymous public-share assistant; reuses the chat
@@ -371,6 +374,12 @@ export class AiSettingsService {
       totalPages,
       // Optional hint for the client: a reindex run is currently in progress.
       reindexing: progress != null,
+      // Per-run identity so the client can key its poll on a stable run id and
+      // reset its per-run state when a NEW run starts. Present only while a run
+      // is active; `runId` may be '' for a legacy/degraded record (the client
+      // treats that as "no identity").
+      runId: progress?.runId,
+      reindexStartedAt: progress?.startedAt,
     };
   }
 

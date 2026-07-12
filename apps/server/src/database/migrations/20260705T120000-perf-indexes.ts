@@ -33,16 +33,18 @@ import { type Kysely, sql } from 'kysely';
  *    - comments: `findPageComments` does WHERE page_id ORDER BY id ASC, but only
  *      `(page_id)` exists → extra sort.
  *
- * DEPLOY-TIME LOCK WARNING: these are plain (non-CONCURRENT) CREATE INDEX
- * statements — CONCURRENTLY is impossible because Kysely runs each migration in a
- * transaction. They take a SHARE lock that BLOCKS writes (INSERT/UPDATE/DELETE) on
- * pages/users/groups/comments/page_history for the duration of the build. The two
- * GIN trigram builds on pages.title / users.name are the slow ones and can take
- * minutes on a large tenant → a write-outage window during the deploy migration.
- * For large installations, run this migration in a maintenance window, or build
- * the trigram indexes out-of-band with CREATE INDEX CONCURRENTLY before deploying
- * (then this migration's `IF NOT EXISTS` is a no-op). Small/typical tenants are
- * unaffected.
+ * DEPLOY-TIME LOCK: these are plain (non-CONCURRENT) CREATE INDEX statements —
+ * CONCURRENTLY is impossible HERE because Kysely runs each migration in a
+ * transaction. The two GIN trigram builds on pages.title / users.name are the
+ * slow ones and would take a SHARE lock that BLOCKS writes on pages/users for
+ * minutes on a large tenant. To avoid that, `ensureConcurrentIndexes`
+ * (database/concurrent-indexes.ts) now pre-builds BOTH trigram indexes with
+ * CREATE INDEX CONCURRENTLY (no transaction) BEFORE the migrator runs, so on an
+ * existing DB the two `IF NOT EXISTS` trigram creates below no-op and no write
+ * lock is taken. On a fresh DB the pre-build is skipped and they build on an
+ * empty table. Keep the two trigram creates in lockstep with their CANONICAL
+ * definitions in CONCURRENT_INDEXES. (The plain b-tree indexes further down are
+ * fast metadata-only builds; they are not pre-built.)
  */
 export async function up(db: Kysely<any>): Promise<void> {
   // Index-compatible, output-identical redefinition of f_unaccent (see header).

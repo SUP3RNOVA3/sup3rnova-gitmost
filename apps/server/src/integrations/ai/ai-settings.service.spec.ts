@@ -99,10 +99,12 @@ describe('AiSettingsService.getMasked reindex progress', () => {
     // actually pins the progress.total branch rather than coincidentally
     // matching the DB fallback. With fix #1 the two sources agree in practice,
     // but getMasked must still return progress.total when a record is active.
+    const startedAt = Date.now();
     reindexProgress.get.mockResolvedValue({
       total: 500,
       done: 120,
-      startedAt: Date.now(),
+      startedAt,
+      runId: 'run-abc',
     });
 
     const masked = await service.getMasked(WORKSPACE_ID);
@@ -110,6 +112,10 @@ describe('AiSettingsService.getMasked reindex progress', () => {
     expect(masked.indexedPages).toBe(120); // progress.done, not DB 478
     expect(masked.totalPages).toBe(500); // progress.total, not DB 478
     expect(masked.reindexing).toBe(true);
+    // The status payload must carry the run identity so the client can key its
+    // poll on it (a changed runId => a NEW run).
+    expect(masked.runId).toBe('run-abc');
+    expect(masked.reindexStartedAt).toBe(startedAt);
   });
 
   it('falls back to countIndexedPages when no reindex is active', async () => {
@@ -121,6 +127,10 @@ describe('AiSettingsService.getMasked reindex progress', () => {
     expect(masked.indexedPages).toBe(478);
     expect(masked.totalPages).toBe(478);
     expect(masked.reindexing).toBe(false);
+    // No active run -> no run identity surfaced (the client keeps its prior
+    // steady-state behaviour).
+    expect(masked.runId).toBeUndefined();
+    expect(masked.reindexStartedAt).toBeUndefined();
   });
 });
 

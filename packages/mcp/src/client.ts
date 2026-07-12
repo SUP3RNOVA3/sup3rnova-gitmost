@@ -37,6 +37,12 @@ export {
   formatSpaceNotAccessible,
 } from "./client/errors.js";
 
+// Branded canonical page-identity type (#435): the internal page UUID is a
+// distinct nominal type so an unresolved raw/slug string can't be swapped into
+// the seams that require the canonical id (see lib/page-id.ts). Re-exported on
+// the package surface for hosts that type against the resolved id.
+export type { PageId } from "./lib/page-id.js";
+
 // The full public + shared instance surface of the assembled client. Built by
 // INTERSECTING each domain mixin's public interface (each DERIVED from its class
 // and enforced by that class's `implements` clause — issue #446, no hand-mirror)

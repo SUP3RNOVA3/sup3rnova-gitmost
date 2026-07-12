@@ -37,6 +37,7 @@ import { AiProviderCredentialsRepo } from '@docmost/db/repos/ai-chat/ai-provider
 import { AiMcpServerRepo } from '@docmost/db/repos/ai-chat/ai-mcp-server.repo';
 import { AiAgentRoleRepo } from '@docmost/db/repos/ai-agent-roles/ai-agent-roles.repo';
 import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
+import { ApiKeyRepo } from '@docmost/db/repos/api-key/api-key.repo';
 import { PageListener } from '@docmost/db/listeners/page.listener';
 import { PostgresJSDialect } from 'kysely-postgres-js';
 import * as postgres from 'postgres';
@@ -129,6 +130,7 @@ import { firstSqlToken } from '../integrations/metrics/metrics.constants';
     AiMcpServerRepo,
     AiAgentRoleRepo,
     PageEmbeddingRepo,
+    ApiKeyRepo,
     PageListener,
   ],
   exports: [
@@ -164,6 +166,7 @@ import { firstSqlToken } from '../integrations/metrics/metrics.constants';
     AiMcpServerRepo,
     AiAgentRoleRepo,
     PageEmbeddingRepo,
+    ApiKeyRepo,
   ],
 })
 export class DatabaseModule implements OnApplicationBootstrap {
