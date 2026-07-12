@@ -370,10 +370,12 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
     );
   });
 
-  // #490 reactive branch: a provider CONTEXT-OVERFLOW 400 in onError is classified,
-  // records a distinguishable cause, and stamps metadata.replayOverflow so the NEXT
-  // turn's budgeter trims aggressively (the recovery that un-bricks the chat).
-  it('#490: a context-overflow 400 stamps replayOverflow on the finalized row', async () => {
+  // #490/#520 reactive branch: a provider CONTEXT-OVERFLOW 400 in onError is
+  // classified, records a distinguishable cause, and stamps the consecutive-overflow
+  // COUNTER (metadata.replayOverflowCount) so the NEXT turn's budgeter trims with
+  // escalating aggression (the recovery that un-bricks the chat). This is a fresh
+  // chat (empty history -> prior streak 0), so the first overflow stamps count 1.
+  it('#490/#520: a context-overflow 400 stamps replayOverflowCount=1 on the finalized row', async () => {
     jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined as never);
@@ -397,11 +399,14 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       metadata: Record<string, unknown>;
     };
     expect(patch.status).toBe('error');
-    expect(patch.metadata.replayOverflow).toBe(true);
+    // First overflow on a fresh chat -> k = prior(0) + 1 = 1.
+    expect(patch.metadata.replayOverflowCount).toBe(1);
+    // The legacy boolean is no longer written (the counter supersedes it).
+    expect('replayOverflow' in patch.metadata).toBe(false);
     expect(patch.metadata.error).toContain('контекстное окно');
   });
 
-  it('#490: a non-overflow error does NOT stamp replayOverflow', async () => {
+  it('#490/#520: a non-overflow error does NOT stamp the overflow counter', async () => {
     jest
       .spyOn(Logger.prototype, 'error')
       .mockImplementation(() => undefined as never);
@@ -412,6 +417,7 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       status: string;
       metadata: Record<string, unknown>;
     };
+    expect('replayOverflowCount' in patch.metadata).toBe(false);
     expect('replayOverflow' in patch.metadata).toBe(false);
   });
 });

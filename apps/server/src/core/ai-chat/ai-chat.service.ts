@@ -141,9 +141,10 @@ const OUTPUT_DEGENERATION_ERROR =
 
 // Prefix recorded on the assistant row when the provider rejected the turn for
 // CONTEXT OVERFLOW (#490): the replayed history exceeded the model's window. The
-// row is ALSO stamped `metadata.replayOverflow` so the NEXT turn's budgeter trims
-// aggressively (the reactive recovery — the overflowing turn had no usage signal
-// to trigger preventive trimming, so the classified 400 is what un-bricks it).
+// row is ALSO stamped `metadata.replayOverflowCount` (the consecutive-overflow
+// counter, #520) so the NEXT turn's budgeter trims with escalating aggression (the
+// reactive recovery — the overflowing turn had no usage signal to trigger
+// preventive trimming, so the classified 400 is what un-bricks it).
 export const CONTEXT_OVERFLOW_ERROR_PREFIX =
   'Диалог превысил контекстное окно модели; история будет агрессивно ' +
   'сокращена на следующем ходу.';
@@ -1228,27 +1229,52 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       }
       // Last turn's provider-reported context size (authoritative when present).
       const priorContextTokens = lastAssistantContextTokens(oldHistory);
-      // Reactive recovery (#490): if the LAST turn was rejected for context
-      // overflow (stamped by onError), trim AGGRESSIVELY this turn — the
-      // overflowing turn produced no usage signal, so a normal-threshold trim may
-      // not shrink enough to fit. This is what un-bricks a chat that just 400'd.
-      const priorOverflowed = lastAssistantReplayOverflow(oldHistory);
+      // Reactive recovery (#490/#520): `k` = how many CONSECUTIVE preceding turns
+      // were rejected for context overflow (stamped by onError). Each consecutive
+      // overflow trims MORE aggressively (resolveEffectiveReplayThreshold scales the
+      // budget by 0.5**k, clamped at the floor) so recovery ESCALATES until the
+      // history fits — the overflowing turn produced no usage signal, so a single
+      // fixed cut may not shrink enough when the real model window is small. This is
+      // what un-bricks a chat that keeps 400'ing on the context window.
+      const priorOverflowCount = lastAssistantReplayOverflowCount(oldHistory);
       const effectiveThreshold = resolveEffectiveReplayThreshold(
         replayBudget.thresholdTokens,
-        priorOverflowed,
+        priorOverflowCount,
       );
-      if (priorOverflowed) {
-        this.logger.warn(
-          `AI chat (chat ${chatId}): previous turn hit context overflow; ` +
-            `applying aggressive replay budget (${effectiveThreshold} tokens).`,
-        );
+      // #520 Option B: recovery MAY cut the replay budget BELOW the admin-configured
+      // window when the provider keeps proving non-fit (the anti-brick invariant of
+      // the reactive branch beats a config that a 400 has disproved). Surface it so
+      // the admin sees their window is factually too large, and mark the turn so the
+      // UI/telemetry can show it. Only true when actually below (not on in-budget
+      // escalation edge cases); k>0 implies below for any budget >= 2 tokens.
+      const replayBelowConfiguredBudget =
+        replayBudget.thresholdTokens != null &&
+        effectiveThreshold != null &&
+        effectiveThreshold < replayBudget.thresholdTokens;
+      if (priorOverflowCount > 0) {
+        if (replayBelowConfiguredBudget) {
+          this.logger.warn(
+            `AI chat (chat ${chatId}): configured replay budget ` +
+              `(${replayBudget.thresholdTokens} tokens) does not fit the model — ` +
+              `replaying BELOW it at ${effectiveThreshold} tokens after ` +
+              `${priorOverflowCount} consecutive context overflow(s) ` +
+              `(escalation level ${priorOverflowCount}). Lower chatContextWindow ` +
+              `to match the model's real context window.`,
+          );
+        } else {
+          this.logger.warn(
+            `AI chat (chat ${chatId}): ${priorOverflowCount} consecutive context ` +
+              `overflow(s); applying escalated aggressive replay budget ` +
+              `(${effectiveThreshold} tokens).`,
+          );
+        }
       }
       const preTrim = trimHistoryForReplay(
         messages,
         effectiveThreshold,
         // A prior OVERFLOW means the provider count is stale/absent — force the
         // char-estimate path by ignoring priorContextTokens on recovery.
-        priorOverflowed ? undefined : priorContextTokens,
+        priorOverflowCount > 0 ? undefined : priorContextTokens,
       );
       messages = preTrim.messages;
       // Observability (#490): record the budgeter's decision on the turn so the UI
@@ -1903,6 +1929,10 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 pageChanged,
                 partsCache,
                 replayTrimmedToTokens,
+                // #520 Option B: mark the turn when recovery replayed BELOW the
+                // configured budget (only when it actually did).
+                replayBelowConfiguredBudget:
+                  replayBelowConfiguredBudget || undefined,
               }),
             );
             // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
@@ -1981,7 +2011,16 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 pageChanged,
                 partsCache,
                 replayTrimmedToTokens,
-                replayOverflow: overflow || undefined,
+                // #520: escalate the consecutive-overflow counter so the NEXT turn
+                // trims MORE aggressively (0.5**k). k grows by 1 each consecutive
+                // overflow; a clean finalize omits the field, resetting it to 0.
+                replayOverflowCount: overflow
+                  ? priorOverflowCount + 1
+                  : undefined,
+                // #520 Option B: mark the turn when THIS replay was already below the
+                // configured budget (only when it actually was).
+                replayBelowConfiguredBudget:
+                  replayBelowConfiguredBudget || undefined,
               }),
             );
             // #184: settle the RUN as failed, carrying the provider/transport cause.
@@ -2413,22 +2452,39 @@ export function seedActivatedTools(
 }
 
 /**
- * Whether the most recent assistant turn was rejected for CONTEXT OVERFLOW
- * (#490): its row carries `metadata.replayOverflow` (stamped by the stream's
- * onError). The next turn's budgeter reads this to trim aggressively — the
- * reactive recovery. Only the LAST assistant turn matters (an older overflow was
- * already recovered), so we stop at the first assistant row scanning backwards.
+ * How many CONSECUTIVE recent turns were rejected for CONTEXT OVERFLOW (#490/#520):
+ * `k`, read from the most recent assistant row's `metadata.replayOverflowCount`
+ * (stamped by the stream's onError, incremented each consecutive overflow and reset
+ * to 0 on any clean finalize). The next turn's budgeter feeds this to
+ * {@link resolveEffectiveReplayThreshold} to trim with ESCALATING aggression — the
+ * reactive recovery. Only the LAST assistant turn matters (its count already carries
+ * the consecutive streak; an older overflow followed by a clean turn was recovered),
+ * so we stop at the first assistant row scanning backwards.
+ *
+ * BACK-COMPAT: a row written by the pre-#520 boolean stamp (`replayOverflow: true`,
+ * no count) is read as k=1 — the old single 0.5× behavior — so in-flight chats do
+ * not regress across the deploy.
  */
-export function lastAssistantReplayOverflow(
+export function lastAssistantReplayOverflowCount(
   history: ReadonlyArray<AiChatMessage>,
-): boolean {
+): number {
   for (let i = history.length - 1; i >= 0; i--) {
     const row = history[i];
     if (row.role !== 'assistant') continue;
-    const meta = (row.metadata ?? {}) as { replayOverflow?: unknown };
-    return meta.replayOverflow === true;
+    const meta = (row.metadata ?? {}) as {
+      replayOverflowCount?: unknown;
+      replayOverflow?: unknown;
+    };
+    if (typeof meta.replayOverflowCount === 'number') {
+      // Guard against a corrupt/negative persisted value.
+      return meta.replayOverflowCount > 0
+        ? Math.floor(meta.replayOverflowCount)
+        : 0;
+    }
+    // Back-compat: legacy boolean stamp -> one overflow (0.5× cut).
+    return meta.replayOverflow === true ? 1 : 0;
   }
-  return false;
+  return 0;
 }
 
 /** The last message with role 'user' from a useChat payload, if any. */
@@ -3084,9 +3140,16 @@ export function flushAssistant(
     // the (estimated) token size it trimmed to — the UI can show "replay truncated
     // at N tokens". Omitted when nothing was trimmed.
     replayTrimmedToTokens?: number;
-    // #490 reactive branch: set when the provider rejected this turn for context
-    // overflow. Stamped into metadata so the NEXT turn's budgeter trims aggressively.
-    replayOverflow?: boolean;
+    // #490/#520 reactive branch: the consecutive context-overflow count for THIS
+    // turn (prior streak + 1) when the provider rejected it for context overflow.
+    // Stamped into metadata so the NEXT turn's budgeter trims with escalating
+    // aggression (0.5**k). Omitted (undefined) on a clean turn, which resets k to 0.
+    replayOverflowCount?: number;
+    // #520 Option B observability: true when recovery replayed this turn's history
+    // BELOW the admin-configured budget (the configured window did not fit and the
+    // anti-brick invariant cut past it). Omitted on a normal in-budget replay so the
+    // flag marks ONLY the "config is factually too large" case.
+    replayBelowConfiguredBudget?: boolean;
   },
 ): AssistantFlush {
   const finished = capturedSteps ?? [];
@@ -3139,7 +3202,10 @@ export function flushAssistant(
     metadata.maxContextTokens = extra.maxContextTokens;
   if (extra?.replayTrimmedToTokens)
     metadata.replayTrimmedToTokens = extra.replayTrimmedToTokens;
-  if (extra?.replayOverflow) metadata.replayOverflow = true;
+  if (extra?.replayOverflowCount && extra.replayOverflowCount > 0)
+    metadata.replayOverflowCount = extra.replayOverflowCount;
+  if (extra?.replayBelowConfiguredBudget)
+    metadata.replayBelowConfiguredBudget = true;
   if (extra?.error) metadata.error = extra.error;
   // Persist the page-change diff the agent saw this turn (#274 observability),
   // so history / the Markdown export can show what the user changed. Only when

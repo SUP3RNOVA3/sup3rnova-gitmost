@@ -1,6 +1,11 @@
 import { randomBytes } from 'crypto';
 import { Client } from 'pg';
-import { flushAssistant, serializeSteps } from './ai-chat.service';
+import {
+  flushAssistant,
+  serializeSteps,
+  lastAssistantReplayOverflowCount,
+} from './ai-chat.service';
+import type { AiChatMessage } from '@docmost/db/types/entity.types';
 
 /**
  * #490 write-volume regression — an OBSERVABLE-PROPERTY test on a LIVE Postgres,
@@ -206,4 +211,112 @@ describe('#490 write-volume on a live Postgres (pg_current_wal_lsn delta)', () =
     // Removing the duplicated trace copy is a large, real write-volume reduction.
     expect(v2).toBeLessThan(v1 * 0.75);
   }, 120_000);
+});
+
+/**
+ * #520 reactive-recovery COUNTER lifecycle on a LIVE Postgres — proves the
+ * consecutive-overflow count survives a real jsonb metadata round-trip (the persist
+ * path), not just an in-memory object. flushAssistant BUILDS the row metadata, we
+ * WRITE it to a jsonb column, READ it back, then reconstruct the assistant row and
+ * run lastAssistantReplayOverflowCount over it — exactly the read the next turn does.
+ *
+ * The lifecycle proven end-to-end through pg:
+ *   - consecutive overflows INCREMENT k (1 -> 2 -> 3);
+ *   - a CLEAN finalize omits the field, which the reader treats as a RESET to 0;
+ *   - a legacy boolean row (`replayOverflow: true`) reads back as k=1 (back-compat).
+ */
+describe('#520 overflow-counter lifecycle on a live Postgres (jsonb round-trip)', () => {
+  let client: Client | undefined;
+  let available = false;
+
+  beforeAll(async () => {
+    try {
+      client = new Client(CONN);
+      await client.connect();
+      await client.query('SELECT 1');
+      available = true;
+    } catch {
+      available = false;
+      client = undefined;
+    }
+  });
+
+  afterAll(async () => {
+    await client?.end().catch(() => undefined);
+  });
+
+  // Round-trip an arbitrary metadata object through a real jsonb column and read it
+  // back as the reconstructed assistant row the next turn would load.
+  async function roundTrip(
+    c: Client,
+    metadata: unknown,
+  ): Promise<AiChatMessage> {
+    await c.query('UPDATE _wal_counter SET metadata=$1 WHERE id=1', [
+      JSON.stringify(metadata),
+    ]);
+    const back = (await c.query('SELECT metadata FROM _wal_counter WHERE id=1'))
+      .rows[0].metadata as Record<string, unknown>;
+    return { role: 'assistant', metadata: back } as unknown as AiChatMessage;
+  }
+
+  it('increments across consecutive overflows, resets on a clean turn, and honors the legacy boolean', async () => {
+    if (!available || !client) {
+      console.warn('SKIP: gitmost-test-pg not reachable; skipping counter test.');
+      return;
+    }
+    const c = client;
+    await c.query('DROP TABLE IF EXISTS _wal_counter');
+    await c.query('CREATE TABLE _wal_counter(id int primary key, metadata jsonb)');
+    await c.query("INSERT INTO _wal_counter VALUES (1, '{}'::jsonb)");
+
+    // Turn 1 overflow: prior streak 0 -> stamp k=1 (as the service does: prior+1).
+    let prior = lastAssistantReplayOverflowCount([]); // fresh chat
+    expect(prior).toBe(0);
+    let row = await roundTrip(
+      c,
+      flushAssistant([], '', 'error', {
+        error: 'ctx',
+        replayOverflowCount: prior + 1,
+      }).metadata,
+    );
+    prior = lastAssistantReplayOverflowCount([row]);
+    expect(prior).toBe(1);
+
+    // Turn 2 overflow: prior 1 -> stamp k=2.
+    row = await roundTrip(
+      c,
+      flushAssistant([], '', 'error', {
+        error: 'ctx',
+        replayOverflowCount: prior + 1,
+      }).metadata,
+    );
+    prior = lastAssistantReplayOverflowCount([row]);
+    expect(prior).toBe(2);
+
+    // Turn 3 overflow: prior 2 -> stamp k=3.
+    row = await roundTrip(
+      c,
+      flushAssistant([], '', 'error', {
+        error: 'ctx',
+        replayOverflowCount: prior + 1,
+      }).metadata,
+    );
+    prior = lastAssistantReplayOverflowCount([row]);
+    expect(prior).toBe(3);
+
+    // Turn 4 CLEAN finalize: no overflow -> the field is omitted -> reset to 0.
+    row = await roundTrip(
+      c,
+      flushAssistant([], 'all good', 'completed', { finishReason: 'stop' })
+        .metadata,
+    );
+    expect('replayOverflowCount' in (row.metadata as object)).toBe(false);
+    expect(lastAssistantReplayOverflowCount([row])).toBe(0);
+
+    // Back-compat: a row persisted by the pre-#520 boolean stamp reads back as k=1.
+    row = await roundTrip(c, { replayOverflow: true });
+    expect(lastAssistantReplayOverflowCount([row])).toBe(1);
+
+    await c.query('DROP TABLE IF EXISTS _wal_counter');
+  }, 60_000);
 });
