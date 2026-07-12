@@ -181,6 +181,12 @@ export interface IAiChatMessageRow {
   toolCalls?: unknown;
   metadata?: {
     parts?: UIMessage["parts"];
+    // #491 step-alignment anchor: the count of FINISHED steps whose parts are in
+    // THIS row, written atomically with `parts` server-side (flushAssistant). The
+    // resume client reads it as its persisted step frontier N — the tail-only
+    // attach asks the run-stream registry for the frames of step N onward (the
+    // seed already carries steps 0..N-1). Absent on pre-#491 rows -> read as 0.
+    stepsPersisted?: number;
     // AI SDK v6 `totalUsage` persisted on assistant rows. Legacy cumulative
     // figure (sum of every step's usage for the turn); kept for back-compat and
     // as the fallback for older rows that have no `contextTokens`.

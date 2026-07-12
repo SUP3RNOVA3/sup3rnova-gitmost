@@ -25,6 +25,20 @@ const SWEEP_STREAMING_STALE_MS = 10 * 60 * 1000; // 10 minutes
 // into memory; far above any realistic transcript length.
 const FIND_ALL_BY_CHAT_LIMIT = 5000;
 
+// Delta-poll overlap (#491): the poll query reaches this far BEHIND the client's
+// echoed cursor, so a row that committed with an `updatedAt` marginally before the
+// previous cursor was taken (on another autocommit connection) is still caught.
+// Sized well above realistic single-row commit skew; the client merge is
+// idempotent by id (mergeById), so the guaranteed repeats the overlap produces are
+// harmless.
+export const DELTA_POLL_OVERLAP_SECONDS = 5;
+
+// Hard cap on rows one delta poll returns — a safety bound (a poll should carry a
+// handful of just-changed rows, never a whole transcript). Ordered by (updatedAt,
+// id) asc, so on the pathological overflow the OLDEST changes win and the newest
+// are picked up by the next poll (its cursor did not advance past them).
+export const DELTA_POLL_MAX_ROWS = 500;
+
 @Injectable()
 export class AiChatMessageRepo {
   private readonly logger = new Logger(AiChatMessageRepo.name);
@@ -139,6 +153,72 @@ export class AiChatMessageRepo {
       .executeTakeFirst();
   }
 
+  /**
+   * Delta read (#491) for the degraded poll: the chat's messages whose row
+   * changed AFTER the client's `cursor`, plus a FRESH cursor taken from the DB
+   * clock. Replaces the old "refetch ALL infinite-query pages every 2.5s with
+   * full parts" poll — the client seeds once (findByChat) and thereafter pulls
+   * only the deltas and merges them by id (mergeById).
+   *
+   * Cursor: a DB-clock timestamp (now()) the client echoes back each poll. All
+   * delta-relevant writes stamp `updatedAt` with now() (see `update` /
+   * `finalizeOwner`), so this is a SINGLE monotonic axis. The query overlaps the
+   * cursor by DELTA_POLL_OVERLAP_SECONDS to catch a row committed with an
+   * `updatedAt` marginally BEFORE the previous cursor was taken on another
+   * connection (single-row autocommit UPDATEs; no long transactions). The overlap
+   * GUARANTEES occasional REPEATS, so the client merge MUST be idempotent by id.
+   *
+   * `cursor === null` (first poll after the full seed) returns NO rows — there is
+   * nothing "new" relative to a just-loaded seed — only the fresh cursor to start
+   * the delta chain. The fresh cursor is read AFTER the rows, so it is >= every
+   * returned row's `updatedAt` (they were read strictly earlier) — a row that
+   * commits between the rows-read and the cursor-read is at most
+   * DELTA_POLL_OVERLAP_SECONDS behind the returned cursor, so the next poll's
+   * overlap window always re-includes it (no miss).
+   */
+  async findByChatUpdatedAfter(
+    chatId: string,
+    workspaceId: string,
+    cursor: string | null,
+  ): Promise<{ rows: AiChatMessage[]; cursor: string }> {
+    if (cursor === null) {
+      const nowRow = await sql<{ now: Date }>`select now() as now`.execute(
+        this.db,
+      );
+      return { rows: [], cursor: nowRow.rows[0].now.toISOString() };
+    }
+    // Overlap the client cursor by DELTA_POLL_OVERLAP_SECONDS, computed in SQL off
+    // the echoed cursor so the whole comparison stays on the DB clock.
+    const rows = await this.db
+      .selectFrom('aiChatMessages')
+      .select(this.baseFields)
+      .where('chatId', '=', chatId)
+      .where('workspaceId', '=', workspaceId)
+      .where('deletedAt', 'is', null)
+      .where(
+        'updatedAt',
+        '>',
+        sql<Date>`${cursor}::timestamptz - make_interval(secs => ${DELTA_POLL_OVERLAP_SECONDS})`,
+      )
+      .orderBy('updatedAt', 'asc')
+      .orderBy('id', 'asc')
+      .limit(DELTA_POLL_MAX_ROWS)
+      .execute();
+    // When the page filled (pathological overflow), DO NOT advance the cursor to
+    // now(): that would skip the changed rows past the cap that this poll did not
+    // return. Resume from the last returned row's updatedAt instead (the next
+    // poll's overlap re-includes ties by id). In the normal case the fresh DB-clock
+    // now() is the cursor.
+    if (rows.length === DELTA_POLL_MAX_ROWS) {
+      return {
+        rows,
+        cursor: rows[rows.length - 1].updatedAt.toISOString(),
+      };
+    }
+    const nowRow = await sql<{ now: Date }>`select now() as now`.execute(this.db);
+    return { rows, cursor: nowRow.rows[0].now.toISOString() };
+  }
+
   async insert(
     insertable: InsertableAiChatMessage,
     trx?: KyselyTransaction,
@@ -172,7 +252,13 @@ export class AiChatMessageRepo {
     const db = dbOrTx(this.db, opts?.trx);
     let query = db
       .updateTable('aiChatMessages')
-      .set({ ...(patch as Record<string, unknown>), updatedAt: new Date() })
+      // #491: stamp `updatedAt` from the DB clock (sql now()), NOT the app clock
+      // (new Date()). The delta-poll cursor (findByChatUpdatedAfter) is a single
+      // DB-clock axis; a per-step 'streaming' UPDATE stamped with the app clock
+      // would be a SECOND, skewed clock source and could leave a row's updatedAt
+      // just under a cursor taken from now() on another connection — an
+      // independent source of delta MISSES. All delta-relevant writes use now().
+      .set({ ...(patch as Record<string, unknown>), updatedAt: sql`now()` })
       .where('id', '=', id)
       .where('workspaceId', '=', workspaceId);
     // Concurrency guard (#183 review): a per-step 'streaming' update must NEVER
@@ -214,7 +300,9 @@ export class AiChatMessageRepo {
     const db = dbOrTx(this.db, trx);
     return db
       .updateTable('aiChatMessages')
-      .set({ ...(patch as Record<string, unknown>), updatedAt: new Date() })
+      // #491: DB-clock stamp (see `update`) — this terminal write flips the row's
+      // status, which the delta poll must observe on the shared now() cursor axis.
+      .set({ ...(patch as Record<string, unknown>), updatedAt: sql`now()` })
       .where('id', '=', id)
       .where('workspaceId', '=', workspaceId)
       .where((eb) =>
@@ -249,7 +337,9 @@ export class AiChatMessageRepo {
       .set({
         status,
         metadata: sql`coalesce(metadata, '{}'::jsonb) || jsonb_build_object('finalizeFailed', true)`,
-        updatedAt: new Date(),
+        // #491: DB-clock stamp (see `update`) so a reconcile status flip lands on
+        // the same now() cursor axis the delta poll reads.
+        updatedAt: sql`now()`,
       })
       .where('id', '=', id)
       .where('workspaceId', '=', workspaceId)
@@ -307,7 +397,9 @@ export class AiChatMessageRepo {
       .set({
         status: 'aborted',
         metadata: sql`coalesce(m.metadata, '{}'::jsonb) || jsonb_build_object('finalizeFailed', true)`,
-        updatedAt: new Date(),
+        // #491: DB-clock stamp (see `update`). The staleness WHERE below stays on
+        // the app clock — a >minutes window makes the ms-scale skew irrelevant.
+        updatedAt: sql`now()`,
       })
       .where('m.status', '=', 'streaming')
       .where('m.updatedAt', '<', staleBefore)
@@ -351,7 +443,8 @@ export class AiChatMessageRepo {
       .set({
         status: 'aborted',
         metadata: sql`coalesce(metadata, '{}'::jsonb) || jsonb_build_object('finalizeFailed', true)`,
-        updatedAt: new Date(),
+        // #491: DB-clock stamp (see `update`). Staleness WHERE stays app-clock.
+        updatedAt: sql`now()`,
       })
       .where('status', '=', 'streaming')
       .where('updatedAt', '<', staleBefore)

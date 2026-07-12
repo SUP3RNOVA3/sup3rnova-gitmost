@@ -8,10 +8,12 @@ import { SUBSCRIBER_MAX_BUFFERED_BYTES } from './ai-chat-stream-registry.service
 import type { User, Workspace } from '@docmost/db/types/entity.types';
 
 /**
- * Wiring spec for the #184 phase 1.5 attach endpoint
+ * Wiring spec for the #184 phase 1.5 attach endpoint (tail-only #491)
  * (`GET /ai-chat/runs/:chatId/stream`). Owner-gated via assertOwnedChat; the
- * registry is mocked so this exercises ONLY the controller's replay/live/204/
- * cleanup wiring against a fake raw socket. Constructor order is (aiChatService,
+ * registry is mocked so this exercises ONLY the controller's tail-write/live/204/
+ * cleanup wiring against a fake raw socket. The attach signature is now
+ * `(chatId, anchor, n, cb)` — the client hands its persisted step frontier `n`
+ * and its assistant row id `anchor`. Constructor order is (aiChatService,
  * aiChatRunService, aiChatRepo, aiChatMessageRepo, aiTranscription, pageRepo,
  * streamRegistry, environment).
  */
@@ -86,8 +88,8 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
       attach: jest.fn(
         (
           _chatId: string,
-          _live: boolean,
           _anchor: string | undefined,
+          _n: number,
           cb: RunStreamCallbacks,
         ) => {
           capturedCb = cb;
@@ -156,7 +158,7 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     expect(res.hijack).not.toHaveBeenCalled();
   });
 
-  it('threads expect=live and anchor through to the registry', async () => {
+  it('threads anchor and the numeric frontier n through to the registry', async () => {
     const { controller, streamRegistry } = makeController({
       chat: owned,
       attachment: null,
@@ -165,8 +167,8 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     const { req } = makeReq();
     await controller.attachRunStream(
       'c1',
-      'live',
       'anchor-1',
+      '2',
       req,
       res,
       user,
@@ -174,13 +176,44 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     );
     expect(streamRegistry.attach).toHaveBeenCalledWith(
       'c1',
-      true,
       'anchor-1',
+      2, // parsed to a number
       expect.anything(),
     );
   });
 
-  it('passes expect=false when the query is absent', async () => {
+  it('#491: an ABSENT/invalid n passes null (not 0) so a finished run 204s (not-tail-aware)', async () => {
+    // Distinguishing a MISSING `n` from `n=0` is the #137/#161 dup guard: a
+    // parameterless/legacy tab must be handed null (-> the registry 204s a finished
+    // run) rather than frontier 0 (which would serve a finished non-rotated run's
+    // whole tail). MUTATION-VERIFY: revert to `Number(n) || 0` and this asserts 0.
+    const { controller, streamRegistry } = makeController({
+      chat: owned,
+      attachment: null,
+    });
+    for (const bad of [undefined, '', 'abc']) {
+      streamRegistry.attach.mockClear();
+      const { res } = makeRawRes();
+      const { req } = makeReq();
+      await controller.attachRunStream(
+        'c1',
+        undefined,
+        bad,
+        req,
+        res,
+        user,
+        workspace,
+      );
+      expect(streamRegistry.attach).toHaveBeenCalledWith(
+        'c1',
+        undefined,
+        null,
+        expect.anything(),
+      );
+    }
+  });
+
+  it('#491: a PRESENT n=0 passes 0 (tail-aware, distinct from absent)', async () => {
     const { controller, streamRegistry } = makeController({
       chat: owned,
       attachment: null,
@@ -190,7 +223,7 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     await controller.attachRunStream(
       'c1',
       undefined,
-      undefined,
+      '0',
       req,
       res,
       user,
@@ -198,8 +231,8 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     );
     expect(streamRegistry.attach).toHaveBeenCalledWith(
       'c1',
-      false,
       undefined,
+      0,
       expect.anything(),
     );
   });
@@ -245,8 +278,8 @@ describe('AiChatController attach endpoint (#184 phase 1.5)', () => {
     const { req } = makeReq();
     await controller.attachRunStream(
       'c1',
-      'live',
       'a1',
+      '1',
       req,
       res,
       user,

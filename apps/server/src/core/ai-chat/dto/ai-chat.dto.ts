@@ -1,4 +1,10 @@
-import { IsOptional, IsString, MaxLength, MinLength } from 'class-validator';
+import {
+  IsISO8601,
+  IsOptional,
+  IsString,
+  MaxLength,
+  MinLength,
+} from 'class-validator';
 
 /** Identify a chat by id (workspace-scoped on the server). */
 export class ChatIdDto {
@@ -34,6 +40,24 @@ export class GetChatMessagesDto {
 
   @IsOptional()
   @IsString()
+  cursor?: string;
+}
+
+/**
+ * Delta poll (#491): pull the chat's rows changed since `cursor` (a DB-clock
+ * timestamp from the previous poll) plus the current run fact — the degraded-poll
+ * fallback's payload, replacing the full infinite-query refetch. Omit `cursor` on
+ * the first poll (returns just a fresh cursor to start the chain).
+ */
+export class GetChatDeltaDto {
+  @IsString()
+  chatId: string;
+
+  // ISO-8601 timestamp echoed from the previous poll's response. Validated as
+  // ISO-8601 (not a bare string): a malformed cursor would otherwise reach the
+  // `::timestamptz` cast in findByChatUpdatedAfter and 500 instead of a clean 400.
+  @IsOptional()
+  @IsISO8601()
   cursor?: string;
 }
 

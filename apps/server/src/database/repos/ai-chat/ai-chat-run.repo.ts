@@ -136,7 +136,11 @@ export class AiChatRunRepo {
     const db = dbOrTx(this.db, trx);
     return db
       .updateTable('aiChatRuns')
-      .set({ ...(patch as Record<string, unknown>), updatedAt: new Date() })
+      // #491: DB-clock stamp (sql now()) so the run row shares the delta poll's
+      // single now() cursor axis with the assistant message rows — a run-status
+      // change (the run fact the delta carries) must never sit on a skewed app
+      // clock relative to the message updatedAt cursor.
+      .set({ ...(patch as Record<string, unknown>), updatedAt: sql`now()` })
       .where('id', '=', id)
       .where('workspaceId', '=', workspaceId)
       .returning(this.baseFields)
@@ -162,14 +166,15 @@ export class AiChatRunRepo {
     trx?: KyselyTransaction,
   ): Promise<AiChatRun | undefined> {
     const db = dbOrTx(this.db, trx);
-    const now = new Date();
     return db
       .updateTable('aiChatRuns')
       .set({
         status: patch.status,
         error: patch.error,
-        finishedAt: now,
-        updatedAt: now,
+        // #491: DB-clock stamps (finished_at + updated_at) so the terminal run
+        // fact lands on the delta poll's now() cursor axis.
+        finishedAt: sql`now()`,
+        updatedAt: sql`now()`,
       })
       .where('id', '=', id)
       .where('workspaceId', '=', workspaceId)
@@ -192,7 +197,8 @@ export class AiChatRunRepo {
     const db = dbOrTx(this.db, trx);
     return db
       .updateTable('aiChatRuns')
-      .set({ stopRequestedAt: new Date(), updatedAt: new Date() })
+      // #491: DB-clock stamps (see `update`).
+      .set({ stopRequestedAt: sql`now()`, updatedAt: sql`now()` })
       .where('id', '=', id)
       .where('workspaceId', '=', workspaceId)
       .where('status', 'in', ACTIVE_RUN_STATUSES as unknown as string[])
@@ -249,13 +255,14 @@ export class AiChatRunRepo {
     trx?: KyselyTransaction,
   ): Promise<number> {
     const db = dbOrTx(this.db, trx);
-    const now = new Date();
     let query = db
       .updateTable('aiChatRuns')
       .set({
         status: 'aborted',
-        finishedAt: now,
-        updatedAt: now,
+        // #491: DB-clock stamps (see `update`). The staleness WHERE below stays on
+        // the app clock — a >minutes window makes the ms-scale skew irrelevant.
+        finishedAt: sql`now()`,
+        updatedAt: sql`now()`,
         error: sql`coalesce(error, ${'Run interrupted by a server restart.'})`,
       })
       .where('status', 'in', ACTIVE_RUN_STATUSES as unknown as string[]);
@@ -263,7 +270,7 @@ export class AiChatRunRepo {
     // sibling replica's live run is never aborted. Omitted on the phase-1 boot
     // sweep -> unconditional.
     if (typeof opts.staleMs === 'number') {
-      const staleBefore = new Date(now.getTime() - opts.staleMs);
+      const staleBefore = new Date(Date.now() - opts.staleMs);
       query = query.where('updatedAt', '<', staleBefore);
     }
     const rows = await query.returning('id').execute();
