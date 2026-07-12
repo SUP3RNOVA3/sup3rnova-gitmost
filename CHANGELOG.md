@@ -129,6 +129,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A drifted comment suggestion can be re-synced instead of failing forever
+  with a 409.** A suggestion whose stored anchor no longer matched the live
+  document used to reject every apply attempt with an unrecoverable conflict; a
+  new resync path re-reads the live anchor so the suggestion applies against the
+  current text, and orphaned anchors (whose marked run was deleted) are
+  reconciled rather than left blocking. (#496)
+
 - **Place several images side by side in a row.** A new "Inline (side by
   side)" alignment mode in the image bubble menu renders consecutive inline
   images as a row that wraps onto the next line on narrow screens. The row is
@@ -304,6 +311,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer controls whether a turn is a run — it now governs **only** the
   browser-disconnect semantics (ON = detached/survives a disconnect; OFF = a
   disconnect stops the run). (#487)
+- **Vendor `ai` patch: upstream-tracking + version-alignment plan documented.**
+  The two local `ai@6.0.134` fixes (O(n²) `partialOutput` heap-OOM; the
+  `writeToServerResponse` drain-hang) and the hocuspocus connect-vs-unload race
+  now have explicit upstream-reporting and `ai`-version-alignment steps recorded
+  in `AGENTS.md` (client `ai@6.0.207` vs server `ai@6.0.134`-patched drift). The
+  patch bytes are unchanged — they feed the lockfile `patch_hash`, so the
+  alignment is called out as an install-gated plan rather than a bare version
+  bump. No runtime change.
 - **Client markdown paste/copy and AI-chat rendering now go through the canonical
   converter.** Pasting markdown into the editor, "Copy as markdown", the AI title
   generator, and the AI-chat markdown renderer all now use
@@ -336,6 +351,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MCP write tools no longer report a false failure that provokes a duplicate
+  write.** `drawioCreate` used to throw when the diagram landed as a NESTED block
+  (anchored inside a callout or table cell) because there is no `#<index>` handle
+  for it — but the diagram was already written, so a retry-prone agent re-created
+  it and produced a duplicate. It now returns success with `nodeId: null` plus a
+  warning that explains the write landed and how to re-read it (via
+  `getOutline` / `getPageJson` by `attachmentId`). Separately, when the live
+  collaboration-session cache hits its LRU entry cap, evicting a session whose
+  write is still in flight no longer rejects that write as a hard failure — it is
+  reported as INDETERMINATE ("the update may already have persisted; verify
+  before retry") so the agent re-reads instead of blind-retrying, and a
+  still-connecting session is no longer picked as an idle eviction victim by a
+  parallel acquire. (#494)
+- **A long AI chat no longer bricks on the model's context window, and each turn
+  stops re-persisting the whole tool-output history.** Tool outputs are now
+  stored ONCE, in `metadata.parts`; the `tool_calls` trace keeps only per-step
+  outcome flags (a v2 trace shape), ending the O(N²) write amplification that
+  re-wrote every prior output on every step (measured on a live Postgres via the
+  `pg_current_wal_lsn()` delta: the trace column shrank ~3200×, the full
+  assistant row ~51%). The persisted record is unchanged in content — the full
+  history still lives in `metadata.parts`. At REPLAY time only, the history sent
+  to the provider is now bounded by a deterministic, prompt-cache-friendly token
+  budget: `floor(0.7 × chatContextWindow)` when a window is configured (no cap —
+  anti-brick protection, not a cost limiter), a flat 100k fallback for installs
+  with no window set (exactly the ones that hit terminal overflow), or off when
+  the window is explicitly `0`. Trimming truncates old tool outputs first, then
+  mechanically collapses the oldest turns, always keeping the recent turns full
+  and the tool-call/result pairing balanced. A provider context-overflow 400 is
+  now classified and used as a reactive signal: the row is stamped so the NEXT
+  turn re-trims aggressively (0.5×), which un-bricks a chat that just 400'd. The
+  client token badge and the server budgeter now share one estimator (new
+  `@docmost/token-estimate` package) so they can never diverge. Deferred-tool
+  activation is also cached in the chat metadata to avoid re-resolving it each
+  turn. (#490)
 - **A chat with one malformed message part no longer 500s on every turn, and a
   failed send no longer duplicates the user's message.** Incoming client parts
   are now whitelisted to `text` (a forged tool-result part can no longer reach
@@ -352,7 +401,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body-timeout so a legitimate >1-min idle between the model's tool calls no
   longer breaks a long-lived SSE socket (new `AI_MCP_SSE_BODY_TIMEOUT_MS`, default
   10 min; see `.env.example`). (#489)
-
+- **Decisions on comment suggestions now leave a durable audit record.**
+  Applying or dismissing a comment suggestion hard-deletes the (childless)
+  subject comment, so the only surviving trace of who decided what is the audit
+  event — but the audit trail was wired to a Noop service that silently
+  swallowed every event. The trail is now DB-backed, so
+  `comment.suggestion_applied` / `comment.suggestion_dismissed` (and the other
+  comment-decision events) persist to the `audit` table and can be reviewed
+  after the comment is gone. A persistence failure is still swallowed with a
+  warning so it never breaks the originating request. (#496)
+- **Applying a comment suggestion no longer strips the replaced run's inline
+  formatting.** The suggested text was re-inserted carrying only the comment
+  anchor mark, silently dropping bold/italic/code/link on the affected run; the
+  prevailing formatting of the replaced run is now carried onto the applied
+  text. (#496)
+- **Markdown round-trips no longer silently drop a line that opens with a block
+  trigger.** When a document is exported to Markdown and re-imported (git-sync
+  stabilize, agent writes), a paragraph or continuation line (after a hard break)
+  that begins with a block marker — an ATX heading `#`, a blockquote/callout `>`,
+  a list marker (`-`/`*`/`+`/`N.`/`N)`), a code fence, a table `|`, a thematic
+  break (`---`), or a setext underline (`--`, `----`, or a lone `=`) — is now
+  backslash-escaped so it round-trips as text instead of being re-parsed into a
+  heading/list/quote/rule and losing its content. Front-matter stripping is
+  scoped to the import path only. (#493)
 - **The server no longer runs out of heap during long autonomous agent runs.** A
   new pnpm patch on `ai@6.0.134` stops the SDK from building a cumulative
   snapshot of the ENTIRE turn text on every streamed text-delta when no output
@@ -469,6 +540,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through that exact share (its own share or an ancestor `includeSubPages`
   share); any other value now returns the generic "not found" instead of
   serving the page. (#218)
+- **MCP tool-allowlist semantics flipped: an empty `[]` now means deny-all
+  (previously it was coerced to "no restrictions").** For an external MCP server,
+  a stored `tool_allowlist` of `[]` now denies **every** tool of that server
+  (zero tools reach the agent) instead of being treated as an empty/unset filter
+  that allowed all of them. A corrupt or non-array stored value now **fails
+  closed** to deny-all rather than silently allowing everything. The admin form
+  no longer silently widens an existing deny-all server: leaving its tag field
+  empty preserves `[]` (deny-all) on save instead of NULL-ing the column to
+  allow-all, so a routine rename/toggle can no longer grant the agent every tool.
+  "No restrictions" is still expressible — a genuinely unrestricted server stores
+  NULL, and clearing the field on such a server keeps it NULL. Operationally
+  significant: audit any server that was created or left with a literal `[]`, as
+  it now exposes no tools until an explicit allowlist (or NULL) is set. (#476)
 
 - **Tool and provider error text no longer leaks to anonymous readers in the
   public-share AI chat.** A failing tool's raw error (which could carry an

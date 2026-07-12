@@ -58,6 +58,31 @@ export async function stopRun(
 }
 
 /**
+ * Delta poll (#491): the chat's message rows changed since `cursor` (a DB-clock
+ * timestamp echoed from the previous poll) plus the current run fact, in ONE
+ * round-trip — the degraded-poll fallback's payload, replacing the old "refetch
+ * ALL infinite-query pages every 2.5s with full parts" poll. Omit `cursor` on the
+ * first poll (returns just a fresh cursor, no rows, to start the chain). The
+ * overlap window guarantees occasional REPEATS, so the caller MUST merge rows
+ * idempotently by id (mergeById). Owner-gated server-side.
+ */
+export async function getAiChatMessagesDelta(
+  chatId: string,
+  cursor?: string,
+): Promise<{
+  rows: IAiChatMessageRow[];
+  cursor: string;
+  run: { id: string; status: string } | null;
+}> {
+  const req = await api.post<{
+    rows: IAiChatMessageRow[];
+    cursor: string;
+    run: { id: string; status: string } | null;
+  }>("/ai-chat/messages/delta", { chatId, cursor });
+  return req.data;
+}
+
+/**
  * #488: the run-fact — "is a run active on this chat?" — first-class from the
  * server (POST /ai-chat/run). Called on mount to seed the client FSM's run-fact
  * and to VERIFY after a supersede mismatch (an observer following a superseded

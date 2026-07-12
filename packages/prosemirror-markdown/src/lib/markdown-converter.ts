@@ -34,6 +34,26 @@ import {
 const MAX_NODE_DEPTH = 400;
 
 /**
+ * Thrown by {@link convertProseMirrorToMarkdown} in `strict` mode when it hits a
+ * node or mark type it has no lossless markdown form for (the serializer would
+ * otherwise silently degrade it — drop an unknown mark, flatten an unknown node
+ * to its children). Carries the offending kind/name so a caller (git-sync) can
+ * surface exactly what would have been lost.
+ */
+export class ConverterLossError extends Error {
+  readonly kind: "node" | "mark";
+  readonly typeName: string;
+  constructor(kind: "node" | "mark", typeName: string) {
+    super(
+      `convertProseMirrorToMarkdown: unknown ${kind} type "${typeName}" has no lossless markdown representation (strict mode)`,
+    );
+    this.name = "ConverterLossError";
+    this.kind = kind;
+    this.typeName = typeName;
+  }
+}
+
+/**
  * Options for {@link convertProseMirrorToMarkdown}.
  */
 export interface ConvertProseMirrorToMarkdownOptions {
@@ -46,6 +66,23 @@ export interface ConvertProseMirrorToMarkdownOptions {
    * path where resolved anchors MUST be preserved for round-tripping.
    */
   dropResolvedCommentAnchors?: boolean;
+  /**
+   * Optional sink for LOSS warnings. When the serializer reaches a node or mark
+   * type it has no dedicated case for, it degrades gracefully (flattens an
+   * unknown node to its children, drops an unknown mark) — historically a SILENT
+   * data loss. When this array is provided, one human-readable message per such
+   * event is pushed here so the caller can observe (and log) what was degraded.
+   * Not provided by default -> behavior is byte-identical to before for existing
+   * callers.
+   */
+  warnings?: string[];
+  /**
+   * When true, THROW a {@link ConverterLossError} on the FIRST unknown node/mark
+   * instead of degrading silently — a warning becomes a hard error. Used by the
+   * lossless git-sync export path and the converter tests, where an unmapped
+   * type is a bug to surface, not data to quietly drop.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -63,6 +100,70 @@ export interface ConvertProseMirrorToMarkdownOptions {
  * separator is emitted for any other join, so non-list output is unchanged.
  */
 const LIST_MARKER_SEPARATOR = "<!-- -->";
+
+/**
+ * Backslash-escape a leading markdown BLOCK trigger so a serialized paragraph
+ * line re-parses as a PARAGRAPH, not another block. Without this, a paragraph
+ * whose text begins at column 0 with an ATX heading `#`, a blockquote/callout
+ * `>`, a bullet marker `-`/`*`/`+`, an ordered marker `N.`/`N)`, a code fence
+ * (```` ``` ````/`~~~`), a table `|`, or a thematic break (`---`/`***`/`___`,
+ * solid or spaced) silently becomes a heading/list/quote/code block/table/rule
+ * on the next markdown -> ProseMirror import — a known data-loss class (the
+ * thematic-break case drops the text entirely, since a horizontalRule carries
+ * none). CommonMark's escape tokenizer decodes the inserted `\` back to the
+ * literal character on import AND stops the block interpretation, so the line
+ * round-trips byte-exact as paragraph text. Only the FIRST offending character
+ * is escaped (the minimum needed to break block recognition); a line that does
+ * NOT open a block — emphasis `**x**`, an inline code span, ordinary prose — is
+ * returned verbatim, so there is no backslash churn for the common case.
+ *
+ * Applied ONLY to paragraph text, once per `\n`-separated LINE (the paragraph
+ * case splits on `\n` — each hardBreak emits `  \n` — so a trigger on a
+ * continuation line is escaped too): headings/lists/blockquotes legitimately
+ * open with these markers and render them from their own cases. This is the
+ * single, canonical fix for the class the client bridge worked around with a
+ * ZWSP (`gitmost-recording.ts`) and the generative suite self-censored around
+ * (`text-arbitraries.ts`) — both now removed.
+ */
+function escapeLeadingBlockTrigger(line: string): string {
+  // ATX heading: 1..6 `#` then whitespace/EOL.
+  if (/^#{1,6}(?:\s|$)/.test(line)) return "\\" + line;
+  // Blockquote / Docmost callout opener (`>` or `> [!info]`).
+  if (line.startsWith(">")) return "\\" + line;
+  // Bullet list marker then whitespace/EOL. Emphasis (`*x*`, `**x**`) has no
+  // space after the leading marker and is intentionally left verbatim.
+  if (/^[-*+](?:\s|$)/.test(line)) return "\\" + line;
+  // Ordered list marker `N.` / `N)`: escape the DELIMITER so the digits stay
+  // literal (`1. x` -> `1\. x`, which imports back as the text `1. x`).
+  const ordered = line.match(/^(\d+)[.)](?:\s|$)/);
+  if (ordered) {
+    const digits = ordered[1].length;
+    return line.slice(0, digits) + "\\" + line.slice(digits);
+  }
+  // Fenced code block: 3+ backticks or tildes. A single/double backtick is an
+  // inline code span and is left verbatim.
+  if (/^(?:`{3,}|~{3,})/.test(line)) return "\\" + line;
+  // Thematic break: a WHOLE line of 3+ identical `-`/`*`/`_`, optionally spaced.
+  if (/^([-*_])(?:\s*\1){2,}\s*$/.test(line)) return "\\" + line;
+  // Setext underline: a continuation line (after a hardBreak) that is ONLY `-`
+  // or ONLY `=` (any count, trailing spaces allowed). Under a paragraph line
+  // such a line re-parses as a SETEXT HEADING and SILENTLY DROPS its own text
+  // (`a\n--` -> heading "a", the `--` is LOST; `a\n=` -> heading "a", `=` LOST).
+  // The bullet arm above catches a lone `-` (via its `$`) and the thematic arm
+  // catches 3+ dashes, but exactly TWO dashes (`--`) fall through both; and no
+  // arm covers a lone `=` at all (a `==` pair is neutralized earlier by the
+  // inline `==`->`\=\=` escape, so only a single `=` line reaches here). Escaping
+  // the leading char (`\--`, `\=`) breaks the setext interpretation so the line
+  // round-trips as paragraph text. The WHOLE line must be the marker (anchored
+  // `^-+`/`^=+` to EOL), so a mid-content `-`/`=` is never spuriously escaped;
+  // and a `---`/`----` already handled by the thematic arm never reaches here,
+  // so there is no double-escape.
+  if (/^-+[ \t]*$/.test(line) || /^=+[ \t]*$/.test(line)) return "\\" + line;
+  // GFM table row opener.
+  if (line.startsWith("|")) return "\\" + line;
+  return line;
+}
+
 function listMarkerFamily(type: string | undefined): "ul" | "ol" | null {
   if (type === "bulletList" || type === "taskList") return "ul";
   if (type === "orderedList") return "ol";
@@ -108,6 +209,26 @@ export function convertProseMirrorToMarkdown(
   // loop and the raw-HTML inlineToHtml path). Off by default; the agent-read
   // callers (mcp getPage / in-app AI chat) pass it true.
   const dropResolvedCommentAnchors = options.dropResolvedCommentAnchors === true;
+
+  // Loss reporting for node/mark types with no dedicated serializer case. In
+  // `strict` mode the FIRST such type throws (git-sync, tests); otherwise the
+  // serializer degrades gracefully (as it always has) but records one warning
+  // per unmapped type into the optional sink so the loss is observable, not
+  // silent. Deduped per type so a document with many unknown nodes of one type
+  // produces one message.
+  const strict = options.strict === true;
+  const warningsSink = options.warnings;
+  const seenLossTypes = new Set<string>();
+  const warnLoss = (kind: "node" | "mark", typeName: string): void => {
+    if (strict) throw new ConverterLossError(kind, typeName);
+    if (!warningsSink) return;
+    const key = `${kind}:${typeName}`;
+    if (seenLossTypes.has(key)) return;
+    seenLossTypes.add(key);
+    warningsSink.push(
+      `Unknown ${kind} type "${typeName}" has no lossless markdown form; it was degraded on export.`,
+    );
+  };
 
   // Escape a value interpolated into an HTML double-quoted attribute value
   // (textAlign, colors, image src, math `text`, all data-* attrs, etc.). In the
@@ -412,7 +533,17 @@ export function convertProseMirrorToMarkdown(
       }
 
       case "paragraph": {
-        const text = renderInlineChildren(nodeContent);
+        // Escape a leading block trigger on EVERY line of the paragraph, not
+        // just the first: a hardBreak serializes as `  \n`, so a `#`/`-`/`>`/
+        // `1.`/`|`/fence/`---` at the start of a CONTINUATION line would also
+        // re-parse into another block on the next import (a heading/list/table/
+        // setext-`---`), and for the text-less thematic/setext case would LOSE
+        // that line's text entirely. Escaping each `\n`-separated line closes
+        // the class for multi-line paragraphs too.
+        const text = renderInlineChildren(nodeContent)
+          .split("\n")
+          .map(escapeLeadingBlockTrigger)
+          .join("\n");
         const align = node.attrs?.textAlign;
         // Non-default alignment round-trips as an ATTACHED HTML comment at the
         // END of the block line (#293 canon #9):
@@ -595,6 +726,12 @@ export function convertProseMirrorToMarkdown(
                 }
                 break;
               }
+              default:
+                // Unknown mark: no dedicated case, so it has no markdown form and
+                // is dropped from the run. Report the loss (throws in strict
+                // mode) then leave the text unwrapped — the historical behavior.
+                warnLoss("mark", String(mark.type));
+                break;
             }
           }
         }
@@ -1173,7 +1310,11 @@ export function convertProseMirrorToMarkdown(
       }
 
       default:
-        // Fallback: process children
+        // Unknown node type: no dedicated case, so the node's identity + attrs
+        // have no lossless markdown form. Report the loss (throws in strict
+        // mode) then degrade by flattening to its children — the historical
+        // graceful fallback.
+        warnLoss("node", String(type));
         return nodeContent.map(processNode).join("");
     }
   };
@@ -1296,6 +1437,12 @@ export function convertProseMirrorToMarkdown(
                 const r = mark.attrs?.resolved ? ` data-resolved="true"` : "";
                 t = `<span data-comment-id="${escapeAttr(mark.attrs.commentId)}"${r}>${t}</span>`;
               }
+              break;
+            default:
+              // Unknown mark on the raw-HTML path: dropped (no HTML form). Report
+              // the loss (throws in strict mode) — same policy as the markdown
+              // path's marks loop above.
+              warnLoss("mark", String(mark.type));
               break;
           }
         }

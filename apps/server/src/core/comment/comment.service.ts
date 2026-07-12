@@ -371,6 +371,76 @@ export class CommentService {
   }
 
   /**
+   * Re-sync a suggestion's stored `selection` (== apply-time expectedText) to the
+   * RAW substring the inline mark actually covers in the LIVE document (#496).
+   *
+   * The MCP client creates the comment from a DEBOUNCED REST snapshot, then
+   * anchors the mark in the live collab doc. When the two disagree (the doc moved
+   * on in the debounce window) the stored selection no longer equals the marked
+   * text, so EVERY apply 409s ("the commented text changed"). After anchoring the
+   * client re-reads the exact marked substring and calls this to store it, making
+   * apply's strict equality hold.
+   *
+   * Only meaningful for an un-settled top-level suggestion authored by the
+   * caller: applying/resolving freezes the anchor, and a reply-carrying thread is
+   * preserved rather than mutated. The new text must still differ from the
+   * suggestion (else "apply" would be a no-op), preserving create()'s invariant.
+   */
+  async resyncSuggestionAnchor(
+    comment: Comment,
+    selection: string,
+    user: User,
+  ): Promise<Comment> {
+    if (comment.creatorId !== user.id) {
+      throw new ForbiddenException(
+        'You can only re-anchor your own suggestion',
+      );
+    }
+    if (comment.parentCommentId) {
+      throw new BadRequestException(
+        'Only a top-level comment can carry a suggested edit',
+      );
+    }
+    if (!comment.suggestedText) {
+      throw new BadRequestException('This comment has no suggested edit');
+    }
+    // A settled suggestion's anchor is frozen: re-anchoring an applied/resolved
+    // thread is meaningless and could resurrect a stale expectedText.
+    if (comment.suggestionAppliedAt || comment.resolvedAt) {
+      throw new BadRequestException(
+        'Cannot re-anchor a suggestion that was already applied or resolved',
+      );
+    }
+    const trimmed = selection.trim();
+    if (trimmed.length === 0) {
+      throw new BadRequestException('The re-anchored selection cannot be empty');
+    }
+    // Same no-op guard as create(): the suggestion must differ from the text it
+    // replaces, or apply becomes indistinguishable from already-applied.
+    if (trimmed === comment.suggestedText.trim()) {
+      throw new BadRequestException(
+        'A suggested edit must differ from the selected text',
+      );
+    }
+
+    // Idempotent: nothing to persist when the anchor already matches.
+    if (comment.selection === selection) {
+      return comment;
+    }
+
+    await this.commentRepo.updateComment({ selection }, comment.id);
+
+    const updatedComment = await this.commentRepo.findById(comment.id, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
+
+    // Re-anchoring only corrects stored metadata; it does not change the page
+    // text or the comment body, so no ws broadcast / notification is warranted.
+    return updatedComment;
+  }
+
+  /**
    * Apply the suggested edit carried by a top-level inline comment: atomically
    * replace the text under the comment mark in the collaborative document with
    * the comment's suggestedText, then stamp the applied fields and auto-resolve
@@ -524,7 +594,7 @@ export class CommentService {
         resourceType: AuditResource.COMMENT,
         resourceId: comment.id,
         spaceId: comment.spaceId,
-        metadata: { pageId: comment.pageId },
+        metadata: this.suggestionAuditMetadata(comment, user),
       });
       return { ...updatedComment, outcome: 'resolved' };
     }
@@ -538,7 +608,7 @@ export class CommentService {
       resourceType: AuditResource.COMMENT,
       resourceId: comment.id,
       spaceId: comment.spaceId,
-      metadata: { pageId: comment.pageId },
+      metadata: this.suggestionAuditMetadata(comment, user),
     });
     return settled;
   }
@@ -577,8 +647,10 @@ export class CommentService {
 
       // Auto-resolve the thread. resolveComment handles the resolve mark, its ws
       // broadcast and the resolve notification. Stay defensive on re-entry.
+      let didResolveBroadcast = false;
       if (!comment.resolvedAt) {
         await this.resolveComment(comment, true, user, provenance);
+        didResolveBroadcast = true;
       }
 
       const updatedComment = await this.commentRepo.findById(comment.id, {
@@ -586,18 +658,27 @@ export class CommentService {
         includeResolvedBy: true,
       });
 
-      this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
-        operation: 'commentUpdated',
-        pageId: comment.pageId,
-        comment: updatedComment,
-      });
+      // #496 dedup: resolveComment already broadcast `commentResolved` carrying
+      // the fully-enriched row (the applied stamps were persisted above, before
+      // that call, so its re-read reflects them). Emitting `commentUpdated` here
+      // too made the client receive TWO events for one apply. Broadcast the
+      // update ONLY when we did NOT resolve — i.e. the rare re-entry on an
+      // already-resolved thread, where the applied-stamp change still needs a
+      // broadcast and resolveComment did not run.
+      if (!didResolveBroadcast) {
+        this.wsService.emitCommentEvent(comment.spaceId, comment.pageId, {
+          operation: 'commentUpdated',
+          pageId: comment.pageId,
+          comment: updatedComment,
+        });
+      }
 
       this.auditService.log({
         event: AuditEvent.COMMENT_SUGGESTION_APPLIED,
         resourceType: AuditResource.COMMENT,
         resourceId: comment.id,
         spaceId: comment.spaceId,
-        metadata: { pageId: comment.pageId },
+        metadata: this.suggestionAuditMetadata(comment, user),
       });
 
       return { ...updatedComment, outcome: 'resolved' };
@@ -616,7 +697,7 @@ export class CommentService {
       resourceType: AuditResource.COMMENT,
       resourceId: comment.id,
       spaceId: comment.spaceId,
-      metadata: { pageId: comment.pageId },
+      metadata: this.suggestionAuditMetadata(comment, user),
     });
 
     return settled;
@@ -627,14 +708,17 @@ export class CommentService {
    * inline `comment` anchor mark, then ATOMICALLY hard-delete the row only if it
    * is still childless. Shared by the apply/dismiss no-replies branches (#329).
    *
-   * ORDER MATTERS: the anchor mark is removed FIRST and FATALLY (mirrors
-   * applySuggestion, which mutates the doc before writing the DB). The row
-   * delete is irreversible, so if the mark removal fails — including the
-   * COLLAB_DISABLE_REDIS "no live instance" hard-error — we must NOT delete the
-   * row and report success, or the document is left with a permanent orphan
-   * anchor pointing at a comment that no longer exists (the exact data-integrity
-   * bug #329 targets). Let the exception propagate (→ 5xx); the operation is
-   * then repeatable with row + mark still consistent.
+   * ORDER MATTERS (updated #399 → #496): what runs FIRST and FATALLY here is the
+   * mark-removal ENQUEUE (a fast, durable Redis add), NOT the mark op itself.
+   * deleteCommentMark awaits only the enqueue, so a failed add throws BEFORE the
+   * irreversible row delete — the row + mark stay consistent and the operation is
+   * repeatable. The actual anchor strip then runs off the HTTP path in the worker
+   * (idempotent, 3 retries). Only an EXHAUSTED-retries job could leave the doc
+   * with an orphan anchor pointing at a hard-deleted comment (the data-integrity
+   * bug #329 targets); that residual divergence is now self-healed by the
+   * resolve/unresolve mark worker, which strips an orphan mark whenever its
+   * comment row is gone (#496), and it is meanwhile VISIBLE via BullMQ failed-job
+   * metrics rather than a silently-swallowed warn.
    *
    * RACE (#338 F4): the caller read `hasChildren` BEFORE the (slow) mark
    * removal, so a reply can land in that window. `comments.parent_comment_id` is
@@ -730,6 +814,27 @@ export class CommentService {
       userId,
     };
     return this.generalQueue.add(QueueJob.COMMENT_MARK_UPDATE, jobData);
+  }
+
+  /**
+   * Build the audit metadata for a suggestion apply/dismiss decision (#496).
+   * The subject comment is HARD-DELETED on the childless path, so the audit row
+   * is the only surviving record — capture the decision's substance (what was
+   * suggested, the anchored text it replaced, who authored it, who decided)
+   * before the row can vanish. `decidedBy` is the acting user; `commentAuthor`
+   * is the suggestion's creator.
+   */
+  private suggestionAuditMetadata(
+    comment: Comment,
+    user: User,
+  ): Record<string, any> {
+    return {
+      pageId: comment.pageId,
+      suggestedText: comment.suggestedText ?? null,
+      selection: comment.selection ?? null,
+      commentAuthor: comment.creatorId ?? null,
+      decidedBy: user.id,
+    };
   }
 
   private async queueCommentNotification(

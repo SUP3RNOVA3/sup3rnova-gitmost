@@ -22,14 +22,14 @@
  * inline markdown (`**bold**`, `` `code` ``, `[t](u)`), the raw locator will not
  * match the document's plain text. Exactly like editPageText's json-edit
  * fallback, we first try the verbatim selection and, ONLY if it anchors nowhere
- * in the whole document, retry with `stripInlineMarkdown` applied. `canAnchorInDoc`,
- * `getAnchoredText` and `applyAnchorInDoc` share this decision via
- * `resolveAnchorSelection`. `countAnchorMatches` keeps its OWN parallel exact-wins
- * implementation (it needs a raw match COUNT, not a single resolved locator), kept
- * deliberately in sync with `resolveAnchorSelection`: raw match ⇒ use raw, else fall
- * back to the stripped count. All four therefore agree on which locator matched —
- * the suggestion-uniqueness gate depends on count and can/get never disagreeing, so
- * these two exact-wins implementations MUST stay in sync if either is changed.
+ * in the whole document, retry with `stripInlineMarkdown` applied. All four entry
+ * points — `canAnchorInDoc`, `getAnchoredText`, `applyAnchorInDoc` and
+ * `countAnchorMatches` — share this exact-wins / strip-fallback decision through the
+ * SINGLE resolver `resolveAnchorSelection`; there is no second copy of the control
+ * flow. `countAnchorMatches` just asks the resolver which selection form wins and
+ * returns the raw occurrence count of that winning form. Because count and anchor
+ * derive from the same resolver, the suggestion-uniqueness gate (which depends on
+ * count) can never disagree with what actually anchors.
  */
 
 import { stripInlineMarkdown } from "./text-normalize.js";
@@ -312,10 +312,9 @@ export function canAnchorInDoc(doc: any, selection: string): boolean {
 function spliceCommentMark(
   blockContent: any[],
   match: AnchorMatch,
-  commentId: string,
+  commentMark: any,
 ): void {
   const { startChild, startOffset, endChild, endOffset } = match;
-  const commentMark = makeCommentMark(commentId);
   const fragments: any[] = [];
 
   for (let k = startChild; k <= endChild; k++) {
@@ -423,22 +422,23 @@ function rawCountAnchorMatches(doc: any, selection: string): number {
 }
 
 /**
- * Uniqueness gate for suggestions, with the SAME markdown-strip fallback as the
- * other entry points so count never disagrees with can/get/apply. EXACT WINS: if
- * the verbatim selection occurs at all, return its raw occurrence count (so a
- * selection that is unique raw stays unique — the fallback never runs and cannot
- * introduce a spurious second match). Only when the verbatim selection is absent
- * do we count occurrences of the markdown-stripped form.
+ * Uniqueness gate for suggestions. Delegates the exact-wins / markdown-strip
+ * FALLBACK DECISION to `resolveAnchorSelection` — the single resolver every
+ * other entry point (canAnchorInDoc / getAnchoredText / applyAnchorInDoc) shares
+ * — then counts occurrences of the resolved form. This removes the parallel
+ * exact-wins control flow (#494): counting can no longer drift from anchoring
+ * about WHICH selection form wins, because both ask the same resolver. Behaviour
+ * is unchanged: `resolveAnchorSelection` reports `found` iff the verbatim (else
+ * stripped) selection anchors — the same condition under which the old
+ * raw>0 / strippedCount>0 branches fired — and it returns the same winning form,
+ * whose raw occurrence count is what we return (EXACT WINS: a raw match yields the
+ * raw count, so a selection unique raw stays unique; only an absent verbatim
+ * selection falls back to the stripped form's count).
  */
 export function countAnchorMatches(doc: any, selection: string): number {
-  const raw = rawCountAnchorMatches(doc, selection);
-  if (raw > 0) return raw;
-  const stripped = stripInlineMarkdown(selection);
-  if (stripped !== selection) {
-    const strippedCount = rawCountAnchorMatches(doc, stripped);
-    if (strippedCount > 0) return strippedCount;
-  }
-  return 0;
+  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  if (!found) return 0;
+  return rawCountAnchorMatches(doc, effective);
 }
 
 /**
@@ -452,6 +452,22 @@ export function applyAnchorInDoc(
   selection: string,
   commentId: string,
 ): boolean {
+  return applyCommentMarkInDoc(doc, selection, makeCommentMark(commentId));
+}
+
+/**
+ * Core of {@link applyAnchorInDoc}, but splices an ARBITRARY comment mark object
+ * (not just a fresh `{ commentId, resolved:false }`) across the first matching
+ * range. This lets a caller re-apply a mark that carries `resolved:true` and any
+ * other stored attrs. Depth-first (same order as canAnchorInDoc); mutates in
+ * place on the first matching block and returns true, else returns false without
+ * mutating.
+ */
+export function applyCommentMarkInDoc(
+  doc: any,
+  selection: string,
+  commentMark: any,
+): boolean {
   const { selection: effective, found } = resolveAnchorSelection(doc, selection);
   if (!found) return false;
   const visit = (node: any, depth: number): boolean => {
@@ -459,7 +475,7 @@ export function applyAnchorInDoc(
     if (!Array.isArray(node.content)) return false;
     const match = findAnchorInBlock(node.content, effective);
     if (match) {
-      spliceCommentMark(node.content, match, commentId);
+      spliceCommentMark(node.content, match, commentMark);
       return true;
     }
     for (const child of node.content) {
@@ -470,4 +486,98 @@ export function applyAnchorInDoc(
     return false;
   };
   return visit(doc, 0);
+}
+
+/** A resolved inline-comment span lifted from a doc: its mark + anchored text. */
+export interface ResolvedCommentSpan {
+  commentId: string;
+  /** The full comment mark (carrying `resolved:true` + any stored attrs). */
+  mark: any;
+  /** The concatenated raw text the mark spans — used as the re-anchor selection. */
+  text: string;
+}
+
+/** True when a text node carries a RESOLVED comment mark; returns that mark. */
+function resolvedCommentMarkOf(node: any): any | null {
+  if (!node || node.type !== "text" || !Array.isArray(node.marks)) return null;
+  return (
+    node.marks.find(
+      (m: any) =>
+        m && m.type === "comment" && m.attrs?.resolved === true && m.attrs?.commentId,
+    ) || null
+  );
+}
+
+/**
+ * Collect every RESOLVED inline-comment span in `doc`, in document order. Within
+ * each block's direct content, a maximal run of consecutive text nodes sharing
+ * the same resolved `commentId` is ONE span; its concatenated raw text is the
+ * selection used to re-anchor it elsewhere. Active (unresolved) comment marks are
+ * ignored — they survive a markdown round-trip on their own (a page read emits
+ * their `<span data-comment-id>` wrapper), whereas resolved anchors are hidden
+ * from agent reads (#337) and would be erased by a full-body markdown rewrite.
+ */
+export function collectResolvedCommentSpans(doc: any): ResolvedCommentSpan[] {
+  const spans: ResolvedCommentSpan[] = [];
+  const visit = (node: any, depth: number): void => {
+    if (depth > MAX_DEPTH || !node || typeof node !== "object") return;
+    if (!Array.isArray(node.content)) return;
+    const content = node.content;
+    let i = 0;
+    while (i < content.length) {
+      const mark = resolvedCommentMarkOf(content[i]);
+      if (mark) {
+        const commentId = mark.attrs.commentId;
+        let text = "";
+        let j = i;
+        while (j < content.length) {
+          const mj = resolvedCommentMarkOf(content[j]);
+          if (!mj || mj.attrs.commentId !== commentId) break;
+          text += typeof content[j].text === "string" ? content[j].text : "";
+          j++;
+        }
+        if (text.length > 0) spans.push({ commentId, mark, text });
+        i = j > i ? j : i + 1;
+      } else {
+        i++;
+      }
+    }
+    for (const child of content) {
+      if (child && typeof child === "object" && Array.isArray(child.content)) {
+        visit(child, depth + 1);
+      }
+    }
+  };
+  visit(doc, 0);
+  return spans;
+}
+
+/**
+ * Re-graft RESOLVED comment marks from `oldDoc` onto matching text ranges in
+ * `newDoc`, returning a NEW doc (never mutates the inputs).
+ *
+ * WHY (#493): an agent read hides resolved-comment anchors (#337), so the
+ * markdown it sends to a FULL-body rewrite (`updatePageMarkdown`) no longer
+ * carries them — a naive full write would erase every resolved comment mark.
+ * This restores them: each resolved span from the previous document is re-anchored
+ * onto the SAME text in the newly-imported body (first occurrence, using the
+ * shared anchoring / markdown-strip fallback), preserving `resolved:true` and the
+ * stored attrs. A span whose text the agent changed or deleted simply does not
+ * re-anchor and is dropped (its anchor is gone; it was already resolved). Active
+ * comments are untouched — they ride through the markdown themselves.
+ */
+export function regraftResolvedComments<T = any>(oldDoc: any, newDoc: T): T {
+  if (!newDoc || typeof newDoc !== "object") return newDoc;
+  const spans = collectResolvedCommentSpans(oldDoc);
+  if (spans.length === 0) return newDoc;
+  const out =
+    typeof structuredClone === "function"
+      ? structuredClone(newDoc)
+      : (JSON.parse(JSON.stringify(newDoc)) as T);
+  for (const span of spans) {
+    // Clone the mark so the new document never shares a mark object with oldDoc.
+    const markClone = { type: "comment", attrs: { ...span.mark.attrs } };
+    applyCommentMarkInDoc(out, span.text, markClone);
+  }
+  return out;
 }

@@ -444,9 +444,13 @@ export class McpClientsService {
       try {
         client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
         const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
+        // Allowlist semantics (#476): null/absent = no restriction (all tools);
+        // ANY array — including `[]` — is authoritative, so an EMPTY allowlist
+        // yields ZERO tools (deny-all). Do NOT add a `.length > 0` escape here:
+        // that read `[]` as falsy and silently widened deny-all to allow-all
+        // (the repo also fails corrupt rows closed to `[]` for the same reason).
         const allow = server.toolAllowlist;
-        const picked =
-          Array.isArray(allow) && allow.length > 0 ? pick(raw, allow) : raw;
+        const picked = Array.isArray(allow) ? pick(raw, allow) : raw;
         // Bound each tool's execute with a per-call total-timeout guard before
         // merging, so a single chatty-but-stuck call is aborted after the cap.
         const guarded = wrapToolsWithCallTimeout(picked, callTimeoutMs);

@@ -29,6 +29,10 @@ packages/mcp/build/
 # is a build artifact like build/ — never committed, always fresh.
 packages/mcp/src/registry-stamp.generated.ts
 
+# token-estimate compiled output (#490; built in CI/Docker via `pnpm build` /
+# the server `pretest`, never committed, so src/ and prod can never diverge).
+packages/token-estimate/dist/
+
 # Logs
 logs
 *.log

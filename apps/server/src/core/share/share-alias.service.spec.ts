@@ -1,4 +1,8 @@
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { NoResultError } from 'kysely';
 import { ShareAliasService } from './share-alias.service';
 
@@ -7,6 +11,8 @@ import { ShareAliasService } from './share-alias.service';
  * 409 reassign guard, uniqueness-race handling, availability probe, and the
  * request-time readable-target resolution (which re-runs the share boundary).
  */
+const USER = { id: 'u-1' } as any;
+
 describe('ShareAliasService', () => {
   // Sentinel handed to repo calls so tests can assert they ran inside the tx.
   const trx = { __trx: true };
@@ -27,6 +33,10 @@ describe('ShareAliasService', () => {
       resolveReadableSharePage: jest.fn(),
       isSharingAllowed: jest.fn(),
     };
+    // Default: the requester CAN view the target page (validateCanView resolves),
+    // so the reassign 409 may disclose its title. Tests override to reject to
+    // assert the no-leak path.
+    const pageAccessService = { validateCanView: jest.fn().mockResolvedValue(undefined) };
     // Fake kysely db: only .transaction().execute(cb) is used by setAlias.
     const db = {
       transaction: jest.fn(() => ({
@@ -37,9 +47,10 @@ describe('ShareAliasService', () => {
       shareAliasRepo as any,
       pageRepo as any,
       shareService as any,
+      pageAccessService as any,
       db as any,
     );
-    return { service, shareAliasRepo, pageRepo, shareService, db };
+    return { service, shareAliasRepo, pageRepo, shareService, pageAccessService, db };
   }
 
   describe('setAlias', () => {
@@ -50,6 +61,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'A', // too short + uppercase
         }),
       ).rejects.toBeInstanceOf(BadRequestException);
@@ -66,6 +78,7 @@ describe('ShareAliasService', () => {
         workspaceId: 'ws-1',
         pageId: 'p-1',
         creatorId: 'u-1',
+        user: USER,
         alias: '  My Page ',
       });
 
@@ -114,6 +127,7 @@ describe('ShareAliasService', () => {
         workspaceId: 'ws-1',
         pageId: 'p-1',
         creatorId: 'u-1',
+        user: USER,
         alias: 'ted',
       });
 
@@ -144,6 +158,7 @@ describe('ShareAliasService', () => {
         workspaceId: 'ws-1',
         pageId: 'p-1',
         creatorId: 'u-1',
+        user: USER,
         alias: 'foo',
       });
 
@@ -179,6 +194,7 @@ describe('ShareAliasService', () => {
         workspaceId: 'ws-1',
         pageId: 'p-1',
         creatorId: 'u-1',
+        user: USER,
         alias: 'new',
       });
 
@@ -190,30 +206,77 @@ describe('ShareAliasService', () => {
       );
     });
 
-    it('throws 409 with current target when name is taken and not confirmed', async () => {
-      const { service, shareAliasRepo, pageRepo } = makeService();
+    it('throws 409 with the target TITLE (never its id) when the requester CAN view it', async () => {
+      const { service, shareAliasRepo, pageRepo, pageAccessService } =
+        makeService();
       shareAliasRepo.findByAliasAndWorkspace.mockResolvedValue({
         id: 'a-1',
         alias: 'foo',
         pageId: 'p-other',
       });
       pageRepo.findById.mockResolvedValue({ id: 'p-other', title: 'Other' });
+      pageAccessService.validateCanView.mockResolvedValue(undefined); // can view
 
       try {
         await service.setAlias({
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
         });
         fail('expected ConflictException');
       } catch (err) {
         expect(err).toBeInstanceOf(ConflictException);
-        expect((err as ConflictException).getResponse()).toMatchObject({
+        const body = (err as ConflictException).getResponse();
+        expect(body).toMatchObject({
           code: 'ALIAS_REASSIGN_REQUIRED',
-          currentPageId: 'p-other',
           currentPageTitle: 'Other',
         });
+        // SECURITY (#495): the page id is NEVER disclosed, even to a viewer.
+        expect(body).not.toHaveProperty('currentPageId');
+        expect(pageAccessService.validateCanView).toHaveBeenCalledWith(
+          expect.objectContaining({ id: 'p-other' }),
+          USER,
+        );
+      }
+      expect(shareAliasRepo.updatePageId).not.toHaveBeenCalled();
+    });
+
+    it('throws 409 WITHOUT the title or id when the requester CANNOT view the target (#495)', async () => {
+      const { service, shareAliasRepo, pageRepo, pageAccessService } =
+        makeService();
+      shareAliasRepo.findByAliasAndWorkspace.mockResolvedValue({
+        id: 'a-1',
+        alias: 'foo',
+        pageId: 'p-secret',
+      });
+      pageRepo.findById.mockResolvedValue({ id: 'p-secret', title: 'Secret' });
+      // No view permission on the target page -> validateCanView throws.
+      pageAccessService.validateCanView.mockRejectedValue(
+        new ForbiddenException(),
+      );
+
+      try {
+        await service.setAlias({
+          workspaceId: 'ws-1',
+          pageId: 'p-1',
+          creatorId: 'u-1',
+          user: USER,
+          alias: 'foo',
+        });
+        fail('expected ConflictException');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ConflictException);
+        const body = (err as ConflictException).getResponse() as Record<
+          string,
+          unknown
+        >;
+        expect(body).toMatchObject({ code: 'ALIAS_REASSIGN_REQUIRED' });
+        // The enumeration hole: neither the id nor the title of a page the
+        // requester cannot see may leak.
+        expect(body).not.toHaveProperty('currentPageId');
+        expect(body.currentPageTitle ?? null).toBeNull();
       }
       expect(shareAliasRepo.updatePageId).not.toHaveBeenCalled();
     });
@@ -231,6 +294,7 @@ describe('ShareAliasService', () => {
         workspaceId: 'ws-1',
         pageId: 'p-1',
         creatorId: 'u-1',
+        user: USER,
         alias: 'foo',
         confirmReassign: true,
       });
@@ -269,6 +333,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
         });
         fail('expected ConflictException');
@@ -294,6 +359,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
         });
         fail('expected ConflictException');
@@ -317,6 +383,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
         });
         fail('expected ConflictException');
@@ -346,6 +413,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
         });
         fail('expected ConflictException');
@@ -375,6 +443,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
           confirmReassign: true,
         });
@@ -406,6 +475,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'ted',
         });
         fail('expected ConflictException');
@@ -428,6 +498,7 @@ describe('ShareAliasService', () => {
           workspaceId: 'ws-1',
           pageId: 'p-1',
           creatorId: 'u-1',
+          user: USER,
           alias: 'foo',
         }),
       ).rejects.toBeInstanceOf(BadRequestException);
@@ -450,18 +521,22 @@ describe('ShareAliasService', () => {
         alias: 'free-name',
         valid: true,
         available: true,
-        currentPageId: null,
       });
+      // SECURITY (#495): the availability probe must NOT leak any page id.
+      expect(res).not.toHaveProperty('currentPageId');
     });
 
-    it('reports taken with the current target page', async () => {
+    it('reports taken WITHOUT leaking the current target page id (#495)', async () => {
       const { service, shareAliasRepo } = makeService();
       shareAliasRepo.findByAliasAndWorkspace.mockResolvedValue({
         id: 'a-1',
         pageId: 'p-9',
       });
       const res = await service.checkAvailability('taken', 'ws-1');
-      expect(res).toMatchObject({ available: false, currentPageId: 'p-9' });
+      expect(res).toMatchObject({ available: false });
+      // The row exists (available:false) but its pageId is never returned — an
+      // authenticated member cannot map an alias name to a page id it can't view.
+      expect(res).not.toHaveProperty('currentPageId');
     });
   });
 

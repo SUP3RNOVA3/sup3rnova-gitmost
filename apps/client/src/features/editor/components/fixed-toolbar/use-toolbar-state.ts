@@ -35,6 +35,30 @@ export interface ToolbarState {
 // When neither history backend is installed (the pre-sync static editor —
 // mainExtensions only, undoRedo disabled), both fall through to 0 -> false,
 // matching the previous `safeCan` behavior.
+// Reads the Yjs UndoManager's undo/redo availability from its stack lengths.
+//
+// `undoStack` / `redoStack` are PRIVATE y-undo / yjs internals, so we touch them
+// defensively: a yjs or y-undo upgrade that renames or restructures these fields
+// must not silently mis-drive the toolbar buttons (nor throw on `.length` of
+// `undefined`). We only trust them when they are actually arrays; otherwise this
+// returns null and the caller falls back to a safe default. The pin-test in
+// use-toolbar-state.test.ts asserts the current library shape, so an upgrade that
+// breaks this contract fails loudly there instead of failing silently in the UI.
+export function yHistoryAvailability(
+  undoManager: unknown,
+): { canUndo: boolean; canRedo: boolean } | null {
+  if (!undoManager || typeof undoManager !== "object") return null;
+  const { undoStack, redoStack } = undoManager as {
+    undoStack?: unknown;
+    redoStack?: unknown;
+  };
+  if (!Array.isArray(undoStack) || !Array.isArray(redoStack)) return null;
+  return {
+    canUndo: undoStack.length > 0,
+    canRedo: redoStack.length > 0,
+  };
+}
+
 function historyAvailability(editor: Editor): {
   canUndo: boolean;
   canRedo: boolean;
@@ -43,16 +67,14 @@ function historyAvailability(editor: Editor): {
 
   // Collaboration history (Yjs) takes precedence when present.
   const yState = yUndoPluginKey.getState(state) as
-    | { undoManager?: { undoStack: unknown[]; redoStack: unknown[] } }
+    | { undoManager?: unknown }
     | undefined;
-  if (yState?.undoManager) {
-    return {
-      canUndo: yState.undoManager.undoStack.length > 0,
-      canRedo: yState.undoManager.redoStack.length > 0,
-    };
-  }
+  const yAvail = yHistoryAvailability(yState?.undoManager);
+  if (yAvail) return yAvail;
 
   // Plain prosemirror-history (returns 0 when the history plugin is absent).
+  // This is also the safe default when a Yjs UndoManager is present but its
+  // private stack shape is no longer recognized (yHistoryAvailability -> null).
   return {
     canUndo: undoDepth(state) > 0,
     canRedo: redoDepth(state) > 0,

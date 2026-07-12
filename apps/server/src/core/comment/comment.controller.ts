@@ -16,6 +16,7 @@ import { UpdateCommentDto } from './dto/update-comment.dto';
 import { ResolveCommentDto } from './dto/resolve-comment.dto';
 import { ApplySuggestionDto } from './dto/apply-suggestion.dto';
 import { DismissSuggestionDto } from './dto/dismiss-suggestion.dto';
+import { ResyncSuggestionAnchorDto } from './dto/resync-suggestion-anchor.dto';
 import { PageIdDto, CommentIdDto } from './dto/comments.input';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
@@ -233,6 +234,39 @@ export class CommentController {
     // for an already-applied suggestion, and lets ConflictException (409, with
     // currentText in the payload) propagate untouched.
     return this.commentService.applySuggestion(comment, user, provenance);
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('resync-suggestion-anchor')
+  async resyncSuggestionAnchor(
+    @Body() dto: ResyncSuggestionAnchorDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
+    const comment = await this.commentRepo.findById(dto.commentId, {
+      includeCreator: true,
+      includeResolvedBy: true,
+    });
+    if (!comment) {
+      throw new NotFoundException('Comment not found');
+    }
+
+    const page = await this.pageRepo.findById(comment.pageId);
+    if (!page || page.deletedAt) {
+      throw new NotFoundException('Page not found');
+    }
+
+    // Authorize BEFORE revealing structural detail (mirrors apply/dismiss).
+    // Re-anchoring does NOT change the page text — it only corrects the stored
+    // selection metadata — so the page-level gate is comment access. The service
+    // further restricts it to the suggestion's own author.
+    await this.pageAccessService.validateCanComment(page, user, workspace.id);
+
+    return this.commentService.resyncSuggestionAnchor(
+      comment,
+      dto.selection,
+      user,
+    );
   }
 
   @HttpCode(HttpStatus.OK)

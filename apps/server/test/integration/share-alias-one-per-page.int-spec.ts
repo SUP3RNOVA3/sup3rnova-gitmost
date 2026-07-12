@@ -33,6 +33,11 @@ describe('share_aliases one-per-page invariant [integration]', () => {
   const pageRepo = {
     findById: async (id: string) => ({ id, title: `title-${id}` }),
   };
+  // The requester can view the target page (permissive), so the reassign 409 may
+  // include its title — these tests exercise the one-per-page invariant, not the
+  // #495 disclosure gate (that is unit-tested in share-alias.service.spec.ts).
+  const pageAccessService = { validateCanView: async () => {} };
+  const USER = { id: 'u-int' } as any;
 
   beforeAll(async () => {
     db = getTestDb();
@@ -41,6 +46,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       repo as any,
       pageRepo as any,
       {} as any, // shareService — unused by setAlias
+      pageAccessService as any,
       db as any,
     );
     wsId = (await createWorkspace(db)).id;
@@ -188,6 +194,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId,
       creatorId,
+      user: USER,
       alias: 'te',
     });
     expect(first.alias).toBe('te');
@@ -196,6 +203,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId,
       creatorId,
+      user: USER,
       alias: 'ted',
     });
     // Same row id — a RENAME, not a new insert.
@@ -217,12 +225,14 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId,
       creatorId: null as any,
+      user: USER,
       alias: 'hello',
     });
     const again = await service.setAlias({
       workspaceId: wsId,
       pageId,
       creatorId: null as any,
+      user: USER,
       alias: 'hello',
     });
     expect(again.id).toBe(inserted.id);
@@ -244,6 +254,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       flakyRepo as any,
       pageRepo as any,
       {} as any,
+      pageAccessService as any,
       db as any,
     );
 
@@ -252,6 +263,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
         workspaceId: wsId,
         pageId,
         creatorId: null as any,
+        user: USER,
         alias: 'rollback-me',
       }),
     ).rejects.toBeInstanceOf(BadRequestException);
@@ -275,6 +287,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId: pageA,
       creatorId: null as any,
+      user: USER,
       alias: 'shared',
     });
 
@@ -283,6 +296,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
         workspaceId: wsId,
         pageId: pageB,
         creatorId: null as any,
+        user: USER,
         alias: 'shared',
       }),
     ).rejects.toBeInstanceOf(ConflictException);
@@ -291,6 +305,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId: pageB,
       creatorId: null as any,
+      user: USER,
       alias: 'shared',
       confirmReassign: true,
     });
@@ -317,12 +332,14 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId: pageA,
       creatorId: null as any,
+      user: USER,
       alias: 'shared-target',
     });
     await service.setAlias({
       workspaceId: wsId,
       pageId: pageB,
       creatorId: null as any,
+      user: USER,
       alias: 'bee',
     });
 
@@ -330,6 +347,7 @@ describe('share_aliases one-per-page invariant [integration]', () => {
       workspaceId: wsId,
       pageId: pageB,
       creatorId: null as any,
+      user: USER,
       alias: 'shared-target',
       confirmReassign: true,
     });

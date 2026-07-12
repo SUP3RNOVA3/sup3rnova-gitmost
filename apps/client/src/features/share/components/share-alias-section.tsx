@@ -48,7 +48,6 @@ export default function ShareAliasSection({
   const [availability, setAvailability] = useState<{
     valid: boolean;
     available: boolean;
-    currentPageId: string | null;
   } | null>(null);
   const [reassign, setReassign] = useState<{
     alias: string;
@@ -76,7 +75,6 @@ export default function ShareAliasSection({
         setAvailability({
           valid: res.valid,
           available: res.available,
-          currentPageId: res.currentPageId,
         });
       } catch {
         setAvailability(null);

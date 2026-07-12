@@ -42,7 +42,7 @@ import { assistantMessageHasVisibleContent } from "@/features/ai-chat/utils/mess
 import {
   isStreamingTail,
   isSettledAssistantTail,
-  seedRows,
+  stepsPersistedOf,
   mergeById,
 } from "@/features/ai-chat/utils/resume-helpers.ts";
 import { getRun } from "@/features/ai-chat/services/ai-chat-service.ts";
@@ -266,25 +266,33 @@ export default function ChatThread({
   // is NOT one of the lifecycle flags the FSM replaced.
   const mountedRef = useRef(true);
 
-  // attachStrategy DATA (behind the resumeStream effect; #491 swaps it to tail-only
-  // WITHOUT touching the FSM). The controller is effect-owned (aborted in cleanup,
-  // I5). `stripRef`/`strippedRowRef` are the current full-replay+strip anchor.
+  // attachStrategy DATA (behind the resumeStream effect; #491 tail-only, WITHOUT
+  // touching the FSM). The controller is effect-owned (aborted in cleanup, I5).
+  // `anchorRef` is the PERSISTED assistant row that pins the run (server invariant
+  // 6) and its persisted step frontier N: it feeds `?anchor=<id>&n=<stepsPersisted>`
+  // so the tail-only attach returns frames for steps >= N (the seed carries 0..N-1).
+  // It is NOT a "stripped" row — the seed keeps every row (tail-only replaces the
+  // old full-replay+strip). Null when there is no streaming/active tail to resume.
   const attachAbortRef = useRef<AbortController | null>(null);
-  const stripRef = useRef(chatId !== null && isStreamingTail(initialRows ?? []));
-  const strippedRowRef = useRef<IAiChatMessageRow | null>(
-    stripRef.current ? (initialRows ?? [])[initialRows!.length - 1] : null,
+  const anchorRef = useRef<{ id: string; stepsPersisted: number } | null>(
+    (() => {
+      if (chatId === null || !isStreamingTail(initialRows ?? [])) return null;
+      const rows = initialRows ?? [];
+      const tail = rows[rows.length - 1];
+      return { id: tail.id, stepsPersisted: stepsPersistedOf(tail) };
+    })(),
   );
   // Effect-owned backoff timers (not lifecycle flags): the reconnect ladder and the
   // stalled inactivity cap. Cleared by the cancelReconnect effect / the cap effect.
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const idleCapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // #491 tail-only: seed EVERY persisted row unchanged (no strip). The streaming
+  // tail holds steps 0..N-1; the run-stream registry's tail (steps >= N) is APPENDED
+  // to it by the SDK continuation (readUIMessageStream({ message })), so it must be
+  // present in the store for the attach to continue the RIGHT message.
   const initialMessages = useMemo<UIMessage[]>(
-    () =>
-      seedRows(
-        initialRows ?? [],
-        stripRef.current && autonomousRunsEnabled === true,
-      ).map(rowToUiMessage),
+    () => (initialRows ?? []).map(rowToUiMessage),
     [initialRows],
   );
 
@@ -335,21 +343,16 @@ export default function ChatThread({
     (eff: RunEffect, epoch: number) => {
       switch (eff.type) {
         case "resumeStream": {
-          // The attach GET. Stamp the outcome's generation (I1). A reconnect
-          // attempt filters the pinned live row from the store first (the mount
-          // seed already stripped it), so the live replay's text-start rebuilds it
-          // without duplicating parts (#430).
+          // The attach GET. Stamp the outcome's generation (I1). #491 tail-only: the
+          // store already holds EXACTLY the persisted steps 0..N-1 (the mount seed IS
+          // persist; a reconnect was re-seeded from persist BEFORE FINISH_DISCONNECT
+          // scheduled it — see the onFinish disconnect handler), so there is nothing
+          // to filter here: the SDK continues that seeded message, appending the tail
+          // (steps >= N) without duplicating the pre-drop partial step.
           pendingAttachEpochRef.current = epoch;
           // The resumed stream's onFinish is stamped with THIS attach generation
           // (F1), so a superseded attempt's late finish is dropped.
           turnEpochRef.current = epoch;
-          if (machineRef.current.phase.name === "reconnecting") {
-            const anchor = strippedRowRef.current;
-            if (anchor)
-              setMessagesRef.current?.((prev) =>
-                prev.filter((m) => m.id !== anchor.id),
-              );
-          }
           void resumeStreamRef.current?.();
           break;
         }
@@ -464,18 +467,23 @@ export default function ChatThread({
       new DefaultChatTransport<UIMessage>({
         api: "/api/ai-chat/stream",
         credentials: "include",
-        prepareReconnectToStreamRequest: () => ({
-          // Build the attach URL from the REAL chat id. ?expect=live&anchor=<row id>
-          // only when a streaming tail was stripped: expect=live opts into a
-          // finished-retained replay (safe only because the row is stripped and the
-          // replay rebuilds it), and the anchor pins the replay to OUR run — a
-          // mismatching (newer) run 204s into the restore+poll path instead.
-          api: `/api/ai-chat/runs/${chatIdRef.current}/stream${
-            stripRef.current
-              ? `?expect=live&anchor=${strippedRowRef.current!.id}`
-              : ""
-          }`,
-        }),
+        prepareReconnectToStreamRequest: () => {
+          // #491 tail-only attach URL. When there is an anchor (a streaming/active
+          // tail to resume) build `?anchor=<assistantRowId>&n=<stepsPersisted>`: the
+          // server returns the TAIL — a synthetic `start` frame + frames for steps
+          // >= n, then live — which the SDK continuation appends to the seeded row.
+          // The server 204s (-> restore-noop + poll) when it cannot cover the
+          // frontier (overflow/rotation gap) or the anchor mismatches (a newer run).
+          // No anchor (a user tail / pre-first-frame break) => no params.
+          const anchor = anchorRef.current;
+          return {
+            api: `/api/ai-chat/runs/${chatIdRef.current}/stream${
+              anchor
+                ? `?anchor=${anchor.id}&n=${anchor.stepsPersisted}`
+                : ""
+            }`,
+          };
+        },
         fetch: async (input: RequestInfo | URL, init: RequestInit = {}) => {
           if ((init.method ?? "GET") !== "GET") {
             // Send path (POST). #488 commit 5: NO client 409 retry ladder anymore
@@ -562,8 +570,9 @@ export default function ChatThread({
 
   // Attach GET outcome -> FSM event. The epoch guard replaces BOTH the one-shot
   // 204 guard (noStreamHandledRef) and the unmount gate: a stale/superseded or
-  // post-DISPOSE outcome is dropped (I1). For a NONE outcome the attachStrategy
-  // recovery (restore the stripped row + invalidate for a fresh poll) runs first.
+  // post-DISPOSE outcome is dropped (I1). #491 tail-only: on a NONE outcome there is
+  // NOTHING to restore — the anchor row was never stripped from the view (the seed
+  // keeps it) — so we only invalidate for a fresh poll + dispatch the FSM event.
   const handleAttachOutcome = useCallback(
     (ep: number, wasReconnecting: boolean, live: boolean) => {
       if (ep !== epochRef.current) return; // stale generation — drop
@@ -575,10 +584,6 @@ export default function ChatThread({
         );
         return;
       }
-      if (strippedRowRef.current)
-        setMessagesRef.current?.((prev) =>
-          mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
-        );
       queryClient.invalidateQueries({
         queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
       });
@@ -661,56 +666,31 @@ export default function ChatThread({
       // keeps executing server-side — must win; only a NON-disconnect error (a
       // provider 500, `{ isError:true, isDisconnect:false }`) is terminal.
       if (isDisconnect) {
-        if (wasObserver) {
-          // A resumed/attached OBSERVER stream dropped. Recover via the degraded
-          // poll (restore the stripped row only when there is no visible content;
-          // never clobber a fuller on-screen tail, invariant 9). The FSM decides
-          // reconnect-vs-poll from liveFollow (a live-follow drop reconnects again,
-          // #488 commit 3; a mount-resume drop polls).
-          if (mountedRef.current) {
-            const hasVisible = msgHasVisible;
-            if (!hasVisible && strippedRowRef.current)
-              setMessages((prev) =>
-                mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
-              );
-            queryClient.invalidateQueries({
-              queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
-            });
-            dispatch({
-              type: "FINISH_DISCONNECT",
-              hasVisibleContent: hasVisible,
-              epoch: stampEpoch,
-            });
-          }
+        if (!mountedRef.current) {
           setStopNotice(null);
           return;
         }
-        // A LOCAL live turn dropped. #488 commit 2: recover by the RUN-FACT, not by
-        // the presence of an assistant message — a setup-phase break (before the
-        // first frame) still leaves a detached run writing to pages. In autonomous
-        // mode a run is active for the whole turn, so seed the run-fact from the
-        // start-metadata runId when known, else a sentinel (the attach GET goes by
-        // chatId, not runId). Pin the assistant row as the strip/anchor when present.
-        if (autonomousRunsEnabled === true && mountedRef.current) {
-          const hasAnchor =
-            message?.role === "assistant" && typeof message.id === "string";
-          if (hasAnchor) {
-            strippedRowRef.current = {
-              id: message.id,
-              role: "assistant",
-              content: "",
-              status: "streaming",
-              createdAt: new Date().toISOString(),
-              metadata: { parts: message.parts },
-            };
-            stripRef.current = true;
-          } else {
-            strippedRowRef.current = null;
-            stripRef.current = false;
-          }
+        // No detached run to recover (legacy, non-autonomous): a plain disconnect —
+        // terminal notice, no reconnect. (An observer only exists in autonomous mode,
+        // so this is always a local turn.)
+        if (autonomousRunsEnabled !== true) {
           dispatch({
-            type: "RUN_FACT",
-            runFact: { runId: extractRunId(message) ?? "pending" },
+            type: "FINISH_DISCONNECT",
+            hasVisibleContent: false,
+            epoch: stampEpoch,
+          });
+          setStopNotice("disconnect");
+          return;
+        }
+        // A mount-resume OBSERVER (one-shot resume, NOT live-follow) drop falls to
+        // the degraded POLL, which merges by id — it does NOT attach, so there is
+        // nothing to re-seed. #491 tail-only: the anchor row was never removed from
+        // the view (the seed keeps it; the continuation only APPENDED), so nothing to
+        // restore either. The FSM routes this to `polling` (ownership observer,
+        // !liveFollow).
+        if (wasObserver && !machineRef.current.ctx.liveFollow) {
+          queryClient.invalidateQueries({
+            queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
           });
           dispatch({
             type: "FINISH_DISCONNECT",
@@ -718,14 +698,92 @@ export default function ChatThread({
             epoch: stampEpoch,
           });
           setStopNotice(null);
-        } else {
+          return;
+        }
+        // We will (re-)ENTER THE RECONNECT LADDER (an attach): a LOCAL live turn's
+        // first drop, OR a live-follow observer's SUBSEQUENT drop (#488 commit 3).
+        // #488 commit 2: recover by the RUN-FACT, not by the presence of an assistant
+        // message — a setup-phase break still leaves a detached run writing to pages.
+        //
+        // #491 tail-only (THE crux): the live store holds a PARTIAL step that is AHEAD
+        // of the persisted boundary; tail-applying the reconnect's step frames over it
+        // would DUPLICATE that partial step. So entering reconnecting is ALWAYS via a
+        // RE-SEED FROM PERSIST — never the live store. Fetch the authoritative
+        // persisted assistant row (`getRun` returns the projected `message`), replace
+        // the live partial by id (mergeById -> the store now holds EXACTLY steps
+        // 0..N-1), and set the anchor to `{ id, n = stepsPersisted }`. Only AFTER the
+        // re-seed is applied do we enter the ladder (FINISH_DISCONNECT schedules the
+        // backoff) — so the attach can never tail-apply over the live partial.
+        const cid = chatIdRef.current;
+        // The live-message runId is the run-fact source (the attach GET keys on
+        // chatId, so a sentinel still recovers a setup-phase break).
+        const runId = extractRunId(message ?? undefined) ?? "pending";
+        const enterReconnect = (fact: string): void => {
+          if (!mountedRef.current) return;
+          // Epoch-stamp the run-fact too (I1): the getRun rtt widens the
+          // onFinish->dispatch window, so a concurrent SEND_LOCAL during it must be
+          // able to drop this stale RUN_FACT (else it clobbers the new turn's
+          // runFact.runId). Consistent with the postRun RUN_FACT stamp.
+          dispatch({ type: "RUN_FACT", runFact: { runId: fact }, epoch: stampEpoch });
           dispatch({
             type: "FINISH_DISCONNECT",
-            hasVisibleContent: false,
+            hasVisibleContent: msgHasVisible,
             epoch: stampEpoch,
           });
-          setStopNotice("disconnect");
+        };
+        // Restore the STRUCTURAL guarantee that the live partial is never the
+        // tail-apply base: drop the live partial from the store by id and null the
+        // anchor, so the reconnect replays from step 0 into a CLEAN store (a full
+        // rebuild) or, past any rotation, 204s -> degraded poll. Used on BOTH the
+        // no-persisted-row and getRun-FAILURE paths — after this there is no path
+        // where the attach tail-applies frames onto a row that already has them
+        // (the #137/#161 duplication class).
+        const dropLivePartialAndReplayFromStart = (): void => {
+          if (message?.role === "assistant" && typeof message.id === "string") {
+            const liveId = message.id;
+            setMessagesRef.current?.((prev) =>
+              prev.filter((m) => m.id !== liveId),
+            );
+          }
+          anchorRef.current = null;
+        };
+        if (cid) {
+          void getRun(cid)
+            .then((res) => {
+              if (!mountedRef.current) return;
+              const persisted = res.message;
+              if (persisted && persisted.role === "assistant") {
+                anchorRef.current = {
+                  id: persisted.id,
+                  stepsPersisted: stepsPersistedOf(persisted),
+                };
+                // Replace the live partial with the persisted row IN PLACE by id —
+                // the re-seed from persist. The attach's tail (steps >= N) then
+                // appends to a store holding EXACTLY steps 0..N-1: no duplication.
+                setMessages((prev) => mergeById(prev, rowToUiMessage(persisted)));
+              } else {
+                // No persisted assistant row (pre-first-frame break): drop the live
+                // partial + replay from start (no anchor/n) so nothing is duplicated.
+                dropLivePartialAndReplayFromStart();
+              }
+              enterReconnect(res.run?.id ?? runId);
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              // Persist read FAILED: we cannot re-seed from fresh persist, and a
+              // stale mount-time anchor over the live partial would tail-apply
+              // already-present steps -> duplication (a flaky-network blip:
+              // SSE + getRun both fail, network recovers in ~1s, the registry still
+              // covers from the mount frontier). Restore the removed-filter guarantee
+              // instead: drop the live partial + replay from start / 204 -> poll.
+              dropLivePartialAndReplayFromStart();
+              enterReconnect(runId);
+            });
+        } else {
+          dropLivePartialAndReplayFromStart();
+          enterReconnect(runId);
         }
+        setStopNotice(null);
         return;
       }
       // A NON-disconnect stream error (a provider 500 etc.) -> terminal error banner.
@@ -746,11 +804,10 @@ export default function ChatThread({
         if (mountedRef.current) {
           const hasVisible = msgHasVisible;
           if (!hasVisible) {
-            // Starved replay: restore the stripped row + poll to the real terminal.
-            if (strippedRowRef.current)
-              setMessages((prev) =>
-                mergeById(prev, rowToUiMessage(strippedRowRef.current!)),
-              );
+            // Starved replay (the tail carried no new steps). #491 tail-only: the
+            // seeded steps 0..N-1 are still on screen (the SDK continuation never
+            // wiped them — `start` does not reset parts), so there is nothing to
+            // restore; just poll to the real terminal.
             queryClient.invalidateQueries({
               queryKey: AI_CHAT_MESSAGES_RQ_KEY(chatIdRef.current),
             });
@@ -863,12 +920,12 @@ export default function ChatThread({
     const tail = rows[rows.length - 1];
     if (!tail || tail.role !== "assistant") return;
     setMessages((prev) => mergeById(prev, rowToUiMessage(tail)));
-    // Anchor-mismatch coherence: a restored stripped row A that a DIFFERENT run's
-    // row B has replaced as the tail would linger as an orphan — settle A from
-    // fresh history so no phantom row survives.
-    const stripped = strippedRowRef.current;
-    if (stripped && stripped.id !== tail.id) {
-      const historical = rows.find((r) => r.id === stripped.id);
+    // Anchor-mismatch coherence: if a DIFFERENT run's row B has replaced our anchor
+    // row A as the tail, A would linger as an orphan — reconcile A by id from FRESH
+    // PERSISTED history (not the pinned live row) so no phantom row survives.
+    const anchor = anchorRef.current;
+    if (anchor && anchor.id !== tail.id) {
+      const historical = rows.find((r) => r.id === anchor.id);
       if (historical)
         setMessages((prev) => mergeById(prev, rowToUiMessage(historical)));
     }
