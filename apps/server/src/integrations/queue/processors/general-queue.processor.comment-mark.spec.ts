@@ -139,13 +139,19 @@ describe('GeneralQueueProcessor — COMMENT_MARK_UPDATE (#399)', () => {
     );
   });
 
-  it('skips (no throw) when the comment row has vanished', async () => {
+  it('reconcile (#496): comment row vanished → strips the orphan anchor mark', async () => {
     const { proc, collaborationGateway, commentRepo } = makeProc();
     commentRepo.findById.mockResolvedValue(undefined);
 
     await expect(
       proc.process(job({ ...base, action: 'resolve', ts: 1000 })),
     ).resolves.toBeUndefined();
-    expect(collaborationGateway.handleYjsEvent).not.toHaveBeenCalled();
+    // A resolve/unresolve mark job whose comment row is gone leaves a silent
+    // orphan; the worker self-heals by stripping the anchor instead of returning.
+    expect(collaborationGateway.handleYjsEvent).toHaveBeenCalledWith(
+      'deleteCommentMark',
+      'page.page-1',
+      { commentId: 'c-1', user: { id: 'user-1' } },
+    );
   });
 });

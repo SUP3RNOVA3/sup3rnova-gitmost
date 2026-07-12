@@ -450,6 +450,12 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
     // can surface the closest-block / spans-multiple-blocks hint built from the
     // LIVE document (the pre-check page is not in scope there).
     let liveNotFoundError: Error | null = null;
+    // #496: the RAW substring the mark actually covers in the LIVE doc. The
+    // stored selection (payload.selection) came from a DEBOUNCED REST snapshot,
+    // which can differ from the live doc — and apply compares the marked live
+    // text to the stored selection strictly, so a stale snapshot 409s on EVERY
+    // apply. Captured here (same doc version the mark is set in) and synced below.
+    let liveAnchoredSelection: string | null = null;
     try {
       const collabToken = await this.getCollabTokenWithReauth();
       // Open the collab doc by the canonical UUID, never the slugId (#260). The
@@ -489,6 +495,12 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
           }
           if (applyAnchorInDoc(doc, selection as string, newCommentId)) {
             anchored = true;
+            // For a suggestion, re-read the exact substring now under the mark
+            // (the mark is an attribute, so it does not change the raw text) to
+            // sync as the stored expectedText after the mutation resolves.
+            if (hasSuggestion) {
+              liveAnchoredSelection = getAnchoredText(doc, selection as string);
+            }
             return doc;
           }
           // Selection text not found in the LIVE document: abort the write. The
@@ -525,6 +537,36 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
           "createComment: failed to anchor the comment (selection not found in the live document); the comment was rolled back",
         )
       );
+    }
+
+    // #496: sync the stored selection (== apply-time expectedText) to the RAW
+    // substring the mark actually covers in the LIVE doc when it diverged from
+    // the debounced REST snapshot we stored at create time. Without this, apply
+    // strictly compares the marked live text to a stale stored selection and
+    // 409s every time. Best-effort: the comment is already correctly anchored, so
+    // a resync failure must NOT roll it back — it only risks a later apply 409,
+    // which we surface as a soft warning.
+    if (
+      hasSuggestion &&
+      liveAnchoredSelection != null &&
+      liveAnchoredSelection !== payload.selection
+    ) {
+      try {
+        await this.client.post("/comments/resync-suggestion-anchor", {
+          commentId: newCommentId,
+          selection: liveAnchoredSelection,
+        });
+        // Reflect the corrected anchor in the returned comment.
+        if (result.data) result.data.selection = liveAnchoredSelection;
+      } catch (e) {
+        if (process.env.DEBUG) {
+          console.error("Failed to resync suggestion anchor:", e);
+        }
+        result.warning =
+          "The suggestion was anchored, but its stored selection could not be " +
+          "synced to the live document; applying it may report a conflict if the " +
+          "text changed. Re-create the suggestion if Apply fails.";
+      }
     }
 
     // Soft warning (like editPageText): the selection only matched after

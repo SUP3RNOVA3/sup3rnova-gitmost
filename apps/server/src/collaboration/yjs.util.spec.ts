@@ -529,4 +529,107 @@ describe('replaceYjsMarkedText', () => {
     expect(result).toEqual({ applied: false, currentText: 'abcdef' });
     expect(text.toDelta()).toEqual(before);
   });
+
+  // #496: apply must NOT silently strip the replaced run's inline formatting.
+  // Build a paragraph and format the marked range with extra marks, then assert
+  // the replacement carries them.
+  function buildFormatted(
+    runs: Array<{ text: string; attrs?: Record<string, any> }>,
+  ): { fragment: Y.XmlFragment; text: Y.XmlText } {
+    const ydoc = new Y.Doc();
+    const fragment = ydoc.getXmlFragment('default');
+    const para = new Y.XmlElement('paragraph');
+    fragment.insert(0, [para]);
+    const text = new Y.XmlText();
+    para.insert(0, [text]);
+    text.insert(0, runs.map((r) => r.text).join(''));
+    let offset = 0;
+    for (const run of runs) {
+      if (run.attrs) text.format(offset, run.text.length, run.attrs);
+      offset += run.text.length;
+    }
+    return { fragment, text };
+  }
+
+  it('preserves the original run formatting (bold + link) on the replacement', () => {
+    const { fragment, text } = buildFormatted([
+      { text: 'see ' },
+      {
+        text: 'old',
+        attrs: {
+          comment: { commentId: 'c1', resolved: false },
+          bold: true,
+          link: { href: 'https://x.test' },
+        },
+      },
+      { text: ' end' },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'old', 'new');
+
+    expect(result).toEqual({ applied: true, currentText: 'new' });
+    // The comment anchor AND the bold/link marks survive the delete+insert.
+    expect(text.toDelta()).toEqual([
+      { insert: 'see ' },
+      {
+        insert: 'new',
+        attributes: {
+          comment: { commentId: 'c1', resolved: false },
+          bold: true,
+          link: { href: 'https://x.test' },
+        },
+      },
+      { insert: ' end' },
+    ]);
+  });
+
+  it('mixed formatting under the mark: replacement takes the DOMINANT (longest) run, NOT the leading one', () => {
+    // Leading run is SHORT + plain ("x", 1 char); the following run is LONGER +
+    // bold ("bolded", 6 chars), same commentId. The longest run is deliberately
+    // NOT first: a "first-wins" pick would carry plain (no bold), so asserting
+    // bold on the result only holds if the code genuinely selects the LONGEST run.
+    const { fragment, text } = buildFormatted([
+      { text: 'x', attrs: { comment: { commentId: 'c1', resolved: false } } },
+      {
+        text: 'bolded',
+        attrs: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'xbolded', 'Z');
+
+    expect(result).toEqual({ applied: true, currentText: 'Z' });
+    expect(text.toDelta()).toEqual([
+      {
+        insert: 'Z',
+        attributes: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+    ]);
+  });
+
+  it('mixed formatting under the mark: on a length tie the FIRST run wins', () => {
+    // Two equal-length runs (2 chars each) with different formatting, same
+    // commentId. The reduce keeps the accumulator on a tie, so the FIRST run
+    // (italic) prevails over the later bold one.
+    const { fragment, text } = buildFormatted([
+      {
+        text: 'AA',
+        attrs: { comment: { commentId: 'c1', resolved: false }, italic: true },
+      },
+      {
+        text: 'BB',
+        attrs: { comment: { commentId: 'c1', resolved: false }, bold: true },
+      },
+    ]);
+
+    const result = replaceYjsMarkedText(fragment, 'c1', 'AABB', 'Z');
+
+    expect(result).toEqual({ applied: true, currentText: 'Z' });
+    expect(text.toDelta()).toEqual([
+      {
+        insert: 'Z',
+        attributes: { comment: { commentId: 'c1', resolved: false }, italic: true },
+      },
+    ]);
+  });
 });
