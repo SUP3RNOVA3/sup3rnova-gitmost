@@ -14,9 +14,11 @@
  */
 
 /*
- * Push the top-anchored toast containers below the top chrome (fixed 45px
- * header + optional 45px format toolbar + ~6px gap) so a toast (z-index 10000)
- * neither covers nor intercepts clicks on the header/toolbar (both z-index 99).
+ * Anchor the top toast containers to the very top edge of the viewport (a small
+ * 8px gap), above the header/search chrome, per product request. The toast
+ * (z-index 10000) therefore renders over the header/toolbar (both z-index 99)
+ * for the few seconds it is visible — intentional, since it is the top-most,
+ * in-the-line-of-sight surface.
  *
  * Scoped to [data-position^='top'] on purpose. Mantine renders ALL SIX position
  * containers simultaneously (`position` only routes toasts into one via the
@@ -34,7 +36,7 @@
  * (the :where() contributes 0), regardless of stylesheet order.
  */
 .mantine-Notifications-root[data-position^='top'] {
-  top: 96px;
+  top: 8px;
 }
 
 [data-mantine-color-scheme='light'] .mantine-Notification-root {
