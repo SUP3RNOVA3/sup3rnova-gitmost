@@ -37,9 +37,11 @@ import { Page } from '@docmost/db/types/entity.types';
 import { CollabHistoryService } from '../services/collab-history.service';
 import {
   EMBED_DEBOUNCE_MS,
-  HISTORY_FAST_INTERVAL,
-  HISTORY_FAST_THRESHOLD,
-  HISTORY_INTERVAL,
+  IDLE_INTERVAL_AGENT,
+  IDLE_INTERVAL_USER,
+  IDLE_MAX_WAIT_AGENT,
+  IDLE_MAX_WAIT_USER,
+  PageHistoryKind,
 } from '../constants';
 import { TransclusionService } from '../../core/page/transclusion/transclusion.service';
 import {
@@ -55,6 +57,16 @@ import { hasTransclusionFamilyNodes } from '../../core/page/transclusion/utils/t
  * connection, not the payload, so the signal cannot be aimed at another page.
  */
 export const INTENTIONAL_CLEAR_MESSAGE_TYPE = 'intentional-clear';
+
+/**
+ * #370 — wire format of the client→server "save a version" signal. Sent by the
+ * human (Cmd+S / Save button) and by the agent's explicit save tool over the
+ * SAME stateless channel. The intentionality tier ('manual' vs 'agent') is
+ * derived SERVER-SIDE from the signed connection actor, never from this
+ * payload, so a version's type is unforgeable. The document is taken from the
+ * connection (not the payload), so the signal cannot be aimed at another page.
+ */
+export const SAVE_VERSION_MESSAGE_TYPE = 'save-version';
 
 /**
  * #251 — how long an intentional-clear signal stays "pending" before it is
@@ -92,35 +104,39 @@ export function resolveSource(
 }
 
 /**
- * Compute the BullMQ job id + delay for a page-history snapshot job. Pure so
- * the data-loss-sensitive timing arithmetic is unit-testable; `now` is injected
- * (caller passes `Date.now()`) for determinism.
+ * #370 — compute the BullMQ job id + delay for a page's trailing idle-flush
+ * autosnapshot. Pure so the timing is unit-testable.
  *
- * - Agent edits: delay 0 and a source-keyed job id `${page.id}-agent`. The
- *   delay MUST stay 0 — the worker re-reads the page row at run time, so any
- *   delay risks reading content a later human edit has already overwritten
- *   (mis-tagged snapshot). 0 minimizes that window. The `-agent` suffix keeps
- *   the job from coalescing with the bare-page.id human job.
- * - Human edits: age-based debounce so rapid human edits coalesce into one
- *   snapshot; job id is the bare `page.id`.
- *
- * BullMQ forbids ':' in custom job ids (Redis key separator), so '-' is used;
- * page.id is a UUID, so `${page.id}-agent` cannot collide with a human job.
+ * Both humans and the agent now share ONE idle pipeline (the agent's old
+ * `delay=0` fast path is gone — intentional agent points arrive via the
+ * explicit save-version signal instead). The job id is the bare `page.id`, so a
+ * page has at most one pending idle job; the caller removes-and-re-adds it on
+ * every store to keep it debounced to the trailing edge of an edit burst. The
+ * window differs by source only: the agent flushes sooner than a human.
  */
 export function computeHistoryJob(
-  page: Pick<Page, 'id' | 'createdAt'>,
+  page: Pick<Page, 'id'>,
   source: string,
-  now: number,
+  // Epoch ms of the FIRST edit in the current burst (when the pending idle job
+  // was first armed). Used to enforce the max-wait ceiling so a continuous
+  // editing session cannot re-arm the trailing timer forever. `now` is injectable
+  // for tests; both default to a live clock / no ceiling when omitted.
+  burstStart?: number,
+  now: number = Date.now(),
 ): { jobId: string; delay: number } {
   const isAgent = source === 'agent';
-  const pageAge = now - new Date(page.createdAt).getTime();
-  const delay = isAgent
-    ? 0
-    : pageAge < HISTORY_FAST_THRESHOLD
-      ? HISTORY_FAST_INTERVAL
-      : HISTORY_INTERVAL;
-  const jobId = isAgent ? `${page.id}-agent` : page.id;
-  return { jobId, delay };
+  const interval = isAgent ? IDLE_INTERVAL_AGENT : IDLE_INTERVAL_USER;
+  const maxWait = isAgent ? IDLE_MAX_WAIT_AGENT : IDLE_MAX_WAIT_USER;
+
+  let delay = interval;
+  if (burstStart !== undefined) {
+    // Time already elapsed since the burst's first edit; the snapshot must fire
+    // no later than `maxWait` after that, so shrink the trailing delay to the
+    // remaining budget (never negative, so BullMQ fires it promptly).
+    const remaining = burstStart + maxWait - now;
+    delay = Math.max(0, Math.min(interval, remaining));
+  }
+  return { jobId: page.id, delay };
 }
 
 @Injectable()
@@ -132,6 +148,28 @@ export class PersistenceExtension implements Extension {
   // coalescing window" per document and OR it across all edits in the window,
   // so the snapshot is marked 'agent' regardless of who wrote last.
   private agentTouched: Map<string, boolean> = new Map();
+  // #370 — epoch ms of the FIRST edit in the current idle-flush burst. Keyed by
+  // documentName (like its sibling per-document maps above), NOT by page.id, so
+  // it can be cleaned in afterUnloadDocument alongside `contributors` /
+  // `agentTouched` / `intentionalClear` when the doc unloads — otherwise any page
+  // that was edited but never manually saved (the common case) would keep its
+  // entry forever and the Map would grow unbounded in this long-lived process.
+  // Set when the pending idle job is first armed (empty entry), read to enforce
+  // the max-wait ceiling in computeHistoryJob, and cleared on doc unload or when
+  // a manual save cancels the idle job so the next burst starts a fresh window.
+  //
+  // Single-process assumption (like `contributors` / `agentTouched` above): this
+  // lives only in THIS collab process's memory. A restart, or a page's ownership
+  // moving to another node, loses the burst-start marker. Consequence: a burst
+  // that spans the restart looks like a fresh burst to the surviving process, so
+  // its max-wait ceiling is re-anchored to the first post-restart edit — a single
+  // continuous session straddling a restart can therefore wait up to ~2× the cap
+  // for its idle snapshot (once for the lost pre-restart window, once for the new
+  // one). Bounded and benign (it only DELAYS a safety-net autosnapshot; manual
+  // saves are unaffected and the next quiet period always flushes), but the
+  // assumption and its consequence are recorded here so no one mistakes the
+  // in-memory marker for a durable, cross-process guarantee.
+  private idleBurstStart: Map<string, number> = new Map();
   // #251 — per-document "intentional clear pending" flags. Keyed by
   // documentName, value = expiry timestamp (ms). Set by onStateless when the
   // client reports a deliberate clear; consumed once by the next
@@ -363,20 +401,19 @@ export class PersistenceExtension implements Extension {
             //this.logger.debug('Contributors error:' + err?.['message']);
           }
 
-          // Approach A — boundary snapshot before the agent's first edit.
-          // When this store is the agent's and the page's currently persisted
-          // state was authored by a human, pin that human state as its own
-          // history version BEFORE the agent overwrites it. `page` still holds
-          // the OLD content/provenance here, so saveHistory(page) captures the
-          // pre-agent state tagged 'user'. The agent's new content is
-          // snapshotted later by the debounced PAGE_HISTORY job ('agent'). Skip
-          // if the prior state is already agent-authored (boundary already
-          // pinned on the user->agent transition), if the page is effectively
-          // empty, or if the latest existing snapshot already equals this human
-          // state (avoid duplicates).
+          // #370 — boundary snapshot on ANY source transition. When the store
+          // flips the page's provenance (user↔agent↔git), pin the OUTGOING
+          // state as its own history version BEFORE the incoming source
+          // overwrites it. `page` still holds the OLD content/provenance here,
+          // so saveHistory(page) captures the pre-transition state tagged with
+          // its own source, kind='boundary'. The incoming content is snapshotted
+          // later by the debounced idle job. Skip if the page is effectively
+          // empty or if the latest existing snapshot already equals this state
+          // (the shared isDeepStrictEqual gate — avoids duplicates). Generalizing
+          // beyond the old user→agent special-case also covers git-sync for free.
           if (
-            lastUpdatedSource === 'agent' &&
-            page.lastUpdatedSource !== 'agent'
+            page.lastUpdatedSource &&
+            page.lastUpdatedSource !== lastUpdatedSource
           ) {
             // pageHistory.pageId is uuid-typed; use page.id (never the doc-name
             // slugId) so a `page.<slugId>` doc cannot throw 22P02 here (#260).
@@ -384,15 +421,13 @@ export class PersistenceExtension implements Extension {
               page.id,
               { includeContent: true, trx },
             );
-            const humanBaselineMissing =
+            const baselineMissing =
               !lastHistory ||
               !isDeepStrictEqual(lastHistory.content, page.content);
-            if (
-              !isEmptyParagraphDoc(page.content as any) &&
-              humanBaselineMissing
-            ) {
+            if (!isEmptyParagraphDoc(page.content as any) && baselineMissing) {
               await this.pageHistoryRepo.saveHistory(page, {
                 contributorIds: page.contributorIds ?? undefined,
+                kind: 'boundary',
                 trx,
               });
             }
@@ -522,7 +557,7 @@ export class PersistenceExtension implements Extension {
         { jobId: `embed-${page.id}`, delay: EMBED_DEBOUNCE_MS },
       );
 
-      await this.enqueuePageHistory(page, lastUpdatedSource);
+      await this.enqueuePageHistory(page, documentName, lastUpdatedSource);
     }
 
     // #402 — report the serialized size for the store histogram's size_bucket.
@@ -554,12 +589,174 @@ export class PersistenceExtension implements Extension {
       return; // unrelated / malformed stateless message
     }
 
+    // #370 — explicit "save a version" (human Cmd+S / agent save tool). Edit
+    // rights are already enforced by the readOnly reject above (a reader can't
+    // create a version), exactly as intentional-clear requires.
+    if (message?.type === SAVE_VERSION_MESSAGE_TYPE) {
+      await this.handleSaveVersion(data);
+      return;
+    }
+
     if (message?.type !== INTENTIONAL_CLEAR_MESSAGE_TYPE) return;
 
     this.intentionalClear.set(
       documentName,
       Date.now() + INTENTIONAL_CLEAR_TTL_MS,
     );
+  }
+
+  /**
+   * #370 — persist an intentional version from the live in-memory ydoc.
+   *
+   * One stateless path serves BOTH the human and the agent; the tier is derived
+   * SERVER-SIDE from the signed connection actor ('agent' → 'agent', anything
+   * else → 'manual'), so the version type cannot be spoofed by the client. We
+   * take the fresh ydoc from the collab process memory and run it through the
+   * EXISTING store path first (so pages.content/ydoc reflect the exact content
+   * being versioned — a REST endpoint would race the up-to-10s-stale page row),
+   * then snapshot it into page_history with the intentional kind.
+   *
+   * Promote-not-dup: if the latest history row already holds this exact content
+   * and it is an autosave (idle/boundary/legacy-null), upgrade its kind in place
+   * instead of duplicating a heavy content row; if it is already 'manual', it is
+   * a no-op (the client shows an "already saved" toast). Otherwise a fresh
+   * version row is written, popping the aggregated contributors from Redis.
+   */
+  private async handleSaveVersion(data: onStatelessPayload): Promise<void> {
+    const { connection, document, documentName } = data;
+    const context = connection?.context;
+    const pageId = getPageId(documentName);
+    // Unforgeable: 'agent' only for a signed agent connection, else 'manual'.
+    const kind: PageHistoryKind =
+      context?.actor === 'agent' ? 'agent' : 'manual';
+
+    // Flush the live ydoc through the normal store path so the page row + ydoc
+    // hold exactly what we are about to version (also fires the idle enqueue we
+    // supersede below, plus any source-transition boundary). onStoreDocument
+    // only needs document/documentName/context.
+    await this.onStoreDocument({
+      document,
+      documentName,
+      context,
+    } as onStoreDocumentPayload);
+
+    let result:
+      | { historyId: string; kind: PageHistoryKind; alreadySaved: boolean }
+      | undefined;
+
+    // #370 F8-twin — the contributor set popped from Redis (destructive SPOP)
+    // must be restored if the version row does not durably land. The inner
+    // try/catch below only covers a throw INSIDE the callback; but executeTx
+    // COMMITS after the callback, so a commit-abort (serialization/deadlock/
+    // connection drop — the transient class the epic retries in the processor)
+    // rejects OUTSIDE the callback, after saveHistory already ran and the SPOP
+    // already happened, while the INSERT rolls back. onStateless does NOT retry,
+    // so an unrestored pop is a one-shot irrecoverable attribution loss (the
+    // processor got exactly this fix: poppedForRestore + an outer catch). We
+    // track the popped set here (keyed by the page UUID it was popped by — never
+    // the doc-name id, which may be a slugId, #260) and restore it in the outer
+    // catch. addContributors is an idempotent Redis SADD, so a double-restore is
+    // harmless. versionedPageId is also reused below to remove the superseded
+    // idle job by its real jobId (page.id).
+    let poppedForRestore: string[] = [];
+    let versionedPageId: string | undefined;
+
+    try {
+      await executeTx(this.db, async (trx) => {
+        const page = await this.pageRepo.findById(pageId, {
+          withLock: true,
+          includeContent: true,
+          trx,
+        });
+        if (!page) return;
+        versionedPageId = page.id;
+        // Never version an effectively-empty page (mirrors the processor's
+        // first-history guard); there is nothing intentional to pin.
+        if (isEmptyParagraphDoc(page.content as any)) return;
+
+        const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
+          page.id,
+          { includeContent: true, trx },
+        );
+
+        if (
+          lastHistory &&
+          isDeepStrictEqual(lastHistory.content, page.content)
+        ) {
+          // Content is already snapshotted. Promote-not-dup.
+          if (lastHistory.kind === 'manual') {
+            result = {
+              historyId: lastHistory.id,
+              kind: 'manual',
+              alreadySaved: true,
+            };
+            return;
+          }
+          await this.pageHistoryRepo.updateHistoryKind(
+            lastHistory.id,
+            kind,
+            trx,
+          );
+          result = { historyId: lastHistory.id, kind, alreadySaved: false };
+          return;
+        }
+
+        // Fresh version row. Pop the contributors aggregated since the last
+        // snapshot (SPOP); restore them if the write fails so they aren't lost.
+        const contributorIds = await this.collabHistory.popContributors(
+          page.id,
+        );
+        poppedForRestore = contributorIds;
+        try {
+          const saved = await this.pageHistoryRepo.saveHistory(page, {
+            contributorIds,
+            kind,
+            trx,
+          });
+          result = { historyId: saved.id, kind, alreadySaved: false };
+        } catch (err) {
+          await this.collabHistory.addContributors(page.id, contributorIds);
+          poppedForRestore = [];
+          throw err;
+        }
+      });
+    } catch (err) {
+      // A throw here means the tx did NOT commit (callback threw, or the commit
+      // itself failed and rolled back). If we popped contributors and the inner
+      // catch did not already restore them, restore now so attribution is not
+      // lost — onStateless has no retry to recover it. Restore by the page UUID
+      // the pop was keyed under (versionedPageId is always set before the pop).
+      if (poppedForRestore.length && versionedPageId) {
+        await this.collabHistory.addContributors(
+          versionedPageId,
+          poppedForRestore,
+        );
+      }
+      throw err;
+    }
+
+    // Housekeeping: this explicit version supersedes the page's pending idle
+    // autosnapshot, so cancel it and end the current idle burst so the next edit
+    // starts a fresh max-wait window. Remove the idle job by its REAL jobId
+    // (page.id UUID — computeHistoryJob arms it under page.id), not the raw
+    // doc-name id which may be a slugId for a `page.<slugId>` doc (#260), or the
+    // remove silently misses. The burst marker is keyed by documentName (like its
+    // sibling per-document maps), and is also cleaned in afterUnloadDocument.
+    if (versionedPageId) {
+      await this.historyQueue.remove(versionedPageId).catch(() => undefined);
+    }
+    this.idleBurstStart.delete(documentName);
+
+    if (result) {
+      document.broadcastStateless(
+        JSON.stringify({
+          type: 'version.saved',
+          historyId: result.historyId,
+          kind: result.kind,
+          alreadySaved: result.alreadySaved,
+        }),
+      );
+    }
   }
 
   async onChange(data: onChangePayload) {
@@ -586,6 +783,10 @@ export class PersistenceExtension implements Extension {
     this.contributors.delete(documentName);
     this.agentTouched.delete(documentName);
     this.intentionalClear.delete(documentName);
+    // #370 — drop the idle-burst marker with the other per-document maps so it
+    // cannot accumulate across the process lifetime for never-manually-saved
+    // pages. The pending idle job (if any) is a self-expiring BullMQ delayed job.
+    this.idleBurstStart.delete(documentName);
   }
 
   private consumeContributors(documentName: string): string[] {
@@ -617,19 +818,80 @@ export class PersistenceExtension implements Extension {
 
   private async enqueuePageHistory(
     page: Page,
+    documentName: string,
     lastUpdatedSource: string,
   ): Promise<void> {
-    // Job id + delay arithmetic lives in the pure `computeHistoryJob` (see its
-    // doc comment for the agent-delay-0 / age-based-debounce invariants).
+    // #370 — trailing idle debounce with a max-wait ceiling. One pending idle
+    // job per page (jobId = page.id); on every store we remove the pending
+    // delayed job and re-add it, so the snapshot lands `delay` after edits go
+    // quiet rather than once per store (precedent: workspace.service.ts).
+    // remove() on a delayed job simply deletes it (0 if absent, no throw); if the
+    // job is already ACTIVE and the remove is a no-op, the add still de-dups and
+    // the processor's isDeepStrictEqual gate collapses the duplicate content.
+    //
+    // The FIRST arm of a burst records `burstStart`; computeHistoryJob shrinks
+    // the delay to the remaining max-wait budget from that point, so a continuous
+    // session cannot re-arm the trailing timer forever and starve the snapshot.
+    // A burst marker older than THIS TIER's max-wait means the previous idle job
+    // has already fired — start a fresh window instead of firing immediately on
+    // the next edit. Must use the SAME source-specific max-wait computeHistoryJob
+    // uses (agent 5m / user 10m): a hardcoded USER ceiling would leave an agent
+    // burst's marker stale for 5..10m, forcing delay=0 on every store in that
+    // window and writing one idle row per store — exactly the per-store bloat the
+    // debounce exists to prevent, on the continuous-agent path.
+    const maxWait =
+      lastUpdatedSource === 'agent' ? IDLE_MAX_WAIT_AGENT : IDLE_MAX_WAIT_USER;
+    const now = Date.now();
+    // Keyed by documentName (see the map declaration) so afterUnloadDocument can
+    // clean it; the queue jobId stays page.id (computeHistoryJob) as required.
+    let burstStart = this.idleBurstStart.get(documentName);
+    if (burstStart === undefined || now - burstStart >= maxWait) {
+      burstStart = now;
+      this.idleBurstStart.set(documentName, burstStart);
+    }
+
     const { jobId, delay } = computeHistoryJob(
       page,
       lastUpdatedSource,
-      Date.now(),
+      burstStart,
+      now,
     );
+
+    // remove-then-add trailing-debounce idiom, and its ONE race. We delete the
+    // pending delayed job and re-add it under the same jobId so the timer resets
+    // to the trailing edge of the burst. The race is the small window between
+    // these two awaits: if the delayed job's `delay` elapses in that gap it goes
+    // ACTIVE, and then:
+    //   - remove() on an active/locked job is a no-op (BullMQ won't yank a job a
+    //     worker holds), and our `.catch(() => undefined)` swallows that too; and
+    //   - add() with a jobId that already exists (the now-active job's id) is
+    //     DROPPED by BullMQ — a duplicate add is a no-op.
+    // So this store fails to re-arm the trailing job: the just-fired snapshot
+    // captured content up to the moment it went active, and THIS edit is left
+    // without a pending trailing job. It is bounded and self-healing — the NEXT
+    // store re-arms a fresh delayed job (the id is free again once the active job
+    // completes / removeOnComplete frees it), and the processor's
+    // isDeepStrictEqual gate collapses any content-identical duplicate. The only
+    // uncovered case is when the racing store was the LAST in the session: the
+    // tail edits made after the job went active get NO trailing snapshot until
+    // the next edit re-arms one. That is an acceptable safety-net gap (a manual
+    // Save, a source-transition boundary, or simply the next edit all still cover
+    // it), which is why the reviewer accepts documenting it here rather than
+    // adding a post-add "did the add actually arm a job?" re-check.
+    //
+    // NOTE — do NOT "unify" this with the neighbouring embed-debounce idiom
+    // (aiQueue.add of PAGE_CONTENT_UPDATED above): that one uses a STABLE jobId
+    // and NO remove(), relying purely on BullMQ coalescing a repeated add under
+    // the same id, because a re-embed only needs to eventually run once on the
+    // latest content and re-anchoring its delay on every keystroke is undesirable.
+    // THIS idiom deliberately removes-then-adds precisely to PUSH the delay back
+    // to the trailing edge on every store (a true debounce), which coalescing
+    // alone cannot do. Collapsing them would silently change the history cadence.
+    await this.historyQueue.remove(jobId).catch(() => undefined);
 
     await this.historyQueue.add(
       QueueJob.PAGE_HISTORY,
-      { pageId: page.id } as IPageHistoryJob,
+      { pageId: page.id, kind: 'idle' } as IPageHistoryJob,
       { jobId, delay },
     );
   }

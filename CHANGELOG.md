@@ -135,6 +135,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new resync path re-reads the live anchor so the suggestion applies against the
   current text, and orphaned anchors (whose marked run was deleted) are
   reconciled rather than left blocking. (#496)
+- **Save intentional page versions.** Press `Cmd/Ctrl+S` (or use the page menu)
+  to save a named version of a page. The history panel now distinguishes
+  intentional versions (a "Saved" / "Agent version" badge) from automatic
+  snapshots, dims autosaves, and offers an "Only versions" filter. Automatic
+  snapshots switched from a fixed interval to a trailing idle-flush with a
+  max-wait ceiling, and a boundary snapshot is pinned whenever the editing source
+  changes (e.g. a person's edits followed by the AI agent). (#370)
 
 - **Place several images side by side in a row.** A new "Inline (side by
   side)" alignment mode in the image bubble menu renders consecutive inline
@@ -385,6 +392,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `@docmost/token-estimate` package) so they can never diverge. Deferred-tool
   activation is also cached in the chat metadata to avoid re-resolving it each
   turn. (#490)
+- **Cyrillic (and any non-ASCII) draw.io labels no longer turn into mojibake
+  when a diagram is opened in the draw.io editor.** Agent-created diagrams
+  (`drawioCreate`) and Confluence-imported diagrams stored their model in the
+  SVG's `content=` attribute as base64; the draw.io editor decodes that via
+  Latin-1 `atob` (no UTF-8 step), so every non-ASCII char (e.g. `Старт-бит`,
+  `ё`, `—`) split into garbage and the editor's autosave then persisted the
+  corrupted model, breaking the page preview too. Both write paths
+  (`buildDrawioSvg`, the import service's `createDrawioSvg`) now write `content=`
+  as XML-entity-escaped mxfile XML — draw.io's own native form, decoded by the
+  DOM as UTF-8 — so labels open intact. The decoder reads both the new
+  entity-encoded form and the old base64 form, so existing diagrams still open.
+  *Healing pre-fix diagrams:* only a diagram that still holds its original
+  (correct-UTF-8) base64 — i.e. one not yet opened/autosaved in the draw.io
+  editor — can be repaired in place by `drawioGet` → `drawioUpdate` with the
+  same XML (rewrites the attachment in the new form); no migration script is
+  needed. A diagram that was already opened in the editor persisted the
+  mojibake at rest, so `drawioGet` reads the already-corrupted text and
+  `drawioUpdate` faithfully rewrites it — that text is lost and is not
+  recoverable by a rewrite. (#507)
 - **A chat with one malformed message part no longer 500s on every turn, and a
   failed send no longer duplicates the user's message.** Incoming client parts
   are now whitelisted to `text` (a forged tool-result part can no longer reach

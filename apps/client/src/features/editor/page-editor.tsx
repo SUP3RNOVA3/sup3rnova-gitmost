@@ -31,11 +31,18 @@ import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
+  collabProviderAtom,
   currentPageEditModeAtom,
   dictationAvailabilityAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
+import { notifications } from "@mantine/notifications";
+import {
+  VERSION_SAVED_MESSAGE_TYPE,
+  type VersionSavedMessage,
+  saveVersionPending,
+} from "@/features/page-history/version-messages";
 import { asideStateAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom";
 import {
   activeCommentIdAtom,
@@ -124,6 +131,7 @@ export default function PageEditor({
 
   const [currentUser] = useAtom(currentUserAtom);
   const [, setEditor] = useAtom(pageEditorAtom);
+  const setCollabProvider = useSetAtom(collabProviderAtom);
   const [, setAsideState] = useAtom(asideStateAtom);
   const [, setActiveCommentId] = useAtom(activeCommentIdAtom);
   const [showCommentPopup, setShowCommentPopup] = useAtom(showCommentPopupAtom);
@@ -181,6 +189,24 @@ export default function PageEditor({
       const onStatelessHandler = ({ payload }: onStatelessParameters) => {
         try {
           const message = JSON.parse(payload);
+          // #370 — a version was saved somewhere; live-refresh the history panel
+          // on every client. Only the client that pressed Save (tracked by the
+          // module-level flag) shows the confirmation toast.
+          if (message?.type === VERSION_SAVED_MESSAGE_TYPE) {
+            const versionMsg = message as VersionSavedMessage;
+            queryClient.invalidateQueries({
+              queryKey: ["page-history-list"],
+            });
+            if (saveVersionPending.current) {
+              saveVersionPending.current = false;
+              notifications.show({
+                message: versionMsg.alreadySaved
+                  ? t("Already saved as the latest version")
+                  : t("Version saved"),
+              });
+            }
+            return;
+          }
           if (message?.type !== "page.updated" || !message.updatedAt) return;
           const pageData = queryClient.getQueryData<IPage>(["pages", slugId]);
           if (pageData) {
@@ -238,12 +264,16 @@ export default function PageEditor({
 
       local.on("synced", onLocalSyncedHandler);
       providersRef.current = { socket, local, remote };
+      // #370 — publish the provider so the header menu can emit save-version.
+      setCollabProvider(remote);
       setProvidersReady(true);
     } else {
+      setCollabProvider(providersRef.current.remote);
       setProvidersReady(true);
     }
     // Only destroy on final unmount
     return () => {
+      setCollabProvider(null);
       providersRef.current?.socket.destroy();
       providersRef.current?.remote.destroy();
       providersRef.current?.local.destroy();

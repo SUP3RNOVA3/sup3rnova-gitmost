@@ -1433,5 +1433,14 @@
   "The commented text changed since this suggestion was made; it was not applied.": "Прокомментированный текст изменился после создания предложения; оно не было применено.",
   "Dismiss": "Не применять",
   "Suggestion dismissed": "Предложение отклонено",
-  "Failed to dismiss suggestion": "Не удалось отклонить предложение"
+  "Failed to dismiss suggestion": "Не удалось отклонить предложение",
+  "Save version": "Сохранить версию",
+  "Ctrl+S": "Ctrl+S",
+  "Version saved": "Версия сохранена",
+  "Already saved as the latest version": "Уже сохранено как последняя версия",
+  "Agent version": "Версия агента",
+  "Boundary": "Граница",
+  "Autosave": "Автосейв",
+  "Only versions": "Только версии",
+  "No saved versions yet.": "Пока нет сохранённых версий."
 }

@@ -226,6 +226,13 @@ jobs:
       - name: Build mcp
         run: pnpm --filter @docmost/mcp build
 
+      # apps/server imports @docmost/token-estimate at runtime (history-budget.ts,
+      # #490); its dist/ is gitignored and `test:e2e` type-checks + runs the code,
+      # so build it here or tsc fails with TS2307 Cannot find module
+      # '@docmost/token-estimate' (mirrors the editor-ext / mcp build steps above).
+      - name: Build token-estimate
+        run: pnpm --filter @docmost/token-estimate build
+
       - name: Run migrations
         run: pnpm --filter ./apps/server migration:latest
 
