@@ -131,10 +131,12 @@ describe('#502 importer options — DEFAULTS unchanged (editor/file/git-sync)', 
     expect(JSON.stringify(b)).toBe(JSON.stringify(a));
   });
 
-  it('round-trip export->import(DEFAULTS) keeps math node lossless (#328 pair intact)', async () => {
-    // A page holding real math is exported, then FULL-FILE re-imported with
-    // DEFAULTS (math ON): the mathInline survives, so the lossless pair is not
-    // broken by the write-path's extensions-off importer.
+  it('round-trip export->import at the PACKAGE-DEFAULT layer keeps math (file-import / #328)', async () => {
+    // The package DEFAULT importer is what the server file-import path uses. A
+    // page holding real math is exported, then re-imported with DEFAULTS (math
+    // ON): the mathInline survives. (The tool-level import_page_markdown round-
+    // trip, which goes through mcp's markdownToProseMirrorCanonical, is pinned
+    // authoritatively in @docmost/mcp's mcp-write-extensions-off test.)
     const source = {
       type: 'doc',
       content: [

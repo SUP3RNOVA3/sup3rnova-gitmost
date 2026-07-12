@@ -52,6 +52,12 @@ export class ImportService {
     userId: string,
     spaceId: string,
     workspaceId: string,
+    // #502: when true, the markdown importer runs with the two layered
+    // extensions OFF (a `$…$` span stays literal text; a schemeless `www.host` is
+    // NOT autolinked). ONLY the MCP agent `createPage` path sets this; a HUMAN
+    // file upload never passes it, so it defaults false and math/autolink stay ON
+    // for human imports (their `$x^2$` still becomes a formula).
+    disableMarkdownExtensions = false,
   ) {
     const file = await filePromise;
     const fileBuffer = await file.toBuffer();
@@ -66,7 +72,10 @@ export class ImportService {
 
     try {
       if (fileExtension.endsWith('.md')) {
-        prosemirrorState = await this.processMarkdown(fileContent);
+        prosemirrorState = await this.processMarkdown(
+          fileContent,
+          disableMarkdownExtensions,
+        );
       } else if (fileExtension.endsWith('.html')) {
         prosemirrorState = await this.processHTML(fileContent);
       }
@@ -138,7 +147,12 @@ export class ImportService {
     return createdPage;
   }
 
-  async processMarkdown(markdownInput: string): Promise<any> {
+  async processMarkdown(
+    markdownInput: string,
+    // #502: forwarded to the importer. DEFAULT false keeps math + fuzzy autolink
+    // ON (human uploads unaffected); the MCP agent `createPage` path passes true.
+    disableMarkdownExtensions = false,
+  ): Promise<any> {
     // Canonical markdown -> ProseMirror JSON directly via
     // `@docmost/prosemirror-markdown` (issue #345) — no HTML intermediate and no
     // second editor-ext markdown layer. Foreign markdown surfaces the strict
@@ -147,7 +161,12 @@ export class ImportService {
     // The HTML-cleanup pass (`normalizeImportHtml`) is intentionally skipped here:
     // it targets foreign *HTML* (Notion/XWiki), which only ever arrives on the
     // `.html` path (`processHTML`), never as canonical markdown.
-    return markdownToProseMirror(normalizeForeignMarkdown(markdownInput));
+    return markdownToProseMirror(
+      normalizeForeignMarkdown(markdownInput),
+      disableMarkdownExtensions
+        ? { parseMath: false, fuzzyLinkify: false }
+        : undefined,
+    );
   }
 
   async processHTML(htmlInput: string): Promise<any> {

@@ -93,6 +93,13 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     const buildForm = () => {
       const form = new FormData();
       form.append("spaceId", spaceId);
+      // #502: this is an AGENT-authored body (plain prose / config), so tell the
+      // server import path to run the markdown importer with the two layered
+      // extensions OFF — a `$…$` span stays literal text (real math via
+      // `update_page_json`) and a schemeless `www.host`/email is not autolinked
+      // (an explicit `https://…` still links). A human file upload never sends
+      // this field, so human imports keep math + autolink ON.
+      form.append("disableMarkdownExtensions", "true");
       form.append("file", fileContent, {
         filename: `${title || "import"}.md`,
         contentType: "text/markdown",
