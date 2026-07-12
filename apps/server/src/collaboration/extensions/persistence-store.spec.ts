@@ -736,6 +736,53 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       expect(historyQueue.remove).toHaveBeenCalledWith(PAGE_ID);
       expect(historyQueue.remove).not.toHaveBeenCalledWith(SLUG);
     });
+
+    // #370 F2 — an effectively-empty page is a REACHABLE no-op (agent calls
+    // save_page_version on a blank page): the version tx short-circuits with
+    // nothing to pin. The handler MUST still broadcast a TERMINAL reply
+    // (version.skipped, reason:'empty') so the client resolves at once instead of
+    // waiting out its 20s ack timeout and misreporting a healthy server as
+    // unreachable. MUTATION: drop the `else if (skipped)` broadcast → no terminal
+    // reply is sent → this reddens.
+    it('empty page → no version written, broadcasts a terminal version.skipped(empty)', async () => {
+      const emptyDoc = { type: 'doc', content: [{ type: 'paragraph' }] };
+      const document = ydocFor(emptyDoc);
+      pageRepo.findById.mockResolvedValue({
+        ...persistedHumanPage('IGNORED'),
+        content: emptyDoc,
+      });
+
+      await emitSave(document, 'agent');
+
+      // Nothing pinned.
+      expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
+      expect(pageHistoryRepo.updateHistoryKind).not.toHaveBeenCalled();
+      // But a terminal reply WAS sent so the client never times out. The flush
+      // (onStoreDocument) emits its own `page.updated`; the version.skipped is the
+      // LAST broadcast (dropping the skip branch leaves page.updated last → reds).
+      const calls = (document as any).broadcastStateless.mock.calls;
+      const msg = JSON.parse(calls[calls.length - 1][0]);
+      expect(msg).toEqual({ type: 'version.skipped', reason: 'empty' });
+    });
+
+    // #370 F2 — the page row is gone (deleted / never persisted). Same rule: a
+    // terminal reply MUST be sent (version.skipped, reason:'page-not-found') so the
+    // client surfaces a truthful "not found" immediately rather than a health
+    // timeout. onStoreDocument's own `!page` guard returns early without throwing,
+    // so the handler reaches the version tx and its `!page` skip branch.
+    it('page not found → broadcasts a terminal version.skipped(page-not-found)', async () => {
+      const document = ydocFor(doc('GONE'));
+      pageRepo.findById.mockResolvedValue(null);
+
+      await emitSave(document, 'agent');
+
+      expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
+      expect((document as any).broadcastStateless).toHaveBeenCalledTimes(1);
+      const msg = JSON.parse(
+        (document as any).broadcastStateless.mock.calls[0][0],
+      );
+      expect(msg).toEqual({ type: 'version.skipped', reason: 'page-not-found' });
+    });
   });
 
   // #370 — the in-memory idle-burst marker must be dropped on doc unload (like

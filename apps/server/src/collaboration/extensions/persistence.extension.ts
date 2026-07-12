@@ -69,6 +69,19 @@ export const INTENTIONAL_CLEAR_MESSAGE_TYPE = 'intentional-clear';
 export const SAVE_VERSION_MESSAGE_TYPE = 'save-version';
 
 /**
+ * #370 F2 — wire format of the server→client REPLY to a save-version signal, sent
+ * over the same stateless channel. `version.saved` means a version was created or
+ * promoted; `version.skipped` is a TERMINAL "nothing was pinned" reply for the two
+ * reachable no-op cases (an effectively-empty page, or the page row is gone) so the
+ * client resolves at once instead of waiting out its ack timeout and misreporting a
+ * healthy server as unreachable. EXACTLY ONE of these is broadcast per handled
+ * save. The MCP client duplicates these literals (it cannot import server code) —
+ * keep the two in sync (see packages/mcp/src/lib/collaboration.ts).
+ */
+export const VERSION_SAVED_MESSAGE_TYPE = 'version.saved';
+export const VERSION_SKIPPED_MESSAGE_TYPE = 'version.skipped';
+
+/**
  * #251 — how long an intentional-clear signal stays "pending" before it is
  * ignored. The signal is set on the clearing keystroke but consumed by the
  * DEBOUNCED onStoreDocument, so the TTL must comfortably exceed the collab
@@ -643,6 +656,10 @@ export class PersistenceExtension implements Extension {
     let result:
       | { historyId: string; kind: PageHistoryKind; alreadySaved: boolean }
       | undefined;
+    // #370 F2 — set when there is nothing to version (empty page / page gone), so
+    // the tail broadcasts a terminal `version.skipped` instead of staying silent
+    // and forcing the client to time out. Mutually exclusive with `result`.
+    let skipped: 'empty' | 'page-not-found' | undefined;
 
     // #370 F8-twin — the contributor set popped from Redis (destructive SPOP)
     // must be restored if the version row does not durably land. The inner
@@ -668,11 +685,20 @@ export class PersistenceExtension implements Extension {
           includeContent: true,
           trx,
         });
-        if (!page) return;
+        if (!page) {
+          // The page row is gone (deleted/never persisted). Nothing to version —
+          // record it so the tail sends a terminal skip reply (#370 F2).
+          skipped = 'page-not-found';
+          return;
+        }
         versionedPageId = page.id;
         // Never version an effectively-empty page (mirrors the processor's
-        // first-history guard); there is nothing intentional to pin.
-        if (isEmptyParagraphDoc(page.content as any)) return;
+        // first-history guard); there is nothing intentional to pin. Record the
+        // skip so the client gets a terminal reply rather than a timeout (#370 F2).
+        if (isEmptyParagraphDoc(page.content as any)) {
+          skipped = 'empty';
+          return;
+        }
 
         const lastHistory = await this.pageHistoryRepo.findPageLastHistory(
           page.id,
@@ -747,13 +773,24 @@ export class PersistenceExtension implements Extension {
     }
     this.idleBurstStart.delete(documentName);
 
+    // EXACTLY ONE terminal reply per handled save (#370 F2): a real save/promote
+    // broadcasts `version.saved`; the two no-op early returns (empty page / page
+    // gone) broadcast `version.skipped` so the client never waits out its ack
+    // timeout. A genuine failure threw above and rejected before reaching here.
     if (result) {
       document.broadcastStateless(
         JSON.stringify({
-          type: 'version.saved',
+          type: VERSION_SAVED_MESSAGE_TYPE,
           historyId: result.historyId,
           kind: result.kind,
           alreadySaved: result.alreadySaved,
+        }),
+      );
+    } else if (skipped) {
+      document.broadcastStateless(
+        JSON.stringify({
+          type: VERSION_SKIPPED_MESSAGE_TYPE,
+          reason: skipped,
         }),
       );
     }

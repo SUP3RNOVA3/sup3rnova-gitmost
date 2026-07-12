@@ -592,8 +592,10 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
   /**
    * Save an intentional NAMED version of a page's CURRENT live content (#370).
    * The write goes over the same agent-authenticated collab session content edits
-   * use, so the server derives kind='agent' from the signed actor. Returns the
-   * created (or promoted) history id, its kind, and whether it was already saved.
+   * use, so the server derives kind='agent' from the signed actor. Resolves a
+   * SaveVersionResult: `{ saved:true, historyId, kind, alreadySaved }` on success,
+   * or `{ saved:false, skipped:true, reason }` when the server had nothing to pin
+   * (e.g. an empty page). A stale/missing pageId throws (not a benign skip).
    */
   async savePageVersion(pageId: string) {
     const collabToken = await this.getCollabTokenWithReauth();

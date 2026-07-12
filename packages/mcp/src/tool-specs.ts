@@ -756,7 +756,9 @@ export const SHARED_TOOL_SPECS = {
       'version type is derived SERVER-SIDE from your signed agent identity (you ' +
       'cannot mislabel it); a save whose content is IDENTICAL to the last saved ' +
       'version is promoted/no-op\'d server-side, so a redundant call is harmless ' +
-      'and never duplicates a version. Returns { historyId, kind, alreadySaved }.',
+      'and never duplicates a version. Returns { saved:true, historyId, kind, ' +
+      'alreadySaved } on success, or { saved:false, skipped:true, reason:\'empty\' } ' +
+      'when the page had nothing to pin (e.g. it was empty).',
     tier: 'deferred',
     catalogLine:
       'savePageVersion — pin the page\'s current content as a named agent version (restorable checkpoint).',

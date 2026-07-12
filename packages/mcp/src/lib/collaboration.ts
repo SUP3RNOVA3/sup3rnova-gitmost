@@ -328,25 +328,70 @@ export async function mutatePageContent(
  * Stateless-channel message types for the #370 explicit save-version handshake.
  * These MUST match the server constants in
  * apps/server/src/collaboration/extensions/persistence.extension.ts
- * (SAVE_VERSION_MESSAGE_TYPE / the 'version.saved' broadcast) — the mcp package
- * cannot import server code, so the literals are duplicated here with this note.
+ * (SAVE_VERSION_MESSAGE_TYPE and the VERSION_SAVED / VERSION_SKIPPED replies) —
+ * the mcp package cannot import server code, so the literals are duplicated here.
+ * KEEP THE TWO SIDES IN SYNC: the server broadcasts exactly ONE terminal reply per
+ * handled save (`version.saved` for a real save/promote, `version.skipped` for a
+ * reachable no-op — an empty page or a missing page row); the client must match
+ * BOTH or it waits out the ack timeout on the skip case and misreports a healthy
+ * server as unreachable (#370 F2).
  */
 const SAVE_VERSION_MESSAGE_TYPE = "save-version";
 const VERSION_SAVED_MESSAGE_TYPE = "version.saved";
+const VERSION_SKIPPED_MESSAGE_TYPE = "version.skipped";
 
 /**
- * Bounded wait for the server's `version.saved` broadcast after we ask it to save
- * a version. The server flushes the live ydoc through its store path and writes a
- * history row inside a DB transaction before broadcasting, so allow the same
- * headroom as a persistence ack; reject (do NOT hang) past it.
+ * Bounded wait for the server's terminal reply after we ask it to save a version.
+ * The server flushes the live ydoc through its store path and writes a history row
+ * inside a DB transaction before broadcasting, so allow the same headroom as a
+ * persistence ack; reject (do NOT hang) past it. A timeout here means NO reply at
+ * all arrived — the genuine "collab server unreachable/overloaded" case — as
+ * distinct from a `version.skipped` reply, which resolves immediately.
  */
 const SAVE_VERSION_ACK_TIMEOUT_MS = 20000;
 
-/** The resolved shape of an explicit save-version, surfaced to the tool caller. */
+/**
+ * The resolved outcome of an explicit save-version, surfaced to the tool caller.
+ * `saved:true` → a version was created or promoted (historyId/kind/alreadySaved
+ * are present). `saved:false` → the server had nothing to pin (a reachable no-op,
+ * e.g. an empty page); `skipped` + `reason` explain why. A page-not-found reply is
+ * NOT represented here — it is surfaced as a thrown error (a bad/stale pageId).
+ */
 export interface SaveVersionResult {
-  historyId: string;
-  kind: string;
-  alreadySaved: boolean;
+  saved: boolean;
+  historyId?: string;
+  kind?: string;
+  alreadySaved?: boolean;
+  skipped?: boolean;
+  reason?: string;
+}
+
+/**
+ * Parsed terminal reply the predicate hands back to savePageVersionRealtime. Kept
+ * internal: it carries the page-not-found case (mapped to a thrown error, never a
+ * returned result) that SaveVersionResult deliberately does not model.
+ */
+type SaveVersionReply =
+  | { outcome: "saved"; historyId: string; kind: string; alreadySaved: boolean }
+  | { outcome: "skipped"; reason: string };
+
+/** Match the server's terminal reply (version.saved / version.skipped), ignoring
+ *  any unrelated / cross-page stateless message so the wait is not resolved by
+ *  noise. Returns `undefined` to keep waiting (#370 F1 predicate coverage). */
+function matchSaveVersionReply(message: any): SaveVersionReply | undefined {
+  if (!message || typeof message !== "object") return undefined;
+  if (message.type === VERSION_SAVED_MESSAGE_TYPE) {
+    return {
+      outcome: "saved",
+      historyId: String(message.historyId),
+      kind: String(message.kind),
+      alreadySaved: !!message.alreadySaved,
+    };
+  }
+  if (message.type === VERSION_SKIPPED_MESSAGE_TYPE) {
+    return { outcome: "skipped", reason: String(message.reason ?? "unknown") };
+  }
+  return undefined;
 }
 
 /**
@@ -354,17 +399,27 @@ export interface SaveVersionResult {
  * (#370). Runs under the per-page lock, acquires the SAME cached CollabSession the
  * content writes use (#400) — so it authenticates with the caller's agent collab
  * token, and the server derives kind='agent' from that signed actor — then sends a
- * `{type:'save-version'}` stateless message and awaits the server's
- * `{type:'version.saved', …}` reply on the same channel.
+ * `{type:'save-version'}` stateless message and awaits the server's terminal reply
+ * (`version.saved` or `version.skipped`) on the same channel.
  *
  * Deliberately does NOT read `pages.content` over REST: the versioned content is
  * the live in-memory ydoc, which the debounced (up-to-10s-stale) page row would
  * not yet reflect. The stateless round-trip is what makes the save exact.
  *
- * On any failure the session is destroyed so the next call reconnects fresh, and
- * the error propagates. A save is safe to retry — the server promotes-not-
- * duplicates an identical latest version — so the caller (and its agent) may
- * re-issue it without risking a duplicate heavy history row.
+ * Outcomes:
+ *   - a real save/promote → `{ saved:true, historyId, kind, alreadySaved }`;
+ *   - the server had nothing to pin (empty page) → `{ saved:false, skipped:true,
+ *     reason:'empty' }` — a clean, immediate no-op, NOT a stall;
+ *   - the page row is gone (a stale/bad pageId) → a thrown error, immediate and
+ *     truthful (not the health-timeout path);
+ *   - no reply within the timeout → a thrown timeout error (the genuine "server
+ *     unreachable/overloaded" case).
+ *
+ * On a TRANSPORT failure (timeout / disconnect) the session is destroyed so the
+ * next call reconnects fresh; a page-not-found is a healthy-connection terminal
+ * reply, so the session is left cached. A save is safe to retry — the server
+ * promotes-not-duplicates an identical latest version — so the caller (and its
+ * agent) may re-issue it without risking a duplicate heavy history row.
  */
 export async function savePageVersionRealtime(
   pageId: PageId,
@@ -373,24 +428,39 @@ export async function savePageVersionRealtime(
 ): Promise<SaveVersionResult> {
   return withPageLock(pageId, async () => {
     const session = await acquireCollabSession(pageId, collabToken, baseUrl);
+    let reply: SaveVersionReply;
     try {
-      return await session.sendStatelessAndAwait<SaveVersionResult>(
+      reply = await session.sendStatelessAndAwait<SaveVersionReply>(
         JSON.stringify({ type: SAVE_VERSION_MESSAGE_TYPE }),
-        (message) =>
-          message && message.type === VERSION_SAVED_MESSAGE_TYPE
-            ? {
-                historyId: String(message.historyId),
-                kind: String(message.kind),
-                alreadySaved: !!message.alreadySaved,
-              }
-            : undefined,
+        matchSaveVersionReply,
         SAVE_VERSION_ACK_TIMEOUT_MS,
       );
     } catch (e) {
-      // Drop the session on any failure so the next call reconnects fresh.
+      // TRANSPORT failure (no reply within the timeout, or a disconnect): drop the
+      // session so the next call reconnects fresh.
       session.destroy("save-version failed");
       throw e;
     }
+    // A terminal reply arrived over a healthy connection — do NOT destroy the
+    // session; interpret the outcome.
+    if (reply.outcome === "skipped") {
+      if (reply.reason === "page-not-found") {
+        // A resolved pageId that the collab server no longer holds (deleted, or a
+        // stale id). Surface it immediately and truthfully, not as a health error.
+        throw new Error(
+          `savePageVersion: page ${pageId} was not found on the collaboration ` +
+            `server (it may have been deleted) — nothing was saved.`,
+        );
+      }
+      // Reachable benign no-op (e.g. an empty page): a clean result, not a throw.
+      return { saved: false, skipped: true, reason: reply.reason };
+    }
+    return {
+      saved: true,
+      historyId: reply.historyId,
+      kind: reply.kind,
+      alreadySaved: reply.alreadySaved,
+    };
   });
 }
 
