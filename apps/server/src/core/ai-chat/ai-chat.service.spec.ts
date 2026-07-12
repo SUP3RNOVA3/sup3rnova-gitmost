@@ -664,16 +664,22 @@ describe('lastAssistantReplayOverflowCount', () => {
   });
 
   // The floor never RAISES a legitimately small configured budget above itself —
-  // that would re-overflow the very window it was configured for.
-  it('#520: never inflates a small configured budget above itself', () => {
+  // that would re-overflow the very window it was configured for. Under #520 Option B
+  // recovery MAY cut it BELOW itself (down to floor(0.5×base) = the old 0.5× cut).
+  it('#520: never inflates a small configured budget above itself (may cut below)', () => {
     const small = 5_000; // below the floor
+    const floor = Math.min(REPLAY_MIN_FLOOR_TOKENS, Math.floor(small * 0.5)); // 2500
     expect(resolveEffectiveReplayThreshold(small, 0)).toBe(small);
-    // Even under escalation the effective threshold never exceeds the base.
+    // Even under escalation the effective threshold never exceeds the base, and never
+    // drops below the absolute floor.
     for (const k of [1, 2, 3, 10]) {
-      expect(
-        resolveEffectiveReplayThreshold(small, k) as number,
-      ).toBeLessThanOrEqual(small);
+      const t = resolveEffectiveReplayThreshold(small, k) as number;
+      expect(t).toBeLessThanOrEqual(small);
+      expect(t).toBeGreaterThanOrEqual(floor);
     }
+    // Option B: on overflow it DOES cut below the configured budget (old floor==budget
+    // behavior would keep this at `small`).
+    expect(resolveEffectiveReplayThreshold(small, 1)).toBe(floor);
   });
 });
 
@@ -1023,6 +1029,27 @@ describe('flushAssistant', () => {
     const f = flushAssistant([], '', 'completed', { finishReason: 'stop' });
     expect('replayTrimmedToTokens' in f.metadata).toBe(false);
     expect('replayOverflowCount' in f.metadata).toBe(false);
+    expect('replayBelowConfiguredBudget' in f.metadata).toBe(false);
+  });
+
+  // #520 Option B observability: the turn is marked when recovery replayed BELOW the
+  // admin-configured budget, so the UI/telemetry can surface "config too large".
+  it('stamps replayBelowConfiguredBudget when recovery cut below the configured budget', () => {
+    const f = flushAssistant([], '', 'error', {
+      error: 'ctx',
+      replayOverflowCount: 2,
+      replayBelowConfiguredBudget: true,
+    });
+    // MUTATION SENTINEL: dropping the metadata stamp in flushAssistant reddens this.
+    expect(f.metadata.replayBelowConfiguredBudget).toBe(true);
+  });
+
+  it('omits replayBelowConfiguredBudget on a normal in-budget replay', () => {
+    // false/omitted must NOT leave the flag on the turn (only the below-budget case).
+    const off = flushAssistant([], '', 'completed', {
+      replayBelowConfiguredBudget: false,
+    });
+    expect('replayBelowConfiguredBudget' in off.metadata).toBe(false);
   });
 
   // A clean finalize (no overflow -> count 0/omitted) leaves NO counter, which the

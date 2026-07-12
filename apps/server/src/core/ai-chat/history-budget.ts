@@ -32,13 +32,23 @@ export const REPLAY_BUDGET_WINDOW_FRACTION = 0.7;
  */
 export const REPLAY_AGGRESSIVE_FRACTION = 0.5;
 /**
- * Lower bound (tokens) on the escalating reactive budget: the iterative cut is
- * clamped here so it CONVERGES (a fixed floor, not an ever-shrinking value that
- * would eventually trim everything). Rationale: below ~8k tokens a chat cannot
+ * Absolute lower bound (tokens) on the escalating reactive budget: the iterative
+ * cut is clamped here so it CONVERGES (a fixed floor, not an ever-shrinking value
+ * that would eventually trim everything). Rationale: below ~8k tokens a chat cannot
  * carry meaningful recent context, and even a small real model window comfortably
  * fits this much — keep-recent-turns still applies on top, so a handful of recent
- * turns survive. It is never applied so as to RAISE a legitimately small configured
- * budget (that would re-overflow a tiny window); see resolveEffectiveReplayThreshold.
+ * turns survive.
+ *
+ * #520 Option B: for a LARGE configured window this floor sits BELOW the configured
+ * replay budget, and recovery is allowed to escalate PAST the configured budget down
+ * to it — "the chat must not brick on overflow" is an INVARIANT of the reactive
+ * branch, and a configured window is a claim about model capacity, not a promise
+ * about replay size; once the provider proves non-fit with a 400, reality beats the
+ * config. This does NOT change the NORMAL path's upper bound (#510 Option A still
+ * respects the configured budget while it fits) — it is survival once non-fit is
+ * proven. For a SMALL configured window the effective floor is instead the old
+ * single 0.5× cut (never worse than before, and never RAISED above the budget); see
+ * {@link resolveEffectiveReplayThreshold}.
  */
 export const REPLAY_MIN_FLOOR_TOKENS = 8_000;
 /**
@@ -117,9 +127,19 @@ export function resolveReplayBudget(rawContextWindow: unknown): ReplayBudget {
  * enough to fit; the escalating cut is what recovers such a chat.
  *
  * A `null` base budget (trimming OFF) is passed through unchanged: an explicit
- * off-switch is never overridden by the recovery path. The floor is applied as
- * `min(floor, base)` so it never RAISES a legitimately small configured budget
- * above itself (which would re-overflow the same small window it was set for).
+ * off-switch is never overridden by the recovery path.
+ *
+ * The absolute floor is `min(REPLAY_MIN_FLOOR_TOKENS, floor(0.5 × base))` (#520
+ * Option B):
+ *   - LARGE window (floor(0.5 × base) >= REPLAY_MIN_FLOOR_TOKENS) -> the fixed
+ *     REPLAY_MIN_FLOOR_TOKENS, which is BELOW the configured budget: escalation is
+ *     ALLOWED to cut past the configured budget down to this absolute minimum, so a
+ *     chat whose real model window is far smaller than the configured window still
+ *     un-bricks (the invariant beats a config reality disproved with a 400).
+ *   - SMALL window (floor(0.5 × base) < REPLAY_MIN_FLOOR_TOKENS) -> floor(0.5 ×
+ *     base), i.e. AT LEAST the old single 0.5× cut: recovery is never WORSE than the
+ *     pre-#520 behavior, and the floor is still never RAISED above the configured
+ *     budget itself (that would re-overflow the very window it was set for).
  */
 export function resolveEffectiveReplayThreshold(
   thresholdTokens: number | null,
@@ -127,7 +147,11 @@ export function resolveEffectiveReplayThreshold(
 ): number | null {
   if (thresholdTokens == null || k <= 0) return thresholdTokens;
   const scaled = Math.floor(thresholdTokens * REPLAY_AGGRESSIVE_FRACTION ** k);
-  return Math.max(scaled, Math.min(REPLAY_MIN_FLOOR_TOKENS, thresholdTokens));
+  const floor = Math.min(
+    REPLAY_MIN_FLOOR_TOKENS,
+    Math.floor(thresholdTokens * REPLAY_AGGRESSIVE_FRACTION),
+  );
+  return Math.max(scaled, floor);
 }
 
 /**
