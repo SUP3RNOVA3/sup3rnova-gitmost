@@ -3,6 +3,7 @@ import {
   IconArrowRight,
   IconArrowsHorizontal,
   IconClockHour4,
+  IconDeviceFloppy,
   IconDots,
   IconEye,
   IconEyeOff,
@@ -17,7 +18,7 @@ import {
   IconTrash,
   IconWifiOff,
 } from "@tabler/icons-react";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useAsideTriggerProps } from "@/hooks/use-toggle-aside.tsx";
 import { useAtom, useAtomValue } from "jotai";
 import { historyAtoms } from "@/features/page-history/atoms/history-atoms.ts";
@@ -39,9 +40,14 @@ import { Trans, useTranslation } from "react-i18next";
 import ExportModal from "@/components/common/export-modal";
 import { convertProseMirrorToMarkdown } from "@docmost/prosemirror-markdown/browser";
 import {
+  collabProviderAtom,
   pageEditorAtom,
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms.ts";
+import {
+  SAVE_VERSION_MESSAGE_TYPE,
+  saveVersionPending,
+} from "@/features/page-history/version-messages.ts";
 import { formattedDate } from "@/lib/time.ts";
 import { PageEditModeToggle } from "@/features/user/components/page-state-pref.tsx";
 import MovePageModal from "@/features/page/components/move-page-modal.tsx";
@@ -72,8 +78,33 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
   });
   const isDeleted = !!page?.deletedAt;
   const [workspace] = useAtom(workspaceAtom);
+  const collabProvider = useAtomValue(collabProviderAtom);
   // Community public-sharing entry point (replaces the removed EE PageShareModal)
   const workspaceSharingDisabled = workspace?.settings?.sharing?.disabled === true;
+
+  // #370 — explicit "save a version" (Cmd+S / Save button). One path for the
+  // human; the server derives the tier from the signed actor. Readers can't save
+  // (the button is hidden and the collab connection is read-only server-side).
+  const handleSaveVersion = useCallback(() => {
+    if (readOnly || !collabProvider) return;
+    // Flag this client as the initiator so only it shows the confirmation toast;
+    // a safety timeout clears it if no broadcast comes back (e.g. offline).
+    saveVersionPending.current = true;
+    window.setTimeout(() => {
+      saveVersionPending.current = false;
+    }, 5000);
+    collabProvider.sendStateless(
+      JSON.stringify({ type: SAVE_VERSION_MESSAGE_TYPE }),
+    );
+  }, [readOnly, collabProvider]);
+
+  // mod+S must also block the browser's "Save page" dialog. `triggerOnContent-
+  // Editable` + empty ignore-list so it fires while typing in the editor/title.
+  useHotkeys(
+    [["mod+S", handleSaveVersion, { preventDefault: true }]],
+    [],
+    true,
+  );
 
   useHotkeys(
     [
@@ -133,15 +164,16 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
         </ActionIcon>
       </Tooltip>
 
-      <PageActionMenu readOnly={readOnly} />
+      <PageActionMenu readOnly={readOnly} onSaveVersion={handleSaveVersion} />
     </>
   );
 }
 
 interface PageActionMenuProps {
   readOnly?: boolean;
+  onSaveVersion?: () => void;
 }
-function PageActionMenu({ readOnly }: PageActionMenuProps) {
+function PageActionMenu({ readOnly, onSaveVersion }: PageActionMenuProps) {
   const { t } = useTranslation();
   const [, setHistoryModalOpen] = useAtom(historyAtoms);
   const clipboard = useClipboard({ timeout: 500 });
@@ -302,6 +334,20 @@ function PageActionMenu({ readOnly }: PageActionMenuProps) {
               <PageWidthToggle label={t("Full width")} />
             </Group>
           </Menu.Item>
+
+          {!readOnly && (
+            <Menu.Item
+              leftSection={<IconDeviceFloppy size={16} />}
+              onClick={onSaveVersion}
+              rightSection={
+                <Text size="xs" c="dimmed">
+                  {t("Ctrl+S")}
+                </Text>
+              }
+            >
+              {t("Save version")}
+            </Menu.Item>
+          )}
 
           <Menu.Item
             leftSection={<IconHistory size={16} />}
