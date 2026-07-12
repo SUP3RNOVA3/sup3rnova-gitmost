@@ -72,6 +72,12 @@ export const PROSE_NON_TOOL_TERMS: ReadonlySet<string> = new Set([
   "parentCommentId",
   "suggestedText",
   "historyId",
+  // search RESPONSE fields documented in the routing prose (#529) — schema
+  // fields the search tool returns, not tools themselves
+  "matchedTerms",
+  "matchedFields",
+  "hasMore",
+  "truncatedAtCap",
   // helper / value fragments
   "orderedList", // "orderedList.type" (a dropped attr, not a tool)
   "mxGraph", // "mxGraph XML"
