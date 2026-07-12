@@ -102,28 +102,49 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
   }
 
   private async validateApiKey(req: any, payload: JwtApiKeyPayload) {
-    let ApiKeyModule: any;
-    let isApiKeyModuleReady = false;
+    const apiKeyService = this.resolveApiKeyService();
+    if (!apiKeyService) {
+      throw new UnauthorizedException('Enterprise API Key module missing');
+    }
 
+    const result = await apiKeyService.validateApiKey(payload);
+
+    // Stamp the agent-edit provenance for the API-KEY path too (#486). Unlike the
+    // access-token path above, it CANNOT be resolved before this point: the
+    // API-key payload carries no signed actor/aiChatId claim, and the user (with
+    // its isAgent flag) is unknown until the key is validated. Claim semantics for
+    // API keys: an is_agent API key (an agent service account) stamps 'agent' on
+    // every REST write; an ordinary API key resolves to 'user'. An API key has no
+    // internal ai_chats row, so aiChatId is always null. Derived from the
+    // SERVER-SIDE user (never a client field), so an 'agent' badge is unspoofable
+    // — mirroring the access-token path. Passing `null` for the claim means the
+    // actor is decided solely by user.isAgent.
+    const provenance = resolveProvenance((result as any)?.user, null);
+    req.raw.actor = provenance.actor;
+    req.raw.aiChatId = provenance.aiChatId;
+
+    return result;
+  }
+
+  /**
+   * Resolve the enterprise ApiKeyService, or `null` when the EE module is not
+   * bundled in this build (community build). Extracted as an overridable seam so
+   * the API-key provenance stamping can be unit-tested without the EE package
+   * present (docmost is OSS + a separate EE bundle; `require` of the EE path
+   * throws here). Any load/resolve error is treated as "module missing".
+   */
+  protected resolveApiKeyService(): {
+    validateApiKey: (payload: JwtApiKeyPayload) => Promise<unknown>;
+  } | null {
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      ApiKeyModule = require('./../../../ee/api-key/api-key.service');
-      isApiKeyModuleReady = true;
+      const ApiKeyModule = require('./../../../ee/api-key/api-key.service');
+      return this.moduleRef.get(ApiKeyModule.ApiKeyService, { strict: false });
     } catch (err) {
       this.logger.debug(
         'API Key module requested but enterprise module not bundled in this build',
       );
-      isApiKeyModuleReady = false;
+      return null;
     }
-
-    if (isApiKeyModuleReady) {
-      const ApiKeyService = this.moduleRef.get(ApiKeyModule.ApiKeyService, {
-        strict: false,
-      });
-
-      return ApiKeyService.validateApiKey(payload);
-    }
-
-    throw new UnauthorizedException('Enterprise API Key module missing');
   }
 }

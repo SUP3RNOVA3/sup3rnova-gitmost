@@ -3,7 +3,9 @@ import {
   ForbiddenException,
   Injectable,
   Logger,
+  OnModuleDestroy,
   OnModuleInit,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { FastifyReply } from 'fastify';
 import {
@@ -12,6 +14,7 @@ import {
   convertToModelMessages,
   stepCountIs,
   type UIMessage,
+  type ModelMessage,
   type LanguageModel,
 } from 'ai';
 import { AiService } from '../../integrations/ai/ai.service';
@@ -41,7 +44,11 @@ import {
   makeLoadToolsTool,
   buildExternalToolCatalog,
 } from './tools/tool-tiers';
-import { RunAlreadyActiveError } from './ai-chat-run.service';
+import {
+  RunAlreadyActiveError,
+  AiChatRunService,
+} from './ai-chat-run.service';
+import { inAppToolCallCapMs } from './tools/ai-chat-tools.service';
 import { computePageChange } from './page-change/page-change.util';
 import {
   sanitizeSelection,
@@ -55,6 +62,7 @@ import {
 import {
   isDegenerateOutput,
   truncateDegeneratedTail,
+  shouldCheckDegeneration,
 } from './output-degeneration';
 
 // Max agent steps per turn. One step = one model generation; a step that calls
@@ -248,15 +256,23 @@ export function cleanGeneratedTitle(text: string): string {
  * partial output is already in history thanks to the step-granular write path).
  */
 export function isInterruptResume(
-  history: Array<{ role: string; status?: string | null }>,
+  history: Array<{
+    role: string;
+    status?: string | null;
+    metadata?: unknown;
+  }>,
   clientInterrupted: boolean | undefined,
 ): boolean {
   if (clientInterrupted !== true) return false;
   const prev = history[history.length - 2];
-  return (
-    prev?.role === 'assistant' &&
-    (prev.status === 'aborted' || prev.status === 'streaming')
-  );
+  if (prev?.role !== 'assistant') return false;
+  // #487: a reconcile STAMP (metadata.finalizeFailed) is NOT a genuine user
+  // interruption — the previous turn's process died and a reconcile settled the
+  // row as 'aborted'. Treating it as an interrupt-resume would inject a false
+  // "you were interrupted" note. Exclude any finalizeFailed row.
+  const meta = prev.metadata as { finalizeFailed?: unknown } | null | undefined;
+  if (meta && meta.finalizeFailed === true) return false;
+  return prev.status === 'aborted' || prev.status === 'streaming';
 }
 
 /**
@@ -377,6 +393,14 @@ export interface AiChatStreamBody {
   // it against persisted history (`isInterruptResume`) before injecting the
   // interrupt note, so a spoofed/stale flag on an ordinary turn is ignored.
   interrupted?: boolean;
+  // #487: server-side supersede CAS. When present, this POST asks the server to
+  // STOP the run `supersede.runId` (which the client saw as the chat's active run)
+  // and, once it has settled, start THIS turn in its place. The server validates
+  // the target against the chat and answers 400 (wrong chat) / 409
+  // SUPERSEDE_TARGET_MISMATCH / 409 SUPERSEDE_TIMEOUT, or proceeds normally
+  // (degrade / ready). Absent => an ordinary send (rejected with 409
+  // A_RUN_ALREADY_ACTIVE if a run is already active on the chat).
+  supersede?: { runId?: string } | null;
   // useChat sends the full UIMessage list; the last one is the new user turn.
   messages?: UIMessage[];
 }
@@ -426,6 +450,11 @@ export interface AiChatStreamArgs {
   // chat row (existing chat) or the request body (new chat). null => universal
   // assistant. Carried here so the turn never re-loads it.
   role: AiAgentRole | null;
+  // #487: true when this turn was started by SUPERSEDING a still-live previous run
+  // (the controller ran the supersede CAS to a `ready` result). Adds the
+  // SUPERSEDE_NOTE to the system prompt (the previous run's last ops may still be
+  // applying — no side-effect quiescence). Absent on an ordinary send.
+  superseded?: boolean;
 }
 
 /**
@@ -442,7 +471,7 @@ export interface AiChatStreamArgs {
  *                    can be rebuilt for `convertToModelMessages`.
  */
 @Injectable()
-export class AiChatService implements OnModuleInit {
+export class AiChatService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(AiChatService.name);
 
   constructor(
@@ -463,7 +492,16 @@ export class AiChatService implements OnModuleInit {
     // constructions (int-specs) compile unchanged; Nest always injects the real
     // provider in production. Only ever touched on the run-wrapped + flag-on path.
     private readonly streamRegistry?: AiChatStreamRegistryService,
+    // #487: the run lifecycle service, for the periodic + opportunistic reconcile
+    // (zombie re-drive + stale-run abort). OPTIONAL so positional test
+    // constructions compile unchanged; Nest always injects the real singleton, so
+    // reconcile sees the SAME in-memory active/zombie maps the runner mutates.
+    private readonly aiChatRunService?: AiChatRunService,
   ) {}
+
+  // #487: periodic reconcile timer (single-process phase 1). Started in
+  // onModuleInit, cleared in onModuleDestroy.
+  private reconcileTimer?: ReturnType<typeof setInterval>;
 
   /**
    * Crash-recovery sweep on server start (#183): any assistant row left in the
@@ -487,6 +525,158 @@ export class AiChatService implements OnModuleInit {
         `Startup sweep of dangling 'streaming' messages failed: ${
           err instanceof Error ? err.message : 'unknown error'
         }`,
+      );
+    }
+
+    // #487: start the PERIODIC reconcile (was boot-only). It heals both directions
+    // of the run<->message lifecycle asymmetry that a boot sweep alone left to the
+    // NEXT restart. Single-process phase 1: the in-memory active/zombie maps are
+    // authoritative, so "no live entry" is a safe primary gate.
+    const staleMs = this.reconcileStalenessMs();
+    // boot-warn if the per-call cap is configured so high the derived staleness is
+    // unusually long (a stale run then lingers longer before reconcile aborts it).
+    if (staleMs > 30 * 60 * 1000) {
+      this.logger.warn(
+        `#487 reconcile staleness is ${Math.round(staleMs / 60000)}min ` +
+          `(derived from max(2 x per-call cap, 15min)); a per-call cap this high ` +
+          `delays stale-run recovery. Review AI_CHAT_INAPP_TOOL_CALL_CAP_MS.`,
+      );
+    }
+    const intervalMs = this.reconcileIntervalMs();
+    this.reconcileTimer = setInterval(() => {
+      void this.reconcile().catch((err) => {
+        this.logger.warn(
+          `Periodic reconcile failed: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        );
+      });
+    }, intervalMs);
+    this.reconcileTimer.unref?.();
+  }
+
+  /** #487: stop the periodic reconcile timer on shutdown. */
+  onModuleDestroy(): void {
+    if (this.reconcileTimer) {
+      clearInterval(this.reconcileTimer);
+      this.reconcileTimer = undefined;
+    }
+  }
+
+  /**
+   * #487: reconcile staleness threshold X — a run/message is only a "no live
+   * runner" abort candidate once UNTOUCHED past this. Derived as
+   * max(2 x per-call cap, 15min): 2x the longest legitimate single tool call plus
+   * a floor, so a marathon turn making steady progress (updatedAt bumped each
+   * step) is never swept.
+   */
+  private reconcileStalenessMs(): number {
+    return Math.max(2 * inAppToolCallCapMs(), 15 * 60 * 1000);
+  }
+
+  /** #487: how often the periodic reconcile runs (env-tunable, default 2min). */
+  private reconcileIntervalMs(): number {
+    const raw = Number(process.env.AI_CHAT_RECONCILE_INTERVAL_MS);
+    return Number.isFinite(raw) && raw > 0 ? raw : 2 * 60 * 1000;
+  }
+
+  /**
+   * #487: the periodic BIDIRECTIONAL reconcile. Runs the clauses IN ORDER; each is
+   * best-effort (a failure of one never blocks the others). Single-process phase 1
+   * — the run service's in-memory maps are authoritative for "live entry".
+   *
+   *  (a) re-drive ZOMBIE runs (a terminal write that gave up) — apply the intended
+   *      status via the conditional UPDATE;
+   *  (b) message 'streaming' + its RUN terminal -> stamp the message by the run's
+   *      status (succeeded-run + stuck row -> 'aborted'+finalizeFailed, NOT
+   *      'completed' with empty parts — the final text lived only in the dead
+   *      process's memory, a documented loss);
+   *  (c) run active + NO live entry + NO zombie + stale -> aborted (the run
+   *      service applies the "no entry" primary gate + last-progress staleness);
+   *  (d) message 'streaming' + age>X + NO active run on the chat -> aborted
+   *      (historical-row safety, double-gated).
+   */
+  async reconcile(): Promise<void> {
+    const staleMs = this.reconcileStalenessMs();
+
+    // (a) zombie re-drive.
+    if (this.aiChatRunService) {
+      for (const runId of this.aiChatRunService.zombieRunIds()) {
+        try {
+          await this.aiChatRunService.settleZombie(runId);
+        } catch (err) {
+          this.logger.warn(
+            `Reconcile (a) zombie ${runId} re-drive failed: ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          );
+        }
+      }
+    }
+
+    // (b) message streaming + run terminal -> stamp message by run status.
+    try {
+      const stuck = await this.aiChatMessageRepo.findStreamingWithTerminalRun();
+      for (const s of stuck) {
+        // succeeded-run -> 'aborted' (NOT 'completed'-empty); failed -> 'error';
+        // aborted -> 'aborted'. All via the finalizeFailed stamp.
+        const status = s.runStatus === 'failed' ? 'error' : 'aborted';
+        await this.aiChatMessageRepo.stampTerminalIfStreaming(
+          s.messageId,
+          s.workspaceId,
+          status,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Reconcile (b) message<-run failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
+    }
+
+    // (c) stale active run with no live runner -> aborted.
+    if (this.aiChatRunService) {
+      try {
+        await this.aiChatRunService.reconcileStaleRuns(staleMs);
+      } catch (err) {
+        this.logger.warn(
+          `Reconcile (c) stale-run abort failed: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        );
+      }
+    }
+
+    // (d) historical streaming row, no active run on the chat, stale -> aborted.
+    try {
+      await this.aiChatMessageRepo.sweepStreamingWithoutActiveRun(staleMs);
+    } catch (err) {
+      this.logger.warn(
+        `Reconcile (d) historical-row sweep failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
+    }
+  }
+
+  /**
+   * #487: OPPORTUNISTIC single-chat reconcile at the start of a turn (beginRun /
+   * supersede path), so a user who returns to a chat with a stuck streaming row
+   * (its run already terminal) sees it settled WITHOUT waiting for the periodic
+   * job. Best-effort — a failure NEVER fails the turn (swallowed by the caller).
+   */
+  async reconcileChat(chatId: string, workspaceId: string): Promise<void> {
+    const stuck = await this.aiChatMessageRepo.findStreamingWithTerminalRun(50, {
+      chatId,
+      workspaceId,
+    });
+    for (const s of stuck) {
+      const status = s.runStatus === 'failed' ? 'error' : 'aborted';
+      await this.aiChatMessageRepo.stampTerminalIfStreaming(
+        s.messageId,
+        s.workspaceId,
+        status,
       );
     }
   }
@@ -725,6 +915,7 @@ export class AiChatService implements OnModuleInit {
     model,
     role,
     runHooks,
+    superseded,
   }: AiChatStreamArgs): Promise<void> {
     // Resolve / create the chat. A new chat is created when no valid chatId is
     // supplied or the supplied one does not belong to this workspace.
@@ -756,6 +947,13 @@ export class AiChatService implements OnModuleInit {
       // or violate the page_id FK on insert (this runs after res.hijack(), so a
       // DB error would break the stream).
       const originPageId: string | null = openPageContext?.id ?? null;
+      // ORPHAN-ON-BEGIN-FAILURE tradeoff (#486, B3): the chat row is inserted
+      // HERE, before runHooks.begin below. If begin fails (e.g. a 503 / run-slot
+      // rejection) the turn aborts before the client is told this new chatId, so
+      // an empty chat is left behind and a retry mints ANOTHER one. We accept this
+      // over reordering: begin needs a chatId to bind the run to, and inserting
+      // the chat first keeps the id stable + the FK/history-join invariants above
+      // intact. Orphan empty chats are cheap and swept by normal chat cleanup.
       const chat = await this.aiChatRepo.insert({
         creatorId: user.id,
         workspaceId: workspace.id,
@@ -797,13 +995,47 @@ export class AiChatService implements OnModuleInit {
             code: 'A_RUN_ALREADY_ACTIVE',
           });
         }
-        // Any OTHER run-start failure must not break the turn — fall back to the
-        // socket signal (legacy behavior) and stream anyway.
+        // Any OTHER run-start failure (e.g. a DB-pool blip) must FAIL THE TURN,
+        // not silently stream without a run-row. The old fallback let the turn
+        // continue untracked: in autonomous mode nobody could then abort it —
+        // /stop can't see a run that doesn't exist, a client disconnect doesn't
+        // abort it, and the one-run-per-chat gate would let a SECOND run in. That
+        // is an unstoppable, invisible run until process restart. Reject NOW,
+        // BEFORE the first byte (nothing is written yet, no user row inserted, no
+        // MCP lease taken), so the controller's post-hijack catch turns this
+        // HttpException into an honest 503 on the raw socket. Same policy for BOTH
+        // modes — #487 inherits it (no mode-branching here).
         this.logger.error(
-          `Failed to begin agent run (chat ${chatId}); streaming without run tracking`,
+          `Failed to begin agent run (chat ${chatId}); failing the turn`,
           err as Error,
         );
+        throw new ServiceUnavailableException({
+          message:
+            'Could not start the agent run. This is usually temporary — please try again.',
+          code: 'A_RUN_BEGIN_FAILED',
+          // Self-describe the status in the body: the controller's post-hijack
+          // catch writes getResponse() verbatim onto the raw socket, and an
+          // object-arg HttpException does NOT inject statusCode. Without it the
+          // client's 503 classifier (which reads the body JSON) could not see the
+          // status. With it present, the client's A_RUN_BEGIN_FAILED branch (which
+          // runs strictly before the generic-503 branch) shows "temporary, retry".
+          statusCode: 503,
+        });
       }
+    }
+
+    // #487: opportunistic single-chat reconcile — settle any streaming row on this
+    // chat whose run is already terminal BEFORE this turn's history load, so the
+    // user never waits on the periodic job and the new turn's model history is not
+    // polluted by a stuck 'streaming' row. Best-effort: it must NEVER fail the turn.
+    try {
+      await this.reconcileChat(chatId, workspace.id);
+    } catch (err) {
+      this.logger.debug(
+        `Opportunistic reconcile for chat ${chatId} failed (ignored): ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`,
+      );
     }
 
     try {
@@ -811,7 +1043,58 @@ export class AiChatService implements OnModuleInit {
       const incoming = lastUserMessage(body.messages);
       const incomingText = uiMessageText(incoming);
 
-      // Persist the user message before contacting the model.
+      // #489: sanitize client-supplied parts ON RECEIPT. The client only ever
+      // sends `sendMessage({ text })` (a single text part); there is no
+      // file/attachment path. Any other part — most dangerously a tool-part in
+      // `input-available` state — is untrusted data that, once persisted to
+      // `metadata.parts` verbatim, is REPLAYED through convertToModelMessages on
+      // every later turn. A malformed tool-part makes that conversion throw,
+      // 500-ing every future turn of the chat forever ("bricked"). Drop any
+      // non-whitelisted part with a warn.
+      const sanitizedParts = sanitizeUserParts(incoming?.parts, (type) =>
+        this.logger.warn(
+          `Dropping unsupported user message part '${type}' on chat ${chatId}`,
+        ),
+      );
+
+      // #489: rebuild the conversation from persisted history (not the client
+      // payload) and CONVERT it to model messages BEFORE persisting the user row.
+      // Load the OLD history (WITHOUT the new row) and append the incoming turn in
+      // memory for the conversion. This makes the insert happen only after a
+      // successful conversion, so a conversion failure cannot leave a DUPLICATE
+      // user row behind on the client's retry (the "bricked chat" that accreted a
+      // dup on every 500). `findAllByChat` returns chronological order (oldest ->
+      // newest) and keeps a 5000-row memory-safety backstop (on overflow it keeps
+      // the NEWEST rows and logs a warning); that is a safety net far above any
+      // realistic chat, not a conversational limit.
+      const oldHistory = await this.aiChatMessageRepo.findAllByChat(
+        chatId,
+        workspace.id,
+      );
+      const uiMessages: Array<Omit<UIMessage, 'id'> & { id: string }> = [
+        ...oldHistory.map(rowToUiMessage),
+        {
+          id: 'pending-user',
+          role: 'user',
+          parts: (sanitizedParts && sanitizedParts.length > 0
+            ? sanitizedParts
+            : textPart(incomingText)) as UIMessage['parts'],
+        },
+      ];
+      // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
+      // Resilient (#489): a single poisoned row in the OLD history is isolated via
+      // per-row conversion and degraded to plain text with a "[tool context
+      // omitted]" marker rather than 500-ing the whole turn (silent loss of tool
+      // context is not acceptable — the model must see the truncation).
+      const messages = await convertHistoryResilient(uiMessages, (index, err) =>
+        this.logger.warn(
+          `Degraded unconvertible history row ${index} on chat ${chatId} to text: ${
+            err instanceof Error ? err.message : 'unknown error'
+          }`,
+        ),
+      );
+
+      // Persist the user message only AFTER a successful conversion (#489).
       await this.aiChatMessageRepo.insert({
         chatId,
         workspaceId: workspace.id,
@@ -819,31 +1102,21 @@ export class AiChatService implements OnModuleInit {
         role: 'user',
         content: incomingText,
         // jsonb column: UIMessage parts are JSON-serializable at runtime but not
-        // structurally `JsonValue`, so cast through unknown.
-        metadata: (incoming?.parts ? { parts: incoming.parts } : null) as never,
+        // structurally `JsonValue`, so cast through unknown. Persist the SANITIZED
+        // parts (never the raw client parts) so the row is always convertible.
+        metadata: (sanitizedParts ? { parts: sanitizedParts } : null) as never,
       });
-
-      // Rebuild the conversation from persisted history (not the client payload),
-      // so the model always sees the authoritative server-side transcript. Load
-      // the FULL history in chronological order (oldest -> newest, incl. the user
-      // message just inserted above) so NO turns are dropped — there is no
-      // recent-tail window anymore. `findAllByChat` keeps a 5000-row memory-safety
-      // backstop (on overflow it keeps the NEWEST rows and logs a warning); that
-      // is a safety net far above any realistic chat, not a conversational limit.
-      const history = await this.aiChatMessageRepo.findAllByChat(
-        chatId,
-        workspace.id,
-      );
-      const uiMessages = history.map(rowToUiMessage);
-      // convertToModelMessages is async in ai@6.0.134 (returns Promise<ModelMessage[]>).
-      const messages = await convertToModelMessages(uiMessages);
 
       // Interrupt-resume detection (#198): the client "send now" flag is only a
       // hint — confirm it against the persisted history (the preceding assistant
       // turn must really be aborted/streaming) so a spoofed flag cannot inject the
       // interrupt note onto an ordinary turn. The partial output the model needs is
       // already in `messages` (the aborted assistant row replays via findRecent).
-      const interrupted = isInterruptResume(history, body.interrupted);
+      // Append the new user turn (shape-only) so index -2 is the prior assistant.
+      const interrupted = isInterruptResume(
+        [...oldHistory, { role: 'user', status: null, metadata: null }],
+        body.interrupted,
+      );
 
       // Per-turn page-change detection (#274): if the open page was hand-edited by
       // the user since the agent's last turn ended, compute the unified diff so the
@@ -900,14 +1173,13 @@ export class AiChatService implements OnModuleInit {
         );
       } catch (err) {
         // An explicit Stop reached the RUN's signal DURING setup: re-throw so the
-        // outer catch finalizes the run as aborted — never swallow a Stop. Gated on
-        // `runId`: the re-throw exists ONLY to finalize the run, which exists only
-        // in autonomous mode. On the legacy path (no runId) `effectiveSignal` is the
-        // SOCKET signal (it aborts on a client disconnect); re-throwing there would
-        // change prior behavior and make the controller write JSON to an already-
-        // closed socket (it only attaches res.raw.on('error') in autonomous mode).
-        // So legacy keeps its prior behavior — warn + proceed, and streamText then
-        // observes the aborted socket signal.
+        // outer catch finalizes the run as aborted — never swallow a Stop. #487: the
+        // turn is ALWAYS run-wrapped now (both modes), so `effectiveSignal` is the
+        // RUN signal and `runId` is set in BOTH — a Stop (from /ai-chat/stop or a
+        // legacy disconnect's requestStop) aborts it identically. The `runId` guard
+        // now only defends the theoretical no-handle fallback (`begin` returned
+        // nothing, leaving `effectiveSignal` as the bare socket signal): there we
+        // keep the old warn-and-proceed rather than re-throw.
         if (runId && effectiveSignal.aborted) {
           throw err;
         }
@@ -1011,6 +1283,9 @@ export class AiChatService implements OnModuleInit {
           // History-confirmed interrupt-resume flag (#198): adds the interrupt note
           // so the model treats the partial answer above as cut off, not finished.
           interrupted,
+          // #487: this turn superseded a still-live run — warn the model the
+          // previous run's last ops may still be applying (no quiescence).
+          superseded,
           // Detected between-turns human edit to the open page (#274): adds the
           // page_changed note + unified diff so the agent doesn't overwrite it.
           pageChanged,
@@ -1080,7 +1355,6 @@ export class AiChatService implements OnModuleInit {
       const degenerationController = new AbortController();
       let degenerationDetected = false;
       let lastDegenerationCheckLen = 0;
-      const DEGENERATION_CHECK_STEP = 2000;
 
       // Step-granular durability (#183): create the assistant row UPFRONT in the
       // 'streaming' state (before any token), then UPDATE it as each step finishes
@@ -1166,29 +1440,59 @@ export class AiChatService implements OnModuleInit {
       // callbacks — mirroring the pre-#183 persist-at-most-once guard for the
       // TERMINAL status (the row may be updated many times with 'streaming' before
       // this fires once).
+      // #487: the once-gate closes ONLY AFTER a successful write, and the write is
+      // BOUNDED-RETRIED. Previously `finalized` was set BEFORE the write and never
+      // retried, so a single failed UPDATE stranded the row 'streaming' forever
+      // (the boot-only sweep was the only recovery). Now a transient blip is ridden
+      // out in place; a total give-up leaves the gate OPEN and logs, and the
+      // periodic reconcile (clauses b/d) later settles the row. Returns whether the
+      // terminal write LANDED, so the caller can error-mark the RUN on a message
+      // failure (the run is finalized regardless — never gated on the message).
       let finalized = false;
+      const FINALIZE_MSG_MAX_ATTEMPTS = 3;
       const finalizeAssistant = async (
         flushed: AssistantFlush,
-      ): Promise<void> => {
-        if (finalized) return;
-        finalized = true;
+      ): Promise<boolean> => {
+        if (finalized) return true;
         const plan = planFinalizeAssistant(assistantId);
-        try {
-          // Shared dispatch (see applyFinalize): UPDATE the upfront row, or — when
-          // the upfront insert failed (kind 'insert') — INSERT the terminal row as
-          // the only safety against losing the turn entirely.
-          await applyFinalize(
-            this.aiChatMessageRepo,
-            plan,
-            { chatId, workspaceId: workspace.id, userId: user.id },
-            flushed,
-          );
-        } catch (err) {
-          this.logger.error(
-            `Failed to finalize assistant message (kind=${plan.kind})`,
-            err as Error,
-          );
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= FINALIZE_MSG_MAX_ATTEMPTS; attempt++) {
+          try {
+            // Shared dispatch (see applyFinalize): conditionally UPDATE the upfront
+            // row (owner-write priority), or — when the upfront insert failed (kind
+            // 'insert') — INSERT the terminal row as the only safety against losing
+            // the turn entirely.
+            await applyFinalize(
+              this.aiChatMessageRepo,
+              plan,
+              { chatId, workspaceId: workspace.id, userId: user.id },
+              flushed,
+            );
+            finalized = true; // gate closes ONLY after a successful write
+            return true;
+          } catch (err) {
+            lastError = err;
+            this.logger.warn(
+              `Assistant message finalize attempt ${attempt}/${FINALIZE_MSG_MAX_ATTEMPTS} ` +
+                `failed (kind=${plan.kind}): ${
+                  err instanceof Error ? err.message : 'unknown error'
+                }`,
+            );
+            if (attempt < FINALIZE_MSG_MAX_ATTEMPTS) {
+              await new Promise((r) => setTimeout(r, 50 * attempt));
+            }
+          }
         }
+        // Gave up: leave the gate OPEN (no in-process second settler exists — the
+        // terminal callbacks are mutually exclusive) and log. The periodic reconcile
+        // settles the stranded row; a late owner-write is impossible for this turn,
+        // so the reconcile stamp (aborted+finalizeFailed) is the final state.
+        this.logger.error(
+          `Assistant message finalize GAVE UP after ${FINALIZE_MSG_MAX_ATTEMPTS} ` +
+            `attempts (row left 'streaming', chat ${chatId}); reconcile will settle it`,
+          lastError as Error,
+        );
+        return false;
       };
 
       // DIAGNOSTIC (Safari stream-drop investigation) — temporary. Measure
@@ -1254,8 +1558,10 @@ export class AiChatService implements OnModuleInit {
               // trigger, abort the run ONCE with a distinguishable reason.
               if (
                 !degenerationDetected &&
-                inProgressText.length - lastDegenerationCheckLen >=
-                  DEGENERATION_CHECK_STEP
+                shouldCheckDegeneration(
+                  inProgressText.length,
+                  lastDegenerationCheckLen,
+                )
               ) {
                 lastDegenerationCheckLen = inProgressText.length;
                 if (isDegenerateOutput(inProgressText)) {
@@ -1275,6 +1581,13 @@ export class AiChatService implements OnModuleInit {
             // the in-progress accumulator for the next step.
             capturedSteps.push(step as StepLike);
             inProgressText = '';
+            // Reset the degeneration-check watermark too (#486): it tracks a byte
+            // offset INTO inProgressText, so once that resets to '' a stale (large)
+            // mark makes `inProgressText.length - lastDegenerationCheckLen` go
+            // negative and the throttled detector stays silent until a later step's
+            // text re-grows past the old offset — a whole degenerate step could slip
+            // through undetected. Zeroing it re-arms the check from the next byte.
+            lastDegenerationCheckLen = 0;
             // Step-granular durability (#183): persist this finished step (its text +
             // tool calls + tool RESULTS) the moment it ends, so a process death after
             // this point still recovers the step. Not awaited here (never block the
@@ -1324,7 +1637,7 @@ export class AiChatService implements OnModuleInit {
             const stepExhausted = steps.length >= MAX_AGENT_STEPS;
             const emptyTurnMarker =
               !producedText && stepExhausted ? STEP_LIMIT_NO_ANSWER_MARKER : '';
-            await finalizeAssistant(
+            const msgOk = await finalizeAssistant(
               flushAssistant(steps as StepLike[], emptyTurnMarker, 'completed', {
                 finishReason: finishReason as string,
                 usage: totalUsage as StreamUsage,
@@ -1338,9 +1651,19 @@ export class AiChatService implements OnModuleInit {
                 pageChanged,
               }),
             );
-            // #184: settle the RUN as succeeded (best-effort, after the projection
-            // is finalized above).
-            if (runId) await runHooks?.onSettled?.(runId, 'completed');
+            // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
+            // If the message finalize GAVE UP, error-mark the run so the asymmetry
+            // "run succeeded / message streaming forever" cannot arise; the
+            // periodic reconcile then settles the stuck message from this run.
+            if (runId) {
+              await runHooks?.onSettled?.(
+                runId,
+                msgOk ? 'completed' : 'error',
+                msgOk
+                  ? undefined
+                  : 'Assistant message could not be persisted (finalize failed).',
+              );
+            }
             // Lifecycle: release the external MCP clients leased for this turn.
             await closeExternalClients();
 
@@ -1794,6 +2117,82 @@ function textPart(text: string): Array<{ type: 'text'; text: string }> {
 }
 
 /**
+ * Part types accepted on an INCOMING user turn (#489). The client only ever
+ * sends `sendMessage({ text })` (a single text part); there is no file/attachment
+ * path. Everything else on a client-supplied user message — most dangerously a
+ * tool-part in `input-available` state — is untrusted data that would be
+ * persisted to `metadata.parts` verbatim and replayed through
+ * `convertToModelMessages` on every later turn, potentially bricking the chat.
+ */
+const ALLOWED_USER_PART_TYPES: ReadonlySet<string> = new Set(['text']);
+
+/**
+ * Keep only whitelisted parts on a client-supplied user message; report each
+ * dropped part's type via `onDrop` (the caller warns). Returns `undefined` when
+ * nothing survives (no parts / none whitelisted), so the caller persists a null
+ * metadata rather than an empty-parts object. Never throws.
+ */
+export function sanitizeUserParts(
+  parts: UIMessage['parts'] | undefined,
+  onDrop: (type: string) => void,
+): UIMessage['parts'] | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  const kept = parts.filter((p) => {
+    const type =
+      typeof (p as { type?: unknown })?.type === 'string'
+        ? (p as { type: string }).type
+        : '';
+    if (ALLOWED_USER_PART_TYPES.has(type)) return true;
+    onDrop(type || '(unknown)');
+    return false;
+  });
+  return kept.length > 0 ? (kept as UIMessage['parts']) : undefined;
+}
+
+/** Marker for a history row whose tool parts could not be replayed (#489). */
+export const TOOL_CONTEXT_OMITTED_MARKER = '[tool context omitted]';
+
+/**
+ * Convert persisted UI history to model messages, tolerating a single poisoned
+ * row (#489). `convertToModelMessages` over the WHOLE array throws if ANY row is
+ * malformed (e.g. a tool-part left unbalanced / in `input-available` state),
+ * which would otherwise 500 every turn of the chat forever. On a batch failure we
+ * fall back to per-row conversion so the bad row is isolated: it is degraded to
+ * plain text carrying its readable text plus a `[tool context omitted]` marker
+ * (the model MUST see that its tool context was truncated — silent loss is not
+ * acceptable), while every healthy row converts normally. Because AI SDK v6
+ * carries a tool call and its result inside the SAME assistant UIMessage's parts,
+ * per-row conversion preserves call/result pairing.
+ */
+export async function convertHistoryResilient(
+  uiMessages: Array<Omit<UIMessage, 'id'> & { id: string }>,
+  onDegrade: (index: number, err: unknown) => void,
+): Promise<ModelMessage[]> {
+  try {
+    return await convertToModelMessages(uiMessages as UIMessage[]);
+  } catch {
+    const out: ModelMessage[] = [];
+    for (let i = 0; i < uiMessages.length; i++) {
+      const m = uiMessages[i];
+      try {
+        out.push(...(await convertToModelMessages([m as UIMessage])));
+      } catch (err) {
+        onDegrade(i, err);
+        const text = uiMessageText(m as UIMessage);
+        const degraded = text
+          ? `${text}\n\n${TOOL_CONTEXT_OMITTED_MARKER}`
+          : TOOL_CONTEXT_OMITTED_MARKER;
+        out.push({
+          role: m.role === 'assistant' ? 'assistant' : 'user',
+          content: degraded,
+        } as ModelMessage);
+      }
+    }
+    return out;
+  }
+}
+
+/**
  * Minimal shapes of the AI SDK v6 step objects we read to rebuild UIMessage
  * parts (see ai@6.0.134 `StepResult`: `text`, `toolCalls` -> TypedToolCall,
  * `toolResults` -> TypedToolResult). Typed loosely so this survives provider
@@ -2081,7 +2480,10 @@ export function planFinalizeAssistant(
  *  a test mock both satisfy it). */
 export interface FinalizeRepo {
   insert(insertable: Record<string, unknown>): Promise<unknown>;
-  update(
+  // #487: the OWNER terminal write is CONDITIONAL (status='streaming' OR
+  // metadata.finalizeFailed) so the owner overwrites a reconcile stamp but never
+  // an already-proper terminal row (owner-write priority).
+  finalizeOwner(
     id: string,
     workspaceId: string,
     patch: AssistantFlush,
@@ -2090,10 +2492,11 @@ export interface FinalizeRepo {
 
 /**
  * Apply a finalize `plan` to the repo with the terminal `flushed` payload (#183):
- * UPDATE the upfront row, or INSERT a fresh terminal row as the fallback when the
- * upfront insert failed. The SINGLE dispatch shared by the service's
- * finalizeAssistant and its test, so the test exercises the real path instead of
- * a copy (#186 review). Pure of error handling — the caller wraps it.
+ * conditionally UPDATE the upfront row (owner-write priority, #487), or INSERT a
+ * fresh terminal row as the fallback when the upfront insert failed. The SINGLE
+ * dispatch shared by the service's finalizeAssistant and its test, so the test
+ * exercises the real path instead of a copy (#186 review). Pure of error
+ * handling — the caller wraps it (and RETRIES it, #487).
  */
 export async function applyFinalize(
   repo: FinalizeRepo,
@@ -2102,7 +2505,7 @@ export async function applyFinalize(
   flushed: AssistantFlush,
 ): Promise<void> {
   if (plan.kind === 'update') {
-    await repo.update(plan.id, base.workspaceId, flushed);
+    await repo.finalizeOwner(plan.id, base.workspaceId, flushed);
     return;
   }
   await repo.insert({

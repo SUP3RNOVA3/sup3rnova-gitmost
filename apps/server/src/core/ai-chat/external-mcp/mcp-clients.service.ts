@@ -1,5 +1,6 @@
 import { isIP } from 'node:net';
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
+import { pathToFileURL } from 'node:url';
 import { Injectable, Logger } from '@nestjs/common';
 import { type Tool, type ToolCallOptions } from 'ai';
 import { createMCPClient } from '@ai-sdk/mcp';
@@ -10,9 +11,29 @@ import {
   streamingDispatcherOptions,
   mcpStreamTimeoutMs,
   mcpCallTimeoutMs,
+  mcpSseBodyTimeoutMs,
 } from '../../../integrations/ai/ai-streaming-fetch';
 import { SecretBoxService } from '../../../integrations/crypto/secret-box';
 import { isUrlAllowed, isIpAllowed } from './ssrf-guard';
+// TYPE-ONLY (erased at compile): @docmost/mcp is ESM-only and cannot be a runtime
+// `require()` from this commonjs module (same constraint as docmost-client.loader).
+// The write-class MAP is loaded lazily via the dynamic-import trick below.
+import type { ToolWriteClass } from '@docmost/mcp';
+
+// TS(commonjs) downlevels a literal `import()` to `require()`, which cannot load
+// the ESM-only @docmost/mcp. Indirect through Function so the real dynamic
+// `import()` survives compilation (same trick as docmost-client.loader.ts).
+const esmImport = new Function(
+  'specifier',
+  'return import(specifier)',
+) as (specifier: string) => Promise<unknown>;
+
+/** Local read-only predicate — avoids a value import of the ESM-only package.
+ *  Only a pure read is retry-safe after a transport break (a write is
+ *  indeterminate). Kept in lockstep with @docmost/mcp's isRetryableWriteClass. */
+function isReadOnlyWriteClass(writeClass: ToolWriteClass | undefined): boolean {
+  return writeClass === 'readOnly';
+}
 
 /** A closable external MCP client handle. */
 export interface Closable {
@@ -81,12 +102,52 @@ const MAX_TOOL_NAME_LENGTH = 64;
  * close until the turn releases it, so a TTL expiry mid-turn never closes a
  * client a stream is still executing against.
  */
+/**
+ * Where a merged (namespaced) tool came from, so the per-run recovery wrapper
+ * (#489) can, on a transport error, reconnect THAT server and re-resolve the SAME
+ * underlying tool by its raw name. `writeClass` gates the single auto-retry (a
+ * read is retry-safe; a write is indeterminate). `serverIndex` indexes the
+ * entry's `servers` array (which server config to reconnect).
+ */
+interface ToolProvenance {
+  serverIndex: number;
+  rawName: string;
+  writeClass: ToolWriteClass | undefined;
+}
+
+/** A live reconnected server (its fresh client + raw call-timeout-wrapped tools). */
+interface RecoveredServerState {
+  client: McpClient;
+  tools: Record<string, Tool>;
+}
+
+/**
+ * Per-run, per-server recovery binding (#489). `current` is the server's LIVE
+ * target for this run: `null` means "use the ORIGINAL cached client/template";
+ * a non-null value is a reconnected throwaway client all this server's tools now
+ * call. `reconnecting` dedupes concurrent reconnects so only ONE fresh client is
+ * minted per death (a losing concurrent call awaits it and retries on the SAME
+ * new client — the CAS-by-identity rule).
+ */
+interface ServerBinding {
+  current: RecoveredServerState | null;
+  reconnecting?: Promise<RecoveredServerState>;
+}
+
 interface CacheEntry {
   tools: Record<string, Tool>;
   clients: McpClient[];
   outcomes: ServerOutcome[];
   /** Prompt guidance for qualifying servers (see McpServerInstruction). */
   instructions: McpServerInstruction[];
+  /**
+   * The enabled server configs used to build this entry (#489), so the per-run
+   * recovery wrapper can reconnect a specific server by index. Parallel to the
+   * indices referenced by {@link toolMeta}.
+   */
+  servers: AiMcpServer[];
+  /** merged-tool-key -> provenance (#489), for the per-run recovery wrapper. */
+  toolMeta: Record<string, ToolProvenance>;
   expiresAt: number;
   /** Active leases (turns currently using these clients). */
   refCount: number;
@@ -120,19 +181,81 @@ export class McpClientsService {
    */
   private readonly cache = new Map<string, Promise<CacheEntry>>();
   /**
-   * A single shared SSRF-pinned dispatcher for ALL outbound external-MCP fetches.
-   * Its custom connect.lookup runs per connection, so one instance safely guards
-   * every server's connections (we never connect to an unvalidated IP).
+   * SSRF-pinned dispatchers for outbound external-MCP fetches. Both use the SAME
+   * custom connect.lookup (so every connection is IP-validated), but carry a
+   * DIFFERENT `bodyTimeout` (#489): the HTTP (streamable) transport opens a fresh
+   * request per call, so it keeps the tight silence timeout; the SSE transport
+   * holds ONE long-lived body open across many calls, so a >1-min idle BETWEEN
+   * calls is LEGITIMATE and must not break the socket — it gets a much larger
+   * bodyTimeout. (headersTimeout stays tight on both.)
    */
-  private readonly dispatcher: Dispatcher = buildPinnedDispatcher();
-  /** guardedFetch bound to the pinned dispatcher; reused by every transport. */
-  private readonly guardedFetch: typeof fetch = (input, init) =>
-    guardedFetch(this.dispatcher, input, init);
+  private readonly dispatcherHttp: Dispatcher = buildPinnedDispatcher(
+    mcpStreamTimeoutMs(),
+  );
+  private readonly dispatcherSse: Dispatcher = buildPinnedDispatcher(
+    mcpSseBodyTimeoutMs(),
+  );
+  /** guardedFetch bound to each dispatcher; picked by transport type in connect(). */
+  private readonly guardedFetchHttp: typeof fetch = (input, init) =>
+    guardedFetch(this.dispatcherHttp, input, init);
+  private readonly guardedFetchSse: typeof fetch = (input, init) =>
+    guardedFetch(this.dispatcherSse, input, init);
+
+  /**
+   * Memoized write-class map (#489), loaded lazily from @docmost/mcp via the
+   * dynamic-import trick. Keyed by tool name (=== mcpName). A tool NOT in the map
+   * (any third-party external MCP tool) classifies as `undefined` -> treated as a
+   * write by the retry gate (the safe default: never blind-retry an unknown tool).
+   * On any load failure the map is `{}` (every tool -> no auto-retry), so a
+   * missing/older @docmost/mcp build only DISABLES retries, never mis-retries.
+   */
+  private writeClassMapPromise: Promise<Record<string, ToolWriteClass>> | null =
+    null;
 
   constructor(
     private readonly repo: AiMcpServerRepo,
     private readonly secretBox: SecretBoxService,
   ) {}
+
+  /**
+   * Whether an external MCP server is the TRUSTED internal Docmost MCP server —
+   * the only server whose tools may be classified by the Docmost write-class map
+   * (#489 review). Today this is ALWAYS false: every `ai_mcp_servers` row is an
+   * admin-configured THIRD-PARTY endpoint (there is no builtin/self flag, sentinel
+   * URL, or synthetic server in this path — Docmost's OWN tools are exposed via the
+   * separate in-app tools path, never through this external-MCP client). So no
+   * third-party tool can inherit `readOnly` by a name collision with a Docmost read
+   * tool, and none is ever auto-retried on a transport error (which would risk a
+   * double-apply — the #435 class). Flip this (an explicit `kind`/`isBuiltin`
+   * column, or a configured self-MCP URL) if a trusted internal server is ever
+   * introduced. A method (not a free function) so it is a single, mockable seam.
+   */
+  private isInternalDocmostServer(_server: AiMcpServer): boolean {
+    return false;
+  }
+
+  /** Lazily load + memoize the shared write-class map (see the field doc). */
+  private getWriteClassMap(): Promise<Record<string, ToolWriteClass>> {
+    if (!this.writeClassMapPromise) {
+      this.writeClassMapPromise = (async () => {
+        try {
+          const entry = require.resolve('@docmost/mcp');
+          const mod = (await esmImport(pathToFileURL(entry).href)) as {
+            SHARED_TOOL_WRITE_CLASS?: Record<string, ToolWriteClass>;
+          };
+          return mod.SHARED_TOOL_WRITE_CLASS ?? {};
+        } catch (err) {
+          this.logger.warn(
+            `Could not load MCP write-class map (auto-retry disabled): ${shortError(
+              err,
+            )}`,
+          );
+          return {};
+        }
+      })();
+    }
+    return this.writeClassMapPromise;
+  }
 
   /**
    * Build (or reuse a cached) external toolset for a workspace. Returns the
@@ -162,11 +285,37 @@ export class McpClientsService {
         }
       },
     };
-    // One release handle drives the whole leased entry; closing it releases all
-    // underlying clients together (they share the same lease lifecycle).
+
+    // #489: the run accumulates a SET of leases — the primary cache lease PLUS any
+    // throwaway client minted by an in-run transport-recovery reconnect. They are
+    // NEVER released mid-run (releasing a swapped-out client while a concurrent
+    // in-flight call still holds it would INDUCE a second failure); the caller
+    // releases the WHOLE set together at turn-end. A recovery reconnect pushes its
+    // lease onto this live array, which the consumer closes over.
+    const leaseSet: Closable[] = [release];
+
+    // #489: per-RUN transport-recovery binding, one per server, SHARED by all of
+    // that server's tools so a swap by one call is seen by the next (CAS by
+    // identity). Kept per-run (here, not in the cached entry) because the binding
+    // + lease-set state is per-run.
+    const bindings = new Map<number, ServerBinding>();
+    const capMs = mcpCallTimeoutMs();
+
+    // Wrap each cached tool with the recovery layer. On a transport error a
+    // declared readOnly tool reconnects its server and retries ONCE; a write is
+    // never blind-retried (indeterminate — may have applied before the reset). A
+    // tool without provenance (a minimal stub entry in a test) passes through raw.
+    const tools: Record<string, Tool> = {};
+    for (const [key, tool] of Object.entries(entry.tools)) {
+      const meta = entry.toolMeta?.[key];
+      tools[key] = meta
+        ? this.wrapWithTransportRecovery(entry, meta, tool, leaseSet, bindings, capMs)
+        : tool;
+    }
+
     return {
-      tools: entry.tools,
-      clients: [release],
+      tools,
+      clients: leaseSet,
       outcomes: entry.outcomes,
       instructions: entry.instructions,
     };
@@ -254,6 +403,16 @@ export class McpClientsService {
     // Per-call total wall-clock cap, read once for this build (env-overridable).
     const callTimeoutMs = mcpCallTimeoutMs();
     const instructions: McpServerInstruction[] = [];
+    // merged-key -> provenance for the per-run recovery wrapper (#489).
+    const toolMeta: Record<string, ToolProvenance> = {};
+    // Shared Docmost write-class map (#489) — classifies a tool by its raw name.
+    // Loaded ONLY when at least one server is a TRUSTED internal Docmost server
+    // (see isInternalDocmostServer): for third-party servers the map is never
+    // applied (a name collision must not grant readOnly-retry), so we skip the
+    // dynamic ESM load entirely in that (currently universal) case.
+    const writeClassMap = servers.some((s) => this.isInternalDocmostServer(s))
+      ? await this.getWriteClassMap()
+      : null;
 
     // Per-server connect+tools result, still tagged with its server so the merge
     // below can be applied in the SAME order as `servers` (see the parallel note).
@@ -327,11 +486,23 @@ export class McpClientsService {
       // against names already merged from earlier servers, so no external
       // tool is silently overwritten on collision. The returned count drives
       // whether this server's prompt guidance is included (≥1 tool merged).
+      // #489 (review): the Docmost write-class map keys by DOCMOST tool names and
+      // may ONLY be trusted for a server KNOWN to be the internal Docmost MCP
+      // server. Every row here is an admin-configured THIRD-PARTY endpoint, so a
+      // third-party WRITE tool that happens to be named like a Docmost read
+      // (getPage, listPages, ...) must NOT inherit readOnly — that would auto-retry
+      // a mutation on a transport error (double-apply, the #435 class). Gate the
+      // map on the trust check; untrusted servers get writeClass=undefined -> the
+      // recovery wrapper treats them as writes and never auto-retries.
+      const trustWriteClass = this.isInternalDocmostServer(server);
       const merged = this.mergeNamespaced(
         tools,
         result.guarded,
         server.name,
         server.id,
+        toolMeta,
+        i,
+        trustWriteClass ? writeClassMap : null,
       );
       outcomes.push({ name: server.name, ok: true });
       // Include this server's guidance ONLY when it actually contributed at
@@ -353,6 +524,8 @@ export class McpClientsService {
       clients,
       outcomes,
       instructions,
+      servers,
+      toolMeta,
       expiresAt: Date.now() + CACHE_TTL_MS,
       refCount: 0,
       evicted: false,
@@ -379,18 +552,33 @@ export class McpClientsService {
     picked: Record<string, Tool>,
     serverName: string,
     serverId: string,
+    toolMeta: Record<string, ToolProvenance>,
+    serverIndex: number,
+    // The Docmost write-class map, or `null` for an UNTRUSTED (third-party)
+    // server whose tools must all default to write (never auto-retried).
+    writeClassMap: Record<string, ToolWriteClass> | null,
   ): { count: number; prefix: string } {
     let count = 0;
-    for (const [name, tool] of Object.entries(namespace(picked, serverName))) {
-      let key = name;
+    for (const { full, raw, tool } of namespace(picked, serverName)) {
+      let key = full;
       if (key in target) {
         const original = key;
-        key = disambiguate(name, serverId, (candidate) => candidate in target);
+        key = disambiguate(full, serverId, (candidate) => candidate in target);
         this.logger.debug(
           `External MCP tool name "${original}" collided; renamed to "${key}"`,
         );
       }
       target[key] = tool;
+      // Record provenance so the per-run recovery wrapper (#489) can reconnect
+      // this tool's server and re-resolve it by its raw name. writeClass is set
+      // ONLY from a TRUSTED (internal-Docmost) map; for a third-party server the
+      // map is null -> writeClass stays undefined -> the wrapper treats the tool
+      // as a write and never auto-retries it (no double-apply on name collision).
+      toolMeta[key] = {
+        serverIndex,
+        rawName: raw,
+        writeClass: writeClassMap ? writeClassMap[raw] : undefined,
+      };
       count += 1;
     }
     return { count, prefix: namespacePrefix(serverName) };
@@ -424,7 +612,10 @@ export class McpClientsService {
         // Defense in depth: re-validate the actual request host on EVERY fetch
         // AND pin the socket to a validated IP via the dispatcher's connect
         // lookup, closing the DNS-rebinding TOCTOU between check and connect.
-        fetch: this.guardedFetch,
+        // #489: the SSE transport uses the raised-bodyTimeout dispatcher (idle
+        // between calls is legit); HTTP uses the tight one.
+        fetch:
+          transportType === 'sse' ? this.guardedFetchSse : this.guardedFetchHttp,
       },
     })) as unknown as McpClient;
     return client;
@@ -505,6 +696,176 @@ export class McpClientsService {
     }
   }
 
+  /**
+   * Wrap one merged external tool with the per-run transport-recovery layer (#489).
+   *
+   * attempt 1 runs on the server's CURRENT binding (the cached client, or a client
+   * a sibling tool already reconnected this run). On a REAL transport error
+   * (undici/@ai-sdk socket/body-timeout shapes — {@link isRetryableConnectError},
+   * NOT a mock) and ONLY for a declared readOnly tool, it reconnects the server
+   * and retries EXACTLY ONCE on the fresh client; a write is surfaced as an
+   * indeterminate error (it may have applied before the reset — never
+   * blind-retried). A single per-call cap bounds BOTH attempts + the reconnect,
+   * and the run's abort signal is checked before the retry AND before minting a
+   * fresh connection (no connection is opened for a stopped run).
+   */
+  private wrapWithTransportRecovery(
+    entry: CacheEntry,
+    meta: ToolProvenance,
+    template: Tool,
+    leaseSet: Closable[],
+    bindings: Map<number, ServerBinding>,
+    capMs: number,
+  ): Tool {
+    const original = template.execute;
+    if (typeof original !== 'function') return template;
+    const service = this;
+    const { serverIndex, rawName, writeClass } = meta;
+
+    let binding = bindings.get(serverIndex);
+    if (!binding) {
+      binding = { current: null };
+      bindings.set(serverIndex, binding);
+    }
+    const boundBinding = binding;
+
+    const execute = async (args: unknown, options: ToolCallOptions) => {
+      // The per-call cap governs the WHOLE sequence (attempt1 + reconnect +
+      // attempt2). Compose it with the run's abort signal so a Stop or the cap
+      // ends any awaited call — @ai-sdk/mcp does not settle on abort, so we RACE.
+      const capController = new AbortController();
+      const capTimer = setTimeout(() => {
+        capController.abort(new Error(`MCP tool call timed out after ${capMs}ms`));
+      }, capMs);
+      capTimer.unref?.();
+      const runSignal = options?.abortSignal;
+      const composed = runSignal
+        ? AbortSignal.any([runSignal, capController.signal])
+        : capController.signal;
+      const stopped = () => runSignal?.aborted === true || capController.signal.aborted;
+
+      const callOn = async (
+        exec: NonNullable<Tool['execute']>,
+      ): Promise<unknown> => {
+        const aborted = new Promise<never>((_, reject) => {
+          const fail = () => reject(abortReason(composed));
+          if (composed.aborted) fail();
+          else composed.addEventListener('abort', fail, { once: true });
+        });
+        return Promise.race([exec(args, { ...options, abortSignal: composed }), aborted]);
+      };
+
+      const execFor = (
+        state: RecoveredServerState | null,
+      ): NonNullable<Tool['execute']> | undefined =>
+        state ? (state.tools[rawName]?.execute as NonNullable<Tool['execute']>) : original;
+
+      try {
+        // Snapshot the target BEFORE the call so a swap by a concurrent call is
+        // detected by identity in the catch.
+        const attemptState = boundBinding.current;
+        const attemptExec = execFor(attemptState);
+        if (typeof attemptExec !== 'function') {
+          throw new Error(`external MCP tool "${rawName}" is not callable`);
+        }
+        try {
+          return await callOn(attemptExec);
+        } catch (err) {
+          // Never retry on a Stop or an exhausted cap.
+          if (stopped()) throw err;
+          // Only a genuine transport break is a recovery candidate.
+          if (!isRetryableConnectError(err)) throw err;
+          // A write tool is INDETERMINATE on a transport error (may have applied
+          // before the reset) — surface that; do NOT auto-retry (double-apply is
+          // the #435 incident class).
+          if (!isReadOnlyWriteClass(writeClass)) {
+            throw new Error(
+              `external MCP tool "${rawName}" hit a transport error and MAY have already ` +
+                `applied on the server — not retried automatically; verify state before ` +
+                `retrying. (${shortError(err)})`,
+            );
+          }
+          // Abort check BEFORE minting a fresh connection (no socket for a
+          // stopped run). LIMITATION (#489, LOW): the reconnect's own connect is
+          // bounded by CONNECT_TIMEOUT_MS but does NOT itself observe `composed`,
+          // so a Stop that lands DURING the handshake is only honored at the next
+          // `stopped()` gate (before the retry) — a bounded ≤5s late-abort window;
+          // the throwaway client is closed at turn-end regardless. Threading
+          // `composed` into the SHARED (CAS-deduped) reconnect is deliberately
+          // avoided: it would let the first caller's abort tear down a reconnect a
+          // concurrent still-live caller depends on.
+          if (stopped()) throw err;
+          // CAS-swap by IDENTITY: mint+swap only if nobody swapped since this
+          // call's snapshot; a losing concurrent call awaits the same reconnect
+          // and retries on the SAME fresh client.
+          let target: RecoveredServerState;
+          if (boundBinding.current === attemptState) {
+            if (!boundBinding.reconnecting) {
+              boundBinding.reconnecting = (async () => {
+                const server = entry.servers[serverIndex];
+                const fresh = await service.reconnectServer(server, capMs);
+                leaseSet.push(fresh.lease); // accumulate; released at turn-end
+                boundBinding.current = fresh.state;
+                return fresh.state;
+              })();
+              // Clear the in-flight marker once it settles (success or failure) so
+              // a LATER death of the new client can reconnect again.
+              void boundBinding.reconnecting.then(
+                () => (boundBinding.reconnecting = undefined),
+                () => (boundBinding.reconnecting = undefined),
+              );
+            }
+            target = await boundBinding.reconnecting;
+          } else {
+            target = boundBinding.current as RecoveredServerState;
+          }
+          // Abort check BEFORE the retry.
+          if (stopped()) throw err;
+          const retryExec = execFor(target);
+          if (typeof retryExec !== 'function') throw err;
+          return await callOn(retryExec);
+        }
+      } finally {
+        clearTimeout(capTimer);
+      }
+    };
+    return { ...template, execute } as unknown as Tool;
+  }
+
+  /**
+   * Reconnect ONE server for an in-run recovery (#489): open a fresh client and
+   * list+wrap its tools. The throwaway client is NOT cached — it is owned by the
+   * RUN via the returned lease (closed at turn-end), independent of the shared
+   * cache entry (whose TTL rebuild heals future turns). On a failure the fresh
+   * client is closed so its socket never leaks.
+   */
+  private async reconnectServer(
+    server: AiMcpServer,
+    capMs: number,
+  ): Promise<{ state: RecoveredServerState; lease: Closable }> {
+    const client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
+    let tools: Record<string, Tool>;
+    try {
+      const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
+      const allow = server.toolAllowlist;
+      const picked =
+        Array.isArray(allow) && allow.length > 0 ? pick(raw, allow) : raw;
+      tools = wrapToolsWithCallTimeout(picked, capMs);
+    } catch (err) {
+      void client.close().catch(() => undefined);
+      throw err;
+    }
+    let released = false;
+    const lease: Closable = {
+      close: async () => {
+        if (released) return;
+        released = true;
+        await client.close().catch(() => undefined);
+      },
+    };
+    return { state: { client, tools }, lease };
+  }
+
   /** Mark an entry evicted; close its clients now if nothing is leasing them. */
   private evict(entry: CacheEntry): void {
     clearTimeout(entry.timer);
@@ -554,22 +915,21 @@ export function validateResolvedAddresses(addrs: readonly LookupAddress[]): {
  * certificate validation still uses the real hostname (we never rewrite the URL
  * to an IP literal).
  */
-function buildPinnedDispatcher(): Agent {
-  // External-MCP traffic uses a DEDICATED, shorter silence timeout
+function buildPinnedDispatcher(bodyTimeoutMs: number): Agent {
+  // External-MCP traffic uses a DEDICATED, shorter HEADERS silence timeout
   // (`AI_MCP_STREAM_TIMEOUT_MS`, default 1 min) — deliberately tighter than the
   // chat provider's 15-min `streamTimeoutMs()` — so a byte-silent/hung MCP
   // upstream is broken in ~1 min instead of 15. We keep the keep-alive options
-  // from `streamingDispatcherOptions()` but OVERRIDE headers/body timeouts.
-  // Accepted trade-off: a legitimately long but byte-silent single tool call,
-  // and an SSE transport idling >1 min BETWEEN tool calls, are also cut here; the
-  // per-call total cap (wrapToolsWithCallTimeout, `AI_MCP_CALL_TIMEOUT_MS`) is the
-  // complementary guard for chatty-but-stuck calls that keep the socket warm yet
-  // never return.
-  const mcpSilenceMs = mcpStreamTimeoutMs();
+  // from `streamingDispatcherOptions()` but OVERRIDE the timeouts. `bodyTimeout`
+  // is passed in per-transport (#489): tight for HTTP (fresh request per call),
+  // raised for SSE (one long-lived body across calls — idle BETWEEN calls is
+  // legit). The per-call total cap (`AI_MCP_CALL_TIMEOUT_MS`) is the complementary
+  // guard for chatty-but-stuck calls that keep the socket warm yet never return.
+  const headersMs = mcpStreamTimeoutMs();
   return new Agent({
     ...streamingDispatcherOptions(),
-    headersTimeout: mcpSilenceMs,
-    bodyTimeout: mcpSilenceMs,
+    headersTimeout: headersMs,
+    bodyTimeout: bodyTimeoutMs,
     connect: {
       lookup: (hostname, _options, callback) => {
         // Always resolve ALL addresses ourselves; do not trust the caller's
@@ -669,18 +1029,22 @@ function pick(
 function namespace(
   tools: Record<string, Tool>,
   serverName: string,
-): Record<string, Tool> {
+): Array<{ full: string; raw: string; tool: Tool }> {
   const prefix = namespacePrefix(serverName);
-  const out: Record<string, Tool> = {};
+  const out: Array<{ full: string; raw: string; tool: Tool }> = [];
+  const taken: Record<string, true> = {};
   for (const [name, t] of Object.entries(tools)) {
     const safe = sanitizeName(name);
     let full = capName(`${prefix}_${safe}`);
     // Duplicate names within ONE server can still collide after sanitize/
     // truncate — suffix-disambiguate so the second tool is not overwritten.
-    if (full in out) {
-      full = disambiguate(full, '', (candidate) => candidate in out);
+    if (full in taken) {
+      full = disambiguate(full, '', (candidate) => candidate in taken);
     }
-    out[full] = t;
+    taken[full] = true;
+    // Keep the RAW (un-namespaced) name alongside the merged key so the per-run
+    // recovery wrapper (#489) can re-resolve the same tool on a fresh client.
+    out.push({ full, raw: name, tool: t });
   }
   return out;
 }
@@ -802,6 +1166,69 @@ export function wrapToolWithCallTimeout(tool: Tool, ms: number): Tool {
   // `Tool` is a union whose `execute` overloads conflict; cast narrowly so the
   // wrapped tool keeps every other field while swapping only `execute`.
   return { ...tool, execute } as unknown as Tool;
+}
+
+/**
+ * undici / Node network error CODES that mean the connection broke (not an
+ * application-level error) — a transient transport failure a readOnly call may
+ * safely retry after reconnecting. Matched against the REAL error shapes (#489):
+ * a socket reset surfaces as `TypeError: fetch failed` whose `.cause` is an
+ * undici `SocketError { code:'UND_ERR_SOCKET' }`; a body-timeout as
+ * `TypeError: terminated` whose `.cause` is `BodyTimeoutError`. Classifying by
+ * these real codes/names (not by mock errors) is essential — a mock-shaped
+ * predicate would leave eviction silently dead in production while CI is green.
+ */
+const RETRYABLE_TRANSPORT_ERROR_CODES: ReadonlySet<string> = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'EPIPE',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+  'UND_ERR_CLOSED',
+  'UND_ERR_DESTROYED',
+]);
+
+/** undici error CLASS names for the same transport-break conditions. */
+const RETRYABLE_TRANSPORT_ERROR_NAMES: ReadonlySet<string> = new Set([
+  'SocketError',
+  'BodyTimeoutError',
+  'HeadersTimeoutError',
+  'ConnectTimeoutError',
+  'ClientClosedError',
+  'ClientDestroyedError',
+]);
+
+/**
+ * Whether `err` is a retryable TRANSPORT break (a broken socket / body timeout),
+ * classified by the REAL undici/@ai-sdk error shapes (#489). undici surfaces a
+ * reset as `TypeError('fetch failed'|'terminated')` with the real error in
+ * `.cause`, and @ai-sdk/mcp may wrap it again in an `MCPClientError` (cause
+ * chain), so we walk `.cause` (bounded depth) checking `.code` and `.name`. An
+ * app-level tool error (a 4xx, a validation failure) is NOT retryable and returns
+ * false — only a connection-level failure heals with a reconnect.
+ */
+export function isRetryableConnectError(err: unknown, depth = 0): boolean {
+  if (!err || typeof err !== 'object' || depth > 6) return false;
+  const e = err as {
+    code?: unknown;
+    name?: unknown;
+    cause?: unknown;
+  };
+  if (typeof e.code === 'string' && RETRYABLE_TRANSPORT_ERROR_CODES.has(e.code)) {
+    return true;
+  }
+  if (typeof e.name === 'string' && RETRYABLE_TRANSPORT_ERROR_NAMES.has(e.name)) {
+    return true;
+  }
+  if (e.cause != null) return isRetryableConnectError(e.cause, depth + 1);
+  return false;
 }
 
 /** The signal's reason as an Error (informative thrown value on abort/timeout). */

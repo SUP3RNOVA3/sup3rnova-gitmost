@@ -132,6 +132,32 @@ export function isDegenerateOutput(text: string): boolean {
 }
 
 /**
+ * How many bytes the in-progress text must grow before the (amortized) tail
+ * heuristics are re-run. Shared with ai-chat.service so the throttle the stream
+ * applies is the SAME one the unit test drives.
+ */
+export const DEGENERATION_CHECK_STEP = 2000;
+
+/**
+ * Throttle decision for the degeneration guard (#444/#486). Returns true when
+ * the accumulated text has grown at least DEGENERATION_CHECK_STEP bytes past the
+ * last-checked offset, so the pure rules only fire every ~2KB. Pure; the caller
+ * updates its watermark to `textLen` when this returns true.
+ *
+ * The watermark is an offset INTO the accumulator, so when the accumulator is
+ * reset to '' on a step boundary the caller MUST reset the watermark to 0 too
+ * (#486). Otherwise `textLen - lastCheckLen` goes negative after the reset and
+ * this returns false until a later step re-grows past the stale offset — a whole
+ * degenerate step could stream unchecked.
+ */
+export function shouldCheckDegeneration(
+  textLen: number,
+  lastCheckLen: number,
+): boolean {
+  return textLen - lastCheckLen >= DEGENERATION_CHECK_STEP;
+}
+
+/**
  * Truncate a degenerated tail before persist so hundreds of KB of garbage never
  * reach the DB / replay (#444). Keeps everything up to and including the FIRST
  * `keepRepeats` repeats of the detected loop, then appends a short marker. If no

@@ -224,7 +224,7 @@ describe('PublicShareChatToolsService.forShare', () => {
         (tools.getSharePage as unknown as ToolExec).execute({
           pageId: 'page-1',
         }),
-      ).rejects.toThrow('That page is not part of this published share.');
+      ).rejects.toThrow('The requested page is not available in this share.');
 
       // No content is ever fetched/returned for a non-resolving page.
       expect(shareService.updatePublicAttachments).not.toHaveBeenCalled();

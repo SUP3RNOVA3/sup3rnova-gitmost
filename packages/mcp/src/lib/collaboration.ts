@@ -269,6 +269,12 @@ export async function mutatePageContent(
   collabToken: string,
   baseUrl: string,
   transform: (liveDoc: any) => any | null,
+  // #487: optional abort signal carrying the turn's Stop + the in-app tool
+  // per-call cap. Checked as the PRE-COMMIT safe-point below (after the session
+  // is acquired, immediately before the atomic read->write), so a Stop that
+  // arrives during the connect/lock window stops THIS write from landing. See the
+  // limitation note at the check.
+  signal?: AbortSignal,
 ): Promise<MutationResult> {
   return withPageLock(pageId, async () => {
     if (process.env.DEBUG) {
@@ -281,6 +287,13 @@ export async function mutatePageContent(
 
     const session = await acquireCollabSession(pageId, collabToken, baseUrl);
     try {
+      // #487 PRE-COMMIT safe-point: if the turn was Stopped (or the in-app tool
+      // per-call cap fired) after we acquired the collab session but before the
+      // atomic write, throw NOW so this commit never runs. KNOWN LIMITATION
+      // (#487): this only stops THIS commit — a write tool that already committed
+      // an EARLIER call this turn leaves that op applied. Cancel guarantees "no
+      // NEW commit starts", NOT "the write didn't land".
+      signal?.throwIfAborted();
       return await session.mutate(transform);
     } catch (e) {
       // Drop the session on any failure so the next call reconnects fresh (this
@@ -306,6 +319,8 @@ export async function replacePageContent(
   prosemirrorDoc: any,
   collabToken: string,
   baseUrl: string,
+  // #487: threaded straight to mutatePageContent's pre-commit safe-point.
+  signal?: AbortSignal,
 ): Promise<MutationResult> {
   // Fail fast on a bad document instead of deferring the failure into the
   // collaboration write (where TiptapTransformer.toYdoc(undefined) used to
@@ -322,6 +337,7 @@ export async function replacePageContent(
     collabToken,
     baseUrl,
     () => prosemirrorDoc,
+    signal,
   );
 }
 

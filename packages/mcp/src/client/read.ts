@@ -127,8 +127,13 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
           "listPages: tree mode requires a spaceId (a page tree is scoped to one space). Pass spaceId, or omit tree to get the recent-pages list.",
         );
       }
-      const { pages } = await this.enumerateSpacePages(spaceId);
-      return buildPageTree(pages);
+      // #486: propagate `truncated` (same pattern as check_new_comments). The old
+      // code dropped it, so a caller handed an INCOMPLETE tree (the stdio-fallback
+      // BFS hit its node cap) had no way to know pages were missing. Return the
+      // tree alongside the flag; the primary /pages/tree path is uncapped so this
+      // is false there.
+      const { pages, truncated } = await this.enumerateSpacePages(spaceId);
+      return { tree: buildPageTree(pages), truncated };
     }
 
     const clampedLimit = Math.max(1, Math.min(100, limit));

@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { tool, type Tool } from 'ai';
+import { tool, type Tool, type ToolCallOptions } from 'ai';
 import { z } from 'zod';
 import { User } from '@docmost/db/types/entity.types';
 import { TokenService } from '../../auth/services/token.service';
@@ -159,6 +159,129 @@ function __assertClientCallContract(client: DocmostClientLike): void {
  * existing service-account `/mcp` path already calls loopback successfully, so
  * this works for single-workspace self-host.
  */
+/**
+ * #487: wall-clock cap for a SINGLE in-app tool call, env-tunable via
+ * `AI_CHAT_INAPP_TOOL_CALL_CAP_MS`. Bounds a read tool that would otherwise
+ * paginate for minutes and a content write whose collab commit hangs, and is the
+ * per-call CAP half of the composite abort signal every in-app tool is wrapped
+ * with (the other half is the turn's Stop signal). Default 2 minutes: generous
+ * for a legitimate long read/write, tight enough that a stuck call cannot pin the
+ * turn. The reconcile staleness floor (#487 commit 4) is derived as
+ * max(2 x this cap, 15 min), so keep this well under that.
+ */
+export function inAppToolCallCapMs(): number {
+  const raw = Number(process.env.AI_CHAT_INAPP_TOOL_CALL_CAP_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
+}
+
+/** #487: the composite signal's reason as an Error (informative thrown value). */
+function inAppAbortReason(signal: AbortSignal): Error {
+  const r = signal.reason;
+  return r instanceof Error
+    ? r
+    : new Error(typeof r === 'string' ? r : 'In-app tool call aborted');
+}
+
+/**
+ * The client surface {@link wrapInAppToolWithCap} drives (#487). Both methods are
+ * OPTIONAL: the real loopback DocmostClient implements them (so a Stop/cap reaches
+ * its pagination / pre-commit safe-points), but a client that omits them still
+ * gets the OUTER guarantee — the race rejects on abort regardless. This keeps the
+ * wrapper decoupled from the exact client shape (unit-test doubles need not stub
+ * the plumbing).
+ */
+export interface ToolAbortSignalSink {
+  setToolAbortSignal?(signal: AbortSignal | null): void;
+  getToolAbortSignal?(): AbortSignal | null;
+}
+
+/**
+ * #487: wrap an in-app tool so a Stop (the turn's `options.abortSignal`) OR the
+ * per-call wall-clock cap REJECTS the call immediately, and so that SAME
+ * composite signal reaches the client's pagination / pre-commit safe-points (via
+ * `client.setToolAbortSignal`) — making a Stop stop the NEXT HTTP/WS call from
+ * starting.
+ *
+ * Reuses the RACE pattern of `wrapToolWithCallTimeout` (mcp-clients.service.ts):
+ * the call is raced against the composite signal, so on abort we reject in the
+ * SAME tick and DISCARD the loser promise. Its network / collab teardown latency
+ * therefore never blocks the turn — the supersede timeout W=10s (#487 commit 3)
+ * relies on this abort->settle latency being milliseconds, not a socket teardown.
+ * Awaiting the client's own signal-into-write path alone would NOT satisfy this
+ * (the loser could still be tearing down a collab socket).
+ *
+ * The composite is SET on the client at entry and deliberately NOT restored on
+ * unwind: after this wrapper rejects on abort, the ABANDONED loser promise keeps
+ * running, and its safe-points read the client field — leaving the (aborted)
+ * composite there is exactly what makes the loser's NEXT call throw and stop. The
+ * next in-app tool call overwrites the field with its own fresh composite before
+ * any of its safe-points run, so a stale settled signal never leaks forward.
+ * SINGLE-WRITER by phase-1 assumption — see DocmostClientContext.toolAbortSignal
+ * for the parallel-call caveat (#487).
+ *
+ * KNOWN LIMITATION (#487): a write tool that issues SEVERAL sequential collab
+ * commits can be aborted BETWEEN commits, leaving a partially-applied operation.
+ * Cancel guarantees "no NEW call starts", NOT "the write didn't land".
+ */
+export function wrapInAppToolWithCap(
+  toolDef: Tool,
+  client: ToolAbortSignalSink,
+  capMs: number,
+): Tool {
+  const original = toolDef.execute;
+  if (typeof original !== 'function') return toolDef;
+  const execute = async (args: unknown, options: ToolCallOptions) => {
+    const capController = new AbortController();
+    const timer = setTimeout(() => {
+      capController.abort(
+        new Error(`In-app tool call exceeded the ${capMs}ms per-call cap`),
+      );
+    }, capMs);
+    timer.unref?.();
+    const composite = options?.abortSignal
+      ? AbortSignal.any([options.abortSignal, capController.signal])
+      : capController.signal;
+    // Reject the MOMENT the composite fires, independent of whether `original`
+    // ever settles (a hung collab write / read would otherwise pin the turn). The
+    // losing `original` is left pending; Promise.race attaches a rejection
+    // handler to both inputs so a late rejection is never unhandled.
+    const aborted = new Promise<never>((_, reject) => {
+      const fail = () => reject(inAppAbortReason(composite));
+      if (composite.aborted) fail();
+      else composite.addEventListener('abort', fail, { once: true });
+    });
+    // Publish the composite so the client's pagination / pre-commit safe-points
+    // observe it (see the "not restored on unwind" rationale above). Guarded: a
+    // client without the plumbing still gets the OUTER race guarantee below.
+    client.setToolAbortSignal?.(composite);
+    try {
+      return await Promise.race([
+        (original as (a: unknown, o: ToolCallOptions) => Promise<unknown>)(
+          args,
+          { ...options, abortSignal: composite },
+        ),
+        aborted,
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  return { ...toolDef, execute } as unknown as Tool;
+}
+
+/** #487: apply {@link wrapInAppToolWithCap} to every tool in a set. */
+export function wrapInAppToolsWithCap(
+  tools: Record<string, Tool>,
+  client: ToolAbortSignalSink,
+  capMs: number,
+): Record<string, Tool> {
+  const out: Record<string, Tool> = {};
+  for (const [name, t] of Object.entries(tools)) {
+    out[name] = wrapInAppToolWithCap(t, client, capMs);
+  }
+  return out;
+}
+
 @Injectable()
 export class AiChatToolsService {
   private readonly logger = new Logger(AiChatToolsService.name);
@@ -186,7 +309,12 @@ export class AiChatToolsService {
     sessionId: string,
     workspaceId: string,
     aiChatId: string,
-  ): Promise<DocmostClientLike> {
+    // #487: the returned client also carries the tool-cancellation plumbing
+    // (setToolAbortSignal/getToolAbortSignal). These are host plumbing, NOT part
+    // of the tool-execute surface (DocmostClientMethod), so they are surfaced here
+    // as an intersection rather than by widening that Pick — keeping the
+    // positional-call drift-guard (#446) scoped to the actual tool methods.
+  ): Promise<DocmostClientLike & ToolAbortSignalSink> {
     const apiUrl =
       process.env.MCP_DOCMOST_API_URL ||
       `http://127.0.0.1:${process.env.PORT || 3000}/api`;
@@ -630,7 +758,15 @@ export class AiChatToolsService {
     // dependency and reuses the CASL enforcement already on `client`. When the
     // loaded package predates #417 (factory undefined) or the loader is mocked in
     // a unit test, signalling is a pure no-op and results are byte-identical.
-    if (!createCommentSignalTracker) return tools;
+    // #487: wrap every in-app tool with the race-on-abort + per-call cap guard so
+    // a Stop / cap rejects immediately AND reaches the client's write/pagination
+    // safe-points. Applied as the OUTERMOST wrapper (over the comment-signal
+    // wrapper below) so the race governs the whole call. The client carries the
+    // per-call composite signal via setToolAbortSignal.
+    const capMs = inAppToolCallCapMs();
+    if (!createCommentSignalTracker) {
+      return wrapInAppToolsWithCap(tools, client, capMs);
+    }
 
     const tracker = createCommentSignalTracker({
       probe: async (pageId: string, sinceMs: number) => {
@@ -659,7 +795,11 @@ export class AiChatToolsService {
       },
     });
 
-    return wrapToolsWithCommentSignal(tools, tracker);
+    return wrapInAppToolsWithCap(
+      wrapToolsWithCommentSignal(tools, tracker),
+      client,
+      capMs,
+    );
   }
 }
 

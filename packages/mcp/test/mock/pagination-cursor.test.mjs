@@ -184,12 +184,14 @@ test("enumerateSpacePages (via listPages tree) uses one /pages/tree request", as
   });
 
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
-  // listPages tree:true -> enumerateSpacePages(spaceId) -> buildPageTree.
-  const tree = await client.listPages("space-1", 50, true);
+  // listPages tree:true -> enumerateSpacePages(spaceId) -> { tree, truncated }.
+  const { tree, truncated } = await client.listPages("space-1", 50, true);
 
   assert.equal(treeRequests, 1, "exactly one /pages/tree request for the space");
   assert.equal(sidebarRequests, 0, "no per-node sidebar BFS requests");
   assert.deepEqual(treeBody, { spaceId: "space-1" }, "space scope posts spaceId only");
+  // The uncapped /pages/tree path is never truncated (#486).
+  assert.equal(truncated, false, "primary /pages/tree path is not truncated");
   // buildPageTree nests c1 under r1; two roots at the top level.
   assert.equal(tree.length, 2, "two root nodes");
   const r1 = tree.find((n) => n.id === "r1");
@@ -249,7 +251,7 @@ test("enumerateSpacePages falls back to the cursor BFS on /pages/tree 404", asyn
   });
 
   const client = new DocmostClient(baseURL, "user@example.com", "pw");
-  const tree = await client.listPages("space-1", 50, true);
+  const { tree, truncated } = await client.listPages("space-1", 50, true);
 
   assert.ok(treeRequests >= 1, "the tree endpoint was attempted first");
   assert.deepEqual(
@@ -257,6 +259,8 @@ test("enumerateSpacePages falls back to the cursor BFS on /pages/tree 404", asyn
     ["<root>", "r1"],
     "fell back to the sidebar BFS: roots then the root's children",
   );
+  // Small fallback walk well under the node cap -> not truncated (#486).
+  assert.equal(truncated, false, "fallback BFS below the cap is not truncated");
   assert.equal(tree.length, 1, "one root in the built tree");
   assert.equal(tree[0].children[0].id, "c1", "leaf nested via the BFS");
 });

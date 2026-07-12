@@ -16,6 +16,7 @@ import {
 } from './mcp-auth.helpers';
 import { JwtType } from '../../core/auth/dto/jwt-payload';
 import { CREDENTIALS_MISMATCH_MESSAGE } from '../../core/auth/auth.constants';
+import { McpService } from './mcp.service';
 
 // The /mcp per-user auth decision logic is tested through the framework-free
 // `resolveMcpSessionConfig` helper that McpService delegates to. McpService
@@ -1177,5 +1178,48 @@ describe('mapAuthResultToResponse (handle status/body mapping, refactor R2)', ()
       status: 401,
       body: { error: 'Unauthorized' },
     });
+  });
+});
+
+// #486: onModuleDestroy must ALSO tear down the live loopback CollabSessions, not
+// just clear the sweep timer — otherwise the embedded MCP's collab sockets keep
+// docs pinned open on the collab server past process exit. The teardown goes
+// through an overridable seam (destroyAllMcpSessions) so it can be spied without
+// loading the ESM-only @docmost/mcp package.
+describe('McpService.onModuleDestroy — CollabSession teardown (#486)', () => {
+  function makeService(): McpService {
+    // The constructor only stores its deps and starts the (unref'd) sweep timer,
+    // so bare stubs suffice. onModuleDestroy clears that timer, so no leak.
+    return new McpService(
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+    );
+  }
+
+  it('destroys all sessions AND clears the sweep timer on shutdown', async () => {
+    const svc = makeService();
+    const destroy = jest.fn().mockResolvedValue(undefined);
+    (svc as any).destroyAllMcpSessions = destroy;
+    const clearSpy = jest.spyOn(global, 'clearInterval');
+
+    await svc.onModuleDestroy();
+
+    expect(destroy).toHaveBeenCalledTimes(1);
+    expect(clearSpy).toHaveBeenCalledWith((svc as any).sweepTimer);
+    clearSpy.mockRestore();
+  });
+
+  it('swallows a teardown failure so shutdown never throws', async () => {
+    const svc = makeService();
+    (svc as any).destroyAllMcpSessions = jest
+      .fn()
+      .mockRejectedValue(new Error('collab teardown boom'));
+
+    await expect(svc.onModuleDestroy()).resolves.toBeUndefined();
   });
 });

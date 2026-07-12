@@ -89,11 +89,22 @@ describe('AiChatService.stream run-lifecycle safety net (#184)', () => {
     const runRepo = {
       insert: jest.fn().mockResolvedValue({ id: 'run-1', status: 'running' }),
       update: jest.fn().mockResolvedValue({ id: 'run-1' }),
+      // #487: the terminal settle now goes through the CONDITIONAL write.
+      finalizeIfActive: jest
+        .fn()
+        .mockResolvedValue({ id: 'run-1', status: 'failed' }),
+      findById: jest.fn().mockResolvedValue(undefined),
     };
     const runService = new AiChatRunService(runRepo as never, { isCloud: () => false } as never);
 
-    // The user-message insert (the first bare await after beginRun) throws.
+    // The user-message insert throws. #489 runs the history load + convert BEFORE
+    // the insert (convert-before-insert, so a retry cannot duplicate the user row),
+    // so `findAllByChat` (a real repo method) is now called first — stub it to an
+    // empty history so the flow reaches the insert. Both awaits are AFTER beginRun,
+    // so the "exception after beginRun -> settled to error" invariant is unchanged;
+    // the throw point simply moved from insert to a later insert after a no-op load.
     const aiChatMessageRepo = {
+      findAllByChat: jest.fn().mockResolvedValue([]),
       insert: jest.fn().mockRejectedValue(new Error('insert boom')),
     };
     const aiChatRepo = {
@@ -148,9 +159,10 @@ describe('AiChatService.stream run-lifecycle safety net (#184)', () => {
 
     // The run was begun...
     expect(runRepo.insert).toHaveBeenCalledTimes(1);
-    // ...then settled to a terminal FAILED status by the safety net...
-    expect(runRepo.update).toHaveBeenCalledTimes(1);
-    expect(runRepo.update).toHaveBeenCalledWith(
+    // ...then settled to a terminal FAILED status by the safety net (via the
+    // #487 conditional write)...
+    expect(runRepo.finalizeIfActive).toHaveBeenCalledTimes(1);
+    expect(runRepo.finalizeIfActive).toHaveBeenCalledWith(
       'run-1',
       'ws1',
       expect.objectContaining({ status: 'failed' }),

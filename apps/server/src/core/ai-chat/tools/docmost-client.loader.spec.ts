@@ -1,7 +1,15 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  readdirSync,
+  statSync,
+  readFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 
 import { computeSrcRegistryStamp } from './docmost-client.loader';
 
@@ -30,10 +38,14 @@ function assertStaleGuard(
   }
 }
 
-// Build a throwaway `<pkg>/build/index.js` + optional `<pkg>/src/tool-specs.ts`
-// layout so `computeSrcRegistryStamp(<pkg>/build/index.js)` resolves src the same
-// way the loader does (dirname(dirname(entry))/src/tool-specs.ts).
-function makeFakePackage(toolSpecsSource: string | null): {
+// Build a throwaway `<pkg>/build/index.js` + optional `<pkg>/src/` tree so
+// `computeSrcRegistryStamp(<pkg>/build/index.js)` resolves src the same way the
+// loader does (dirname(dirname(entry))/src). Since #486 the stamp hashes the WHOLE
+// src tree, so a fixture is a { relPath: content } map. A bare string is sugar for
+// a single `tool-specs.ts`; `null` means "no src tree" (the prod no-op path).
+function makeFakePackage(
+  src: string | Record<string, string> | null,
+): {
   entry: string;
   cleanup: () => void;
 } {
@@ -42,10 +54,15 @@ function makeFakePackage(toolSpecsSource: string | null): {
   mkdirSync(buildDir, { recursive: true });
   const entry = join(buildDir, 'index.js');
   writeFileSync(entry, '// fake @docmost/mcp build entry\n', 'utf8');
-  if (toolSpecsSource !== null) {
+  if (src !== null) {
+    const files =
+      typeof src === 'string' ? { 'tool-specs.ts': src } : src;
     const srcDir = join(root, 'src');
-    mkdirSync(srcDir, { recursive: true });
-    writeFileSync(join(srcDir, 'tool-specs.ts'), toolSpecsSource, 'utf8');
+    for (const [rel, content] of Object.entries(files)) {
+      const full = join(srcDir, rel);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, content, 'utf8');
+    }
   }
   return { entry, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
@@ -93,34 +110,109 @@ describe('computeSrcRegistryStamp (#447 stale-build guard)', () => {
     }
   });
 
-  // CROSS-IMPL EQUALITY (covers reviewer suggestion 2). The SAME fixed input and
+  // #486 CORE (negative): an edit to a NON-tool-specs src file (client.ts) with a
+  // rebuild NOT run must move the src stamp away from the built REGISTRY_STAMP, so
+  // the loader's stale-check refuses. Under the old tool-specs.ts-only hash this
+  // edit was invisible and a stale build/ served the old client.ts silently.
+  it('a client.ts edit (no rebuild) moves the src stamp -> loader refuses (#486)', () => {
+    // "Built" state: the package as it was compiled.
+    const built = makeFakePackage({
+      'tool-specs.ts': 'export const SPECS = 1;\n',
+      'client.ts': "export const impl = 'v1';\n",
+    });
+    // "Dev edited src, forgot to rebuild": client.ts changed, tool-specs.ts not.
+    const edited = makeFakePackage({
+      'tool-specs.ts': 'export const SPECS = 1;\n',
+      'client.ts': "export const impl = 'v2';\n",
+    });
+    try {
+      const builtStamp = computeSrcRegistryStamp(built.entry);
+      const editedStamp = computeSrcRegistryStamp(edited.entry);
+      expect(builtStamp).not.toBeNull();
+      expect(editedStamp).not.toBe(builtStamp);
+      // build/ still carries builtStamp; src now hashes to editedStamp -> refuse.
+      expect(() => assertStaleGuard(editedStamp, builtStamp as string)).toThrow(
+        STALE_BUILD_MESSAGE,
+      );
+    } finally {
+      built.cleanup();
+      edited.cleanup();
+    }
+  });
+
+  // *.generated.ts is excluded (the codegen's own output — a fixed-point cycle
+  // otherwise): its presence/content must not move the stamp.
+  it('excludes *.generated.ts from the stamp', () => {
+    const without = makeFakePackage({ 'tool-specs.ts': 'x\n' });
+    const withGen = makeFakePackage({
+      'tool-specs.ts': 'x\n',
+      'registry-stamp.generated.ts': 'export const REGISTRY_STAMP = "abc";\n',
+    });
+    try {
+      expect(computeSrcRegistryStamp(withGen.entry)).toBe(
+        computeSrcRegistryStamp(without.entry),
+      );
+    } finally {
+      without.cleanup();
+      withGen.cleanup();
+    }
+  });
+
+  // CROSS-IMPL EQUALITY (covers reviewer suggestion 2). The SAME fixed tree and
   // EXPECTED hash are asserted in the mcp-side node test
   // (packages/mcp/test/unit/registry-stamp.test.mjs) against the codegen's
   // `computeRegistryStamp`. Asserting the SAME pair here against the loader's
-  // `computeSrcRegistryStamp` proves both implementations normalize+hash
+  // `computeSrcRegistryStamp` proves both implementations enumerate+normalize+hash
   // identically; a divergence in EITHER side reddens one of the two tests.
-  it('matches the documented cross-impl hash for a fixed input', () => {
-    const FIXED_INPUT = 'line1\r\nline2\n';
-    const EXPECTED =
-      '683376e290829b482c2655745caffa7a1dccfa10afaa62dac2b42dd6c68d0f83';
-    const { entry, cleanup } = makeFakePackage(FIXED_INPUT);
+  const CROSS_IMPL_TREE = {
+    'tool-specs.ts': 'line1\r\nline2\n',
+    'client/read.ts': 'export const R = 1;\n',
+    'registry-stamp.generated.ts': 'export const REGISTRY_STAMP="ignored";\n',
+  };
+  const CROSS_IMPL_EXPECTED =
+    '131c1b9e4e2f5a7d6cef91ca8df619822b442f52bc45ebd09474a4c1d6728616';
+
+  it('matches the documented cross-impl hash for a fixed tree', () => {
+    const { entry, cleanup } = makeFakePackage(CROSS_IMPL_TREE);
     try {
-      expect(computeSrcRegistryStamp(entry)).toBe(EXPECTED);
+      expect(computeSrcRegistryStamp(entry)).toBe(CROSS_IMPL_EXPECTED);
     } finally {
       cleanup();
     }
   });
 
-  it('the documented EXPECTED is the normalize+sha256 of the fixed input', () => {
-    // Proves EXPECTED is not a magic constant but the documented computation.
-    const FIXED_INPUT = 'line1\r\nline2\n';
-    const normalized = FIXED_INPUT.replace(/\r\n/g, '\n').replace(/\n$/, '');
-    const expected = createHash('sha256')
-      .update(normalized, 'utf8')
-      .digest('hex');
-    const { entry, cleanup } = makeFakePackage(FIXED_INPUT);
+  it('the documented EXPECTED is the enumerate+normalize+sha256 of the tree', () => {
+    // Proves EXPECTED is not a magic constant but the documented computation — a
+    // local re-implementation of the loader's tree walk.
+    const { entry, cleanup } = makeFakePackage(CROSS_IMPL_TREE);
     try {
-      expect(computeSrcRegistryStamp(entry)).toBe(expected);
+      const srcDir = join(dirname(dirname(entry)), 'src');
+      const collect = (dir: string): string[] => {
+        const out: string[] = [];
+        for (const e of readdirSync(dir)) {
+          const f = join(dir, e);
+          if (statSync(f).isDirectory()) out.push(...collect(f));
+          else if (e.endsWith('.ts') && !e.endsWith('.generated.ts'))
+            out.push(f);
+        }
+        return out;
+      };
+      const files = collect(srcDir)
+        .map((abs) => ({ rel: relative(srcDir, abs).split(sep).join('/'), abs }))
+        .sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+      const h = createHash('sha256');
+      for (const { rel, abs } of files) {
+        const n = readFileSync(abs, 'utf8')
+          .replace(/\r\n/g, '\n')
+          .replace(/\n$/, '');
+        h.update(rel, 'utf8');
+        h.update('\0', 'utf8');
+        h.update(n, 'utf8');
+        h.update('\0', 'utf8');
+      }
+      const localHash = h.digest('hex');
+      expect(computeSrcRegistryStamp(entry)).toBe(localHash);
+      expect(localHash).toBe(CROSS_IMPL_EXPECTED);
     } finally {
       cleanup();
     }
