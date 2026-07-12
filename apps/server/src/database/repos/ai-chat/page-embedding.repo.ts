@@ -200,8 +200,11 @@ export class PageEmbeddingRepo {
    *
    * The `model_dimensions = $dim` filter applies ONLY on the semantic side
    * (cosine compares same-dimension vectors; pgvector errors otherwise). The
-   * lexical side (`fts`) is dimension-independent. If `websearch_to_tsquery`
-   * yields an EMPTY query (e.g. the text is all stopwords) the `@@` matches
+   * lexical side (`fts`) is dimension-independent. Its query config is `ru_en`,
+   * matched IN LOCKSTEP with the `page_embeddings.fts` generated column's config
+   * (#529 acceptance #13): a mismatch silently breaks Cyrillic RAG retrieval. If
+   * `websearch_to_tsquery` yields an EMPTY query (e.g. the text is all stopwords)
+   * the `@@` matches
    * nothing and the lexical CTE is empty, so results degrade to pure-semantic —
    * which is correct behaviour, not an error.
    *
@@ -249,7 +252,7 @@ export class PageEmbeddingRepo {
                row_number() OVER (ORDER BY ts_rank(pe.fts, q.query) DESC) AS rank_ix
         FROM page_embeddings pe
         JOIN pages p ON p.id = pe.page_id,
-             websearch_to_tsquery('english', f_unaccent(${queryText})) AS q(query)
+             websearch_to_tsquery('ru_en', f_unaccent(${queryText})) AS q(query)
         WHERE pe.workspace_id = ${workspaceId}
           AND pe.space_id IN (${spaceList})
           AND p.deleted_at IS NULL

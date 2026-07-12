@@ -450,15 +450,22 @@ server.registerTool(
   "search",
   {
     description:
-      "Find pages by a fragment of a technical string (hostnames, IPs, IDs " +
-      "like `srv.local`, `10.0.12`, `WB-MGE-30D86B`) — one call returns each " +
-      "hit's location (`path`: ancestor titles root→parent) and a `snippet` " +
-      "around the first match, so you rarely need a follow-up get_page. " +
-      "Matches substrings literally (dots/dashes/digits are not tokenized) as " +
-      "well as full-text. Returns `{ pageId, title, path, snippet, score }` " +
-      "sorted by `score` (a per-response relevance float).",
+      "Search pages across the wiki. OR by default with relevance ranking " +
+      "(RU+EN morphology): multi-word queries match ANY term, not all. " +
+      "Operators: \"exact phrase\" (adjacent words), +term (require), -term " +
+      "(exclude) — e.g. `+кофейня -архив`, `+\"воздушный шар\" кофе`. A leading " +
+      "-/+ is the operator; -,.,: INSIDE a token are literal (`WB-MGE-30D86B`, " +
+      "`10.0.12.5` stay one term). Technical fragments (hostnames, IPs, IDs) " +
+      "auto-match as substrings; words use full-text. Each hit returns its " +
+      "location (`path`: ancestor titles root→parent), a `snippet`, `score`, " +
+      "`matchedTerms` and `matchedFields`, so you rarely need a follow-up " +
+      "getPage. Paginate with limit + offset; the response carries " +
+      "`total` (exact, permission-filtered), `hasMore` and `truncatedAtCap`. " +
+      "NOTE: results past the relevance cap (~500) are unreachable by " +
+      "pagination — narrow the query (add terms / +required / a spaceId) " +
+      "instead when `truncatedAtCap` is true.",
     inputSchema: {
-      query: z.string().min(1).describe("Search query"),
+      query: z.string().min(1).describe("Search query (supports \"phrase\", +require, -exclude)"),
       spaceId: z
         .string()
         .optional()
@@ -473,6 +480,13 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Match page titles only; skip page text"),
+      match: z
+        .enum(["auto", "word", "prefix", "substring"])
+        .optional()
+        .describe(
+          "Match mode (default auto: identifiers→substring, words→full-text). " +
+            "Override with word/prefix/substring.",
+        ),
       limit: z
         .number()
         .int()
@@ -480,12 +494,20 @@ server.registerTool(
         .max(50)
         .optional()
         .describe("Max results to return (1-50, default 10)"),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Pagination offset (default 0); use with total/hasMore"),
     },
   },
-  async ({ query, spaceId, parentPageId, titleOnly, limit }) => {
+  async ({ query, spaceId, parentPageId, titleOnly, match, limit, offset }) => {
     const result = await docmostClient.search(query, spaceId, limit, {
       parentPageId,
       titleOnly,
+      match,
+      offset,
     });
     return jsonContent(result);
   },

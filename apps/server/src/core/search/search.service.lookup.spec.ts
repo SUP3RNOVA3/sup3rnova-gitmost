@@ -1,19 +1,14 @@
-import {
-  computeLookupScore,
-  escapeLikePattern,
-  SearchLookupTier,
-} from './search.service';
+import { escapeLikePattern } from './search.service';
 
 /**
- * Pure-function coverage for the #443 agent-lookup helpers:
- *  - escapeLikePattern: LIKE-metacharacter escaping so `%`/`_`/`\` are literals
- *    (the acceptance-table requirement that a query of `%` or `_` does NOT match
- *    everything);
- *  - computeLookupScore: the tiered 0..1 ranking score, where a stronger tier
- *    always outranks a weaker one regardless of the in-tier secondary signal.
+ * Pure-function coverage for `escapeLikePattern` — LIKE-metacharacter escaping so
+ * `%`/`_`/`\` are matched literally (the acceptance requirement that a query of
+ * `%` or `_` does NOT match everything, #529 acceptance #10). The substring
+ * branch's DB behaviour is covered by the integration spec.
  *
- * The DB-touching branch (substring UNION FTS, path CTE, snippet window) is
- * covered by the integration spec against the real schema.
+ * NOTE (#529): the old tiered `computeLookupScore` was replaced by RRF rank
+ * fusion in the unified engine, so its unit coverage moved to the integration
+ * ordering tests; only the escaping helper remains a pure unit here.
  */
 describe('escapeLikePattern', () => {
   it('escapes the LIKE metacharacters % _ and \\', () => {
@@ -41,55 +36,5 @@ describe('escapeLikePattern', () => {
   it('is null/undefined-safe', () => {
     expect(escapeLikePattern(undefined as any)).toBe('');
     expect(escapeLikePattern(null as any)).toBe('');
-  });
-});
-
-describe('computeLookupScore', () => {
-  it('keeps every score within (0, 1]', () => {
-    for (const tier of [
-      SearchLookupTier.TITLE_EXACT,
-      SearchLookupTier.TITLE_SUBSTRING,
-      SearchLookupTier.TEXT,
-    ]) {
-      for (const secondary of [0, 0.001, 1, 100, 1e6]) {
-        const s = computeLookupScore({ tier, secondary });
-        expect(s).toBeGreaterThan(0);
-        expect(s).toBeLessThanOrEqual(1);
-      }
-    }
-  });
-
-  it('a stronger tier ALWAYS outranks a weaker tier, whatever the secondary', () => {
-    // Weak tier with a huge secondary must still lose to a strong tier with a
-    // tiny secondary — tiers dominate.
-    const strongLowSecondary = computeLookupScore({
-      tier: SearchLookupTier.TITLE_EXACT,
-      secondary: 0,
-    });
-    const weakHighSecondary = computeLookupScore({
-      tier: SearchLookupTier.TEXT,
-      secondary: 1e9,
-    });
-    expect(strongLowSecondary).toBeGreaterThan(weakHighSecondary);
-  });
-
-  it('within a tier a larger secondary sorts higher', () => {
-    const lo = computeLookupScore({
-      tier: SearchLookupTier.TEXT,
-      secondary: 0.1,
-    });
-    const hi = computeLookupScore({
-      tier: SearchLookupTier.TEXT,
-      secondary: 5,
-    });
-    expect(hi).toBeGreaterThan(lo);
-  });
-
-  it('treats a negative/absent secondary as 0', () => {
-    const zero = computeLookupScore({ tier: SearchLookupTier.TEXT, secondary: 0 });
-    expect(computeLookupScore({ tier: SearchLookupTier.TEXT })).toBe(zero);
-    expect(
-      computeLookupScore({ tier: SearchLookupTier.TEXT, secondary: -5 }),
-    ).toBe(zero);
   });
 });

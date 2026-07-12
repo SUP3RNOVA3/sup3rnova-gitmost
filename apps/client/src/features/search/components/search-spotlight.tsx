@@ -1,6 +1,6 @@
 import { Spotlight } from "@mantine/spotlight";
 import { IconSearch } from "@tabler/icons-react";
-import { Group, VisuallyHidden } from "@mantine/core";
+import { Group, Text, VisuallyHidden } from "@mantine/core";
 import { useState, useMemo } from "react";
 import { useDebouncedValue } from "@mantine/hooks";
 import { useTranslation } from "react-i18next";
@@ -84,6 +84,11 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
             onFiltersChange={handleFiltersChange}
             spaceId={spaceId}
           />
+          {/* #529: operator hint — matches ANY word by default; "…" for an exact
+              phrase, +term to require, -term to exclude. */}
+          <Text size="xs" c="dimmed" mt={4}>
+            {t('Tip: "exact phrase", +required, -excluded')}
+          </Text>
         </div>
 
         <VisuallyHidden role="status" aria-live="polite">
