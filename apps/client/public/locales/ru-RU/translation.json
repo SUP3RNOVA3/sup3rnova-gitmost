@@ -239,6 +239,8 @@
   "Comment re-opened successfully": "Комментарий успешно открыт повторно",
   "Comment unresolved successfully": "Комментарий успешно переведён в нерешённые",
   "Failed to resolve comment": "Не удалось разрешить комментарий",
+  "Failed to re-open comment": "Не удалось переоткрыть комментарий",
+  "Comment no longer exists": "Комментарий больше не существует",
   "Resolve comment": "Решить комментарий",
   "Unresolve comment": "Снять статус решённого с комментария",
   "Resolve Comment Thread": "Решить ветку комментариев",
