@@ -24,7 +24,7 @@ import {
 const tsquery = require('pg-tsquery')();
 
 // The FTS text-search configuration used on BOTH the stored side (pages.tsv via
-// its trigger, see migration 20260707T120000) and the query side here. #529
+// its trigger, see migration 20260707T130000) and the query side here. #529
 // acceptance #13 invariant: column config and query config always change as a
 // pair — flip this only alongside the migration.
 const TS_CONFIG = 'ru_en';

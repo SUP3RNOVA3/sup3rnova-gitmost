@@ -152,7 +152,7 @@ async function swapEmbeddingsFtsConfig(
   if (!inlineEmbeddingsRewriteEnabled()) {
     // eslint-disable-next-line no-console
     console.warn(
-      `[migration 20260707T120000] SEARCH_EMBEDDINGS_FTS_INLINE_REWRITE=false: ` +
+      `[migration 20260707T130000] SEARCH_EMBEDDINGS_FTS_INLINE_REWRITE=false: ` +
         `SKIPPING the page_embeddings.fts rewrite to '${config}'. The operator MUST ` +
         `perform this fts swap out-of-band. Until then the RAG lexical leg stays on ` +
         `its current config while the query config is '${config}' (documented, ` +
@@ -232,7 +232,7 @@ export async function down(db: Kysely<any>): Promise<void> {
   if ((await embeddingsFtsExpr(db)).includes('ru_en')) {
     // eslint-disable-next-line no-console
     console.warn(
-      `[migration 20260707T120000] down(): page_embeddings.fts still references ` +
+      `[migration 20260707T130000] down(): page_embeddings.fts still references ` +
         `ru_en (inline rewrite was gated off) — leaving the ru_en text-search ` +
         `configuration in place. Drop it out-of-band once fts is back on 'english'.`,
     );

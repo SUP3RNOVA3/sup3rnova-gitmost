@@ -1,6 +1,6 @@
 import { Kysely, sql } from 'kysely';
 import { getTestDb, destroyTestDb } from './db';
-import * as migration from '../../src/database/migrations/20260707T120000-search-ru-en-config';
+import * as migration from '../../src/database/migrations/20260707T130000-search-ru-en-config';
 
 /**
  * #529 A1 — the ru_en config migration must be REVERSIBLE in the correct order:
