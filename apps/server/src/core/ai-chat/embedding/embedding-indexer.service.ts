@@ -108,15 +108,24 @@ export class EmbeddingIndexerService {
       return;
     }
 
-    // Resolve embeddings config WITHOUT crashing the queue when unconfigured.
+    // Resolve the embeddings provider WITHOUT crashing the queue when
+    // unconfigured. #530: resolveEmbeddingProvider prefers the workspace provider
+    // and falls back to the GLOBAL env provider (TEI sidecar), and yields the
+    // doc-prefix + the active fingerprint stored per row so search filters by the
+    // active generation.
     let modelName = 'unknown';
+    let provider: Awaited<
+      ReturnType<AiService['resolveEmbeddingProvider']>
+    >;
     try {
-      const model = await this.aiService.getEmbeddingModel(workspaceId);
+      provider = await this.aiService.resolveEmbeddingProvider(workspaceId);
       // Record the model id per row so a future migration can detect + re-index
       // rows produced by a different model (see the migration header). The SDK
       // type is `string | EmbeddingModel{V2,V3}`; model objects carry `modelId`.
       modelName =
-        typeof model === 'string' ? model : (model.modelId ?? 'unknown');
+        typeof provider.model === 'string'
+          ? provider.model
+          : (provider.model.modelId ?? 'unknown');
     } catch (err) {
       if (err instanceof AiEmbeddingNotConfiguredException) {
         // No embeddings provider for this workspace: NO-OP (§6.7). The page can
@@ -145,8 +154,18 @@ export class EmbeddingIndexerService {
       return;
     }
 
-    // Embed all chunks in one batch.
-    const vectors = await this.aiService.embedTexts(workspaceId, chunks);
+    // #530: prepend the provider's DOC prefix to each chunk (e5-style
+    // "passage: "; empty for a non-e5 provider) so stored vectors live in the
+    // same prefixed space as a prefixed query, then embed with the RESOLVED
+    // provider model (which may be the global TEI sidecar, not a workspace one).
+    const prefixedChunks = provider.docPrefix
+      ? chunks.map((c) => provider.docPrefix + c)
+      : chunks;
+    const vectors = await this.aiService.embedWithModel(
+      provider.model,
+      workspaceId,
+      prefixedChunks,
+    );
 
     // The column is dimension-agnostic, so ANY model dimension is stored as-is.
     // Defensive sanity check only: all chunks of ONE page come from the SAME
@@ -170,6 +189,7 @@ export class EmbeddingIndexerService {
       vectors,
       { pageId, workspaceId, spaceId },
       modelName,
+      provider.fingerprint,
     );
 
     // HARD replace in one transaction: delete then insert so search never
@@ -216,7 +236,9 @@ export class EmbeddingIndexerService {
     // (seeded at enqueue time); the finally cleans that too.
     try {
       try {
-        await this.aiService.getEmbeddingModel(workspaceId);
+        // #530: resolve via the same path reindexPage uses (workspace provider,
+        // else the global TEI sidecar) so a global-only deployment is NOT skipped.
+        await this.aiService.resolveEmbeddingProvider(workspaceId);
       } catch (err) {
         if (err instanceof AiEmbeddingNotConfiguredException) {
           this.logger.log(
@@ -348,6 +370,7 @@ export class EmbeddingIndexerService {
     vectors: number[][],
     ids: { pageId: string; workspaceId: string; spaceId: string },
     modelName: string,
+    fingerprint: string | null,
   ): PageEmbeddingChunkRow[] {
     const rows: PageEmbeddingChunkRow[] = [];
     let cursor = 0;
@@ -370,6 +393,8 @@ export class EmbeddingIndexerService {
         // Provenance for a future re-index sweep on model change.
         modelName,
         modelDimensions: embedding.length,
+        // #530: the active generation fingerprint this row belongs to.
+        fingerprint,
         embedding,
       });
     }

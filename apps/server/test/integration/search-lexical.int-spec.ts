@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { Kysely, sql } from 'kysely';
+import { Logger } from '@nestjs/common';
 import { SearchService } from 'src/core/search/search.service';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
+import { AiEmbeddingNotConfiguredException } from 'src/integrations/ai/ai-embedding-not-configured.exception';
 import {
   getTestDb,
   destroyTestDb,
@@ -53,10 +56,19 @@ describe('SearchService #529 lexical overhaul [integration]', () => {
   // Service wired to the real DB + real PageRepo (recursive descendants) with
   // stubbed space-membership + permission repos so a test controls scope and the
   // permission filter explicitly. `accessibleIds` (when set) is the KEEP list.
+  // #530: a FAKE AiService whose embedQuery is fully controlled per test. By
+  // DEFAULT it throws AiEmbeddingNotConfiguredException, so the semantic arm is
+  // omitted and every Phase-A case runs the BYTE-IDENTICAL lexical path — the
+  // semantic layer must never change lexical behaviour on degrade. Semantic cases
+  // pass `embedVector` (a deterministic 384-dim query vector) or `embedThrows`.
   function buildService(opts?: {
     userSpaceIds?: string[];
     accessibleIds?: string[] | null;
     filterThrows?: boolean;
+    embedVector?: number[];
+    embedFingerprint?: string;
+    embedThrows?: 'no-provider' | 'degraded';
+    slowVectorArm?: boolean;
   }): SearchService {
     const pageRepo = new PageRepo(db as any, null as any, null as any);
     const spaceMemberRepo = {
@@ -71,13 +83,84 @@ describe('SearchService #529 lexical overhaul [integration]', () => {
           : pageIds;
       },
     };
+    const aiService = {
+      embedQuery: async () => {
+        if (opts?.embedVector) {
+          return {
+            vector: opts.embedVector,
+            fingerprint: opts.embedFingerprint ?? ACTIVE_FP,
+          };
+        }
+        if (opts?.embedThrows === 'degraded') {
+          const err = new Error('embedding request timed out after 1ms');
+          err.name = 'TimeoutError';
+          throw err;
+        }
+        // Default (and explicit 'no-provider'): no embedding provider resolved.
+        throw new AiEmbeddingNotConfiguredException();
+      },
+    };
+    // Real repo on the migrated test DB — exercises the actual vector-candidate
+    // SQL (pgvector <=>, fingerprint + dimension filters). When slowVectorArm is
+    // set, wrap the arm so it sleeps well past the (tiny, test-set) statement
+    // timeout, forcing a 57014 cancellation to exercise the degrade-to-lexical net.
+    const realRepo = new PageEmbeddingRepo(db as any);
+    const pageEmbeddingRepo = opts?.slowVectorArm
+      ? {
+          vectorCandidateArm: (p: any) => {
+            const inner = realRepo.vectorCandidateArm(p);
+            return sql`SELECT * FROM (${inner}) AS slowarm WHERE (SELECT true FROM pg_sleep(0.5))`;
+          },
+        }
+      : realRepo;
     return new SearchService(
       db as any,
       pageRepo as any,
       {} as any,
       spaceMemberRepo as any,
       pagePermissionRepo as any,
+      aiService as any,
+      pageEmbeddingRepo as any,
     );
+  }
+
+  // Active embedding fingerprint used by planted rows + the fake query embed.
+  const ACTIVE_FP = 'fp-active-530';
+
+  // A deterministic unit-ish 384-dim vector with a single 1 at `concept`. Two
+  // vectors of the same concept have cosine distance 0; different concepts are
+  // orthogonal (distance 1), so nearest-neighbour ordering is fully controlled.
+  function conceptVec(concept: number): number[] {
+    const v = new Array(384).fill(0);
+    v[concept % 384] = 1;
+    return v;
+  }
+
+  // Plant one chunk embedding for a page via the REAL repo (exercises the #530
+  // fingerprint insert path). Dimension is fixed at 384 to match conceptVec.
+  async function plantEmbedding(
+    pageId: string,
+    vector: number[],
+    fingerprint: string = ACTIVE_FP,
+    planSpaceId: string = spaceId,
+  ): Promise<void> {
+    const repo = new PageEmbeddingRepo(db as any);
+    await repo.insertChunks([
+      {
+        pageId,
+        workspaceId,
+        spaceId: planSpaceId,
+        attachmentId: null,
+        chunkIndex: 0,
+        chunkStart: 0,
+        chunkLength: 1,
+        content: 'planted chunk',
+        modelName: 'test-model',
+        modelDimensions: 384,
+        fingerprint,
+        embedding: vector,
+      },
+    ]);
   }
 
   const search = (service: SearchService, params: any) =>
@@ -608,5 +691,325 @@ describe('SearchService #529 lexical overhaul [integration]', () => {
     const hit2 = res2.items.find((i: any) => i.id === rootHit);
     expect(hit2).toBeDefined();
     expect(hit2.path).toEqual([]);
+  });
+
+  // === #530 Phase B (PR-1): semantic fusion ==================================
+  // Deterministic fake embedder (no live model) + real PageEmbeddingRepo on the
+  // migrated DB with planted vectors + the active fingerprint, so cosine ordering
+  // is fully controlled. Each case runs in its OWN space so planted rows never
+  // leak across tests.
+  describe('#530 semantic fusion', () => {
+    // 1. Vector-only hit: nearest to a page that has NO lexical match for the
+    //    query term — it appears via the vector arm, and a pure-lexical run does
+    //    not return it. Mutation (a): drop the vector arm -> this reddens.
+    it('#530-1 a vector-only hit appears; a pure-lexical run would not return it', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const page = await insertPage({
+        title: 'нейтральный вект заголовок',
+        textContent: 'содержимое без искомого термина',
+        spaceId: s,
+      });
+      await plantEmbedding(page, conceptVec(1), ACTIVE_FP, s);
+
+      const svc = buildService({ embedVector: conceptVec(1), userSpaceIds: [s] });
+      const res = await search(svc, { query: 'квазонимикс', spaceId: s });
+      expect(res.items.map((i: any) => i.id)).toContain(page);
+      expect(res.semantic.available).toBe(true);
+      expect(res.semantic.state).toBe('full');
+
+      // Pure-lexical (default degrade): the vector-only page is absent.
+      const lex = buildService({ userSpaceIds: [s] });
+      const res2 = await search(lex, { query: 'квазонимикс', spaceId: s });
+      expect(res2.items.map((i: any) => i.id)).not.toContain(page);
+      expect(res2.semantic.available).toBe(false);
+    });
+
+    // 2. Sidecar down: embedQuery throws -> results = the lexical set; semantic
+    //    unavailable; the fixed 'search.semantic.degraded' event is logged.
+    it('#530-2 sidecar-down degrades to lexical and logs search.semantic.degraded', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const lexHit = await insertPage({
+        title: 'семдвамаркер лексический',
+        textContent: 'обычный текст',
+        spaceId: s,
+      });
+      const warnSpy = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined as any);
+      try {
+        const svc = buildService({ embedThrows: 'degraded', userSpaceIds: [s] });
+        const res = await search(svc, { query: 'семдвамаркер', spaceId: s });
+        expect(res.items.map((i: any) => i.id)).toContain(lexHit);
+        expect(res.semantic.available).toBe(false);
+        expect(res.semantic.reason).toBe('degraded');
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('search.semantic.degraded'),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    // 3. No provider: resolveEmbeddingProvider yields none -> lexical results,
+    //    reason no-provider, no 500.
+    it('#530-3 no-provider yields lexical results with reason no-provider', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const hit = await insertPage({
+        title: 'семтримаркер тема',
+        textContent: 'текст',
+        spaceId: s,
+      });
+      const svc = buildService({ embedThrows: 'no-provider', userSpaceIds: [s] });
+      const res = await search(svc, { query: 'семтримаркер', spaceId: s });
+      expect(res.items.map((i: any) => i.id)).toContain(hit);
+      expect(res.semantic.available).toBe(false);
+      expect(res.semantic.reason).toBe('no-provider');
+    });
+
+    // 4. Permission over the union: a restricted vector-only hit is dropped from
+    //    items AND total; with the permission filter throwing the call rejects
+    //    (fail-closed, never fail-open). Mutation (b): move filterAccessiblePageIds
+    //    inside the semantic try/catch -> the reject assertion reddens.
+    it('#530-4 permission filters a vector-only hit from items AND total (fail-closed)', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const visibleLex = await insertPage({
+        title: 'семчетмаркер видимый',
+        textContent: 'доступный текст',
+        spaceId: s,
+      });
+      const hiddenVec = await insertPage({
+        title: 'скрытая вект страница',
+        textContent: 'содержимое без искомого термина',
+        spaceId: s,
+      });
+      await plantEmbedding(hiddenVec, conceptVec(4), ACTIVE_FP, s);
+
+      // Query hits visibleLex lexically; hiddenVec only via the vector arm.
+      const svc = buildService({
+        embedVector: conceptVec(4),
+        accessibleIds: [visibleLex],
+        userSpaceIds: [s],
+      });
+      const res = await search(svc, { query: 'семчетмаркер', spaceId: s });
+      const ids = res.items.map((i: any) => i.id);
+      expect(ids).toContain(visibleLex);
+      expect(ids).not.toContain(hiddenVec);
+      // The hidden vector hit does not leak into total either.
+      expect(res.total).toBe(1);
+      expect(ids).toHaveLength(res.total);
+
+      // A permission-query error PROPAGATES (never a fail-open empty result).
+      const boom = buildService({
+        embedVector: conceptVec(4),
+        filterThrows: true,
+        userSpaceIds: [s],
+      });
+      await expect(
+        search(boom, { query: 'семчетмаркер', spaceId: s }),
+      ).rejects.toThrow(/permission query failed/);
+    });
+
+    // 5. Hung sidecar under a short embed timeout: graceful degrade (never a 500).
+    it('#530-5 a hung sidecar under a short timeout degrades gracefully', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const hit = await insertPage({
+        title: 'семпятьмаркер тема',
+        textContent: 'текст',
+        spaceId: s,
+      });
+      process.env.SEARCH_EMBED_TIMEOUT_MS = '1';
+      try {
+        const svc = buildService({ embedThrows: 'degraded', userSpaceIds: [s] });
+        const res = await search(svc, { query: 'семпятьмаркер', spaceId: s });
+        expect(res.items.map((i: any) => i.id)).toContain(hit);
+        expect(res.semantic.available).toBe(false);
+        expect(res.semantic.reason).toBe('degraded');
+      } finally {
+        delete process.env.SEARCH_EMBED_TIMEOUT_MS;
+      }
+    });
+
+    // 6. A page matched BOTH lexically and by vector is fused (de-duped), not
+    //    returned twice — the agg CTE collapses it to one row.
+    it('#530-6 a page matched lexically AND by vector appears once', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const both = await insertPage({
+        title: 'семшестьмаркер общий',
+        textContent: 'и лексика и вектор',
+        spaceId: s,
+      });
+      await plantEmbedding(both, conceptVec(6), ACTIVE_FP, s);
+      const svc = buildService({ embedVector: conceptVec(6), userSpaceIds: [s] });
+      const res = await search(svc, { query: 'семшестьмаркер', spaceId: s });
+      const ids = res.items.map((i: any) => i.id);
+      expect(ids.filter((id: string) => id === both)).toHaveLength(1);
+      expect(res.total).toBe(1);
+    });
+
+    // 7. Fingerprint isolation: a planted row under a DIFFERENT fingerprint is not
+    //    a vector candidate for the active-fingerprint query (guards mixing
+    //    generations). It only appears if it also matches lexically (it does not).
+    it('#530-7 a stale-fingerprint vector row is not fused into results', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const stale = await insertPage({
+        title: 'нейтральный семь заголовок',
+        textContent: 'без искомого термина совсем',
+        spaceId: s,
+      });
+      // Same concept vector as the query, but an OLD generation fingerprint.
+      await plantEmbedding(stale, conceptVec(7), 'fp-stale-old', s);
+      const svc = buildService({ embedVector: conceptVec(7), userSpaceIds: [s] });
+      const res = await search(svc, { query: 'квазонимиксseven', spaceId: s });
+      expect(res.items.map((i: any) => i.id)).not.toContain(stale);
+    });
+
+    // 8. Stale embedding space_id (moved page): a page currently in space B whose
+    //    embedding rows still carry space A (movePageToSpace does NOT reindex) is
+    //    STILL a vector hit when searching B — space scoping is enforced only by
+    //    the pages join (pages.space_id, always current), NOT by a stale
+    //    page_embeddings.space_id. Guards against re-adding that predicate (which
+    //    would wrongly drop the moved page's vector-only hit).
+    it('#530-8 a vector hit with a STALE embedding space_id (moved page) is still returned', async () => {
+      const newSpace = (await createSpace(db, workspaceId)).id;
+      const oldSpace = (await createSpace(db, workspaceId)).id;
+      // The page currently lives in newSpace (as after a move into newSpace).
+      const page = await insertPage({
+        title: 'перемещённая вект страница',
+        textContent: 'содержимое без искомого термина',
+        spaceId: newSpace,
+      });
+      // Its embedding was stamped with the OLD space and never reindexed.
+      await plantEmbedding(page, conceptVec(8), ACTIVE_FP, oldSpace);
+      const svc = buildService({
+        embedVector: conceptVec(8),
+        userSpaceIds: [newSpace],
+      });
+      const res = await search(svc, {
+        query: 'квазонимиксeight',
+        spaceId: newSpace,
+      });
+      // Survives despite page_embeddings.space_id (oldSpace) != pages.space_id.
+      expect(res.items.map((i: any) => i.id)).toContain(page);
+      expect(res.semantic.available).toBe(true);
+    });
+
+    // 9. Statement-timeout safety net: a pathologically slow vector scan is
+    //    cancelled (SQLSTATE 57014) and search degrades to lexical-only — the
+    //    lexical hit survives, the vector-only hit vanishes, no 500/hang, and the
+    //    degraded event is logged. Mutation: make the fallback re-throw instead of
+    //    degrading -> this test reds (the call rejects with 57014).
+    it('#530-9 a vector-query timeout degrades to lexical (57014), never 500', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const lexHit = await insertPage({
+        title: 'семдевятьмаркер лексический',
+        textContent: 'обычный текст',
+        spaceId: s,
+      });
+      const vecOnly = await insertPage({
+        title: 'нейтральный девять заголовок',
+        textContent: 'без искомого термина',
+        spaceId: s,
+      });
+      await plantEmbedding(vecOnly, conceptVec(9), ACTIVE_FP, s);
+
+      const warnSpy = jest
+        .spyOn(Logger.prototype, 'warn')
+        .mockImplementation(() => undefined as any);
+      // Tiny per-statement timeout so the 0.5s sleeping arm is cancelled.
+      process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS = '50';
+      try {
+        const svc = buildService({
+          embedVector: conceptVec(9),
+          slowVectorArm: true,
+          userSpaceIds: [s],
+        });
+        const res = await search(svc, { query: 'семдевятьмаркер', spaceId: s });
+        // Lexical result survives; the vector-only page does NOT (arm cancelled).
+        const ids = res.items.map((i: any) => i.id);
+        expect(ids).toContain(lexHit);
+        expect(ids).not.toContain(vecOnly);
+        expect(res.semantic.available).toBe(false);
+        expect(res.semantic.reason).toBe('degraded');
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('search.semantic.degraded'),
+        );
+      } finally {
+        delete process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS;
+        warnSpy.mockRestore();
+      }
+    });
+
+    // 10. SET LOCAL scoping: the search's statement timeout must NOT leak onto a
+    //     later query on the same pooled connection. After a search that set a
+    //     tiny timeout, a deliberately-slow standalone query still completes.
+    it('#530-10 the per-query statement timeout does not leak to later queries', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      await insertPage({
+        title: 'семдесятьмаркер тема',
+        textContent: 'текст',
+        spaceId: s,
+      });
+      process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS = '50';
+      try {
+        const svc = buildService({
+          embedVector: conceptVec(10),
+          slowVectorArm: true,
+          userSpaceIds: [s],
+        });
+        // This search trips + resets the local timeout (via SET LOCAL semantics).
+        await search(svc, { query: 'семдесятьмаркер', spaceId: s });
+        // A subsequent query that sleeps 200ms must NOT be cancelled — proving the
+        // 50ms search timeout did not persist on the connection (it would raise
+        // 57014 if it had leaked). SET LOCAL auto-resets at the search tx end.
+        await expect(sql`SELECT pg_sleep(0.2)`.execute(db)).resolves.toBeDefined();
+      } finally {
+        delete process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS;
+      }
+    });
+
+    // 11. COMMIT-path no-leak (locks is_local=true). #530-10 only covers the
+    //     ROLLBACK path (a timed-out search rolls back — a plain session SET would
+    //     ALSO be undone on rollback, so it would NOT catch is_local true->false).
+    //     Here a NORMAL, FAST semantic search COMMITs its transaction; a leaked
+    //     session-level statement_timeout would then persist on the pooled
+    //     connection and cancel later queries. We prove it does NOT: after the
+    //     committing search (bounded at a small 100ms), a 300ms query succeeds.
+    //     Because postgres.js pools, we run several sequential slow queries so at
+    //     least one reuses the connection the committed search ran on (which is
+    //     where a leaked timeout would live); ALL must succeed. Mutation: flip
+    //     is_local true->false -> the committed 100ms timeout leaks and the
+    //     follow-up pg_sleep is cancelled (57014), reddening this test.
+    it('#530-11 a COMMITTED search does not leak its statement timeout (is_local)', async () => {
+      const s = (await createSpace(db, workspaceId)).id;
+      const page = await insertPage({
+        title: 'семодиннадцать вект страница',
+        textContent: 'содержимое без искомого термина',
+        spaceId: s,
+      });
+      await plantEmbedding(page, conceptVec(11), ACTIVE_FP, s);
+      // Small bound: the fast vector arm still completes (<100ms) so the search
+      // COMMITs, but small enough that a LEAKED timeout would cancel the 300ms
+      // follow-ups below.
+      process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS = '100';
+      try {
+        const svc = buildService({
+          embedVector: conceptVec(11),
+          userSpaceIds: [s],
+        });
+        const res = await search(svc, { query: 'семодиннадцать', spaceId: s });
+        // The (committing) vector path actually ran.
+        expect(res.semantic.available).toBe(true);
+        // Each 300ms query must SUCCEED — a leaked 100ms timeout would cancel the
+        // one that reuses the committed search's connection. 8 sweeps cover the
+        // whole pool (max 5 conns), so a leak on any connection is caught.
+        for (let i = 0; i < 8; i++) {
+          await expect(
+            sql`SELECT pg_sleep(0.3)`.execute(db),
+          ).resolves.toBeDefined();
+        }
+      } finally {
+        delete process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS;
+      }
+    });
   });
 });

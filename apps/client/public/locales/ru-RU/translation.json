@@ -1481,6 +1481,7 @@
   "agent: {{value}}": "агент: {{value}}",
   "Work": "Работа",
   "Agent": "Агент",
+  "{{start}} – {{end}} · {{duration}}": "{{start}} – {{end}} · {{duration}}",
   "≈ {{hours}}h {{minutes}}m": "≈ {{hours}} ч {{minutes}} мин",
   "≈ {{hours}}h": "≈ {{hours}} ч",
   "≈ {{minutes}}m": "≈ {{minutes}} мин",

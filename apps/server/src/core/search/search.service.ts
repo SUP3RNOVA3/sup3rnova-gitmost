@@ -1,8 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { SearchDTO, SearchSuggestionDTO } from './dto/search.dto';
 import {
   SearchResponseDto,
   SearchResultDto,
+  SearchSemanticDto,
 } from './dto/search-response.dto';
 import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
@@ -11,6 +12,10 @@ import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
+import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
+import { AiService } from '../../integrations/ai/ai.service';
+import { AiEmbeddingNotConfiguredException } from '../../integrations/ai/ai-embedding-not-configured.exception';
+import { isStatementTimeout } from '@docmost/db/utils';
 import {
   ParsedQuery,
   ParsedTerm,
@@ -59,14 +64,42 @@ function defaultBooleanMode(): SearchBooleanMode {
   return process.env.SEARCH_MODE === 'and' ? 'and' : 'or';
 }
 
+// #530 semantic env knobs. SEARCH_SEMANTIC=off is the kill-switch (hybrid is
+// otherwise transparent — no per-request mode flag). SEARCH_VECTOR_WEIGHT tunes
+// the vector RRF leg's contribution (default 1.0, i.e. equal to each lexical
+// leg). SEARCH_VECTOR_CANDIDATES caps the vector top-N pulled into the union.
+function semanticKillSwitchOff(): boolean {
+  return process.env.SEARCH_SEMANTIC === 'off';
+}
+function getVectorWeight(): number {
+  const raw = Number(process.env.SEARCH_VECTOR_WEIGHT);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 1.0;
+}
+function getVectorCandidates(): number {
+  const raw = Number(process.env.SEARCH_VECTOR_CANDIDATES);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 50;
+}
+// Safety net for the brute-force vector scan (no ANN index — see
+// vectorCandidateArm): a per-statement timeout bounding ONLY the fused vector
+// query, so a pathological seq scan is cancelled (SQLSTATE 57014) and search
+// degrades to lexical instead of hanging the request. Default 2000ms.
+function getVectorStatementTimeoutMs(): number {
+  const raw = Number(process.env.SEARCH_VECTOR_STATEMENT_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2000;
+}
+
 @Injectable()
 export class SearchService {
+  private readonly logger = new Logger(SearchService.name);
+
   constructor(
     @InjectKysely() private readonly db: KyselyDB,
     private pageRepo: PageRepo,
     private shareRepo: ShareRepo,
     private spaceMemberRepo: SpaceMemberRepo,
     private pagePermissionRepo: PagePermissionRepo,
+    private aiService: AiService,
+    private pageEmbeddingRepo: PageEmbeddingRepo,
   ) {}
 
   // === #529 SQL fragment builders (parameterized AST, never string-concat) =====
@@ -292,33 +325,102 @@ export class SearchService {
     const scopeSql = sql`(${sql.join(scopePreds, sql` AND `)})`;
     const candidateSql = sql`(${scopeSql} AND ${this.candidatePredicate(parsed, titleOnly)})`;
 
+    // --- Semantic (vector) arm: embed the query, degrade gracefully. (#530) ----
+    // The try/catch wraps ONLY embedQuery + vector-arm construction. On ANY throw
+    // (TEI down / 800ms timeout / no provider) we omit the vector arm entirely and
+    // run the byte-identical Phase-A lexical path — never a 500 from the sidecar.
+    // The permission filter below stays OUTSIDE this try (a permission error must
+    // 500, never fail-open). Hybrid is transparent; SEARCH_SEMANTIC=off disables it.
+    let vectorArm: RawBuilder<unknown> | null = null;
+    let semanticAvailable = false;
+    let semanticReason: 'no-provider' | 'degraded' | undefined;
+    if (!semanticKillSwitchOff()) {
+      try {
+        const { vector, fingerprint } = await this.aiService.embedQuery(
+          opts.workspaceId,
+          rawQuery,
+        );
+        vectorArm = this.pageEmbeddingRepo.vectorCandidateArm({
+          queryEmbedding: vector,
+          dimensions: vector.length,
+          fingerprint,
+          scope: scopeSql,
+          limit: getVectorCandidates(),
+          // Filter page_embeddings by (immutable) workspace_id directly, so the
+          // composite index bites on its leading column and candidates are
+          // workspace-scoped at the embedding level (#530 review WARNING 2). Space
+          // scoping stays on the pages join only — page_embeddings.space_id can be
+          // STALE after a cross-space move, so filtering it here would drop a moved
+          // page's vector hit (re-review regression fix).
+          workspaceId: scope.workspaceId,
+        });
+        semanticAvailable = true;
+      } catch (err) {
+        if (err instanceof AiEmbeddingNotConfiguredException) {
+          // No embedding provider is the DEFAULT state of any deployment without
+          // the TEI sidecar — normal, not a problem. Log at DEBUG so it never
+          // floods WARN once per search request.
+          semanticReason = 'no-provider';
+          this.logger.debug(
+            `search.semantic.no-provider workspace=${opts.workspaceId}`,
+          );
+        } else {
+          // A provider IS configured but the embed call failed/timed out — a real
+          // sidecar problem worth a WARN. Structured, greppable event (fixed code)
+          // — no query text/secrets.
+          semanticReason = 'degraded';
+          this.logger.warn(
+            `search.semantic.degraded reason=degraded workspace=${opts.workspaceId}`,
+          );
+        }
+      }
+    }
     // --- Ranked candidate ids (ALL matches, RRF order). -----------------------
-    // Two independent branches ranked SEPARATELY (FTS by ts_rank_cd, substring by
-    // tier) then fused with RRF: score = Σ 1/(k + rank_branch). Deterministic
-    // ORDER BY rrf DESC, id so pagination never dupes/skips (A4, acceptance #8).
-    const rankedRows = await sql<{ id: string }>`
-      WITH candidates AS (
-        SELECT pages.id AS id,
-               ${this.ftsScoreExpr(parsed)} AS fts_score,
-               ${this.subTierExpr(parsed, titleOnly)} AS sub_tier
-        FROM pages
-        WHERE ${candidateSql}
-      ),
-      ranked AS (
-        SELECT id, fts_score, sub_tier,
-               row_number() OVER (ORDER BY fts_score DESC NULLS LAST, id) AS rn_fts,
-               row_number() OVER (ORDER BY sub_tier DESC NULLS LAST, id) AS rn_sub
-        FROM candidates
-      )
-      SELECT id
-      FROM ranked
-      ORDER BY
-        (CASE WHEN fts_score IS NOT NULL THEN 1.0/(${RRF_K} + rn_fts) ELSE 0 END)
-        + (CASE WHEN sub_tier IS NOT NULL THEN 1.0/(${RRF_K} + rn_sub) ELSE 0 END) DESC,
-        id ASC
-    `.execute(this.db);
+    // Lexical branches ranked SEPARATELY (FTS by ts_rank_cd, substring by tier);
+    // when a query vector is available a third VECTOR branch is fused over the
+    // UNION of lexical + vector candidates. RRF: score = Σ w/(k + rank_branch).
+    // Deterministic ORDER BY rrf DESC, id so pagination never dupes/skips (A4,
+    // acceptance #8). `total` is thus the union size (lexical ∪ vector top-N),
+    // post-permission-filter — a documented change from Phase A's exact lexical
+    // count (#530). On degrade the query is byte-identical to Phase A.
+    //
+    // The fused query is bounded by a per-statement timeout (see runRankedQuery):
+    // if the brute-force vector scan is cancelled (SQLSTATE 57014) we degrade to
+    // the byte-identical lexical path — search returns lexical results, never
+    // hangs, never 500s. Only the timeout is caught here; any OTHER SQL error
+    // propagates. The permission filter below stays outside, unchanged.
+    let orderedIds: string[];
+    try {
+      orderedIds = await this.runRankedQuery(
+        candidateSql,
+        parsed,
+        titleOnly,
+        vectorArm,
+      );
+    } catch (err) {
+      if (vectorArm && isStatementTimeout(err)) {
+        semanticAvailable = false;
+        semanticReason = 'degraded';
+        this.logger.warn(
+          `search.semantic.degraded reason=degraded workspace=${opts.workspaceId} (vector statement timeout)`,
+        );
+        // Re-run the exact Phase-A lexical path (no vector arm, no timeout).
+        orderedIds = await this.runRankedQuery(
+          candidateSql,
+          parsed,
+          titleOnly,
+          null,
+        );
+      } else {
+        throw err;
+      }
+    }
 
-    let orderedIds = rankedRows.rows.map((r) => r.id);
+    const semantic: SearchSemanticDto = {
+      state: semanticAvailable ? 'full' : 'off',
+      available: semanticAvailable,
+      ...(semanticReason ? { reason: semanticReason } : {}),
+    };
 
     // --- Permission filter (fail-closed, exact total). ------------------------
     // filterAccessiblePageIds runs the #348 hasRestricted pre-check internally:
@@ -355,14 +457,131 @@ export class SearchService {
     const hasMore = offset + pageIds.length < window.length;
 
     if (pageIds.length === 0) {
-      return { items: [], total, hasMore, truncatedAtCap, offset, query: queryMeta };
+      return {
+        items: [],
+        total,
+        hasMore,
+        truncatedAtCap,
+        offset,
+        query: queryMeta,
+        semantic,
+      };
     }
 
     // --- Detail fetch for the page slice only (ts_headline/snippet are costly, so
     //     compute them ONLY for the returned rows), preserving RRF order. -------
     const items = await this.fetchDetails(pageIds, parsed, titleOnly);
 
-    return { items, total, hasMore, truncatedAtCap, offset, query: queryMeta };
+    return {
+      items,
+      total,
+      hasMore,
+      truncatedAtCap,
+      offset,
+      query: queryMeta,
+      semantic,
+    };
+  }
+
+  /**
+   * Run the ranked-candidate-ids query and return the ids in RRF order (#530).
+   *
+   * When `vectorArm` is null (degrade / semantic off / no query vector) this runs
+   * the BYTE-IDENTICAL Phase-A 2-branch lexical query — the semantic layer must
+   * be a pure superset that never changes lexical behaviour on degrade.
+   *
+   * When a vector arm is supplied it is UNION ALL'd with the lexical arm into one
+   * `candidates` set; `agg` collapses each page to its best per-branch signal
+   * (MAX fts_score / MAX sub_tier / MIN vec_distance); `ranked` assigns a
+   * per-branch row_number; the final ORDER BY fuses the three legs with RRF,
+   * adding the vector leg ONLY for rows that have a vec_distance (a lexical-only
+   * hit contributes 0 to the vector leg, and vice-versa). W_VEC weights the
+   * vector leg.
+   */
+  private async runRankedQuery(
+    candidateSql: RawBuilder<unknown>,
+    parsed: ParsedQuery,
+    titleOnly: boolean,
+    vectorArm: RawBuilder<unknown> | null,
+  ): Promise<string[]> {
+    if (!vectorArm) {
+      // Phase-A lexical path — DO NOT change (byte-identical on degrade, #529).
+      const rankedRows = await sql<{ id: string }>`
+        WITH candidates AS (
+          SELECT pages.id AS id,
+                 ${this.ftsScoreExpr(parsed)} AS fts_score,
+                 ${this.subTierExpr(parsed, titleOnly)} AS sub_tier
+          FROM pages
+          WHERE ${candidateSql}
+        ),
+        ranked AS (
+          SELECT id, fts_score, sub_tier,
+                 row_number() OVER (ORDER BY fts_score DESC NULLS LAST, id) AS rn_fts,
+                 row_number() OVER (ORDER BY sub_tier DESC NULLS LAST, id) AS rn_sub
+          FROM candidates
+        )
+        SELECT id
+        FROM ranked
+        ORDER BY
+          (CASE WHEN fts_score IS NOT NULL THEN 1.0/(${RRF_K} + rn_fts) ELSE 0 END)
+          + (CASE WHEN sub_tier IS NOT NULL THEN 1.0/(${RRF_K} + rn_sub) ELSE 0 END) DESC,
+          id ASC
+      `.execute(this.db);
+      return rankedRows.rows.map((r) => r.id);
+    }
+
+    // #530 fused 3-branch RRF over lexical ∪ vector candidates. The lexical arm
+    // adds NULL::float vec_distance to stay UNION-compatible with the vector arm.
+    const wVec = getVectorWeight();
+
+    // Bound the brute-force vector scan with a per-statement timeout, scoped to
+    // THIS query only. `set_config(..., is_local := true)` = SET LOCAL semantics:
+    // it applies within this transaction and auto-resets at COMMIT/ROLLBACK, so
+    // it can NEVER leak onto the next query that reuses this pooled connection.
+    // On a cancellation the driver raises SQLSTATE 57014, which searchPage catches
+    // to degrade to lexical-only. Running inside a transaction also guarantees the
+    // SET and the ranked query share one connection.
+    const timeoutMs = getVectorStatementTimeoutMs();
+    return this.db.transaction().execute(async (trx) => {
+      await sql`SELECT set_config('statement_timeout', ${String(timeoutMs)}, true)`.execute(
+        trx,
+      );
+      const rankedRows = await sql<{ id: string }>`
+        WITH candidates AS (
+          (SELECT pages.id AS id,
+                  ${this.ftsScoreExpr(parsed)} AS fts_score,
+                  ${this.subTierExpr(parsed, titleOnly)} AS sub_tier,
+                  NULL::float AS vec_distance
+           FROM pages
+           WHERE ${candidateSql})
+          UNION ALL
+          (${vectorArm})
+        ),
+        agg AS (
+          SELECT id,
+                 MAX(fts_score) AS fts_score,
+                 MAX(sub_tier) AS sub_tier,
+                 MIN(vec_distance) AS vec_distance
+          FROM candidates
+          GROUP BY id
+        ),
+        ranked AS (
+          SELECT id, fts_score, sub_tier, vec_distance,
+                 row_number() OVER (ORDER BY fts_score DESC NULLS LAST, id) AS rn_fts,
+                 row_number() OVER (ORDER BY sub_tier DESC NULLS LAST, id) AS rn_sub,
+                 row_number() OVER (ORDER BY vec_distance ASC NULLS LAST, id) AS rn_vec
+          FROM agg
+        )
+        SELECT id
+        FROM ranked
+        ORDER BY
+          (CASE WHEN fts_score IS NOT NULL THEN 1.0/(${RRF_K} + rn_fts) ELSE 0 END)
+          + (CASE WHEN sub_tier IS NOT NULL THEN 1.0/(${RRF_K} + rn_sub) ELSE 0 END)
+          + (CASE WHEN vec_distance IS NOT NULL THEN ${wVec}::float/(${RRF_K} + rn_vec) ELSE 0 END) DESC,
+          id ASC
+      `.execute(trx);
+      return rankedRows.rows.map((r) => r.id);
+    });
   }
 
   // Resolve the search scope: explicit space, the authed user's member spaces, or
