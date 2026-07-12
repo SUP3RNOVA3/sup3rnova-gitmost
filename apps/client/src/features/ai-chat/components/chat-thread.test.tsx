@@ -1254,4 +1254,88 @@ describe("ChatThread — live reconnect + stalled", () => {
     });
     expect(onResumeFallback).toHaveBeenCalledWith(false); // POLL_IDLE_CAP -> idle -> disarm
   });
+
+  it("#541: getRun HANGS on a live disconnect — the timeout race still enters reconnect (no silent freeze in `streaming`)", async () => {
+    // MUTATION-VERIFY: revert the race to a bare `getRun(cid).then/.catch` and this
+    // reddens — a HUNG (never-settling, NOT rejected) getRun leaves the FSM stuck in
+    // `streaming` with no reconnect banner and no poll (the axios client sets no
+    // request timeout, and the stalled-idle cap only arms AFTER reconnecting/polling).
+    renderLive();
+    h.state.getRun.mockReset();
+    h.state.getRun.mockReturnValue(new Promise(() => {})); // getRun HANGS forever
+    await disconnect(); // live partial = liveMsg (id "a2")
+    expect(h.state.getRun).toHaveBeenCalledWith("c1");
+    // BEFORE the bound fires the FSM is still in the live turn — the very freeze bug.
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    // The recovery-start bound fires -> the SAME fallback as the reject path.
+    act(() => {
+      vi.advanceTimersByTime(4_000);
+    });
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    // The live partial (a2) was DROPPED from the store (replay-from-start, no stale
+    // tail-apply base). Mirrors the getRun-REJECT test's inspection.
+    const removedLivePartial = (
+      h.state.setMessages as unknown as {
+        mock: { calls: [unknown][] };
+      }
+    ).mock.calls.some(([updater]) => {
+      if (typeof updater !== "function") return false;
+      const out = (updater as (p: { id: string }[]) => { id: string }[])([
+        { id: "a2" },
+        { id: "u1" },
+      ]);
+      return !out.some((m) => m.id === "a2");
+    });
+    expect(removedLivePartial).toBe(true);
+    // ...and the anchor was NULLED -> replay-from-start (no ?anchor=&n= over the partial).
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
+  });
+
+  it("#541: a getRun resolve AFTER the timeout already fired is IGNORED (no double reconnect, no stale re-seed)", async () => {
+    // The timeout wins first and enters the ladder via replay-from-start. When the
+    // hung getRun FINALLY answers, its late `.then` must be a full no-op: it must not
+    // re-seed the store from the (now stale) persisted row, must not re-set the
+    // anchor, and must not re-enter reconnect. The local `settled` flag makes the
+    // resolve/reject/timeout branches mutually exclusive.
+    // MUTATION-VERIFY: drop the `settled` guard (let the late `.then` run) and the
+    // late re-seed re-sets the anchor (URL regains ?anchor=a2&n=3) + calls setMessages.
+    renderLive();
+    let resolveGetRun!: (v: unknown) => void;
+    h.state.getRun.mockReset();
+    h.state.getRun.mockReturnValue(
+      new Promise((r) => {
+        resolveGetRun = r;
+      }),
+    );
+    await disconnect();
+    act(() => {
+      vi.advanceTimersByTime(4_000); // bound fires -> replay-from-start, reconnecting
+    });
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    advanceToAttempt(1);
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+    // Anchor is null -> replay-from-start URL (the pre-condition the late resolve must
+    // not undo).
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
+    const setMessagesCallsBefore = h.state.setMessages.mock.calls.length;
+    // NOW the hung getRun finally resolves with a persisted anchor (id a2, steps 3).
+    await act(async () => {
+      resolveGetRun(persistedAnchor());
+      await Promise.resolve();
+    });
+    // The late resolve did NOT re-seed the store...
+    expect(h.state.setMessages.mock.calls.length).toBe(setMessagesCallsBefore);
+    // ...did NOT re-set the anchor (URL stays replay-from-start, no ?anchor=&n=)...
+    expect(h.state.transport!.prepareReconnectToStreamRequest!().api).toBe(
+      "/api/ai-chat/runs/c1/stream",
+    );
+    // ...and did NOT trigger a fresh reconnect attach.
+    expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+  });
 });
