@@ -243,6 +243,83 @@ describe('share published_mode (approved) [integration]', () => {
 
   // --- resolveReadableSharePage content freeze -----------------------------
 
+  // --- atomicity regression lock (F1) --------------------------------------
+  // The share-write and the approved baseline mint MUST commit in ONE
+  // transaction. If a future change moves the mint off `trx` back onto
+  // `this.db`, an "approved" share could durably persist WITHOUT a baseline —
+  // the fail-open confidentiality hole the fix closed. These two tests fail the
+  // moment that atomicity is broken: with the mint outside the trx, the failed
+  // mint would no longer roll back the share row (test 1) / the mode UPDATE
+  // (test 2), so the post-condition assertions below would flip.
+
+  it('createShare(approved) rolls back the shares insert when the baseline mint throws', async () => {
+    const pageId = await newPage('mint-fail create body');
+    const page = { id: pageId, spaceId } as any;
+
+    // No manual baseline yet -> ensureApprovedBaseline will attempt a real mint.
+    expect(await manualRows(pageId)).toHaveLength(0);
+
+    // saveHistory is the WRITE the baseline mint performs; force it to throw so
+    // the transaction body rejects after the shares row was inserted.
+    const spy = jest
+      .spyOn(pageHistoryRepo, 'saveHistory')
+      .mockRejectedValueOnce(new Error('boom'));
+
+    try {
+      await expect(
+        service.createShare({
+          authUserId: USER,
+          workspaceId: wsId,
+          page,
+          createShareDto: {
+            pageId,
+            includeSubPages: false,
+            publishedMode: 'approved',
+          } as any,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      // The whole transaction rolled back: NO shares row survived the failed
+      // mint. If the mint ran outside the trx, this row would persist.
+      const share = await shareRepo.findByPageId(pageId);
+      expect(share).toBeFalsy();
+      // And no orphan baseline was committed either.
+      expect(await manualRows(pageId)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('updateShare(->approved) rolls back the mode UPDATE when the baseline mint throws', async () => {
+    const pageId = await newPage('mint-fail update body');
+    // Existing LIVE share with no manual baseline.
+    const shareId = await insertShare({ pageId, publishedMode: 'live' });
+    expect(await manualRows(pageId)).toHaveLength(0);
+
+    const spy = jest
+      .spyOn(pageHistoryRepo, 'saveHistory')
+      .mockRejectedValueOnce(new Error('boom'));
+
+    try {
+      await expect(
+        service.updateShare(shareId, {
+          shareId,
+          publishedMode: 'approved',
+        } as any),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      // The UPDATE rolled back with the failed mint: the row is STILL 'live'.
+      // If the mint ran outside the trx, publishedMode would be 'approved'.
+      const after = await shareRepo.findById(shareId);
+      expect(after).toBeDefined();
+      expect(after!.publishedMode).toBe('live');
+      // No orphan baseline committed.
+      expect(await manualRows(pageId)).toHaveLength(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('resolveReadableSharePage under approved swaps content+title but PRESERVES id + workspaceId', async () => {
     const pageId = await newPage('LIVE draft body');
     const shareId = await insertShare({ pageId, publishedMode: 'approved' });
