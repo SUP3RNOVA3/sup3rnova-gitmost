@@ -39,6 +39,7 @@ function buildService(over: {
     {} as any, // tokenService
     {} as any, // transclusionService
     {} as any, // workspaceRepo
+    {} as any, // pageHistoryRepo
   );
 
   jest

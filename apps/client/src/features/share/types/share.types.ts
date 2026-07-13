@@ -1,11 +1,20 @@
 import { IPage } from "@/features/page/types/page.types.ts";
 
+// #370 Stage B — share publication mode union + default. Mirrors the server-side
+// PublishedMode in apps/server/src/core/share/published-mode.constants.ts (the
+// client cannot import server code); keep the two in sync.
+export type PublishedMode = "live" | "approved";
+export const DEFAULT_PUBLISHED_MODE: PublishedMode = "live";
+
 export interface IShare {
   id: string;
   key: string;
   pageId: string;
   includeSubPages: boolean;
   searchIndexing: boolean;
+  // #370 Stage B — 'live' serves the current draft; 'approved' serves the last
+  // manually-saved version. Mutually exclusive with includeSubPages.
+  publishedMode: PublishedMode;
   creatorId: string;
   spaceId: string;
   workspaceId: string;
@@ -75,6 +84,7 @@ export interface ICreateShare {
   pageId?: string;
   includeSubPages?: boolean;
   searchIndexing?: boolean;
+  publishedMode?: PublishedMode;
 }
 
 export type IUpdateShare = ICreateShare & { shareId: string; pageId?: string };
