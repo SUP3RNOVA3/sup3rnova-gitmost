@@ -55,7 +55,11 @@ describe('PageHistoryRepo.findPageHistoryByPageId — agent avatar stack enrichm
       agentRole: { name: 'Editor', emoji: '✏️' },
     });
 
-    expect(item.agent).toEqual({ name: 'Editor', emoji: '✏️', avatarUrl: null });
+    expect(item.agent).toEqual({
+      name: 'Editor',
+      emoji: '✏️',
+      avatarUrl: null,
+    });
     expect(item.launcher).toEqual({ name: 'Alice', avatarUrl: 'a.png' });
     // The internal join column must never leak to the client.
     expect(item).not.toHaveProperty('agentRole');
@@ -88,6 +92,54 @@ describe('PageHistoryRepo.findPageHistoryByPageId — agent avatar stack enrichm
     expect(item.agent).toEqual({ name: 'MCP Bot', avatarUrl: 'bot.png' });
     expect(item.launcher).toBeNull();
     expect(item).not.toHaveProperty('agentRole');
+  });
+
+  // #559 — external-MCP (api_key) provenance, FORM 3. The row carries
+  // lastUpdatedSource='agent', lastUpdatedAiChatId null, a non-null
+  // lastUpdatedApiKeyId, and the key-name join object (`apiKey`).
+  // attachPageHistoryAgent must thread api_key_id + apiKeyName into
+  // resolveAgentProvenance so the persona is the NAMED key, launcher null, and
+  // the join-only `apiKey` object is stripped.
+  //
+  // NON-VACUITY: if the read-side threading is reverted (attachPageHistoryAgent
+  // no longer passes api_key_id / apiKeyName, or the resolver's external-MCP
+  // branch is removed) this row falls into the degenerate external form and
+  // `agent` becomes lastUpdatedBy ('MCP Bot') instead of the key name.
+  it('external MCP with api_key name (form 3): agent = key name, launcher = null, apiKey stripped', async () => {
+    const item = await firstItem({
+      id: 'ph-5',
+      lastUpdatedSource: 'agent',
+      lastUpdatedAiChatId: null,
+      lastUpdatedApiKeyId: 'key-1',
+      apiKey: { name: 'agent-node-2' },
+      lastUpdatedBy: { name: 'MCP Bot', avatarUrl: 'bot.png' },
+      agentRole: null,
+    });
+
+    expect(item.agent).toEqual({ name: 'agent-node-2', avatarUrl: null });
+    expect(item.launcher).toBeNull();
+    // The join-only key-name object must never leak to the client (the raw
+    // lastUpdatedApiKeyId column stays, like lastUpdatedAiChatId).
+    expect(item).not.toHaveProperty('apiKey');
+  });
+
+  // #559 — external-MCP FALLBACK: a non-null lastUpdatedApiKeyId but a null
+  // `apiKey` join (the key was hard-deleted, or carries no name). The persona
+  // falls back to the EXTERNAL_MCP_FALLBACK_NAME ('External MCP').
+  it('external MCP with a hard-deleted/absent key: agent = "External MCP" fallback', async () => {
+    const item = await firstItem({
+      id: 'ph-6',
+      lastUpdatedSource: 'agent',
+      lastUpdatedAiChatId: null,
+      lastUpdatedApiKeyId: 'key-1',
+      apiKey: null,
+      lastUpdatedBy: { name: 'MCP Bot', avatarUrl: 'bot.png' },
+      agentRole: null,
+    });
+
+    expect(item.agent).toEqual({ name: 'External MCP', avatarUrl: null });
+    expect(item.launcher).toBeNull();
+    expect(item).not.toHaveProperty('apiKey');
   });
 
   it('non-agent (lastUpdatedSource !== "agent"): neither agent nor launcher, agentRole stripped', async () => {
