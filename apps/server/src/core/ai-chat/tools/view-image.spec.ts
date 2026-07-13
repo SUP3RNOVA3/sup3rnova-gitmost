@@ -154,6 +154,26 @@ describe('runViewImage (#588 classification + cache + note)', () => {
     expect(cache.has('new')).toBe(false);
   });
 
+  it('F1: refuses on the BYTE budget even when the count is under the cap', async () => {
+    // Few (< count cap) but LARGE entries: 3 x 9 MiB base64 = 27 MiB > the byte
+    // budget, while count 3 < VIEW_MAX_LIVE_IMAGES. This locks the byte arm
+    // specifically — with the byte check removed, count 3 would NOT refuse.
+    const big = 'A'.repeat(9 * 1024 * 1024);
+    const cache: ViewImageCache = new Map();
+    for (let i = 0; i < 3; i++) {
+      cache.set('big-' + i, { data: big, mediaType: 'image/png' });
+    }
+    expect(cache.size).toBeLessThan(VIEW_MAX_LIVE_IMAGES); // count arm inactive
+    const client = makeClient({
+      node: imageNode(),
+      bytes: { buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png' },
+    });
+    await expect(
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'new', cache),
+    ).rejects.toThrow(/too many images/i);
+    expect(cache.has('new')).toBe(false);
+  });
+
   it('SVG: rasterized to PNG via the #586 rasterizer; mediaType=image/png, width/height propagated, PNG cached', async () => {
     const svgBytes = Buffer.from('<svg/>', 'utf8');
     const png = Buffer.from([1, 2, 3, 4]);
