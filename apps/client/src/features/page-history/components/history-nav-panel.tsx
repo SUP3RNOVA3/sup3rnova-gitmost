@@ -30,6 +30,7 @@ interface Props {
   hasNextPage: boolean;
   isFetchingNextPage: boolean;
   isError: boolean;
+  isLoading: boolean;
   counts: Map<string, number>;
   selectedDayISO: string | null;
   tz: string;
@@ -53,6 +54,7 @@ export default function HistoryNavPanel({
   hasNextPage,
   isFetchingNextPage,
   isError,
+  isLoading,
   counts,
   selectedDayISO,
   tz,
@@ -159,14 +161,16 @@ export default function HistoryNavPanel({
 
       <ScrollArea style={{ flex: 1 }} viewportRef={viewportRef} scrollbarSize={5}>
         {/* F1 — explicit error/empty states instead of a blank panel. The
-            heatmap fails open independently; the list keeps its own states. */}
+            heatmap fails open independently; the list keeps its own states.
+            The empty state is gated on !isLoading so it doesn't flash the
+            "no history" text during the initial query, mirroring the right pane. */}
         {isError ? (
           <Center py="md" px="sm">
             <Text size="sm" c="dimmed" ta="center">
               {t("Error loading page history.")}
             </Text>
           </Center>
-        ) : groups.length === 0 ? (
+        ) : !isLoading && groups.length === 0 ? (
           <Center py="md" px="sm">
             <Text size="sm" c="dimmed" ta="center">
               {onlyVersions

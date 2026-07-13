@@ -214,6 +214,7 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
           hasNextPage={!!hasNextPage}
           isFetchingNextPage={isFetchingNextPage}
           isError={isError}
+          isLoading={isLoading}
           counts={counts}
           selectedDayISO={selectedRow?.dayISO ?? null}
           tz={tz}

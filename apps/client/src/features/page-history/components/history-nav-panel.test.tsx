@@ -49,6 +49,7 @@ function Harness({
         hasNextPage={false}
         isFetchingNextPage={false}
         isError={false}
+        isLoading={false}
         counts={counts}
         selectedDayISO={todayISO}
         tz={TZ}
@@ -109,6 +110,7 @@ describe("HistoryNavPanel (#568 left nav)", () => {
           hasNextPage={false}
           isFetchingNextPage={false}
           isError
+          isLoading={false}
           counts={new Map()}
           selectedDayISO={null}
           tz={TZ}
@@ -132,6 +134,7 @@ describe("HistoryNavPanel (#568 left nav)", () => {
           hasNextPage={false}
           isFetchingNextPage={false}
           isError={false}
+          isLoading={false}
           counts={new Map()}
           selectedDayISO={null}
           tz={TZ}
@@ -141,5 +144,31 @@ describe("HistoryNavPanel (#568 left nav)", () => {
       </MantineProvider>,
     );
     expect(screen.getByText("No page history saved yet.")).toBeDefined();
+  });
+
+  it("does NOT flash the empty text while the initial query is loading", () => {
+    // F1-residual: during the first fetch data is empty but isLoading is true —
+    // the empty state must stay hidden until loading settles (mirrors the right
+    // pane). Reverting the `!isLoading` gate makes this fail.
+    render(
+      <MantineProvider>
+        <HistoryNavPanel
+          fullItems={[]}
+          activeId=""
+          onSelect={vi.fn()}
+          fetchNextPage={vi.fn() as any}
+          hasNextPage={false}
+          isFetchingNextPage={false}
+          isError={false}
+          isLoading={true}
+          counts={new Map()}
+          selectedDayISO={null}
+          tz={TZ}
+          onlyVersions={false}
+          setOnlyVersions={vi.fn()}
+        />
+      </MantineProvider>,
+    );
+    expect(screen.queryByText("No page history saved yet.")).toBeNull();
   });
 });
