@@ -227,7 +227,20 @@ export function DrawioMenu({ editor }: EditorMenuProps) {
       reader.readAsDataURL(blob);
       reader.onloadend = () => {
         const base64data = (reader.result || "") as string;
-        setInitialXML(base64data);
+        // draw.io atob-decodes a base64 data: URL as Latin-1, mojibaking every
+        // multibyte UTF-8 char (e.g. Cyrillic) inside the SVG content= payload.
+        // Hand the editor a proper UTF-8-decoded SVG string instead. This only
+        // decodes the OUTER data-URL base64 (the SVG wrapper); a legacy inner
+        // base64 content= is left verbatim, so old diagrams still open (#584).
+        // onloadend runs after this function's try/catch has returned, so guard
+        // the decode here: a non-SVG/empty blob (e.g. a 404 body) would make
+        // decodeBase64ToSvgString throw uncaught — fall back to the raw payload.
+        try {
+          setInitialXML(decodeBase64ToSvgString(base64data));
+        } catch (err) {
+          console.error(err);
+          setInitialXML(base64data);
+        }
       };
     } catch (err) {
       console.error(err);
