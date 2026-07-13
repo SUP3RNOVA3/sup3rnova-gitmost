@@ -430,6 +430,21 @@ export abstract class DocmostClientContext {
   getPageJson(_pageId: string): Promise<any> {
     throw new Error("getPageJson not wired (missing ReadMixin)");
   }
+  // Called by MediaMixin.uploadFile (#608) to insert the just-uploaded node.
+  // Real implementation lives in NodesWriteMixin and shadows this on the
+  // prototype chain; the stub keeps the base type-checkable in isolation.
+  // Signature mirrors INodesWriteMixin.insertNode 1:1 (nodes-write.ts).
+  insertNode(
+    _pageId: string,
+    _input: { markdown?: string; node?: any },
+    _opts: {
+      position: "before" | "after" | "append";
+      anchorNodeId?: string;
+      anchorText?: string;
+    },
+  ): Promise<any> {
+    throw new Error("insertNode not wired (missing NodesWriteMixin)");
+  }
   listComments(_pageId: string, _includeResolved?: boolean): Promise<any> {
     throw new Error("listComments not wired (missing CommentsMixin)");
   }

@@ -256,6 +256,11 @@ export const INLINE_MCP_INVENTORY: ToolInventoryLine[] = [
     name: "deleteComment",
     purpose: "delete a comment (creator or space admin only).",
   },
+  {
+    name: "uploadFile",
+    purpose:
+      "upload a file from base64 bytes (any type) as a page attachment and get a ready-to-insert node; optionally insert it in the same call.",
+  },
 ];
 
 /**

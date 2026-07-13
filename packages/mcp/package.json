@@ -61,6 +61,7 @@
     "form-data": "^4.0.0",
     "jsdom": "^27.4.0",
     "marked": "^17.0.1",
+    "mime-types": "^3.0.2",
     "pako": "^2.0.3",
     "re2": "^1.21.0",
     "ws": "^8.19.0",
@@ -70,6 +71,7 @@
   },
   "devDependencies": {
     "@types/form-data": "^2.5.0",
+    "@types/mime-types": "^3.0.1",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
   }

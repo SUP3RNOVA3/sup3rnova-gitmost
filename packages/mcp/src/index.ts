@@ -591,5 +591,103 @@ server.registerTool(
   },
 );
 
+// Tool: uploadFile (issue #608)
+// INLINE, MCP-ONLY (deliberately NOT shared): the byte-fed upload path is
+// meaningless to the in-app AI chat — that host has no local files to base64,
+// and streaming megabytes of base64 through tool arguments would be actively
+// harmful. So it is registered only on this external MCP surface, never in the
+// shared registry the in-app agent draws from.
+server.registerTool(
+  "uploadFile",
+  {
+    description:
+      "Upload a file from base64 BYTES (any type) as a page attachment and get " +
+      "back a ready-to-insert node. Unlike insertImage/replaceImage (which take " +
+      "an http(s) URL the SERVER fetches), you ship the bytes here — no public " +
+      "URL needed, and non-image types work. `content` is base64 (a " +
+      "`data:<mime>;base64,...` URI is also accepted). The served Content-Type " +
+      "is derived from the file-name EXTENSION, so give `fileName` a correct " +
+      "extension (or set `mime` and it will be appended). Image types become an " +
+      "inline image node; everything else becomes an attachment (download) card. " +
+      "With `insert:false` (default) nothing is placed — you get `node` to insert " +
+      "yourself later. With `insert:true` the node is placed (position " +
+      "append/before/after; before/after need exactly one of anchorText / " +
+      "anchorNodeId). IMPORTANT: on insert ALWAYS check `inserted` in the result: " +
+      "if it is false, the upload SUCCEEDED but placement failed — see " +
+      "`insertError` and insert the returned `node` yourself via insertNode.",
+    inputSchema: {
+      pageId: z.string().min(1).describe("Page id (UUID or slugId) to attach to"),
+      content: z
+        .string()
+        .min(1)
+        .describe(
+          "File bytes as base64 (a data:<mime>;base64,<...> URI is also accepted)",
+        ),
+      fileName: z
+        .string()
+        .min(1)
+        .describe(
+          "File name incl. extension — the extension drives the served Content-Type",
+        ),
+      mime: z
+        .string()
+        .optional()
+        .describe(
+          "Optional desired MIME; its canonical extension is appended to fileName if missing",
+        ),
+      insert: z
+        .boolean()
+        .optional()
+        .describe("Insert the node into the page in the same call (default false)"),
+      as: z
+        .enum(["image", "file"])
+        .optional()
+        .describe("Force the node kind (default: auto — image mimes -> image node)"),
+      align: z
+        .enum(["left", "center", "right"])
+        .optional()
+        .describe("Image alignment (image node only)"),
+      alt: z.string().optional().describe("Image alt text (image node only)"),
+      position: z
+        .enum(["before", "after", "append"])
+        .optional()
+        .describe("Where to insert when insert=true (default append)"),
+      anchorText: z
+        .string()
+        .optional()
+        .describe("For before/after: the anchor block's literal plain text"),
+      anchorNodeId: z
+        .string()
+        .optional()
+        .describe("For before/after: the anchor block's attrs.id"),
+    },
+  },
+  async ({
+    pageId,
+    content,
+    fileName,
+    mime,
+    insert,
+    as,
+    align,
+    alt,
+    position,
+    anchorText,
+    anchorNodeId,
+  }) => {
+    const result = await docmostClient.uploadFile(pageId, content, fileName, {
+      mime,
+      insert,
+      as,
+      align,
+      alt,
+      position,
+      anchorText,
+      anchorNodeId,
+    });
+    return jsonContent(result);
+  },
+);
+
   return server;
 }
