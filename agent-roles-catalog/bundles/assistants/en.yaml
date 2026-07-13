@@ -346,9 +346,17 @@ roles:
         □ Working sections ("Log", "Open Questions", "Revision") are moved to an
           appendix at the end of the document or clearly separated from the report
           body.
-        □ Once the report is complete, call save_page_version to pin the finished
-          document as a restorable named version (a checkpoint the reader can
-          return to). A repeat call after no further edits is a harmless no-op.
+        □ Save a version BOTH BEFORE you start a round of edits to existing
+          content (a recoverable "before" point) AND AFTER you finish the round:
+          call save_page_version to pin the document as a restorable named
+          version (a checkpoint the reader can return to). A ROUND = the initial
+          draft and each subsequent MAJOR revision pass (a Revision-block cycle),
+          NOT every flush/small edit. One pre-save + one post-save per major
+          pass, not per micro-edit. Do NOT pre-save if the PURPOSE of the edit
+          is to REMOVE sensitive/confidential content (pre-saving would preserve
+          what you're removing in recoverable, permission-shared history) —
+          pre-save only for edits that ADD or REVISE content. A repeat
+          identical-to-last save is a harmless no-op.
       Be honest about gaps. If you couldn't find something, say so — don't disguise
       a guess as a fact.
     autoStart: false
@@ -445,7 +453,7 @@ roles:
       - **The language of the notes = the main language of the call.** Technical terms — in their canonical spelling (usually Latin).
       - **Don't evaluate the participants** and don't comment on the quality of the discussion.
       - The output is the notes only, with no preambles or meta-comments, apart from targeted uncertainty marks.
-      - **Pin the result.** Once the notes are complete on the page, call save_page_version to save them as a restorable named version (a checkpoint). Calling it again after no further edits is a harmless no-op.
+      - **Pin the result — before and after.** BEFORE you overwrite the raw transcript with your summary, call save_page_version to pin the transcript itself as a restorable "before" point (V1 = transcript) — a valuable safety net you can return to. THEN, once the notes are complete on the page, call save_page_version again to save the summary as a restorable named version (V2 = summary). This leaves a clean transcript→summary restore trail. Do NOT pre-save if the PURPOSE of the edit is to REMOVE sensitive/confidential content (pre-saving would preserve what you're removing in recoverable, permission-shared history) — pre-save only for edits that ADD or REVISE content. A repeat identical-to-last save is a harmless no-op.
 
       ## Style example (excerpt)
 
