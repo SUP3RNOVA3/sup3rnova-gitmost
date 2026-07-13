@@ -34,6 +34,17 @@ export const METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL =
 export const METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL =
   'mcp_getpage_cache_misses_total';
 
+// #558 — api-key auth denial observability. Every DEFINITE deny in
+// ApiKeyService.validate (shared by REST jwt.strategy and the /mcp Bearer path)
+// increments this counter, labelled by the BOUNDED deny reason. It replaces the
+// visibility the deleted /mcp Basic brute-force limiter used to give: a
+// revoked/dead key hammering /mcp is otherwise totally silent (validate throws a
+// bare 401 with no log/metric). The `reason` label is a fixed, low-cardinality
+// set (see ApiKeyDenyReason); the apiKeyId is NEVER a label (it goes only into
+// the rate-limited WARN, after the JWT signature is verified). Same "do not
+// rename" contract as the other families.
+export const METRIC_API_KEY_AUTH_DENIED_TOTAL = 'api_key_auth_denied_total';
+
 // Histogram buckets (seconds). Chosen to give useful p50/p95/p99 resolution
 // for typical web/DB latencies without exploding series cardinality.
 export const HTTP_BUCKETS = [

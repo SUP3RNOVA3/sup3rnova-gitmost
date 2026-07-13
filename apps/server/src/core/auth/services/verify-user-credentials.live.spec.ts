@@ -16,11 +16,8 @@ import { hashPassword } from '../../../common/helpers';
  *
  * The load-bearing property: verifyUserCredentials (and login(), which reuses it)
  * throws EXACTLY the shared CREDENTIALS_MISMATCH_MESSAGE for all three
- * credentials-failure cases — unknown email, disabled user, wrong password. The
- * /mcp Basic brute-force limiter only counts a failure when it recognises THIS
- * exact message (isCredentialsFailure in mcp-auth.helpers matches the same shared
- * constant); a reword that diverged here would silently turn /mcp Basic into an
- * unthrottled password-guessing oracle.
+ * credentials-failure cases — unknown email, disabled user, wrong password — so
+ * the surfaced 401 is uniform (anti-enumeration) across every case.
  */
 
 // bcrypt cost-12 hashing/compare takes ~300ms idle but multiple seconds when
@@ -233,9 +230,9 @@ describe('AuthService.login (live credentials-mismatch contract via verifyUserCr
     expect(sessionService.createSessionAndToken).toHaveBeenCalledWith(user);
   });
 
-  it('the message login throws is the SAME shared constant the /mcp limiter matches', () => {
-    // Cross-file coupling lock: the constant is the single source of truth shared
-    // by AuthService and mcp-auth.helpers.isCredentialsFailure.
+  it('login throws EXACTLY the shared credentials-mismatch constant', () => {
+    // The constant is the single source of truth for the uniform 401 message, so
+    // a reword cannot diverge the surfaced error across the credentials cases.
     expect(CREDENTIALS_MISMATCH_MESSAGE).toBe('Email or password does not match');
   });
 });

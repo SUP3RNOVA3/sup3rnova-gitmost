@@ -156,12 +156,12 @@ function __assertClientCallContract(client: DocmostClientLike): void {
  * Each tool call goes loopback over the user's own access JWT, so Docmost CASL
  * enforces access on every request — there is NO extra authorization here
  * (§8.5). The client is built fresh per chat request and never shares the
- * cached service-account `/mcp` handler.
+ * cached embedded `/mcp` handler.
  *
  * SINGLE-WORKSPACE ASSUMPTION: the loopback host (127.0.0.1) does not resolve a
  * workspace subdomain, so this targets the default/first workspace only. The
- * existing service-account `/mcp` path already calls loopback successfully, so
- * this works for single-workspace self-host.
+ * embedded `/mcp` loopback path already calls loopback successfully, so this
+ * works for single-workspace self-host.
  */
 /**
  * #487: wall-clock cap for a SINGLE in-app tool call, env-tunable via
