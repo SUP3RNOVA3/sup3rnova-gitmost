@@ -138,6 +138,22 @@ describe('rasterizeSvgToPng', () => {
     expect(width).toBeLessThan(4000);
   }, 30000);
 
+  it('clamps a per-call maxLongestSidePx that exceeds the hard ceiling (F1)', async () => {
+    const big = [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="1000">',
+      '<rect width="100%" height="100%" fill="#ffffff"/>',
+      '<rect x="100" y="100" width="500" height="500" fill="#3366cc"/>',
+      '</svg>',
+    ].join('');
+    // A caller asking for a huge longest side must NOT bypass the memory cap:
+    // the override may only lower RASTER_MAX_LONGEST_SIDE_PX, never raise it.
+    const { width, height } = await rasterizeSvgToPng(big, {
+      maxLongestSidePx: 1_000_000,
+    });
+    expect(width).toBeLessThanOrEqual(RASTER_MAX_LONGEST_SIDE_PX);
+    expect(height).toBeLessThanOrEqual(RASTER_MAX_LONGEST_SIDE_PX);
+  }, 30000);
+
   it('rejects a malformed SVG', async () => {
     await expect(rasterizeSvgToPng('this is not an svg <<<')).rejects.toThrow();
   }, 30000);

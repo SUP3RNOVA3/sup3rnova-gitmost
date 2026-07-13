@@ -52,10 +52,13 @@ export const RASTER_DEFAULT_BACKGROUND = '#ffffff';
  * `fc-scan --format '%{family}\n' DejaVuSans.ttf` => "DejaVu Sans").
  *
  * resvg maps an unknown SVG family (e.g. `font-family="Helvetica, Arial,
- * sans-serif"`, as emitted by drawio) onto `defaultFontFamily` / the matching
- * generic family. If this string does not exactly match the loaded font's
- * family, every label renders empty. Do not change it without re-verifying the
- * vendored .ttf.
+ * sans-serif"`, as emitted by drawio) onto `defaultFontFamily`. With a SINGLE
+ * embedded font, resvg falls back to that one font for ANY family, so an exact
+ * match here is not strictly required for text to render (verified by mutation:
+ * setting this to a bogus name still renders ink). The actual hard requirement
+ * is a NON-EMPTY fontBuffers — an empty buffer renders every label blank (that
+ * is what the ink-gate test locks). Keep this accurate to the vendored font for
+ * clarity and so behaviour stays predictable if more fonts are ever added.
  */
 export const RASTER_DEFAULT_FONT_FAMILY = 'DejaVu Sans';
 

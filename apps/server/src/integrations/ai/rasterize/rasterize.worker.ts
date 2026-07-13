@@ -90,10 +90,15 @@ function render(
   svg: string,
   opts?: RasterJobOptions,
 ): { png: Buffer; width: number; height: number } {
-  const maxSide =
+  const requested =
     opts?.maxLongestSidePx && opts.maxLongestSidePx > 0
       ? opts.maxLongestSidePx
       : RASTER_MAX_LONGEST_SIDE_PX;
+  // RASTER_MAX_LONGEST_SIDE_PX is a HARD ceiling: it bounds the rendered pixmap
+  // allocation, so the per-call override may only LOWER it, never raise it. A
+  // caller passing a huge maxLongestSidePx must not be able to request an
+  // unbounded raster and OOM the worker (F1) — the const is the security cap.
+  const maxSide = Math.min(requested, RASTER_MAX_LONGEST_SIDE_PX);
   const background = opts?.background ?? RASTER_DEFAULT_BACKGROUND;
   const font_ = fontOptions(font);
 
