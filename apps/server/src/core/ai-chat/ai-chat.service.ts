@@ -16,6 +16,7 @@ import {
   type UIMessage,
   type ModelMessage,
   type LanguageModel,
+  type PrepareStepResult,
 } from 'ai';
 import { AiService } from '../../integrations/ai/ai.service';
 import { AiSettingsService } from '../../integrations/ai/ai-settings.service';
@@ -33,7 +34,11 @@ import {
   AiChatMessage,
   AiAgentRole,
 } from '@docmost/db/types/entity.types';
-import { AiChatToolsService } from './tools/ai-chat-tools.service';
+import {
+  AiChatToolsService,
+  type ViewImageCache,
+  type ViewImageCacheEntry,
+} from './tools/ai-chat-tools.service';
 import { McpClientsService } from './external-mcp/mcp-clients.service';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { AiChatStreamRegistryService } from './ai-chat-stream-registry.service';
@@ -252,6 +257,107 @@ export {
   STEP_LIMIT_NO_ANSWER_MARKER,
   OUTPUT_DEGENERATION_ERROR,
 };
+
+// #588: the fixed instruction that accompanies an injected viewImage image so the
+// model knows the following image part is the one it just requested.
+const VIEW_IMAGE_INJECT_TEXT =
+  'Below is the image from your viewImage call. Assess it.';
+
+/**
+ * Build the ephemeral user-role message that carries a viewImage image to the
+ * model (#588). v6 image-part shape is `{ type:'image', image:<base64>,
+ * mediaType }` (the field is `mediaType`, NOT `mimeType`). Returned as a plain
+ * ModelMessage; it is injected via prepareStep's `messages` override for the
+ * CURRENT step only and is NEVER persisted (buildStepParts reads step.toolResults,
+ * not `messages`), so it stays ephemeral. Exported for unit testing.
+ */
+export function userImageMessage(img: ViewImageCacheEntry): ModelMessage {
+  return {
+    role: 'user',
+    content: [
+      { type: 'text', text: VIEW_IMAGE_INJECT_TEXT },
+      { type: 'image', image: img.data, mediaType: img.mediaType },
+    ],
+  };
+}
+
+/**
+ * #588: has the model produced assistant TEXT on a step that comes AFTER the step
+ * containing `toolCallId`? Deterministic function of the finished-steps array the
+ * SDK hands prepareStep (`opts.steps`). Used to decide when to EVICT a viewImage
+ * cache entry: once the model has "spoken about" the image (any later step with
+ * non-empty assistant text), the image no longer needs re-injecting on every
+ * subsequent step, so we stop re-billing it.
+ *
+ * Locate the step whose toolCalls/content references the id, then scan strictly
+ * LATER steps for non-empty `text`. Returns false when the call is not yet among
+ * the finished steps (it was just issued on the step being prepared), so the image
+ * keeps getting injected until a genuine text step follows. Pure.
+ */
+export function modelSpokeAboutItAfter(
+  toolCallId: string,
+  steps: ReadonlyArray<StepLike> | undefined,
+): boolean {
+  if (!steps || steps.length === 0) return false;
+  let callIdx = -1;
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    const inCalls = (s.toolCalls ?? []).some(
+      (c) => c.toolCallId === toolCallId,
+    );
+    const inContent = (s.content ?? []).some(
+      (p) =>
+        (p.type === 'tool-call' || p.type === 'tool-result') &&
+        p.toolCallId === toolCallId,
+    );
+    if (inCalls || inContent) {
+      callIdx = i;
+      break;
+    }
+  }
+  if (callIdx === -1) return false;
+  for (let i = callIdx + 1; i < steps.length; i++) {
+    if ((steps[i].text ?? '').trim().length > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * #588: given the current prepareStep options and the live viewImage cache, build
+ * the per-step `messages` override that injects every still-live cached image as
+ * an ephemeral trailing user message, and EVICT any entry the model has already
+ * spoken about (see modelSpokeAboutItAfter). Returns the merged step result:
+ * `base` (prepareAgentStep's disjoint {activeTools|toolChoice|system} keys) with
+ * `messages` appended — the merge preserves base's keys so a toolChoice:'none'
+ * lockdown step still carries the injected image to the synthesis step. Returns
+ * `base` unchanged when there is nothing to inject. Mutates `cache` (eviction).
+ *
+ * Exported + pure w.r.t. its inputs (aside from the intended cache eviction) so
+ * the injection/eviction/merge semantics are unit-testable without streamText.
+ */
+export function injectViewImages(
+  base: ReturnType<typeof prepareAgentStep>,
+  opts: {
+    messages: ReadonlyArray<ModelMessage>;
+    steps: ReadonlyArray<StepLike> | undefined;
+  },
+  cache: ViewImageCache,
+): PrepareStepResult {
+  if (cache.size === 0) return base;
+  const injected: ModelMessage[] = [];
+  for (const [toolCallId, img] of cache) {
+    injected.push(userImageMessage(img));
+    // Evict AFTER queuing this step's injection (inject-then-delete): the step
+    // whose prepareStep first observes "the model has spoken" still gets the image
+    // once more (never starve the synthesis step), then future steps skip it.
+    if (modelSpokeAboutItAfter(toolCallId, opts.steps)) cache.delete(toolCallId);
+  }
+  if (injected.length === 0) return base;
+  return {
+    ...(base ?? {}),
+    messages: [...opts.messages, ...injected],
+  };
+}
 
 // Pure, unit-testable post-processing for a model-generated title (#199): trim
 // whitespace, strip a single pair of surrounding quotes the model often adds,
@@ -1412,6 +1518,17 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
       const finalStepLockdownEnabled =
         this.environment.isAiChatFinalStepLockdownEnabled();
 
+      // viewImage vision tool (#588). Default OFF (fail-closed). The SAME flag
+      // gates BOTH the tool registration (forUser below) AND the prepareStep image
+      // injection: when off, neither exists and the turn is byte-identical to
+      // before. `viewImageCache` is a per-run closure Map shared BY REFERENCE with
+      // viewImage.execute (which writes the delivered image bytes keyed by
+      // toolCallId) — NOT experimental_context (the SDK marks that immutable inside
+      // a tool execute). prepareStep reads it to inject the image as an ephemeral
+      // user-role message on every step after the call, until the model has spoken.
+      const viewImageEnabled = this.environment.isAiChatViewImageEnabled();
+      const viewImageCache: ViewImageCache = new Map();
+
       let system: string;
       let docmostTools: Awaited<ReturnType<AiChatToolsService['forUser']>>;
       try {
@@ -1462,6 +1579,10 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           // exposed to the model via getCurrentPage so page identity (and the
           // AUTHORITATIVE title) survives prompt mangling / client title spoofing.
           openPageContext,
+          // #588: gate + the per-run cache viewImage.execute writes into (read by
+          // prepareStep below to inject the image). Off => tool not registered.
+          viewImageEnabled,
+          viewImageCache,
         );
       } catch (err) {
         await closeExternalClients();
@@ -1787,14 +1908,24 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
           // ends with no assistant text (an empty turn). prepareAgentStep forbids
           // further tool calls and appends a synthesis instruction on that step,
           // concatenated onto the original `system` so the persona is preserved.
-          prepareStep: ({ stepNumber }) =>
-            prepareAgentStep(
-              stepNumber,
+          prepareStep: (opts) => {
+            const base = prepareAgentStep(
+              opts.stepNumber,
               system,
               activatedTools,
               deferredEnabled,
               finalStepLockdownEnabled,
-            ),
+            );
+            // #588: when viewImage is enabled, inject each still-live cached image
+            // as an ephemeral trailing user message on EVERY step after its call
+            // (so the model sees it on intermediate tool steps AND the final
+            // synthesis step, incl. a toolChoice:'none' lockdown step), evicting an
+            // entry once the model has spoken about it. When off, `base` is returned
+            // untouched — no injection. The disjoint-key merge preserves base's
+            // activeTools/toolChoice/system so the image rides to synthesis.
+            if (!viewImageEnabled) return base;
+            return injectViewImages(base, opts, viewImageCache);
+          },
           // #184: the RUN's signal (explicit-stop) when a run wraps this turn, else
           // the socket-bound signal (legacy). A browser disconnect aborts only in
           // the legacy path. #444: UNION it with the internal degeneration signal

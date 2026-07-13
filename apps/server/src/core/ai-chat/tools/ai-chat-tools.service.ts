@@ -20,6 +20,7 @@ import {
 } from './current-page.util';
 import { parseNodeArg } from '@docmost/prosemirror-markdown';
 import { modelFriendlyInput } from './model-friendly-input';
+import { rasterizeSvgToPng } from '../../../integrations/ai/rasterize';
 import { SandboxStore } from '../../../integrations/sandbox/sandbox.store';
 import {
   buildInAppDeferredCatalog,
@@ -118,6 +119,8 @@ function __assertClientCallContract(client: DocmostClientLike): void {
     afterText: s,
   });
   void client.replaceImage(s, s, s, { align, alt: s });
+  // --- read (attachment bytes), in-app since #588 (viewImage vision tool) ---
+  void client.fetchAttachmentBytes(s);
   // --- draw.io diagrams (#423 stage 1, #424 stage 2) ---
   // The 5th `layout` arg (#424) is exercised so this parity assertion fails if the
   // client signature drops it — it must reach the client from the shared execute.
@@ -174,6 +177,42 @@ export function inAppToolCallCapMs(): number {
   const raw = Number(process.env.AI_CHAT_INAPP_TOOL_CALL_CAP_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 120_000;
 }
+
+/**
+ * #588: hard byte cap for a RASTER attachment (png/jpeg/webp/gif) delivered to
+ * the model as vision by the `viewImage` tool. A raster is passed through AS-IS
+ * (no resize), so this bounds both the base64 the provider must ingest and the
+ * per-turn memory. ~5 MiB is generous for a screenshot/diagram yet blocks a
+ * pathological multi-MB upload. SVG has no analogous cap here: it is rasterized
+ * by #586's `rasterizeSvgToPng`, whose own RASTER_MAX_SVG_BYTES input cap and
+ * PNG pixel ceiling bound the output.
+ */
+export const VIEW_MAX_RASTER_BYTES = 5 * 1024 * 1024;
+
+/**
+ * #588 F1: per-run cap on the LIVE viewImage cache (images held for prepareStep
+ * injection). Each live entry is re-injected into the provider request on every
+ * step until the model speaks about it, so an unbounded cache — a prompt-injected
+ * page telling the agent to view dozens of nodes before commenting — would hold
+ * up to ~MAX_AGENT_STEPS x 5 MiB base64 AND re-send them all every step (O(N^2)).
+ * Cap both the live count and the total held (base64) bytes; when full, viewImage
+ * refuses with a model-visible note so the model must comment on what it has seen
+ * (which evicts entries) before viewing more. Bytes are measured on the base64
+ * string actually held (~1.33x the raw image size).
+ */
+export const VIEW_MAX_LIVE_IMAGES = 6;
+export const VIEW_MAX_LIVE_BYTES = 24 * 1024 * 1024;
+
+/** #588: the per-run cache value shape shared between `viewImage.execute` (which
+ * WRITES the delivered image bytes, keyed by toolCallId) and the ai-chat
+ * `prepareStep` injection (which READS them into an ephemeral user-role message).
+ * A plain closure Map passed by reference — NOT experimental_context, which the
+ * SDK marks immutable inside a tool execute. */
+export interface ViewImageCacheEntry {
+  data: string; // base64 of the image bytes
+  mediaType: string; // e.g. 'image/png'
+}
+export type ViewImageCache = Map<string, ViewImageCacheEntry>;
 
 /** #487: the composite signal's reason as an Error (informative thrown value). */
 function inAppAbortReason(signal: AbortSignal): Error {
@@ -281,6 +320,145 @@ export function wrapInAppToolsWithCap(
     out[name] = wrapInAppToolWithCap(t, client, capMs);
   }
   return out;
+}
+
+/** The exact past/ephemeral-tense note persisted as the viewImage tool result
+ * (#588). It carries NO image bytes; the image itself is delivered out-of-band as
+ * an ephemeral user-role message (prepareStep injection). The tense matters: on a
+ * later replay this text must NOT make the model believe a live image is still
+ * attached — it must re-call viewImage to see it again. English to match the
+ * language convention of the neighbouring tool results. */
+export const VIEW_IMAGE_NOTE =
+  'The image was shown to you as a separate message on this step; it is NOT ' +
+  'retained on later turns — call viewImage again to see it now.';
+
+/** The raster MIME types the viewImage tool passes through to the model AS-IS
+ * (byte cap only, no resize). Anything else is either SVG (rasterized) or
+ * rejected as unsupported. */
+const VIEW_RASTER_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+]);
+
+/**
+ * The read-only client surface {@link runViewImage} needs (#588): resolve the
+ * node's JSON (for its type + attrs.src) and pull the attachment bytes through
+ * the guarded loopback fetch. A narrow Pick so unit tests can pass a tiny double.
+ */
+export type ViewImageClient = Pick<
+  DocmostClientLike,
+  'getNode' | 'fetchAttachmentBytes'
+>;
+
+export interface ViewImageResult {
+  ok: true;
+  mediaType: string;
+  width?: number;
+  height?: number;
+  source: string;
+  note: string;
+}
+
+/**
+ * Core of the `viewImage` tool (#588), factored out for unit testing without a
+ * live model/provider. Resolves the node, pulls its attachment bytes, classifies
+ * by MIME, and — as a SIDE EFFECT — writes the ready-to-inject base64 image into
+ * `cache` keyed by `toolCallId`. Returns a SMALL, byte-free result (persisted in
+ * chat history) whose note is written in past/ephemeral tense so a later replay
+ * never makes the model hallucinate a still-attached live image.
+ *
+ * Classification:
+ *  - png/jpeg/webp/gif  -> passthrough; oversized (> VIEW_MAX_RASTER_BYTES) throws;
+ *  - image/svg+xml (incl. a drawio node's `.drawio.svg`) -> rasterized to PNG via
+ *    #586's rasterizeSvgToPng (the drawio node type is treated as SVG regardless
+ *    of the served Content-Type, since a drawio attachment is always an SVG);
+ *  - anything else -> throws `unsupported type <mime>`.
+ *
+ * getNode is called with format='json' DELIBERATELY: the markdown rendering drops
+ * `attrs` (incl. the attachment `src`), so JSON is the only form that yields the
+ * `/api/files/<id>/…` source both an image and a drawio node point at.
+ */
+export async function runViewImage(
+  client: ViewImageClient,
+  args: { pageId: string; node: string },
+  toolCallId: string,
+  cache: ViewImageCache,
+): Promise<ViewImageResult> {
+  const res = (await client.getNode(args.pageId, args.node, 'json')) as {
+    type?: string;
+    node?: { attrs?: { src?: unknown } };
+  };
+  if (res?.type !== 'image' && res?.type !== 'drawio') {
+    throw new Error('node is not an image');
+  }
+  const src = res.node?.attrs?.src;
+  if (typeof src !== 'string' || src.length === 0) {
+    throw new Error('node has no image source');
+  }
+
+  const { buffer, mime } = await client.fetchAttachmentBytes(src);
+
+  let data: Buffer;
+  let mediaType: string;
+  let width: number | undefined;
+  let height: number | undefined;
+
+  if (VIEW_RASTER_MIMES.has(mime)) {
+    // Raster passthrough — no resize, byte cap only.
+    if (buffer.length > VIEW_MAX_RASTER_BYTES) {
+      throw new Error('image too large');
+    }
+    data = buffer;
+    mediaType = mime;
+  } else if (mime === 'image/svg+xml' || res.type === 'drawio') {
+    // SVG (incl. .drawio.svg) -> PNG via the #586 in-process rasterizer. The
+    // drawio node type is a robustness fallback: a drawio attachment is always an
+    // SVG even if the file server labels it with a non-svg Content-Type.
+    const { png, width: w, height: h } = await rasterizeSvgToPng(
+      buffer.toString('utf8'),
+    );
+    data = png;
+    mediaType = 'image/png';
+    width = w;
+    height = h;
+  } else {
+    throw new Error('unsupported type ' + mime);
+  }
+
+  // Side effect: stash the ready-to-inject image for prepareStep, keyed by this
+  // call's id so parallel viewImage calls never cross-talk. NOT returned — the
+  // persisted result below carries no bytes.
+  const encoded = data.toString('base64');
+  // #588 F1: bound the live cache before stashing (see VIEW_MAX_LIVE_* above).
+  // A prompt-injected page could otherwise make the agent hold and re-inject
+  // dozens of multi-MiB images per turn. Refuse (model-visible) when adding this
+  // image would exceed the count or byte budget; the model frees budget by
+  // commenting on already-viewed images (which evicts their cache entries).
+  const heldBytes = Array.from(cache.values()).reduce(
+    (n, e) => n + e.data.length,
+    0,
+  );
+  if (
+    cache.size >= VIEW_MAX_LIVE_IMAGES ||
+    heldBytes + encoded.length > VIEW_MAX_LIVE_BYTES
+  ) {
+    throw new Error(
+      'too many images are being held this turn; comment on the ones you ' +
+        'have already viewed so they are released, then call viewImage again',
+    );
+  }
+  cache.set(toolCallId, { data: encoded, mediaType });
+
+  return {
+    ok: true,
+    mediaType,
+    width,
+    height,
+    source: args.node,
+    note: VIEW_IMAGE_NOTE,
+  };
 }
 
 @Injectable()
@@ -412,6 +590,16 @@ export class AiChatToolsService {
       title?: string;
       selection?: SelectionContext | null;
     } | null,
+    // #588: env-gated `viewImage` vision tool. When false the tool is NOT
+    // registered at all (fail-closed) — the SAME flag gates the prepareStep image
+    // injection on the caller side, so an off flag means neither the tool nor any
+    // injection exists. Default false so existing callers keep the old surface.
+    viewImageEnabled = false,
+    // #588: per-run cache the viewImage.execute writes into (keyed by toolCallId),
+    // read by the caller's prepareStep to inject the image as an ephemeral
+    // user-role message. Shared by reference (a plain closure Map) — see
+    // ViewImageCache. Omitted (or the flag off) => no viewImage tool.
+    viewImageCache?: ViewImageCache,
   ): Promise<Record<string, Tool>> {
     // Build the per-user loopback client (carrying the access + collab
     // provenance tokens) and load the shared tool-spec registry. Client
@@ -750,6 +938,41 @@ export class AiChatToolsService {
       sharedToolSpecs.drawioGuide,
       async ({ section }) => getGuideSection(section),
     );
+
+    // viewImage (#588): IN-APP ONLY, env-gated, read-only. Registered inline here
+    // (like drawioShapes/drawioGuide) and ONLY when the caller both enabled the
+    // feature AND supplied the per-run cache — fail-closed. It delivers a node's
+    // image to the model AS VISION on ANY provider by writing the image bytes into
+    // `viewImageCache` (keyed by toolCallId); the ai-chat prepareStep injects them
+    // as an ephemeral user-role message. Deliberately NOT in SHARED_TOOL_SPECS and
+    // NOT on the public-share `forShare` toolset. The tool result itself carries no
+    // bytes (see runViewImage / VIEW_IMAGE_NOTE). Access stays CASL-enforced by the
+    // user's own JWT on GET /api/files/:id (validateCanView) — this adds no auth.
+    if (viewImageEnabled && viewImageCache) {
+      tools.viewImage = tool({
+        description:
+          'View an image node from a page so you can SEE it (vision). Given a ' +
+          'pageId and a node reference (the image/drawio node\'s attrs.id, or ' +
+          '"#<index>" for a top-level block), the image is shown to you as a ' +
+          'separate message on THIS step only. Raster images (png/jpeg/webp/gif) ' +
+          'are shown as-is; SVG and draw.io diagrams are rendered to PNG first. ' +
+          'The image is NOT retained on later turns — call viewImage again if you ' +
+          'need to see it after this turn. Use it to answer questions about what ' +
+          'an image, screenshot, or diagram actually depicts.',
+        inputSchema: modelFriendlyInput({
+          pageId: z.string().min(1).describe('The id of the page.'),
+          node: z
+            .string()
+            .min(1)
+            .describe(
+              'The image/drawio node reference: its attrs.id, or "#<index>" for ' +
+                'a top-level block from the page outline.',
+            ),
+        }),
+        execute: async ({ pageId, node }, { toolCallId }) =>
+          runViewImage(client, { pageId, node }, toolCallId, viewImageCache),
+      });
+    }
 
     // Passive "new comments: N" signal (#417). PER-TURN state (forUser runs once
     // per turn), so the watermark starts now and only comments a human leaves

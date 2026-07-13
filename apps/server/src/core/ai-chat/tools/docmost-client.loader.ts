@@ -65,6 +65,8 @@ type DocmostClientMethod =
   | 'insertImage'
   | 'replaceImage'
   | 'insertFootnote'
+  // --- read (attachment bytes), in-app since #588 (viewImage vision tool) ---
+  | 'fetchAttachmentBytes'
   // --- draw.io diagrams (#423 stage 1, #424 stage 2) ---
   // DERIVED from the real DocmostClient (#446): drawioCreate/drawioUpdate carry
   // the optional layout:"elk" 5th arg in the real signature, so the layout parity
