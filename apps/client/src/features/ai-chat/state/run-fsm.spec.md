@@ -127,6 +127,8 @@ holds. **Pending column: empty.**
 | 17–25 | `chatIdRef`, `openPageRef`, `getEditorSelectionRef`, `roleIdRef`, `stableIdRef`, `queuedRef`, `sendMessageRef`, `statusRef`, `lastForwardedChatIdRef` | **data** (identity/send mirrors) | unchanged — not lifecycle flags |
 | NEW | `pendingSupersedeRef` | **data** (send-plumbing) | the runId injected into the next `POST /stream {supersede}`; the single replacement for the 3 DELETED one-shots (#8/#9/#10) — net −2 refs |
 | NEW | `idleCapTimerRef` | **effect-owned timer** | the stalled inactivity cap → `POLL_IDLE_CAP` (commit 4a); not a flag |
+| NEW | `turnEpochRef` | **runtime carrier of the epoch (I1)** | holds the generation the CURRENTLY-owned stream started under; STAMPS that stream's async outcomes (chiefly its `onFinish`) so the reducer's epoch filter drops a superseded/dead stream's late finish and it cannot drive the live machine (F1 — the per-owned-stream `turnEpoch` §1 names). Re-set at every honored stream start (local send, resume/reconnect attach, the supersede B-send). Not a flag |
+| NEW | `pendingSupersedeTextRef` | **data** (send-plumbing) + presence-guard | the interrupt-and-send ("Send now") text, stashed when a CAS supersede aborts live stream A, held until A's `onFinish` starts stream B in a microtask (no ai@6 overlap — F1). Non-null is ALSO a presence-guard: it makes a second "Send now" in `sendNow` a no-op while a supersede is in flight, and gates the onFinish B-send branch. Not a lifecycle flag |
 
 Net: the 13 lifecycle flags (#1–#13) are eliminated: **8** → FSM phase/ctx/epoch/event
 (#1–#6, #11, #13), **3** deleted (#8/#9/#10), **`reconnectTimerRef` (#7)** becomes an
