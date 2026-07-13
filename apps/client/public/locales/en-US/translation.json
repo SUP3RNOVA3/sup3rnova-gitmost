@@ -165,6 +165,7 @@
   "Revoke {{name}}": "Revoke {{name}}",
   "Select version": "Select version",
   "Highlight changes": "Highlight changes",
+  "Change highlighting is unavailable for this version": "Change highlighting is unavailable for this version",
   "Page import is in progress. Please do not close this tab.": "Page import is in progress. Please do not close this tab.",
   "Pages": "Pages",
   "pages": "pages",
