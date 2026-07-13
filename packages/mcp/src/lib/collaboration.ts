@@ -583,6 +583,20 @@ export async function updatePageContentRealtime(
     // onto the matching text in the freshly-imported body. Active comments are
     // untouched (they ride through the markdown themselves); a resolved span whose
     // text the agent changed simply does not re-anchor and is dropped.
-    (liveDoc) => regraftResolvedComments(liveDoc, tiptapJson),
+    //
+    // #555: surface a dropped resolved anchor through the diagnostics channel
+    // instead of losing it silently — either the text is gone (agent rewrote it)
+    // or too many identical-text anchors collided on too few occurrences (a span
+    // holds only one comment mark). Genuine, if rare, data loss in the resolved
+    // (hidden) zone, so it is logged, not swallowed.
+    (liveDoc) =>
+      regraftResolvedComments(liveDoc, tiptapJson, (w) =>
+        console.error(
+          `[regraft] page ${pageId}: dropped resolved comment ${w.commentId} ` +
+            `(${w.code}) — anchor text ${JSON.stringify(
+              w.text.length > 80 ? `${w.text.slice(0, 80)}…` : w.text,
+            )} could not be re-grafted onto the rewritten body.`,
+        ),
+      ),
   );
 }
