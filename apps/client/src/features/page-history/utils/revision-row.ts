@@ -127,11 +127,25 @@ export function dayGroupLabel(
   }).format(new Date(group.ts));
 }
 
-/** heatmap intensity tier for a day's revision count (thresholds from the
- *  prototype's `heat()`): 0 none, 1 few (≤2), 2 some (≤4), 3 many. */
+/**
+ * Heatmap tier ceilings for a day's TOTAL revision count (#605). The heatmap now
+ * counts ALL revisions per day (any kind), not just versions, so daily sums are
+ * an order of magnitude larger than the old version-only counts and the old
+ * ≤2 / ≤4 ceilings degenerated to a single top tier.
+ *
+ * These ceilings are a roughly log/tertile-flavored split of the real stage
+ * daily sums (8, 13, 19, 48, 73, 76, 163, 426): low days (8–19) land in tier 1,
+ * mid days (48–76) in tier 2, and heavy days (163, 426) in tier 3 — all three
+ * tiers used, low and high genuinely distinct (issue #605 acceptance criterion 4).
+ */
+export const HEAT_LOW_TO_MID_CEILING = 20;
+export const HEAT_MID_TO_HIGH_CEILING = 100;
+
+/** heatmap intensity tier for a day's total revision count:
+ *  0 none, 1 low (≤20), 2 mid (≤100), 3 heavy (>100). */
 export function heatLevel(count: number): 0 | 1 | 2 | 3 {
   if (count <= 0) return 0;
-  if (count <= 2) return 1;
-  if (count <= 4) return 2;
+  if (count <= HEAT_LOW_TO_MID_CEILING) return 1;
+  if (count <= HEAT_MID_TO_HIGH_CEILING) return 2;
   return 3;
 }

@@ -40,7 +40,7 @@ function buildGrid(
 }
 
 interface Props {
-  /** dayISO → version-revision count (heatmap intensity). */
+  /** dayISO → total revision count for the day (heatmap intensity, #605). */
   counts: Map<string, number>;
   selectedDayISO: string | null;
   onPickDay: (dayISO: string) => void;
@@ -153,13 +153,14 @@ export default function MiniCalendar({
           const level = cell.inMonth ? heatLevel(count) : 0;
           const selected = cell.inMonth && cell.dayISO === selectedDayISO;
           // Non-color cue (F3 a11y): the count is announced, not conveyed by the
-          // heat color alone — e.g. "12 Jul: 3 versions".
+          // heat color alone — e.g. "12 Jul: 3 revisions". The heatmap counts ALL
+          // revisions (#605), so the label says "revisions", not "versions".
           const dayLabel = new Intl.DateTimeFormat(undefined, {
             timeZone: tz,
             day: "numeric",
             month: "short",
           }).format(cell.date);
-          const ariaLabel = t("{{date}}: {{count}} versions", {
+          const ariaLabel = t("{{date}}: {{count}} revisions", {
             date: dayLabel,
             count,
           });
