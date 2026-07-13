@@ -5,7 +5,9 @@ import { zonedDayStart, isoDay } from './bucket-by-day';
  *  ALL revisions (any kind) that landed on that day — i.e. day activity. */
 export interface DayCount {
   /** 'YYYY-MM-DD' in the requested tz — the same stable key the client uses to
-   *  group the dense revision list, so a heatmap cell always maps to a list row. */
+   *  group the dense revision list. In the default (filter-off) list a heatmap
+   *  cell maps to a list row; with "Only versions" on, an autosave-only day is
+   *  lit but has no version row (#605 — heatmap is broader than the filter). */
   dayISO: string;
   count: number;
 }

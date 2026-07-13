@@ -1,8 +1,10 @@
 import api from "@/lib/api-client";
 
-/** #568 — one calendar day of the page-history heatmap: the number of *version*
- *  revisions (manual/agent) on that day, keyed by 'YYYY-MM-DD' in the viewer tz.
- *  Same set as the "Only versions" filter, so a lit day always has a list row. */
+/** #568/#605 — one calendar day of the page-history heatmap: the number of ALL
+ *  revisions (any kind — manual/agent/idle/boundary/legacy null) on that day,
+ *  keyed by 'YYYY-MM-DD' in the viewer tz, i.e. total day activity. Intentionally
+ *  broader than the "Only versions" list filter (which stays about versions), so
+ *  a lit day need NOT have a version row — an autosave-only day still lights up. */
 export interface IPageHistoryDayCount {
   dayISO: string;
   count: number;

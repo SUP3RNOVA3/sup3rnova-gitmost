@@ -72,8 +72,10 @@ export default function HistoryNavPanel({
   const groups = useMemo(() => {
     const rows = fullItems
       .map((item) => toRevisionRow(item, tz))
-      // "Only versions": same predicate as the badge (manual/agent), so the
-      // filter and the heatmap describe the same set.
+      // "Only versions": same predicate as the badge (manual/agent). Note this
+      // list filter is version-only, whereas the heatmap counts ALL revisions
+      // (#605) — they intentionally describe DIFFERENT sets, so a lit autosave-
+      // only day has no row here when the filter is on (handlePickDay toasts).
       .filter((row) => (onlyVersions ? row.version : true));
     return groupRevisionsByDay(rows);
   }, [fullItems, tz, onlyVersions]);
