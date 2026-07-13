@@ -189,6 +189,20 @@ export function inAppToolCallCapMs(): number {
  */
 export const VIEW_MAX_RASTER_BYTES = 5 * 1024 * 1024;
 
+/**
+ * #588 F1: per-run cap on the LIVE viewImage cache (images held for prepareStep
+ * injection). Each live entry is re-injected into the provider request on every
+ * step until the model speaks about it, so an unbounded cache — a prompt-injected
+ * page telling the agent to view dozens of nodes before commenting — would hold
+ * up to ~MAX_AGENT_STEPS x 5 MiB base64 AND re-send them all every step (O(N^2)).
+ * Cap both the live count and the total held (base64) bytes; when full, viewImage
+ * refuses with a model-visible note so the model must comment on what it has seen
+ * (which evicts entries) before viewing more. Bytes are measured on the base64
+ * string actually held (~1.33x the raw image size).
+ */
+export const VIEW_MAX_LIVE_IMAGES = 6;
+export const VIEW_MAX_LIVE_BYTES = 24 * 1024 * 1024;
+
 /** #588: the per-run cache value shape shared between `viewImage.execute` (which
  * WRITES the delivered image bytes, keyed by toolCallId) and the ai-chat
  * `prepareStep` injection (which READS them into an ephemeral user-role message).
@@ -416,7 +430,26 @@ export async function runViewImage(
   // Side effect: stash the ready-to-inject image for prepareStep, keyed by this
   // call's id so parallel viewImage calls never cross-talk. NOT returned — the
   // persisted result below carries no bytes.
-  cache.set(toolCallId, { data: data.toString('base64'), mediaType });
+  const encoded = data.toString('base64');
+  // #588 F1: bound the live cache before stashing (see VIEW_MAX_LIVE_* above).
+  // A prompt-injected page could otherwise make the agent hold and re-inject
+  // dozens of multi-MiB images per turn. Refuse (model-visible) when adding this
+  // image would exceed the count or byte budget; the model frees budget by
+  // commenting on already-viewed images (which evicts their cache entries).
+  const heldBytes = Array.from(cache.values()).reduce(
+    (n, e) => n + e.data.length,
+    0,
+  );
+  if (
+    cache.size >= VIEW_MAX_LIVE_IMAGES ||
+    heldBytes + encoded.length > VIEW_MAX_LIVE_BYTES
+  ) {
+    throw new Error(
+      'too many images are being held this turn; comment on the ones you ' +
+        'have already viewed so they are released, then call viewImage again',
+    );
+  }
+  cache.set(toolCallId, { data: encoded, mediaType });
 
   return {
     ok: true,

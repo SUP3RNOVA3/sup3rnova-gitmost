@@ -27,6 +27,7 @@ import {
   runViewImage,
   VIEW_IMAGE_NOTE,
   VIEW_MAX_RASTER_BYTES,
+  VIEW_MAX_LIVE_IMAGES,
   AiChatToolsService,
   type ViewImageCache,
   type ViewImageClient,
@@ -133,6 +134,24 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache),
     ).rejects.toThrow('image too large');
     expect(cache.size).toBe(0);
+  });
+
+  it('F1: refuses (model-visible) and does not write when the live-image cap is reached', async () => {
+    // Pre-fill the cache to the count cap with cheap entries.
+    const cache: ViewImageCache = new Map();
+    for (let i = 0; i < VIEW_MAX_LIVE_IMAGES; i++) {
+      cache.set('held-' + i, { data: 'AA==', mediaType: 'image/png' });
+    }
+    const client = makeClient({
+      node: imageNode(),
+      bytes: { buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png' },
+    });
+    await expect(
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'new', cache),
+    ).rejects.toThrow(/too many images/i);
+    // The refused call must not add its entry.
+    expect(cache.size).toBe(VIEW_MAX_LIVE_IMAGES);
+    expect(cache.has('new')).toBe(false);
   });
 
   it('SVG: rasterized to PNG via the #586 rasterizer; mediaType=image/png, width/height propagated, PNG cached', async () => {
