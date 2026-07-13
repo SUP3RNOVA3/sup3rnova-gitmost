@@ -677,7 +677,8 @@ export const SHARED_TOOL_SPECS = {
     description:
       'Diff two versions of a page and return a Docmost-equivalent change set ' +
       '(inserted/deleted text, integrity counts for images/links/tables/' +
-      'callouts/footnote markers, and a human-readable markdown summary). ' +
+      'callouts/codeBlocks/footnote markers, and a human-readable markdown ' +
+      'summary). ' +
       "`from`/`to` each accept a historyId, or null/'current' for the page's " +
       'current content (defaults: from=current, to=current — pass a historyId ' +
       'from the page-history list to compare against the live page).',
@@ -1493,7 +1494,10 @@ export const SHARED_TOOL_SPECS = {
       'call fails with a "selection not found" error, the error quotes the ' +
       "closest block text (or says the selection spans multiple blocks); retry " +
       "with a corrected EXACT selection copied verbatim from a single " +
-      'paragraph/block. You may also attach a ' +
+      'paragraph/block. A selection that exists only inside a code block ' +
+      'cannot be anchored (comments are not allowed on code block content) — ' +
+      'anchor on the prose paragraph next to the code instead. ' +
+      'You may also attach a ' +
       '`suggestedText` proposing a replacement for the `selection` (a human ' +
       'applies it from the UI); when set, the `selection` must occur exactly ' +
       'once in the page. Reversible via the comment UI.',
