@@ -8,7 +8,10 @@ import { UserRepo } from '@docmost/db/repos/user/user.repo';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { SessionActivityService } from '../../session/session-activity.service';
 import { FastifyRequest } from 'fastify';
-import { extractBearerTokenFromHeader, isUserDisabled } from '../../../common/helpers';
+import {
+  extractBearerTokenFromHeader,
+  isUserDisabled,
+} from '../../../common/helpers';
 import { resolveProvenance } from '../../../common/decorators/auth-provenance.decorator';
 import { ApiKeyService } from '../../api-key/api-key.service';
 
@@ -68,9 +71,13 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     if (!workspace) {
       throw new UnauthorizedException();
     }
-    const user = await this.userRepo.findById(payload.sub, payload.workspaceId, {
-      includeIsAgent: true,
-    });
+    const user = await this.userRepo.findById(
+      payload.sub,
+      payload.workspaceId,
+      {
+        includeIsAgent: true,
+      },
+    );
 
     if (!user || isUserDisabled(user)) {
       throw new UnauthorizedException();
@@ -79,11 +86,19 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     if ((payload as JwtPayload).sessionId) {
       const sessionId = (payload as JwtPayload).sessionId;
       const session = await this.userSessionRepo.findActiveById(sessionId);
-      if (!session || session.userId !== payload.sub || session.workspaceId !== payload.workspaceId) {
+      if (
+        !session ||
+        session.userId !== payload.sub ||
+        session.workspaceId !== payload.workspaceId
+      ) {
         throw new UnauthorizedException();
       }
       req.raw.sessionId = sessionId;
-      this.sessionActivityService.trackActivity(sessionId, payload.sub, payload.workspaceId);
+      this.sessionActivityService.trackActivity(
+        sessionId,
+        payload.sub,
+        payload.workspaceId,
+      );
     }
 
     // Propagate the agent-edit provenance onto the request so REST
@@ -112,17 +127,18 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
     req.raw.authType = 'api_key';
     req.raw.apiKeyId = payload.apiKeyId;
 
-    // Stamp the agent-edit provenance for the API-KEY path too (#486). Unlike the
-    // access-token path above, it CANNOT be resolved before this point: the
-    // API-key payload carries no signed actor/aiChatId claim, and the user (with
-    // its isAgent flag) is unknown until the key is validated. Claim semantics for
-    // API keys: an is_agent API key (an agent service account) stamps 'agent' on
-    // every REST write; an ordinary API key resolves to 'user'. An API key has no
-    // internal ai_chats row, so aiChatId is always null. Derived from the
-    // SERVER-SIDE user (never a client field), so an 'agent' badge is unspoofable
-    // — mirroring the access-token path. Passing `null` for the claim means the
-    // actor is decided solely by user.isAgent.
-    const provenance = resolveProvenance(result.user, null);
+    // Stamp the agent-edit provenance for the API-KEY path too (#486, #559).
+    // Unlike the access-token path above, it CANNOT be resolved before this point:
+    // the API-key payload carries no signed actor/aiChatId claim, and the user is
+    // unknown until the key is validated. #559 — EVERY api-key write is now an
+    // EXTERNAL MCP write: passing the verified `payload.apiKeyId` makes
+    // resolveProvenance stamp actor='agent' even for an ordinary user's PERSONAL
+    // key (intentional — the access is programmatic via api_key, so it is
+    // attributed to the "External MCP" persona named after the key, not shown as
+    // the human). An API key has no internal ai_chats row, so aiChatId stays null;
+    // the key id is what distinguishes the persona. Derived from the SERVER-side
+    // identity + the verified key id (never a client field), so unspoofable.
+    const provenance = resolveProvenance(result.user, null, payload.apiKeyId);
     req.raw.actor = provenance.actor;
     req.raw.aiChatId = provenance.aiChatId;
 

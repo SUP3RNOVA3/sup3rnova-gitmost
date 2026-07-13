@@ -195,7 +195,12 @@ export class PageService {
       // Agent-edit provenance. The human stays the responsible author
       // (creatorId/lastUpdatedById); these only annotate the source. A normal
       // user request leaves the column default ('user').
-      ...agentSourceFields(provenance, 'lastUpdatedSource', 'lastUpdatedAiChatId'),
+      ...agentSourceFields(
+        provenance,
+        'lastUpdatedSource',
+        'lastUpdatedAiChatId',
+        'lastUpdatedApiKeyId',
+      ),
       temporaryExpiresAt,
       content,
       textContent,
@@ -288,7 +293,12 @@ export class PageService {
         // Agent-edit provenance: annotate the source without changing the
         // responsible author. A normal user request leaves the existing source
         // value unchanged.
-        ...agentSourceFields(provenance, 'lastUpdatedSource', 'lastUpdatedAiChatId'),
+        ...agentSourceFields(
+          provenance,
+          'lastUpdatedSource',
+          'lastUpdatedAiChatId',
+          'lastUpdatedApiKeyId',
+        ),
         updatedAt: new Date(),
         contributorIds: contributorIds,
       },
@@ -532,7 +542,12 @@ export class PageService {
           // Agent-edit provenance on the moved root page. Child pages are bulk
           // re-parented to the new space (no content change), so the marker is
           // stamped on the root the agent acted on. Normal user: no change.
-          ...agentSourceFields(provenance, 'lastUpdatedSource', 'lastUpdatedAiChatId'),
+          ...agentSourceFields(
+            provenance,
+            'lastUpdatedSource',
+            'lastUpdatedAiChatId',
+            'lastUpdatedApiKeyId',
+          ),
         },
         rootPage.id,
         trx,
@@ -1027,6 +1042,7 @@ export class PageService {
             provenance,
             'lastUpdatedSource',
             'lastUpdatedAiChatId',
+            'lastUpdatedApiKeyId',
           ),
         },
         dto.pageId,

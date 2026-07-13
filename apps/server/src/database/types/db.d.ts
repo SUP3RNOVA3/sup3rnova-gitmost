@@ -171,6 +171,7 @@ export interface ClientMetrics {
 export interface Comments {
   aiChatId: string | null;
   content: Json | null;
+  createdApiKeyId: string | null;
   createdAt: Generated<Timestamp>;
   createdSource: Generated<string>;
   creatorId: string | null;
@@ -282,6 +283,7 @@ export interface PageHistory {
   id: Generated<string>;
   kind: string | null;
   lastUpdatedAiChatId: string | null;
+  lastUpdatedApiKeyId: string | null;
   lastUpdatedById: string | null;
   lastUpdatedSource: string | null;
   pageId: string;
@@ -307,6 +309,7 @@ export interface Pages {
   isLocked: Generated<boolean>;
   isTemplate: Generated<boolean>;
   lastUpdatedAiChatId: string | null;
+  lastUpdatedApiKeyId: string | null;
   lastUpdatedById: string | null;
   lastUpdatedSource: Generated<string>;
   parentPageId: string | null;

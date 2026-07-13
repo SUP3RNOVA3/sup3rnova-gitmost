@@ -33,6 +33,25 @@ export function pageHistoryAgentRoleQuery(
     .whereRef('aiChats.id', '=', 'pageHistory.lastUpdatedAiChatId');
 }
 
+/**
+ * External-MCP key-name subquery for a page-history row (#559). Resolves
+ * pageHistory.lastUpdatedApiKeyId -> api_keys.name so an edit made by an external
+ * MCP agent is displayed with the human-assigned key name (the persona). NO
+ * deletedAt filter — exactly mirroring the agent-role join above: the historical
+ * signature must SURVIVE a key REVOKE (soft-delete). A hard-delete of the key
+ * (owner/workspace gone → api_keys cascades) nulls last_updated_api_key_id via the
+ * FK's onDelete('set null'), so the row then resolves to the fallback name.
+ * Exported so a unit test can assert the join never filters on deletedAt.
+ */
+export function pageHistoryApiKeyNameQuery(
+  eb: ExpressionBuilder<DB, 'pageHistory'>,
+) {
+  return eb
+    .selectFrom('apiKeys')
+    .select(['apiKeys.name'])
+    .whereRef('apiKeys.id', '=', 'pageHistory.lastUpdatedApiKeyId');
+}
+
 @Injectable()
 export class PageHistoryRepo {
   constructor(@InjectKysely() private readonly db: KyselyDB) {}
@@ -47,6 +66,7 @@ export class PageHistoryRepo {
     'lastUpdatedById',
     'lastUpdatedSource',
     'lastUpdatedAiChatId',
+    'lastUpdatedApiKeyId',
     // #370 — intentionality tier ('manual' | 'agent' | 'idle' | 'boundary');
     // null on legacy rows (= autosave). Selected so callers can read/promote it.
     'kind',
@@ -109,6 +129,9 @@ export class PageHistoryRepo {
         // Copy the provenance marker off the page row, as for lastUpdatedById.
         lastUpdatedSource: page.lastUpdatedSource,
         lastUpdatedAiChatId: page.lastUpdatedAiChatId,
+        // #559 — copy the external-MCP api_key id so the snapshot keeps the
+        // "External MCP" persona (mirrors lastUpdatedAiChatId above).
+        lastUpdatedApiKeyId: page.lastUpdatedApiKeyId,
         kind: opts?.kind ?? null,
         contributorIds: opts?.contributorIds,
         spaceId: page.spaceId,
@@ -144,6 +167,7 @@ export class PageHistoryRepo {
       .select((eb) => this.withLastUpdatedBy(eb))
       .select((eb) => this.withContributors(eb))
       .select((eb) => this.withAgentRole(eb))
+      .select((eb) => this.withApiKeyName(eb))
       .where('pageId', '=', pageId);
 
     const result = await executeWithCursorPagination(query, {
@@ -234,6 +258,12 @@ export class PageHistoryRepo {
     return jsonObjectFrom(pageHistoryAgentRoleQuery(eb)).as('agentRole');
   }
 
+  /** #559 — select the external-MCP key's name (name-only object, or null when
+   *  the row has no api_key / the key was hard-deleted) as `apiKey`. */
+  withApiKeyName(eb: ExpressionBuilder<DB, 'pageHistory'>) {
+    return jsonObjectFrom(pageHistoryApiKeyNameQuery(eb)).as('apiKey');
+  }
+
   withContributors(eb: ExpressionBuilder<DB, 'pageHistory'>) {
     return jsonArrayFrom(
       eb
@@ -259,14 +289,20 @@ function attachPageHistoryAgent<
   R extends {
     lastUpdatedSource?: string | null;
     lastUpdatedAiChatId?: string | null;
+    lastUpdatedApiKeyId?: string | null;
     lastUpdatedBy?: { name: string; avatarUrl?: string | null } | null;
     agentRole?: { name: string; emoji?: string | null } | null;
+    apiKey?: { name: string | null } | null;
   },
 >(row: R) {
-  const { agentRole, ...rest } = row;
+  // Strip the join-only `apiKey` object (its name feeds the resolver); keep the
+  // raw `lastUpdatedApiKeyId` column on the row (like lastUpdatedAiChatId).
+  const { agentRole, apiKey, ...rest } = row;
   const provenance = resolveAgentProvenance({
     isAgent: row.lastUpdatedSource === 'agent',
     aiChatId: row.lastUpdatedAiChatId,
+    api_key_id: row.lastUpdatedApiKeyId,
+    apiKeyName: apiKey?.name,
     creator: row.lastUpdatedBy,
     agentRole,
   });

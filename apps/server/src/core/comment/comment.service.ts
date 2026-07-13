@@ -147,12 +147,21 @@ export class CommentService {
       spaceId: page.spaceId,
       suggestedText,
       // Agent-edit provenance: the user stays creatorId; this only annotates the
-      // source. Normal user requests leave the column default ('user').
-      ...agentSourceFields(provenance, 'createdSource', 'aiChatId'),
+      // source. Normal user requests leave the column default ('user'). #559 —
+      // an external-MCP (api_key) comment also stamps created_api_key_id so it
+      // shows the "External MCP" persona named after the key.
+      ...agentSourceFields(
+        provenance,
+        'createdSource',
+        'aiChatId',
+        'createdApiKeyId',
+      ),
     });
 
     if (createCommentDto.yjsSelection) {
-      const parsed = yjsSelectionSchema.safeParse(createCommentDto.yjsSelection);
+      const parsed = yjsSelectionSchema.safeParse(
+        createCommentDto.yjsSelection,
+      );
       if (!parsed.success) {
         this.logger.warn(
           `Invalid yjsSelection for comment ${inserted.id}: ${parsed.error.message}`,
@@ -413,7 +422,9 @@ export class CommentService {
     }
     const trimmed = selection.trim();
     if (trimmed.length === 0) {
-      throw new BadRequestException('The re-anchored selection cannot be empty');
+      throw new BadRequestException(
+        'The re-anchored selection cannot be empty',
+      );
     }
     // Same no-op guard as create(): the suggestion must differ from the text it
     // replaces, or apply becomes indistinguishable from already-applied.
@@ -459,7 +470,9 @@ export class CommentService {
       );
     }
     if (!comment.suggestedText) {
-      throw new BadRequestException('This comment has no suggested edit to apply');
+      throw new BadRequestException(
+        'This comment has no suggested edit to apply',
+      );
     }
     // State guards. Order matters — the already-applied check precedes the
     // resolved check because an applied comment is normally also resolved.
@@ -504,13 +517,17 @@ export class CommentService {
         `Failed to apply suggested edit for comment ${comment.id}`,
         error,
       );
-      throw new InternalServerErrorException('Failed to apply the suggested edit');
+      throw new InternalServerErrorException(
+        'Failed to apply the suggested edit',
+      );
     }
 
     if (!verdict) {
       // Should not happen given the phase-3 fallback; treat as a hard error
       // rather than assuming success.
-      throw new InternalServerErrorException('Failed to apply the suggested edit');
+      throw new InternalServerErrorException(
+        'Failed to apply the suggested edit',
+      );
     }
 
     if (verdict.applied === true) {
@@ -602,7 +619,11 @@ export class CommentService {
     // Ephemeral: no replies → the suggestion vanishes entirely. The atomic
     // conditional delete may still fall back to a resolve if a reply raced in
     // (see deleteEphemeralSuggestion), so the outcome is whatever it settled on.
-    const settled = await this.deleteEphemeralSuggestion(comment, user, provenance);
+    const settled = await this.deleteEphemeralSuggestion(
+      comment,
+      user,
+      provenance,
+    );
     this.auditService.log({
       event: AuditEvent.COMMENT_SUGGESTION_DISMISSED,
       resourceType: AuditResource.COMMENT,
@@ -690,7 +711,11 @@ export class CommentService {
     // deleted); the audit event still records that the suggestion was applied.
     // The delete is atomic-conditional: if a reply raced in after the
     // hasChildren read, it falls back to resolving instead (outcome 'resolved').
-    const settled = await this.deleteEphemeralSuggestion(comment, user, provenance);
+    const settled = await this.deleteEphemeralSuggestion(
+      comment,
+      user,
+      provenance,
+    );
 
     this.auditService.log({
       event: AuditEvent.COMMENT_SUGGESTION_APPLIED,
@@ -853,7 +878,8 @@ export class CommentService {
       (id) => id !== actorId && !oldMentionIds.includes(id),
     );
 
-    if (newMentionIds.length === 0 && !notifyWatchers && !parentCommentId) return;
+    if (newMentionIds.length === 0 && !notifyWatchers && !parentCommentId)
+      return;
 
     const jobData: ICommentNotificationJob = {
       commentId,
@@ -866,9 +892,6 @@ export class CommentService {
       notifyWatchers,
     };
 
-    await this.notificationQueue.add(
-      QueueJob.COMMENT_NOTIFICATION,
-      jobData,
-    );
+    await this.notificationQueue.add(QueueJob.COMMENT_NOTIFICATION, jobData);
   }
 }

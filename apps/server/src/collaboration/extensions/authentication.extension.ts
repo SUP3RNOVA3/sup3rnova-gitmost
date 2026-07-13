@@ -171,12 +171,19 @@ export class AuthenticationExtension implements Extension {
     // can't drift. An is_agent service account (e.g. the MCP bot) is attributed
     // 'agent' here too, so its page-content edits over collab persist as
     // lastUpdatedSource='agent' (#143 review Arch A) — not just its REST writes.
+    // #559 — a collab token minted by an api-key principal (an EXTERNAL MCP agent)
+    // carries principal='api_key' + apiKeyId (verified above) but no actor claim;
+    // threading `jwtPayload.apiKeyId` makes resolveProvenance stamp actor='agent'
+    // (even for an ordinary user's personal key) and carries the key id into the
+    // context so persistence.extension can persist last_updated_api_key_id and
+    // the page shows the "External MCP" persona named after the key.
     // The human collab path carries no claim and is not flagged → actor='user'.
-    const provenance = resolveProvenance(user, jwtPayload);
+    const provenance = resolveProvenance(user, jwtPayload, jwtPayload.apiKeyId);
     return {
       user,
       actor: provenance.actor,
       aiChatId: provenance.aiChatId,
+      apiKeyId: provenance.apiKeyId,
     };
   }
 }

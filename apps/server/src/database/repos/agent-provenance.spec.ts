@@ -1,6 +1,15 @@
-import { resolveAgentProvenance } from './agent-provenance';
-import { commentAgentRoleQuery } from './comment/comment.repo';
-import { pageHistoryAgentRoleQuery } from './page/page-history.repo';
+import {
+  resolveAgentProvenance,
+  EXTERNAL_MCP_FALLBACK_NAME,
+} from './agent-provenance';
+import {
+  commentAgentRoleQuery,
+  commentApiKeyNameQuery,
+} from './comment/comment.repo';
+import {
+  pageHistoryAgentRoleQuery,
+  pageHistoryApiKeyNameQuery,
+} from './page/page-history.repo';
 
 /**
  * The server-authoritative "agent avatar stack" resolver (#300) normalizes the
@@ -39,7 +48,7 @@ describe('resolveAgentProvenance', () => {
     expect(result?.agent).not.toHaveProperty('emoji');
   });
 
-  it('external MCP (aiChatId null): agent = the account itself, launcher = null', () => {
+  it('degenerate external (aiChatId null, no api key): agent = the account itself, launcher = null', () => {
     const result = resolveAgentProvenance({
       isAgent: true,
       aiChatId: null,
@@ -49,6 +58,57 @@ describe('resolveAgentProvenance', () => {
     expect(result).toEqual({
       agent: { name: 'MCP Bot', avatarUrl: 'bot.png' },
       launcher: null,
+    });
+  });
+
+  // #559 — external MCP: api_key_id present (aiChatId null) → the persona is the
+  // named key, NOT the human account. Launcher is null (no separate human).
+  it('external MCP (api_key + name): agent = the key name, launcher = null', () => {
+    const result = resolveAgentProvenance({
+      isAgent: true,
+      aiChatId: null,
+      api_key_id: 'key-1',
+      apiKeyName: 'agent-node-2',
+      // The creator is the human key OWNER; it must NOT surface as the persona.
+      creator: { name: 'Alice', avatarUrl: 'a.png' },
+      agentRole: null,
+    });
+    expect(result).toEqual({
+      agent: { name: 'agent-node-2', avatarUrl: null },
+      launcher: null,
+    });
+  });
+
+  it('external MCP (api_key present, name null/revoked): agent = the External MCP fallback', () => {
+    const result = resolveAgentProvenance({
+      isAgent: true,
+      aiChatId: null,
+      api_key_id: 'key-1',
+      apiKeyName: null,
+      creator: { name: 'Alice', avatarUrl: 'a.png' },
+      agentRole: null,
+    });
+    expect(result).toEqual({
+      agent: { name: EXTERNAL_MCP_FALLBACK_NAME, avatarUrl: null },
+      launcher: null,
+    });
+    expect(EXTERNAL_MCP_FALLBACK_NAME).toBe('External MCP');
+  });
+
+  // An internal-agent write must be UNCHANGED even if an api_key_id somehow rode
+  // along: aiChatId != null keeps it on the role/launcher branch (form 2).
+  it('internal agent is unaffected by a stray api_key_id (aiChatId wins)', () => {
+    const result = resolveAgentProvenance({
+      isAgent: true,
+      aiChatId: 'chat-1',
+      api_key_id: 'key-9',
+      apiKeyName: 'ignored',
+      creator: human,
+      agentRole: { name: 'Researcher', emoji: '🔬' },
+    });
+    expect(result).toEqual({
+      agent: { name: 'Researcher', emoji: '🔬', avatarUrl: null },
+      launcher: { name: 'Alice', avatarUrl: 'a.png' },
     });
   });
 
@@ -86,7 +146,12 @@ describe('agent role subquery — no live/enabled filter', () => {
       },
     );
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const eb = { selectFrom: (...args: unknown[]) => (calls.push({ method: 'selectFrom', args }), builder) } as any;
+    const eb = {
+      selectFrom: (...args: unknown[]) => (
+        calls.push({ method: 'selectFrom', args }),
+        builder
+      ),
+    } as any;
     return { eb, calls };
   }
 
@@ -124,6 +189,43 @@ describe('agent role subquery — no live/enabled filter', () => {
     assertNoLiveFilter(
       pageHistoryAgentRoleQuery,
       'pageHistory.lastUpdatedAiChatId',
+    );
+  });
+
+  // #559 — the external-MCP key-name join must ALSO omit any deletedAt filter, so
+  // the persona survives a key REVOKE (soft-delete) exactly like the role join.
+  function assertApiKeyNoDeletedFilter(
+    query: (eb: any) => unknown, // eslint-disable-line @typescript-eslint/no-explicit-any
+    apiKeyIdColumn: string,
+  ) {
+    const { eb, calls } = makeRecorder();
+    query(eb);
+
+    const selectFrom = calls.find((c) => c.method === 'selectFrom');
+    expect(selectFrom?.args).toEqual(['apiKeys']);
+
+    const whereRef = calls.find((c) => c.method === 'whereRef');
+    expect(whereRef?.args).toEqual(['apiKeys.id', '=', apiKeyIdColumn]);
+
+    // No deletedAt filter anywhere (revoke must not hide the historical name).
+    const filtered = calls
+      .flatMap((c) => c.args)
+      .filter((a) => a === 'deletedAt');
+    expect(filtered).toEqual([]);
+    expect(calls.some((c) => c.method === 'where')).toBe(false);
+  }
+
+  it('comment api-key join keys on createdApiKeyId with no deletedAt filter', () => {
+    assertApiKeyNoDeletedFilter(
+      commentApiKeyNameQuery,
+      'comments.createdApiKeyId',
+    );
+  });
+
+  it('page-history api-key join keys on lastUpdatedApiKeyId with no deletedAt filter', () => {
+    assertApiKeyNoDeletedFilter(
+      pageHistoryApiKeyNameQuery,
+      'pageHistory.lastUpdatedApiKeyId',
     );
   });
 });

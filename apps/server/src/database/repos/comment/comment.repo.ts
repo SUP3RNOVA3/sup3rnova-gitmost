@@ -31,6 +31,23 @@ export function commentAgentRoleQuery(eb: ExpressionBuilder<DB, 'comments'>) {
     .whereRef('aiChats.id', '=', 'comments.aiChatId');
 }
 
+/**
+ * External-MCP key-name subquery for a comment (#559). Resolves
+ * comments.createdApiKeyId -> api_keys.name so a comment authored by an external
+ * MCP agent is displayed with the human-assigned key name (the persona). NO
+ * deletedAt filter — mirroring the agent-role join above: the historical
+ * signature must SURVIVE a key REVOKE (soft-delete). A hard-delete of the key
+ * (owner/workspace gone → api_keys cascades) nulls created_api_key_id via the
+ * FK's onDelete('set null'), so the comment then resolves to the fallback name.
+ * Exported so a unit test can assert the join never filters on deletedAt.
+ */
+export function commentApiKeyNameQuery(eb: ExpressionBuilder<DB, 'comments'>) {
+  return eb
+    .selectFrom('apiKeys')
+    .select(['apiKeys.name'])
+    .whereRef('apiKeys.id', '=', 'comments.createdApiKeyId');
+}
+
 @Injectable()
 export class CommentRepo {
   constructor(@InjectKysely() private readonly db: KyselyDB) {}
@@ -57,6 +74,9 @@ export class CommentRepo {
       // so the resolver needs it, and every broadcast caller passes
       // includeCreator: true. Non-includeCreator callers keep the plain shape.
       .$if(opts?.includeCreator, (qb) => qb.select(this.withAgentRole))
+      // #559 — resolve the external-MCP persona name alongside the agent role,
+      // on the SAME gate, so a broadcast api-key comment carries the key name.
+      .$if(opts?.includeCreator, (qb) => qb.select(this.withApiKeyName))
       .where('id', '=', commentId)
       .executeTakeFirst();
 
@@ -73,6 +93,7 @@ export class CommentRepo {
       .select((eb) => this.withCreator(eb))
       .select((eb) => this.withResolvedBy(eb))
       .select((eb) => this.withAgentRole(eb))
+      .select((eb) => this.withApiKeyName(eb))
       .where('pageId', '=', pageId);
 
     const result = await executeWithCursorPagination(query, {
@@ -124,6 +145,12 @@ export class CommentRepo {
    *  null when the comment has no internal chat / the chat has no role (#300). */
   withAgentRole(eb: ExpressionBuilder<DB, 'comments'>) {
     return jsonObjectFrom(commentAgentRoleQuery(eb)).as('agentRole');
+  }
+
+  /** #559 — select the external-MCP key's name (name-only object, or null when
+   *  the comment has no api_key / the key was hard-deleted) as `apiKey`. */
+  withApiKeyName(eb: ExpressionBuilder<DB, 'comments'>) {
+    return jsonObjectFrom(commentApiKeyNameQuery(eb)).as('apiKey');
   }
 
   withResolvedBy(eb: ExpressionBuilder<DB, 'comments'>) {
@@ -190,10 +217,7 @@ export class CommentRepo {
       // the cascade would destroy it. Caller falls back to resolving the thread.
       if (child) return 0;
 
-      await trx
-        .deleteFrom('comments')
-        .where('id', '=', commentId)
-        .execute();
+      await trx.deleteFrom('comments').where('id', '=', commentId).execute();
       return 1;
     });
   }
@@ -208,7 +232,10 @@ export class CommentRepo {
     return Number(result?.count) > 0;
   }
 
-  async hasChildrenFromOtherUsers(commentId: string, userId: string): Promise<boolean> {
+  async hasChildrenFromOtherUsers(
+    commentId: string,
+    userId: string,
+  ): Promise<boolean> {
     const result = await this.db
       .selectFrom('comments')
       .select((eb) => eb.fn.count('id').as('count'))
@@ -231,14 +258,20 @@ function attachCommentAgent<
   R extends {
     createdSource?: string | null;
     aiChatId?: string | null;
+    createdApiKeyId?: string | null;
     creator?: { name: string; avatarUrl?: string | null } | null;
     agentRole?: { name: string; emoji?: string | null } | null;
+    apiKey?: { name: string | null } | null;
   },
 >(row: R) {
-  const { agentRole, ...rest } = row;
+  // Strip the join-only `apiKey` object (its name feeds the resolver); keep the
+  // raw `createdApiKeyId` column on the row (like aiChatId).
+  const { agentRole, apiKey, ...rest } = row;
   const provenance = resolveAgentProvenance({
     isAgent: row.createdSource === 'agent',
     aiChatId: row.aiChatId,
+    api_key_id: row.createdApiKeyId,
+    apiKeyName: apiKey?.name,
     creator: row.creator,
     agentRole,
   });

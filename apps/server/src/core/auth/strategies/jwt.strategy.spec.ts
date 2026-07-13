@@ -18,7 +18,9 @@ import { JwtType } from '../dto/jwt-payload';
 describe('JwtStrategy — provenance derivation', () => {
   function makeStrategy(user: any) {
     const userRepo: any = { findById: jest.fn(async () => user) };
-    const workspaceRepo: any = { findById: jest.fn(async () => ({ id: 'ws-1' })) };
+    const workspaceRepo: any = {
+      findById: jest.fn(async () => ({ id: 'ws-1' })),
+    };
     const userSessionRepo: any = { findActiveById: jest.fn() };
     const sessionActivityService: any = { trackActivity: jest.fn() };
     const environmentService: any = { getAppSecret: () => 'test-secret' };
@@ -101,7 +103,10 @@ describe('JwtStrategy — provenance derivation', () => {
       deletedAt: null,
     });
     const req2 = makeReq();
-    await strategy.validate(req2, accessPayload({ actor: 'agent', aiChatId: 'chat-1' }) as any);
+    await strategy.validate(
+      req2,
+      accessPayload({ actor: 'agent', aiChatId: 'chat-1' }) as any,
+    );
     expect(req2.raw.actor).toBe('agent');
     expect(req2.raw.aiChatId).toBe('chat-1');
   });
@@ -115,9 +120,9 @@ describe('JwtStrategy — provenance derivation', () => {
     });
     const req = makeReq();
 
-    await expect(strategy.validate(req, accessPayload() as any)).rejects.toThrow(
-      UnauthorizedException,
-    );
+    await expect(
+      strategy.validate(req, accessPayload() as any),
+    ).rejects.toThrow(UnauthorizedException);
     expect(req.raw.actor).toBeUndefined();
   });
 });
@@ -187,7 +192,12 @@ describe('JwtStrategy — API-key provenance derivation (#486/#501)', () => {
     expect(result).toBe(validated);
   });
 
-  it("stamps actor='user' for an ordinary (non-agent) API key", async () => {
+  it("stamps actor='agent' + apiKeyId for an ordinary (non-agent) API key (#559 external MCP)", async () => {
+    // #559 — every api-key write is now an EXTERNAL MCP write, even for an
+    // ordinary user's PERSONAL key: the access is programmatic via the key, so it
+    // is attributed to the "External MCP" persona named after the key rather than
+    // shown as the human. aiChatId stays null (no internal chat); the key id is
+    // what distinguishes the persona.
     const { strategy } = makeApiKeyStrategy(async () => ({
       user: { id: 'u-1', isAgent: false },
       workspace: { id: 'ws-1' },
@@ -196,8 +206,9 @@ describe('JwtStrategy — API-key provenance derivation (#486/#501)', () => {
 
     await strategy.validate(req, apiKeyPayload() as any);
 
-    expect(req.raw.actor).toBe('user');
+    expect(req.raw.actor).toBe('agent');
     expect(req.raw.aiChatId).toBeNull();
+    expect(req.raw.apiKeyId).toBe('key-1');
     expect(req.raw.authType).toBe('api_key');
   });
 
