@@ -199,5 +199,7 @@ describe("MessageItem streaming answer render is O(blocks), not O(ticks)", () =>
     // MUTATION-VERIFY (documented, not run here): dropping the `memo()` wrapper on
     // MarkdownChunk (so every stable block re-parses each tick) drives `calls`
     // toward `ticks` (~394), reddening both upper-bound assertions above.
-  });
+  }, 30000); // ~780 synchronous rerenders: give a generous explicit timeout so a
+  // loaded CI runner cannot tip this over the default 5s and flake the whole job.
+  // The perf guarantee is the call-count asserts above, NOT wall-clock.
 });
