@@ -123,6 +123,20 @@ test("invalid base64 charset is rejected, server not called", async () => {
   assert.equal(calls.upload.length, 0);
 });
 
+test("4-aligned invalid-charset base64 is rejected by the CHARSET guard (not the length guard)", async () => {
+  // "ab!c" is length 4 (passes the mult-of-4 guard) but "!" is outside the
+  // base64 alphabet. Without the charset guard, Node would silently truncate at
+  // the bad char and upload garbage bytes. Assert the CHARSET-specific message so
+  // this test genuinely locks the charset guard (mutating it to `if(false)` reds
+  // this) rather than falling through to the length guard.
+  const { client, calls } = makeClient();
+  await assert.rejects(
+    () => client.uploadFile("p1", "ab!c", "x.png"),
+    /unexpected characters/,
+  );
+  assert.equal(calls.upload.length, 0);
+});
+
 test("base64 whose length is not a multiple of 4 is rejected", async () => {
   const { client, calls } = makeClient();
   await assert.rejects(
