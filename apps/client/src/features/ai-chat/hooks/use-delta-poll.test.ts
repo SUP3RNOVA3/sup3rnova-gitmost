@@ -136,7 +136,7 @@ describe("useAiChatDeltaPoll", () => {
     expect(h.delta).not.toHaveBeenCalled();
   });
 
-  it("cursor lifecycle: first tick sends undefined, then ECHOES the returned cursor", async () => {
+  it("cursor lifecycle: the leading tick sends undefined, then the interval ECHOES the returned cursor", async () => {
     h.delta
       .mockResolvedValueOnce(deltaRes([], "cur-1"))
       .mockResolvedValueOnce(deltaRes([], "cur-2"))
@@ -145,14 +145,34 @@ describe("useAiChatDeltaPoll", () => {
       () => useAiChatDeltaPoll({ chatId: "c1", armed: true, enabled: true }),
       { wrapper },
     );
-    // No leading tick — nothing before the first interval elapses.
-    expect(h.delta).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS);
+    // The leading tick fires on arm — it IS the first tick, so it sends `undefined`.
     expect(h.delta).toHaveBeenNthCalledWith(1, "c1", undefined);
     await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS);
     expect(h.delta).toHaveBeenNthCalledWith(2, "c1", "cur-1"); // echoed
     await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS);
     expect(h.delta).toHaveBeenNthCalledWith(3, "c1", "cur-2");
+  });
+
+  it("leading tick: fires IMMEDIATELY on arm (before a full interval) with cursor undefined, then the interval takes over", async () => {
+    h.delta
+      .mockResolvedValueOnce(deltaRes([], "cur-1"))
+      .mockResolvedValue(deltaRes([], "cur-2"));
+    renderHook(
+      () => useAiChatDeltaPoll({ chatId: "c1", armed: true, enabled: true }),
+      { wrapper },
+    );
+    // Immediate: the leading tick has already fired ONCE, with the fresh
+    // `undefined` cursor — no timer advance — so the first delta lands promptly
+    // (this is the assertion that goes red if the leading tick is removed, while
+    // the interval-based echoes below stay green).
+    expect(h.delta).toHaveBeenCalledTimes(1);
+    expect(h.delta).toHaveBeenNthCalledWith(1, "c1", undefined);
+    // Still short of a full interval: nothing more fires.
+    await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS - 1);
+    expect(h.delta).toHaveBeenCalledTimes(1);
+    // The interval then continues the chain, echoing the leading tick's cursor.
+    await vi.advanceTimersByTimeAsync(1);
+    expect(h.delta).toHaveBeenNthCalledWith(2, "c1", "cur-1");
   });
 
   it("reset on chat change: the new chat starts a FRESH cursor chain (undefined)", async () => {
@@ -166,13 +186,13 @@ describe("useAiChatDeltaPoll", () => {
         }),
       { wrapper, initialProps: { chatId: "c1" } },
     );
-    await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS);
+    // The leading tick fired on arm with the fresh undefined cursor.
     expect(h.delta).toHaveBeenLastCalledWith("c1", undefined);
     await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS);
     expect(h.delta).toHaveBeenLastCalledWith("c1", "cur-1"); // cursor advanced
-    // Switch chats -> the cursor MUST reset (a c1 cursor is meaningless for c2).
+    // Switch chats -> the cursor MUST reset (a c1 cursor is meaningless for c2);
+    // the re-arm's leading tick fires immediately with a fresh undefined.
     rerender({ chatId: "c2" });
-    await vi.advanceTimersByTimeAsync(DELTA_POLL_INTERVAL_MS);
     expect(h.delta).toHaveBeenLastCalledWith("c2", undefined);
   });
 
@@ -207,12 +227,12 @@ describe("useAiChatDeltaPoll", () => {
       () => useAiChatDeltaPoll({ chatId: "c1", armed: true, enabled: true }),
       { wrapper },
     );
-    expect(result.current).toBeUndefined(); // no poll yet
+    expect(result.current).toBeUndefined(); // leading tick in flight, no result yet
+    // The leading tick surfaces run-1; the first interval re-polls the SAME fact
+    // (deduped — no re-render churn).
     await advance(DELTA_POLL_INTERVAL_MS);
     expect(result.current).toEqual({ id: "run-1", status: "running" });
-    await advance(DELTA_POLL_INTERVAL_MS); // same fact — deduped
-    expect(result.current).toEqual({ id: "run-1", status: "running" });
-    await advance(DELTA_POLL_INTERVAL_MS); // run gone -> null surfaced
+    await advance(DELTA_POLL_INTERVAL_MS); // run gone -> fresh negative surfaced
     expect(result.current).toBeNull();
   });
 
@@ -226,9 +246,12 @@ describe("useAiChatDeltaPoll", () => {
       () => useAiChatDeltaPoll({ chatId: "c1", armed: true, enabled: true }),
       { wrapper },
     );
-    await advance(DELTA_POLL_INTERVAL_MS); // rejects — swallowed
-    expect(result.current).toBeUndefined();
-    await advance(DELTA_POLL_INTERVAL_MS); // recovers
+    // Flush the LEADING tick's rejection without advancing a full interval.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(result.current).toBeUndefined(); // rejected — swallowed
+    await advance(DELTA_POLL_INTERVAL_MS); // next tick recovers
     expect(result.current).toEqual({ id: "run-1", status: "running" });
   });
 });

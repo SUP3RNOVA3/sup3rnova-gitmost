@@ -10,8 +10,9 @@ import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.t
 
 // #491/#555: the degraded DELTA poll interval. The window owns ONLY this dumb
 // timer; the THREAD's run-lifecycle FSM owns arm/disarm (via onResumeFallback) and
-// CONSUMES the run fact this hook surfaces (see run-fsm.spec.md §3.4, S1/S3). No
-// leading tick (the ~5s first-poll latency is a separate, deferred perf item).
+// CONSUMES the run fact this hook surfaces (see run-fsm.spec.md §3.4, S1/S3). A
+// LEADING tick fires once immediately when the poll arms (see below), so the first
+// delta lands promptly instead of after a full interval (no ~5s first-poll latency).
 export const DELTA_POLL_INTERVAL_MS = 2500;
 
 /** The run fact the delta endpoint carries alongside the changed rows: the active
@@ -115,6 +116,13 @@ export function useAiChatDeltaPoll(params: {
         // the next tick — the poll must survive a bounce, like the old dumb refetch.
       }
     };
+    // Leading tick: fire ONCE immediately on arm so the first delta lands promptly
+    // instead of after a full interval (#555). It IS the first tick — it reads the
+    // just-reset `undefined` cursor, so the cursor lifecycle is unchanged. The
+    // `cancelled` guard above makes a StrictMode double-mount safe: the torn-down
+    // closure's in-flight leading tick returns early and cannot write a stale
+    // cursor/fact, so only the live effect's chain advances the cursor.
+    void tick();
     const handle = setInterval(() => void tick(), DELTA_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
