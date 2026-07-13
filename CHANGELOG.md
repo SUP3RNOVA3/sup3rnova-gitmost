@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking Changes
 
 - **The embedded `/mcp` endpoint now authenticates ONLY with a Bearer api_key.**
-  The four former inbound auth paths — HTTP Basic `email:password`, a Bearer
+  The three former inbound auth paths — HTTP Basic `email:password`, a Bearer
   human-session ACCESS token, and the `MCP_DOCMOST_EMAIL` / `MCP_DOCMOST_PASSWORD`
   env service account — are all removed. An agent must send
   `Authorization: Bearer <api_key>` (an api_key minted under Workspace settings →

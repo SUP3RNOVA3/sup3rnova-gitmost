@@ -3,8 +3,18 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
+// #558 deny-observability: mock only the counter so we can assert validate()
+// increments api_key_auth_denied_total{reason} on each deny branch. Every other
+// export stays real (the registry is otherwise a no-op unless METRICS_PORT set).
+jest.mock('../../integrations/metrics/metrics.registry', () => ({
+  ...jest.requireActual('../../integrations/metrics/metrics.registry'),
+  incApiKeyAuthDenied: jest.fn(),
+}));
 import { ApiKeyService } from './api-key.service';
 import { JwtType } from '../auth/dto/jwt-payload';
+import { incApiKeyAuthDenied } from '../../integrations/metrics/metrics.registry';
+
+const incDenied = incApiKeyAuthDenied as jest.Mock;
 
 /**
  * Security contract for ApiKeyService.validate — the single validator shared by
@@ -241,6 +251,10 @@ describe('ApiKeyService.validate', () => {
   // the LOG (the counter is a no-op unless METRICS_PORT is set), NOT the 401 body
   // (the response stays a uniform bare 401 — anti-enumeration).
   describe('deny-observability WARN (rate-limited, per apiKeyId+reason)', () => {
+    // Reset the counter mock so each test asserts only ITS OWN deny increments,
+    // not calls leaked from a sibling test (the mock is module-level).
+    beforeEach(() => incDenied.mockClear());
+
     it('WARNs with the reason + apiKeyId on a revoked/missing key deny', async () => {
       const { service, apiKeyRepo } = makeDeps();
       const warn = jest
@@ -256,6 +270,9 @@ describe('ApiKeyService.validate', () => {
       const msg = warn.mock.calls[0][0] as string;
       expect(msg).toContain('reason=revoked_or_missing');
       expect(msg).toContain('apiKeyId=key-XYZ');
+      // The prom counter is incremented with the EXACT reason (unthrottled,
+      // unlike the WARN). Deleting the incApiKeyAuthDenied line fails here.
+      expect(incDenied).toHaveBeenCalledWith('revoked_or_missing');
     });
 
     it('is rate-limited: a second identical deny within the window does NOT re-WARN', async () => {
@@ -288,6 +305,8 @@ describe('ApiKeyService.validate', () => {
       const msg = warn.mock.calls[0][0] as string;
       expect(msg).toContain('reason=malformed_payload');
       expect(msg).toContain('apiKeyId=unknown');
+      // Counter incremented with the EXACT reason for this second branch too.
+      expect(incDenied).toHaveBeenCalledWith('malformed_payload');
     });
   });
 });
