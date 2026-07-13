@@ -187,6 +187,7 @@ describe('AiChatService run-stream attach [integration]', () => {
         isAiChatDeferredToolsEnabled: () => false,
         isAiChatResumableStreamEnabled: () => true,
         isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
       } as any,
       registry,
     );
@@ -518,6 +519,7 @@ describe('AiChatService run-stream attach [integration]', () => {
         isAiChatDeferredToolsEnabled: () => false,
         isAiChatResumableStreamEnabled: () => true,
         isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
       } as any,
       registry,
     );

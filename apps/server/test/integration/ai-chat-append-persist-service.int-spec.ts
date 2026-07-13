@@ -199,6 +199,7 @@ describe('#492 append-persist service paths [integration]', () => {
       {
         isAiChatDeferredToolsEnabled: () => false,
         isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
       } as any, // environment (deferred OFF -> all tools active every step)
       undefined, // streamRegistry
       undefined, // aiChatRunService
