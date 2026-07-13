@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **The embedded `/mcp` endpoint now authenticates ONLY with a Bearer api_key.**
+  The four former inbound auth paths — HTTP Basic `email:password`, a Bearer
+  human-session ACCESS token, and the `MCP_DOCMOST_EMAIL` / `MCP_DOCMOST_PASSWORD`
+  env service account — are all removed. An agent must send
+  `Authorization: Bearer <api_key>` (an api_key minted under Workspace settings →
+  API keys); every other credential now gets a `401`.
+
+  *Migration:* (1) MCP clients that authenticated with HTTP Basic `email:password`
+  or a session ACCESS token must switch to a Bearer api_key. (2) Deploys that
+  relied on the `MCP_DOCMOST_EMAIL` / `MCP_DOCMOST_PASSWORD` service account must
+  mint an api_key and drop those two env vars (they are no longer read).
+  `MCP_DOCMOST_API_URL` (the outbound loopback URL) and `MCP_TOKEN` (the optional
+  shared `X-MCP-Token` guard) are unchanged. **Deploy order:** roll this out only
+  after every agent has migrated to a Bearer api_key, since the old credentials
+  stop working the moment this deploys. (The in-app AI agent does not use `/mcp`
+  and is unaffected.)
+
 - **External MCP tool names are now camelCase (all renamed).** Every tool on the
   external `/mcp` surface was renamed from `snake_case` to `camelCase`, so the
   external MCP name now matches the in-app tool name exactly (one logical tool,

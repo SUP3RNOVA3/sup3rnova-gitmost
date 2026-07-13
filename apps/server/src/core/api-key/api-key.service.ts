@@ -13,6 +13,7 @@ import { TokenService } from '../auth/services/token.service';
 import { JwtApiKeyPayload } from '../auth/dto/jwt-payload';
 import { ApiKey, User, Workspace } from '@docmost/db/types/entity.types';
 import { isUserDisabled } from '../../common/helpers';
+import { incApiKeyAuthDenied } from '../../integrations/metrics/metrics.registry';
 
 // Default lifetime for a new key when the caller does not specify one: 1 year.
 // The owner runs a homelab where agents live for years; forcing rotation is
@@ -24,6 +25,23 @@ const DEFAULT_LIFETIME_MS = 365 * 24 * 60 * 60 * 1000;
 // 1h resolution is a deliberate constant (forensics granularity, not accounting).
 const LAST_USED_THROTTLE_MS = 60 * 60 * 1000;
 
+// #558 — deny-observability: rate-limit the per-(apiKeyId, reason) WARN to at
+// most one line per this window, so a revoked/dead key hammering the endpoint
+// leaves ONE operator-visible signal per minute instead of flooding the log (or,
+// as before, being totally silent). The prom counter is unthrottled.
+const DENY_WARN_WINDOW_MS = 60_000;
+
+// The BOUNDED set of api-key deny reasons. Used as the prom `reason` label (so
+// its cardinality is fixed) and as part of the WARN aggregation key. NEVER
+// free-form / caller-controlled input.
+type ApiKeyDenyReason =
+  | 'malformed_payload'
+  | 'revoked_or_missing'
+  | 'expired'
+  | 'user_disabled'
+  | 'owner_mismatch'
+  | 'workspace_missing';
+
 /**
  * Core API-key lifecycle service. Owns minting (create), the single validator
  * shared by BOTH the REST jwt.strategy path and the /mcp Bearer path (validate),
@@ -33,6 +51,11 @@ const LAST_USED_THROTTLE_MS = 60 * 60 * 1000;
 @Injectable()
 export class ApiKeyService {
   private readonly logger = new Logger(ApiKeyService.name);
+
+  // #558 — last WARN time per `${apiKeyId}:${reason}` aggregation key, for the
+  // rate-limited deny WARN. Bounded by (#issued keys × #reasons) since apiKeyId
+  // is a verified, issued id (see denyValidate) and reason is a fixed set.
+  private readonly lastDenyWarnAt = new Map<string, number>();
 
   constructor(
     private readonly apiKeyRepo: ApiKeyRepo,
@@ -106,7 +129,7 @@ export class ApiKeyService {
     payload: JwtApiKeyPayload,
   ): Promise<{ user: User; workspace: Workspace }> {
     if (!payload?.apiKeyId || !payload?.sub || !payload?.workspaceId) {
-      throw new UnauthorizedException();
+      throw this.denyValidate('malformed_payload', payload?.apiKeyId);
     }
 
     const row = await this.apiKeyRepo.findById(
@@ -116,12 +139,12 @@ export class ApiKeyService {
     // Absent row = revoked (soft-deleted, invisible to findById), orphaned
     // (creator/workspace cascade-deleted), or never existed. All terminal deny.
     if (!row) {
-      throw new UnauthorizedException();
+      throw this.denyValidate('revoked_or_missing', payload.apiKeyId);
     }
 
     // Expiry is read from the ROW, never an `exp` JWT claim.
     if (row.expiresAt && row.expiresAt.getTime() <= Date.now()) {
-      throw new UnauthorizedException();
+      throw this.denyValidate('expired', payload.apiKeyId);
     }
 
     const user = await this.userRepo.findById(
@@ -130,24 +153,62 @@ export class ApiKeyService {
       { includeIsAgent: true },
     );
     if (!user || isUserDisabled(user)) {
-      throw new UnauthorizedException();
+      throw this.denyValidate('user_disabled', payload.apiKeyId);
     }
 
     // The key acts only as its creator (defence in depth against a token whose
     // signed `sub` ever drifted from the row's owner).
     if (row.creatorId !== user.id) {
-      throw new UnauthorizedException();
+      throw this.denyValidate('owner_mismatch', payload.apiKeyId);
     }
 
     const workspace = await this.workspaceRepo.findById(payload.workspaceId);
     if (!workspace) {
-      throw new UnauthorizedException();
+      throw this.denyValidate('workspace_missing', payload.apiKeyId);
     }
 
     // Best-effort, throttled, fire-and-forget forensics stamp AFTER all checks.
     this.touchLastUsed(row);
 
     return { user, workspace };
+  }
+
+  /**
+   * #558 — deny-observability for validate(). Records EVERY definite deny to the
+   * prom counter (`api_key_auth_denied_total{reason}`, unthrottled) AND emits a
+   * rate-limited operator WARN keyed on (apiKeyId, reason). Returns the bare,
+   * generic `UnauthorizedException` the caller throws — the response body stays a
+   * uniform 401 (anti-enumeration): the WARN is operator-log-only and never
+   * surfaced to the client. It replaces the visibility the deleted /mcp Basic
+   * brute-force limiter used to give, so a revoked/dead key hammering the
+   * endpoint is no longer totally silent.
+   *
+   * `apiKeyId` is safe to log here: validate() is only ever reached AFTER the JWT
+   * signature was verified by the caller (jwt.strategy / the /mcp Bearer router),
+   * so the id is a verified, issued key id — bounded cardinality, never an
+   * unverified/attacker-controlled value. Brute-force is moot for the
+   * unguessable HMAC-signed api_key JWT, so no limiter is needed — only this
+   * visibility.
+   */
+  private denyValidate(
+    reason: ApiKeyDenyReason,
+    apiKeyId?: string,
+  ): UnauthorizedException {
+    // Unthrottled counter (bounded `reason` label; apiKeyId is NOT a label).
+    incApiKeyAuthDenied(reason);
+
+    // Rate-limited structured WARN, one per (apiKeyId, reason) per window.
+    const key = `${apiKeyId ?? 'unknown'}:${reason}`;
+    const now = Date.now();
+    const last = this.lastDenyWarnAt.get(key);
+    if (last === undefined || now - last >= DENY_WARN_WINDOW_MS) {
+      this.lastDenyWarnAt.set(key, now);
+      this.logger.warn(
+        `api-key auth denied: reason=${reason} apiKeyId=${apiKeyId ?? 'unknown'}`,
+      );
+    }
+
+    return new UnauthorizedException();
   }
 
   /**
