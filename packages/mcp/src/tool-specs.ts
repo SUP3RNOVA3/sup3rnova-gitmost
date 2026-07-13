@@ -749,16 +749,21 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'savePageVersion',
     writeClass: 'write',
     description:
-      'Save an intentional, NAMED version (kind=agent) of the page\'s CURRENT ' +
-      'live content — a restorable checkpoint pinned into its history. Call it ' +
-      'when you have FINISHED a coherent editing pass (not after every small ' +
-      'edit), so the reader can see and roll back to the state you left. The ' +
-      'version type is derived SERVER-SIDE from your signed agent identity (you ' +
-      'cannot mislabel it); a save whose content is IDENTICAL to the last saved ' +
-      'version is promoted/no-op\'d server-side, so a redundant call is harmless ' +
-      'and never duplicates a version. Returns { saved:true, historyId, kind, ' +
-      'alreadySaved } on success, or { saved:false, skipped:true, reason:\'empty\' } ' +
-      'when the page had nothing to pin (e.g. it was empty).',
+      'Pin an intentional, NAMED version (kind=agent) of the page\'s CURRENT ' +
+      'live content — a restorable checkpoint in its history. Save a version ' +
+      'BOTH BEFORE you start a round of edits to EXISTING content (a safety ' +
+      '"before" point you can roll back to) AND AFTER you finish the round (the ' +
+      'state you left, for the reader). DELETE CARVEOUT: do NOT pre-save if the ' +
+      'PURPOSE of the edit is to REMOVE sensitive/confidential content ' +
+      '(pre-saving would preserve what you\'re removing in recoverable, ' +
+      'permission-shared history) — pre-save only for edits that ADD or REVISE ' +
+      'content. The version type is derived SERVER-SIDE from your signed agent ' +
+      'identity (you cannot mislabel it); a save whose content is IDENTICAL to ' +
+      'the last saved version is promoted/no-op\'d server-side, so a redundant ' +
+      'call is harmless and never duplicates a version. Returns { saved:true, ' +
+      'historyId, kind, alreadySaved } on success, or { saved:false, ' +
+      'skipped:true, reason:\'empty\' } when the page had nothing to pin (e.g. it ' +
+      'was empty).',
     tier: 'deferred',
     catalogLine:
       'savePageVersion — pin the page\'s current content as a named agent version (restorable checkpoint).',

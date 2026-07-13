@@ -1,7 +1,7 @@
 {
   "call-summarizer": {
-    "version": 1,
-    "hash": "edba0c5ac5e27460f73efd361ee4e7cb743a085ae141f3b649e9d306e5929553"
+    "version": 3,
+    "hash": "d507c5885c7ca11a9b1df29d45fe88c86711c7383e20c6a62b235f09bd9ab4d7"
   },
   "fact-checker": {
     "version": 6,
@@ -20,8 +20,8 @@
     "hash": "cef39fed321779631ddd1077fcba53399adf0e48b301df281c71eb042610900d"
   },
   "researcher": {
-    "version": 9,
-    "hash": "880047f6a8612d420c77c03d9cc6308a25b2cd6f84647da9df9bae0e22bd5e4d"
+    "version": 11,
+    "hash": "ad2f66da891940d9ff1462a2697a5812303653c7b946e0a4118e10df459add08"
   },
   "structural-editor": {
     "version": 4,
