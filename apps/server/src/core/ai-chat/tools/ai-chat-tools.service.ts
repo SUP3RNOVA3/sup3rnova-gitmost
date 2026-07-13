@@ -718,15 +718,27 @@ export class AiChatToolsService {
           // still leaves enough results.
           const candidates = Math.min(Math.max(cap * 5, 50), 200);
 
-          // 1) Embed the query. Unconfigured embeddings (or any embedding error)
-          //    routes to the REST full-text fallback instead of erroring.
+          // 1) Embed the query via the SAME AiService.embedQuery the search
+          //    subsystem uses (#571). embedQuery resolves the active provider,
+          //    applies its QUERY prefix (so the query lives in the same prefixed
+          //    space as the indexer's passage-prefixed docs of THIS generation),
+          //    and returns the active `fingerprint` — which we thread into
+          //    hybridSearch so the vector arm only fuses against current-
+          //    generation rows (never stale cross-provider vectors). Unconfigured
+          //    embeddings (or any embedding error) routes to the REST full-text
+          //    fallback instead of erroring; a successful embed always yields a
+          //    matching fingerprint, so the read can never filter against the
+          //    wrong generation.
           let queryVector: number[];
+          let fingerprint: string;
           try {
-            const [vec] = await this.aiService.embedTexts(workspaceId, [
+            const embedded = await this.aiService.embedQuery(
+              workspaceId,
               trimmed,
-            ]);
-            if (!vec) return await fallback();
-            queryVector = vec;
+            );
+            if (!embedded?.vector) return await fallback();
+            queryVector = embedded.vector;
+            fingerprint = embedded.fingerprint;
           } catch (err) {
             if (!(err instanceof AiEmbeddingNotConfiguredException)) {
               // Never leak provider/key details; log generically and fall back.
@@ -756,6 +768,7 @@ export class AiChatToolsService {
             trimmed,
             accessibleSpaceIds,
             candidates,
+            fingerprint,
           );
           if (hits.length === 0) return await fallback();
 

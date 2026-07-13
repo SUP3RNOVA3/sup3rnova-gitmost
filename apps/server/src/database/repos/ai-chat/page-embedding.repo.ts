@@ -278,9 +278,19 @@ export class PageEmbeddingRepo {
    * and Weaviate) and equal 1.0/1.0 weights as a starting point. `candidates`
    * is both the per-CTE over-fetch limit and the final fused LIMIT.
    *
-   * The `model_dimensions = $dim` filter applies ONLY on the semantic side
-   * (cosine compares same-dimension vectors; pgvector errors otherwise). The
-   * lexical side (`fts`) is dimension-independent. Its query config is `ru_en`,
+   * The `model_dimensions = $dim` AND `fingerprint = $fp` filters apply ONLY on
+   * the semantic side, mirroring `vectorCandidateArm` (the search subsystem's
+   * vector arm) EXACTLY so RAG reads the SAME same-generation invariant: `<=>`
+   * only ever fuses the query against current-generation, same-dimension vectors.
+   * Without the fingerprint filter, a cross-provider embedding transition (same
+   * 384-dim, different provider, no reindex) would silently fuse the query against
+   * STALE rows of a different generation and degrade cosine quality (#571). Both
+   * `model_dimensions` (pgvector errors on a dimension mismatch) and `fingerprint`
+   * (a mismatch fuses incomparable vectors) must therefore be filtered. The active
+   * `$fp`/`$dim` come from the SAME `AiService.embedQuery` the search path uses, so
+   * the read filters against exactly the generation the query vector was produced
+   * for. The lexical side (`fts`) is generation-independent and is left unchanged.
+   * Its query config is `ru_en`,
    * matched IN LOCKSTEP with the `page_embeddings.fts` generated column's config
    * (#529 acceptance #13): a mismatch silently breaks Cyrillic RAG retrieval. If
    * `websearch_to_tsquery` yields an EMPTY query (e.g. the text is all stopwords)
@@ -298,6 +308,11 @@ export class PageEmbeddingRepo {
     spaceIds: string[],
     // Per-CTE over-fetch AND the final fused LIMIT.
     candidates: number,
+    // #571: the ACTIVE embedding fingerprint (from AiService.embedQuery, the same
+    // helper the search path threads into vectorCandidateArm). The semantic CTE
+    // filters `page_embeddings.fingerprint = $fp` so the query is only fused
+    // against current-generation rows — never stale cross-provider vectors.
+    fingerprint: string,
   ): Promise<PageEmbeddingHybridHit[]> {
     if (spaceIds.length === 0) return [];
 
@@ -323,6 +338,7 @@ export class PageEmbeddingRepo {
         WHERE pe.workspace_id = ${workspaceId}
           AND pe.space_id IN (${spaceList})
           AND pe.model_dimensions = ${queryDim}
+          AND pe.fingerprint = ${fingerprint}
           AND p.deleted_at IS NULL
         ORDER BY pe.embedding <=> ${queryVector}
         LIMIT ${candidates}
