@@ -770,4 +770,65 @@ describe('#487 AiChatRunService.supersede (CAS)', () => {
     });
     expect(svc.hasZombie('run-1')).toBe(false);
   });
+
+  it('S5 micro-race: a periodic reconcile re-drives the zombie between awaitSettled and settleZombie -> supersede reports the freed slot as READY, NOT a false SUPERSEDE_TIMEOUT', async () => {
+    // The scenario (self-healing today; this guard removes the transient false
+    // timeout): finalizeRun gives up -> a zombie is recorded and the settle
+    // notifier resolves terminalWriteFailed:true. supersede's awaitSettled reads
+    // that (terminalWriteFailed:true) and moves to settleZombie. In the tiny
+    // window BEFORE settleZombie runs, the periodic zombie reconcile WINS the
+    // re-drive: it applies the intended status (row now TERMINAL) and clears the
+    // zombie. So supersede's settleZombie finds no zombie -> returns false, yet
+    // the slot is genuinely FREE. The guard re-reads the row and returns `ready`.
+    let rowTerminal = false;
+    const repo = makeRepo({
+      // getRun / rowIsTerminal read the row: it flips to TERMINAL the moment the
+      // reconcile wins (below), mirroring the conditional finalize the reconcile
+      // applied.
+      findById: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: rowTerminal ? 'aborted' : 'running',
+        error: null,
+      })),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+      // The finalize keeps failing on THIS replica -> the run gives up (zombie).
+      finalizeIfActive: jest.fn(async () => {
+        throw new Error('db down for this replica');
+      }),
+    });
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+
+    // The terminal write gives up -> zombie (row still 'running' on this replica).
+    await svc.finalizeRun('run-1', ws, 'aborted');
+    expect(svc.hasZombie('run-1')).toBe(true);
+
+    // Inject the concurrent reconcile at the exact race seam: when supersede
+    // reaches settleZombie, the reconcile has ALREADY settled the row terminal
+    // and cleared the zombie, so this call finds nothing to do (returns false).
+    const settleSpy = jest
+      .spyOn(svc, 'settleZombie')
+      .mockImplementation(async (id: string) => {
+        rowTerminal = true; // the reconcile's conditional UPDATE landed
+        expect(svc.hasZombie(id)).toBe(true);
+        const internal = svc as unknown as { zombies: Map<string, unknown> };
+        internal.zombies.delete(id);
+        return false; // zombie gone -> settleZombie's own contract returns false
+      });
+
+    // Without the guard this would be { kind: 'timeout' } (a FALSE timeout).
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'ready',
+    });
+    expect(settleSpy).toHaveBeenCalledWith('run-1');
+  });
 });

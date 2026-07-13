@@ -658,7 +658,29 @@ export class AiChatRunService implements OnModuleInit {
     // is still stranded -> treat as a timeout (nothing persisted for the new run).
     if (outcome.terminalWriteFailed) {
       const settled = await this.settleZombie(targetRunId);
-      if (!settled) return { kind: 'timeout' };
+      if (!settled && !(await this.rowIsTerminal(targetRunId, workspaceId))) {
+        // settleZombie returned false in one of TWO ways we MUST NOT conflate:
+        //   (1) our OWN re-drive threw (the DB is still down) — the row is
+        //       genuinely stranded non-terminal, a real SUPERSEDE_TIMEOUT
+        //       (nothing persisted, the slot is NOT free); or
+        //   (2) S5 micro-race: a CONCURRENT re-driver (the periodic zombie
+        //       reconcile) already settled AND cleared this zombie in the tiny
+        //       window between awaitSettled reading the zombie synth
+        //       (terminalWriteFailed: true) and this settleZombie call, so the
+        //       zombie map is empty HERE (settleZombie sees `!z` -> false) even
+        //       though the row is now terminal and the slot IS free.
+        // Reporting a timeout in case (2) is a FALSE SUPERSEDE_TIMEOUT: it
+        // self-heals (the caller retries and the next supersede sees the freed
+        // slot), but it needlessly bounces a supersede whose slot is already
+        // free. `rowIsTerminal` re-reads the row to tell the cases apart. This
+        // can NEVER mask a real timeout, so it does not weaken the invariant:
+        // the "one active run per chat" slot is enforced by the partial unique
+        // index over pending|running rows, which a TERMINAL row does not occupy;
+        // and the caller still re-gates through beginRun, so a `ready` that lost
+        // its slot to a neighbour in between just gets a clean MISMATCH there.
+        // Only a still-non-terminal row (or an unreadable one) is a timeout.
+        return { kind: 'timeout' };
+      }
     }
     return { kind: 'ready' };
   }
@@ -782,6 +804,23 @@ export class AiChatRunService implements OnModuleInit {
    *  explicit stop targeting a runId. */
   getRun(runId: string, workspaceId: string): Promise<AiChatRun | undefined> {
     return this.runRepo.findById(runId, workspaceId);
+  }
+
+  /** #487/S5: whether the run's row is currently TERMINAL (the slot is free).
+   *  Best-effort — a read failure returns false (conservative: the caller then
+   *  treats the outcome as unconfirmed). Used by supersede to tell a genuine
+   *  give-up (row still non-terminal) apart from the S5 reconcile race (zombie
+   *  already re-driven, row terminal). NEVER throws. */
+  private async rowIsTerminal(
+    runId: string,
+    workspaceId: string,
+  ): Promise<boolean> {
+    try {
+      const row = await this.runRepo.findById(runId, workspaceId);
+      return !!row && isRunTerminal(row.status);
+    } catch {
+      return false;
+    }
   }
 
   /** The active run on a chat, if any (used to reject a concurrent start with a

@@ -106,7 +106,7 @@ export const SUBSCRIBER_MAX_BUFFERED_BYTES = 2 * AI_CHAT_RUN_STREAM_MAX_BUFFER_B
  * delta is JSON-escaped (`\"type\":...`), and the frame would start with
  * `data: {"type":"text-delta"` anyway.
  */
-const FINISH_STEP_FRAME_PREFIX = 'data: {"type":"finish-step"';
+export const FINISH_STEP_FRAME_PREFIX = 'data: {"type":"finish-step"';
 
 /** Resolve the ring cap from the environment, falling back to the default. */
 function resolveMaxBufferBytes(): number {

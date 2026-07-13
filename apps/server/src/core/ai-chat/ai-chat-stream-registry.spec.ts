@@ -2,8 +2,11 @@ import {
   AiChatStreamRegistryService,
   AI_CHAT_RUN_STREAM_MAX_BUFFER_BYTES,
   RUN_STREAM_RETAIN_FINISHED_MS,
+  FINISH_STEP_FRAME_PREFIX,
   RunStreamCallbacks,
 } from './ai-chat-stream-registry.service';
+import { streamText, JsonToSseTransformStream } from 'ai';
+import { MockLanguageModelV3, convertArrayToReadableStream } from 'ai/test';
 
 /**
  * Unit tests for the in-memory run-stream registry (#184 phase 1.5, step-aligned
@@ -580,5 +583,89 @@ describe('AiChatStreamRegistryService retention timers', () => {
     const entry = (registry as any).entries.get(CHAT);
     expect(entry).toBeDefined();
     expect(entry.runId).toBe('run-2');
+  });
+});
+
+/**
+ * #555 item 3 — CANARY for the `finish-step` SSE framing the registry depends on.
+ *
+ * The registry stamps each buffered frame by counting `finish-step` boundaries via
+ * a cheap PREFIX match (`FINISH_STEP_FRAME_PREFIX = 'data: {"type":"finish-step"'`),
+ * deliberately avoiding a JSON.parse per frame. That prefix is pinned to the wire
+ * shape ai@6.0.207 emits: every UI-message-stream part is a single
+ * `data: {json}\n\n` SSE event (never split across `data:` lines) and `type` is the
+ * FIRST key. If a future `ai` SDK bump changes that framing — renames the part,
+ * reorders keys so `type` is no longer first, or reshapes the SSE envelope — the
+ * prefix silently stops matching: steps never advance, and the resumable transport
+ * degrades to the 204/poll fallback WITHOUT any test failing. This canary drives a
+ * REAL streamText through the SDK's own UI-message-stream -> SSE serializer and
+ * asserts the finish-step boundary still matches the exact prefix the code keys on,
+ * so such a bump FAILS LOUDLY here instead of degrading in production.
+ */
+describe('finish-step framing canary (#555 item 3 — detects ai-SDK framing drift)', () => {
+  // Collect every SSE frame the SDK emits for a one-step text generation, using the
+  // SAME path production uses (toUIMessageStream -> JsonToSseTransformStream, which
+  // is what pipeUIMessageStreamToResponse serializes with).
+  async function realSdkFrames(): Promise<string[]> {
+    // The provider-level stream parts a one-step text generation emits. Typed as
+    // `any[]` on purpose: this canary asserts the SDK's OUTPUT wire framing, not the
+    // provider-protocol input types (which are an internal SDK concern and noisy to
+    // satisfy exactly). The runtime shapes are the real ones the SDK consumes.
+    const providerStreamParts: any[] = [
+      { type: 'text-start', id: '0' },
+      { type: 'text-delta', id: '0', delta: 'hello' },
+      { type: 'text-end', id: '0' },
+      {
+        type: 'finish',
+        finishReason: 'stop',
+        usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+      },
+    ];
+    const model = new MockLanguageModelV3({
+      doStream: async () => ({
+        stream: convertArrayToReadableStream(providerStreamParts),
+      }),
+    });
+    const result = streamText({ model, prompt: 'hi' });
+    const sse = result
+      .toUIMessageStream()
+      .pipeThrough(new JsonToSseTransformStream());
+    const reader = sse.getReader();
+    const frames: string[] = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      frames.push(value);
+    }
+    return frames;
+  }
+
+  it('a single generation step emits EXACTLY ONE finish-step frame matching FINISH_STEP_FRAME_PREFIX', async () => {
+    const frames = await realSdkFrames();
+    const finishStepFrames = frames.filter((f) =>
+      f.startsWith(FINISH_STEP_FRAME_PREFIX),
+    );
+    // The registry counts one boundary per finished step; a single step -> one.
+    expect(finishStepFrames).toHaveLength(1);
+  });
+
+  it('the finish-step frame is a self-contained SSE event with `type` as the FIRST key (the two facts the prefix match relies on)', async () => {
+    const frames = await realSdkFrames();
+    const frame = frames.find((f) => f.startsWith(FINISH_STEP_FRAME_PREFIX))!;
+    expect(frame).toBeDefined();
+
+    // FACT 1: one part per `data:` event, terminated by a blank line — never split
+    // across multiple `data:` lines (a prefix match would break otherwise).
+    expect(frame.startsWith('data: ')).toBe(true);
+    expect(frame.endsWith('\n\n')).toBe(true);
+    expect(frame.match(/\bdata:/g)).toHaveLength(1);
+
+    // FACT 2: the JSON payload's FIRST key is `type` with value `finish-step`
+    // (the prefix pins the leading `{"type":"finish-step"`), and the part carries
+    // no other leading key that would push `type` out of first position.
+    const payload = frame.slice('data: '.length).trimEnd();
+    const parsed = JSON.parse(payload) as Record<string, unknown>;
+    expect(Object.keys(parsed)[0]).toBe('type');
+    expect(parsed.type).toBe('finish-step');
   });
 });
