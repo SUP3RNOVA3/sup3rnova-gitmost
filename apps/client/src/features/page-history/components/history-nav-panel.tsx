@@ -33,6 +33,9 @@ interface Props {
   isLoading: boolean;
   counts: Map<string, number>;
   selectedDayISO: string | null;
+  // #583 Fix A — notify the parent which day the user picked so it can set the
+  // ephemeral calendar highlight. Distinct from MiniCalendar's onPickDay (scroll).
+  onDayPicked?: (dayISO: string) => void;
   tz: string;
   onlyVersions: boolean;
   setOnlyVersions: (v: boolean) => void;
@@ -57,6 +60,7 @@ export default function HistoryNavPanel({
   isLoading,
   counts,
   selectedDayISO,
+  onDayPicked,
   tz,
   onlyVersions,
   setOnlyVersions,
@@ -155,7 +159,14 @@ export default function HistoryNavPanel({
       <MiniCalendar
         counts={counts}
         selectedDayISO={selectedDayISO}
-        onPickDay={handlePickDay}
+        // #583 Fix A — COMPOSE both handlers: set the ephemeral highlight first,
+        // then run the existing scroll/load. Setting the highlight up front means
+        // it lands even when handlePickDay early-returns (day already visible).
+        // handlePickDay's scroll/load logic is unchanged.
+        onPickDay={(d) => {
+          onDayPicked?.(d);
+          handlePickDay(d);
+        }}
         tz={tz}
       />
 

@@ -67,6 +67,13 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
   const [highlightChanges, setHighlightChanges] = useAtom(highlightChangesAtom);
   const diffCounts = useAtomValue(diffCountsAtom);
   const [onlyVersions, setOnlyVersions] = useState(false);
+  // #583 Fix A — EPHEMERAL "picked day" highlight for the calendar, in ADDITION
+  // to the existing scroll. Local useState (NOT a jotai atom): the desktop modal
+  // unmounts on close, so the highlight resets on next open while the active
+  // version persists in activeHistoryIdAtom. When a version/row is selected we
+  // clear it (in handleSelect) so the highlight snaps back to the version's day
+  // and the two selections never drift apart.
+  const [pickedDayISO, setPickedDayISO] = useState<string | null>(null);
 
   useHistoryReset(pageId);
   const { canRestore, confirmRestore } = useHistoryRestore();
@@ -102,6 +109,9 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
       // filtered/grouped neighbour), so diff/restore stay correct under "Only
       // versions".
       setActiveHistoryPrevId(resolvePrevSnapshotId(historyItems, id));
+      // #583 Fix A — clear the ephemeral day pick so the calendar highlight
+      // returns to the newly-selected version's day (selectedRow.dayISO).
+      setPickedDayISO(null);
     },
     [historyItems, setActiveHistoryId, setActiveHistoryPrevId],
   );
@@ -216,7 +226,10 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
           isError={isError}
           isLoading={isLoading}
           counts={counts}
-          selectedDayISO={selectedRow?.dayISO ?? null}
+          // #583 Fix A — an ephemeral day pick wins over the selected version's
+          // day; falls back to the version's day, then null.
+          selectedDayISO={pickedDayISO ?? selectedRow?.dayISO ?? null}
+          onDayPicked={setPickedDayISO}
           tz={tz}
           onlyVersions={onlyVersions}
           setOnlyVersions={setOnlyVersions}
@@ -243,7 +256,11 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
               </Text>
             </Stack>
           ) : (
-            <Box p="26px 0" maw={720} mx="auto">
+            {/* #583 Fix B — fullScreen gives the article far more room. Add side
+                padding (.historyEditor .ProseMirror is padding:0 !important, so
+                without it the title/text stick to the panel edge) and a gentle
+                width cap centered so lines stay readable on 4K. */}
+            <Box p="26px 44px" maw={1100} mx="auto">
               {activeHistoryId && <HistoryView />}
             </Box>
           )}

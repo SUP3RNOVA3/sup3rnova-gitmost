@@ -50,7 +50,7 @@ export default function HistoryModal({ pageId, pageTitle }: Props) {
   // dropped for desktop and the body renders edge-to-edge.
   return (
     <Modal.Root
-      size={1400}
+      fullScreen
       opened={isModalOpen}
       onClose={() => setModalOpen(false)}
       aria-label={t("Page history")}
