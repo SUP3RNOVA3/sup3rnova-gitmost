@@ -59,6 +59,17 @@ export class PageWorkTimeDto extends PageIdDto {
   tz?: string;
 }
 
+export class PageHistoryDayCountsDto extends PageIdDto {
+  // #568 — viewer IANA timezone the revisions-per-day heatmap is bucketed in.
+  // Optional (falls back to UTC server-side); length-capped so a bogus value
+  // cannot bloat the request. The value only ever reaches Intl.DateTimeFormat,
+  // which throws on an unknown zone (caught by the controller → 400).
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  tz?: string;
+}
+
 export class DeletePageDto extends PageIdDto {
   @IsOptional()
   @IsBoolean()

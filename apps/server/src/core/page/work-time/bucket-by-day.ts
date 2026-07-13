@@ -100,7 +100,7 @@ function nextDayStart(dayStart: number, tz: string): number {
   return zonedDayStart(dayStart + 26 * 60 * 60 * 1000, tz);
 }
 
-function isoDay(dayStart: number, tz: string): string {
+export function isoDay(dayStart: number, tz: string): string {
   const p = wallParts(dayStart, tz);
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${p.year}-${pad(p.month)}-${pad(p.day)}`;
