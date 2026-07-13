@@ -15,6 +15,7 @@ vi.mock("@/lib/api-client", () => ({
 import {
   createApiKey,
   getApiKeys,
+  revealApiKey,
 } from "@/features/api-key/services/api-key-service";
 
 beforeEach(() => {
@@ -74,5 +75,24 @@ describe("api-key-service response-contract unwrap", () => {
     expect(result).toEqual(rows);
     expect(result).toHaveLength(2);
     expect(post).toHaveBeenCalledWith("/api-keys/list");
+  });
+
+  it("revealApiKey unwraps the envelope to the bare token string", async () => {
+    const SECRET = "gm_revealed-token";
+    post.mockResolvedValue({
+      data: { token: SECRET },
+      success: true,
+      status: 200,
+    });
+
+    const result = await revealApiKey({ id: "key-1", password: "pw" });
+
+    // The service returns ONLY the token string (not the { token } wrapper), so
+    // the caller can copy it straight to the clipboard.
+    expect(result).toBe(SECRET);
+    expect(post).toHaveBeenCalledWith("/api-keys/reveal", {
+      id: "key-1",
+      password: "pw",
+    });
   });
 });

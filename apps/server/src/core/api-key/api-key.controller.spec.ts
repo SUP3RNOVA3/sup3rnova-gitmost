@@ -1,4 +1,8 @@
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  ForbiddenException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { ApiKeyController } from './api-key.controller';
 import {
   WorkspaceCaslAction,
@@ -12,7 +16,8 @@ import {
  *    — GitHub-PAT semantics closing post-revocation laundering.
  *  - admin (CASL Manage on API) sees/revokes all workspace keys; a member only
  *    their own.
- *  - kill-switch OFF -> the surface 404s (looks like the feature does not exist).
+ *  - reveal: password step-up (401 on wrong password), owner-only even for admin
+ *    (404), api_key principal 403 — the copyable-key surface (#557).
  */
 
 function makeController(over: any = {}) {
@@ -22,6 +27,7 @@ function makeController(over: any = {}) {
       key: { id: 'k1', name: 'n', expiresAt: null, createdAt: new Date() },
     }),
     revoke: jest.fn().mockResolvedValue(undefined),
+    reveal: jest.fn().mockResolvedValue('remint.tok'),
     ...(over.apiKeyService ?? {}),
   };
   const apiKeyRepo = {
@@ -36,16 +42,16 @@ function makeController(over: any = {}) {
     }),
     ...(over.workspaceAbility ?? {}),
   };
-  const environmentService = {
-    isApiKeysEnabled: jest.fn().mockReturnValue(over.enabled ?? true),
-    ...(over.environmentService ?? {}),
+  const authService = {
+    verifyUserCredentials: jest.fn().mockResolvedValue({ id: 'u-1' }),
+    ...(over.authService ?? {}),
   };
   const auditService = { log: jest.fn() };
   const controller = new ApiKeyController(
     apiKeyService as any,
     apiKeyRepo as any,
     workspaceAbility as any,
-    environmentService as any,
+    authService as any,
     auditService as any,
   );
   return {
@@ -53,12 +59,12 @@ function makeController(over: any = {}) {
     apiKeyService,
     apiKeyRepo,
     workspaceAbility,
-    environmentService,
+    authService,
     auditService,
   };
 }
 
-const user = { id: 'u-1', workspaceId: 'ws-1' } as any;
+const user = { id: 'u-1', email: 'u@x.io', workspaceId: 'ws-1' } as any;
 const workspace = { id: 'ws-1' } as any;
 const reqAccess = () => ({ raw: {}, ip: '1.2.3.4', socket: {} }) as any;
 const reqApiKey = () =>
@@ -86,20 +92,86 @@ describe('ApiKeyController — a token cannot manage tokens', () => {
       controller.revoke({ id: 'k1' } as any, user, workspace, reqApiKey()),
     ).rejects.toBeInstanceOf(ForbiddenException);
   });
+
+  it('403 on reveal for an api_key principal (a key cannot reveal its siblings)', async () => {
+    const { controller, authService, apiKeyService } = makeController();
+    await expect(
+      controller.reveal(
+        { id: 'k1', password: 'pw' } as any,
+        user,
+        workspace,
+        reqApiKey(),
+      ),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    // Rejected BEFORE the step-up and the key lookup even run.
+    expect(authService.verifyUserCredentials).not.toHaveBeenCalled();
+    expect(apiKeyService.reveal).not.toHaveBeenCalled();
+  });
 });
 
-describe('ApiKeyController — kill-switch OFF → 404', () => {
-  it('create/list/revoke all 404 when disabled', async () => {
-    const { controller } = makeController({ enabled: false });
+describe('ApiKeyController — reveal (copyable key under step-up)', () => {
+  it('re-mints and returns the token + logs API_KEY_REVEALED on success', async () => {
+    const { controller, apiKeyService, authService, auditService } =
+      makeController();
+    const res = await controller.reveal(
+      { id: 'k1', password: 'correct-horse' } as any,
+      user,
+      workspace,
+      reqAccess(),
+    );
+
+    expect(res).toEqual({ token: 'remint.tok' });
+    // Step-up ran with the caller's email + supplied password.
+    expect(authService.verifyUserCredentials).toHaveBeenCalledWith(
+      { email: 'u@x.io', password: 'correct-horse' },
+      'ws-1',
+    );
+    expect(apiKeyService.reveal).toHaveBeenCalledWith({
+      apiKeyId: 'k1',
+      user,
+      workspaceId: 'ws-1',
+    });
+    expect(auditService.log).toHaveBeenCalledWith(
+      expect.objectContaining({ event: 'api_key.revealed' }),
+    );
+  });
+
+  it('401 on a wrong password — step-up runs BEFORE the key lookup (no oracle)', async () => {
+    const { controller, apiKeyService } = makeController({
+      authService: {
+        verifyUserCredentials: jest
+          .fn()
+          .mockRejectedValue(new UnauthorizedException()),
+      },
+    });
     await expect(
-      controller.create({ name: 'x' } as any, user, reqAccess()),
-    ).rejects.toBeInstanceOf(NotFoundException);
+      controller.reveal(
+        { id: 'k1', password: 'wrong' } as any,
+        user,
+        workspace,
+        reqAccess(),
+      ),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+    // The key is never looked up / re-minted when step-up fails.
+    expect(apiKeyService.reveal).not.toHaveBeenCalled();
+  });
+
+  it("propagates the service's uniform 404 (absent/revoked/expired/non-owner)", async () => {
+    const { controller, auditService } = makeController({
+      apiKeyService: {
+        reveal: jest.fn().mockRejectedValue(new NotFoundException()),
+      },
+    });
     await expect(
-      controller.list(user, workspace, reqAccess()),
+      controller.reveal(
+        { id: 'k1', password: 'correct' } as any,
+        user,
+        workspace,
+        reqAccess(),
+      ),
     ).rejects.toBeInstanceOf(NotFoundException);
-    await expect(
-      controller.revoke({ id: 'k1' } as any, user, workspace, reqAccess()),
-    ).rejects.toBeInstanceOf(NotFoundException);
+    // No audit event on a failed reveal.
+    expect(auditService.log).not.toHaveBeenCalled();
   });
 });
 

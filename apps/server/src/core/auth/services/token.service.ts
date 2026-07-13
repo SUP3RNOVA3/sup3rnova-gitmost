@@ -155,19 +155,31 @@ export class TokenService {
     // signer would silently get exp=now+90d and die in 90 days regardless of its
     // row. We mint through a dedicated no-expiry signer, re-stamping only
     // `issuer: 'Docmost'` for claim parity with the shared signer.
+    //
+    // The dedicated signer ALSO sets `noTimestamp: true`, so the token carries
+    // neither `exp` nor `iat`. The payload is a fixed literal { sub, apiKeyId,
+    // workspaceId, type } in a stable order, so the HS256 signature is a pure
+    // deterministic function of (sub, apiKeyId, workspaceId, APP_SECRET): minting
+    // the SAME key twice yields a BYTE-IDENTICAL token. This is what makes the key
+    // "copyable" — the reveal endpoint (#557) re-mints the same value under a
+    // step-up without ever persisting the token material.
     return this.apiKeyJwtService().sign(payload);
   }
 
   // Lazily-built JWT signer for API-key tokens: same APP_SECRET, same 'Docmost'
   // issuer, but WITHOUT the global `expiresIn` — so minted API-key tokens have no
-  // `exp` claim. Built once and cached. Verification still goes through the
-  // shared verifier (same secret); `verifyAsync` does not require an `exp`.
+  // `exp` claim. `noTimestamp: true` additionally suppresses the default `iat`
+  // claim jsonwebtoken would otherwise add, making the minted token a fully
+  // deterministic function of its payload + secret (byte-identical re-mints, the
+  // basis of the copyable/reveal flow). Built once and cached. Verification still
+  // goes through the shared verifier (same secret); `verifyAsync` does not
+  // require an `exp` or `iat`.
   private _apiKeyJwtService?: JwtService;
   private apiKeyJwtService(): JwtService {
     if (!this._apiKeyJwtService) {
       this._apiKeyJwtService = new JwtService({
         secret: this.environmentService.getAppSecret(),
-        signOptions: { issuer: 'Docmost' },
+        signOptions: { issuer: 'Docmost', noTimestamp: true },
       });
     }
     return this._apiKeyJwtService;

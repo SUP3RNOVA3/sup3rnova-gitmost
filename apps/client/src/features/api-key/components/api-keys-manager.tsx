@@ -13,27 +13,26 @@ import {
 } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { notifications } from "@mantine/notifications";
-import { IconAlertTriangle, IconKey, IconTrash } from "@tabler/icons-react";
+import { IconAlertTriangle, IconCopy, IconKey, IconTrash } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import useUserRole from "@/hooks/use-user-role.tsx";
 import { formatLocalized, useDateFnsLocale } from "@/lib/date-locale";
 import { timeAgo } from "@/lib/time";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import {
   useApiKeysQuery,
   useCreateApiKeyMutation,
+  useRevealApiKeyMutation,
   useRevokeApiKeyMutation,
 } from "@/features/api-key/queries/api-key-query";
-import {
-  IApiKey,
-  ICreateApiKeyResponse,
-} from "@/features/api-key/types/api-key.types";
+import { IApiKey } from "@/features/api-key/types/api-key.types";
 import {
   isExpired,
   isExpiringSoon,
   lastUsedBucket,
 } from "@/features/api-key/utils";
 import { CreateApiKeyModal } from "./create-api-key-modal";
-import { ShowTokenModal } from "./show-token-modal";
+import { RevealKeyModal } from "./reveal-key-modal";
 
 export default function ApiKeysManager() {
   const { t } = useTranslation();
@@ -46,27 +45,27 @@ export default function ApiKeysManager() {
   const { data: keys, isLoading, isError } = useApiKeysQuery();
   const createMutation = useCreateApiKeyMutation();
   const revokeMutation = useRevokeApiKeyMutation();
+  const revealMutation = useRevealApiKeyMutation();
 
   const [createOpened, setCreateOpened] = useState(false);
-  // SECURITY: the show-once token lives ONLY here, in this component's local
-  // state. It is never written to localStorage, the query cache or a log. Closing
-  // the modal sets it back to null (handleCloseToken) — discarded forever.
-  const [createdKey, setCreatedKey] = useState<ICreateApiKeyResponse | null>(
-    null,
-  );
+  // SECURITY: only the key METADATA is held here (for the modal title) — never a
+  // token. The token is copied straight to the clipboard in handleCopy and is
+  // never stored in state, the query cache or localStorage.
+  const [revealTarget, setRevealTarget] = useState<IApiKey | null>(null);
 
   const handleCreate = async (values: {
     name: string;
     expiresAt: string | null;
   }): Promise<boolean> => {
     try {
-      const res = await createMutation.mutateAsync(values);
-      setCreateOpened(false);
-      // Move the token into local state, then immediately purge react-query's
-      // own copy of the mutation result so the secret does not linger in the
-      // mutation cache.
-      setCreatedKey(res);
+      await createMutation.mutateAsync(values);
+      // The create response carries a token, but it is now retrievable any time
+      // via the per-row Copy action (reveal), so we DISCARD it here: purge
+      // react-query's copy immediately and never move it into state. The user
+      // copies the key from the list via a password step-up.
       createMutation.reset();
+      setCreateOpened(false);
+      notifications.show({ message: t("API key created") });
       return true;
     } catch {
       notifications.show({
@@ -77,9 +76,36 @@ export default function ApiKeysManager() {
     }
   };
 
-  const handleCloseToken = () => {
-    // Token discarded — the only copy the UI ever held is dropped here.
-    setCreatedKey(null);
+  // Password step-up accepted -> re-mint + copy. The token exists only as a local
+  // `const` for the single clipboard write, then react-query's copy is reset().
+  // It never enters component state, the query cache or localStorage.
+  const handleCopy = async (password: string): Promise<boolean> => {
+    const target = revealTarget;
+    if (!target) return false;
+    try {
+      const token = await revealMutation.mutateAsync({
+        id: target.id,
+        password,
+      });
+      await copyToClipboard(token);
+      revealMutation.reset();
+      notifications.show({ message: t("API key copied to clipboard") });
+      return true;
+    } catch (err) {
+      revealMutation.reset();
+      // 401 = wrong password (keep the modal open to retry); anything else is a
+      // uniform failure (the server does not distinguish key states).
+      const status = (err as { response?: { status?: number } })?.response
+        ?.status;
+      notifications.show({
+        message:
+          status === 401
+            ? t("Incorrect password")
+            : t("Failed to copy API key"),
+        color: "red",
+      });
+      return false;
+    }
   };
 
   const openRevokeModal = (key: IApiKey) =>
@@ -186,16 +212,28 @@ export default function ApiKeysManager() {
           </Table.Td>
         )}
         <Table.Td style={{ textAlign: "right" }}>
-          <Tooltip label={t("Revoke")} withArrow>
-            <ActionIcon
-              variant="subtle"
-              color="red"
-              aria-label={t("Revoke {{name}}", { name: key.name })}
-              onClick={() => openRevokeModal(key)}
-            >
-              <IconTrash size={16} />
-            </ActionIcon>
-          </Tooltip>
+          <Group gap={4} justify="flex-end" wrap="nowrap">
+            <Tooltip label={t("Copy API key")} withArrow>
+              <ActionIcon
+                variant="subtle"
+                aria-label={t("Copy {{name}}", { name: key.name })}
+                disabled={expired}
+                onClick={() => setRevealTarget(key)}
+              >
+                <IconCopy size={16} />
+              </ActionIcon>
+            </Tooltip>
+            <Tooltip label={t("Revoke")} withArrow>
+              <ActionIcon
+                variant="subtle"
+                color="red"
+                aria-label={t("Revoke {{name}}", { name: key.name })}
+                onClick={() => openRevokeModal(key)}
+              >
+                <IconTrash size={16} />
+              </ActionIcon>
+            </Tooltip>
+          </Group>
         </Table.Td>
       </Table.Tr>
     );
@@ -258,7 +296,13 @@ export default function ApiKeysManager() {
         loading={createMutation.isPending}
       />
 
-      <ShowTokenModal created={createdKey} onClose={handleCloseToken} />
+      <RevealKeyModal
+        keyName={revealTarget?.name ?? null}
+        opened={revealTarget !== null}
+        onClose={() => setRevealTarget(null)}
+        onConfirm={handleCopy}
+        loading={revealMutation.isPending}
+      />
     </>
   );
 }

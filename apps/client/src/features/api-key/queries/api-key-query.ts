@@ -9,12 +9,14 @@ import { useTranslation } from "react-i18next";
 import {
   createApiKey,
   getApiKeys,
+  revealApiKey,
   revokeApiKey,
 } from "@/features/api-key/services/api-key-service";
 import {
   IApiKey,
   ICreateApiKey,
   ICreateApiKeyResponse,
+  IRevealApiKey,
 } from "@/features/api-key/types/api-key.types";
 
 export const API_KEYS_QUERY_KEY = ["api-keys"];
@@ -29,12 +31,12 @@ export function useApiKeysQuery(): UseQueryResult<IApiKey[], Error> {
 /**
  * Create mutation.
  *
- * SECURITY: the response contains the token exactly once. This hook deliberately
- * does NOT stash it anywhere — the caller reads it from `mutateAsync`'s resolved
- * value, moves it into the show-once modal's local state, then calls
- * `mutation.reset()` to purge react-query's own copy immediately. `gcTime: 0`
- * is a second belt so nothing lingers in the mutation cache after the observer
- * unmounts. The list is invalidated here (the list carries no token).
+ * SECURITY: the response contains the token. This hook deliberately does NOT
+ * stash it anywhere — the caller reads it from `mutateAsync`'s resolved value
+ * and immediately calls `mutation.reset()` to purge react-query's own copy (the
+ * create flow discards the token; it is re-obtainable later via the reveal/copy
+ * action). `gcTime: 0` is a second belt so nothing lingers in the mutation cache
+ * after the observer unmounts. The list is invalidated here (it carries no token).
  */
 export function useCreateApiKeyMutation() {
   const queryClient = useQueryClient();
@@ -44,6 +46,23 @@ export function useCreateApiKeyMutation() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: API_KEYS_QUERY_KEY });
     },
+  });
+}
+
+/**
+ * Reveal (copy) mutation.
+ *
+ * SECURITY (mirrors useCreateApiKeyMutation): the resolved value is the raw
+ * token. This hook deliberately stashes it NOWHERE — the caller reads it from
+ * `mutateAsync`, writes it straight to the clipboard, then calls
+ * `mutation.reset()` to purge react-query's own copy. `gcTime: 0` is the second
+ * belt so nothing lingers in the mutation cache after the observer unmounts.
+ * There is no `onSuccess` list invalidation: reveal does not change the list.
+ */
+export function useRevealApiKeyMutation() {
+  return useMutation<string, Error, IRevealApiKey>({
+    mutationFn: (data) => revealApiKey(data),
+    gcTime: 0,
   });
 }
 
