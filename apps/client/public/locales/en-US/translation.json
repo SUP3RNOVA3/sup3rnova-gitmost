@@ -1492,5 +1492,5 @@
   "Previous month": "Previous month",
   "Next month": "Next month",
   "No revisions found for that day": "No revisions found for that day",
-  "{{date}}: {{count}} versions": "{{date}}: {{count}} versions"
+  "{{date}}: {{count}} revisions": "{{date}}: {{count}} revisions"
 }

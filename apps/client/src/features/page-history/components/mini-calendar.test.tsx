@@ -37,11 +37,11 @@ describe("MiniCalendar (#568 heatmap)", () => {
 
   it("applies a heat class scaled to the day's revision count", () => {
     const day = isoDayInTz(new Date(), TZ);
-    const { todayISO } = renderCal(new Map([[day, 7]]));
+    const { todayISO } = renderCal(new Map([[day, 200]]));
     const today = screen
       .getAllByTestId("calendar-day")
       .find((c) => c.getAttribute("data-day") === todayISO)!;
-    // 7 revisions → top tier (calHeat3).
+    // 200 revisions → top tier (calHeat3) under the #605 total-activity scale.
     expect(today.className).toContain("calHeat3");
   });
 
@@ -76,7 +76,7 @@ describe("MiniCalendar (#568 heatmap)", () => {
     // A non-color cue is wired (the interpolated count is filled by the real
     // i18next instance in-app; the test's key-fallback t returns the template).
     const label = today.getAttribute("aria-label") ?? "";
-    expect(label).toContain("versions");
+    expect(label).toContain("revisions");
     // The same text is mirrored to the native tooltip.
     expect(today.getAttribute("title")).toBe(label);
     // Outside-month cells are inert (no aria-label / not focusable).
@@ -86,13 +86,14 @@ describe("MiniCalendar (#568 heatmap)", () => {
     expect(outside?.getAttribute("aria-label")).toBeNull();
   });
 
-  it("maps count tiers to heat classes at the prototype boundaries", () => {
+  it("maps count tiers to heat classes at the #605 total-activity boundaries", () => {
     const cases: Array<[number, string]> = [
       [0, "calHeat0"],
-      [2, "calHeat1"],
-      [3, "calHeat2"],
-      [4, "calHeat2"],
-      [5, "calHeat3"],
+      [20, "calHeat1"], // low day (≤20)
+      [21, "calHeat2"], // tier 1→2 boundary
+      [100, "calHeat2"], // mid day (≤100)
+      [101, "calHeat3"], // tier 2→3 boundary
+      [426, "calHeat3"], // heavy stage day
     ];
     for (const [count, cls] of cases) {
       const day = isoDayInTz(new Date(), TZ);

@@ -83,13 +83,15 @@
 .desktopRoot {
   display: flex;
   flex-direction: column;
-  /* #583 Fix B — fullScreen modal: match Modal.Content's --modal-content-height
-     (100dvh). NOT height:100% — in Mantine v8 fullScreen only Modal.Content is
-     sized; Modal.Body stays auto-height and is not a flex column, so height:100%
-     collapses to auto and the inner ScrollAreas lose bounded height. 100dvh gives
-     this flex column (toolbar flex:none 56px + body flex:1 min-height:0) a correct
-     bounded height so both ScrollAreas scroll internally. */
-  height: 100dvh;
+  /* #605 Fix B — centered popup (not fullScreen). The height MUST be
+     viewport-defined: Modal.Body is auto-height and not a flex column, so
+     height:100% would collapse to auto and the inner ScrollAreas would lose
+     their bounded height and clip (the same reason #583 could not use
+     height:100%). 90vh sits inside Mantine's content max height
+     calc(100dvh − 2·yOffset) = 94vh at yOffset=3vh, and gives this flex column
+     (toolbar flex:none 56px + body flex:1 min-height:0) a correct bounded height
+     so both ScrollAreas scroll internally. */
+  height: 90vh;
 }
 
 .desktopToolbar {
