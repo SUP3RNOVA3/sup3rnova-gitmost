@@ -172,6 +172,14 @@ interface ChatThreadProps {
    *  local stream starts or the run settles. The window owns only the dumb 2.5s
    *  timer; the THREAD's FSM owns arm/disarm + the stalled cap (#488). */
   onResumeFallback?: (active: boolean) => void;
+  /** #555 S3: the authoritative run fact carried by the degraded delta poll
+   *  (`POST /ai-chat/messages/delta` → `run: { id, status } | null`), surfaced by
+   *  the window's `useAiChatDeltaPoll`. The FSM consumes it: a fresh NEGATIVE fact
+   *  (no active run) quenches a stale `reconnecting`/`polling`/`attaching`/`stopping`
+   *  immediately (I3 fresh-negative gate), instead of waiting for the terminal ROW
+   *  or the reconnect ladder to exhaust. `undefined` = no poll result yet (ignored).
+   *  Only meaningful while the poll is armed (a poll-bearing recovery). */
+  polledRunFact?: { id: string; status: string } | null;
   /** #184: whether detached/autonomous agent runs are enabled for this workspace.
    *  When true the Stop button must additionally hit the AUTHORITATIVE server stop
    *  (via onServerStop) — aborting only the local SSE is just a client disconnect,
@@ -235,6 +243,7 @@ export default function ChatThread({
   onTurnFinished,
   onServerChatId,
   onResumeFallback,
+  polledRunFact,
   autonomousRunsEnabled,
   onServerStop,
 }: ChatThreadProps) {
@@ -1011,6 +1020,36 @@ export default function ChatThread({
     };
   }, [phase, initialRows]);
 
+  // #555 S3: consume the degraded delta poll's `run` field. Until now the delta
+  // endpoint's authoritative run fact rode the wire UNCONSUMED (run-fsm.spec.md §3.4)
+  // — a 204 reconnect went through RECONNECT_NONE and the run field of the DELTA
+  // response was ignored, so a stale `reconnecting` only cleared once the terminal
+  // ROW merged or the ladder exhausted. Wire it into the RUN_FACT dispatch path: a
+  // fresh NEGATIVE fact quenches recovery IMMEDIATELY (I3 fresh-negative gate),
+  // a positive fact refreshes ctx.runFact. No epoch — this is AMBIENT server truth (a
+  // trigger event that is never dropped), not a per-generation command outcome; the
+  // poll only runs while armed (a poll-bearing recovery), so it never races a live
+  // local stream. Deduped by the derived active run id, and the dedupe ref is reset
+  // when the poll disarms (`polledRunFact` returns to `undefined`) so the NEXT
+  // recovery's negative fact re-quenches.
+  const lastPolledRunKeyRef = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    if (polledRunFact === undefined) {
+      lastPolledRunKeyRef.current = undefined; // poll disarmed — reset the dedupe
+      return;
+    }
+    const activeRunId =
+      polledRunFact && isActiveRunStatus(polledRunFact.status)
+        ? polledRunFact.id
+        : null;
+    if (activeRunId === lastPolledRunKeyRef.current) return; // unchanged — no re-dispatch
+    lastPolledRunKeyRef.current = activeRunId;
+    dispatch({
+      type: "RUN_FACT",
+      runFact: activeRunId ? { runId: activeRunId } : null,
+    });
+  }, [polledRunFact, dispatch]);
+
   // Clear the stopped marker as soon as a new turn begins streaming.
   useEffect(() => {
     if (isStreaming) setStopNotice(null);
@@ -1057,6 +1096,39 @@ export default function ChatThread({
         pendingSupersedeTextRef.current = msg.text;
         dispatch({ type: "SUPERSEDE_REQUESTED", targetRunId: runId });
         stopFnRef.current?.(); // abort A -> its onFinish sends B
+        return;
+      }
+      // #555 S4-full: supersede a run belonging to ANOTHER TAB from the ERROR phase.
+      // A plain POST that hit the one-active-run gate (A_RUN_ALREADY_ACTIVE), or a
+      // supersede that lost a CAS (SUPERSEDE_MISMATCH), leaves the FSM in `error`
+      // with the foreign/moved run absorbed into runFact (W1 groundwork). Unlike the
+      // live-local branch there is NO owned stream A in flight here (error is entered
+      // by a terminal finish or a pre-stream 409), so I1 is not at risk: we send B
+      // DIRECTLY (no stop()/onFinish deferral — there is nothing to abort or wait
+      // for). SUPERSEDE_REQUESTED bumps the epoch, so even a late finish of the failed
+      // A (stamped with its pre-error generation) is dropped and cannot overlap B.
+      // The `runId && runId !== "pending"` guard scopes this to EVERY error kind that
+      // LEFT a run-fact — run-already-active and supersede-mismatch, and also
+      // supersede-timeout / supersede-invalid (all of which keep runFact set). None
+      // of them has an owned stream A in flight, so a direct send is safe for all;
+      // for the supersede-* kinds this is a user-initiated re-supersede (they hit
+      // Send), not an auto-retry. A plain stream error cleared runFact to null and
+      // correctly falls through to a plain send. The reducer already permits
+      // SUPERSEDE_REQUESTED from `error` (spec §1).
+      if (
+        p === "error" &&
+        autonomousRunsEnabled === true &&
+        runId &&
+        runId !== "pending"
+      ) {
+        setQueue(removeQueuedById(queuedRef.current, id));
+        // dispatch first: the `supersede` effect arms pendingSupersedeRef, which
+        // prepareSendMessagesRequest reads-and-clears on the POST below (order-
+        // dependent — the dispatch is synchronous, so the ref is set before send).
+        dispatch({ type: "SUPERSEDE_REQUESTED", targetRunId: runId });
+        // B's onFinish is stamped with the just-bumped (superseding) generation (I1).
+        turnEpochRef.current = epochRef.current;
+        sendMessageRef.current?.({ text: msg.text });
         return;
       }
       if (aLiveLocal) {

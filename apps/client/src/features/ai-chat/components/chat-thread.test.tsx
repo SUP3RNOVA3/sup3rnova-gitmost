@@ -132,6 +132,7 @@ function renderThread(props?: {
   chatId?: string | null;
   initialRows?: IAiChatMessageRow[];
   autonomousRunsEnabled?: boolean;
+  polledRunFact?: { id: string; status: string } | null;
 }) {
   const onTurnFinished = vi.fn();
   const onResumeFallback = vi.fn();
@@ -140,7 +141,7 @@ function renderThread(props?: {
     defaultOptions: { queries: { retry: false } },
   });
   const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
-  const { unmount } = render(
+  const tree = (polledRunFact?: { id: string; status: string } | null) => (
     <QueryClientProvider client={queryClient}>
       <MantineProvider>
         <ChatThread
@@ -150,11 +151,24 @@ function renderThread(props?: {
           onTurnFinished={onTurnFinished}
           onResumeFallback={onResumeFallback}
           onServerStop={onServerStop}
+          polledRunFact={polledRunFact}
         />
       </MantineProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { onTurnFinished, onResumeFallback, onServerStop, invalidateSpy, unmount };
+  const { unmount, rerender } = render(tree(props?.polledRunFact));
+  // Re-render with a fresh `polledRunFact` (the delta poll's surfaced run fact),
+  // keeping every other prop stable — the thread's mount effects do NOT re-run.
+  const setPolledRunFact = (fact: { id: string; status: string } | null) =>
+    rerender(tree(fact));
+  return {
+    onTurnFinished,
+    onResumeFallback,
+    onServerStop,
+    invalidateSpy,
+    unmount,
+    setPolledRunFact,
+  };
 }
 
 function resetState() {
@@ -514,6 +528,51 @@ describe("ChatThread — send now", () => {
     });
     // MUTATION-VERIFY: drop the activeRunId threading (or read the wrong field) ->
     // runFact stays "run-1" -> the CAS targets "run-1" -> this assertion reddens.
+    expect((body.supersede as { runId?: string } | undefined)?.runId).toBe(
+      "run-foreign",
+    );
+  });
+
+  it("#555 S4-full: a queued Send now from the ERROR phase CAS-supersedes another tab's run (B sent directly, no overlap)", async () => {
+    // A plain POST hit the one-active-run gate for a FOREIGN tab's run -> the FSM is
+    // in error(run-already-active) with `run-foreign` absorbed into runFact. Clicking
+    // "Send now" on a queued message must CAS-supersede that foreign run — send B with
+    // supersede:{runId:"run-foreign"} — instead of a plain POST that would 409 again.
+    // And because there is NO owned stream A in the error phase, B is sent DIRECTLY:
+    // no stop() abort (I1 — never two overlapping owned streams).
+    startLocalStreamWithRun(); // sending, local, autonomous, runFact run-1
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ code: "A_RUN_ALREADY_ACTIVE", activeRunId: "run-foreign" }),
+          { status: 409 },
+        ),
+      ),
+    );
+    // A NON-supersede POST hits the gate -> RUN_ALREADY_ACTIVE -> error, runFact
+    // run-foreign.
+    await act(async () => {
+      await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    h.state.sendMessage.mockClear();
+    h.state.stop.mockClear();
+    // Queue a message and Send now DIRECTLY from the error banner.
+    fireEvent.click(screen.getByTestId("queue-btn")); // "queued text"
+    fireEvent.click(screen.getByLabelText("Send now"));
+    // B was sent DIRECTLY (no A to abort/await) and exactly once — a single owned
+    // stream, no overlap.
+    expect(h.state.stop).not.toHaveBeenCalled();
+    expect(h.state.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "queued text" });
+    // B's POST carries the CAS supersede targeting the FOREIGN run.
+    // MUTATION-VERIFY: remove the S4 error-phase branch in sendNow -> the click falls
+    // to a plain localSend, pendingSupersedeRef stays null, body.supersede is
+    // undefined -> this reddens.
+    const { body } = h.state.transport!.prepareSendMessagesRequest!({
+      messages: [],
+      body: {},
+    });
     expect((body.supersede as { runId?: string } | undefined)?.runId).toBe(
       "run-foreign",
     );
@@ -1253,6 +1312,35 @@ describe("ChatThread — live reconnect + stalled", () => {
       vi.advanceTimersByTime(10 * 60_000);
     });
     expect(onResumeFallback).toHaveBeenCalledWith(false); // POLL_IDLE_CAP -> idle -> disarm
+  });
+
+  it("#555 S3: a delta poll's NEGATIVE run-fact quenches `reconnecting` immediately (RUN_FACT{null})", async () => {
+    // Drive into the reconnect ladder, then have the degraded delta poll report NO
+    // active run (run == null): the thread must consume that fact and dispatch
+    // RUN_FACT{null}, which the reducer's fresh-negative gate (I3) sends to idle —
+    // WITHOUT waiting for the terminal row (POLL_TERMINAL) or the ladder to exhaust.
+    // MUTATION-VERIFY: delete the thread's polledRunFact consume effect and the
+    // banner never clears here -> red.
+    const view = renderLive();
+    await disconnect();
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy(); // precondition
+    act(() => {
+      view.setPolledRunFact(null); // the poll: no active run
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull(); // quenched -> idle
+  });
+
+  it("#555 S3: a delta poll's POSITIVE active fact does NOT quench recovery (no over-quench)", async () => {
+    // Control for the above: while reconnecting, a poll reporting a STILL-active run
+    // must keep the ladder going (a positive fact only refreshes ctx.runFact). Guards
+    // against a consume effect that quenches on ANY poll result.
+    const view = renderLive();
+    await disconnect();
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    act(() => {
+      view.setPolledRunFact({ id: "run-1", status: "running" });
+    });
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy(); // still recovering
   });
 
   it("#541: getRun HANGS on a live disconnect — the timeout race still enters reconnect (no silent freeze in `streaming`)", async () => {
