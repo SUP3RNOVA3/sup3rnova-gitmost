@@ -5,7 +5,7 @@
   "scripts": {
     "build": "tsc --build",
     "dev": "tsc --watch",
-    "test": "vitest run",
+    "test": "vitest run && vitest run -c vitest.bench.config.ts",
     "test:watch": "vitest"
   },
   "main": "dist/index.js",

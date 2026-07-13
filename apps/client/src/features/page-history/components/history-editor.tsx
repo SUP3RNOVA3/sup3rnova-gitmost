@@ -36,7 +36,7 @@ export function HistoryEditor({
 
     // Pure diff computation lives in history-diff.ts; the component keeps the
     // editor side-effects (rendering the new content + wiring decorations).
-    const { decorationSet, added, deleted, total } = computeHistoryDiff(
+    const { decorationSet, added, deleted, total, failed } = computeHistoryDiff(
       editor.schema,
       content,
       previousContent,
@@ -44,8 +44,9 @@ export function HistoryEditor({
 
     editor.commands.setContent(content);
 
-    // @ts-ignore
-    setDiffCounts({ added, deleted, total });
+    // @ts-ignore — jotai setter typing in this build resolves as non-callable
+    // (pre-existing); the payload matches DiffCounts.
+    setDiffCounts({ added, deleted, total, failed });
 
     editor.setOptions({
       editorProps: {

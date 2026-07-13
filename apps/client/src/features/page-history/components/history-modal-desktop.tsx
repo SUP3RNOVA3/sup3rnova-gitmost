@@ -130,6 +130,10 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
 
   const showDiffNav =
     highlightChanges && !!diffCounts && diffCounts.total > 0;
+  // Diff engine failed for this version: show a muted notice instead of the
+  // "N of M" navigation (which would otherwise silently show nothing).
+  const showDiffUnavailable =
+    highlightChanges && !!diffCounts && diffCounts.failed;
 
   return (
     <div className={classes.desktopRoot}>
@@ -181,6 +185,11 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
                 <IconChevronDown size={16} />
               </ActionIcon>
             </Group>
+          )}
+          {showDiffUnavailable && (
+            <Text size="sm" c="dimmed" style={{ whiteSpace: "nowrap" }}>
+              {t("Change highlighting is unavailable for this version")}
+            </Text>
           )}
         </Group>
 

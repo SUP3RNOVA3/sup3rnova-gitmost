@@ -167,6 +167,7 @@
   "Revoke {{name}}": "Отозвать {{name}}",
   "Select version": "Выбрать версию",
   "Highlight changes": "Выделить изменения",
+  "Change highlighting is unavailable for this version": "Подсветка изменений недоступна для этой версии",
   "Page import is in progress. Please do not close this tab.": "Импорт страницы в процессе. Пожалуйста, не закрывайте эту вкладку.",
   "Pages": "Страницы",
   "pages": "страницы",
