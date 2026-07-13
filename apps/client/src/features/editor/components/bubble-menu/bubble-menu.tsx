@@ -18,6 +18,7 @@ import {
   IconMessage,
   IconEyeOff,
   IconClearFormatting,
+  IconAsterisk,
 } from "@tabler/icons-react";
 import clsx from "clsx";
 import classes from "./bubble-menu.module.css";
@@ -180,6 +181,17 @@ export const EditorBubbleMenu: FC<EditorBubbleMenuProps> = (props) => {
       // Mirror the fixed-toolbar behavior: strip all inline marks from the selection.
       command: () => props.editor.chain().focus().unsetAllMarks().run(),
       icon: IconClearFormatting,
+    },
+    {
+      name: "Footnote",
+      // Insert action, not a toggle — never show an active/highlighted state.
+      isActive: () => false,
+      // Collapse to the selection end so the marker lands after the selected text.
+      command: () => {
+        const to = props.editor.state.selection.to;
+        props.editor.chain().focus().setTextSelection(to).setFootnote().run();
+      },
+      icon: IconAsterisk,
     },
   ];
 
