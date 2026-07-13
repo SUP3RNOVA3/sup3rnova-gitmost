@@ -358,6 +358,7 @@ describe('AiChatService: onStepFinish re-arms the degeneration watermark (#486)'
         isAiChatDeferredToolsEnabled: () => false,
         // Lockdown OFF -> the degeneration guard is the active anti-babble path.
         isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
       } as never, // environment
     );
   }

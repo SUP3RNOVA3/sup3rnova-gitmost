@@ -57,7 +57,7 @@ describe('AiChatService.stream — concurrent-run race rejection (#184)', () => 
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false, isAiChatViewImageEnabled: () => false } as never, // environment
     );
     const begin = jest.fn(beginImpl);
     return { svc, begin, aiChatRepo, aiChatMessageRepo };
@@ -179,7 +179,7 @@ describe('AiChatService.stream — abortSignal wiring (#184 F3)', () => {
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo (openPage undefined -> never touched)
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false, isAiChatViewImageEnabled: () => false } as never, // environment
     );
     return { svc, aiChatMessageRepo };
   }
@@ -498,7 +498,7 @@ describe('AiChatService.stream — begin-failure fails the turn (#184 F14 / #486
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false, isAiChatViewImageEnabled: () => false } as never, // environment
     );
     return { svc, aiChatMessageRepo };
   }

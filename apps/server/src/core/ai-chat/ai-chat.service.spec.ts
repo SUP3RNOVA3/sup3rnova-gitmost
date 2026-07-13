@@ -1924,6 +1924,7 @@ describe('AiChatService.stream — resumable pipe options (#184 phase 1.5)', () 
       {
         isAiChatDeferredToolsEnabled: () => false,
         isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
         isAiChatResumableStreamEnabled: () => opts.resumable,
       } as never,
       streamRegistry as never,
@@ -2219,6 +2220,7 @@ describe('AiChatService.stream — token-degeneration reaction (#444)', () => {
         isAiChatDeferredToolsEnabled: () => false,
         // lockdown OFF => the degeneration detector is the anti-babble guard.
         isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
         isAiChatResumableStreamEnabled: () => false,
       } as never,
       streamRegistry as never,

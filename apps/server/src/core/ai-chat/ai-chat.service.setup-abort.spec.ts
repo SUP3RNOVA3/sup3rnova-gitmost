@@ -52,7 +52,7 @@ describe('AiChatService.stream — abort during external-MCP setup finalizes the
       {} as never, // aiAgentRoleRepo
       {} as never, // pageRepo (openPage undefined -> never touched)
       {} as never, // pageAccess
-      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false } as never, // environment
+      { isAiChatDeferredToolsEnabled: () => false, isAiChatFinalStepLockdownEnabled: () => false, isAiChatViewImageEnabled: () => false } as never, // environment
     );
     return { svc, tools };
   }
