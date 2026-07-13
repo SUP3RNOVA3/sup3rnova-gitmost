@@ -58,11 +58,9 @@ import ConversationList from "@/features/ai-chat/components/conversation-list.ts
 import ChatThread from "@/features/ai-chat/components/chat-thread.tsx";
 import {
   exportAiChat,
-  getAiChatMessagesDelta,
   stopRun,
 } from "@/features/ai-chat/services/ai-chat-service.ts";
-import { mergeDeltaRowsIntoPages } from "@/features/ai-chat/utils/resume-helpers.ts";
-import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.ts";
+import { useAiChatDeltaPoll } from "@/features/ai-chat/hooks/use-delta-poll.ts";
 import { useChatSession } from "@/features/ai-chat/hooks/use-chat-session.ts";
 import {
   shouldCollapseOnOutsidePointer,
@@ -281,54 +279,17 @@ export default function AiChatWindow() {
       windowOpen,
     );
 
-  // #491 degraded DELTA poll. While armed (degradedPoll) and the window is open on a
-  // chat, poll POST /ai-chat/messages/delta every 2.5s: it returns only the rows
-  // CHANGED since the previous cursor (+ the run fact) in ONE round-trip. We merge
-  // those rows into the SAME infinite-query cache the thread reads (idempotently by
-  // id — the delta's overlap window re-delivers rows), so the thread's reconcile
-  // effect follows the detached run to its terminal row from a fraction of the wire
-  // cost. The run-fact settle stays the thread FSM's job (row-status reconcile), so
-  // we do NOT double-poll /run here. Cursor resets when the chat changes / disarms.
-  const deltaCursorRef = useRef<string | undefined>(undefined);
-  useEffect(() => {
-    deltaCursorRef.current = undefined;
-  }, [activeChatId, degradedPoll]);
-  useEffect(() => {
-    if (!degradedPoll || !windowOpen || !activeChatId) return;
-    const chatId = activeChatId;
-    let cancelled = false;
-    const tick = async (): Promise<void> => {
-      try {
-        const res = await getAiChatMessagesDelta(chatId, deltaCursorRef.current);
-        if (cancelled) return;
-        deltaCursorRef.current = res.cursor;
-        if (res.rows.length > 0) {
-          queryClient.setQueryData(
-            AI_CHAT_MESSAGES_RQ_KEY(chatId),
-            (
-              old:
-                | {
-                    pages: { items: IAiChatMessageRow[]; meta: unknown }[];
-                    pageParams: unknown[];
-                  }
-                | undefined,
-            ) =>
-              old
-                ? { ...old, pages: mergeDeltaRowsIntoPages(old.pages, res.rows) }
-                : old,
-          );
-        }
-      } catch {
-        // Transient failure (e.g. a server restart mid-run): swallow and retry on
-        // the next tick — the poll must survive a bounce, like the old dumb refetch.
-      }
-    };
-    const id = setInterval(() => void tick(), 2500);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [degradedPoll, windowOpen, activeChatId, queryClient]);
+  // #491/#555 degraded DELTA poll. The transport (cursor lifecycle, merge into the
+  // messages cache, the 2.5s timer) lives in `useAiChatDeltaPoll` — extracted so it
+  // is unit-testable in isolation (W1). The thread's FSM owns arm/disarm (degradedPoll
+  // via onResumeFallback) and CONSUMES the run fact the hook surfaces: `polledRunFact`
+  // is threaded into <ChatThread>, where a fresh NEGATIVE fact quenches a stale
+  // `reconnecting`/`polling` immediately (#555 S3 / I3). See run-fsm.spec.md §3.4.
+  const polledRunFact = useAiChatDeltaPoll({
+    chatId: activeChatId,
+    armed: degradedPoll,
+    enabled: windowOpen,
+  });
 
   // #184 reconnect-and-live-follow. Whether detached agent runs are enabled for
   // this workspace. When the feature is off no runs are ever created, so the
@@ -1030,6 +991,10 @@ export default function AiChatWindow() {
               // resume attempt could not attach to the live run; the thread
               // disarms it on settle / local stream.
               onResumeFallback={onResumeFallback}
+              // #555 S3: the degraded delta poll's authoritative run fact. The FSM
+              // consumes a fresh NEGATIVE fact to quench a stale reconnecting/polling
+              // immediately (I3), rather than waiting for the terminal row.
+              polledRunFact={polledRunFact}
               // #184: in autonomous mode the Stop button must hit the authoritative
               // server stop (a local SSE abort is a client disconnect the server
               // ignores).

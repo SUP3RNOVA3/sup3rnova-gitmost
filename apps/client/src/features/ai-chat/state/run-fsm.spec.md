@@ -52,7 +52,7 @@ Legend: **†** = command-transition (bumps `epoch`, I1). Effects in `[…]`.
 | `RUN_FACT{null}` (POST /run → null/terminal, 204) | reconnecting/attaching/polling/stopping | idle | `[cancelReconnect, disarmPoll]`, runFact←null (I3 fresh-negative gate) |
 | `RUN_FACT{runId}` | any | (same) | runFact←runId (pessimism toward an attempt) |
 | `STOP_REQUESTED` (user Stop) | streaming, reconnecting, polling | stopping **†** | `[stopRun, abortAttach, cancelReconnect, armPoll]` (poll drives the terminal — I4 exit by data) |
-| `SUPERSEDE_REQUESTED{targetRunId}` (interrupt+send) | streaming, reconnecting, polling, error | superseding **†** | `[supersede(target), cancelReconnect, disarmPoll]` |
+| `SUPERSEDE_REQUESTED{targetRunId}` (interrupt+send) | streaming, reconnecting, polling, error | superseding **†** | `[supersede(target), cancelReconnect, disarmPoll]` (#555 S4: `error` includes ANOTHER TAB's run — `run-already-active`/`supersede-mismatch` left its id in `runFact`; `sendNow` CAS-targets it) |
 | `SUPERSEDE_READY{runId}` (CAS ok) | superseding | streaming | ownership=local, runFact←runId |
 | `SUPERSEDE_MISMATCH{currentRunId}` (409 SUPERSEDE_TARGET_MISMATCH) | superseding | error(supersede-mismatch) | `[postRun(verify)]`, runFact←currentRunId |
 | `SUPERSEDE_TIMEOUT` (409 SUPERSEDE_TIMEOUT) | superseding | error(supersede-timeout) | — (composer keeps text; no auto-retry) |
@@ -153,12 +153,32 @@ message. Sources, in the order they update `ctx.runFact`:
 3. **Attach outcomes:** `ATTACH_LIVE` (2xx) confirms active; a 204 on a non-stripped
    path is an authoritative NEGATIVE fact → the runtime dispatches `RUN_FACT{null}`,
    which cancels recovery (I3 fresh-negative gate).
-4. **Poll (#491, implemented):** the degraded poll now hits the delta endpoint
-   (`POST /ai-chat/messages/delta`), which ALREADY carries the run fact
-   (`run: {id, status} | null`) alongside the changed rows. The client does NOT yet
-   consume that run field — it still drives to a terminal ROW (merged by id),
-   dispatched as `POLL_TERMINAL` — so the run field rides the wire for a future
-   client that settles straight off it.
+4. **Poll (#491 transport, #555 S3 consumed):** the degraded poll hits the delta
+   endpoint (`POST /ai-chat/messages/delta`), which carries the run fact
+   (`run: {id, status} | null`) alongside the changed rows. The client NOW consumes
+   that run field (#555 S3, was the review #518 gap): the delta transport
+   (`useAiChatDeltaPoll`, in the WINDOW — see the S1 note below) surfaces the fact to
+   the thread as the `polledRunFact` prop, and the thread dispatches it as a
+   `RUN_FACT` — so a fresh NEGATIVE fact (`run == null` / a terminal status) quenches
+   a stale `reconnecting`/`polling` IMMEDIATELY (the fresh-negative gate below),
+   instead of waiting for the terminal ROW to merge (`POLL_TERMINAL`) or the reconnect
+   ladder to exhaust. The row-driven `POLL_TERMINAL` settle stays in force as the
+   belt-and-suspenders backstop. The `RUN_FACT` here carries NO epoch: it is ambient
+   server truth (a trigger event, never dropped), not a per-generation command
+   outcome, and the poll only runs while armed (a poll-bearing recovery) so it never
+   races a live local stream.
+
+   **S1 (where the poll transport lives).** An earlier iteration required MOVING the
+   poll-query into the thread. It stays in the WINDOW (the `useAiChatDeltaPoll` hook),
+   and this is deliberately CORRECT, not drift: the thread's FSM already owns every
+   run-lifecycle DECISION — it arms/disarms the poll (`onResumeFallback`) and now
+   consumes the run fact (`RUN_FACT`) — while the window/hook is a dumb TRANSPORT
+   (cursor + 2.5s timer + idempotent cache merge), symmetric with `initialRows`, which
+   the window also fetches and feeds the thread to drive `POLL_TERMINAL`. Keeping the
+   transport window-side preserves the clean, unit-tested `onResumeFallback` arm/disarm
+   boundary; relocating it would either churn that boundary's tests or leave the prop
+   vestigial, for no functional gain — the S3 gap is closed by consuming the fact, not
+   by moving the fetch.
 
 Pessimism rule: a stale-but-positive fact PERMITS entering recovery (attach); the
 204 then cuts it. A fresh negative fact gates recovery OUT immediately.
