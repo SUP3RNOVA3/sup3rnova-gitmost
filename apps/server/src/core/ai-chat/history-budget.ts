@@ -261,10 +261,11 @@ export interface TrimResult {
  *   2. mechanically collapse the OLDEST turns to their text (concatenation, no LLM)
  *   3. the current + last {@link REPLAY_KEEP_RECENT_TURNS} turns stay FULL
  *
- * `budgetTokens === null` disables trimming. `priorContextTokens` (the provider's
- * fact from last turn) short-circuits the decision: when it is known and already
- * under budget we skip trimming even if the char-estimate is higher (the provider
- * count is authoritative). The char-estimate drives WHAT to cut.
+ * `budgetTokens === null` disables trimming. When `priorContextTokens` (the
+ * provider's fact from last turn) is known, the trim decision uses the LARGER of
+ * it and the local char-estimate — Math.max(prior, estimate), NOT a sum — so
+ * trimming triggers if EITHER signal exceeds budget. Without a prior, the pure
+ * char-estimate decides. The char-estimate drives WHAT to cut.
  */
 export function trimHistoryForReplay(
   messages: ModelMessage[],
@@ -275,9 +276,11 @@ export function trimHistoryForReplay(
     return { messages, trimmed: false, estimatedTokens: 0 };
   }
   const estimated = estimateMessagesTokens(messages);
-  // Decision signal: prefer the provider's fact (last turn's contextTokens) plus
-  // the estimated delta of the messages appended since; fall back to the pure
-  // char-estimate for a chat with no usage yet.
+  // Decision signal: when the provider's fact (last turn's contextTokens) is
+  // known, take the LARGER of it and the local char-estimate of the full message
+  // set — Math.max(prior, estimate), NOT a sum. The prior guards against the
+  // estimator under-counting; the estimate guards against growth since. Fall back
+  // to the pure char-estimate for a chat with no usage yet.
   const projected =
     priorContextTokens != null
       ? Math.max(priorContextTokens, estimated)

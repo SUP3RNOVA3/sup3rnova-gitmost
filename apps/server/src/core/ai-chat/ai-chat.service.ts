@@ -124,11 +124,12 @@ const FINAL_STEP_NUDGE =
 // NO text at all (#444, mitigates the "empty turn" the lockdown used to prevent
 // when the toggle is OFF). Makes the exhausted-without-answer state explicit to
 // the user and, on replay, to the model on the next turn.
-// The persisted content is the app's base locale (en-US) — which is ALSO the
-// i18n key the client localizes through `t()` — instead of a hardcoded Russian
-// string (it used to render Russian for every locale, and fed Russian back to
-// the model on replay). Keep it a plain, model-readable English sentence so the
-// next turn's replay reads cleanly; the client resolves the locale.
+// This is a HARDCODED English sentence and is NOT localized: it is appended
+// verbatim into the assistant row's `content` and rendered/replayed as-is — the
+// client does NOT run it through `t()`, and there is no i18n key for it. English
+// replaced an earlier hardcoded Russian string (which rendered Russian for every
+// locale and fed Russian back to the model on replay). Keep it a plain,
+// model-readable English sentence so the next turn's replay reads cleanly.
 const STEP_LIMIT_NO_ANSWER_MARKER =
   '(Step limit reached — no final answer was produced; the work may be ' +
   'unfinished. Reply "continue" to let the agent carry on.)';

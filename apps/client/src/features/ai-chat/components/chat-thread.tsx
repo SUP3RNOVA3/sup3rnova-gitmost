@@ -350,6 +350,12 @@ export default function ChatThread({
   // generation and is dropped by the reducer, so it cannot drive the live machine
   // into a false reconnect or reset its run-fact. Set at each honored stream start
   // (local send, resume/reconnect attach, the supersede B-send).
+  // LOAD-BEARING (I1): this stamp is what ENFORCES the "two owned streams never
+  // overlap" invariant — the superseded stream A's late onFinish is stamped with
+  // A's now-stale generation and dropped, so only the live stream B drives the
+  // machine. Do NOT remove it, and do NOT move any stream-start assignment of it
+  // to AFTER that stream's onFinish can fire, or a late/overlapping finish leaks
+  // past the epoch filter.
   const turnEpochRef = useRef(0);
 
   // --- Effect runner: executes the reducer's command effects ---------------
