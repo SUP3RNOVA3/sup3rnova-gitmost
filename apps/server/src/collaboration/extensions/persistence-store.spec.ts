@@ -133,7 +133,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
   it('agent store over a human page pins saveHistory(oldHumanPage) BEFORE updatePage', async () => {
     const document = ydocFor(doc('NEW AGENT CONTENT'));
-    pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW AGENT CONTENT'));
+    pageRepo.findById.mockResolvedValue(
+      persistedHumanPage('NEW AGENT CONTENT'),
+    );
     // No human baseline snapshot exists yet → boundary snapshot must run.
     pageHistoryRepo.findPageLastHistory.mockResolvedValue(null);
 
@@ -152,7 +154,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
   it('skips the boundary snapshot when the human baseline is already pinned', async () => {
     const document = ydocFor(doc('NEW AGENT CONTENT'));
-    pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW AGENT CONTENT'));
+    pageRepo.findById.mockResolvedValue(
+      persistedHumanPage('NEW AGENT CONTENT'),
+    );
     // Latest history already equals the current human state → no duplicate.
     pageHistoryRepo.findPageLastHistory.mockResolvedValue({
       content: doc('OLD HUMAN'),
@@ -166,7 +170,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
   it('human store does NOT trigger the boundary snapshot (no source transition)', async () => {
     const document = ydocFor(doc('NEW HUMAN CONTENT'));
-    pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW HUMAN CONTENT'));
+    pageRepo.findById.mockResolvedValue(
+      persistedHumanPage('NEW HUMAN CONTENT'),
+    );
 
     await ext.onStoreDocument(buildData(document, 'user') as any);
 
@@ -194,7 +200,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
       expect(pageHistoryRepo.saveHistory).toHaveBeenCalledTimes(1);
       expect(callOrder).toEqual(['saveHistory', 'updatePage']);
-      expect(pageRepo.updatePage.mock.calls[0][0].lastUpdatedSource).toBe('user');
+      expect(pageRepo.updatePage.mock.calls[0][0].lastUpdatedSource).toBe(
+        'user',
+      );
     });
 
     it('git→user transition fires the boundary (git-sync overwrite is a source change)', async () => {
@@ -242,7 +250,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
   // hook resolves, so the store has to retry while it still holds the only copy.
   it('retries a transient DB failure and still persists the edit (persist-1)', async () => {
     const document = ydocFor(doc('NEW HUMAN CONTENT'));
-    pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW HUMAN CONTENT'));
+    pageRepo.findById.mockResolvedValue(
+      persistedHumanPage('NEW HUMAN CONTENT'),
+    );
     let attempts = 0;
     pageRepo.updatePage.mockImplementation(async () => {
       attempts += 1;
@@ -462,7 +472,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
   // content that was never written.
   it('does not run post-store side effects when every store attempt fails (persist-1)', async () => {
     const document = ydocFor(doc('NEW HUMAN CONTENT'));
-    pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW HUMAN CONTENT'));
+    pageRepo.findById.mockResolvedValue(
+      persistedHumanPage('NEW HUMAN CONTENT'),
+    );
     pageRepo.updatePage.mockRejectedValue(new Error('connection reset'));
 
     await expect(
@@ -570,7 +582,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       // The pending idle autosnapshot is cancelled by the explicit version.
       expect(historyQueue.remove).toHaveBeenCalledWith(PAGE_ID);
       const msg = JSON.parse(
-        (document as any).broadcastStateless.mock.calls[(document as any).broadcastStateless.mock.calls.length - 1][0],
+        (document as any).broadcastStateless.mock.calls[
+          (document as any).broadcastStateless.mock.calls.length - 1
+        ][0],
       );
       expect(msg).toMatchObject({
         type: 'version.saved',
@@ -586,9 +600,11 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
 
       await emitSave(document, 'agent');
 
-      expect(pageHistoryRepo.saveHistory.mock.calls[pageHistoryRepo.saveHistory.mock.calls.length - 1][1]).toEqual(
-        expect.objectContaining({ kind: 'agent' }),
-      );
+      expect(
+        pageHistoryRepo.saveHistory.mock.calls[
+          pageHistoryRepo.saveHistory.mock.calls.length - 1
+        ][1],
+      ).toEqual(expect.objectContaining({ kind: 'agent' }));
     });
 
     it('promote-not-dup: latest snapshot is an autosave with identical content → upgrades in place', async () => {
@@ -611,7 +627,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       );
       expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
       const msg = JSON.parse(
-        (document as any).broadcastStateless.mock.calls[(document as any).broadcastStateless.mock.calls.length - 1][0],
+        (document as any).broadcastStateless.mock.calls[
+          (document as any).broadcastStateless.mock.calls.length - 1
+        ][0],
       );
       expect(msg).toMatchObject({ historyId: 'auto-1', alreadySaved: false });
     });
@@ -631,7 +649,9 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       expect(pageHistoryRepo.updateHistoryKind).not.toHaveBeenCalled();
       expect(pageHistoryRepo.saveHistory).not.toHaveBeenCalled();
       const msg = JSON.parse(
-        (document as any).broadcastStateless.mock.calls[(document as any).broadcastStateless.mock.calls.length - 1][0],
+        (document as any).broadcastStateless.mock.calls[
+          (document as any).broadcastStateless.mock.calls.length - 1
+        ][0],
       );
       expect(msg).toMatchObject({ alreadySaved: true, kind: 'manual' });
     });
@@ -781,7 +801,63 @@ describe('PersistenceExtension.onStoreDocument — Approach-A boundary snapshot'
       const msg = JSON.parse(
         (document as any).broadcastStateless.mock.calls[0][0],
       );
-      expect(msg).toEqual({ type: 'version.skipped', reason: 'page-not-found' });
+      expect(msg).toEqual({
+        type: 'version.skipped',
+        reason: 'page-not-found',
+      });
+    });
+  });
+
+  // #559 — the external-MCP api_key behind a content edit must be threaded from
+  // the connection context all the way to pageRepo.updatePage's
+  // `lastUpdatedApiKeyId`, so the persona ("External MCP" / <key name>) survives
+  // the collab/page edit path. This is the WRITE hop the review flagged as
+  // silently dropping the id (the middle of the auth→DB→history→read chain).
+  describe('external-MCP api_key threading (#559)', () => {
+    // Same shape as buildData, but carries an api_key id on the context.
+    const buildDataWithApiKey = (
+      document: any,
+      actor: 'user' | 'agent',
+      apiKeyId: string | undefined,
+    ) => ({
+      documentName: `page.${PAGE_ID}`,
+      document,
+      context: { user: { id: USER_ID, name: 'Alice' }, actor, apiKeyId },
+    });
+
+    it('writes context.apiKeyId to updatePage.lastUpdatedApiKeyId', async () => {
+      const document = ydocFor(doc('NEW CONTENT'));
+      pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW CONTENT'));
+
+      await ext.onStoreDocument(
+        buildDataWithApiKey(document, 'agent', 'key-1') as any,
+      );
+
+      expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+      // The write hop at persistence.extension updatePage(...): the api_key id
+      // must land on lastUpdatedApiKeyId. NON-VACUITY: reverting the source hop
+      // (e.g. hardcoding `lastUpdatedApiKeyId: null` or dropping the field)
+      // makes this assertion RED.
+      expect(pageRepo.updatePage.mock.calls[0][0].lastUpdatedApiKeyId).toBe(
+        'key-1',
+      );
+    });
+
+    it('writes null lastUpdatedApiKeyId for a human/internal-agent edit (no apiKeyId)', async () => {
+      const document = ydocFor(doc('NEW CONTENT'));
+      pageRepo.findById.mockResolvedValue(persistedHumanPage('NEW CONTENT'));
+
+      // A context with NO apiKeyId (a human, or the internal AI agent) must
+      // resolve to null per the code's `context?.apiKeyId ?? null`, never
+      // undefined — so the column is explicitly cleared, not left absent.
+      await ext.onStoreDocument(
+        buildDataWithApiKey(document, 'user', undefined) as any,
+      );
+
+      expect(pageRepo.updatePage).toHaveBeenCalledTimes(1);
+      expect(
+        pageRepo.updatePage.mock.calls[0][0].lastUpdatedApiKeyId,
+      ).toBeNull();
     });
   });
 

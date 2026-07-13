@@ -455,6 +455,13 @@ export class PersistenceExtension implements Extension {
               // Human stays the responsible author; these annotate the source.
               lastUpdatedSource,
               lastUpdatedAiChatId: context?.aiChatId ?? null,
+              // #559 — the external-MCP api_key behind this content edit (null for
+              // a human or the internal AI agent). The review flagged that apiKeyId
+              // is LOST on the collab/page path unless it is threaded all the way
+              // here from the connection context (set in authentication.extension);
+              // without it the persona always falls back for the common page-edit
+              // case. saveHistory copies this onto every snapshot of this page.
+              lastUpdatedApiKeyId: context?.apiKeyId ?? null,
               contributorIds: contributorIds,
             },
             pageId,

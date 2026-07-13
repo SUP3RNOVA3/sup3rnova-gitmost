@@ -83,6 +83,57 @@ describe('CommentRepo.findById — agent avatar stack enrichment', () => {
     expect(result).not.toHaveProperty('agentRole');
   });
 
+  // #559 — external-MCP (api_key) provenance, FORM 3. The row carries
+  // createdSource='agent', aiChatId null, a non-null createdApiKeyId, and the
+  // key-name join object (`apiKey`). attachCommentAgent must thread
+  // api_key_id + apiKeyName into resolveAgentProvenance so the persona is the
+  // NAMED key, launcher null, and the join-only `apiKey` object is stripped.
+  //
+  // NON-VACUITY: if the read-side threading is reverted (attachCommentAgent no
+  // longer passes api_key_id / apiKeyName, or the resolver's external-MCP branch
+  // is removed) this row falls into the degenerate external form and `agent`
+  // becomes the creator ('MCP Bot') instead of the key name — reddening this.
+  it('external MCP with api_key name (form 3): agent = key name, launcher = null, apiKey stripped', async () => {
+    const { repo } = makeRepo({
+      id: 'c-5',
+      createdSource: 'agent',
+      aiChatId: null,
+      createdApiKeyId: 'key-1',
+      apiKey: { name: 'agent-node-2' },
+      creator: { name: 'MCP Bot', avatarUrl: 'bot.png' },
+      agentRole: null,
+    });
+
+    const result: any = await repo.findById('c-5', enrichOpts);
+
+    expect(result.agent).toEqual({ name: 'agent-node-2', avatarUrl: null });
+    expect(result.launcher).toBeNull();
+    // The join-only key-name object must never leak to the client (the raw
+    // createdApiKeyId column stays, like aiChatId).
+    expect(result).not.toHaveProperty('apiKey');
+  });
+
+  // #559 — external-MCP FALLBACK: a non-null createdApiKeyId but a null `apiKey`
+  // join (the key was hard-deleted, or the key row carries no name). The persona
+  // falls back to the EXTERNAL_MCP_FALLBACK_NAME ('External MCP').
+  it('external MCP with a hard-deleted/absent key: agent = "External MCP" fallback', async () => {
+    const { repo } = makeRepo({
+      id: 'c-6',
+      createdSource: 'agent',
+      aiChatId: null,
+      createdApiKeyId: 'key-1',
+      apiKey: null,
+      creator: { name: 'MCP Bot', avatarUrl: 'bot.png' },
+      agentRole: null,
+    });
+
+    const result: any = await repo.findById('c-6', enrichOpts);
+
+    expect(result.agent).toEqual({ name: 'External MCP', avatarUrl: null });
+    expect(result.launcher).toBeNull();
+    expect(result).not.toHaveProperty('apiKey');
+  });
+
   it('non-agent comment: neither agent nor launcher is attached', async () => {
     const { repo } = makeRepo({
       id: 'c-3',

@@ -1,7 +1,4 @@
-import {
-  NotFoundException,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { NotFoundException, UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from './authentication.extension';
 import { SpaceRole } from '../../common/helpers/types/permission';
 import { JwtType } from '../../core/auth/dto/jwt-payload';
@@ -80,7 +77,9 @@ describe('AuthenticationExtension.onAuthenticate', () => {
       }),
     };
 
-    apiKeyService = { validate: jest.fn().mockResolvedValue({ user: {}, workspace: {} }) };
+    apiKeyService = {
+      validate: jest.fn().mockResolvedValue({ user: {}, workspace: {} }),
+    };
 
     ext = new AuthenticationExtension(
       tokenService as any,
@@ -236,6 +235,23 @@ describe('AuthenticationExtension.onAuthenticate', () => {
     expect(ctx.aiChatId).toBeNull();
   });
 
+  it('#559 api_key principal (ordinary user) → actor=agent + apiKeyId in context (external MCP)', async () => {
+    // An EXTERNAL MCP collab connection carries principal='api_key' + apiKeyId but
+    // NO actor claim, and the key owner is an ordinary (non-is_agent) user. The
+    // seam must still stamp actor='agent' and thread the key id into the context
+    // so persistence.extension persists last_updated_api_key_id and the page shows
+    // the "External MCP" persona named after the key.
+    tokenService.verifyJwt.mockResolvedValue(
+      buildJwt({ principal: 'api_key', apiKeyId: 'key-42' }),
+    );
+    userRepo.findById.mockResolvedValue(buildUser({ isAgent: false }));
+    const ctx = await ext.onAuthenticate(buildData() as any);
+
+    expect(ctx.actor).toBe('agent');
+    expect(ctx.aiChatId).toBeNull();
+    expect(ctx.apiKeyId).toBe('key-42');
+  });
+
   // --- #501: api-key laundering guard (fail-closed discriminator) ----------
   describe('api-key laundering guard', () => {
     it('api_key principal → row-checks the key on connect (valid key proceeds)', async () => {
@@ -266,7 +282,9 @@ describe('AuthenticationExtension.onAuthenticate', () => {
     });
 
     it('api_key principal missing apiKeyId → Unauthorized (malformed)', async () => {
-      tokenService.verifyJwt.mockResolvedValue(buildJwt({ principal: 'api_key' }));
+      tokenService.verifyJwt.mockResolvedValue(
+        buildJwt({ principal: 'api_key' }),
+      );
       await expect(ext.onAuthenticate(buildData() as any)).rejects.toThrow(
         UnauthorizedException,
       );
@@ -274,7 +292,9 @@ describe('AuthenticationExtension.onAuthenticate', () => {
     });
 
     it('session principal → NO api-key check (session-backed, incl. internal agent)', async () => {
-      tokenService.verifyJwt.mockResolvedValue(buildJwt({ principal: 'session' }));
+      tokenService.verifyJwt.mockResolvedValue(
+        buildJwt({ principal: 'session' }),
+      );
       await ext.onAuthenticate(buildData() as any);
       expect(apiKeyService.validate).not.toHaveBeenCalled();
     });
@@ -282,7 +302,9 @@ describe('AuthenticationExtension.onAuthenticate', () => {
     it('claimless token WITHIN the grace window → trusted (legacy pre-rollout)', async () => {
       // Default rolloutAt = now, so we are inside the grace window.
       tokenService.verifyJwt.mockResolvedValue(buildJwt()); // no principal
-      await expect(ext.onAuthenticate(buildData() as any)).resolves.toBeDefined();
+      await expect(
+        ext.onAuthenticate(buildData() as any),
+      ).resolves.toBeDefined();
       expect(apiKeyService.validate).not.toHaveBeenCalled();
     });
 
