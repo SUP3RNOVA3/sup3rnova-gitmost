@@ -6,6 +6,7 @@ import {
   IsString,
   IsUUID,
 } from 'class-validator';
+import { PublishedMode } from '../published-mode.constants';
 
 export class CreateShareDto {
   @IsString()
@@ -25,7 +26,7 @@ export class CreateShareDto {
   // ='manual'). Mutually exclusive with includeSubPages (enforced server-side).
   @IsOptional()
   @IsIn(['live', 'approved'])
-  publishedMode?: 'live' | 'approved';
+  publishedMode?: PublishedMode;
 }
 
 export class UpdateShareDto extends CreateShareDto {

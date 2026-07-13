@@ -6,7 +6,12 @@ import {
 } from '@nestjs/common';
 import { CreateShareDto, ShareInfoDto, UpdateShareDto } from './dto/share.dto';
 import { InjectKysely } from 'nestjs-kysely';
-import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
+import { executeTx } from '@docmost/db/utils';
+import {
+  PublishedMode,
+  DEFAULT_PUBLISHED_MODE,
+} from './published-mode.constants';
 import { nanoIdGen } from '../../common/helpers';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { TokenService } from '../auth/services/token.service';
@@ -95,7 +100,7 @@ export class ShareService {
     const { authUserId, workspaceId, page, createShareDto } = opts;
 
     const includeSubPages = createShareDto.includeSubPages ?? false;
-    const publishedMode = createShareDto.publishedMode ?? 'live';
+    const publishedMode = createShareDto.publishedMode ?? DEFAULT_PUBLISHED_MODE;
 
     // #370 Stage B — 'approved' freezes a SINGLE page to its saved version; a
     // sub-tree cannot be version-frozen in the MVP, so the two are mutually
@@ -104,29 +109,39 @@ export class ShareService {
     this.assertPublishedModeCompatible(publishedMode, includeSubPages);
 
     try {
-      const shares = await this.shareRepo.findByPageId(page.id);
-      if (shares) {
-        return shares;
-      }
+      // Atomic share-write + baseline mint (F1): the share row insert and the
+      // approved baseline are one transaction, so an approved share can never
+      // durably exist WITHOUT its baseline. That "approved without baseline"
+      // state is what the public read path fails OPEN to (serving the live
+      // draft) — making it unreachable closes that confidentiality leak.
+      return await executeTx(this.db, async (trx) => {
+        const shares = await this.shareRepo.findByPageId(page.id, { trx });
+        if (shares) {
+          return shares;
+        }
 
-      const share = await this.shareRepo.insertShare({
-        key: nanoIdGen().toLowerCase(),
-        pageId: page.id,
-        includeSubPages,
-        searchIndexing: createShareDto.searchIndexing ?? false,
-        publishedMode,
-        creatorId: authUserId,
-        spaceId: page.spaceId,
-        workspaceId,
+        const share = await this.shareRepo.insertShare(
+          {
+            key: nanoIdGen().toLowerCase(),
+            pageId: page.id,
+            includeSubPages,
+            searchIndexing: createShareDto.searchIndexing ?? false,
+            publishedMode,
+            creatorId: authUserId,
+            spaceId: page.spaceId,
+            workspaceId,
+          },
+          trx,
+        );
+
+        // Guarantee an approved share always has a saved version to serve: mint
+        // the first manual baseline from the page's current content on enable.
+        if (publishedMode === 'approved') {
+          await this.ensureApprovedBaseline(page.id, trx);
+        }
+
+        return share;
       });
-
-      // Guarantee an approved share always has a saved version to serve: mint
-      // the first manual baseline from the page's current content on enable.
-      if (publishedMode === 'approved') {
-        await this.ensureApprovedBaseline(page.id);
-      }
-
-      return share;
     } catch (err) {
       this.logger.error(err);
       throw new BadRequestException('Failed to share page');
@@ -145,7 +160,7 @@ export class ShareService {
       updateShareDto.includeSubPages ?? current.includeSubPages ?? false;
     const effectivePublishedMode = (updateShareDto.publishedMode ??
       current.publishedMode ??
-      'live') as 'live' | 'approved';
+      DEFAULT_PUBLISHED_MODE) as PublishedMode;
 
     // #370 Stage B — enforce the approved/includeSubPages XOR on the merged
     // state. Thrown before the try so the specific 400 reaches the client.
@@ -155,23 +170,31 @@ export class ShareService {
     );
 
     try {
-      const updated = await this.shareRepo.updateShare(
-        {
-          includeSubPages: updateShareDto.includeSubPages,
-          searchIndexing: updateShareDto.searchIndexing,
-          publishedMode: updateShareDto.publishedMode,
-        },
-        shareId,
-      );
+      // Atomic share-write + baseline mint (F1): the share update and the
+      // approved baseline commit together, so a share can never durably land in
+      // approved mode WITHOUT a baseline. That gap is what the public read path
+      // fails OPEN to (serving the live draft) — one transaction makes it
+      // unreachable and closes the confidentiality leak.
+      return await executeTx(this.db, async (trx) => {
+        const updated = await this.shareRepo.updateShare(
+          {
+            includeSubPages: updateShareDto.includeSubPages,
+            searchIndexing: updateShareDto.searchIndexing,
+            publishedMode: updateShareDto.publishedMode,
+          },
+          shareId,
+          trx,
+        );
 
-      // On (or while) enabling approved mode, ensure a manual baseline exists so
-      // public readers always have a saved version to serve. Idempotent: a no-op
-      // when the page already has a manual history row.
-      if (effectivePublishedMode === 'approved') {
-        await this.ensureApprovedBaseline(current.pageId);
-      }
+        // On (or while) enabling approved mode, ensure a manual baseline exists
+        // so public readers always have a saved version to serve. Idempotent: a
+        // no-op when the page already has a manual history row.
+        if (effectivePublishedMode === 'approved') {
+          await this.ensureApprovedBaseline(current.pageId, trx);
+        }
 
-      return updated;
+        return updated;
+      });
     } catch (err) {
       this.logger.error(err);
       throw new BadRequestException('Failed to update share');
@@ -183,7 +206,7 @@ export class ShareService {
    * includeSubPages: a whole sub-tree cannot be version-frozen in the MVP.
    */
   private assertPublishedModeCompatible(
-    publishedMode: 'live' | 'approved',
+    publishedMode: PublishedMode,
     includeSubPages: boolean,
   ): void {
     if (publishedMode === 'approved' && includeSubPages) {
@@ -199,17 +222,24 @@ export class ShareService {
    * the first manual version. Idempotent: returns early when a manual version
    * already exists, so it is safe to call on every approved update.
    */
-  private async ensureApprovedBaseline(pageId: string): Promise<void> {
+  private async ensureApprovedBaseline(
+    pageId: string,
+    trx: KyselyTransaction,
+  ): Promise<void> {
     const existing = await this.pageHistoryRepo.findLatestByPageIdAndKind(
       pageId,
       'manual',
+      { trx },
     );
     if (existing) return;
 
-    const page = await this.pageRepo.findById(pageId, { includeContent: true });
+    const page = await this.pageRepo.findById(pageId, {
+      includeContent: true,
+      trx,
+    });
     if (!page) return;
 
-    await this.pageHistoryRepo.saveHistory(page, { kind: 'manual' });
+    await this.pageHistoryRepo.saveHistory(page, { kind: 'manual', trx });
   }
 
   /**
