@@ -17,6 +17,13 @@ jest.mock('ai', () => ({
 import { streamText, generateText } from 'ai';
 import { AiChatService } from './ai-chat.service';
 import { RunAlreadyActiveError } from './ai-chat-run.service';
+// Spied as a MODULE so we observe the exact arguments the service threads into
+// the replay budgeter — the wiring the helper unit tests cannot see (#555 item 2).
+import * as historyBudget from './history-budget';
+import {
+  resolveReplayBudget,
+  resolveEffectiveReplayThreshold,
+} from './history-budget';
 
 /**
  * Race-closure coverage for the "one active run per chat" guard (#184).
@@ -573,5 +580,214 @@ describe('AiChatService.stream — begin-failure fails the turn (#184 F14 / #486
     // call, so no orphan/untracked run was left behind.
     expect(aiChatMessageRepo.insert).not.toHaveBeenCalled();
     expect(streamTextMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #555 item 2 — SERVICE-level wiring of the aggressive-threshold ×0.5^k recovery
+ * (#490/#520). The pure helpers (`resolveEffectiveReplayThreshold`,
+ * `lastAssistantReplayOverflowCount`, `trimHistoryForReplay`) are unit-tested in
+ * isolation, but those tests CANNOT catch a regression in how stream() THREADS
+ * them together:
+ *   1. read the prior consecutive-overflow count `k` from the persisted history;
+ *   2. feed it to `resolveEffectiveReplayThreshold(base, k)` and pass THAT
+ *      escalated threshold (NOT the base budget) to `trimHistoryForReplay`;
+ *   3. the `priorOverflowed` PROVENANCE — when `k > 0` the prior turn's provider
+ *      `contextTokens` is stale/absent, so the service DROPS it (passes
+ *      `undefined`) to force the char-estimate path; when `k === 0` it passes the
+ *      real prior count through.
+ * A swap of `effectiveThreshold` back to the base budget, or dropping the
+ * `k > 0 ? undefined : prior` guard, passes every helper unit test yet silently
+ * breaks reactive recovery. These tests spy on the budgeter at the module seam
+ * and assert the exact arguments stream() hands it, driven from REAL persisted
+ * history rows.
+ */
+describe('AiChatService.stream — aggressive-threshold ×0.5 wiring provenance (#555 item 2 / #490/#520)', () => {
+  const streamTextMock = streamText as unknown as jest.Mock;
+
+  function makeStreamResult() {
+    return {
+      consumeStream: jest.fn(),
+      pipeUIMessageStreamToResponse: jest.fn(),
+    };
+  }
+
+  function makeRes() {
+    return {
+      raw: {
+        writeHead: jest.fn(),
+        write: jest.fn(),
+        once: jest.fn(),
+        on: jest.fn(),
+        flushHeaders: jest.fn(),
+        writableEnded: false,
+        destroyed: false,
+      },
+    };
+  }
+
+  // A minimal persisted history whose LAST assistant row carries the given
+  // metadata (the overflow counter + the provider contextTokens fact).
+  function makeService(
+    history: Array<Record<string, unknown>>,
+    chatContextWindowRaw: unknown,
+  ) {
+    const aiChatRepo = {
+      findById: jest.fn(async () => ({ id: 'chat-1', workspaceId: 'ws-1' })),
+      insert: jest.fn(),
+    };
+    const aiChatMessageRepo = {
+      insert: jest.fn(async () => ({ id: 'msg-1' })),
+      findAllByChat: jest.fn(async () => history),
+      update: jest.fn(async () => ({ id: 'msg-1' })),
+      finalizeOwner: jest.fn(async () => ({ id: 'msg-1' })),
+      findStreamingWithTerminalRun: jest.fn(async () => []),
+    };
+    const aiSettings = {
+      resolve: jest.fn(async () => ({ chatContextWindowRaw })),
+    };
+    const tools = { forUser: jest.fn(async () => ({})) };
+    const mcpClients = {
+      toolsFor: jest.fn(async () => ({
+        tools: {},
+        clients: [],
+        outcomes: [],
+        instructions: [],
+      })),
+    };
+    const svc = new AiChatService(
+      {} as never, // ai
+      aiChatRepo as never,
+      aiChatMessageRepo as never,
+      {} as never, // aiChatPageSnapshotRepo
+      aiSettings as never,
+      tools as never,
+      mcpClients as never,
+      {} as never, // aiAgentRoleRepo
+      {} as never, // pageRepo
+      {} as never, // pageAccess
+      {
+        isAiChatDeferredToolsEnabled: () => false,
+        isAiChatFinalStepLockdownEnabled: () => false,
+        isAiChatViewImageEnabled: () => false,
+      } as never, // environment
+    );
+    return { svc };
+  }
+
+  const body = {
+    chatId: 'chat-1',
+    messages: [
+      { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }] },
+    ],
+  };
+
+  async function driveStream(svc: AiChatService) {
+    await svc.stream({
+      user: { id: 'user-1' } as never,
+      workspace: { id: 'ws-1' } as never,
+      sessionId: 'sess-1',
+      body: body as never,
+      res: makeRes() as never,
+      signal: new AbortController().signal,
+      model: {} as never,
+      role: null,
+      runHooks: {
+        begin: jest.fn(async () => ({
+          runId: 'run-1',
+          signal: new AbortController().signal,
+        })),
+        onAssistantSeeded: jest.fn(),
+        onStep: jest.fn(),
+        onSettled: jest.fn(),
+      } as never,
+    });
+  }
+
+  beforeEach(() => {
+    streamTextMock.mockReset();
+    streamTextMock.mockImplementation(() => makeStreamResult());
+    jest
+      .spyOn(Logger.prototype, 'log')
+      .mockImplementation(() => undefined as never);
+    jest
+      .spyOn(Logger.prototype, 'warn')
+      .mockImplementation(() => undefined as never);
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('k>0: reads the prior overflow count, applies the ESCALATED threshold, and DROPS the stale prior contextTokens (undefined) — the priorOverflowed provenance', async () => {
+    const raw = '40000';
+    const base = resolveReplayBudget(raw).thresholdTokens as number;
+    const k = 2;
+    const expected = resolveEffectiveReplayThreshold(base, k) as number;
+    // Sanity: the escalation MUST actually differ from the base, else the assertion
+    // below could not tell "applied the escalation" from "applied the base".
+    expect(expected).toBeLessThan(base);
+
+    const effSpy = jest.spyOn(historyBudget, 'resolveEffectiveReplayThreshold');
+    const trimSpy = jest.spyOn(historyBudget, 'trimHistoryForReplay');
+
+    // Last assistant row: 2 consecutive overflows + a STALE provider contextTokens
+    // that the recovery path must ignore.
+    const { svc } = makeService(
+      [
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: 'prior answer',
+          metadata: { replayOverflowCount: k, contextTokens: 999_999 },
+        },
+      ],
+      raw,
+    );
+    await driveStream(svc);
+
+    // (1) k is read from the persisted row and (2) fed to the escalation helper.
+    expect(effSpy).toHaveBeenCalledWith(base, k);
+    // (2)+(3): the ESCALATED threshold is applied to the trim, and the stale prior
+    // contextTokens is DROPPED (undefined) because k>0 — the provenance regression
+    // this locks. A revert to `replayBudget.thresholdTokens` (base) or to passing
+    // `priorContextTokens` here turns this red.
+    expect(trimSpy).toHaveBeenCalledWith(
+      expect.any(Array),
+      expected,
+      undefined,
+    );
+    expect(streamTextMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('k===0 (control): no escalation (base threshold) and the prior contextTokens IS passed through — the provenance is asymmetric', async () => {
+    const raw = '40000';
+    const base = resolveReplayBudget(raw).thresholdTokens as number;
+    const priorContextTokens = 12_345;
+
+    const trimSpy = jest.spyOn(historyBudget, 'trimHistoryForReplay');
+
+    // A cleanly-finished last assistant turn: no overflow counter, a real prior
+    // contextTokens fact.
+    const { svc } = makeService(
+      [
+        {
+          id: 'a1',
+          role: 'assistant',
+          content: 'prior answer',
+          metadata: { contextTokens: priorContextTokens },
+        },
+      ],
+      raw,
+    );
+    await driveStream(svc);
+
+    // No overflow -> the base budget is used verbatim AND the provider fact is
+    // threaded through (NOT dropped). This is the other arm of the provenance:
+    // if the service dropped the prior on the normal path too, this fails.
+    expect(trimSpy).toHaveBeenCalledWith(
+      expect.any(Array),
+      base,
+      priorContextTokens,
+    );
+    expect(streamTextMock).toHaveBeenCalledTimes(1);
   });
 });
