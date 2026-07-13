@@ -311,6 +311,23 @@ export class EnvironmentService {
   }
 
   /**
+   * In-app AI-chat `viewImage` vision tool (#588, Phase B of #585). When enabled,
+   * the agent gains a read-only `viewImage({pageId, node})` tool that delivers a
+   * node's image to the model AS VISION on any provider: raster images
+   * (png/jpeg/webp/gif) pass through as-is, SVG / draw.io diagrams are rasterized
+   * to PNG (Phase A #586). Defaults to OFF (fail-closed): with the flag off the
+   * tool is not registered and the per-step image injection never runs, so the
+   * agent surface is byte-identical to before. Set AI_CHAT_VIEW_IMAGE=true to
+   * enable. The public-share chat toolset (`forShare`) never gets this tool.
+   */
+  isAiChatViewImageEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('AI_CHAT_VIEW_IMAGE', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
+  /**
    * Resumable SSE transport for durable agent runs (#184 phase 1.5). When
    * enabled, a run tees its SSE frames into the in-memory run-stream registry so
    * a late/reloaded tab can attach (replay + live tail) via

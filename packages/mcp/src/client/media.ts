@@ -56,6 +56,7 @@ export interface IMediaMixin {
   uploadImage(pageId: string, url: string): any;
   insertImage(pageId: string, url: string, opts?: { align?: "left" | "center" | "right"; alt?: string; replaceText?: string; afterText?: string; }): any;
   replaceImage(pageId: string, oldAttachmentId: string, url: string, opts?: { align?: "left" | "center" | "right"; alt?: string }): any;
+  fetchAttachmentBytes(src: string): Promise<{ buffer: Buffer; mime: string }>;
 }
 
 export function MediaMixin<TBase extends GConstructor<DocmostClientContext>>(Base: TBase): GConstructor<DocmostClientContext & IMediaMixin> & TBase {
@@ -718,6 +719,23 @@ export function MediaMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
   protected async fetchAttachmentText(src: string): Promise<string> {
     const { buffer } = await this.fetchInternalFile(src);
     return buffer.toString("utf-8");
+  }
+
+  /**
+   * PUBLIC accessor for the guarded internal-file fetch (#588). A thin, read-only
+   * wrapper over the `protected fetchInternalFile` — it adds NO logic of its own
+   * and deliberately reuses that method's SSRF / traversal / 64 MiB guards rather
+   * than reimplementing them. Exposed on the public client surface so the in-app
+   * AI-chat `viewImage` tool can pull an attachment's raw bytes + Content-Type to
+   * deliver it to the model as vision (raster passthrough or SVG->PNG rasterize),
+   * WITHOUT widening the trust boundary: `src` still flows through
+   * resolveInternalFilePath, so any traversal/percent-encoded escape throws before
+   * a network request is made.
+   */
+  async fetchAttachmentBytes(
+    src: string,
+  ): Promise<{ buffer: Buffer; mime: string }> {
+    return this.fetchInternalFile(src);
   }
 
   /**
