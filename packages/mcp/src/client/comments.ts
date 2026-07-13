@@ -42,6 +42,7 @@ import {
   countAnchorMatches,
   getAnchoredText,
   resolveAnchorSelection,
+  selectionOnlyInMarkForbiddingBlock,
   normalizeForMatch,
 } from "../lib/comment-anchor.js";
 import { closestBlockHint } from "../lib/text-normalize.js";
@@ -270,6 +271,19 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
   ): Error {
     const blockTexts = this.topLevelBlockTexts(doc);
     const rolled = live ? " The comment was rolled back." : "";
+    // Checked FIRST: the selection may well be contiguous document text, just
+    // in a place where the schema forbids the comment mark (a codeBlock) — the
+    // spans-multiple-blocks / closest-block hints would send the agent chasing
+    // a selection problem that does not exist.
+    if (selectionOnlyInMarkForbiddingBlock(doc, selection)) {
+      return new Error(
+        "createComment: the selection text occurs only inside a code block; " +
+          "inline comments cannot anchor to code block content (the editor " +
+          "schema forbids marks there). Anchor the comment on the prose " +
+          "paragraph next to the code block instead." +
+          rolled,
+      );
+    }
     if (this.selectionSpansMultipleBlocks(blockTexts, selection)) {
       return new Error(
         "createComment: the selection spans multiple blocks; anchor on a " +
@@ -407,6 +421,9 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
           (e.message.startsWith("createComment: could not find the selection") ||
             e.message.startsWith(
               "createComment: the selection spans multiple blocks",
+            ) ||
+            e.message.startsWith(
+              "createComment: the selection text occurs only inside a code block",
             ) ||
             e.message.startsWith(
               "createComment: the suggestion's selection is ambiguous",

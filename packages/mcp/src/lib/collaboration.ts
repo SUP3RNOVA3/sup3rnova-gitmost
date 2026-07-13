@@ -169,6 +169,47 @@ export function buildCollabWsUrl(baseUrl: string): string {
 }
 
 /**
+ * Reject a doc that places marks where the schema forbids them (e.g. any mark
+ * inside codeBlock, whose spec is `marks: ""`). PMNode.fromJSON does NOT
+ * validate marks against parent specs, and updateYFragment would happily write
+ * the poison into the live Y.Doc — where the NEXT schema-full materialization
+ * (browser ySyncPlugin) throws and y-prosemirror permanently DELETES the whole
+ * offending node (the July code-block data-loss incident). Failing loudly here
+ * turns silent delayed data loss into an immediate, actionable tool error.
+ *
+ * The whole-document scope is INTENTIONAL — a forbidden mark that pre-dates
+ * this write (legacy poison) is rejected too: failing loudly beats silent
+ * delayed data loss, and pre-existing poison is ephemeral anyway (a browser
+ * open destroys the node within seconds), so there is no long-lived legacy
+ * state worth grandfathering.
+ */
+function assertMarksAllowedByParent(pmNode: PMNode): void {
+  pmNode.descendants((child, _pos, parent) => {
+    // `descendants` never visits the root itself and always passes the
+    // enclosing node as `parent` (the root for its direct children); the
+    // fallback is purely defensive against the nullable type signature.
+    const p = parent ?? pmNode;
+    if (child.marks.length > 0 && !p.type.allowsMarks(child.marks)) {
+      const markNames = child.marks.map((m) => m.type.name).join(", ");
+      const preview = (child.isText ? child.text ?? "" : child.type.name).slice(
+        0,
+        40,
+      );
+      throw new Error(
+        `Document rejected: a "${p.type.name}" node carries the forbidden ` +
+          `mark(s) [${markNames}] on its child ("${preview}"). The editor ` +
+          `schema forbids these marks here, and the next schema-full ` +
+          `materialization would permanently delete the whole ${p.type.name}. ` +
+          `The mark may come from this write or may already exist in the live ` +
+          `document — remove it (or move the marked text out of the ` +
+          `${p.type.name}) and retry.`,
+      );
+    }
+    return true;
+  });
+}
+
+/**
  * Encode a ProseMirror doc to a Yjs document, sanitizing it first and turning
  * the opaque yjs "Unexpected content type" failure into a descriptive error.
  *
@@ -214,6 +255,9 @@ export function applyDocToFragment(ydoc: Y.Doc, newDoc: any): void {
   } catch (e) {
     throw unstorableYjsError(safe, "fromJSON", e);
   }
+  // fromJSON does not check marks against parent node specs, so validate them
+  // BEFORE anything touches the live fragment (see assertMarksAllowedByParent).
+  assertMarksAllowedByParent(pmNode);
   try {
     ydoc.transact(() => {
       updateYFragment(ydoc, fragment, pmNode, {
@@ -243,11 +287,15 @@ export function applyDocToFragment(ydoc: Y.Doc, newDoc: any): void {
 export function assertYjsEncodable(doc: any): void {
   buildYDoc(doc);
   const safe = sanitizeForYjs(doc);
+  let pmNode: PMNode;
   try {
-    PMNode.fromJSON(docmostSchema, safe);
+    pmNode = PMNode.fromJSON(docmostSchema, safe);
   } catch (e) {
     throw unstorableYjsError(safe, "fromJSON", e);
   }
+  // Preview/apply parity: reject schema-forbidden marks (e.g. a comment mark
+  // inside a codeBlock) here too, exactly like applyDocToFragment does.
+  assertMarksAllowedByParent(pmNode);
 }
 
 /**

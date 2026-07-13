@@ -49,6 +49,7 @@ export interface DiffIntegrity {
   links: [number, number];
   tables: [number, number];
   callouts: [number, number];
+  codeBlocks: [number, number];
   footnoteMarkers: [number[], number[]];
 }
 
@@ -234,11 +235,15 @@ function computeIntegrity(
     countNodes(oldDoc, (n) => n.type === "callout"),
     countNodes(newDoc, (n) => n.type === "callout"),
   ];
+  const codeBlocks: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "codeBlock"),
+    countNodes(newDoc, (n) => n.type === "codeBlock"),
+  ];
   const fns: [number[], number[]] = [
     footnoteMarkers(oldDoc, notesHeading),
     footnoteMarkers(newDoc, notesHeading),
   ];
-  return { images, links, tables, callouts, footnoteMarkers: fns };
+  return { images, links, tables, callouts, codeBlocks, footnoteMarkers: fns };
 }
 
 /**
@@ -384,6 +389,9 @@ function renderMarkdown(
   lines.push(`- tables: ${integrity.tables[0]} -> ${integrity.tables[1]}`);
   lines.push(`- callouts: ${integrity.callouts[0]} -> ${integrity.callouts[1]}`);
   lines.push(
+    `- codeBlocks: ${integrity.codeBlocks[0]} -> ${integrity.codeBlocks[1]}`,
+  );
+  lines.push(
     `- footnoteMarkers: [${integrity.footnoteMarkers[0].join(", ")}] -> [${integrity.footnoteMarkers[1].join(", ")}]`,
   );
   lines.push("");
@@ -489,9 +497,10 @@ export interface VerifyReport {
   marks: Record<string, [number, number]>;
   /**
    * ONLY structural integrity types whose count changed, as [before, after]
-   * (images/links/tables/callouts). Surfaces structural mutations that touch
-   * neither text nor marks (e.g. insertImage, deleting a table) which diffDocs
-   * — being TEXT-only — would otherwise report as "no content change".
+   * (images/links/tables/callouts/codeBlocks). Surfaces structural mutations
+   * that touch neither text nor marks (e.g. insertImage, deleting a table)
+   * which diffDocs — being TEXT-only — would otherwise report as "no content
+   * change".
    */
   structure?: Record<string, [number, number]>;
   /** One-line human/agent-readable summary. */
@@ -509,9 +518,9 @@ export interface VerifyReport {
  * `changed:false` / "no content change" rather than a misleading +0/-0 change.
  *
  * The structural integrity delta (from diffDocs's `integrity` tuples) is what
- * makes `changed` true for an image/table/callout/link count change that diffs
- * to zero text — closing a verify blind spot for insertImage, deleteNode on a
- * table, etc.
+ * makes `changed` true for an image/table/callout/codeBlock/link count change
+ * that diffs to zero text — closing a verify blind spot for insertImage,
+ * deleteNode on a table, a vanished codeBlock, etc.
  */
 export function summarizeChange(before: any, after: any): VerifyReport {
   try {
@@ -531,14 +540,16 @@ export function summarizeChange(before: any, after: any): VerifyReport {
     }
 
     // Structural integrity delta from diffDocs: count-based [old,new] tuples for
-    // images/links/tables/callouts. Include a type only when old != new.
+    // images/links/tables/callouts/codeBlocks. Include a type only when
+    // old != new.
     const integrity = diff.integrity;
     const structure: Record<string, [number, number]> = {};
-    const countTypes: ["images", "links", "tables", "callouts"] = [
+    const countTypes: ["images", "links", "tables", "callouts", "codeBlocks"] = [
       "images",
       "links",
       "tables",
       "callouts",
+      "codeBlocks",
     ];
     for (const type of countTypes) {
       const [b, a] = integrity[type];

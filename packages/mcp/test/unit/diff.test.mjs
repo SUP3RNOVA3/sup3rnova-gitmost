@@ -51,14 +51,21 @@ test("diffDocs reports integrity counts as [old,new] tuples", () => {
     attrs: { type: "info" },
     content: [para(t("note"))],
   };
+  const codeBlock = {
+    type: "codeBlock",
+    attrs: { language: "js" },
+    content: [t("const a = 1;")],
+  };
 
   const oldDoc = doc(
     para(t("a link", link)),
     image,
     callout,
+    codeBlock,
     para(t("body with [1] and [2]")),
   );
-  // new doc: drop the image, drop one footnote marker, keep link + callout.
+  // new doc: drop the image AND the code block, drop one footnote marker,
+  // keep link + callout.
   const newDoc = doc(
     para(t("a link", link)),
     callout,
@@ -70,8 +77,12 @@ test("diffDocs reports integrity counts as [old,new] tuples", () => {
   assert.deepEqual(r.integrity.links, [1, 1]);
   assert.deepEqual(r.integrity.callouts, [1, 1]);
   assert.deepEqual(r.integrity.tables, [0, 0]);
+  // codeBlock canary: a vanished code block shows up as [1, 0].
+  assert.deepEqual(r.integrity.codeBlocks, [1, 0]);
   // footnote markers parsed in reading order from the body.
   assert.deepEqual(r.integrity.footnoteMarkers, [[1, 2], [1]]);
+  // ...and the markdown summary carries the codeBlocks line.
+  assert.match(r.markdown, /- codeBlocks: 1 -> 0/);
 });
 
 // ---------------------------------------------------------------------------

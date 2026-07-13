@@ -33,6 +33,7 @@
  */
 
 import { stripInlineMarkdown } from "./text-normalize.js";
+import { docmostSchema } from "./docmost-schema.js";
 
 /** Typographic double-quote variants mapped to ASCII `"`. */
 const DOUBLE_QUOTES = "«»„“”‟〝〞＂";
@@ -43,6 +44,26 @@ const DASHES = "–—―−‐‑‒";
 
 /** Guard against pathological/cyclic documents in the depth-first walk. */
 const MAX_DEPTH = 200;
+
+// Node types with inline (text) content whose spec forbids the `comment` mark
+// (TipTap codeBlock declares `marks: ""`). Anchoring a comment mark inside such
+// a node poisons the Y.Doc: on the next schema-full materialization
+// y-prosemirror deletes the WHOLE node (permanent data loss). Derived from the
+// schema so a future mark-forbidding block type is covered automatically.
+const MARK_FORBIDDING_BLOCKS: ReadonlySet<string> = new Set(
+  Object.values(docmostSchema.nodes)
+    .filter((t) => t.inlineContent && !t.allowsMarkType(docmostSchema.marks.comment))
+    .map((t) => t.name),
+);
+
+/**
+ * True when a node's OWN content is allowed to hold a comment-mark anchor
+ * (i.e. its type is not a mark-forbidding block). This gates ONLY the
+ * own-content match at each traversal step — recursion into children is never
+ * gated (harmless for codeBlock, whose children are bare text, and required
+ * for containers like tables whose paragraphs must keep matching).
+ */
+const canMatchIn = (node: any): boolean => !MARK_FORBIDDING_BLOCKS.has(node?.type);
 
 /** The comment mark Docmost stores on anchored text. */
 function makeCommentMark(commentId: string): any {
@@ -234,7 +255,10 @@ export function getAnchoredText(doc: any, selection: string): string | null {
   const visit = (node: any, depth: number): string | null => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return null;
     if (!Array.isArray(node.content)) return null;
-    const match = findAnchorInBlock(node.content, effective);
+    // Own-content match only where a comment mark may live (see canMatchIn).
+    const match = canMatchIn(node)
+      ? findAnchorInBlock(node.content, effective)
+      : null;
     if (match) return reconstructRawText(node.content, match);
     for (const child of node.content) {
       if (child && typeof child === "object" && Array.isArray(child.content)) {
@@ -251,12 +275,25 @@ export function getAnchoredText(doc: any, selection: string): string | null {
  * RAW (no markdown-strip fallback) depth-first check that `selection` anchors
  * somewhere in `doc`. This is the primitive `resolveAnchorSelection` builds on;
  * public callers should use `canAnchorInDoc`, which adds the strip fallback.
+ *
+ * `includeMarkForbidding` is an INTERNAL escape hatch: when true, the
+ * mark-forbidding-block guard is disabled so `resolveAnchorSelection` can
+ * distinguish "the text is absent" from "the text exists only inside a
+ * codeBlock" for its diagnostic flag. It must never be used to actually anchor.
  */
-function rawCanAnchorInDoc(doc: any, selection: string): boolean {
+function rawCanAnchorInDoc(
+  doc: any,
+  selection: string,
+  includeMarkForbidding = false,
+): boolean {
   const visit = (node: any, depth: number): boolean => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return false;
     if (!Array.isArray(node.content)) return false;
-    if (findAnchorInBlock(node.content, selection)) return true;
+    if (
+      (includeMarkForbidding || canMatchIn(node)) &&
+      findAnchorInBlock(node.content, selection)
+    )
+      return true;
     for (const child of node.content) {
       if (child && typeof child === "object" && Array.isArray(child.content)) {
         if (visit(child, depth + 1)) return true;
@@ -279,11 +316,23 @@ function rawCanAnchorInDoc(doc: any, selection: string): boolean {
  * The stripped form is used ONLY to LOCATE the anchor; getAnchoredText still
  * reconstructs and stores the RAW document substring, so the strip never leaks
  * into what gets persisted.
+ *
+ * When neither form anchors in ALLOWED content, the resolver re-checks with the
+ * mark-forbidding-block guard disabled and sets `inMarkForbiddingBlock` when
+ * the selection WOULD have matched inside such a block (e.g. a codeBlock) —
+ * so callers can explain WHY anchoring is refused instead of claiming the text
+ * is missing. `found` stays false either way.
  */
 export function resolveAnchorSelection(
   doc: any,
   selection: string,
-): { selection: string; found: boolean; normalized: boolean } {
+): {
+  selection: string;
+  found: boolean;
+  normalized: boolean;
+  /** The selection matches ONLY inside a mark-forbidding block (codeBlock). */
+  inMarkForbiddingBlock?: boolean;
+} {
   if (rawCanAnchorInDoc(doc, selection)) {
     return { selection, found: true, normalized: false };
   }
@@ -291,7 +340,33 @@ export function resolveAnchorSelection(
   if (stripped !== selection && rawCanAnchorInDoc(doc, stripped)) {
     return { selection: stripped, found: true, normalized: true };
   }
+  // Anchors nowhere in allowed content: flag when the miss is caused by the
+  // mark-forbidding guard (both selection forms are re-checked, guard off).
+  if (
+    rawCanAnchorInDoc(doc, selection, true) ||
+    (stripped !== selection && rawCanAnchorInDoc(doc, stripped, true))
+  ) {
+    return {
+      selection,
+      found: false,
+      normalized: false,
+      inMarkForbiddingBlock: true,
+    };
+  }
   return { selection, found: false, normalized: false };
+}
+
+/**
+ * True when `selection` cannot anchor anywhere in allowed content but DOES
+ * occur inside a mark-forbidding block (e.g. a codeBlock). Implemented via
+ * `resolveAnchorSelection` so this diagnostic can never disagree with what the
+ * anchoring entry points actually refuse.
+ */
+export function selectionOnlyInMarkForbiddingBlock(
+  doc: any,
+  selection: string,
+): boolean {
+  return resolveAnchorSelection(doc, selection).inMarkForbiddingBlock === true;
 }
 
 /**
@@ -410,7 +485,8 @@ function rawCountAnchorMatches(doc: any, selection: string): number {
   const visit = (node: any, depth: number): void => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return;
     if (!Array.isArray(node.content)) return;
-    total += countInBlock(node.content);
+    // Count own-content occurrences only where a comment mark may live.
+    if (canMatchIn(node)) total += countInBlock(node.content);
     for (const child of node.content) {
       if (child && typeof child === "object" && Array.isArray(child.content)) {
         visit(child, depth + 1);
@@ -473,7 +549,12 @@ export function applyCommentMarkInDoc(
   const visit = (node: any, depth: number): boolean => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return false;
     if (!Array.isArray(node.content)) return false;
-    const match = findAnchorInBlock(node.content, effective);
+    // Never splice a comment mark into a mark-forbidding block (codeBlock):
+    // the schema rejects it and y-prosemirror would delete the whole node on
+    // the next materialization. Recursion into children stays unguarded.
+    const match = canMatchIn(node)
+      ? findAnchorInBlock(node.content, effective)
+      : null;
     if (match) {
       spliceCommentMark(node.content, match, commentMark);
       return true;
@@ -565,6 +646,10 @@ export function collectResolvedCommentSpans(doc: any): ResolvedCommentSpan[] {
  * stored attrs. A span whose text the agent changed or deleted simply does not
  * re-anchor and is dropped (its anchor is gone; it was already resolved). Active
  * comments are untouched — they ride through the markdown themselves.
+ *
+ * A resolved span whose text now survives ONLY inside a mark-forbidding block
+ * (e.g. a codeBlock) likewise does not re-anchor and is dropped — the shared
+ * anchoring guard skips such blocks so a comment mark can never poison them.
  */
 export function regraftResolvedComments<T = any>(oldDoc: any, newDoc: T): T {
   if (!newDoc || typeof newDoc !== "object") return newDoc;
