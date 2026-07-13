@@ -256,10 +256,10 @@ export default function HistoryModalDesktop({ pageId, onClose }: Props) {
               </Text>
             </Stack>
           ) : (
-            {/* #583 Fix B — fullScreen gives the article far more room. Add side
-                padding (.historyEditor .ProseMirror is padding:0 !important, so
-                without it the title/text stick to the panel edge) and a gentle
-                width cap centered so lines stay readable on 4K. */}
+            /* #583 Fix B — fullScreen gives the article far more room. Add side
+               padding (.historyEditor .ProseMirror is padding:0 !important, so
+               without it the title/text stick to the panel edge) and a gentle
+               width cap centered so lines stay readable on 4K. */
             <Box p="26px 44px" maw={1100} mx="auto">
               {activeHistoryId && <HistoryView />}
             </Box>
