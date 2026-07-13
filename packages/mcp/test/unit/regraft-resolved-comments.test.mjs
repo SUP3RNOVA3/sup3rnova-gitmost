@@ -105,3 +105,112 @@ test("applyCommentMarkInDoc preserves an arbitrary mark's attrs (resolved:true)"
   assert.equal(marked[0].text, "anchor me");
   assert.equal(commentMarkOf(marked[0]).attrs.resolved, true);
 });
+
+// #555 (review of #514) — two DISTINCT resolved anchors on IDENTICAL text used to
+// both land on occurrence #0, and the second comment mark was silently dropped at
+// toYdoc (a span can carry only one comment mark). The regraft now spreads them
+// over DISTINCT occurrences, and surfaces an unavoidable drop through the sink.
+
+test("two distinct resolved comments on identical text land on distinct occurrences (both survive)", () => {
+  // OLD: the word "note" is commented twice, in two different places.
+  const old = doc(
+    para(text("a "), text("note", [resolvedComment("r1")]), text(" here")),
+    para(text("b "), text("note", [resolvedComment("r2")]), text(" there")),
+  );
+  // NEW: the agent's markdown dropped both anchors, but "note" occurs twice.
+  const fresh = doc(para(text("a note here")), para(text("b note there")));
+
+  const warnings = [];
+  const out = regraftResolvedComments(old, fresh, (w) => warnings.push(w));
+
+  // BOTH comment marks are present, on DISTINCT text nodes, one per occurrence.
+  const marked = textNodes(out).filter((n) => commentMarkOf(n));
+  assert.equal(marked.length, 2, "both anchors must survive");
+  assert.deepEqual(
+    marked.map((n) => n.text),
+    ["note", "note"],
+  );
+  const ids = marked.map((n) => commentMarkOf(n).attrs.commentId).sort();
+  assert.deepEqual(ids, ["r1", "r2"], "both comment ids attach");
+  assert.equal(warnings.length, 0, "no drop → no warning");
+});
+
+test("more identical-text anchors than occurrences → unavoidable drop warns via the sink", () => {
+  // TWO distinct resolved comments on "gamma", but the rewritten body keeps only
+  // ONE "gamma": one anchor cannot be placed (a span holds one comment mark).
+  const old = doc(
+    para(text("gamma", [resolvedComment("g1")])),
+    para(text("gamma", [resolvedComment("g2")])),
+  );
+  const fresh = doc(para(text("only one gamma now")));
+
+  const warnings = [];
+  const out = regraftResolvedComments(old, fresh, (w) => warnings.push(w));
+
+  const marked = textNodes(out).filter((n) => commentMarkOf(n));
+  assert.equal(marked.length, 1, "exactly one anchor fits");
+  assert.equal(warnings.length, 1, "the un-graftable anchor is surfaced");
+  assert.equal(warnings[0].code, "collision");
+  assert.ok(["g1", "g2"].includes(warnings[0].commentId));
+  assert.equal(warnings[0].text, "gamma");
+});
+
+test("a non-matching resolved anchor emits a no-match warning in the sink", () => {
+  const old = doc(para(text("stale text", [resolvedComment("r1")])));
+  const fresh = doc(para(text("completely rewritten body")));
+
+  const warnings = [];
+  const out = regraftResolvedComments(old, fresh, (w) => warnings.push(w));
+
+  assert.equal(textNodes(out).filter((n) => commentMarkOf(n)).length, 0);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].code, "no-match");
+  assert.equal(warnings[0].commentId, "r1");
+  assert.equal(warnings[0].text, "stale text");
+});
+
+test("regraft without a sink stays silent (backwards compatible)", () => {
+  const old = doc(para(text("gone", [resolvedComment("r1")])));
+  const fresh = doc(para(text("nothing to see")));
+  // No sink argument: must not throw, and drops the anchor as before.
+  const out = regraftResolvedComments(old, fresh);
+  assert.equal(textNodes(out).filter((n) => commentMarkOf(n)).length, 0);
+});
+
+// #603 guard interaction — the free-occurrence search must never place a comment
+// mark inside a mark-forbidding block (a codeBlock), where a materialized comment
+// mark would make y-prosemirror delete the whole node (permanent data loss).
+const codeBlock = (t) => ({ type: "codeBlock", content: [text(t)] });
+
+test("resolved anchor whose text now lives only in a codeBlock is NOT grafted there (no-match warning)", () => {
+  const old = doc(para(text("run this", [resolvedComment("r1")])));
+  // The agent moved the text into a code block; a comment mark may not live there.
+  const fresh = doc(codeBlock("run this"));
+
+  const warnings = [];
+  const out = regraftResolvedComments(old, fresh, (w) => warnings.push(w));
+
+  // Nothing marked anywhere (the codeBlock is never anchored).
+  assert.equal(textNodes(out).filter((n) => commentMarkOf(n)).length, 0);
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].code, "no-match");
+  assert.equal(warnings[0].commentId, "r1");
+});
+
+test("identical text in an EARLIER codeBlock is skipped; the anchor lands on the later paragraph", () => {
+  const old = doc(para(text("total", [resolvedComment("r1")])));
+  // "total" occurs first inside a codeBlock (document order), then in a paragraph.
+  const fresh = doc(codeBlock("total"), para(text("total")));
+
+  const warnings = [];
+  const out = regraftResolvedComments(old, fresh, (w) => warnings.push(w));
+
+  const marked = textNodes(out).filter((n) => commentMarkOf(n));
+  assert.equal(marked.length, 1, "exactly one mark, in the allowed block");
+  assert.equal(marked[0].text, "total");
+  assert.equal(commentMarkOf(marked[0]).attrs.commentId, "r1");
+  // The marked node must be the paragraph's text, NOT the codeBlock's.
+  const codeText = out.content[0].content[0];
+  assert.equal(commentMarkOf(codeText), null, "codeBlock text stays unmarked");
+  assert.equal(warnings.length, 0, "placed successfully → no warning");
+});
