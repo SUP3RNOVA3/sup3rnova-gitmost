@@ -159,8 +159,10 @@ function renderThread(props?: {
   const { unmount, rerender } = render(tree(props?.polledRunFact));
   // Re-render with a fresh `polledRunFact` (the delta poll's surfaced run fact),
   // keeping every other prop stable — the thread's mount effects do NOT re-run.
-  const setPolledRunFact = (fact: { id: string; status: string } | null) =>
-    rerender(tree(fact));
+  // `undefined` models the poll DISARMING (no result), which resets the dedupe ref.
+  const setPolledRunFact = (
+    fact?: { id: string; status: string } | null,
+  ) => rerender(tree(fact));
   return {
     onTurnFinished,
     onResumeFallback,
@@ -518,6 +520,22 @@ describe("ChatThread — send now", () => {
     await act(async () => {
       await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
     });
+    // F2: drive the REAL SDK finish of the FAILED turn (production ALWAYS fires it
+    // after the 409). WITHOUT the F1 fix this FINISH_ERROR clobbers runFact -> null,
+    // so the SEND_LOCAL below has nothing to preserve and Send now falls to a plain
+    // promote+abort (no supersede body) -> the final assertion reddens.
+    h.state.error = {
+      message: '{"message":"active","code":"A_RUN_ALREADY_ACTIVE","statusCode":409}',
+    };
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: true,
+      });
+      await Promise.resolve();
+    });
     // runFact is now "run-foreign". SEND_LOCAL preserves it; Send now CAS-targets it.
     fireEvent.click(screen.getByTestId("send-btn")); // SEND_LOCAL -> sending, local
     fireEvent.click(screen.getByTestId("queue-btn")); // Y
@@ -554,6 +572,23 @@ describe("ChatThread — send now", () => {
     // run-foreign.
     await act(async () => {
       await h.state.transport!.fetch!("http://x", { method: "POST", body: "{}" });
+    });
+    // F2: drive the REAL SDK finish of the FAILED turn (production ALWAYS fires this
+    // after the 409). The SDK also sets useChat `error` on an isError finish. WITHOUT
+    // the F1 fix this FINISH_ERROR clobbers runFact -> null, so the Send-now below
+    // falls to a plain send (body.supersede undefined) and the final assertion reddens
+    // — this is what un-vacuums the test onto the real prod path.
+    h.state.error = {
+      message: '{"message":"active","code":"A_RUN_ALREADY_ACTIVE","statusCode":409}',
+    };
+    await act(async () => {
+      h.state.onFinish?.({
+        message: { id: "a1", role: "assistant", parts: [] },
+        isAbort: false,
+        isDisconnect: false,
+        isError: true,
+      });
+      await Promise.resolve();
     });
     h.state.sendMessage.mockClear();
     h.state.stop.mockClear();
@@ -1341,6 +1376,41 @@ describe("ChatThread — live reconnect + stalled", () => {
       view.setPolledRunFact({ id: "run-1", status: "running" });
     });
     expect(screen.getByText(/reconnecting/i)).toBeTruthy(); // still recovering
+  });
+
+  it("#555 S3/F3: the dedupe ref RESETS on poll disarm so a SECOND recovery's negative fact re-quenches", async () => {
+    // The delta-poll consume dedupes by the derived active run id (lastPolledRunKeyRef)
+    // to avoid re-dispatching an unchanged fact. That ref resets when the poll DISARMS
+    // (`polledRunFact` returns to `undefined`) so the NEXT recovery's negative fact is
+    // NOT swallowed as a duplicate of the previous recovery's negative fact.
+    // MUTATION-VERIFY: drop the `polledRunFact === undefined -> reset` branch and the
+    // second negative fact (null === the stale null) is deduped -> the banner never
+    // clears the second time -> red.
+    const view = renderLive();
+    // First recovery: reconnecting, a NEGATIVE poll fact quenches to idle (ref=null).
+    await disconnect();
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    act(() => {
+      view.setPolledRunFact(null);
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
+    // The poll DISARMS (no result) -> the dedupe ref must reset to `undefined`.
+    act(() => {
+      view.setPolledRunFact(undefined);
+    });
+    // Second recovery: a fresh local send that then drops re-enters the ladder (the
+    // send re-stamps the turn epoch so this drop's dispatches are not epoch-dropped).
+    act(() => {
+      fireEvent.click(screen.getByTestId("send-btn")); // SEND_LOCAL -> sending
+    });
+    await disconnect();
+    expect(screen.getByText(/reconnecting/i)).toBeTruthy();
+    // The SAME negative fact (null) must re-quench — it would be deduped (null === the
+    // stale null from the first recovery) if the ref had NOT reset on disarm.
+    act(() => {
+      view.setPolledRunFact(null);
+    });
+    expect(screen.queryByText(/reconnecting/i)).toBeNull();
   });
 
   it("#541: getRun HANGS on a live disconnect — the timeout race still enters reconnect (no silent freeze in `streaming`)", async () => {

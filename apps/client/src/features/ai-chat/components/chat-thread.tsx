@@ -366,6 +366,22 @@ export default function ChatThread({
   // to AFTER that stream's onFinish can fire, or a late/overlapping finish leaks
   // past the epoch filter.
   const turnEpochRef = useRef(0);
+  // #555 F1: a ONE-SHOT set by the transport `fetch` path when the server returns a
+  // gate/CAS 409 whose FSM event ADOPTS (or preserves) a run-fact on the `error`
+  // phase — A_RUN_ALREADY_ACTIVE (-> RUN_ALREADY_ACTIVE, adopts activeRunId) and the
+  // supersede-* 409s SUPERSEDE_TARGET_MISMATCH / SUPERSEDE_TIMEOUT / SUPERSEDE_INVALID
+  // (all leave runFact set — see the run-fsm reducer and the S4 sendNow branch). The
+  // SAME failed turn's stream then fires `onFinish({isError:true})`, whose default
+  // FINISH_ERROR would CLOBBER that adopted run-fact to null — killing the S4 "Send
+  // now" CAS-supersede (the guard `runId && runId!=="pending"` would go false). The
+  // FSM has ALREADY absorbed this turn's outcome via the 409 -> `error(kind)`
+  // transition, so the stream's own error finish is REDUNDANT: onFinish reads-and-
+  // clears this ref at the top and SKIPS FINISH_ERROR when it is set. MIRRORS the
+  // superseding-pending special case (pendingSupersedeTextRef) that likewise special-
+  // cases onFinish. Scoped STRICTLY to those 409s: a NORMAL stream error (one that did
+  // NOT adopt a run-fact via a gate/CAS 409) leaves this false and still dispatches
+  // FINISH_ERROR (clearing runFact). Send-plumbing DATA, not a lifecycle flag.
+  const runFactAdopted409Ref = useRef(false);
 
   // --- Effect runner: executes the reducer's command effects ---------------
   const runEffect = useCallback(
@@ -528,24 +544,38 @@ export default function ChatThread({
                 dispatchRef.current({ type: "SUPERSEDE_READY", epoch: ep });
               } else if (response.status === 409) {
                 const { code, activeRunId } = await read409(response);
-                if (code === "SUPERSEDE_TARGET_MISMATCH")
+                if (code === "SUPERSEDE_TARGET_MISMATCH") {
+                  // #555 F1: this CAS 409 leaves the FSM in error(supersede-mismatch)
+                  // with the moved run absorbed into runFact — arm the one-shot so the
+                  // failed turn's own onFinish does not clobber it (see the ref decl).
+                  runFactAdopted409Ref.current = true;
                   dispatchRef.current({
                     type: "SUPERSEDE_MISMATCH",
                     currentRunId: activeRunId,
                     epoch: ep,
                   });
-                else if (code === "SUPERSEDE_TIMEOUT")
+                } else if (code === "SUPERSEDE_TIMEOUT") {
+                  // #555 F1: error(supersede-timeout) PRESERVES the prior runFact.
+                  runFactAdopted409Ref.current = true;
                   dispatchRef.current({ type: "SUPERSEDE_TIMEOUT", epoch: ep });
-                else if (code === "SUPERSEDE_INVALID")
+                } else if (code === "SUPERSEDE_INVALID") {
+                  // #555 F1: error(supersede-invalid) PRESERVES the prior runFact.
+                  runFactAdopted409Ref.current = true;
                   dispatchRef.current({ type: "SUPERSEDE_INVALID", epoch: ep });
+                }
               }
             } else if (response.status === 409) {
               const { code, activeRunId } = await read409(response);
-              if (code === "A_RUN_ALREADY_ACTIVE")
+              if (code === "A_RUN_ALREADY_ACTIVE") {
                 // S4: thread the server's activeRunId into the event so the FSM can
                 // adopt it as the run-fact — a later "Send now" then CAS-supersedes
                 // that (possibly foreign-tab) run instead of a blind promote+abort.
+                // #555 F1: arm the one-shot so the SAME failed turn's onFinish does
+                // NOT clobber that just-adopted run-fact to null (see the ref decl) —
+                // this is THE fix for the dead run-already-active S4 case.
+                runFactAdopted409Ref.current = true;
                 dispatchRef.current({ type: "RUN_ALREADY_ACTIVE", activeRunId });
+              }
             }
             return response;
           }
@@ -650,6 +680,16 @@ export default function ChatThread({
       // Notify the parent on EVERY terminal outcome (threadKey-guarded downstream
       // for #161); fires even while unmounting.
       onTurnFinished(extractServerChatId(message), threadKey);
+
+      // #555 F1: read-and-CLEAR the runFact-adopting-409 one-shot BEFORE any finish
+      // routing. When set, the FSM already absorbed THIS turn's outcome via a gate/CAS
+      // 409 -> `error(kind)` with the foreign/moved run in runFact; the isError branch
+      // below SKIPS its FINISH_ERROR so it does not clobber that run-fact to null
+      // (which kills the S4 Send-now supersede). Cleared unconditionally here so it can
+      // never leak into a later turn's finish (true one-shot). A normal stream error
+      // leaves it false -> FINISH_ERROR still fires and clears runFact. See the decl.
+      const adopted409 = runFactAdopted409Ref.current;
+      runFactAdopted409Ref.current = false;
 
       // A missing message (a pre-first-frame break) has no visible content.
       const msgHasVisible = message
@@ -848,7 +888,15 @@ export default function ChatThread({
       }
       // A NON-disconnect stream error (a provider 500 etc.) -> terminal error banner.
       if (isError) {
-        dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        // #555 F1: if a gate/CAS 409 already absorbed this turn's outcome (the FSM is
+        // already in error(kind) with the foreign/moved run in runFact), the stream's
+        // own error finish is redundant — dispatching FINISH_ERROR would clobber that
+        // run-fact to null and kill the S4 Send-now supersede. Skip it (the classified
+        // 409 banner + the adopted run-fact both survive). adopted409 is false for a
+        // normal stream error, which still dispatches FINISH_ERROR and clears runFact.
+        if (!adopted409) {
+          dispatch({ type: "FINISH_ERROR", kind: "stream", epoch: stampEpoch });
+        }
         setStopNotice(null);
         return;
       }
