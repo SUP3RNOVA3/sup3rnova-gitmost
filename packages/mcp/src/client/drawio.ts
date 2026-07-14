@@ -324,6 +324,15 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
    * `.drawio.svg` is uploaded as a FRESH attachment (in-place byte overwrite is
    * avoided — some Docmost versions corrupt an attachment on overwrite, exactly
    * as replaceImage documents) and the node is repointed with new dimensions.
+   *
+   * KNOWN LIMITATION (same class as replaceImage's, see media.ts): this repoints
+   * `src`/`attachmentId` on the SAME node, so the diagram COUNT is unchanged
+   * (drawio: 1 -> 1) and no text or marks move — `summarizeChange` therefore may
+   * report `verify.changed === false`. #600 added drawio/excalidraw integrity
+   * counts, which name a diagram that is LOST or GAINED; an attribute-only swap
+   * of a surviving diagram is still outside the text+marks+counts model. That is
+   * acceptable here: the write is confirmed by `repointed` / the baseHash CAS,
+   * and verify is supplementary.
    */
   async drawioUpdate(
     pageId: string,
@@ -475,6 +484,10 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
    * and to every edge whose source/target is deleted), then runs the SAME #423
    * pipeline as drawioUpdate (lint + quality warnings -> preview -> attachment ->
    * repoint the node). Ids are stable so diffs stay meaningful across edits.
+   *
+   * KNOWN LIMITATION: shares drawioUpdate's attribute-only blind spot — the node
+   * is repointed, so the diagram count stays 1 -> 1 and `verify.changed` may be
+   * false. The write is confirmed by `repointed` / the baseHash CAS, not verify.
    */
   async drawioEditCells(
     pageId: string,

@@ -677,8 +677,8 @@ export const SHARED_TOOL_SPECS = {
     description:
       'Diff two versions of a page and return a Docmost-equivalent change set ' +
       '(inserted/deleted text, integrity counts for images/links/tables/' +
-      'callouts/codeBlocks/footnote markers, and a human-readable markdown ' +
-      'summary). ' +
+      'callouts/codeBlocks/drawio/excalidraw/footnote markers, and a ' +
+      'human-readable markdown summary). ' +
       "`from`/`to` each accept a historyId, or null/'current' for the page's " +
       'current content (defaults: from=current, to=current — pass a historyId ' +
       'from the page-history list to compare against the live page).',
