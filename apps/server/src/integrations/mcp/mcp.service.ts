@@ -17,6 +17,7 @@ import {
   sharedTokenMatches,
   bindMcpBearerVerifier,
   mapAuthResultToResponse,
+  isCredentialHeaderPresent,
   DocmostMcpConfig,
   ResolvedMcpAuth,
 } from './mcp-auth.helpers';
@@ -66,10 +67,9 @@ let warnedLegacyMcpAuth = false;
 // cannot load the ESM-only @docmost/mcp package. Indirect through Function so
 // the real dynamic import() survives compilation and can load ESM from
 // CommonJS at runtime.
-const esmImport = new Function(
-  'specifier',
-  'return import(specifier)',
-) as (specifier: string) => Promise<unknown>;
+const esmImport = new Function('specifier', 'return import(specifier)') as (
+  specifier: string,
+) => Promise<unknown>;
 
 /**
  * Route ONE dependency-neutral metric sample emitted by the @docmost/mcp package
@@ -365,13 +365,40 @@ export class McpService implements OnModuleDestroy {
       }
     }
 
+    // RFC 6750 §3.1 — "if the request lacks any authentication information ... the
+    // resource server SHOULD NOT include an error code". `error="invalid_token"` on
+    // a request that sent NO credential (the common `claude mcp add` without
+    // --header) would tell the client its token is bad when it never sent one.
+    //
+    // The two credentials are tracked SEPARATELY because the two 401 branches
+    // challenge different ones: the shared-token 401 is about `X-MCP-Token`, the
+    // api_key 401 about `Authorization`. Collapsing them into one flag would make a
+    // request that sent only the api_key draw an `error="invalid_token"` about an
+    // X-MCP-Token it never sent (and vice versa). isCredentialHeaderPresent also
+    // reads a present-but-empty header as "no credential".
+    const bearerPresented = isCredentialHeaderPresent(
+      req.headers['authorization'],
+    );
+    const sharedTokenPresented = isCredentialHeaderPresent(
+      req.headers['x-mcp-token'],
+    );
+
     // Pure status/body mapping for the whole pre-hijack gauntlet.
     const decision = mapAuthResultToResponse({
       sharedTokenOk,
       enabled,
       error: authError,
+      sharedTokenPresented,
+      bearerPresented,
     });
     if (decision.kind === 'respond') {
+      // #636 — a 401 carries the RFC 6750 challenge (WWW-Authenticate: Bearer ...)
+      // so the client learns the accepted scheme instead of guessing OAuth.
+      if (decision.headers) {
+        for (const [name, value] of Object.entries(decision.headers)) {
+          res.header(name, value);
+        }
+      }
       res.status(decision.status).send(decision.body);
       return;
     }

@@ -46,6 +46,61 @@ export function resolveStaticAssetHeaders(
   return headers;
 }
 
+/**
+ * RFC 8615 reserves `/.well-known/` for MACHINE-readable site metadata
+ * (OAuth discovery, security.txt, WebFinger, MTA-STS...). A discovery client
+ * fetches such a URL and parses the body as JSON/text — it must get an honest
+ * 404 when no such resource exists, never a 200 `text/html` SPA shell.
+ *
+ * The bug (#636): the SPA catch-all answered `GET /.well-known/oauth-protected-resource`
+ * with index.html + 200, so an MCP client that (per the 2025-06-18 spec) starts
+ * OAuth discovery after a 401 from /mcp died on "Failed to parse JSON" instead
+ * of learning that this server has no OAuth AS at all.
+ *
+ * Feed this the DECODED path — `req.params['*']` from the catch-all route, not
+ * `req.url`. Matching on the raw url is bypassable: `/%2ewell-known/x` and
+ * `/.well-%6bnown/x` reach the same handler but do not literally start with
+ * `/.well-known/`, so a raw-url check hands them the SPA shell.
+ *
+ * This predicate is SELF-SUFFICIENT about the rest: it does not rely on the router
+ * having tidied the path up first, because Fastify only half does. Verified against
+ * a real Fastify + @fastify/static stand, `req.params['*']` is percent-decoded, but
+ * it does NOT collapse repeated leading slashes (`//.well-known/x` arrives verbatim)
+ * and does NOT collapse dot-segments that were smuggled in percent-encoded:
+ * `GET /a/..%2f.well-known/x` arrives as `/a/../.well-known/x`, which does not start
+ * with `/.well-known/` and used to be served the SPA shell. So the normalisation the
+ * check needs is done HERE, on whatever string it is handed:
+ *   - a query string is stripped (`req.params['*']` never carries one, but a
+ *     direct/unit caller may pass a raw url — a URL *fragment* needs no such strip:
+ *     it is client-side only and never reaches the server);
+ *   - `.` and `..` segments are resolved, so `/a/../.well-known/x` is seen for the
+ *     `/.well-known/x` it is, and `/.well-known/../home` for the plain `/home` it is;
+ *   - empty segments collapse and a leading slash is (re)imposed, so `//.well-known/x`
+ *     and a relative `.well-known/x` both normalise to the one shape.
+ * Whatever it is fed, the string it decides on is a canonical absolute path.
+ */
+export function shouldServeSpaShell(pathname: string): boolean {
+  const path = pathname.split('?')[0];
+
+  // Resolve the path to its canonical form: drop empty (`//`) and `.` segments, and
+  // let `..` pop the segment before it (popping an empty stack is a no-op — `/..`
+  // cannot escape above the root, exactly as a browser/proxy resolves it).
+  const segments: string[] = [];
+  for (const segment of path.split('/')) {
+    if (segment === '' || segment === '.') continue;
+    if (segment === '..') {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const normalized = '/' + segments.join('/');
+
+  return (
+    normalized !== '/.well-known' && !normalized.startsWith('/.well-known/')
+  );
+}
+
 @Module({})
 export class StaticModule implements OnModuleInit {
   constructor(
@@ -127,6 +182,33 @@ export class StaticModule implements OnModuleInit {
       });
 
       app.get(RENDER_PATH, (req: any, res: any) => {
+        // #636 — never answer the machine-readable /.well-known/ namespace with
+        // the SPA shell. Nothing is lost by 404-ing it: the client dist ships no
+        // /.well-known/ files, and @fastify/static (wildcard:false, no
+        // serveDotFiles) would not serve a dot-prefixed directory anyway; ACME
+        // challenges terminate at the reverse proxy and never reach Node. If a
+        // real /.well-known resource is ever added it needs its own route (plus
+        // the dotfile options here) — and this predicate must then be relaxed.
+        //
+        // Match on the DECODED wildcard (`req.params['*']`), not on the raw
+        // `req.url`: `/%2ewell-known/x` hits this handler with a url that does not
+        // literally start with `/.well-known/` and would otherwise slip through.
+        // shouldServeSpaShell canonicalises whatever it is given (dot-segments,
+        // repeated slashes, query string), so the raw-url fallback below — used only
+        // if the param is somehow absent — is safe too, and is never a value that
+        // trivially passes the check.
+        const wildcard = (req.params as Record<string, string> | undefined)?.[
+          '*'
+        ];
+        if (!shouldServeSpaShell(wildcard ?? req.url ?? '')) {
+          res
+            .status(404)
+            .header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            .type('application/json')
+            .send({ error: 'Not found' });
+          return;
+        }
+
         const stream = fs.createReadStream(indexFilePath);
         res
           .header('Cache-Control', 'no-cache, no-store, must-revalidate')

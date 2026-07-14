@@ -195,8 +195,113 @@ export async function verifyMcpBearer(
  * UnauthorizedException's own message.
  */
 export type McpHandleDecision =
-  | { kind: 'respond'; status: number; body: { error: string } }
+  | {
+      kind: 'respond';
+      status: number;
+      body: { error: string };
+      headers?: Record<string, string>;
+    }
   | { kind: 'hijack' };
+
+/**
+ * The `error_description` of the /mcp challenge when the ONLY thing the request
+ * needs is the Bearer api_key. Byte-identical to the 401 body message thrown by
+ * resolveMcpSessionConfig, so the header and the body say the same thing.
+ */
+export const MCP_CHALLENGE_BEARER_DESCRIPTION =
+  'MCP requires a Bearer api_key token (Authorization: Bearer <api_key>).';
+
+/**
+ * The `error_description` when the deployment also sets MCP_TOKEN and the shared
+ * guard is what failed. It MUST name `X-MCP-Token`: a challenge that mentions only
+ * the Bearer api_key sends the client into an endless loop — it dutifully adds
+ * `Authorization: Bearer <api_key>`, still misses the shared header, and gets a 401
+ * forever. That "the challenge names a credential the server does not actually want"
+ * bug class is exactly what #636 exists to kill, so the shared-token branch names
+ * BOTH credentials it needs.
+ *
+ * It carries NO comma. A comma is legal inside a quoted-string (RFC 7235 §2.1), but
+ * `WWW-Authenticate` is a comma-separated list of challenges/params and plenty of
+ * real-world clients and proxies split the header on `,` without honouring the
+ * quotes — a comma in here would tear the challenge in half and hand them a garbage
+ * second "challenge". The wording therefore parenthesises each header on its own.
+ */
+export const MCP_CHALLENGE_SHARED_TOKEN_DESCRIPTION =
+  'MCP requires the shared secret in the X-MCP-Token header (X-MCP-Token: <MCP_TOKEN>) plus a Bearer api_key token (Authorization: Bearer <api_key>).';
+
+/**
+ * Build the RFC 6750 §3 challenge sent with a /mcp 401. Without it a client only
+ * sees a bare 401 and has to guess the scheme; Claude Code guesses OAuth, walks
+ * /.well-known/oauth-protected-resource and dies there (#636).
+ *
+ * It deliberately carries NO `resource_metadata=...` parameter. Under the MCP
+ * spec (2025-06-18) that parameter is a promise — "I have an OAuth authorization
+ * server, here is its metadata" — and we have no OAuth AS at all. Advertising one
+ * is exactly the false promise this bug is about. The only scheme /mcp accepts is
+ * a Bearer api_key (plus the optional X-MCP-Token shared guard), so the challenge
+ * says only that. Never add `resource_metadata` back.
+ *
+ * `credentialPresented` implements RFC 6750 §3.1: "If the request lacks any
+ * authentication information (e.g., the client was unaware that authentication is
+ * necessary...), the resource server SHOULD NOT include an error code." An
+ * `error="invalid_token"` on a request that carried NO credential at all reads as
+ * "the token you sent is bad" and misleads the client into re-checking a token it
+ * never sent — so the code is emitted ONLY when a credential was actually presented
+ * and rejected.
+ *
+ * It is the presence of the credential THIS challenge is about — see
+ * mapAuthResultToResponse: the shared-token challenge asks about `X-MCP-Token`, so a
+ * request that sent only `Authorization` presented nothing to IT, and vice versa.
+ */
+export function buildMcpChallenge(
+  description: string,
+  credentialPresented: boolean,
+): string {
+  const errorCode = credentialPresented ? 'error="invalid_token", ' : '';
+  return `Bearer realm="mcp", ${errorCode}error_description="${description}"`;
+}
+
+/**
+ * Does this raw header value carry authentication information (RFC 6750 §3.1)?
+ *
+ * Node hands a header value in three shapes, and only one of them is a credential:
+ *   - a non-empty string                       -> presented;
+ *   - `undefined` (header absent)              -> not presented;
+ *   - `''` / whitespace (`X-MCP-Token:` with no value, which is a legal request)
+ *     -> NOT presented: the header exists but "lacks any authentication
+ *     information", which is the §3.1 wording, so it must not draw an
+ *     `error="invalid_token"` ("the token you sent is bad" — there was no token);
+ *   - `string[]`: Node joins duplicate headers into a comma-separated string for
+ *     most fields, but not for all, so a duplicated `X-MCP-Token` can surface as an
+ *     array. Reading an array as "absent" (`typeof v === 'string'` alone) would say
+ *     "no credential presented" about a request that presented two — hence the
+ *     explicit array arm.
+ */
+export function isCredentialHeaderPresent(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim() !== '';
+  if (Array.isArray(value)) {
+    return value.some((v) => typeof v === 'string' && v.trim() !== '');
+  }
+  return false;
+}
+
+/**
+ * The challenge for a REJECTED Bearer api_key (a credential was presented). This is
+ * the value the READMEs and the CHANGELOG quote verbatim — keep them in sync.
+ */
+export const MCP_WWW_AUTHENTICATE = buildMcpChallenge(
+  MCP_CHALLENGE_BEARER_DESCRIPTION,
+  true,
+);
+
+/**
+ * The challenge for a REJECTED shared X-MCP-Token (a credential was presented) on a
+ * deployment that sets MCP_TOKEN. Also quoted verbatim in the docs.
+ */
+export const MCP_WWW_AUTHENTICATE_SHARED_TOKEN = buildMcpChallenge(
+  MCP_CHALLENGE_SHARED_TOKEN_DESCRIPTION,
+  true,
+);
 
 /**
  * Pure mapping of McpService.handle's auth/enablement gauntlet to a response
@@ -208,14 +313,52 @@ export type McpHandleDecision =
  *          never the token/header — the message is the only thing surfaced).
  *        - any other error          -> 500 generic 'Internal server error'.
  *   4. otherwise (auth resolved)   -> hijack and delegate to the transport.
+ *
+ * Every 401 branch (and ONLY the 401 branches — the 403/500 responses are not
+ * authentication challenges) carries the RFC 6750 §3 `WWW-Authenticate` header,
+ * built by buildMcpChallenge. Each branch names the credential IT actually wants:
+ * the shared-token branch names `X-MCP-Token` (naming only the Bearer api_key there
+ * would loop the client forever), the api_key branch names the Bearer api_key. The
+ * bodies are unchanged.
+ *
+ * The `error="invalid_token"` code is PER BRANCH, because the two 401s are about two
+ * DIFFERENT credentials (RFC 6750 §3.1: no error code when the request "lacks any
+ * authentication information" — meaning the information THIS challenge asks for):
+ *   - `sharedTokenPresented` = the request carried a non-empty `X-MCP-Token`. It
+ *     gates the shared-token challenge. A single "some credential was sent" flag
+ *     would mis-fire here: the deployment sets MCP_TOKEN, the client sends only
+ *     `Authorization: Bearer <api_key>` (exactly what the api_key challenge told it
+ *     to), and it would get `error="invalid_token"` about an X-MCP-Token it never
+ *     sent — the same "the error names a credential that was never presented" bug
+ *     this whole change exists to kill.
+ *   - `bearerPresented` = the request carried a non-empty `Authorization`. It gates
+ *     the api_key challenge, and the mirror case (no MCP_TOKEN set, client sends
+ *     only `X-MCP-Token`) is why it may not be the shared-token flag either.
+ * Both are REQUIRED fields so no call site can silently inherit the wrong reading;
+ * feed them from isCredentialHeaderPresent, which also treats a present-but-empty
+ * header as the absence of a credential.
  */
 export function mapAuthResultToResponse(input: {
   sharedTokenOk: boolean;
   enabled: boolean;
   error?: unknown;
+  sharedTokenPresented: boolean;
+  bearerPresented: boolean;
 }): McpHandleDecision {
   if (!input.sharedTokenOk) {
-    return { kind: 'respond', status: 401, body: { error: 'Unauthorized' } };
+    return {
+      kind: 'respond',
+      status: 401,
+      body: { error: 'Unauthorized' },
+      headers: {
+        'WWW-Authenticate': buildMcpChallenge(
+          MCP_CHALLENGE_SHARED_TOKEN_DESCRIPTION,
+          // This challenge is about X-MCP-Token, so ONLY an X-MCP-Token that was
+          // actually sent (and rejected) earns the `invalid_token` code.
+          input.sharedTokenPresented,
+        ),
+      },
+    };
   }
 
   if (!input.enabled) {
@@ -232,6 +375,14 @@ export function mapAuthResultToResponse(input: {
         kind: 'respond',
         status: 401,
         body: { error: input.error.message },
+        headers: {
+          'WWW-Authenticate': buildMcpChallenge(
+            MCP_CHALLENGE_BEARER_DESCRIPTION,
+            // This challenge is about the Bearer api_key, so an X-MCP-Token that
+            // happened to be sent must not make it claim a bad api_key.
+            input.bearerPresented,
+          ),
+        },
       };
     }
     return {
@@ -295,10 +446,10 @@ export async function resolveMcpSessionConfig(
     };
   }
 
-  // No usable credential: /mcp requires a Bearer api_key and nothing else.
-  throw new UnauthorizedException(
-    'MCP requires a Bearer api_key token (Authorization: Bearer <api_key>).',
-  );
+  // No usable credential: /mcp requires a Bearer api_key and nothing else. The
+  // body message IS the challenge's error_description (one constant, so the 401's
+  // header and its JSON body can never drift apart).
+  throw new UnauthorizedException(MCP_CHALLENGE_BEARER_DESCRIPTION);
 }
 
 // Re-export JwtType so callers binding `verifyAccessJwt` know which type to
