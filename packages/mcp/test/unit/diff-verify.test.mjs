@@ -208,6 +208,50 @@ test("summarizeChange surfaces a vanished drawio diagram (drawio 1->0)", () => {
   assert.ok(r.textDeleted <= 1, "at most the atom's leaf placeholder");
 });
 
+// The excalidraw MIRROR of the test above. Without it the two kinds are locked
+// asymmetrically: dropping only "excalidraw" from countTypes would keep the
+// whole suite green while a lost excalidraw stays UNNAMED in the very report a
+// writing agent reads (`changed: false` / "no content change").
+test("summarizeChange surfaces a vanished excalidraw diagram (excalidraw 1->0)", () => {
+  const before = doc(
+    para(t("architecture")),
+    { type: "excalidraw", attrs: { src: "/api/files/e.svg", attachmentId: "e1" } },
+  );
+  const after = doc(para(t("architecture")));
+  const r = summarizeChange(before, after);
+
+  assert.equal(r.changed, true, "a vanished excalidraw diagram is a change");
+  assert.deepEqual(r.structure.excalidraw, [1, 0]);
+  assert.match(r.summary, /excalidraw 1→0/);
+  assert.deepEqual(r.marks, {});
+  assert.equal(r.textInserted, 0);
+  assert.ok(r.textDeleted <= 1, "at most the atom's leaf placeholder");
+});
+
+// The central design claim of #600, asserted where it actually BITES:
+// `structure` includes a kind only when old !== new, so a single "diagrams"
+// bucket would see a drawio->excalidraw swap as 1 -> 1 and omit it ENTIRELY —
+// `changed:false`, "no content change" — while a diagram was destroyed. Two
+// keys name both sides. (diff.test.mjs pins this against diffDocs.integrity;
+// this pins it against the VerifyReport the writing agent reads.)
+test("summarizeChange names a drawio->excalidraw swap (a bucket would report nothing)", () => {
+  const before = doc(
+    para(t("architecture")),
+    { type: "drawio", attrs: { src: "/api/files/d.svg", attachmentId: "d1" } },
+  );
+  const after = doc(
+    para(t("architecture")),
+    { type: "excalidraw", attrs: { src: "/api/files/e.svg", attachmentId: "e1" } },
+  );
+  const r = summarizeChange(before, after);
+
+  assert.equal(r.changed, true, "a destroyed diagram is a change");
+  assert.deepEqual(r.structure.drawio, [1, 0]);
+  assert.deepEqual(r.structure.excalidraw, [0, 1]);
+  assert.match(r.summary, /drawio 1→0/);
+  assert.match(r.summary, /excalidraw 0→1/);
+});
+
 // ---------------------------------------------------------------------------
 // Robustness: a malformed pair must never throw; it degrades gracefully.
 // ---------------------------------------------------------------------------

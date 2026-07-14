@@ -535,7 +535,7 @@ export interface VerifyReport {
   marks: Record<string, [number, number]>;
   /**
    * ONLY structural integrity types whose count changed, as [before, after]
-   * (images/links/tables/callouts/codeBlocks/diagrams). Surfaces structural
+   * (images/links/tables/callouts/codeBlocks/drawio/excalidraw). Surfaces structural
    * mutations that touch neither text nor marks (e.g. insertImage, deleting a
    * table, a vanished code block or draw.io diagram) which diffDocs — being
    * TEXT-only — would otherwise report as "no content change".
@@ -578,7 +578,7 @@ export function summarizeChange(before: any, after: any): VerifyReport {
     }
 
     // Structural integrity delta from diffDocs: count-based [old,new] tuples for
-    // images/links/tables/callouts/codeBlocks/diagrams. Include a type only when
+    // images/links/tables/callouts/codeBlocks/drawio/excalidraw. Include a type only when
     // old != new.
     const integrity = diff.integrity;
     const structure: Record<string, [number, number]> = {};

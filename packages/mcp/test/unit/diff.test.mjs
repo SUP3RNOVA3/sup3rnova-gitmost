@@ -147,9 +147,18 @@ test("diffDocs counts drawio/excalidraw as separate integrity kinds", () => {
     type: "excalidraw",
     attrs: { src: "/api/files/e.svg", attachmentId: "e1" },
   };
-  const oldDoc = doc(para(t("architecture")), drawio, excalidraw);
-  // The drawio diagram silently vanishes; the prose is untouched.
-  const newDoc = doc(para(t("architecture")), excalidraw);
+  // The excalidraw sits INSIDE a callout: countNodes must walk the whole tree,
+  // not just doc.content (drawioCreate can anchor a diagram inside a callout or
+  // a table cell, so a container-nested diagram is a real shape, and a
+  // top-level-only walk would silently un-guard it).
+  const callout = {
+    type: "callout",
+    attrs: { type: "info" },
+    content: [para(t("see the sketch")), excalidraw],
+  };
+  const oldDoc = doc(para(t("architecture")), drawio, callout);
+  // The drawio diagram silently vanishes; the prose and the callout are untouched.
+  const newDoc = doc(para(t("architecture")), callout);
 
   const r = diffDocs(oldDoc, newDoc);
   assert.deepEqual(r.integrity.drawio, [1, 0], "the lost drawio is counted");
