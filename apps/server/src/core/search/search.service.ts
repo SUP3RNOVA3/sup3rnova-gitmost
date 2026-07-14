@@ -13,7 +13,10 @@ import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
-import { AiService } from '../../integrations/ai/ai.service';
+// #599: SearchService no longer talks to AiService directly — every semantic read
+// goes through EmbeddingGenerationService, which embeds the query with the CURRENT
+// provider but reports the ACTIVE generation's fingerprint to filter rows by.
+import { EmbeddingGenerationService } from '../../integrations/ai/embedding-generation.service';
 import { AiEmbeddingNotConfiguredException } from '../../integrations/ai/ai-embedding-not-configured.exception';
 import { isStatementTimeout } from '@docmost/db/utils';
 import {
@@ -98,8 +101,11 @@ export class SearchService {
     private shareRepo: ShareRepo,
     private spaceMemberRepo: SpaceMemberRepo,
     private pagePermissionRepo: PagePermissionRepo,
-    private aiService: AiService,
     private pageEmbeddingRepo: PageEmbeddingRepo,
+    // #599: the embedding fingerprint lifecycle — resolves the ACTIVE generation
+    // the vector arm must filter by (NOT the live config's, which is the target of
+    // an in-flight reindex) and reports its coverage for `semantic.state`.
+    private embeddingGeneration: EmbeddingGenerationService,
   ) {}
 
   // === #529 SQL fragment builders (parameterized AST, never string-concat) =====
@@ -231,7 +237,9 @@ export class SearchService {
       const needle = sql`LOWER(f_unaccent(${t.text}))`;
       const pat = this.likePattern(t);
       exact.push(sql`LOWER(f_unaccent(pages.title)) = ${needle}`);
-      titleSub.push(sql`LOWER(f_unaccent(pages.title)) LIKE ${pat} ESCAPE '\\'`);
+      titleSub.push(
+        sql`LOWER(f_unaccent(pages.title)) LIKE ${pat} ESCAPE '\\'`,
+      );
       textSub.push(
         sql`LOWER(f_unaccent(pages.text_content)) LIKE ${pat} ESCAPE '\\'`,
       );
@@ -333,28 +341,105 @@ export class SearchService {
     // 500, never fail-open). Hybrid is transparent; SEARCH_SEMANTIC=off disables it.
     let vectorArm: RawBuilder<unknown> | null = null;
     let semanticAvailable = false;
-    let semanticReason: 'no-provider' | 'degraded' | undefined;
+    let semanticReason: 'no-provider' | 'degraded' | 'stale' | undefined;
+    // #599 coverage of the ACTIVE generation + whether a swap is in flight; both
+    // drive `semantic.state` below. Undefined while the arm has not run.
+    let semanticCoverage: { indexed: number; total: number } | undefined;
+    let semanticStale = false;
+    // #599 (D2): the served generation was produced by a DIFFERENT model than the
+    // one embedding this query -> the vector arm is not raised at all, and the
+    // response reports `state: 'stale', available: false` (not 'off': a provider IS
+    // configured and the semantics are merely out of date pending a reindex).
+    let semanticModelChanged = false;
     if (!semanticKillSwitchOff()) {
       try {
-        const { vector, fingerprint } = await this.aiService.embedQuery(
-          opts.workspaceId,
-          rawQuery,
-        );
-        vectorArm = this.pageEmbeddingRepo.vectorCandidateArm({
-          queryEmbedding: vector,
-          dimensions: vector.length,
-          fingerprint,
-          scope: scopeSql,
-          limit: getVectorCandidates(),
-          // Filter page_embeddings by (immutable) workspace_id directly, so the
-          // composite index bites on its leading column and candidates are
-          // workspace-scoped at the embedding level (#530 review WARNING 2). Space
-          // scoping stays on the pages join only — page_embeddings.space_id can be
-          // STALE after a cross-space move, so filtering it here would drop a moved
-          // page's vector hit (re-review regression fix).
-          workspaceId: scope.workspaceId,
-        });
-        semanticAvailable = true;
+        // #599: embed with the CURRENT provider but filter by the ACTIVE
+        // fingerprint — during a target reindex those differ, and serving the old
+        // generation is what keeps semantic recall alive across the swap window
+        // (see EmbeddingGenerationService.embedQueryForActiveGeneration).
+        const { vector, fingerprint, generation } =
+          await this.embeddingGeneration.embedQueryForActiveGeneration(
+            opts.workspaceId,
+            rawQuery,
+          );
+
+        // #599 (D2) — the MODEL of the served generation changed under us. The rows
+        // of the active generation and this query vector belong to two independently
+        // trained embedding spaces: their cosine is noise (the spaces are related by
+        // an arbitrary rotation), and RRF would inject those arbitrarily ranked pages
+        // into the top, DISPLACING valid lexical hits. That is strictly worse than
+        // having no vector arm at all, so we drop the arm and serve pure lexical
+        // until the target reindex completes and the pointer flips onto rows from
+        // this model. A dimension change would already be filtered out by the arm's
+        // `model_dimensions = queryDim` predicate (0 rows -> clean degrade); this
+        // covers the SAME-dimension model swap (e5-base -> bge-base, both 768), which
+        // that filter cannot see.
+        if (generation.modelChanged) {
+          semanticModelChanged = true;
+          semanticStale = true;
+          semanticReason = 'stale';
+          this.logger.warn(
+            `search.semantic.model-changed workspace=${opts.workspaceId} ` +
+              `active_model=${generation.activeModel ?? 'unknown'} ` +
+              `config_model=${generation.targetModel} (vector arm disabled: the served ` +
+              `generation lives in a different embedding space; lexical only until the ` +
+              `reindex completes)`,
+          );
+        } else {
+          vectorArm = this.pageEmbeddingRepo.vectorCandidateArm({
+            queryEmbedding: vector,
+            dimensions: vector.length,
+            fingerprint,
+            scope: scopeSql,
+            limit: getVectorCandidates(),
+            // Filter page_embeddings by (immutable) workspace_id directly, so the
+            // composite index bites on its leading column and candidates are
+            // workspace-scoped at the embedding level (#530 review WARNING 2). Space
+            // scoping stays on the pages join only — page_embeddings.space_id can be
+            // STALE after a cross-space move, so filtering it here would drop a moved
+            // page's vector hit (re-review regression fix).
+            workspaceId: scope.workspaceId,
+          });
+          semanticAvailable = true;
+
+          // Coverage of the generation we just filtered by. A swap in flight is
+          // ALWAYS stale — the active generation may well be 100% covered (it is
+          // the OLD one), but the workspace's semantics no longer reflect the
+          // configured model until the reindex completes and the pointer flips.
+          // Coverage is TTL-cached, so this does not add a scan per keystroke.
+          //
+          // Its OWN try/catch: coverage is a cosmetic indicator, and a failed count
+          // must never demote a working vector arm to `degraded` — we keep the arm
+          // and simply report the state without the numbers (a swap in flight is
+          // still reported stale, that fact needs no DB count).
+          //
+          // #599 (R3) — when the COUNT fails, coverage is UNKNOWN, and the DTO
+          // defines `full` as "the active generation covers every page". We must not
+          // claim that on no evidence: on a legacy workspace with 0 indexed pages a
+          // single failed COUNT would turn an honest `stale` into a lying `full`
+          // ("semantic search is complete") while the index is empty. Unknown
+          // coverage therefore reports `stale` (numbers omitted) — the honest,
+          // safe-direction answer: "the arm ran, but we cannot prove it is complete;
+          // a reindex may be needed".
+          semanticStale = generation.swapping;
+          try {
+            const coverage = await this.embeddingGeneration.getCoverage(
+              opts.workspaceId,
+              generation.active,
+            );
+            semanticCoverage = {
+              indexed: coverage.indexed,
+              total: coverage.total,
+            };
+            semanticStale = semanticStale || coverage.state === 'stale';
+          } catch {
+            semanticStale = true;
+            this.logger.debug(
+              `search.semantic.coverage-unavailable workspace=${opts.workspaceId} ` +
+                `(coverage unknown -> reporting state=stale)`,
+            );
+          }
+        }
       } catch (err) {
         if (err instanceof AiEmbeddingNotConfiguredException) {
           // No embedding provider is the DEFAULT state of any deployment without
@@ -401,6 +486,10 @@ export class SearchService {
       if (vectorArm && isStatementTimeout(err)) {
         semanticAvailable = false;
         semanticReason = 'degraded';
+        // The arm did not contribute -> its coverage numbers describe nothing that
+        // ran; drop them so the response cannot be read as "semantics worked".
+        semanticCoverage = undefined;
+        semanticStale = false;
         this.logger.warn(
           `search.semantic.degraded reason=degraded workspace=${opts.workspaceId} (vector statement timeout)`,
         );
@@ -416,10 +505,31 @@ export class SearchService {
       }
     }
 
+    // #599 semantic state:
+    //   'off'   — the arm never ran and there is nothing to reindex about it
+    //             (kill-switch / no provider / a degrade).
+    //   'stale' — either the arm RAN over an incompletely covered generation
+    //             (`available: true` — a partially covered generation still returns
+    //             real hits), or the arm was deliberately NOT raised because the
+    //             served generation's model no longer matches the configured one
+    //             (D2: `available: false`, lexical only, a reindex will fix it).
+    //   'full'  — the arm ran over a fully covered, same-model generation.
+    if (semanticAvailable && semanticStale && !semanticReason) {
+      semanticReason = 'stale';
+    }
     const semantic: SearchSemanticDto = {
-      state: semanticAvailable ? 'full' : 'off',
+      state: semanticAvailable
+        ? semanticStale
+          ? 'stale'
+          : 'full'
+        : semanticModelChanged
+          ? 'stale'
+          : 'off',
       available: semanticAvailable,
       ...(semanticReason ? { reason: semanticReason } : {}),
+      ...(semanticCoverage
+        ? { indexed: semanticCoverage.indexed, total: semanticCoverage.total }
+        : {}),
     };
 
     // --- Permission filter (fail-closed, exact total). ------------------------

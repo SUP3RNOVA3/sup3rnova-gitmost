@@ -26,6 +26,8 @@ import {
   METRIC_MCP_TOOL_DURATION,
   METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL,
   METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL,
+  METRIC_MCP_DOWNLOAD_BYTES_TOTAL,
+  METRIC_API_KEY_AUTH_DENIED_TOTAL,
   sizeBucket,
 } from './metrics.constants';
 
@@ -66,6 +68,10 @@ let mcpToolHist: Histogram<'tool'> | null = null;
 // #479 — getPage conversion-cache hit/miss counters.
 let getPageCacheHitsCounter: Counter | null = null;
 let getPageCacheMissesCounter: Counter | null = null;
+// #613 — bytes read over the loopback by the MCP downloadFile tool, by tool label.
+let mcpDownloadBytesCounter: Counter<'tool'> | null = null;
+// #558 — api-key auth denials, by bounded reason label.
+let apiKeyAuthDeniedCounter: Counter<'reason'> | null = null;
 
 // #402 — read-on-scrape source for collab_docs_open. The gauge is NEVER
 // inc/dec'd (that drifts under crashes/handoffs); instead its collect() callback
@@ -192,6 +198,20 @@ function init(): void {
     help: 'Total getPage PM→Markdown conversions computed (cache misses)',
     registers: [registry],
   });
+
+  mcpDownloadBytesCounter = new Counter({
+    name: METRIC_MCP_DOWNLOAD_BYTES_TOTAL,
+    help: 'Total bytes read over the loopback by the MCP downloadFile tool, by tool name',
+    labelNames: ['tool'],
+    registers: [registry],
+  });
+
+  apiKeyAuthDeniedCounter = new Counter({
+    name: METRIC_API_KEY_AUTH_DENIED_TOTAL,
+    help: 'Total api-key auth denials in ApiKeyService.validate, by bounded reason',
+    labelNames: ['reason'],
+    registers: [registry],
+  });
 }
 
 // Runs once when this module is first imported. Safe to call again (idempotent).
@@ -270,6 +290,29 @@ export function incGetPageCacheHit(): void {
 
 export function incGetPageCacheMiss(): void {
   getPageCacheMissesCounter?.inc();
+}
+
+/**
+ * #558 — record one api-key auth denial, labelled by its BOUNDED reason. A no-op
+ * when metrics are disabled. `reason` MUST come from the fixed ApiKeyDenyReason
+ * set (never free-form / attacker-controlled input) so the label cardinality
+ * stays bounded. The apiKeyId is deliberately NOT a label — it is logged only in
+ * the rate-limited WARN, after the JWT signature has been verified.
+ */
+export function incApiKeyAuthDenied(reason: string): void {
+  apiKeyAuthDeniedCounter?.inc({ reason });
+}
+
+/**
+ * #613 — add the bytes ONE MCP download read over the loopback. `tool` MUST be a
+ * bounded, registration-derived MCP tool name (the package's onMetric labels every
+ * sample with the tool that emitted it) — never free-form input — so the label
+ * cardinality stays bounded. A non-finite/negative value is dropped: prom-client
+ * throws on a negative inc(), and a metric must never be able to break a download.
+ */
+export function addMcpDownloadBytes(tool: string, bytes: number): void {
+  if (!Number.isFinite(bytes) || bytes < 0) return;
+  mcpDownloadBytesCounter?.inc({ tool }, bytes);
 }
 
 export function observeMcpTool(tool: string, seconds: number): void {

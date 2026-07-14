@@ -3,8 +3,18 @@ import {
   NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
+// #558 deny-observability: mock only the counter so we can assert validate()
+// increments api_key_auth_denied_total{reason} on each deny branch. Every other
+// export stays real (the registry is otherwise a no-op unless METRICS_PORT set).
+jest.mock('../../integrations/metrics/metrics.registry', () => ({
+  ...jest.requireActual('../../integrations/metrics/metrics.registry'),
+  incApiKeyAuthDenied: jest.fn(),
+}));
 import { ApiKeyService } from './api-key.service';
 import { JwtType } from '../auth/dto/jwt-payload';
+import { incApiKeyAuthDenied } from '../../integrations/metrics/metrics.registry';
+
+const incDenied = incApiKeyAuthDenied as jest.Mock;
 
 /**
  * Security contract for ApiKeyService.validate — the single validator shared by
@@ -229,6 +239,74 @@ describe('ApiKeyService.validate', () => {
 
     await expect(service.validate(payload() as any)).resolves.toMatchObject({
       user: { id: 'u-1' },
+    });
+  });
+
+  // --- #558 deny-observability: replaces the deleted /mcp Basic limiter's
+  // visibility. A revoked/dead key hammering validate() must not be SILENT: each
+  // deny emits a rate-limited operator WARN keyed on (apiKeyId, reason) AND
+  // increments api_key_auth_denied_total{reason}. The apiKeyId is only ever
+  // logged AFTER the JWT signature was verified (validate is reached post-verify),
+  // so it is a bounded, issued id — never an unverified attacker value. We assert
+  // the LOG (the counter is a no-op unless METRICS_PORT is set), NOT the 401 body
+  // (the response stays a uniform bare 401 — anti-enumeration).
+  describe('deny-observability WARN (rate-limited, per apiKeyId+reason)', () => {
+    // Reset the counter mock so each test asserts only ITS OWN deny increments,
+    // not calls leaked from a sibling test (the mock is module-level).
+    beforeEach(() => incDenied.mockClear());
+
+    it('WARNs with the reason + apiKeyId on a revoked/missing key deny', async () => {
+      const { service, apiKeyRepo } = makeDeps();
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      apiKeyRepo.findById.mockResolvedValue(undefined); // revoked/missing row
+
+      await expect(
+        service.validate(payload({ apiKeyId: 'key-XYZ' }) as any),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = warn.mock.calls[0][0] as string;
+      expect(msg).toContain('reason=revoked_or_missing');
+      expect(msg).toContain('apiKeyId=key-XYZ');
+      // The prom counter is incremented with the EXACT reason (unthrottled,
+      // unlike the WARN). Deleting the incApiKeyAuthDenied line fails here.
+      expect(incDenied).toHaveBeenCalledWith('revoked_or_missing');
+    });
+
+    it('is rate-limited: a second identical deny within the window does NOT re-WARN', async () => {
+      const { service, apiKeyRepo } = makeDeps();
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+      apiKeyRepo.findById.mockResolvedValue(undefined);
+
+      const p = payload({ apiKeyId: 'key-HAMMER' }) as any;
+      await service.validate(p).catch(() => undefined);
+      await service.validate(p).catch(() => undefined);
+      await service.validate(p).catch(() => undefined);
+
+      // Three denies for the SAME (apiKeyId, reason) → exactly ONE WARN line.
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it('a malformed payload (no apiKeyId) WARNs with apiKeyId=unknown', async () => {
+      const { service } = makeDeps();
+      const warn = jest
+        .spyOn((service as any).logger, 'warn')
+        .mockImplementation(() => undefined);
+
+      await expect(
+        service.validate(payload({ apiKeyId: undefined }) as any),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = warn.mock.calls[0][0] as string;
+      expect(msg).toContain('reason=malformed_payload');
+      expect(msg).toContain('apiKeyId=unknown');
+      // Counter incremented with the EXACT reason for this second branch too.
+      expect(incDenied).toHaveBeenCalledWith('malformed_payload');
     });
   });
 });

@@ -5,6 +5,9 @@ import {
   buildCollabWsUrl,
   markdownToProseMirror,
   markdownToProseMirrorCanonical,
+  buildYDoc,
+  applyDocToFragment,
+  assertYjsEncodable,
 } from "../../build/lib/collaboration.js";
 
 /** Recursively find the first descendant node (or self) of the given type. */
@@ -159,6 +162,88 @@ test("markdownToProseMirror (comment path) PRESERVES an inline footnote (no cano
   assert.equal(findAll(doc, "footnoteDefinition").length, 1);
   assert.equal(findAll(doc, "footnotesList").length, 1);
   assert.match(JSON.stringify(doc), /an inline footnote/);
+});
+
+// ---------------------------------------------------------------------------
+// Schema-forbidden marks (the July code-block data-loss incident). The docmost
+// codeBlock spec declares `marks: ""`, but PMNode.fromJSON does NOT validate
+// marks against parent specs, so a doc carrying a comment mark inside a
+// codeBlock used to slide through applyDocToFragment into the live Y.Doc —
+// where the next schema-full client materialization made y-prosemirror DELETE
+// the whole codeBlock. Both write paths must now reject such a doc loudly.
+// ---------------------------------------------------------------------------
+
+/** A paragraph + codeBlock doc; `poison` adds a comment mark inside the code. */
+function codeBlockDoc(poison) {
+  const codeText = poison
+    ? [
+        { type: "text", text: "static bool " },
+        {
+          type: "text",
+          text: "s_dirty_seen",
+          marks: [{ type: "comment", attrs: { commentId: "c1", resolved: false } }],
+        },
+        { type: "text", text: " = false;" },
+      ]
+    : [{ type: "text", text: "static bool s_dirty_seen = false;" }];
+  return {
+    type: "doc",
+    content: [
+      { type: "paragraph", content: [{ type: "text", text: "before" }] },
+      { type: "codeBlock", attrs: { language: "c" }, content: codeText },
+    ],
+  };
+}
+
+test("applyDocToFragment rejects a comment mark inside a codeBlock (names node, mark, preview)", () => {
+  const ydoc = buildYDoc(codeBlockDoc(false));
+  assert.throws(
+    () => applyDocToFragment(ydoc, codeBlockDoc(true)),
+    (e) => {
+      assert.match(e.message, /codeBlock/, "names the forbidding parent type");
+      assert.match(e.message, /comment/, "names the offending mark type");
+      assert.match(e.message, /s_dirty_seen/, "quotes the child text preview");
+      return true;
+    },
+  );
+});
+
+test("assertYjsEncodable rejects the same poisoned doc (preview/apply parity)", () => {
+  assert.throws(
+    () => assertYjsEncodable(codeBlockDoc(true)),
+    (e) => {
+      assert.match(e.message, /codeBlock/);
+      assert.match(e.message, /comment/);
+      return true;
+    },
+  );
+});
+
+test("a clean codeBlock doc passes both write-path validations", () => {
+  assert.doesNotThrow(() => assertYjsEncodable(codeBlockDoc(false)));
+  const ydoc = buildYDoc(codeBlockDoc(false));
+  const edited = codeBlockDoc(false);
+  edited.content[0].content[0].text = "before (edited)";
+  assert.doesNotThrow(() => applyDocToFragment(ydoc, edited));
+});
+
+test("a comment mark in a PARAGRAPH is still accepted (guard is not over-broad)", () => {
+  const d = {
+    type: "doc",
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          {
+            type: "text",
+            text: "anchored prose",
+            marks: [{ type: "comment", attrs: { commentId: "c2", resolved: false } }],
+          },
+        ],
+      },
+    ],
+  };
+  assert.doesNotThrow(() => assertYjsEncodable(d));
 });
 
 test("markdownToProseMirrorCanonical (page path) yields a single reference-ordered list", async () => {

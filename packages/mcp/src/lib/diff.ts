@@ -49,6 +49,22 @@ export interface DiffIntegrity {
   links: [number, number];
   tables: [number, number];
   callouts: [number, number];
+  codeBlocks: [number, number];
+  /**
+   * Diagram block atoms (#600). Both are atoms whose ENTIRE payload lives in
+   * attrs (src/attachmentId), so deleting one moves no prose and no marks — the
+   * only trace in the text delta is the single leaf placeholder `textBetween`
+   * emits for an atom, i.e. a 1-char delta indistinguishable from fixing a typo.
+   * The count is what NAMES the loss (attribution), which is the blind spot
+   * codeBlocks closed for code.
+   *
+   * Counted as TWO keys, not one "diagrams" bucket: a bucket would report a
+   * drawio replaced by an excalidraw as `1 -> 1` (clean) and omit it from
+   * `VerifyReport.structure` entirely — recreating the very blind spot this
+   * guard exists to close.
+   */
+  drawio: [number, number];
+  excalidraw: [number, number];
   footnoteMarkers: [number[], number[]];
 }
 
@@ -234,11 +250,32 @@ function computeIntegrity(
     countNodes(oldDoc, (n) => n.type === "callout"),
     countNodes(newDoc, (n) => n.type === "callout"),
   ];
+  const codeBlocks: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "codeBlock"),
+    countNodes(newDoc, (n) => n.type === "codeBlock"),
+  ];
+  const drawio: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "drawio"),
+    countNodes(newDoc, (n) => n.type === "drawio"),
+  ];
+  const excalidraw: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "excalidraw"),
+    countNodes(newDoc, (n) => n.type === "excalidraw"),
+  ];
   const fns: [number[], number[]] = [
     footnoteMarkers(oldDoc, notesHeading),
     footnoteMarkers(newDoc, notesHeading),
   ];
-  return { images, links, tables, callouts, footnoteMarkers: fns };
+  return {
+    images,
+    links,
+    tables,
+    callouts,
+    codeBlocks,
+    drawio,
+    excalidraw,
+    footnoteMarkers: fns,
+  };
 }
 
 /**
@@ -384,6 +421,15 @@ function renderMarkdown(
   lines.push(`- tables: ${integrity.tables[0]} -> ${integrity.tables[1]}`);
   lines.push(`- callouts: ${integrity.callouts[0]} -> ${integrity.callouts[1]}`);
   lines.push(
+    `- codeBlocks: ${integrity.codeBlocks[0]} -> ${integrity.codeBlocks[1]}`,
+  );
+  lines.push(
+    `- drawio: ${integrity.drawio[0]} -> ${integrity.drawio[1]}`,
+  );
+  lines.push(
+    `- excalidraw: ${integrity.excalidraw[0]} -> ${integrity.excalidraw[1]}`,
+  );
+  lines.push(
     `- footnoteMarkers: [${integrity.footnoteMarkers[0].join(", ")}] -> [${integrity.footnoteMarkers[1].join(", ")}]`,
   );
   lines.push("");
@@ -489,9 +535,10 @@ export interface VerifyReport {
   marks: Record<string, [number, number]>;
   /**
    * ONLY structural integrity types whose count changed, as [before, after]
-   * (images/links/tables/callouts). Surfaces structural mutations that touch
-   * neither text nor marks (e.g. insertImage, deleting a table) which diffDocs
-   * — being TEXT-only — would otherwise report as "no content change".
+   * (images/links/tables/callouts/codeBlocks/drawio/excalidraw). Surfaces structural
+   * mutations that touch neither text nor marks (e.g. insertImage, deleting a
+   * table, a vanished code block or draw.io diagram) which diffDocs — being
+   * TEXT-only — would otherwise report as "no content change".
    */
   structure?: Record<string, [number, number]>;
   /** One-line human/agent-readable summary. */
@@ -509,9 +556,9 @@ export interface VerifyReport {
  * `changed:false` / "no content change" rather than a misleading +0/-0 change.
  *
  * The structural integrity delta (from diffDocs's `integrity` tuples) is what
- * makes `changed` true for an image/table/callout/link count change that diffs
- * to zero text — closing a verify blind spot for insertImage, deleteNode on a
- * table, etc.
+ * makes `changed` true for an image/table/callout/codeBlock/diagram/link count
+ * change that diffs to zero text — closing a verify blind spot for insertImage,
+ * deleteNode on a table, a vanished codeBlock or drawio/excalidraw diagram, etc.
  */
 export function summarizeChange(before: any, after: any): VerifyReport {
   try {
@@ -531,14 +578,26 @@ export function summarizeChange(before: any, after: any): VerifyReport {
     }
 
     // Structural integrity delta from diffDocs: count-based [old,new] tuples for
-    // images/links/tables/callouts. Include a type only when old != new.
+    // images/links/tables/callouts/codeBlocks/drawio/excalidraw. Include a type only when
+    // old != new.
     const integrity = diff.integrity;
     const structure: Record<string, [number, number]> = {};
-    const countTypes: ["images", "links", "tables", "callouts"] = [
+    const countTypes: [
       "images",
       "links",
       "tables",
       "callouts",
+      "codeBlocks",
+      "drawio",
+      "excalidraw",
+    ] = [
+      "images",
+      "links",
+      "tables",
+      "callouts",
+      "codeBlocks",
+      "drawio",
+      "excalidraw",
     ];
     for (const type of countTypes) {
       const [b, a] = integrity[type];

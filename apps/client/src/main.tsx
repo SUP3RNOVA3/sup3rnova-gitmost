@@ -1,7 +1,7 @@
 import "@mantine/core/styles.css";
 import "@mantine/spotlight/styles.css";
 import "@mantine/notifications/styles.css";
-import '@mantine/dates/styles.css';
+import "@mantine/dates/styles.css";
 import "@/styles/a11y-overrides.css";
 import "@/styles/notification-overrides.css";
 
@@ -23,6 +23,8 @@ import {
   isPostHogEnabled,
 } from "@/lib/config.ts";
 import { initVitals } from "@/lib/telemetry/vitals";
+import { installPageMetaEviction } from "@/features/page/atoms/page-meta-cache-atom";
+import { installPageYdocEvictionOnce } from "@/features/editor/page-ydoc-eviction";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -35,12 +37,30 @@ export const queryClient = new QueryClient({
   },
 });
 
+// #564 — destroy a page's LOCAL YDOC (its body, on disk in IndexedDB) as soon as
+// ANY page query fails with 403/404. Installed at APP level and BEFORE the
+// page-meta eviction below, for two load-bearing reasons:
+//  - the case this guard exists for (a revoked page opened in a fresh session)
+//    renders not-found and NEVER mounts the page editor, so installing it from
+//    the editor would mean the 403 is never heard;
+//  - it resolves a slugId to its pageId through the page-meta boot cache, which
+//    installPageMetaEviction() deletes on the very same event. Query-cache
+//    listeners run in registration order, so this one must read the alias first.
+installPageYdocEvictionOnce(queryClient);
+
+// #563 — evict a page from the localStorage boot cache as soon as ANY page query
+// fails with 403/404 (deleted / access revoked), regardless of what is mounted.
+// Without this, a revoked page would keep painting stale chrome from the cache
+// on every subsequent visit.
+installPageMetaEviction(queryClient);
+
 // #355 — client perf-telemetry. Decides sampling ONCE (25%/session) before
 // subscribing to any observer; non-sampled sessions send nothing.
 initVitals();
 
 const container = document.getElementById("root") as HTMLElement;
-const root = (container as any).__reactRoot ??= ReactDOM.createRoot(container);
+const root = ((container as any).__reactRoot ??=
+  ReactDOM.createRoot(container));
 
 function renderApp() {
   root.render(

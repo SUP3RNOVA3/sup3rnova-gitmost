@@ -345,9 +345,17 @@ roles:
         □ Working sections («Журнал», «Открытые вопросы», «Ревизия») are moved to
           an appendix at the end of the document or clearly separated from the
           report body.
-        □ Once the report is complete, call save_page_version to pin the finished
-          document as a restorable named version (a checkpoint the reader can
-          return to). A repeat call after no further edits is a harmless no-op.
+        □ Save a version BOTH BEFORE you start a round of edits to existing
+          content (a recoverable "before" point) AND AFTER you finish the round:
+          call save_page_version to pin the document as a restorable named
+          version (a checkpoint the reader can return to). A ROUND = the initial
+          draft and each subsequent MAJOR revision pass (a Revision-block cycle),
+          NOT every flush/small edit. One pre-save + one post-save per major
+          pass, not per micro-edit. Do NOT pre-save if the PURPOSE of the edit
+          is to REMOVE sensitive/confidential content (pre-saving would preserve
+          what you're removing in recoverable, permission-shared history) —
+          pre-save only for edits that ADD or REVISE content. A repeat
+          identical-to-last save is a harmless no-op.
       Be honest about gaps. If you couldn't find something, say so — don't disguise
       a guess as a fact.
     autoStart: false
@@ -444,7 +452,7 @@ roles:
       - **Язык конспекта = основной язык созвона.** Технические термины — в каноническом написании (обычно латиницей).
       - **Не оценивай участников** и не комментируй качество обсуждения.
       - На выходе — только конспект, без преамбул и мета-комментариев, кроме точечных пометок неуверенности.
-      - **Зафиксируй результат.** Когда конспект готов на странице, вызови save_page_version, чтобы сохранить его как именованную версию (точку восстановления). Повторный вызов без новых правок — безвредный no-op.
+      - **Зафиксируй результат — до и после.** ПЕРЕД тем как перезаписать исходный транскрипт конспектом, вызови save_page_version, чтобы зафиксировать сам транскрипт как точку восстановления «до» (V1 = транскрипт) — ценную страховку, к которой можно вернуться. ЗАТЕМ, когда конспект готов на странице, вызови save_page_version ещё раз, чтобы сохранить конспект как именованную версию (V2 = конспект). Так остаётся чистая цепочка восстановления транскрипт→конспект. НЕ делай предварительное сохранение, если ЦЕЛЬ правки — УДАЛИТЬ чувствительный/конфиденциальный контент (предсохранение сохранило бы удаляемое в восстановимой истории с общим доступом по правам) — предсохраняй только для правок, которые ДОБАВЛЯЮТ или ПЕРЕРАБАТЫВАЮТ контент. Повторное сохранение, идентичное последнему, — безвредный no-op.
 
       ## Пример стиля (фрагмент)
 

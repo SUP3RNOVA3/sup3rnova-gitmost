@@ -34,6 +34,26 @@ export const METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL =
 export const METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL =
   'mcp_getpage_cache_misses_total';
 
+// #613 — downloadFile volume. The MCP package meters the BYTES it reads over the
+// authenticated loopback for every successful downloadFile (its onMetric sink),
+// and the mcp.service router adds them to this counter, labelled by the tool that
+// read them. Access itself stays inside the service account's CASL scope, but the
+// VOLUME an external agent pulls out is otherwise invisible to the operator; this
+// is the signal a bulk export shows up in. The `tool` label is registration-derived
+// (bounded cardinality). Same "do not rename" contract.
+export const METRIC_MCP_DOWNLOAD_BYTES_TOTAL = 'mcp_download_bytes_total';
+
+// #558 — api-key auth denial observability. Every DEFINITE deny in
+// ApiKeyService.validate (shared by REST jwt.strategy and the /mcp Bearer path)
+// increments this counter, labelled by the BOUNDED deny reason. It replaces the
+// visibility the deleted /mcp Basic brute-force limiter used to give: a
+// revoked/dead key hammering /mcp is otherwise totally silent (validate throws a
+// bare 401 with no log/metric). The `reason` label is a fixed, low-cardinality
+// set (see ApiKeyDenyReason); the apiKeyId is NEVER a label (it goes only into
+// the rate-limited WARN, after the JWT signature is verified). Same "do not
+// rename" contract as the other families.
+export const METRIC_API_KEY_AUTH_DENIED_TOTAL = 'api_key_auth_denied_total';
+
 // Histogram buckets (seconds). Chosen to give useful p50/p95/p99 resolution
 // for typical web/DB latencies without exploding series cardinality.
 export const HTTP_BUCKETS = [

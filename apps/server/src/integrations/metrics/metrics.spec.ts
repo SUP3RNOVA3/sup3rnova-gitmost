@@ -6,6 +6,7 @@ import {
   sizeBucket,
 } from './metrics.constants';
 import {
+  addMcpDownloadBytes,
   getMetricsRegistry,
   incConnectTimeout,
   incDocLoad,
@@ -201,6 +202,10 @@ describe('metrics helpers are safe no-ops when METRICS_PORT is unset', () => {
       incConnectTimeout();
       incGetPageCacheHit();
       incGetPageCacheMiss();
+      addMcpDownloadBytes('downloadFile', 4096);
+      // A garbage value must not throw either (prom-client throws on inc(<0)).
+      addMcpDownloadBytes('downloadFile', -1);
+      addMcpDownloadBytes('downloadFile', Number.NaN);
       // Registering a source must not create the gauge or invoke the fn.
       registerDocsOpenSource(() => {
         throw new Error('docsOpenSource must NOT be called when disabled');

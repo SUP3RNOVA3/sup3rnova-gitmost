@@ -483,6 +483,175 @@ export function convertProseMirrorToMarkdown(
     return `<table><tbody>${htmlRows}</tbody></table>`;
   };
 
+  // ---------------------------------------------------------------------------
+  // #515 inline helpers. `case "text"` used to inline both of these; they are
+  // factored out so the code-emphasis run emitter (renderInlineChildren) can
+  // reuse the EXACT same escaping and mark-rendering logic when it factors a
+  // shared mark out of several adjacent runs. Behaviour is unchanged: the escape
+  // gate still runs only for NON-code runs, and the mark switch still wraps the
+  // text in the order the marks array lists them (first mark = innermost).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Intentional markdown escapes for a NON-code text run. A run carrying the
+   * `code` mark must NOT go through here: a code span's content is literal
+   * (marked does not decode escapes inside backticks), so `==`, `$…$`, `^[` and
+   * `<br>` stay verbatim there.
+   */
+  const escapeInlineText = (raw: string): string => {
+    let textContent = raw;
+    // #293 canon #2 (F2): inside a footnote body, DOUBLE every RAW user
+    // backslash FIRST, so it survives `^[…]` (the import tokenizer treats
+    // `\<char>` as an escape when balancing brackets, and `parseInline`
+    // decodes escapes). Doing it before the intentional escapes below keeps
+    // the serializer's own single escapes (`\=` `\$` `^\[`, and the `\[`/
+    // `\]` balanceBrackets adds) single; only genuine user backslashes are
+    // doubled.
+    if (inFootnoteBody) {
+      textContent = textContent.replace(/\\/g, "\\\\");
+    }
+    // #293 canon #7: `==` is now a LIVE inline highlight syntax on import (a
+    // marked inline extension turns `==text==` into a color-less highlight
+    // mark). A LITERAL `==` in a text run would therefore be misparsed as a
+    // highlight on the next import, so backslash-escape each `=` of a `==`
+    // pair; marked's escape tokenizer decodes `\=` back to a literal `=`, so
+    // a literal `==` round-trips as text (never materializes a phantom mark).
+    // A highlight run's own `==` delimiters are appended AFTER this by the mark
+    // switch, so they are never escaped; only the run's inner text is.
+    textContent = textContent.replace(/==/g, "\\=\\=");
+    // #293 canon #6: escape a would-be inline-math `$…$` span so it stays
+    // literal text on re-import (currency `$5` is left clean — see
+    // escapeProseMath).
+    textContent = escapeProseMath(textContent);
+    // #293 canon #2: `^[` opens a LIVE inline-footnote span on import
+    // (`^[text]` -> a footnote reference). A LITERAL `^[` in prose text
+    // would therefore materialize a phantom footnote on the next import, so
+    // backslash-escape the bracket (`^[` -> `^\[`); marked's escape
+    // tokenizer decodes `\[` back to `[`, so a literal `^[…]` round-trips
+    // as text and never opens a footnote. Only the OPENING `^[` needs
+    // breaking (the tokenizer requires it), so this is a minimal, idempotent
+    // escape. A real footnoteReference node emits `^[body]` from its own
+    // case, never through here.
+    textContent = textContent.replace(/\^\[/g, "^\\[");
+    // #554: a LITERAL inline-HTML break tag typed as prose text (`<br>`,
+    // `<br/>`, `<br />`, case-insensitive / optional whitespace) would be
+    // parsed by marked as an inline-HTML line break on re-import, silently
+    // turning the user's literal text into a hardBreak node. HTML-entity-
+    // encode only the angle brackets of a break-tag sequence so it lands
+    // in the markdown as `&lt;br&gt;`: marked passes the entities through
+    // and the importer decodes them back to the literal characters `<br>`,
+    // so the run round-trips as text and NEVER materializes a hardBreak.
+    // Scoped strictly to the `<br…>` pattern (not every `<`/`>`), so stray
+    // angle brackets in ordinary prose (`a < b > c`) are untouched. This
+    // is the text-content path ONLY; a real hardBreak node serializes from
+    // its own case (`  \n`, or `<br>` via inlineToHtml on the raw-HTML
+    // path), so the serializer's own emitted breaks are never escaped.
+    textContent = textContent.replace(/<(\s*br\s*\/?\s*)>/gi, "&lt;$1&gt;");
+    return textContent;
+  };
+
+  /**
+   * Wrap already-rendered inline content in ONE mark's markdown (or HTML) form.
+   * Called in marks-array order, so the first mark of the array ends up
+   * innermost — exactly as the historical in-place loop did.
+   */
+  const applyInlineMark = (mark: any, inner: string): string => {
+    let textContent = inner;
+    switch (mark.type) {
+      case "bold":
+        textContent = `**${textContent}**`;
+        break;
+      case "italic":
+        textContent = `*${textContent}*`;
+        break;
+      case "code":
+        // #515: `code` is applied FIRST (innermost) by the callers, never
+        // through this switch — a backtick span must sit INSIDE any emphasis
+        // (CommonMark: `**`x`**` is <strong><code>x</code></strong>). Kept as a
+        // defensive fallback for any caller that passes the mark through.
+        textContent = `\`${textContent}\``;
+        break;
+      case "link": {
+        const href = mark.attrs?.href || "";
+        const title = mark.attrs?.title;
+        if (title) {
+          // Emit the optional markdown link title; escape an embedded
+          // double-quote so it cannot terminate the title string early.
+          const safeTitle = String(title).replace(/"/g, '\\"');
+          textContent = `[${textContent}](${href} "${safeTitle}")`;
+        } else {
+          textContent = `[${textContent}](${href})`;
+        }
+        break;
+      }
+      case "strike":
+        textContent = `~~${textContent}~~`;
+        break;
+      case "underline":
+        textContent = `<u>${textContent}</u>`;
+        break;
+      case "subscript":
+        textContent = `<sub>${textContent}</sub>`;
+        break;
+      case "superscript":
+        textContent = `<sup>${textContent}</sup>`;
+        break;
+      case "highlight": {
+        // #293 canon #7: a highlight WITHOUT a color serializes as the
+        // Obsidian/GFM `==text==` syntax (the importer's marked inline
+        // `==` extension parses it back to a color-less highlight mark).
+        // A highlight WITH a color keeps the `<mark style="background-
+        // color: …">` HTML form (the condition is deterministic on the
+        // `color` attr), so a colored highlight is not flattened. The
+        // inner textContent already had any literal `==` backslash-
+        // escaped above, so a highlight over text containing `==` still
+        // round-trips.
+        const color = mark.attrs?.color;
+        textContent = color
+          ? `<mark style="background-color: ${escapeAttr(color)}">${textContent}</mark>`
+          : `==${textContent}==`;
+        break;
+      }
+      case "textStyle":
+        if (mark.attrs?.color) {
+          textContent = `<span style="color: ${escapeAttr(mark.attrs.color)}">${textContent}</span>`;
+        }
+        break;
+      case "spoiler":
+        // Markdown has no native spoiler syntax, so emit the same raw
+        // inline HTML the editor-ext/MCP stack uses. The schema's Spoiler
+        // mark parses span[data-spoiler] back on import, so the mark
+        // survives the PM -> MD -> PM round-trip.
+        textContent = `<span data-spoiler="true">${textContent}</span>`;
+        break;
+      case "comment": {
+        // Emit the inline comment anchor so highlights round-trip. The
+        // schema's Comment mark parses span[data-comment-id] (attrs
+        // commentId/resolved).
+        const cid = mark.attrs?.commentId;
+        if (cid) {
+          // Hide resolved anchors from agent reads: drop the wrapper and
+          // keep only the bare text. Active anchors keep their wrapper.
+          if (mark.attrs?.resolved && dropResolvedCommentAnchors) {
+            break;
+          }
+          const resolvedAttr = mark.attrs?.resolved
+            ? ` data-resolved="true"`
+            : "";
+          textContent = `<span data-comment-id="${escapeAttr(cid)}"${resolvedAttr}>${textContent}</span>`;
+        }
+        break;
+      }
+      default:
+        // Unknown mark: no dedicated case, so it has no markdown form and
+        // is dropped from the run. Report the loss (throws in strict
+        // mode) then leave the text unwrapped — the historical behavior.
+        warnLoss("mark", String(mark.type));
+        break;
+    }
+    return textContent;
+  };
+
   const processNode = (node: any): string => {
     if (nodeDepth >= MAX_NODE_DEPTH) {
       // Bail out of deeper recursion without throwing. A text node still has
@@ -582,177 +751,31 @@ export function convertProseMirrorToMarkdown(
         return headingLine;
       }
 
-      case "text":
-        let textContent = node.text || "";
-        // #293 canon #7: `==` is now a LIVE inline highlight syntax on import (a
-        // marked inline extension turns `==text==` into a color-less highlight
-        // mark). A LITERAL `==` in a text run would therefore be misparsed as a
-        // highlight on the next import, so backslash-escape each `=` of a `==`
-        // pair; marked's escape tokenizer decodes `\=` back to a literal `=`, so
-        // a literal `==` round-trips as text (never materializes a phantom mark).
-        // This runs for BOTH unmarked text and marked non-code runs, but NOT for
-        // an inline code span (a run carrying the `code` mark returns a backtick
-        // span below with `==` verbatim, matching `` `a == b` `` staying code).
-        // A highlight run's own `==` delimiters are appended AFTER this in the
-        // marks loop, so they are never escaped; only the run's inner text is.
-        if (!(node.marks || []).some((m: any) => m.type === "code")) {
-          // #293 canon #2 (F2): inside a footnote body, DOUBLE every RAW user
-          // backslash FIRST, so it survives `^[…]` (the import tokenizer treats
-          // `\<char>` as an escape when balancing brackets, and `parseInline`
-          // decodes escapes). Doing it before the intentional escapes below keeps
-          // the serializer's own single escapes (`\=` `\$` `^\[`, and the `\[`/
-          // `\]` balanceBrackets adds) single; only genuine user backslashes are
-          // doubled. Skipped for code runs (a code span's content is NOT decoded
-          // by parseInline, so its backslashes must stay verbatim).
-          if (inFootnoteBody) {
-            textContent = textContent.replace(/\\/g, "\\\\");
-          }
-          textContent = textContent.replace(/==/g, "\\=\\=");
-          // #293 canon #6: escape a would-be inline-math `$…$` span so it stays
-          // literal text on re-import (currency `$5` is left clean — see
-          // escapeProseMath). Runs on the SAME non-code runs as the `==` escape
-          // above; an inline `code` run returns verbatim below, matching the
-          // codeBlock path (a `$…$` inside code must stay code, never math).
-          textContent = escapeProseMath(textContent);
-          // #293 canon #2: `^[` opens a LIVE inline-footnote span on import
-          // (`^[text]` -> a footnote reference). A LITERAL `^[` in prose text
-          // would therefore materialize a phantom footnote on the next import, so
-          // backslash-escape the bracket (`^[` -> `^\[`); marked's escape
-          // tokenizer decodes `\[` back to `[`, so a literal `^[…]` round-trips
-          // as text and never opens a footnote. Only the OPENING `^[` needs
-          // breaking (the tokenizer requires it), so this is a minimal, idempotent
-          // escape. A real footnoteReference node emits `^[body]` from its own
-          // case, never through here.
-          textContent = textContent.replace(/\^\[/g, "^\\[");
-          // #554: a LITERAL inline-HTML break tag typed as prose text (`<br>`,
-          // `<br/>`, `<br />`, case-insensitive / optional whitespace) would be
-          // parsed by marked as an inline-HTML line break on re-import, silently
-          // turning the user's literal text into a hardBreak node. HTML-entity-
-          // encode only the angle brackets of a break-tag sequence so it lands
-          // in the markdown as `&lt;br&gt;`: marked passes the entities through
-          // and the importer decodes them back to the literal characters `<br>`,
-          // so the run round-trips as text and NEVER materializes a hardBreak.
-          // Scoped strictly to the `<br…>` pattern (not every `<`/`>`), so stray
-          // angle brackets in ordinary prose (`a < b > c`) are untouched. This
-          // is the text-content path ONLY; a real hardBreak node serializes from
-          // its own case (`  \n`, or `<br>` via inlineToHtml on the raw-HTML
-          // path), so the serializer's own emitted breaks are never escaped.
-          textContent = textContent.replace(
-            /<(\s*br\s*\/?\s*)>/gi,
-            "&lt;$1&gt;",
-          );
+      case "text": {
+        const marks: any[] = node.marks || [];
+        // #515: a run may now carry `code` TOGETHER with other marks (the schema's
+        // `code` mark no longer declares `excludes: "_"`, matching CommonMark:
+        // ``**`x`**`` is <strong><code>x</code></strong>). Serialize `code` FIRST
+        // so the backtick span is the INNERMOST wrapper, then apply the remaining
+        // marks in the SAME array order as before — so a run WITHOUT `code` is
+        // byte-identical to the historical output.
+        const hasCode = marks.some((m: any) => m.type === "code");
+        // The escape gate stays scoped to NON-code runs: a code span's content is
+        // literal (`==`, `$…$`, `^[`, `<br>` are not re-parsed inside backticks),
+        // so escaping it would permanently stamp backslashes into the code.
+        let textContent = hasCode
+          ? node.text || ""
+          : escapeInlineText(node.text || "");
+        if (hasCode) {
+          textContent = `\`${textContent}\``;
         }
-        // Apply marks (bold, italic, code, etc.)
-        if (node.marks) {
-          // The schema's `code` mark declares `excludes: "_"` — it excludes every
-          // other inline mark — so the editor can NEVER produce a text run that
-          // carries `code` together with another mark, and on import any
-          // co-occurring mark is always dropped (the run comes back as code-only).
-          // The lossless, byte-stable behavior is therefore: when a run has the
-          // `code` mark, emit ONLY the backtick code span and ignore every other
-          // mark, so md1 is already code-only and md2 === md1. Runs WITHOUT a code
-          // mark are rendered exactly as before.
-          const markTypes = node.marks.map((m: any) => m.type);
-          const hasCode = markTypes.includes("code");
-          if (hasCode) {
-            textContent = `\`${textContent}\``;
-            return textContent;
-          }
-          for (const mark of node.marks) {
-            switch (mark.type) {
-              case "bold":
-                textContent = `**${textContent}**`;
-                break;
-              case "italic":
-                textContent = `*${textContent}*`;
-                break;
-              case "code":
-                // A `code` run already returned above (hasCode early return), so
-                // this branch is only reached for a non-code run that somehow
-                // still lists `code`; emit the plain backtick span.
-                textContent = `\`${textContent}\``;
-                break;
-              case "link": {
-                const href = mark.attrs?.href || "";
-                const title = mark.attrs?.title;
-                if (title) {
-                  // Emit the optional markdown link title; escape an embedded
-                  // double-quote so it cannot terminate the title string early.
-                  const safeTitle = String(title).replace(/"/g, '\\"');
-                  textContent = `[${textContent}](${href} "${safeTitle}")`;
-                } else {
-                  textContent = `[${textContent}](${href})`;
-                }
-                break;
-              }
-              case "strike":
-                textContent = `~~${textContent}~~`;
-                break;
-              case "underline":
-                textContent = `<u>${textContent}</u>`;
-                break;
-              case "subscript":
-                textContent = `<sub>${textContent}</sub>`;
-                break;
-              case "superscript":
-                textContent = `<sup>${textContent}</sup>`;
-                break;
-              case "highlight": {
-                // #293 canon #7: a highlight WITHOUT a color serializes as the
-                // Obsidian/GFM `==text==` syntax (the importer's marked inline
-                // `==` extension parses it back to a color-less highlight mark).
-                // A highlight WITH a color keeps the `<mark style="background-
-                // color: …">` HTML form (the condition is deterministic on the
-                // `color` attr), so a colored highlight is not flattened. The
-                // inner textContent already had any literal `==` backslash-
-                // escaped above, so a highlight over text containing `==` still
-                // round-trips.
-                const color = mark.attrs?.color;
-                textContent = color
-                  ? `<mark style="background-color: ${escapeAttr(color)}">${textContent}</mark>`
-                  : `==${textContent}==`;
-                break;
-              }
-              case "textStyle":
-                if (mark.attrs?.color) {
-                  textContent = `<span style="color: ${escapeAttr(mark.attrs.color)}">${textContent}</span>`;
-                }
-                break;
-              case "spoiler":
-                // Markdown has no native spoiler syntax, so emit the same raw
-                // inline HTML the editor-ext/MCP stack uses. The schema's Spoiler
-                // mark parses span[data-spoiler] back on import, so the mark
-                // survives the PM -> MD -> PM round-trip.
-                textContent = `<span data-spoiler="true">${textContent}</span>`;
-                break;
-              case "comment": {
-                // Emit the inline comment anchor so highlights round-trip. The
-                // schema's Comment mark parses span[data-comment-id] (attrs
-                // commentId/resolved).
-                const cid = mark.attrs?.commentId;
-                if (cid) {
-                  // Hide resolved anchors from agent reads: drop the wrapper and
-                  // keep only the bare text. Active anchors keep their wrapper.
-                  if (mark.attrs?.resolved && dropResolvedCommentAnchors) {
-                    break;
-                  }
-                  const resolvedAttr = mark.attrs?.resolved
-                    ? ` data-resolved="true"`
-                    : "";
-                  textContent = `<span data-comment-id="${escapeAttr(cid)}"${resolvedAttr}>${textContent}</span>`;
-                }
-                break;
-              }
-              default:
-                // Unknown mark: no dedicated case, so it has no markdown form and
-                // is dropped from the run. Report the loss (throws in strict
-                // mode) then leave the text unwrapped — the historical behavior.
-                warnLoss("mark", String(mark.type));
-                break;
-            }
-          }
+        // Apply the remaining marks (bold, italic, link, …), `code` already done.
+        for (const mark of marks) {
+          if (mark.type === "code") continue;
+          textContent = applyInlineMark(mark, textContent);
         }
         return textContent;
+      }
 
       case "codeBlock":
         const language = node.attrs?.language || "";
@@ -1341,6 +1364,217 @@ export function convertProseMirrorToMarkdown(
     }
   };
 
+  // ---------------------------------------------------------------------------
+  // #515 code-emphasis runs.
+  //
+  // Now that the schema's `code` mark no longer excludes the other inline marks,
+  // ADJACENT text runs can share an outer emphasis mark with an inline code span
+  // (CommonMark: ``**`aaa` + `bbb`**`` is <strong><code>aaa</code> + <code>bbb
+  // </code></strong>, i.e. three sibling runs all carrying `bold`). Rendering
+  // those runs INDEPENDENTLY would close and re-open the `**` delimiters around
+  // every span (`` `aaa`** + **`bbb` ``) — the dangling-delimiter corruption from
+  // the bug report. So a bounded coalescing pass factors a SHARED emphasis out of
+  // such a run once.
+  //
+  // The pass is deliberately narrow (data-loss-critical git-sync path): it only
+  // ever touches a maximal run of CONSECUTIVE text nodes that is SEEDED by a node
+  // carrying `code` TOGETHER WITH a bare-delimiter emphasis mark — the ONLY shape
+  // #515 newly made expressible, and the only one where an emphasis delimiter can
+  // end up glued to a backtick. A plain `` `code` `` span next to an emphasized
+  // neighbour (`` **bold**`c` ``) was always legal, always round-tripped as
+  // markdown, and is left completely untouched (no seed => no run => the exact
+  // pre-#515 bytes). From a genuine seed the run only pulls in an
+  // IMMEDIATELY adjacent text node whose
+  // emphasis mark emits a BARE delimiter (`**` / `*` / `~~` / `==`) — those are
+  // exactly the delimiters that COLLIDE with a neighbouring span's delimiters
+  // (`` **`a`***b* `` re-imports as literal `**`). Neighbours that render as
+  // HTML/bracket forms (underline, sub/sup, spoiler, comment, textStyle, colored
+  // highlight, link) have self-delimiting boundaries and are NOT pulled in, so the
+  // ordinary ``pre **`code`** post`` case stays clean markdown. Non-text inline
+  // nodes (mathInline, mention, status, footnoteReference, hardBreak) render via
+  // processNode as before and BREAK any run.
+  // ---------------------------------------------------------------------------
+
+  /** Marks whose markdown form is a bare, collidable delimiter. */
+  const isBareDelimiterMark = (m: any): boolean =>
+    m.type === "bold" ||
+    m.type === "italic" ||
+    m.type === "strike" ||
+    (m.type === "highlight" && !m.attrs?.color);
+
+  const hasCodeMark = (n: any): boolean =>
+    (n?.marks || []).some((m: any) => m.type === "code");
+
+  const nonCodeMarks = (n: any): any[] =>
+    (n?.marks || []).filter((m: any) => m.type !== "code");
+
+  /**
+   * SEED of a code-emphasis run. A delimiter collision is only POSSIBLE when the
+   * CODE node ITSELF carries a bare-delimiter emphasis mark: that is the only way
+   * an emphasis delimiter ends up glued to a backtick (`` **`x`** ``). A code node
+   * with NO emphasis mark (plain `` `x` ``) has ALWAYS been representable next to
+   * any emphasized neighbour — the old `excludes: "_"` forbade code+mark on the
+   * SAME node, never on ADJACENT nodes — and those constructs (`` **bold**`c` ``,
+   * `` `c`**bold** ``, `` **a**`c`**b** ``) are valid CommonMark that re-imports
+   * losslessly. So an un-emphasized code node is NOT a seed and never starts a
+   * run: it keeps serializing through `case "text"` byte-for-byte as before, and
+   * the pre-#515 markdown in the git-sync repo does not degrade to HTML.
+   */
+  const isRunSeed = (n: any): boolean =>
+    n?.type === "text" &&
+    hasCodeMark(n) &&
+    (n.marks || []).some(isBareDelimiterMark);
+
+  /**
+   * A text node that may EXTEND a run that a seed has already started. Broader
+   * than the seed rule on purpose: once a genuine collision exists, an adjacent
+   * bare-delimiter neighbour (`` **`a`***b* ``) or an adjacent plain code span
+   * (`` **`a`**`b` ``) participates in the delimiter re-pairing and must be
+   * folded into the same emission decision.
+   */
+  const isRunMember = (n: any): boolean =>
+    n?.type === "text" &&
+    (hasCodeMark(n) || (n.marks || []).some(isBareDelimiterMark));
+
+  /**
+   * Stable identity of a mark: its type PLUS its FULL attrs, deeply compared
+   * (for `link` that is every attr — class/href/internal/rel/target/title — not
+   * just href/title, so two links that differ in any attr are NOT factored into
+   * one shared wrapper).
+   */
+  const markIdentity = (m: any): string => {
+    const attrs = m?.attrs && typeof m.attrs === "object" ? m.attrs : {};
+    const keys = Object.keys(attrs)
+      .filter((k) => attrs[k] !== undefined)
+      .sort();
+    return JSON.stringify([m?.type, keys.map((k) => [k, attrs[k]])]);
+  };
+
+  /** Identity of a node's NON-code mark SET (order-insensitive). */
+  const nonCodeMarkSetIdentity = (n: any): string =>
+    nonCodeMarks(n).map(markIdentity).sort().join("|");
+
+  /**
+   * Is `c` (a SINGLE code point, or "" at the edge of the inline content) a
+   * character next to which an emphasis delimiter glued to a backtick still
+   * flanks — i.e. a character the IMPORTER counts as whitespace-or-punctuation?
+   *
+   * The rule is stated EXPLICITLY against the importer's own definition rather
+   * than inferred: marked's emphasis tokenizer classifies a character with
+   * `punctSpace = /[\s\p{P}\p{S}]/u` (CommonMark 0.31's "Unicode whitespace or
+   * punctuation", where punctuation includes the SYMBOL categories). Anything
+   * outside that class — a letter, a digit, but ALSO a combining mark (U+0301),
+   * a format character (ZWJ, SOFT HYPHEN) — is a word character to marked, so a
+   * `**` opener sitting between it and a backtick is NOT left-flanking and the
+   * emphasis is dropped on re-import. An earlier `!/[\p{L}\p{N}]/u` formulation
+   * called those non-letter/non-digit characters BOUNDARIES and silently lost the
+   * mark (byte-stably, so the round-trip property could not see it).
+   *
+   * ASTRAL code points are treated as WORD characters (never a boundary), i.e.
+   * conservatively pushed to the lossless HTML fallback, EVEN when their Unicode
+   * category says "symbol" (emoji). marked inspects the preceding character with
+   * a UTF-16 `.slice(-1)`, so it tests a lone LOW SURROGATE — which matches
+   * neither `\s` nor `\p{P}`/`\p{S}` — and refuses to open the emphasis. The
+   * fallback is verified by the astral regression tests; do NOT "optimize" this
+   * to trust the code point's real category.
+   */
+  const isWordBoundaryChar = (c: string): boolean => {
+    if (c === "") return true;
+    const cp = c.codePointAt(0);
+    if (cp === undefined) return true;
+    // Astral (or a stray lone surrogate): word char -> HTML fallback.
+    if (cp > 0xffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+    return /[\s\p{P}\p{S}]/u.test(c);
+  };
+
+  /**
+   * LAST / FIRST code point of a string ("" when empty) — NOT a UTF-16 unit.
+   * `slice(-1)` / `slice(0, 1)` would return a lone SURROGATE half of an astral
+   * character. Taking two units first bounds the work to O(1) while still
+   * capturing a whole surrogate pair, which `Array.from` then yields as one
+   * code point.
+   */
+  const lastCodePoint = (s: string): string => {
+    const cps = Array.from(s.slice(-2));
+    return cps.length ? cps[cps.length - 1] : "";
+  };
+  const firstCodePoint = (s: string): string => Array.from(s.slice(0, 2))[0] ?? "";
+
+  /**
+   * Emit one detected code-emphasis run. `prevPart` / `nextPart` are the already
+   * rendered markdown of the immediately surrounding siblings ("" at the edges) —
+   * needed for the flanking check below.
+   *
+   * HOMOGENEOUS (every node carries the IDENTICAL non-code mark set): factor the
+   * shared marks OUT once (in the first node's mark-array order, so the innermost
+   * wrapper matches the single-node path), with each node rendered inside as its
+   * code span (code innermost) or its escaped text.
+   *
+   * HETEROGENEOUS (the non-code sets differ — e.g. `[code,bold]` beside
+   * `[italic]`): no single markdown factoring exists and per-node markdown would
+   * collide (`` **`a`***b* `` — the `***` re-parses as ONE delimiter run and the
+   * bold is lost), so emit the WHOLE run as schema HTML via inlineToHtml (per-node
+   * wrapping, NOT factored). marked passes the inline HTML through and
+   * generateJSON rebuilds the exact marks — lossless and idempotent.
+   *
+   * FLANKING (also HTML): even a homogeneous run can be unemittable as markdown.
+   * CommonMark's flanking rules disqualify an emphasis delimiter that sits
+   * BETWEEN a backtick and a word character:
+   *   * an OPENER `**` directly before a code span is left-flanking only if the
+   *     char BEFORE it is whitespace/punctuation — so `x**`+`` `a` ``+`**` (an
+   *     emphasized code span glued to preceding prose) would NOT open, and
+   *   * a CLOSER `**` directly after a code span is right-flanking only if the
+   *     char AFTER it is whitespace/punctuation — so ``**`a`**b`` would NOT close.
+   * Either way the delimiters re-pair across the paragraph on re-import and the
+   * emphasis silently leaks onto (or off) neighbouring text — data loss on the
+   * git-sync path. When the emitted markdown would land in that position, take the
+   * same lossless HTML fallback. Runs separated from their neighbours by a space
+   * (the overwhelmingly common ``pre **`code`** post``) are unaffected.
+   */
+  const renderCodeEmphasisRun = (
+    run: any[],
+    prevPart: string,
+    nextPart: string,
+    soloPart: string,
+  ): string => {
+    const identities = run.map(nonCodeMarkSetIdentity);
+    const homogeneous = identities.every((id) => id === identities[0]);
+    if (!homogeneous) return inlineToHtml(run);
+
+    // A ONE-node run (the common ``pre **`code`** post``) is exactly what
+    // `case "text"` already emitted (2a: code span innermost, other marks around
+    // it in mark-array order) — reuse that rendering verbatim rather than
+    // duplicating it, so `case "text"` stays the single source for a single run.
+    let out = soloPart;
+    if (run.length > 1) {
+      out = run
+        .map((n: any) => {
+          const raw = n.text || "";
+          // `code` is the INNERMOST wrapper; its content is literal (unescaped).
+          return hasCodeMark(n) ? `\`${raw}\`` : escapeInlineText(raw);
+        })
+        .join("");
+      for (const mark of nonCodeMarks(run[0])) {
+        out = applyInlineMark(mark, out);
+      }
+    }
+
+    // Flanking guard (see above). Only a BARE delimiter (`*`/`~`/`=`) that is
+    // glued to a backtick can be disqualified; an HTML-form mark (<u>, <mark
+    // style>, <span>, a link's brackets) is self-delimiting and always safe.
+    const openerHitsCode = /^[*~=]+`/.test(out);
+    const closerHitsCode = /`[*~=]+$/.test(out);
+    const prevChar = lastCodePoint(prevPart);
+    const nextChar = firstCodePoint(nextPart);
+    if (
+      (openerHitsCode && !isWordBoundaryChar(prevChar)) ||
+      (closerHitsCode && !isWordBoundaryChar(nextChar))
+    ) {
+      return inlineToHtml(run);
+    }
+    return out;
+  };
+
   // Render a run of inline children to MARKDOWN, with the #293 canon #6
   // inline-math guard. A `mathInline` serialized as `$…$` whose FOLLOWING
   // sibling renders starting with a DIGIT would put a digit right after the
@@ -1351,6 +1585,40 @@ export function convertProseMirrorToMarkdown(
   // is unchanged whenever no math sits directly before a digit.
   const renderInlineChildren = (nodes: any[]): string => {
     const parts = nodes.map(processNode);
+
+    // #515 (2b/2c): coalesce code-emphasis runs BEFORE the math/hardBreak guards
+    // below, so those guards see the FINAL rendering of their neighbours. A run's
+    // whole output lands on its FIRST index and the remaining member indices are
+    // blanked. A run can never start mid-way after a mathInline/hardBreak (those
+    // node types break runs), so no guard ever looks at a blanked index.
+    //
+    // The pass only ever TRIGGERS on a genuine seed (a code node that itself
+    // carries a bare-delimiter emphasis mark — see isRunSeed). Every inline shape
+    // that was already expressible before #515 therefore contains no seed at all
+    // and takes ZERO passes through here, keeping its historical markdown output
+    // byte-for-byte.
+    for (let i = 0; i < nodes.length; ) {
+      if (!isRunSeed(nodes[i])) {
+        i++;
+        continue;
+      }
+      let start = i;
+      while (start - 1 >= 0 && isRunMember(nodes[start - 1])) start--;
+      let end = i;
+      while (end + 1 < nodes.length && isRunMember(nodes[end + 1])) end++;
+      // The neighbours are never run members (the run is maximal), so their parts
+      // are already final markdown — safe to read for the flanking check.
+      parts[start] = renderCodeEmphasisRun(
+        nodes.slice(start, end + 1),
+        parts[start - 1] ?? "",
+        parts[end + 1] ?? "",
+        // The `case "text"` rendering of a lone code run, already computed above.
+        parts[start],
+      );
+      for (let j = start + 1; j <= end; j++) parts[j] = "";
+      i = end + 1;
+    }
+
     for (let i = 0; i < nodes.length - 1; i++) {
       if (
         nodes[i]?.type === "mathInline" &&
@@ -1416,7 +1684,19 @@ export function convertProseMirrorToMarkdown(
           return processNode(n);
         }
         let t = escapeHtmlText(n.text || "");
-        for (const mark of n.marks || []) {
+        // #515: apply `code` FIRST so the <code> element is the INNERMOST wrapper
+        // (`<strong><code>x</code></strong>`), regardless of where the mark sits
+        // in this node's marks array. Required for byte stability: ProseMirror
+        // re-orders a node's marks by schema rank on import, so honouring the
+        // array order verbatim would flip <code> outside on the SECOND export and
+        // md2 !== md1. Marks are a SET in ProseMirror, so the nesting order does
+        // not change what re-imports — only the bytes. A node with no `code` mark
+        // keeps the historical order exactly (the filter is order-preserving).
+        const orderedMarks = [
+          ...(n.marks || []).filter((m: any) => m.type === "code"),
+          ...(n.marks || []).filter((m: any) => m.type !== "code"),
+        ];
+        for (const mark of orderedMarks) {
           switch (mark.type) {
             case "bold":
               t = `<strong>${t}</strong>`;

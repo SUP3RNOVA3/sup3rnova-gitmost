@@ -59,22 +59,36 @@ describe('convertProseMirrorToMarkdown', () => {
       ).toBe('`x`');
     });
 
-    it('code + another mark emits the backtick code form (code wins)', () => {
-      // The schema's `code` mark excludes all other marks, so the editor can
-      // never produce code+bold on one run and import always drops the co-mark.
-      // The lossless, byte-stable behavior is to emit ONLY the backtick code
-      // span and ignore the co-occurring mark.
+    it('code + another mark nests the code span INSIDE the emphasis (#515)', () => {
+      // #515: the schema's `code` mark no longer declares `excludes: "_"`, so a
+      // run legitimately carries code together with bold (CommonMark parses
+      // ``**`x`**`` as <strong><code>x</code></strong>). The backtick span is the
+      // INNERMOST wrapper and the other marks are applied around it, in the
+      // marks-array order — so the run round-trips with BOTH marks intact.
       const out = convertProseMirrorToMarkdown(
         doc(para(text('x', [{ type: 'bold' }, { type: 'code' }]))),
       );
-      expect(out).toBe('`x`');
+      expect(out).toBe('**`x`**');
     });
 
-    it('code + strike combo emits the backtick code form (code wins)', () => {
+    it('code + strike combo nests the code span inside `~~` (#515)', () => {
       const out = convertProseMirrorToMarkdown(
         doc(para(text('x', [{ type: 'strike' }, { type: 'code' }]))),
       );
-      expect(out).toBe('`x`');
+      expect(out).toBe('~~`x`~~');
+    });
+
+    it('code + italic + bold applies the non-code marks in marks-array order (#515)', () => {
+      // The mark array order is preserved exactly as before the fix (first mark =
+      // innermost wrapper); `code` is simply pulled in front of all of them.
+      const out = convertProseMirrorToMarkdown(
+        doc(
+          para(
+            text('x', [{ type: 'italic' }, { type: 'bold' }, { type: 'code' }]),
+          ),
+        ),
+      );
+      expect(out).toBe('***`x`***');
     });
   });
 

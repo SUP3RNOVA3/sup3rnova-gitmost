@@ -60,16 +60,27 @@ describe('parsePositiveInt', () => {
 describe('AiSettingsService.getMasked reindex progress', () => {
   const WORKSPACE_ID = 'ws-1';
 
-  function makeService() {
+  function makeService(activeFingerprint: string | null = null) {
     // No driver configured -> the credentials lookup is skipped, keeping the
     // setup minimal; we only care about the indexed/total numbers here.
     const workspaceRepo = {
       findById: jest.fn().mockResolvedValue({ settings: {} }),
+      // #599: the ACTIVE generation pointer — the steady-state numerator is scoped
+      // to it (see the R8a tests below).
+      getEmbeddingGeneration: jest.fn().mockResolvedValue({
+        activeFingerprint,
+        activeModel: null,
+        coverageTotal: null,
+        coverageEmbeddable: null,
+      }),
     };
     const aiAgentRoleRepo = {};
     const aiProviderCredentialsRepo = { find: jest.fn() };
     const pageEmbeddingRepo = {
       countIndexedPages: jest.fn().mockResolvedValue(478),
+      // Only the ACTIVE generation's pages: mid-swap this is far below the
+      // generation-blind count above.
+      countPagesByFingerprint: jest.fn().mockResolvedValue(120),
     };
     const pageRepo = {
       countEmbeddablePages: jest.fn().mockResolvedValue(478),
@@ -118,12 +129,14 @@ describe('AiSettingsService.getMasked reindex progress', () => {
     expect(masked.reindexStartedAt).toBe(startedAt);
   });
 
-  it('falls back to countIndexedPages when no reindex is active', async () => {
-    const { service, reindexProgress } = makeService();
+  it('falls back to countIndexedPages when no reindex is active AND no generation pointer exists', async () => {
+    const { service, reindexProgress } = makeService(null);
     reindexProgress.get.mockResolvedValue(null);
 
     const masked = await service.getMasked(WORKSPACE_ID);
 
+    // Legacy / fresh workspace: no active fingerprint to scope to, so the
+    // generation-blind count is the only meaningful number (pre-#599 behavior).
     expect(masked.indexedPages).toBe(478);
     expect(masked.totalPages).toBe(478);
     expect(masked.reindexing).toBe(false);
@@ -131,6 +144,26 @@ describe('AiSettingsService.getMasked reindex progress', () => {
     // steady-state behaviour).
     expect(masked.runId).toBeUndefined();
     expect(masked.reindexStartedAt).toBeUndefined();
+  });
+
+  it('#599 R8a — counts only the ACTIVE generation, so the panel cannot claim "478 of 478" mid-swap', async () => {
+    const { service, reindexProgress, pageEmbeddingRepo } = makeService('fp-A');
+    reindexProgress.get.mockResolvedValue(null);
+
+    const masked = await service.getMasked(WORKSPACE_ID);
+
+    // NON-VACUITY: countIndexedPages() is generation-blind — during a model swap the
+    // half-built TARGET generation's rows counted toward it, so the admin panel
+    // showed a complete "Indexed 478 of 478" bar while the search API reported
+    // `semantic.state: stale` for the same workspace. The numerator now tracks the
+    // generation that is actually SERVED.
+    expect(pageEmbeddingRepo.countPagesByFingerprint).toHaveBeenCalledWith(
+      WORKSPACE_ID,
+      'fp-A',
+    );
+    expect(pageEmbeddingRepo.countIndexedPages).not.toHaveBeenCalled();
+    expect(masked.indexedPages).toBe(120);
+    expect(masked.totalPages).toBe(478);
   });
 });
 
@@ -198,6 +231,22 @@ describe('AiSettingsService.reindex progress seed', () => {
     expect(aiQueue.add).toHaveBeenCalledTimes(1);
     // Seed must precede the enqueue so the first poll already reports done=0.
     expect(order).toEqual(['start', 'add']);
+
+    // #599 R2 — the reindex job MUST carry a retry policy. The AI_QUEUE default is
+    // `attempts: 1`, and a run left partial by a transient embedding failure does
+    // not flip the active generation: with a single attempt the workspace would sit
+    // in the swap window (2x rows, `stale`, lexical-only after a model change)
+    // forever. The stable jobId is what de-duplicates the manual button, the
+    // AI-Search toggle and the automatic fingerprint-change reindex.
+    expect(aiQueue.add).toHaveBeenCalledWith(
+      expect.anything(),
+      { workspaceId: WORKSPACE_ID },
+      expect.objectContaining({
+        jobId: `ai-reindex-${WORKSPACE_ID}`,
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 60_000 },
+      }),
+    );
   });
 
   it('does NOT re-seed when a run is already active (mid-run re-trigger)', async () => {

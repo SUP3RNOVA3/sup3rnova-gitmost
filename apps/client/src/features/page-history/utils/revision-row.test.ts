@@ -129,14 +129,45 @@ describe("dayGroupLabel — relative Today/Yesterday else absolute", () => {
   });
 });
 
-describe("heatLevel — prototype heat() thresholds", () => {
+describe("heatLevel — #605 total-activity thresholds (≤20 / ≤100 / >100)", () => {
   it("maps counts to 0/1/2/3 tiers", () => {
     expect(heatLevel(0)).toBe(0);
+    expect(heatLevel(-3)).toBe(0);
     expect(heatLevel(1)).toBe(1);
-    expect(heatLevel(2)).toBe(1);
-    expect(heatLevel(3)).toBe(2);
-    expect(heatLevel(4)).toBe(2);
-    expect(heatLevel(5)).toBe(3);
-    expect(heatLevel(99)).toBe(3);
+    expect(heatLevel(20)).toBe(1);
+  });
+
+  it("uses the exact tier-boundary ceilings", () => {
+    // tier 1 → tier 2 boundary at 20/21.
+    expect(heatLevel(20)).toBe(1);
+    expect(heatLevel(21)).toBe(2);
+    // tier 2 → tier 3 boundary at 100/101.
+    expect(heatLevel(100)).toBe(2);
+    expect(heatLevel(101)).toBe(3);
+    expect(heatLevel(9999)).toBe(3);
+  });
+
+  // Acceptance criterion 4: the real stage daily sums must spread across all
+  // THREE tiers, with low-activity days distinct from the heavy 426 day.
+  it("spreads the real stage daily sums across all three tiers", () => {
+    const stage: Array<[number, 0 | 1 | 2 | 3]> = [
+      [8, 1],
+      [13, 1],
+      [19, 1],
+      [48, 2],
+      [73, 2],
+      [76, 2],
+      [163, 3],
+      [426, 3],
+    ];
+    for (const [sum, tier] of stage) {
+      expect(heatLevel(sum)).toBe(tier);
+    }
+    // All three non-zero tiers are actually used…
+    const tiers = new Set(stage.map(([sum]) => heatLevel(sum)));
+    expect(tiers).toEqual(new Set([1, 2, 3]));
+    // …and a low day is NOT collapsed into the same tier as the heavy day.
+    expect(heatLevel(8)).not.toBe(heatLevel(426));
+    expect(heatLevel(13)).not.toBe(heatLevel(426));
   });
 });

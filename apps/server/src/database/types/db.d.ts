@@ -343,6 +343,7 @@ export interface Shares {
   includeSubPages: Generated<boolean | null>;
   key: string;
   pageId: string | null;
+  publishedMode: Generated<string>;
   searchIndexing: Generated<boolean | null>;
   spaceId: string;
   updatedAt: Generated<Timestamp>;

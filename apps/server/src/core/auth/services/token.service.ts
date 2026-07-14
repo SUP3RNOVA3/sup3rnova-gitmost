@@ -226,9 +226,10 @@ export class TokenService {
   /**
    * Verify a token's signature ONCE and assert its `type` is one of `allowed`.
    *
-   * This is the type-routing primitive for surfaces that legitimately accept
-   * more than one token type on the same Bearer slot (the /mcp Bearer path
-   * accepts both an ACCESS and an API_KEY token). It is deliberately NOT a
+   * This is the type-routing primitive for surfaces that pin the Bearer slot to
+   * an explicit token-type allowlist. The /mcp Bearer path pins that allowlist to
+   * `[API_KEY]` only (#558 — /mcp no longer accepts a human-session ACCESS token
+   * or any other type). It is deliberately NOT a
    * "verify-and-return-whatever-type" helper — that would be a reusable
    * confused-deputy footgun (any caller could then feed an attachment/collab
    * token where an access token is expected). An explicit allowlist preserves

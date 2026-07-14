@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **The embedded `/mcp` endpoint now authenticates ONLY with a Bearer api_key.**
+  The three former inbound auth paths — HTTP Basic `email:password`, a Bearer
+  human-session ACCESS token, and the `MCP_DOCMOST_EMAIL` / `MCP_DOCMOST_PASSWORD`
+  env service account — are all removed. An agent must send
+  `Authorization: Bearer <api_key>` (an api_key minted under Workspace settings →
+  API keys); every other credential now gets a `401`.
+
+  *Migration:* (1) MCP clients that authenticated with HTTP Basic `email:password`
+  or a session ACCESS token must switch to a Bearer api_key. (2) Deploys that
+  relied on the `MCP_DOCMOST_EMAIL` / `MCP_DOCMOST_PASSWORD` service account must
+  mint an api_key and drop those two env vars (they are no longer read).
+  `MCP_DOCMOST_API_URL` (the outbound loopback URL) and `MCP_TOKEN` (the optional
+  shared `X-MCP-Token` guard) are unchanged. **Deploy order:** roll this out only
+  after every agent has migrated to a Bearer api_key, since the old credentials
+  stop working the moment this deploys. (The in-app AI agent does not use `/mcp`
+  and is unaffected.)
+
 - **External MCP tool names are now camelCase (all renamed).** Every tool on the
   external `/mcp` surface was renamed from `snake_case` to `camelCase`, so the
   external MCP name now matches the in-app tool name exactly (one logical tool,
@@ -129,6 +146,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Page chrome paints from a local boot cache instead of waiting for the page
+  request.** With the new `LOCAL_FIRST_ENABLED` env var (default `false`), the
+  client keeps a small per-(workspace, user) `localStorage` cache of page
+  metadata (title, icon), so opening or reloading a page renders its title,
+  header and breadcrumbs without waiting for `/pages/info` — the page is still
+  revalidated on every mount and the fresh response always wins. Edit
+  affordances are deliberately NOT served from the cache: they stay disabled
+  until the live response confirms the permissions. The cache holds no page
+  content and no permissions, is purged on logout / sign-in / `401`, and a page
+  that returns `403`/`404` is evicted immediately. With the flag off, nothing is
+  read or written and behaviour is unchanged. (#563)
+- **The page body paints from the local collab replica instead of waiting for
+  the collab server.** Under `LOCAL_FIRST_ENABLED` (default `false`), reopening a
+  page whose local ydoc already holds content renders the real body immediately —
+  no network round-trip — and keeps it strictly READ-ONLY until the collab room
+  confirms a sync: no keystroke, no programmatic command and no plugin
+  transaction can reach the Y.Doc in that window, so a stale local copy can never
+  clobber newer server content on merge. An empty local ydoc keeps today's
+  server-seeded static copy (no blank body on a first visit), a real disconnect
+  raises a page-wide "offline, showing the cached copy" banner (a healthy
+  connection stays silent), and a page that returns `403`/`404` has its local ydoc
+  destroyed on disk. With the flag off, behaviour is unchanged. (#564)
+
+
+- **Changing the embedding model no longer empties semantic search.** The
+  embeddings now have a versioned lifecycle: the workspace stores which embedding
+  generation search actually serves, and a model/revision/prefix change starts a
+  background reindex into a NEW generation while the OLD one keeps answering
+  queries. The pointer flips to the new generation atomically, and only after the
+  reindex has covered every page — a run with failures or a fatal provider abort
+  leaves the previous generation serving instead of publishing a half-built index,
+  and is retried automatically with backoff (a transient embedding-sidecar timeout
+  no longer parks the workspace in a half-swapped state until someone notices).
+  Superseded generations (including pre-existing rows written before fingerprints
+  existed, which until now were silently invisible to search) are reclaimed by a
+  generational GC capped at two live generations. Search responses report the
+  state (`off` / `stale` / `full`) with an indexed/total count, so a degraded or
+  in-progress index is visible instead of silently returning fewer results. If the
+  configured model differs from the one the served generation was built with,
+  search and the AI agent's retrieval fall back to lexical-only rather than
+  comparing vectors from two different embedding spaces (which would rank random
+  pages above genuine matches). A reindex of one workspace is serialised, so a
+  retried background job can never corrupt an in-flight one. (#599)
 - **A drifted comment suggestion can be re-synced instead of failing forever
   with a 409.** A suggestion whose stored anchor no longer matched the live
   document used to reject every apply attempt with an unrecoverable conflict; a
@@ -369,6 +429,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base-URL contract is unchanged. (#229)
 
 ### Fixed
+
+- **A public share no longer serves an attachment whose page has been trashed.**
+  The public file endpoint validated the share token but never re-read the
+  soft-delete state, so a valid (1-hour) attachment token kept streaming the
+  bytes after the page was moved to the trash. This became reachable with the
+  `approved` share mode: the published content is a FROZEN saved version that
+  still references the attachment, whereas a live draft simply drops the node.
+  The endpoint now re-checks the page (and the attachment row) on every public
+  hit and answers with the same `404 File not found` it already used for a
+  mismatched token, so nothing about the file's existence leaks. Note that an
+  already-served response stays cacheable for up to an hour (`Cache-Control:
+  public, max-age=3600`), so the guard applies to origin hits. (#574)
+
+- **A lost draw.io/Excalidraw diagram is no longer unnamed in the MCP integrity
+  guard.** The structural integrity guard behind `diffPageVersions` and the
+  post-write verify report counted images/links/tables/callouts/code blocks, but
+  no diagram kind — and a diagram is a block ATOM whose whole payload lives in
+  its attributes, so deleting one moves no prose and no marks: the only trace was
+  the single leaf placeholder an atom leaves in the text delta, i.e. a 1-char
+  change indistinguishable from fixing a typo (the same blind spot a vanished
+  code block used to have). `drawio` and `excalidraw` are now counted as their
+  own integrity kinds: losing (or gaining) one raises the same class of flag as
+  losing a table — a `drawio: N -> N-1` line in the diff's `## Integrity` block
+  and a `structure.drawio` entry with `changed: true` in the write report, so the
+  loss is NAMED rather than hidden in a text delta. They are deliberately two
+  keys, not one `diagrams` bucket: a bucket would report a drawio swapped for an
+  excalidraw as `1 -> 1` (clean) and omit it from the report entirely. Detection
+  only: this makes such a loss loud, it does not prevent it.
 
 - **MCP write tools no longer report a false failure that provokes a duplicate
   write.** `drawioCreate` used to throw when the diagram landed as a NESTED block

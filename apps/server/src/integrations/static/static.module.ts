@@ -88,6 +88,9 @@ export class StaticModule implements OnModuleInit {
         // client only collects/sends vitals when the operator opts in.
         CLIENT_TELEMETRY_ENABLED:
           this.environmentService.isClientTelemetryEnabled(),
+        // #563 — mirrors LOCAL_FIRST_ENABLED so the client's page-meta boot
+        // cache (instant chrome) is only active when the operator opts in.
+        LOCAL_FIRST_ENABLED: this.environmentService.isLocalFirstEnabled(),
       };
 
       const windowScriptContent = `<script>window.CONFIG=${JSON.stringify(configString)};</script>`;

@@ -54,6 +54,15 @@ export function isClientTelemetryEnabled(): boolean {
   return castToBoolean(getConfigValue("CLIENT_TELEMETRY_ENABLED", "false"));
 }
 
+// #563 — operator toggle for the local-first page boot cache. DEFAULT OFF: the
+// server mirrors LOCAL_FIRST_ENABLED into window.CONFIG; when off the page-meta
+// boot cache is neither written nor read and the page behaves exactly as before
+// (skeleton until the network resolves). Rollback is a flag flip, not a deploy —
+// a revert would not clean already-written localStorage.
+export function isLocalFirstEnabled(): boolean {
+  return castToBoolean(getConfigValue("LOCAL_FIRST_ENABLED", "false"));
+}
+
 export function getAvatarUrl(
   avatarUrl: string,
   type: AvatarIconType = AvatarIconType.AVATAR,

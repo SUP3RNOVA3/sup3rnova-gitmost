@@ -7,6 +7,12 @@ import { RefObject, useCallback, useEffect, useState } from "react";
 // so a slow load doesn't release mid-render and reintroduce the collapse.
 const RELEASE_CAP_MS = 4000;
 
+// #564 — release tolerance for an EARLY (local-first) swap, where the live doc
+// comes from the local ydoc and may legitimately be a little shorter than the
+// server-seeded static copy. Must stay high enough that a document collapsed to
+// a fraction of its height (unloaded images / embeds) does NOT release.
+export const EARLY_SWAP_RELEASE_RATIO = 0.8;
+
 /**
  * Reserves the document height across the static -> live editor swap.
  *
@@ -35,6 +41,7 @@ const RELEASE_CAP_MS = 4000;
 export function useSwapHeightReservation(
   showStatic: boolean,
   menuContainerRef: RefObject<HTMLElement | null>,
+  earlySwap: boolean = false,
 ): {
   reservedHeight: number | null;
   captureReservation: (height: number | null) => void;
@@ -56,16 +63,30 @@ export function useSwapHeightReservation(
   // last-resort so we never pin forever. A shorter-than-reserved live doc (rare:
   // stale/longer cache) releases at the cap, leaving only harmless bottom dead
   // space until then.
+  // `earlySwap` (#564, guard 6): with local-first the swap happens hundreds of ms
+  // EARLIER, from the local ydoc — whose content may legitimately differ in
+  // height from the (network-seeded) static copy. Demanding an exact match would
+  // then pin the reservation until the 4s cap and leave dead space under the
+  // body, so the early-swap rule releases at a TOLERANCE of the reserved height.
+  //
+  // The tolerance is deliberately NOT "any non-zero height": the live editor's
+  // first laid-out frame can be a small fraction of the static copy (lazy images,
+  // excalidraw / drawio / page-embed nodes all measure to ~0 until they load), and
+  // releasing there would collapse the document and clamp the scroll to the top —
+  // precisely the bug the reservation exists to prevent. Releasing at 80% keeps
+  // the guard meaningful while tolerating a legitimately-shorter local copy; a
+  // still-shorter one falls back to the 4s cap, as before.
   useEffect(() => {
     if (showStatic || reservedHeight == null) return;
     let raf = 0;
     const startedAt = Date.now();
     const check = () => {
       const liveHeight = menuContainerRef.current?.scrollHeight ?? 0;
-      if (
-        liveHeight >= reservedHeight ||
-        Date.now() - startedAt > RELEASE_CAP_MS
-      ) {
+      const target = earlySwap
+        ? reservedHeight * EARLY_SWAP_RELEASE_RATIO
+        : reservedHeight;
+      const laidOut = liveHeight > 0 && liveHeight >= target;
+      if (laidOut || Date.now() - startedAt > RELEASE_CAP_MS) {
         setReservedHeight(null);
         return;
       }
@@ -73,7 +94,7 @@ export function useSwapHeightReservation(
     };
     raf = requestAnimationFrame(check);
     return () => cancelAnimationFrame(raf);
-  }, [showStatic, reservedHeight, menuContainerRef]);
+  }, [showStatic, reservedHeight, menuContainerRef, earlySwap]);
 
   return { reservedHeight, captureReservation };
 }

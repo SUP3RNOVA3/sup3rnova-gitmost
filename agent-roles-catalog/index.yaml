@@ -33,6 +33,6 @@ bundles:
       - en
     roles:
       - slug: researcher
-        version: 10
+        version: 11
       - slug: call-summarizer
-        version: 2
+        version: 3

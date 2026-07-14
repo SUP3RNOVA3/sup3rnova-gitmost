@@ -40,6 +40,10 @@ const ALLOWED_NAMES = new Set([
   "editor_tx_ms",
   "page_open_ms",
   "longtask_ms",
+  // #563 — page-meta boot-cache counters (value is always 1; they are counts).
+  "page_meta_hit",
+  "page_meta_miss",
+  "page_meta_evict",
 ]);
 
 interface VitalEvent {
@@ -133,7 +137,12 @@ function flush(): void {
  * session is sampled. Route is always the current TEMPLATE.
  */
 export function reportClientMetric(
-  name: "editor_tx_ms" | "page_open_ms",
+  name:
+    | "editor_tx_ms"
+    | "page_open_ms"
+    | "page_meta_hit"
+    | "page_meta_miss"
+    | "page_meta_evict",
   value: number,
   extra?: { docSize?: number },
 ): void {

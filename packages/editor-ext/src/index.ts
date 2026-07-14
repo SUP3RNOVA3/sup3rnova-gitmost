@@ -24,6 +24,7 @@ export * from "./lib/subpages";
 export * from "./lib/transclusion";
 export * from "./lib/page-embed";
 export * from "./lib/highlight";
+export * from "./lib/code";
 export * from "./lib/spoiler/spoiler";
 export * from "./lib/indent";
 export * from "./lib/heading/heading";

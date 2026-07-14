@@ -1,7 +1,11 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { QueueName, QueueJob } from '../queue/constants';
+import {
+  QueueName,
+  QueueJob,
+  workspaceReindexJobOptions,
+} from '../queue/constants';
 import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
 import { AiAgentRoleRepo } from '@docmost/db/repos/ai-agent-roles/ai-agent-roles.repo';
 import { AiProviderCredentialsRepo } from '@docmost/db/repos/ai-chat/ai-provider-credentials.repo';
@@ -116,6 +120,15 @@ export class AiSettingsService {
    * pass is kept and no duplicate is started. The .catch only guards against
    * transport/Redis errors.
    *
+   * #599 (review F1) — that dedupe means a CONFIG CHANGE during an active run
+   * enqueues NOTHING, so the new fingerprint gets no job of its own. What builds
+   * it is the running job itself: it finishes its (now stale) target, sees the
+   * drift in EmbeddingGenerationService.completeRun, and FAILS with
+   * StaleReindexTargetError so BullMQ retries it — and the retry re-resolves the
+   * provider and builds the current target. Kept deliberately: adding a second job
+   * would race the departing one for the same jobId (and lose, which is how the
+   * new generation was silently lost before).
+   *
    * Also cancels any pending delayed WORKSPACE_DELETE_EMBEDDINGS job (scheduled
    * when AI Search was disabled) so it cannot wipe the embeddings we are about
    * to rebuild. The job no-ops if embeddings are unconfigured.
@@ -156,7 +169,10 @@ export class AiSettingsService {
       seeded = true;
     }
 
-    const jobId = `ai-reindex-${workspaceId}`;
+    // Shared with the AI-Search enable toggle and the automatic
+    // fingerprint-change reindex: same jobId (dedupe) + same retry policy (#599).
+    const jobOptions = workspaceReindexJobOptions(workspaceId);
+    const jobId = jobOptions.jobId;
     // Clear a prior non-active entry so a stale job can't block this reindex.
     // A locked/active job is left in place (remove() no-ops) and the add() below
     // de-duplicates against it, keeping the in-progress pass.
@@ -166,11 +182,7 @@ export class AiSettingsService {
       await this.aiQueue.add(
         QueueJob.WORKSPACE_CREATE_EMBEDDINGS,
         { workspaceId },
-        {
-          jobId,
-          removeOnComplete: true,
-          removeOnFail: true,
-        },
+        jobOptions,
       );
     } catch (err) {
       // If the enqueue fails (Redis hiccup/shutdown) the worker never runs, so
@@ -339,6 +351,21 @@ export class AiSettingsService {
     // (non-empty text, content-borne text, or already-stored embeddings), so
     // empty/text-less pages don't keep the "Indexed N of M pages" bar below 100%
     // forever.
+    // #599 (R8a) — the steady-state numerator counts the pages of the ACTIVE
+    // generation, not "any row of any generation". countIndexedPages() is
+    // generation-blind, so during a swap window (a model change being reindexed)
+    // the target generation's fresh rows counted toward it and the panel happily
+    // showed "Indexed 478 of 478" — a green, complete-looking bar — while the search
+    // API was correctly reporting `semantic.state: 'stale'` for the very same
+    // workspace, because the pointer had not flipped and the vector arm was serving
+    // (or refusing to serve) the OLD generation. Two contradictory truths in one UI.
+    // Counting the active fingerprint makes the panel agree with search: the bar
+    // climbs only when the generation that is actually SERVED grows.
+    //
+    // A workspace whose pointer was never flipped (legacy rows / a fresh instance
+    // that has not completed a run) has no active fingerprint: there is no generation
+    // to scope to, so we keep the generation-blind count — the pre-#599 behavior and
+    // the only meaningful number available there.
     const progress = await this.reindexProgress.get(workspaceId);
     let indexedPages: number;
     let totalPages: number;
@@ -346,8 +373,15 @@ export class AiSettingsService {
       indexedPages = progress.done;
       totalPages = progress.total;
     } else {
+      const { activeFingerprint } =
+        await this.workspaceRepo.getEmbeddingGeneration(workspaceId);
       [indexedPages, totalPages] = await Promise.all([
-        this.pageEmbeddingRepo.countIndexedPages(workspaceId),
+        activeFingerprint
+          ? this.pageEmbeddingRepo.countPagesByFingerprint(
+              workspaceId,
+              activeFingerprint,
+            )
+          : this.pageEmbeddingRepo.countIndexedPages(workspaceId),
         this.pageRepo.countEmbeddablePages(workspaceId),
       ]);
     }

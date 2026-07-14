@@ -5,6 +5,7 @@ import type { GConstructor, DocmostClientContext } from "./context.js";
 import FormData from "form-data";
 import axios, { AxiosInstance } from "axios";
 import { basename, extname } from "path";
+import * as mime from "mime-types";
 import {
   updatePageContentRealtime,
   replacePageContent,
@@ -48,6 +49,40 @@ const MIME_TO_EXT: Record<string, string> = {
   "image/svg+xml": ".svg",
 };
 
+// The MIME types that render as an INLINE image node in the Docmost editor.
+// Anything else uploaded via uploadFile becomes a generic `attachment` block
+// (a download card). Defined explicitly (not derived from MIME_TO_EXT) so the
+// image-vs-attachment decision is a stable, auditable allowlist independent of
+// the extension<->mime maps above (issue #608).
+const RENDERABLE_IMAGE_MIMES = new Set<string>([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/svg+xml",
+]);
+
+// Default upload byte ceiling for uploadFile (issue #608). The /mcp POST body is
+// bounded by the server's global Fastify `HTTP_JSON_BODY_LIMIT` (default 25 MiB,
+// main.ts) and base64 inflates the payload ~1.333×, so the effective on-disk file
+// ceiling is ≈ HTTP_JSON_BODY_LIMIT × 0.74 ≈ 18 MiB. Overridable (but never
+// disable-able) via MCP_MAX_UPLOAD_BYTES — see resolveMaxUploadBytes.
+const DEFAULT_MAX_UPLOAD_BYTES = 18 * 1024 * 1024;
+
+/**
+ * Resolve the uploadFile byte ceiling from the environment, falling back to the
+ * shared default. Parsed exactly like resolveCommentSignalDebounceMs
+ * (index.ts): a non-finite / non-positive value keeps the default, so a bad env
+ * var can never DISABLE the size limit (there is no "unlimited" setting). Read
+ * fresh on each call so a test/rollback can change it without reloading.
+ */
+function resolveMaxUploadBytes(): number {
+  const parsed = parseInt(process.env.MCP_MAX_UPLOAD_BYTES ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_MAX_UPLOAD_BYTES;
+}
+
 // Public method surface of MediaMixin (issue #450) — a NAMED type so the factory
 // return type is expressible in the emitted .d.ts (the anonymous mixin class
 // carries the base's protected shared state, which would otherwise trip TS4094).
@@ -56,6 +91,28 @@ export interface IMediaMixin {
   uploadImage(pageId: string, url: string): any;
   insertImage(pageId: string, url: string, opts?: { align?: "left" | "center" | "right"; alt?: string; replaceText?: string; afterText?: string; }): any;
   replaceImage(pageId: string, oldAttachmentId: string, url: string, opts?: { align?: "left" | "center" | "right"; alt?: string }): any;
+  uploadFile(pageId: string, content: string, fileName: string, opts?: {
+    mime?: string;
+    insert?: boolean;
+    as?: "image" | "file";
+    align?: "left" | "center" | "right";
+    alt?: string;
+    position?: "before" | "after" | "append";
+    anchorText?: string;
+    anchorNodeId?: string;
+  }): Promise<{
+    uploaded: true;
+    attachmentId: string;
+    fileName: string;
+    fileSize: number;
+    mime: string;
+    src: string;
+    node: any;
+    inserted: boolean;
+    placement?: "before" | "after" | "append";
+    verify?: any;
+    insertError?: string;
+  }>;
   fetchAttachmentBytes(src: string): Promise<{ buffer: Buffer; mime: string }>;
 }
 
@@ -205,6 +262,219 @@ export function MediaMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     };
     if (alt) node.attrs.alt = alt;
     return node;
+  }
+
+  /**
+   * Upload an arbitrary file from caller-supplied base64 BYTES as a page
+   * attachment (any type), returning the attachment metadata plus a
+   * ready-to-insert ProseMirror node; optionally insert that node into the page
+   * in one step. This is the byte-fed counterpart to uploadImage/insertImage
+   * (which only accept an http(s) URL the SERVER must fetch): here the caller
+   * ships the bytes, so no public URL is required and non-image types are
+   * supported. MCP-only (issue #608).
+   *
+   * Ordering is load-bearing (orphan avoidance + validate-before-upload):
+   *  - pageId is resolved to its canonical UUID FIRST — a slugId sent to
+   *    /files/upload lands raw in the DB `uuid` column, the DB error is
+   *    swallowed, and the file is already on disk = an orphan. Resolving first
+   *    also catches a non-existent page before anything is uploaded.
+   *  - insert-anchor options and the base64 payload are fully validated BEFORE
+   *    the multipart POST, so a bad request never leaves an unreferenced file.
+   */
+  async uploadFile(
+    pageId: string,
+    content: string,
+    fileName: string,
+    opts: {
+      mime?: string;
+      insert?: boolean;
+      as?: "image" | "file";
+      align?: "left" | "center" | "right";
+      alt?: string;
+      position?: "before" | "after" | "append";
+      anchorText?: string;
+      anchorNodeId?: string;
+    } = {},
+  ) {
+    // STEP 1: auth.
+    await this.ensureAuthenticated();
+
+    // STEP 2: resolve pageId -> canonical UUID BEFORE upload. Use the UUID for
+    // BOTH the upload and the insert. A slugId in /files/upload -> raw slug in
+    // the uuid column -> swallowed DB error -> orphan file on disk (#260/#608).
+    const pageUuid = await this.resolvePageId(pageId);
+
+    // STEP 3: validate insert-anchor options BEFORE upload. before/after require
+    // EXACTLY ONE of anchorText / anchorNodeId (insertNode enforces the same, but
+    // checking here means a bad anchor request never leaves an orphan file).
+    const insert = opts.insert ?? false;
+    const position = opts.position ?? "append";
+    if (insert && (position === "before" || position === "after")) {
+      const hasText =
+        typeof opts.anchorText === "string" && opts.anchorText.length > 0;
+      const hasId =
+        typeof opts.anchorNodeId === "string" && opts.anchorNodeId.length > 0;
+      if (hasText === hasId) {
+        throw new Error(
+          `uploadFile: position "${position}" requires exactly one of anchorText or anchorNodeId`,
+        );
+      }
+    }
+
+    // STEP 4: normalize + validate the base64 payload.
+    // 4a. Strip a `data:<mediatype>;base64,` prefix ONLY when it fully matches
+    //     (and capture the embedded mime hint from the bare media type). A valid
+    //     data URI may carry media-type PARAMETERS before `;base64` (e.g.
+    //     `data:text/plain;charset=utf-8;base64,...`), so allow zero or more
+    //     `;param` segments and take only the media type (before the first `;`)
+    //     as the hint. If a `data:` URI is present but NOT base64-encoded, reject
+    //     it: otherwise its non-base64 tail would decode silently to garbage bytes.
+    let payload = content;
+    let dataUriMimeHint: string | null = null;
+    const dataUriMatch = /^data:([^;,]*)(?:;[^;,]*)*;base64,/.exec(content);
+    if (dataUriMatch) {
+      dataUriMimeHint = dataUriMatch[1] ? dataUriMatch[1].trim() : null;
+      payload = content.slice(dataUriMatch[0].length);
+    } else if (/^data:/.test(content)) {
+      throw new Error(
+        "uploadFile: `content` is a data: URI that is not base64-encoded; " +
+          "expected data:<mime>;base64,<base64> or a bare base64 string",
+      );
+    }
+    // 4b. Strip ALL whitespace BEFORE the charset check so line-wrapped base64
+    //     (valid) is accepted.
+    const clean = payload.replace(/\s/g, "");
+    // 4c. Validate the base64 charset AND 4-byte alignment. Node's decoder
+    //     silently TRUNCATES a misaligned / non-base64 string to garbage, so
+    //     both guards are required.
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) {
+      throw new Error(
+        "uploadFile: `content` is not valid base64 (unexpected characters)",
+      );
+    }
+    if (clean.length % 4 !== 0) {
+      throw new Error(
+        "uploadFile: `content` is not valid base64 (length is not a multiple of 4)",
+      );
+    }
+    const buffer = Buffer.from(clean, "base64");
+    if (buffer.length === 0) {
+      throw new Error("uploadFile: `content` is empty (no bytes to upload)");
+    }
+
+    // STEP 5: enforce the size ceiling BEFORE calling the server. The /mcp POST
+    // body is bounded by the server's HTTP_JSON_BODY_LIMIT and base64 inflates
+    // the payload ~1.333×, so name that knob and the math in the error.
+    const MAX = resolveMaxUploadBytes();
+    if (buffer.length > MAX) {
+      throw new Error(
+        `uploadFile: file is ${buffer.length} bytes, over the ${MAX}-byte limit. ` +
+          `The /mcp POST body is bounded by the server's HTTP_JSON_BODY_LIMIT ` +
+          `(default 25 MiB); base64 inflates the payload ~1.333×, so the ` +
+          `effective file ceiling is ≈ HTTP_JSON_BODY_LIMIT × 0.74 (~18 MiB).`,
+      );
+    }
+
+    // STEP 6: sanitize the file name: non-empty after trim, and basename only
+    // (strip any path separators the caller may have included).
+    const trimmedName = fileName.trim();
+    if (!trimmedName) {
+      throw new Error("uploadFile: `fileName` must be a non-empty string");
+    }
+    let finalFileName = basename(trimmedName);
+
+    // STEP 7: resolve the effective MIME. The SERVER derives the served
+    // Content-Type from the file-name EXTENSION (getMimeType = mime.contentType
+    // (extname), file.helper.ts), IGNORING the multipart contentType — so the
+    // extension is what actually matters. Mirror uploadImage's canonical-ext
+    // append: if a desired mime has a canonical extension the name lacks, append
+    // it, so the server serves the intended type. Effective mime is then derived
+    // FROM the (possibly extended) name for exact parity with the server, with
+    // the desired mime and octet-stream as fallbacks.
+    const desiredMime = opts.mime || dataUriMimeHint || null;
+    if (desiredMime) {
+      const canonicalExt = mime.extension(desiredMime); // e.g. "pdf" (no dot)
+      if (canonicalExt) {
+        const dotted = "." + canonicalExt;
+        if (extname(finalFileName).toLowerCase() !== dotted) {
+          finalFileName += dotted;
+        }
+      }
+    }
+    const mimeFromExt = mime.contentType(extname(finalFileName)); // string|false
+    const effMime = mimeFromExt || desiredMime || "application/octet-stream";
+
+    // STEP 8: upload the bytes. uploadAttachmentBuffer reuses uploadImage's
+    // fresh-FormData + one-shot 401/403 re-auth handling.
+    const att = await this.uploadAttachmentBuffer(
+      pageUuid,
+      buffer,
+      finalFileName,
+      effMime,
+    );
+
+    // STEP 9: build src + node from the SERVER-RETURNED file name (never the raw
+    // input: a `/` in the name would break the /files/:fileId/:fileName route ->
+    // 404). Image mimes render inline; everything else becomes an attachment card.
+    const src = `/api/files/${att.id}/${att.fileName}`;
+    const nodeKind =
+      opts.as ?? (RENDERABLE_IMAGE_MIMES.has(effMime) ? "image" : "file");
+    const node: any =
+      nodeKind === "image"
+        ? this.buildImageNode(
+            { id: att.id, fileName: att.fileName, fileSize: att.fileSize },
+            opts.align,
+            opts.alt,
+          )
+        : {
+            type: "attachment",
+            attrs: {
+              url: src,
+              name: att.fileName,
+              mime: effMime,
+              size: att.fileSize ?? null,
+              attachmentId: att.id,
+            },
+          };
+
+    const base = {
+      uploaded: true as const,
+      attachmentId: att.id,
+      fileName: att.fileName,
+      fileSize: att.fileSize,
+      mime: effMime,
+      src,
+      node,
+    };
+
+    // STEP 10: upload-only — return the node for the caller to insert later.
+    if (!insert) {
+      return { ...base, inserted: false };
+    }
+
+    // STEP 11: insert the node in the SAME call. Never lose the upload: if the
+    // insert throws (e.g. anchor not found), report inserted:false + insertError
+    // while still returning the attachment id / src / node. insertNode returns
+    // `position` (not `placement`) — map it.
+    try {
+      const r = await this.insertNode(
+        pageUuid,
+        { node },
+        {
+          position,
+          anchorText: opts.anchorText,
+          anchorNodeId: opts.anchorNodeId,
+        },
+      );
+      return {
+        ...base,
+        inserted: true,
+        placement: (r?.position ?? position) as "before" | "after" | "append",
+        verify: r?.verify,
+      };
+    } catch (e: any) {
+      return { ...base, inserted: false, insertError: e?.message ?? String(e) };
+    }
   }
 
   /**

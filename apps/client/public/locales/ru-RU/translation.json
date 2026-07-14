@@ -1468,6 +1468,8 @@
   "This role is no longer in the catalog": "Эта роль больше не представлена в каталоге",
   "This language is no longer available in the catalog": "Этот язык больше не доступен в каталоге",
   "Connecting… (read-only)": "Подключение… (только чтение)",
+  "You're offline — showing the last copy saved on this device. Editing is disabled until the connection is restored.": "Нет соединения — показана последняя копия, сохранённая на этом устройстве. Редактирование недоступно, пока соединение не восстановится.",
+  "Still syncing with the server — please wait for the connection and try again.": "Идёт синхронизация с сервером — дождитесь подключения и повторите попытку.",
   "Apply": "Применить",
   "Applied": "Применено",
   "Suggestion applied": "Предложение применено",
@@ -1509,5 +1511,5 @@
   "Previous month": "Предыдущий месяц",
   "Next month": "Следующий месяц",
   "No revisions found for that day": "Нет ревизий за этот день",
-  "{{date}}: {{count}} versions": "{{date}}: версий — {{count}}"
+  "{{date}}: {{count}} revisions": "{{date}}: {{count}} правок"
 }

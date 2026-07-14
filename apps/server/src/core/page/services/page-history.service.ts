@@ -73,12 +73,12 @@ export class PageHistoryService {
   }
 
   /**
-   * #568 — "revisions per day" aggregate for the page-history mini-calendar
-   * heatmap. Reads only the cheap timeline projection (no `content`) — the same
-   * source as computeWorkTime — and tallies VERSION rows (manual/agent) into the
-   * viewer's calendar days, reusing the shared tz core. Whole history in one
-   * request (no `month` param) so month navigation is purely client-side and the
-   * counts always match the "Only versions" list.
+   * #568/#605 — "all revisions per day" aggregate for the page-history
+   * mini-calendar heatmap. Reads only the cheap timeline projection (no
+   * `content`) — the same source as computeWorkTime — and tallies ALL revisions
+   * (any kind) into the viewer's calendar days, reusing the shared tz core, so
+   * the heatmap reflects total day activity. Whole history in one request (no
+   * `month` param) so month navigation is purely client-side.
    *
    * `tz` is the viewer's IANA zone; an unknown zone makes the Intl-backed core
    * throw a RangeError, which the controller maps to a 400 (like /history/time).

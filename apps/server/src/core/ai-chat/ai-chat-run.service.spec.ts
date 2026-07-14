@@ -770,4 +770,163 @@ describe('#487 AiChatRunService.supersede (CAS)', () => {
     });
     expect(svc.hasZombie('run-1')).toBe(false);
   });
+
+  it('S5 micro-race: a periodic reconcile re-drives the zombie between awaitSettled and settleZombie -> supersede reports the freed slot as READY, NOT a false SUPERSEDE_TIMEOUT', async () => {
+    // The scenario (self-healing today; this guard removes the transient false
+    // timeout): finalizeRun gives up -> a zombie is recorded and the settle
+    // notifier resolves terminalWriteFailed:true. supersede's awaitSettled reads
+    // that (terminalWriteFailed:true) and moves to settleZombie. In the tiny
+    // window BEFORE settleZombie runs, the periodic zombie reconcile WINS the
+    // re-drive: it applies the intended status (row now TERMINAL) and clears the
+    // zombie. So supersede's settleZombie finds no zombie -> returns false, yet
+    // the slot is genuinely FREE. The guard re-reads the row and returns `ready`.
+    let rowTerminal = false;
+    const repo = makeRepo({
+      // getRun / rowIsTerminal read the row: it flips to TERMINAL the moment the
+      // reconcile wins (below), mirroring the conditional finalize the reconcile
+      // applied.
+      findById: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: rowTerminal ? 'aborted' : 'running',
+        error: null,
+      })),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+      // The finalize keeps failing on THIS replica -> the run gives up (zombie).
+      finalizeIfActive: jest.fn(async () => {
+        throw new Error('db down for this replica');
+      }),
+    });
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+
+    // The terminal write gives up -> zombie (row still 'running' on this replica).
+    await svc.finalizeRun('run-1', ws, 'aborted');
+    expect(svc.hasZombie('run-1')).toBe(true);
+
+    // Inject the concurrent reconcile at the exact race seam: when supersede
+    // reaches settleZombie, the reconcile has ALREADY settled the row terminal
+    // and cleared the zombie, so this call finds nothing to do (returns false).
+    const settleSpy = jest
+      .spyOn(svc, 'settleZombie')
+      .mockImplementation(async (id: string) => {
+        rowTerminal = true; // the reconcile's conditional UPDATE landed
+        expect(svc.hasZombie(id)).toBe(true);
+        const internal = svc as unknown as { zombies: Map<string, unknown> };
+        internal.zombies.delete(id);
+        return false; // zombie gone -> settleZombie's own contract returns false
+      });
+
+    // Without the guard this would be { kind: 'timeout' } (a FALSE timeout).
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'ready',
+    });
+    expect(settleSpy).toHaveBeenCalledWith('run-1');
+  });
+
+  it('S5 fail-safe (row NOT terminal): terminalWriteFailed + settleZombie fails AND the re-read row is still non-terminal -> a REAL SUPERSEDE_TIMEOUT (the give-up branch of the S5 guard)', async () => {
+    // Mirror of the S5 micro-race, but on the GIVE-UP side (documented case 1): the
+    // DB stays down for THIS replica, so finalizeRun gives up AND our OWN
+    // settleZombie re-drive also throws -> returns false, and the row is never
+    // flipped terminal. The S5 guard must NOT launder that into `ready`: it
+    // re-reads the row (still 'running' -> non-terminal) and reports a genuine
+    // timeout. This locks the fail-safe so a stuck 'running' row is never reported
+    // as `ready` (which the caller would surface as the wrong RunAlreadyActiveError
+    // instead of a clean SUPERSEDE_TIMEOUT). Reverting the S5 guard, or mutating
+    // rowIsTerminal to `return true`, reds this.
+    const repo = makeRepo({
+      // The row is stranded non-terminal for the whole call: getRun (target
+      // validation) and the S5 rowIsTerminal re-read both see 'running'.
+      findById: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+        error: null,
+      })),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+      // Finalize keeps failing on this replica -> finalizeRun gives up (zombie) AND
+      // the real settleZombie re-drive also throws -> returns false.
+      finalizeIfActive: jest.fn(async () => {
+        throw new Error('db down for this replica');
+      }),
+    });
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+
+    // The terminal write gives up -> zombie (row still 'running' on this replica).
+    await svc.finalizeRun('run-1', ws, 'aborted');
+    expect(svc.hasZombie('run-1')).toBe(true);
+
+    // settleZombie returns false (its own re-drive threw) AND rowIsTerminal reads
+    // 'running' (non-terminal) -> the guard's fail-safe fires -> timeout.
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'timeout',
+    });
+    // Nothing settled the row, so the zombie is still held for a later re-drive.
+    expect(svc.hasZombie('run-1')).toBe(true);
+  });
+
+  it('S5 fail-safe (rowIsTerminal read-error): terminalWriteFailed + settleZombie fails AND the row re-read THROWS -> timeout (the guard swallows the read error conservatively)', async () => {
+    // Same give-up setup, but now the S5 re-read itself hits a DB read error.
+    // rowIsTerminal swallows it and returns false (the outcome is UNCONFIRMED), so
+    // the guard must fall through to a conservative timeout rather than a false
+    // `ready`. Mutating rowIsTerminal to `return true` reds this too.
+    let findByIdCalls = 0;
+    const repo = makeRepo({
+      // The FIRST read (supersede's getRun target validation) succeeds; the SECOND
+      // read (the S5 rowIsTerminal re-read) throws a DB read error.
+      findById: jest.fn(async () => {
+        findByIdCalls += 1;
+        if (findByIdCalls >= 2) {
+          throw new Error('db read error on the S5 re-read');
+        }
+        return {
+          id: 'run-1',
+          chatId: chat,
+          workspaceId: ws,
+          status: 'running',
+          error: null,
+        };
+      }),
+      findActiveByChat: jest.fn(async () => ({
+        id: 'run-1',
+        chatId: chat,
+        workspaceId: ws,
+        status: 'running',
+      })),
+      finalizeIfActive: jest.fn(async () => {
+        throw new Error('db down for this replica');
+      }),
+    });
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const svc = new AiChatRunService(repo as never, makeEnv() as never);
+    await svc.beginRun({ chatId: chat, workspaceId: ws, userId: 'u1' });
+
+    // The terminal write gives up -> zombie (row still 'running' on this replica).
+    await svc.finalizeRun('run-1', ws, 'aborted');
+    expect(svc.hasZombie('run-1')).toBe(true);
+
+    // settleZombie returns false and the rowIsTerminal re-read THROWS ->
+    // rowIsTerminal swallows the error -> false -> a conservative timeout.
+    expect(await svc.supersede(chat, 'run-1', ws, 10_000)).toEqual({
+      kind: 'timeout',
+    });
+  });
 });

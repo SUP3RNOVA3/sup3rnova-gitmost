@@ -32,6 +32,36 @@ import {
 const doc = (node: any) => ({ type: 'doc', content: [node] });
 const para = (content: any[]) => ({ type: 'paragraph', content });
 
+/**
+ * CORPUS GUARDRAIL — an inline `code` run inside a FOOTNOTE BODY may not contain
+ * `[` or `]`.
+ *
+ * A footnote body is serialized INLINE as `^[…]`, and the importer's tokenizer
+ * finds the closing `]` by counting brackets — it is blind to code spans. So the
+ * serializer must escape a stray bracket in the body (`balanceBrackets`), or the
+ * footnote does not parse at all. But a code span's content is LITERAL on import
+ * (marked never decodes escapes inside backticks), so the `\` of that escape
+ * survives into the text: `` `a [ 0` `` comes back as `` `a \[ 0` ``. The run's
+ * TEXT silently mutates on every git-sync cycle.
+ *
+ * This is a PRE-EXISTING converter bug, NOT a #515 regression: the serializer on
+ * `gitea/develop` produces the identical corrupted `` `a \[ 0` `` for a doc whose
+ * code run carries NO other mark (a shape that has always been expressible). It
+ * is pinned as a documented `it.fails` repro in markdown-converter-gaps.test.ts
+ * ("footnote body + inline code + bracket"); fixing it means changing the
+ * footnote canon (the bracket cannot simply be left raw — that breaks the
+ * footnote parse outright), which is out of scope here.
+ *
+ * The corpus previously dodged this only by luck of the seed. Excluding the shape
+ * keeps the generative properties honest about the SUPPORTED space instead of
+ * flaking on a known, separately-tracked gap.
+ */
+const withoutBracketsInCodeRuns = (n: any): any => {
+  if (n?.type !== 'text') return n;
+  if (!(n.marks || []).some((m: any) => m.type === 'code')) return n;
+  return { ...n, text: String(n.text ?? '').replace(/[[\]]/g, '(') };
+};
+
 /** A named flat-document generator. */
 export interface NamedGen {
   name: string;
@@ -222,7 +252,13 @@ const gen = {
           para([...refText, { type: 'footnoteReference', attrs: { id } }]),
           {
             type: 'footnotesList',
-            content: [{ type: 'footnoteDefinition', attrs: { id }, content: [para(noteBody)] }],
+            content: [
+              {
+                type: 'footnoteDefinition',
+                attrs: { id },
+                content: [para(noteBody.map(withoutBracketsInCodeRuns))],
+              },
+            ],
           },
         ],
       }),

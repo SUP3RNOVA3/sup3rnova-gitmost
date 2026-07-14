@@ -24,6 +24,7 @@ import {
   usePageBreadcrumbsQuery,
 } from "@/features/page/queries/page-query.ts";
 import { extractPageSlugId } from "@/lib";
+import { useCachedPageMeta } from "@/features/page/atoms/page-meta-cache-atom";
 import { useMediaQuery } from "@mantine/hooks";
 import { useTranslation } from "react-i18next";
 
@@ -66,10 +67,27 @@ export default function Breadcrumb() {
     SpaceTreeNode[] | null
   >(null);
   const { pageSlug, spaceSlug } = useParams();
+  const pageSlugId = extractPageSlugId(pageSlug);
   const { data: currentPage } = usePageMetaQuery({
-    pageId: extractPageSlugId(pageSlug),
+    pageId: pageSlugId,
   });
-  const currentPageId = currentPage?.id;
+  // #563 — local-first phase 1: on a reload the page query has not resolved yet,
+  // so fall back to the synchronously-read boot cache to learn the page id. That
+  // is all the breadcrumb needs to derive its chain from the (equally
+  // boot-cached) sidebar tree, so the crumbs paint with the rest of the chrome
+  // instead of after the round-trip. The live query wins as soon as it lands.
+  const cachedMeta = useCachedPageMeta(pageSlugId);
+  // `placeholderData: keepPreviousData` means `currentPage` can still hold the
+  // PREVIOUS page while we navigate into this one, so it only counts as live data
+  // for THIS page when its identifiers match the URL (same guard as page.tsx).
+  // Otherwise the cached entry — which IS this page's — drives the crumbs.
+  const livePage =
+    currentPage &&
+    (currentPage.slugId === pageSlugId || currentPage.id === pageSlugId)
+      ? currentPage
+      : undefined;
+  const currentPageMeta = livePage ?? cachedMeta;
+  const currentPageId = currentPageMeta?.id;
   // The page's own ancestor chain, fetched independently of the lazily-built
   // sidebar tree so a deep page doesn't render a blank breadcrumb for seconds
   // while the tree backfills (#218).
@@ -95,7 +113,7 @@ export default function Breadcrumb() {
   const treePath = useAtomValue(treePathAtom);
 
   useEffect(() => {
-    if (!currentPage) return;
+    if (!currentPageMeta) return;
 
     // Selection/mapping + stale-clearing live in a pure, unit-tested helper
     // (#218). The tree-hit chain (treePath) always wins when present; otherwise
@@ -107,11 +125,11 @@ export default function Breadcrumb() {
       computeBreadcrumbState(
         null,
         ancestors as IPage[] | undefined,
-        currentPage.id,
+        currentPageMeta.id,
         previous,
       ),
     );
-  }, [currentPage?.id, treePath, ancestors]);
+  }, [currentPageMeta?.id, treePath, ancestors]);
 
   const HiddenNodesTooltipContent = () =>
     breadcrumbNodes?.slice(1, -1).map((node) => (

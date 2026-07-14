@@ -7,12 +7,18 @@ import PageHeader from "@/features/page/components/header/page-header.tsx";
 import { extractPageSlugId } from "@/lib";
 import { useGetSpaceBySlugQuery } from "@/features/space/queries/space-query.ts";
 import { useTranslation } from "react-i18next";
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { EmptyState } from "@/components/ui/empty-state.tsx";
 import { IconAlertTriangle, IconFileOff } from "@tabler/icons-react";
 import { Button, Skeleton } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { ErrorBoundary } from "react-error-boundary";
+import {
+  derivePageChromeCanEdit,
+  useCachedPageMeta,
+} from "@/features/page/atoms/page-meta-cache-atom";
+import { reportClientMetric } from "@/lib/telemetry/vitals";
+import { isLocalFirstEnabled } from "@/lib/config";
 const MemoizedFullEditor = React.memo(FullEditor);
 const MemoizedPageHeader = React.memo(PageHeader);
 const MemoizedHistoryModal = React.memo(HistoryModal);
@@ -43,25 +49,86 @@ export default function Page() {
 
 function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
   const { t } = useTranslation();
+  const pageSlugId = extractPageSlugId(pageSlug);
 
   const {
     data: page,
     isLoading,
     isError,
     error,
-  } = usePageQuery({ pageId: extractPageSlugId(pageSlug) });
+  } = usePageQuery({ pageId: pageSlugId });
   const { data: space } = useGetSpaceBySlugQuery(page?.space?.slug);
 
-  const canEdit = !page?.deletedAt && (page?.permissions?.canEdit ?? false);
+  // #563 — local-first phase 1. The boot cache is read SYNCHRONOUSLY (jotai
+  // atomWithStorage + getOnInit), so the chrome below no longer waits for THIS
+  // page's `/pages/info` round-trip: it renders from the cached metadata the
+  // moment this component mounts.
+  //
+  // What that does NOT (yet) mean: a paint on the very first frame of a reload.
+  // UserProvider still returns nothing until `/me` resolves (user-provider.tsx —
+  // `if (isLoading) return <></>`) and it wraps ALL authenticated routing, so the
+  // app shell — this page included — is still gated on that ONE request. Phase 1
+  // removes the SECOND, sequential round-trip (`/pages/info`, which today only
+  // starts after `/me`), not the first. A true first-frame paint additionally
+  // needs the `/me` gate lifted (a persisted current-user), which is out of
+  // scope here.
+  //
+  // Precedence: the LIVE query always wins — the cached entry only fills the gap
+  // until it resolves. Reconciliation is automatic: usePageQuery force-refetches
+  // on every mount and writes the fresh page back through to the cache, so a
+  // rename/icon/permission change lands as soon as the response arrives (and
+  // re-renders the chrome).
+  const cachedMeta = useCachedPageMeta(pageSlugId);
+  // `placeholderData: keepPreviousData` means `page` can still hold the PREVIOUS
+  // page while we navigate into this one, so it only counts as live data for THIS
+  // page when its identifiers match the URL. Otherwise the cached entry (which is
+  // this page's) drives the chrome.
+  const livePage =
+    page && (page.slugId === pageSlugId || page.id === pageSlugId)
+      ? page
+      : undefined;
+  const chromeMeta = livePage ?? cachedMeta;
+
+  // FAIL-CLOSED edit rights. `canEdit` is derived from the LIVE page only —
+  // never from the cache. A permission DOWNGRADE (editor -> viewer) keeps the
+  // page readable, so it produces no 403/404 and nothing evicts the cached entry;
+  // trusting a cached `canEdit:true` would therefore offer Share / Save version /
+  // Move / Delete / the edit toggle to a user the server has already demoted,
+  // until `/pages/info` lands. The chrome (title, icon, breadcrumbs) still paints
+  // instantly from the cache; only the edit affordances wait for the network.
+  const canEdit = derivePageChromeCanEdit(livePage);
+  // The BODY still renders whatever the query holds (previous page included, as
+  // today), so its edit rights must come from THAT page — never from the chrome's
+  // possibly-different metadata.
+  const canEditBody = derivePageChromeCanEdit(page);
   const canComment =
-    canEdit ||
+    canEditBody ||
     (space?.settings?.comments?.allowViewerComments === true);
 
-  if (isLoading) {
-    return <PageSkeleton />;
-  }
+  // Boot-cache hit/miss counter — once per visited page. Telemetry is a no-op
+  // unless the operator enabled it AND the session is sampled. Reported ONLY
+  // when the local-first flag is on: with the flag off the cache is never read,
+  // so every visit would trivially count as a miss and drown the flag-ON hit
+  // rate — and the flag-OFF `page_open_ms` baseline this feature is measured
+  // against would be polluted by counters that describe nothing.
+  const countedSlugId = useRef<string | null>(null);
+  useEffect(() => {
+    if (!isLocalFirstEnabled()) return;
+    if (!pageSlugId || countedSlugId.current === pageSlugId) return;
+    countedSlugId.current = pageSlugId;
+    // Deliberately NOT keyed on `cachedMeta`: the counter records what the cache
+    // held when this page was opened, not what the network later wrote back.
+    reportClientMetric(cachedMeta ? "page_meta_hit" : "page_meta_miss", 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageSlugId]);
 
-  if (isError || !page) {
+  // The network ALWAYS wins over the cache: a deleted page / revoked access
+  // (403/404) renders not-found, never the stale cached chrome. The cached entry
+  // itself is dropped by the global query-cache subscriber
+  // (installPageMetaEviction), so the next visit is a clean miss — no flash of
+  // stale chrome. Same second condition as before: a settled query with no data
+  // and no error (e.g. a missing slug) still shows the error state.
+  if (isError || (!isLoading && !page)) {
     if ([401, 403, 404].includes(error?.["status"])) {
       return (
         <EmptyState
@@ -86,34 +153,44 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
     );
   }
 
-  if (!space) {
+  // Cache MISS (first visit to this page in this browser, flag off, corrupt
+  // cache, or an unresolved user) → today's behavior, unchanged.
+  if (!chromeMeta) {
     return <PageSkeleton />;
   }
 
   return (
-    page && (
-      <div>
-        <Helmet>
-          <title>{`${page?.icon || ""}  ${page?.title || t("Untitled")}`}</title>
-        </Helmet>
+    <div>
+      <Helmet>
+        <title>{`${chromeMeta.icon || ""}  ${chromeMeta.title || t("Untitled")}`}</title>
+      </Helmet>
 
-        <MemoizedPageHeader readOnly={!canEdit} />
+      <MemoizedPageHeader readOnly={!canEdit} />
 
-        <MemoizedFullEditor
-          key={page.id}
-          pageId={page.id}
-          title={page.title}
-          content={page.content}
-          slugId={page.slugId}
-          spaceSlug={page?.space?.slug}
-          editable={canEdit}
-          creator={page.creator}
-          contributors={page.contributors}
-          canComment={canComment}
-        />
-        <MemoizedHistoryModal pageId={page.id} />
-      </div>
-    )
+      {/* BODY — unchanged network swap (making it instant is phase 2, #564): the
+          editor needs the full page (content) and the space settings, so until
+          both resolve it keeps showing today's skeleton. Only the chrome above
+          escaped the network gate. */}
+      {page && space ? (
+        <>
+          <MemoizedFullEditor
+            key={page.id}
+            pageId={page.id}
+            title={page.title}
+            content={page.content}
+            slugId={page.slugId}
+            spaceSlug={page?.space?.slug}
+            editable={canEditBody}
+            creator={page.creator}
+            contributors={page.contributors}
+            canComment={canComment}
+          />
+          <MemoizedHistoryModal pageId={page.id} />
+        </>
+      ) : (
+        <PageSkeleton />
+      )}
+    </div>
   );
 }
 

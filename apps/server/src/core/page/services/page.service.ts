@@ -55,7 +55,7 @@ import {
 import { canonicalizeFootnotes } from '@docmost/editor-ext';
 import {
   markdownToProseMirror,
-  normalizeForeignMarkdown,
+  normalizeAgentMarkdown,
 } from '@docmost/prosemirror-markdown';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
@@ -1356,8 +1356,21 @@ export class PageService {
         // no editor-ext markdown layer. Foreign markdown surfaces the strict
         // parser rejects (GFM `[^id]` reference footnotes) are normalized to the
         // canonical inline form first.
+        //
+        // #555 (review of #514): use `normalizeAgentMarkdown`, NOT
+        // `normalizeForeignMarkdown`. This is the REST content-write path
+        // (createPage / updatePageContent — a user or client PUTting a full body
+        // or a fragment), which must be SYMMETRIC with the MCP agent-write path
+        // (`markdownToProseMirrorCanonical` -> `normalizeAgentMarkdown`): a leading
+        // `---…---` in a full-body write is (almost) always a `horizontalRule` the
+        // serializer emitted, so stripping it as YAML front-matter would silently
+        // delete the page's leading content. The front-matter strip stays a
+        // FILE-import concern (`normalizeForeignMarkdown` in import.service.ts /
+        // file-import-task.service.ts), where a `.md` really can open with an
+        // Obsidian/Hugo header. Both normalizers still rewrite GFM `[^id]`
+        // reference footnotes to the canonical inline form.
         prosemirrorJson = await markdownToProseMirror(
-          normalizeForeignMarkdown(content as string),
+          normalizeAgentMarkdown(content as string),
         );
         break;
       }

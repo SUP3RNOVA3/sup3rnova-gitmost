@@ -33,6 +33,7 @@ function buildService() {
     tokenService as any,
     {} as any, // transclusionService (unused)
     workspaceRepo as any,
+    {} as any, // pageHistoryRepo (unused on this path)
   );
 }
 

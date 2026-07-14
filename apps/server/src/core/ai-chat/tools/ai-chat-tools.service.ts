@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { User } from '@docmost/db/types/entity.types';
 import { TokenService } from '../../auth/services/token.service';
 import { AiService } from '../../../integrations/ai/ai.service';
+import { EmbeddingGenerationService } from '../../../integrations/ai/embedding-generation.service';
 import { AiEmbeddingNotConfiguredException } from '../../../integrations/ai/ai-embedding-not-configured.exception';
 import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
@@ -156,12 +157,12 @@ function __assertClientCallContract(client: DocmostClientLike): void {
  * Each tool call goes loopback over the user's own access JWT, so Docmost CASL
  * enforces access on every request — there is NO extra authorization here
  * (§8.5). The client is built fresh per chat request and never shares the
- * cached service-account `/mcp` handler.
+ * cached embedded `/mcp` handler.
  *
  * SINGLE-WORKSPACE ASSUMPTION: the loopback host (127.0.0.1) does not resolve a
  * workspace subdomain, so this targets the default/first workspace only. The
- * existing service-account `/mcp` path already calls loopback successfully, so
- * this works for single-workspace self-host.
+ * embedded `/mcp` loopback path already calls loopback successfully, so this
+ * works for single-workspace self-host.
  */
 /**
  * #487: wall-clock cap for a SINGLE in-app tool call, env-tunable via
@@ -473,6 +474,10 @@ export class AiChatToolsService {
     private readonly pagePermissionRepo: PagePermissionRepo,
     // Shared singleton in-RAM blob store backing the stash tool.
     private readonly sandboxStore: SandboxStore,
+    // #599: resolves the ACTIVE embedding generation, so the RAG read stays in
+    // lockstep with SearchService's vector arm (both serve the active fingerprint,
+    // never a half-built target one).
+    private readonly embeddingGeneration: EmbeddingGenerationService,
   ) {}
 
   /**
@@ -718,25 +723,43 @@ export class AiChatToolsService {
           // still leaves enough results.
           const candidates = Math.min(Math.max(cap * 5, 50), 200);
 
-          // 1) Embed the query via the SAME AiService.embedQuery the search
-          //    subsystem uses (#571). embedQuery resolves the active provider,
-          //    applies its QUERY prefix (so the query lives in the same prefixed
-          //    space as the indexer's passage-prefixed docs of THIS generation),
-          //    and returns the active `fingerprint` — which we thread into
-          //    hybridSearch so the vector arm only fuses against current-
-          //    generation rows (never stale cross-provider vectors). Unconfigured
-          //    embeddings (or any embedding error) routes to the REST full-text
-          //    fallback instead of erroring; a successful embed always yields a
-          //    matching fingerprint, so the read can never filter against the
-          //    wrong generation.
+          // 1) Embed the query through the SAME funnel the search subsystem uses
+          //    (#571, #599): it resolves the active provider, applies its QUERY
+          //    prefix (so the query lives in the same prefixed space as the
+          //    indexer's passage-prefixed docs), and returns the fingerprint of the
+          //    ACTIVE generation — which we thread into hybridSearch so the vector
+          //    CTE only fuses against the generation that is actually being served
+          //    (never stale cross-provider vectors, and never the half-built TARGET
+          //    generation of an in-flight reindex: during a swap the active pointer
+          //    still names the OLD generation, so RAG keeps full recall exactly like
+          //    search does). Unconfigured embeddings (or any embedding error) routes
+          //    to the REST full-text fallback instead of erroring.
           let queryVector: number[];
           let fingerprint: string;
           try {
-            const embedded = await this.aiService.embedQuery(
-              workspaceId,
-              trimmed,
-            );
+            const embedded =
+              await this.embeddingGeneration.embedQueryForActiveGeneration(
+                workspaceId,
+                trimmed,
+              );
             if (!embedded?.vector) return await fallback();
+            // #599 (D2): the served generation was produced by a DIFFERENT model
+            // than the one that just embedded this query. Their vectors live in two
+            // independently trained spaces, so a cosine between them is noise and the
+            // RRF fusion would rank arbitrary pages above genuine lexical hits. Fall
+            // back to the REST full-text search (lexical only) until the reindex of
+            // the new model completes and the pointer flips — exactly what
+            // SearchService does with its vector arm.
+            if (embedded.generation.modelChanged) {
+              this.logger.warn(
+                `searchPages: embedding model changed (active=${
+                  embedded.generation.activeModel ?? 'unknown'
+                } config=${embedded.generation.targetModel}); the served generation is ` +
+                  `not comparable with the new model — falling back to full-text search ` +
+                  `until the reindex completes.`,
+              );
+              return await fallback();
+            }
             queryVector = embedded.vector;
             fingerprint = embedded.fingerprint;
           } catch (err) {

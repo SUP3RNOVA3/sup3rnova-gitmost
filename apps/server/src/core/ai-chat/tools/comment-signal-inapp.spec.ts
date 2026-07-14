@@ -310,6 +310,9 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
       {} as never,
       {} as never,
       { asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }) } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   }
 

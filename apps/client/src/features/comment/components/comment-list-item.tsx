@@ -20,6 +20,7 @@ import { IComment } from "@/features/comment/types/comment.types";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useTranslation } from "react-i18next";
+import { useBodyWriteBlocked } from "@/features/editor/hooks/use-body-write-blocked";
 
 interface CommentListItemProps {
   comment: IComment;
@@ -58,6 +59,11 @@ function CommentListItem({
   const resolveCommentMutation = useResolveCommentMutation();
   const [currentUser] = useAtom(currentUserAtom);
   const createdAtAgo = useTimeAgo(comment.createdAt);
+  // #564 — both handlers below pair a server mutation with an in-document mark
+  // update (unsetComment / setCommentResolved). In the local-first read-only
+  // window that mark update is dropped by the body write guard, so the pair must
+  // refuse as a whole rather than commit the server half alone.
+  const { refuseIfBlocked } = useBodyWriteBlocked();
 
   // `canEdit`/`pageId` are threaded through for wiring parity with the container;
   // the thread row does not itself gate on them (Apply lives on AgentEditCard).
@@ -89,6 +95,7 @@ function CommentListItem({
   }
 
   async function handleDeleteComment() {
+    if (refuseIfBlocked()) return;
     try {
       await deleteCommentMutation.mutateAsync(comment.id);
       editor?.commands.unsetComment(comment.id);
@@ -98,6 +105,7 @@ function CommentListItem({
   }
 
   async function handleResolveComment() {
+    if (refuseIfBlocked()) return;
     try {
       const isResolved = comment.resolvedAt != null;
       await resolveCommentMutation.mutateAsync({
@@ -165,7 +173,13 @@ function CommentListItem({
                       <Text size="xs" c="dimmed" fw={400} aria-hidden>
                         ·
                       </Text>
-                      <Text size="xs" c="dimmed" fw={400} lineClamp={1} lh={1.2}>
+                      <Text
+                        size="xs"
+                        c="dimmed"
+                        fw={400}
+                        lineClamp={1}
+                        lh={1.2}
+                      >
                         {comment.launcher.name}
                       </Text>
                     </>

@@ -16,16 +16,28 @@ describe('countRevisionsByDay (#568 heatmap aggregate)', () => {
     expect(countRevisionsByDay([], 'UTC')).toEqual([]);
   });
 
-  it('counts only VERSION rows (manual/agent); ignores autosnapshots', () => {
+  it('counts ALL rows regardless of kind (#605 — total day activity)', () => {
     const rows: TimelineSample[] = [
       row('2026-07-04T10:00:00Z', 'manual'),
       row('2026-07-04T11:00:00Z', 'agent'),
-      row('2026-07-04T12:00:00Z', 'idle'), // ignored
-      row('2026-07-04T13:00:00Z', 'boundary'), // ignored
-      row('2026-07-04T14:00:00Z', null), // legacy autosave, ignored
+      row('2026-07-04T12:00:00Z', 'idle'),
+      row('2026-07-04T13:00:00Z', 'boundary'),
+      row('2026-07-04T14:00:00Z', null), // legacy autosave
+    ];
+    // All five now count — versions AND autosnapshots (idle/boundary/null).
+    expect(countRevisionsByDay(rows, 'UTC')).toEqual([
+      { dayISO: '2026-07-04', count: 5 },
+    ]);
+  });
+
+  it('non-version rows (null/idle/boundary) on their own still count (#605)', () => {
+    const rows: TimelineSample[] = [
+      row('2026-07-04T10:00:00Z', 'idle'),
+      row('2026-07-04T11:00:00Z', 'boundary'),
+      row('2026-07-04T12:00:00Z', null),
     ];
     expect(countRevisionsByDay(rows, 'UTC')).toEqual([
-      { dayISO: '2026-07-04', count: 2 },
+      { dayISO: '2026-07-04', count: 3 },
     ]);
   });
 

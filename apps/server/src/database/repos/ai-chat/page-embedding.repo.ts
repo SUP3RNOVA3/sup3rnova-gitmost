@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { RawBuilder, sql } from 'kysely';
 import * as pgvector from 'pgvector';
@@ -63,24 +63,168 @@ export interface PageEmbeddingHybridHit {
 
 @Injectable()
 export class PageEmbeddingRepo {
+  private readonly logger = new Logger(PageEmbeddingRepo.name);
+
   constructor(@InjectKysely() private readonly db: KyselyDB) {}
 
   /**
-   * HARD-delete every embedding row for a page (within its workspace). Used
-   * before a reindex and on page deletion — a hard delete (not soft) guarantees
-   * the HNSW index never returns vectors for content that no longer exists.
+   * HARD-delete embedding rows for a page (within its workspace). Used before a
+   * reindex and on page deletion — a hard delete (not soft) guarantees search
+   * never returns vectors for content that no longer exists.
+   *
+   * #599 `fingerprints` — FINGERPRINT-SCOPED delete. When omitted (the default)
+   * EVERY row of the page is deleted, which is what the PURGE paths want (page
+   * deleted / emptied / trashed: the page must vanish from every generation).
+   *
+   * The REPLACE path (indexer delete+insert of the same page) passes the single
+   * generation it is rewriting — the TARGET fingerprint — whenever a swap is in
+   * flight (active != target). Without that scope, editing a page mid-reindex
+   * would delete its ACTIVE-generation rows too and, because the new rows carry
+   * the TARGET fingerprint (which search does not serve until the flip), the page
+   * would silently drop out of semantic search for the whole reindex window
+   * (#599 acceptance 3). Scoping the delete to the target keeps the page's
+   * active-generation rows intact and served until the pointer flips.
+   *
+   * NOTE the SQL `IN` semantics: rows with a NULL fingerprint (legacy) never match
+   * a scoped delete — they are a separate generation and are reclaimed by the
+   * generational GC (`deleteOtherGenerations`), not here.
    */
   async deleteByPage(
     pageId: string,
     workspaceId: string,
     trx?: KyselyTransaction,
+    fingerprints?: string[],
   ): Promise<void> {
     const db = dbOrTx(this.db, trx);
-    await db
+    let query = db
       .deleteFrom('pageEmbeddings')
       .where('pageId', '=', pageId)
+      .where('workspaceId', '=', workspaceId);
+    if (fingerprints && fingerprints.length > 0) {
+      query = query.where('fingerprint', 'in', fingerprints);
+    }
+    await query.execute();
+  }
+
+  /**
+   * #599 GENERATIONAL GC: hard-delete every embedding row of this workspace whose
+   * fingerprint is NOT one of `keep` — including legacy NULL-fingerprint rows,
+   * which are simply a very old generation (nothing serves them: both the search
+   * vector arm and the RAG hybrid CTE filter `fingerprint = $active`, and NULL
+   * never equals anything).
+   *
+   * Both call sites go through EmbeddingGenerationService.gcGenerations (which
+   * adds the logging + coverage-cache invalidation): the indexer calls it at the
+   * START of a reindex run with keep = [active, target] (so at most 2 generations
+   * survive: the one still being served and the one being built), and
+   * EmbeddingGenerationService.completeRun calls it again right AFTER a successful
+   * pointer flip with keep = [target] (which reclaims the superseded generation).
+   *
+   * IDEMPOTENT — it is a set-difference delete, so re-running it (an aborted run
+   * that is retried) is a no-op once the extra generations are gone. Running it at
+   * the START is what makes a retried run clean: a PARTIAL target generation from
+   * an aborted run whose config has since moved on is no longer active nor target,
+   * so it is reclaimed here instead of lingering forever.
+   *
+   * STORAGE / LATENCY TRADE-OFF (deliberate): between the start of a reindex and
+   * the post-flip GC, the workspace holds ~2x the pgvector rows (active + target
+   * generations). That is the price of a NON-DESTRUCTIVE swap — the old generation
+   * must stay readable while the new one is built, or search would lose all
+   * semantic recall for the whole reindex window. It costs both disk and LATENCY:
+   * the vector column carries no ANN index, so `<=>` is a brute-force seq scan and
+   * the scan must skip the other generation's (and any not-yet-vacuumed dead) rows.
+   * The GC caps this at 2 generations rather than letting every model change pile
+   * up another one; the post-flip GC brings it back down to 1.
+   *
+   * FAIL-CLOSED on an empty `keep` (#599 review F3). Both call sites derive `keep`
+   * from a RESOLVED provider fingerprint (a sha256 hex string), so an empty set is
+   * unreachable today — but this method is a bulk DELETE, and the cost of the two
+   * possible defensive branches is wildly asymmetric:
+   *
+   *   - fail-OPEN (drop the fingerprint predicate): the statement degenerates to
+   *     `DELETE FROM page_embeddings WHERE workspace_id = $1` — it WIPES the
+   *     workspace's entire vector index, including the generation that is being
+   *     served. Semantic search goes to zero recall until someone notices and runs
+   *     a full reindex. That is the exact "keep nothing" reading of an EMPTY array,
+   *     but an empty array here can only ever mean "the caller lost its fingerprints",
+   *     never "the admin asked to purge everything" (that is deleteByWorkspace).
+   *   - fail-CLOSED (this): delete nothing, log, return 0. The worst case is some
+   *     superseded rows linger until the next run's GC reclaims them — wasted disk,
+   *     no data loss.
+   *
+   * So an empty `keep` is treated as a caller bug, not as a purge order.
+   *
+   * Returns the number of rows deleted (0 when nothing to reclaim).
+   */
+  async deleteOtherGenerations(
+    workspaceId: string,
+    keep: string[],
+    trx?: KyselyTransaction,
+  ): Promise<number> {
+    const db = dbOrTx(this.db, trx);
+    const kept = keep.filter((fp) => typeof fp === 'string' && fp.length > 0);
+
+    // Nothing to keep => refuse. Without this the query below would carry no
+    // predicate but the workspace id and delete EVERY embedding row of the
+    // workspace (see the fail-closed rationale above).
+    if (kept.length === 0) {
+      this.logger.error(
+        `deleteOtherGenerations: refusing to GC workspace ${workspaceId} with an ` +
+          `EMPTY keep set — that would delete every embedding row of the workspace, ` +
+          `including the generation currently serving search. This is a caller bug ` +
+          `(a run always keeps at least its target fingerprint); nothing was deleted.`,
+      );
+      return 0;
+    }
+
+    const result = await db
+      .deleteFrom('pageEmbeddings')
       .where('workspaceId', '=', workspaceId)
-      .execute();
+      .where((eb) =>
+        eb.or([
+          // `fingerprint NOT IN (...)` evaluates to NULL (not true) for a NULL
+          // fingerprint, so legacy rows need this explicit arm to be GC'd.
+          eb('fingerprint', 'is', null),
+          eb('fingerprint', 'not in', kept),
+        ]),
+      )
+      .executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
+  }
+
+  /**
+   * #599 — count DISTINCT non-deleted pages holding at least one row of ONE
+   * generation. This is the coverage NUMERATOR: how many pages the ACTIVE
+   * fingerprint actually serves (`indexed`). Mirrors the vector arm's filters
+   * (workspace + fingerprint, trashed pages excluded) so the number reflects what
+   * search can really retrieve.
+   *
+   * `changedSince` (#599 review F2) narrows the count to pages TOUCHED since a
+   * given instant — i.e. how many of the pages the completed run's coverage
+   * measurement no longer describes are nonetheless already covered by the active
+   * generation (the event-driven indexer embedded them). computeCoverage subtracts
+   * this from the numerator to split the corpus into the run's OLD bucket and the
+   * CHANGED bucket; see the rule there.
+   */
+  async countPagesByFingerprint(
+    workspaceId: string,
+    fingerprint: string,
+    changedSince?: Date,
+  ): Promise<number> {
+    let query = this.db
+      .selectFrom('pageEmbeddings as pe')
+      .innerJoin('pages as p', 'p.id', 'pe.pageId')
+      .where('pe.workspaceId', '=', workspaceId)
+      .where('pe.fingerprint', '=', fingerprint)
+      .where('p.deletedAt', 'is', null)
+      .where('pe.deletedAt', 'is', null);
+    if (changedSince) {
+      query = query.where('p.updatedAt', '>', changedSince);
+    }
+    const row = await query
+      .select((eb) => eb.fn.count('pe.pageId').distinct().as('count'))
+      .executeTakeFirst();
+    return Number(row?.count ?? 0);
   }
 
   /**
