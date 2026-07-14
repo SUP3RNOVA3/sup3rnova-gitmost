@@ -37,9 +37,10 @@ function timed(fn) {
   return { out, ms: performance.now() - s };
 }
 
-// A 300-para (~600-node) pair: comfortably over the 150-node default, yet small
-// enough that the un-guarded recreateTransform still FINISHES (~1-3s) so the
-// test can time the contrast without hanging.
+// A 300-para (~600-node) pair: comfortably over BOTH defaults (#582: 200 nodes /
+// 4 KiB), yet
+// small enough that the un-guarded precise path still FINISHES (~1s) so the test
+// can time the contrast without hanging.
 const OLD = buildDoc(300, "a");
 const NEW = buildDoc(300, "b");
 
@@ -68,7 +69,8 @@ test("guard skips recreateTransform over-cap (guarded run is far faster than un-
     "with caps raised, the precise recreateTransform path runs",
   );
 
-  // The precise run executed recreateTransform (O(n²)); the guarded run did not.
+  // The precise run executed recreateTransform (cost ~ changedBlocks x docBytes);
+  // the guarded run did not.
   // Require a large speedup so the ONLY explanation is the skipped transform.
   assert.ok(
     guarded.ms * 5 < unguarded.ms,

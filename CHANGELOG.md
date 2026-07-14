@@ -379,6 +379,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The MCP/agent verify diff now uses the fixed in-app diff algorithm, and its
+  DoS size guard was tightened to actually hold its ~200ms budget (byte cap
+  `12 KiB` → `4 KiB`).** `diffDocs` (the precise diff behind every agent edit's
+  verify report) switched from the published
+  `@fellow/prosemirror-recreate-transform` to the same `recreateTransform` the
+  editor's history diff uses (`@docmost/editor-ext`, fixed in `#581`): 1.5-5x
+  faster on every measured shape, and MCP can no longer disagree with the UI about
+  what changed. Re-benchmarking the pre-flight guard from `#464` against the new
+  algorithm (`packages/mcp/scripts/diff-size-guard-bench.mjs`) showed the **byte
+  cap was never holding the budget it advertised**: the byte-heavy worst case (text
+  rewritten wholesale) costs its time inside `ChangeSet.addSteps` — which re-diffs
+  the replaced range token by token and which `#581` did *not* touch (at 6 KB:
+  `recreateTransform` 17ms vs `addSteps` 194ms) — so the old 12 KiB cap was
+  **admitting 300-660ms event-loop blocks** (seconds before `#581`) while the docs
+  claimed ~200ms. The byte cap therefore drops to **4 KiB**, the largest value under
+  which every admitted shape stays inside ~200ms (worst admitted: 156ms; the
+  adversarial short-token shape, which costs ~40-60% more per byte, peaks at 136ms).
+  **This is a DoS fix, and it SHRINKS the precise-diff envelope**: byte-heavy pages
+  that used to get precise change ranges now degrade to the coarse block-level diff.
+  Operators who accept the block in exchange for precise diffs on such docs can opt
+  back in with `MCP_DIFF_MAX_BYTES=6144` (~200-235ms) or `=12288` (~400-660ms, the
+  previous behaviour). The node cap rises `150` → `200`, but note it is *subsumed*
+  by the byte cap at the default setting (~55 B of JSON per text block means only
+  ~68 blocks fit in 4 KiB) and only becomes live if `MCP_DIFF_MAX_BYTES` is raised;
+  `MCP_DIFF_MAX_NODES` remains an env override. Fully-rewritten documents may now
+  report a single whole-document change instead of a per-block list; the counts are
+  unchanged.
+
 - **Every AI-chat turn is now a first-class server-side run, and one run per chat
   is enforced in both modes.** The run machinery from `#184` was universalized: a
   turn is tracked in `ai_chat_runs` and gated by the single-active-run-per-chat

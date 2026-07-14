@@ -1,13 +1,25 @@
-// Issue #464 — prod CPU-DoS pre-flight size guard for diffDocs.
+// Issue #464 — prod CPU-DoS pre-flight size guard for diffDocs; recalibrated in
+// #582 for the fixed editor-ext recreateTransform (defaults: 200 nodes / 4 KiB).
 //
-// diffDocs synchronously calls recreateTransform (rfc6902) which is O(n·m) in
-// node count and O(w²) in per-run word count; on a large/heavily-changed doc it
-// pins the event loop for seconds-to-hours WITHOUT throwing. A pre-flight size
-// guard routes any doc over MCP_DIFF_MAX_NODES / MCP_DIFF_MAX_BYTES straight to
-// the coarse fallback (`fellBack:true`), so the sync block stays ~<200ms.
+// diffDocs synchronously runs recreateTransform + ChangeSet.addSteps; on a large,
+// heavily-changed doc that pins the event loop for seconds WITHOUT throwing. A
+// pre-flight size guard routes any doc over MCP_DIFF_MAX_NODES /
+// MCP_DIFF_MAX_BYTES straight to the coarse fallback (`fellBack:true`).
 //
-// These tests assert the BEHAVIOR of the guard (fast + coarse-mode + asymmetry +
-// env knobs). A sibling test (diff-guard-skips-recreate.test.mjs) proves
+// THE BUDGET CLAIM, STATED HONESTLY. The caps exist so that every ADMITTED pair
+// completes inside a ~200ms synchronous block. That is a claim about the docs the
+// guard LETS THROUGH, and #582 found it was false: the previous 12 KiB byte cap
+// admitted byte-heavy pairs costing 300-660ms, because the dominant cost sits in
+// ChangeSet.addSteps (which #581 did not touch), not in recreateTransform. The byte
+// cap is now 4 KiB, the largest value under which the worst admitted shape measured
+// inside the budget. The tests below therefore pin BOTH sides of the cap:
+//   - "the worst ADMISSIBLE byte-heavy pair stays inside the budget" (the dangerous
+//     zone: under the byte cap but expensive), and
+//   - "a pair just over the byte cap falls back" (deterministically, in ~1ms).
+// The budget test is non-vacuous: restoring the old 12 KiB cap makes it FAIL.
+//
+// These tests assert the BEHAVIOR of the guard (budget + fast + coarse-mode +
+// asymmetry + env knobs). A sibling test (diff-guard-skips-recreate.test.mjs) proves
 // recreateTransform is skipped over the cap via a behavioral proxy (guarded run
 // is orders of magnitude faster than the same pair with the caps raised).
 import { test } from "node:test";
@@ -47,7 +59,7 @@ function clearEnv() {
 // ---------------------------------------------------------------------------
 test("over-threshold doc falls back to coarse mode and returns fast", () => {
   clearEnv();
-  // 600 paragraphs -> ~1200 nodes, far over the 150-node default.
+  // 600 paragraphs -> ~1200 nodes, far over the 200-node default.
   const oldDoc = buildDoc(600, 8, "a");
   const newDoc = buildDoc(600, 8, "b");
 
@@ -118,7 +130,7 @@ test("asymmetric pair (tiny old, huge new) falls back to coarse", () => {
 test("node-light but byte-heavy doc falls back on the byte cap", () => {
   clearEnv();
   // 5 paragraphs (~11 nodes, well under the node cap) but each a very long run,
-  // pushing the serialized size far over the 12 KiB byte default.
+  // pushing the serialized size far over the 4 KiB byte default.
   const bigRun = (seed) =>
     doc(
       Array.from({ length: 5 }, (_, i) =>
@@ -139,8 +151,8 @@ test("node-light but byte-heavy doc falls back on the byte cap", () => {
     v(d);
     return n;
   };
-  assert.ok(nodeCount(oldDoc) < 150, "node count is under the node cap");
-  assert.ok(JSON.stringify(oldDoc).length > 12 * 1024, "serialized size is over the byte cap");
+  assert.ok(nodeCount(oldDoc) < 200, "node count is under the node cap");
+  assert.ok(JSON.stringify(oldDoc).length > 4 * 1024, "serialized size is over the byte cap");
 
   const r = diffDocs(oldDoc, newDoc);
   assert.match(r.markdown, /coarse block-level diff/, "byte cap must trip independently");
@@ -226,4 +238,268 @@ test("integrity counts are still correct on a guard-tripped (coarse) doc", () =>
   const r = diffDocs(oldDoc, newDoc);
   assert.match(r.markdown, /coarse block-level diff/, "large pair fell back");
   assert.deepEqual(r.integrity.images, [1, 0], "integrity is computed regardless of fallback");
+});
+
+// ---------------------------------------------------------------------------
+// #582 NODE CAP (150 -> 200) — and the honest statement of what it buys.
+//
+// Under the DEFAULT byte cap (4 KiB) the node cap is SUBSUMED: it can never trip.
+// A text block costs ~55 B of JSON, so only ~68 of them (~137 nodes) fit under
+// 4 KiB; even the cheapest possible node (an EMPTY paragraph, ~21 B) only gets
+// ~190 nodes in. The byte cap always refuses first. So the 150 -> 200 raise admits
+// nothing new for prose — the node cap survives purely as defence-in-depth, and it
+// becomes live only when an operator RAISES MCP_DIFF_MAX_BYTES.
+//
+// These two tests pin exactly that, rather than the (false) claim that bigger pages
+// now get precise diffs:
+//   1. subsumption — a 201-node doc cannot be built under the byte cap at all;
+//   2. the node cap still works in the regime where it IS reachable (byte cap
+//      raised), including the 150 -> 200 window.
+// ---------------------------------------------------------------------------
+function nodeCount(d) {
+  let n = 0;
+  const v = (x) => {
+    if (!x || typeof x !== "object") return;
+    n++;
+    if (Array.isArray(x.content)) for (const c of x.content) v(c);
+  };
+  v(d);
+  return n;
+}
+
+test("the node cap is subsumed by the byte cap at the default settings", () => {
+  clearEnv();
+  // The CHEAPEST node there is: an empty paragraph (~21 B of JSON, no text child).
+  // Even 200 of them do not fit under the 4 KiB byte cap, so no document can ever
+  // reach the 200-node cap while staying byte-admissible.
+  const emptyParas = (n) => doc(Array.from({ length: n }, () => ({ type: "paragraph" })));
+  const atNodeCap = emptyParas(200); // 201 nodes counting the doc node
+  assert.ok(nodeCount(atNodeCap) > 200, "this doc is at/over the node cap");
+  assert.ok(
+    JSON.stringify(atNodeCap).length > 4 * 1024,
+    "…yet it is ALREADY over the byte cap — the byte cap refuses it first, so the " +
+      "node cap cannot be the thing that trips at default settings",
+  );
+
+  // And the realistic shape is far more byte-hungry: ~68 text blocks exhaust 4 KiB.
+  const textBlocks = buildDoc(75, 1, "a"); // 151 nodes, over the OLD 150-node cap
+  assert.ok(nodeCount(textBlocks) > 150, "over the old 150-node cap");
+  assert.ok(
+    JSON.stringify(textBlocks).length > 4 * 1024,
+    "a doc in the 150→200 node window is already over the byte cap, so the raise " +
+      "admits no prose that the old cap refused",
+  );
+});
+
+test("the node cap still guards when the byte cap is raised (150→200 window)", () => {
+  clearEnv();
+  // Isolate the node axis: raise the byte knob so ONLY the node count can trip.
+  process.env.MCP_DIFF_MAX_BYTES = "1000000";
+  try {
+    // 90 paragraphs -> 181 nodes: over the OLD 150-node cap, under the NEW 200.
+    const oldDoc = buildDoc(90, 6, "a");
+    const newDoc = JSON.parse(JSON.stringify(oldDoc));
+    // A realistic agent edit: one word changed in two separate blocks.
+    newDoc.content[10].content[0].text += " sentinelalpha";
+    newDoc.content[70].content[0].text += " sentinelbeta";
+
+    const nodes = Math.max(nodeCount(oldDoc), nodeCount(newDoc));
+    assert.ok(nodes > 150, `pair must exceed the OLD 150-node cap (was ${nodes})`);
+    assert.ok(nodes <= 200, `pair must be within the NEW 200-node cap (was ${nodes})`);
+
+    // Control: with the OLD node cap restored, this SAME pair falls back — proof
+    // that the 150→200 raise (not some unrelated change) is what admits it.
+    process.env.MCP_DIFF_MAX_NODES = "150";
+    assert.match(
+      diffDocs(oldDoc, newDoc).markdown,
+      /coarse block-level diff/,
+      "under the OLD 150-node cap this pair fell back",
+    );
+    delete process.env.MCP_DIFF_MAX_NODES;
+
+    const r = diffDocs(oldDoc, newDoc);
+    assert.doesNotMatch(
+      r.markdown,
+      /coarse block-level diff/,
+      "under the NEW 200-node cap the same pair takes the precise path",
+    );
+    // PRECISE: the change ranges are the two inserted words, not the whole blocks.
+    const inserts = r.changes.filter((c) => c.op === "insert");
+    assert.equal(inserts.length, 2, "exactly the two edited spots are reported");
+    for (const ins of inserts) {
+      assert.match(ins.text, /sentinel(alpha|beta)/, "insert is the edited word");
+      assert.ok(
+        ins.text.length < 20,
+        `precise range, not a whole-block coarse chunk (got ${ins.text.length} chars)`,
+      );
+    }
+    assert.equal(r.summary.deleted, 0, "nothing was deleted");
+
+    // Past the node cap it still degrades, even with bytes unlimited.
+    const bigOld = buildDoc(110, 4, "a"); // 221 nodes
+    const bigNew = JSON.parse(JSON.stringify(bigOld));
+    bigNew.content[5].content[0].text += " sentinelalpha";
+    assert.ok(Math.max(nodeCount(bigOld), nodeCount(bigNew)) > 200, "over the node cap");
+    assert.match(
+      diffDocs(bigOld, bigNew).markdown,
+      /coarse block-level diff/,
+      "past the node cap the pair degrades to coarse",
+    );
+  } finally {
+    clearEnv();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #582 THE DANGEROUS ZONE — a doc UNDER the byte cap can still be EXPENSIVE, and
+// that is the only thing the byte cap is for. Nothing used to test it, which is how
+// the 12 KiB cap shipped while admitting 300-660ms blocks under a "~200ms" comment.
+//
+// The adversarial worst case is text REWRITTEN wholesale with the SHORTEST possible
+// unique tokens: ChangeSet.addSteps re-diffs the replaced range token by token, so
+// at a fixed byte budget more tokens = more work (~40-60% worse than prose-length
+// words). This is agent/user-authored content, so the attacker picks the density.
+//
+// NON-VACUITY: the second pair below sits just over the byte cap, so the guard
+// refuses it in ~1ms. Restore the old cap (MCP_DIFF_MAX_BYTES=12288) and it is
+// ADMITTED instead, costs 400-660ms, and this test FAILS. That is precisely the
+// regression the tightened cap removes.
+// ---------------------------------------------------------------------------
+
+/** One paragraph packed with the shortest unique tokens, up to `budget` JSON bytes. */
+function densePara(seed, budget) {
+  let s = "";
+  let w = 0;
+  for (;;) {
+    const next = `${seed}${(w).toString(36)} `;
+    if (JSON.stringify(doc([para(s + next)])).length > budget) break;
+    s += next;
+    w++;
+  }
+  return doc([para(s)]);
+}
+
+/** Best-of-3, to shed GC/JIT noise the way the calibration bench does. */
+function bestOf3(fn) {
+  let best = Infinity;
+  let out;
+  for (let i = 0; i < 3; i++) {
+    const s = performance.now();
+    out = fn();
+    best = Math.min(best, performance.now() - s);
+  }
+  return { out, ms: best };
+}
+
+// The stated budget is ~200ms. Assert against a deliberately generous ceiling so a
+// loaded CI box cannot flake: the worst ADMITTED shape measures ~136-186ms, while
+// anything the old 12 KiB cap admitted costs >=400ms — the ceiling sits between.
+const BUDGET_CEILING_MS = 300;
+
+test("the worst ADMISSIBLE byte-heavy pair stays inside the budget", () => {
+  clearEnv();
+  // Just UNDER the 4 KiB byte cap, every token rewritten: the most expensive pair
+  // the guard actually lets through.
+  const oldDoc = densePara("a", 4 * 1024);
+  const newDoc = densePara("b", 4 * 1024);
+
+  // Non-vacuity #1: it really is ADMITTED (this is the dangerous zone, not a
+  // fallback in disguise), and really is byte-bound rather than node-bound.
+  const bytes = Math.max(
+    JSON.stringify(oldDoc).length,
+    JSON.stringify(newDoc).length,
+  );
+  assert.ok(bytes > 3 * 1024, `pair must sit near the byte cap (was ${bytes}B)`);
+  assert.ok(bytes <= 4 * 1024, `pair must be UNDER the byte cap (was ${bytes}B)`);
+  assert.ok(nodeCount(oldDoc) < 200, "only 3 nodes: the node cap is not in play");
+
+  const { out, ms } = bestOf3(() => diffDocs(oldDoc, newDoc));
+  assert.doesNotMatch(
+    out.markdown,
+    /coarse block-level diff/,
+    "this pair is ADMITTED — the precise pipeline really did run",
+  );
+  assert.ok(out.summary.inserted > 0 && out.summary.deleted > 0, "it really diffed");
+  assert.ok(
+    ms < BUDGET_CEILING_MS,
+    `worst admissible byte-heavy pair must hold the ~200ms budget, took ${ms.toFixed(0)}ms`,
+  );
+});
+
+test("a byte-heavy pair just OVER the cap falls back (and the old 12 KiB cap did not)", () => {
+  clearEnv();
+  // The shape the OLD 12 KiB cap admitted — and blocked the event loop for ~400-660ms.
+  const oldDoc = densePara("a", 12 * 1024);
+  const newDoc = densePara("b", 12 * 1024);
+  const bytes = Math.max(
+    JSON.stringify(oldDoc).length,
+    JSON.stringify(newDoc).length,
+  );
+  assert.ok(bytes > 4 * 1024, `pair must exceed the NEW byte cap (was ${bytes}B)`);
+  assert.ok(bytes <= 12 * 1024, `…while fitting the OLD 12 KiB cap (was ${bytes}B)`);
+  assert.ok(nodeCount(oldDoc) < 200, "only 3 nodes: ONLY the byte cap can trip here");
+
+  const { out, ms } = bestOf3(() => diffDocs(oldDoc, newDoc));
+  assert.match(
+    out.markdown,
+    /coarse block-level diff/,
+    "over the byte cap -> coarse fallback",
+  );
+  // This is the assertion that FAILS if MCP_DIFF_MAX_BYTES is restored to 12288:
+  // the pair would then be admitted and cost >=400ms instead of ~1ms.
+  assert.ok(
+    ms < BUDGET_CEILING_MS,
+    `the guarded path must hold the budget, took ${ms.toFixed(0)}ms`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The pathology that DRIVES the byte cap (#582): a SINGLE large text node rewritten
+// wholesale is expensive in ChangeSet.addSteps (not in recreateTransform) — which is
+// why the byte cap had to come DOWN to 4 KiB rather than up. Far past the cap the
+// pair must fall back — deterministically and fast.
+// ---------------------------------------------------------------------------
+test("a single huge rewritten text node (byte-axis worst case) falls back fast", () => {
+  clearEnv();
+  const bigText = (seed) => {
+    let s = "";
+    let w = 0;
+    while (s.length < 40_000) s += `${seed}${w++} `;
+    return doc([para(s.slice(0, 40_000))]);
+  };
+  const oldDoc = bigText("a");
+  const newDoc = bigText("b");
+  assert.ok(nodeCount(oldDoc) < 200, "3 nodes: only the byte cap can trip here");
+
+  const start = performance.now();
+  const r = diffDocs(oldDoc, newDoc);
+  const elapsed = performance.now() - start;
+
+  assert.match(r.markdown, /coarse block-level diff/, "byte cap catches it");
+  assert.ok(
+    elapsed < 200,
+    `the guarded path must stay inside the budget, took ${elapsed.toFixed(0)}ms`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The other side of the byte axis: a big text node with a SMALL edit is cheap
+// (recreateTransform emits one tiny step), but the guard is a pre-flight on SIZE
+// and refuses it anyway. Pinned so the trade-off is explicit and any future
+// change to it is a deliberate test edit, not an accident.
+// ---------------------------------------------------------------------------
+test("byte cap refuses a big-but-lightly-edited doc (documented trade-off)", () => {
+  clearEnv();
+  let s = "";
+  let w = 0;
+  while (s.length < 20_000) s += `word${w++} `;
+  const oldDoc = doc([para(s)]);
+  const newDoc = doc([para(s.replace("word5 ", "word5 sentinelalpha "))]);
+
+  const r = diffDocs(oldDoc, newDoc);
+  assert.match(
+    r.markdown,
+    /coarse block-level diff/,
+    "over the byte cap -> coarse, even though this particular edit is cheap",
+  );
 });
