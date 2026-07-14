@@ -489,6 +489,9 @@ importers:
       eslint-plugin-react-refresh:
         specifier: 0.5.2
         version: 0.5.2(eslint@9.28.0(jiti@2.4.2))
+      fast-check:
+        specifier: ^4.8.0
+        version: 4.8.0
       globals:
         specifier: 15.13.0
         version: 15.13.0
@@ -1073,6 +1076,9 @@ importers:
       marked:
         specifier: ^17.0.1
         version: 17.0.5
+      mime-types:
+        specifier: ^3.0.2
+        version: 3.0.2
       pako:
         specifier: ^2.0.3
         version: 2.0.3
@@ -1095,6 +1101,9 @@ importers:
       '@types/form-data':
         specifier: ^2.5.0
         version: 2.5.2
+      '@types/mime-types':
+        specifier: ^3.0.1
+        version: 3.0.1
       '@types/node':
         specifier: ^20.0.0
         version: 20.19.43
