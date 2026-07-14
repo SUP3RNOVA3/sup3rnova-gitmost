@@ -27,6 +27,7 @@ import {
   incConnectTimeout,
   incGetPageCacheHit,
   incGetPageCacheMiss,
+  addMcpDownloadBytes,
 } from '../metrics/metrics.registry';
 
 // Minimal shape of the embedded MCP HTTP handler exported by @docmost/mcp/http.
@@ -69,6 +70,41 @@ const esmImport = new Function(
   'specifier',
   'return import(specifier)',
 ) as (specifier: string) => Promise<unknown>;
+
+/**
+ * Route ONE dependency-neutral metric sample emitted by the @docmost/mcp package
+ * onto this app's prom-client registry (#402, #479, #613).
+ *
+ * This is the ONLY place the package's generic (name, value, labels) names are
+ * mapped to instruments, and it is a CLOSED mapping: a name with no branch here
+ * is DISCARDED and never reaches /metrics. So every new sample the package emits
+ * MUST get a branch here (that omission is exactly what this function was
+ * extracted for — it makes the mapping unit-testable without instantiating the
+ * Nest graph). `labels?.tool` is guarded defensively; the package's tool wrapper
+ * always sets it.
+ *
+ * Exported (not inlined in the onMetric closure) so mcp.service.spec can assert
+ * the mapping directly. The isMetricsEnabled() gate stays at the CALL site: when
+ * metrics are off, onMetric is undefined and the package skips even building the
+ * label object.
+ */
+export function routeMcpMetric(
+  name: string,
+  value: number,
+  labels?: Record<string, string>,
+): void {
+  if (name === 'mcp_tool_duration_seconds') {
+    observeMcpTool(labels?.tool ?? 'other', value);
+  } else if (name === 'collab_connect_timeouts_total') {
+    incConnectTimeout();
+  } else if (name === 'mcp_getpage_cache_hits_total') {
+    incGetPageCacheHit();
+  } else if (name === 'mcp_getpage_cache_misses_total') {
+    incGetPageCacheMiss();
+  } else if (name === 'mcp_download_bytes_total') {
+    addMcpDownloadBytes(labels?.tool ?? 'other', value);
+  }
+}
 
 @Injectable()
 export class McpService implements OnModuleDestroy {
@@ -232,33 +268,17 @@ export class McpService implements OnModuleDestroy {
             // credential variant resolved. The sink (put/has/evict + uri↔id
             // mapping) is owned by SandboxStore.asSink().
             // Route the package's dependency-neutral metric samples onto the
-            // prom-client registry. When metrics are disabled, onMetric is
-            // undefined → the package's tool-timer/timeout hooks are a
-            // negligible-overhead no-op: the registerTool wrapper still runs a
-            // performance.now() + async try/finally per tool call, but the
-            // `onMetric?.()` short-circuits so no label/object is built. (Cost
-            // is immaterial at LLM tool-call rate.) labels?.tool is guarded
-            // defensively (the tool wrapper always sets it).
+            // prom-client registry (the closed mapping lives in routeMcpMetric,
+            // above). When metrics are disabled, onMetric is undefined → the
+            // package's tool-timer/timeout hooks are a negligible-overhead
+            // no-op: the registerTool wrapper still runs a performance.now() +
+            // async try/finally per tool call, but the `onMetric?.()`
+            // short-circuits so no label/object is built. (Cost is immaterial at
+            // LLM tool-call rate.)
             return {
               ...resolved.config,
               sandbox: this.sandboxStore.asSink(),
-              onMetric: isMetricsEnabled()
-                ? (
-                    name: string,
-                    value: number,
-                    labels?: Record<string, string>,
-                  ) => {
-                    if (name === 'mcp_tool_duration_seconds') {
-                      observeMcpTool(labels?.tool ?? 'other', value);
-                    } else if (name === 'collab_connect_timeouts_total') {
-                      incConnectTimeout();
-                    } else if (name === 'mcp_getpage_cache_hits_total') {
-                      incGetPageCacheHit();
-                    } else if (name === 'mcp_getpage_cache_misses_total') {
-                      incGetPageCacheMiss();
-                    }
-                  }
-                : undefined,
+              onMetric: isMetricsEnabled() ? routeMcpMetric : undefined,
             };
           },
           {

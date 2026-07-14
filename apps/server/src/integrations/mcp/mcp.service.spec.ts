@@ -1,4 +1,6 @@
 import { UnauthorizedException } from '@nestjs/common';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import {
   resolveMcpSessionConfig,
   verifyMcpBearer,
@@ -9,7 +11,21 @@ import {
   McpAuthDeps,
 } from './mcp-auth.helpers';
 import { JwtType } from '../../core/auth/dto/jwt-payload';
-import { McpService } from './mcp.service';
+import { McpService, routeMcpMetric } from './mcp.service';
+
+// The prom instruments are mocked so the metric ROUTING can be asserted directly:
+// the real registry is a disabled no-op under jest (no METRICS_PORT), which would
+// make any assertion against it vacuous. McpService's own tests below never touch
+// metrics, so the mock is inert for them.
+jest.mock('../metrics/metrics.registry', () => ({
+  isMetricsEnabled: jest.fn(() => false),
+  observeMcpTool: jest.fn(),
+  incConnectTimeout: jest.fn(),
+  incGetPageCacheHit: jest.fn(),
+  incGetPageCacheMiss: jest.fn(),
+  addMcpDownloadBytes: jest.fn(),
+}));
+import * as metrics from '../metrics/metrics.registry';
 
 // The /mcp per-request auth decision logic is tested through the framework-free
 // `resolveMcpSessionConfig` helper that McpService delegates to. McpService
@@ -394,5 +410,96 @@ describe('McpService.onModuleDestroy — CollabSession teardown (#486)', () => {
       .mockRejectedValue(new Error('collab teardown boom'));
 
     await expect(svc.onModuleDestroy()).resolves.toBeUndefined();
+  });
+});
+
+// The @docmost/mcp package is dependency-neutral: it emits generic
+// (name, value, labels) samples through its `onMetric` sink and knows nothing
+// about prom-client. routeMcpMetric is the ONLY place those names are mapped onto
+// this app's instruments, and the mapping is CLOSED — a name with no branch is
+// silently DISCARDED and never reaches /metrics. That is a real failure mode
+// (#613 shipped mcp_download_bytes_total in the package with no branch here, so
+// the metric existed in the package's unit tests and nowhere else), hence both a
+// per-name mapping test AND a drift guard that scrapes the package source.
+describe('routeMcpMetric — the package→prom metric mapping (#402/#479/#613)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('routes mcp_tool_duration_seconds onto the tool histogram, by tool label', () => {
+    routeMcpMetric('mcp_tool_duration_seconds', 0.25, { tool: 'getPage' });
+    expect(metrics.observeMcpTool).toHaveBeenCalledWith('getPage', 0.25);
+  });
+
+  it('routes an unlabelled duration sample to the bounded "other" bucket', () => {
+    routeMcpMetric('mcp_tool_duration_seconds', 0.5, undefined);
+    expect(metrics.observeMcpTool).toHaveBeenCalledWith('other', 0.5);
+  });
+
+  it('routes collab_connect_timeouts_total and the getPage cache counters', () => {
+    routeMcpMetric('collab_connect_timeouts_total', 1);
+    routeMcpMetric('mcp_getpage_cache_hits_total', 1);
+    routeMcpMetric('mcp_getpage_cache_misses_total', 1);
+    expect(metrics.incConnectTimeout).toHaveBeenCalledTimes(1);
+    expect(metrics.incGetPageCacheHit).toHaveBeenCalledTimes(1);
+    expect(metrics.incGetPageCacheMiss).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes mcp_download_bytes_total onto the download counter WITH its tool label (#613)', () => {
+    routeMcpMetric('mcp_download_bytes_total', 4096, { tool: 'downloadFile' });
+    expect(metrics.addMcpDownloadBytes).toHaveBeenCalledWith('downloadFile', 4096);
+    // It must NOT be mistaken for a duration observation.
+    expect(metrics.observeMcpTool).not.toHaveBeenCalled();
+  });
+
+  it('discards an unknown name without throwing (the closed mapping)', () => {
+    expect(() => routeMcpMetric('totally_unknown_total', 1, { tool: 'x' })).not.toThrow();
+    expect(metrics.observeMcpTool).not.toHaveBeenCalled();
+    expect(metrics.incConnectTimeout).not.toHaveBeenCalled();
+    expect(metrics.addMcpDownloadBytes).not.toHaveBeenCalled();
+  });
+
+  // Drift guard: EVERY metric name the package emits must have a branch here.
+  // Scraped from the package source, so a new `onMetric(...)` sample added there
+  // with no branch here reds THIS test instead of silently vanishing at runtime.
+  it('has a branch for every metric name the @docmost/mcp package emits', () => {
+    const pkgSrc = resolve(__dirname, '../../../../../packages/mcp/src');
+    const files: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith('.ts')) files.push(full);
+      }
+    };
+    walk(pkgSrc);
+
+    const emitted = new Set<string>();
+    for (const file of files) {
+      const src = readFileSync(file, 'utf8');
+      for (const m of src.matchAll(
+        /onMetric(?:Fn)?\?\.\(\s*["']([a-z0-9_]+)["']/g,
+      )) {
+        emitted.add(m[1]);
+      }
+    }
+    // Sanity: if the scrape regressed, fail loudly rather than pass vacuously.
+    expect(emitted.size).toBeGreaterThanOrEqual(5);
+    expect(emitted.has('mcp_download_bytes_total')).toBe(true);
+
+    for (const name of emitted) {
+      jest.clearAllMocks();
+      routeMcpMetric(name, 1, { tool: 'downloadFile' });
+      const routed =
+        (metrics.observeMcpTool as jest.Mock).mock.calls.length +
+        (metrics.incConnectTimeout as jest.Mock).mock.calls.length +
+        (metrics.incGetPageCacheHit as jest.Mock).mock.calls.length +
+        (metrics.incGetPageCacheMiss as jest.Mock).mock.calls.length +
+        (metrics.addMcpDownloadBytes as jest.Mock).mock.calls.length;
+      if (routed !== 1) {
+        throw new Error(
+          `the package emits "${name}" but routeMcpMetric routed it to ${routed} ` +
+            `instrument(s) — with 0 the sample is DISCARDED and never reaches /metrics`,
+        );
+      }
+    }
   });
 });

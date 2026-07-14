@@ -8,12 +8,105 @@ import {
   resolveInternalFilePath,
 } from "../lib/internal-file-urls.js";
 
+// downloadFile (#613) — base64 branch ceiling.
+// The base64 branch returns the bytes base64-encoded INTO the tool result, which
+// the MCP host serializes as TEXT into the model context (jsonContent). So this
+// ceiling is a CONTEXT budget, not a transport one: 1 MiB of bytes ≈ 1.37 MiB of
+// base64 text ≈ hundreds of thousands of tokens already. Default 1 MiB; the value
+// is overridable via MCP_MAX_DOWNLOAD_BASE64_BYTES or a per-call maxBase64Bytes,
+// but ALWAYS clamped to DOWNLOAD_BASE64_HARD_CEILING so neither a bad env var nor
+// a caller can turn the base64 branch into a context bomb (review finding).
+const DEFAULT_MAX_DOWNLOAD_BASE64_BYTES = 1 * 1024 * 1024; // 1 MiB
+const DOWNLOAD_BASE64_HARD_CEILING = 4 * 1024 * 1024; // 4 MiB absolute clamp
+
+/**
+ * The loopback read's own memory guard: fetchInternalFile never buffers more
+ * than this, whatever a caller or a sandbox env asks for. Every deliverable
+ * bound is clamped to it, so an error message can never quote a limit the fetch
+ * physically cannot reach.
+ */
+const FETCH_HARD_CEILING = 64 * 1024 * 1024; // 64 MiB
+
+// downloadFile (#613) — blob-sandbox per-blob delivery caps: FALLBACK defaults.
+// The AUTHORITATIVE caps are the sink's own (on the Docmost server they are the
+// per-deployment env vars SANDBOX_MAX_BYTES / SANDBOX_MAX_IMAGE_BYTES, read on
+// every put), and the host reports them to the package through the sandbox sink
+// (config.sandbox.maxBytes / maxImageBytes → this.sandboxMaxBytes /
+// this.sandboxMaxImageBytes). downloadFile uses THOSE values for its pre-check,
+// its early-abort fetch bound and every size error message, so raising the env
+// on the server genuinely raises what downloadFile will deliver.
+// These two constants are used ONLY when the host reports nothing (standalone /
+// stdio, or an older binding); they are the upstream DEFAULTS of those env vars.
+const DEFAULT_SANDBOX_MAX_BYTES = 8 * 1024 * 1024; // 8 MiB, non-image blob
+const DEFAULT_SANDBOX_MAX_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MiB, image blob
+
+/**
+ * Resolve the downloadFile base64 ceiling: an explicit per-call override wins,
+ * else MCP_MAX_DOWNLOAD_BASE64_BYTES, else the 1 MiB default — and the result is
+ * ALWAYS clamped to DOWNLOAD_BASE64_HARD_CEILING. Parsed like resolveMaxUploadBytes:
+ * a non-finite/non-positive value is ignored (never DISABLES the limit). Read
+ * fresh so a test/rollback can change the env without reloading the module.
+ */
+function resolveMaxDownloadBase64Bytes(override?: number): number {
+  const fromOpt =
+    typeof override === "number" && Number.isFinite(override) && override > 0
+      ? override
+      : undefined;
+  const parsed = parseInt(process.env.MCP_MAX_DOWNLOAD_BASE64_BYTES ?? "", 10);
+  const fromEnv = Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  const chosen = fromOpt ?? fromEnv ?? DEFAULT_MAX_DOWNLOAD_BASE64_BYTES;
+  return Math.min(chosen, DOWNLOAD_BASE64_HARD_CEILING);
+}
+
+/**
+ * Recognize an axios content-length abort (the early-abort guard fired) so
+ * downloadFile can rewrap it as an actionable, size-specific error instead of
+ * surfacing the raw axios internals. Best-effort: matches the v1 error code and
+ * the classic message on either bound.
+ */
+function isMaxContentLengthError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const anyErr = err as { code?: unknown; message?: unknown };
+  const code = typeof anyErr.code === "string" ? anyErr.code : "";
+  const msg = typeof anyErr.message === "string" ? anyErr.message : "";
+  return (
+    /ERR_FR_MAX_CONTENT_LENGTH_EXCEEDED/i.test(code) ||
+    /maxContentLength|maxBodyLength/i.test(msg)
+  );
+}
+
+/**
+ * Discriminated result of downloadFile (#613). `kind` selects the branch:
+ *  - 'base64': the bytes, base64-encoded (small files — enters the model context);
+ *  - 'url': a short ANONYMOUS sandbox URL any server can fetch without auth.
+ * Both carry best-effort `fileName`/`attachmentId` parsed from the src.
+ */
+export type DownloadFileResult =
+  | {
+      kind: "base64";
+      base64: string;
+      mime: string;
+      fileName: string | null;
+      attachmentId: string | null;
+      size: number;
+    }
+  | {
+      kind: "url";
+      uri: string;
+      sha256: string;
+      mime: string;
+      fileName: string | null;
+      attachmentId: string | null;
+      size: number;
+    };
+
 // Public method surface of StashMixin (issue #450) — a NAMED type so the factory
 // return type is expressible in the emitted .d.ts (the anonymous mixin class
 // carries the base's protected shared state, which would otherwise trip TS4094).
 // Derived from the class below; `implements IStashMixin` fails to compile on drift.
 export interface IStashMixin {
   stashPage(pageId: string): Promise<{ uri: string; sha256: string; size: number; images: { mirrored: number; failed: number }; }>;
+  downloadFile(src: string, opts?: { format?: "base64" | "url" | "auto"; maxBase64Bytes?: number }): Promise<DownloadFileResult>;
 }
 
 export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Base: TBase): GConstructor<DocmostClientContext & IStashMixin> & TBase {
@@ -32,17 +125,28 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
    * escape `/api/files/` and reach another internal endpoint (SSRF). That throw
    * happens before this.client.get, so a malicious src is counted as a failed
    * mirror — it never reaches the network.
+   *
+   * `maxBytes` (optional, #613) lowers the axios content-length bound BELOW the
+   * 64 MiB ceiling so an oversize blob aborts EARLY (before buffering 64 MiB) —
+   * downloadFile passes it so a file over the requested delivery ceiling is
+   * rejected without a full read. It is clamped to the hard ceiling, so it can
+   * only tighten, never widen, the guard; omitted (the stashPage/viewImage path)
+   * it keeps the original 64 MiB behaviour unchanged.
    */
   protected async fetchInternalFile(
     src: string,
+    maxBytes?: number,
   ): Promise<{ buffer: Buffer; mime: string }> {
-    const HARD_CEILING = 64 * 1024 * 1024; // 64 MiB memory guard
+    const cap =
+      typeof maxBytes === "number" && Number.isFinite(maxBytes) && maxBytes > 0
+        ? Math.min(maxBytes, FETCH_HARD_CEILING)
+        : FETCH_HARD_CEILING;
     const relPath = resolveInternalFilePath(src);
     const response = await this.client.get(relPath, {
       responseType: "arraybuffer",
       timeout: 30000,
-      maxContentLength: HARD_CEILING,
-      maxBodyLength: HARD_CEILING,
+      maxContentLength: cap,
+      maxBodyLength: cap,
     });
     const buffer = Buffer.from(response.data);
     if (buffer.length === 0) {
@@ -213,6 +317,244 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       size: stored.size,
       images: { mirrored, failed },
     };
+  }
+
+  /**
+   * Download an INTERNAL Docmost attachment's bytes and hand them back in a
+   * caller-chosen shape (#613). `src` is the internal `/api/files/<id>/<name>`
+   * (or bare `/files/...`) URL the agent already has from getPageJson / getNode /
+   * uploadFile. The reused primitive is the SAME guarded loopback fetch
+   * (fetchInternalFile) stashPage/viewImage use, so the SSRF / traversal /
+   * memory guards are unchanged; this method only surfaces the bytes externally.
+   *
+   * `format` (default 'auto'):
+   *  - 'base64' → the bytes base64-encoded (small files ONLY — this enters the
+   *    model context and costs tokens); rejected over the base64 ceiling.
+   *  - 'url' → the bytes stashed into the blob sandbox and returned as a SHORT
+   *    ANONYMOUS URL any server can fetch WITHOUT auth (the way to hand a file to
+   *    insertImage/replaceImage on another instance). The URL is PUBLIC and
+   *    NON-revocable until it expires (~1h TTL, RAM-only) — same model as stashPage.
+   *  - 'auto' → base64 when it fits the base64 ceiling, else the anonymous URL
+   *    when the sandbox is configured and the file fits its per-blob cap, else a
+   *    clear "too large to deliver" error (the dead zone between the base64
+   *    ceiling and the sandbox's per-blob cap for that mime — by default 1–8 MiB
+   *    is delivered as a URL and 8–20 MiB is the dead zone for a NON-image, while
+   *    an image is deliverable up to the 20 MiB image cap).
+   *
+   * The per-blob caps are the sink's REAL ones when the host reports them (see
+   * DEFAULT_SANDBOX_MAX_BYTES above), so an operator who raises SANDBOX_MAX_BYTES
+   * on the server raises what this tool delivers, and the error messages quote
+   * the caps that will actually be enforced.
+   *
+   * `src` may be an ABSOLUTE URL (e.g. copied from another instance): its HOST is
+   * IGNORED — only the `/api/files/...` path is used, and the bytes are ALWAYS
+   * fetched from THIS instance over the authenticated loopback. It is therefore
+   * never a way to reach a remote host (no SSRF), but it is also NOT a way to
+   * download another instance's file: you get THIS instance's file with that id,
+   * or a 404.
+   *
+   * SECURITY: `src` is resolved via resolveInternalFilePath (rejects traversal /
+   * percent-encoded escapes / anything outside /api/files/ BEFORE any network
+   * call) and then additionally required to be EXACTLY /api/files/<uuid>/<name>,
+   * so `/api/files/onlyoneseg` (which clears the prefix gate but matches no file
+   * route and would hit the SPA catch-all with a 200 index.html) is rejected up
+   * front rather than "succeeding" with an HTML page.
+   */
+  async downloadFile(
+    src: string,
+    opts: {
+      format?: "base64" | "url" | "auto";
+      maxBase64Bytes?: number;
+    } = {},
+  ): Promise<DownloadFileResult> {
+    await this.ensureAuthenticated();
+
+    // Accept BOTH internal forms an agent can copy out of getPageJson/getNode:
+    // the canonical `/api/files/...` and the bare `/files/...` (page content
+    // carries both — stashPage normalizes for the same reason before fetching).
+    // This only ADDS the `/api` prefix to a `/files/`-rooted path; it cannot
+    // widen the trust boundary, because resolveInternalFilePath below still
+    // canonicalizes the result and re-asserts the `/api/files/` prefix.
+    const normalizedSrc = normalizeFileUrl(src);
+
+    // FORM VALIDATION. resolveInternalFilePath throws on traversal / percent-
+    // encoded escape / non-/api/files src BEFORE any network call. We then pin the
+    // shape to /files/<uuid>/<non-empty name> so the SPA catch-all can never be
+    // mistaken for an attachment (review R-sec #5).
+    const relPath = resolveInternalFilePath(normalizedSrc);
+    const formMatch =
+      /^\/files\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/([^/]+)$/i.exec(
+        relPath,
+      );
+    if (!formMatch) {
+      throw new Error(
+        `downloadFile: src must be an internal attachment URL of the form ` +
+          `/api/files/<uuid>/<fileName> (got "${src}")`,
+      );
+    }
+
+    // The canonical, HOST-STRIPPED path we actually fetch. resolveInternalFilePath
+    // already discarded any absolute-URL host (that is the SSRF guard), so feeding
+    // its output back is what pins the property structurally: whatever host the
+    // agent passed, the loopback fetch only ever sees `/api/files/<uuid>/<name>`
+    // on THIS instance. (fetchInternalFile re-resolves it — idempotent.)
+    const canonicalSrc = `/api${relPath}`;
+
+    const format = opts.format ?? "auto";
+    const base64cap = resolveMaxDownloadBase64Bytes(opts.maxBase64Bytes);
+
+    // The sink's REAL per-blob caps when the host reports them, else the upstream
+    // defaults (see the constants above). Read BEFORE the fetch because they set
+    // the early-abort bound.
+    const maxNonImageBytes = this.sandboxMaxBytes ?? DEFAULT_SANDBOX_MAX_BYTES;
+    const maxImageBytes =
+      this.sandboxMaxImageBytes ?? DEFAULT_SANDBOX_MAX_IMAGE_BYTES;
+    // The absolute ceiling of what the url branch can EVER deliver, whatever the
+    // mime turns out to be. Math.max (not "the image cap") because an operator is
+    // free to configure a non-image cap LARGER than the image one — but clamped
+    // to the loopback read's own 64 MiB memory guard (fetchInternalFile's
+    // HARD_CEILING), which no sandbox env can lift. Without the clamp, raising
+    // SANDBOX_MAX_IMAGE_BYTES past 64 MiB would make the abort message quote a
+    // limit the fetch can never reach, and promise a delivery it cannot make.
+    const maxDeliverableBytes = Math.min(
+      Math.max(maxNonImageBytes, maxImageBytes),
+      FETCH_HARD_CEILING,
+    );
+
+    // Bound the loopback read so an oversize blob aborts EARLY (before buffering
+    // the full 64 MiB ceiling): base64 can never deliver more than base64cap;
+    // url/auto no more than the largest per-blob cap. +1 so a file EXACTLY at the
+    // cap still reads and is then rejected below with a clear message.
+    const fetchBound =
+      format === "base64" ? base64cap + 1 : maxDeliverableBytes + 1;
+
+    let buffer: Buffer;
+    let mime: string;
+    try {
+      const got = await this.fetchInternalFile(canonicalSrc, fetchBound);
+      buffer = got.buffer;
+      mime = got.mime;
+    } catch (err) {
+      // The early-abort guard firing is reported as a size-specific, actionable
+      // error; every other fetch failure (traversal reject / 404 / timeout)
+      // propagates unchanged.
+      if (isMaxContentLengthError(err)) {
+        if (format === "base64") {
+          throw new Error(
+            `downloadFile: file exceeds the base64 ceiling of ${base64cap} bytes; ` +
+              `use format:'url' (anonymous URL) or 'auto'`,
+          );
+        }
+        // The mime is unknown at abort time (the response was cut off), so the
+        // only honest bound to quote is the ABSOLUTE maximum — the largest
+        // per-blob cap. A non-image's own cap may well be lower; that case is
+        // caught after a completed read, with its exact cap named.
+        throw new Error(
+          `downloadFile: file exceeds the ${maxDeliverableBytes}-byte absolute ` +
+            `maximum this server can deliver (the largest blob-sandbox per-blob ` +
+            `cap); fetch it directly from Docmost instead`,
+        );
+      }
+      throw err;
+    }
+
+    // Observability: report the volume read over the loopback so a bulk download
+    // by an external agent is visible to the operator (access stays within the
+    // service account's CASL scope, but VOLUME is otherwise invisible; review
+    // ops #4). Emitted once per successful fetch, before format branching.
+    this.onMetricFn?.("mcp_download_bytes_total", buffer.length, {
+      tool: "downloadFile",
+    });
+
+    // Best-effort metadata from the resolved path. decodeURIComponent throws on a
+    // malformed % escape → keep fileName null rather than fail the download.
+    const attachmentId: string | null = formMatch[1];
+    let fileName: string | null = null;
+    try {
+      fileName = decodeURIComponent(formMatch[2]);
+    } catch {
+      fileName = null;
+    }
+
+    const isImage = mime.startsWith("image/");
+    const sandboxCap = isImage ? maxImageBytes : maxNonImageBytes;
+    const size = buffer.length;
+
+    const deliverBase64 = (): DownloadFileResult => {
+      if (buffer.length > base64cap) {
+        throw new Error(
+          `downloadFile: file is ${buffer.length} bytes, over the base64 ceiling ` +
+            `of ${base64cap} bytes; use format:'url' (anonymous URL) or 'auto'`,
+        );
+      }
+      return {
+        kind: "base64",
+        base64: buffer.toString("base64"),
+        mime,
+        fileName,
+        attachmentId,
+        size,
+      };
+    };
+
+    const deliverUrl = (): DownloadFileResult => {
+      if (!this.sandboxPut) {
+        throw new Error(
+          "downloadFile: url format is unavailable — the blob sandbox is not " +
+            "configured on this server",
+        );
+      }
+      if (buffer.length > sandboxCap) {
+        throw new Error(
+          `downloadFile: file is ${buffer.length} bytes, over the ${sandboxCap}-byte ` +
+            `deliverable limit for ${isImage ? "images" : "non-image files"} ` +
+            `(the blob sandbox per-blob cap)`,
+        );
+      }
+      let stored;
+      try {
+        stored = this.sandboxPut(buffer, mime);
+      } catch (err) {
+        // The pre-check above should have caught an oversize; never leak a raw
+        // sandbox internal error to the agent.
+        throw new Error(
+          `downloadFile: failed to stash the file into the blob sandbox: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      return {
+        kind: "url",
+        uri: stored.uri,
+        sha256: stored.sha256,
+        mime,
+        fileName,
+        attachmentId,
+        size,
+      };
+    };
+
+    if (format === "base64") return deliverBase64();
+    if (format === "url") return deliverUrl();
+    // auto: small enough for context → base64; else if the sandbox can take it →
+    // url; else a clear "too large to deliver". That dead zone is (this mime's
+    // per-blob cap, maxDeliverableBytes]: with the DEFAULT caps a non-image over
+    // 8 MiB is undeliverable (8–20 MiB reaches here; over 20 MiB the fetch
+    // early-aborts and the message above fires instead), while an image is
+    // deliverable right up to its 20 MiB cap. It also covers "no sandbox at all",
+    // where anything over the base64 ceiling is undeliverable.
+    if (buffer.length <= base64cap) return deliverBase64();
+    if (this.sandboxPut && buffer.length <= sandboxCap) return deliverUrl();
+    throw new Error(
+      `downloadFile: file is ${buffer.length} bytes — too large to deliver ` +
+        `(base64 ceiling ${base64cap} bytes; ${
+          this.sandboxPut
+            ? `sandbox cap ${sandboxCap} bytes for ${
+                isImage ? "images" : "non-image files"
+              }`
+            : "blob sandbox not configured"
+        }). Fetch it directly from Docmost instead.`,
+    );
   }
 
   /**
