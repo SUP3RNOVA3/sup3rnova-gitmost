@@ -510,6 +510,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and, in a spec-conformant client, falls straight into that broken OAuth path.
   Replace the header with `Authorization: Bearer <api_key>`.
 
+- **CI: клиент теперь проверяется тайпчекером на каждом PR.** Скрипт `test` у
+  клиента — это `vitest run`, то есть esbuild: он *вырезает* типы, ничего не
+  проверяя. А релизный путь (`build`, и он же в docker-образе) — это
+  `tsc && vite build`. В результате ошибка типов в любом клиентском файле
+  проходила PR-гейт полностью зелёной и всплывала только на сборке образа: так в
+  develop уехали четыре TS-ошибки в новых тестовых файлах. Добавлен явный шаг
+  `Typecheck client` (`pnpm --filter client typecheck` → `tsc --noEmit`) после
+  сборки workspace-пакетов, чьи `.d.ts` он читает, и до прогона тестов. Файлы
+  тестов лежат под `src/` и попадают в `include` — они проверяются тоже, что и
+  требовалось.
+
 - **A public share no longer serves an attachment whose page has been trashed.**
   The public file endpoint validated the share token but never re-read the
   soft-delete state, so a valid (1-hour) attachment token kept streaming the

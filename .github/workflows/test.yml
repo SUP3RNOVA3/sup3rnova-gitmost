@@ -167,6 +167,19 @@ jobs:
       - name: Build token-estimate
         run: pnpm --filter @docmost/token-estimate build
 
+      # The client's `test` script is `vitest run` — esbuild, which STRIPS types
+      # without checking them. Its `build` script (the release path, and what the
+      # Docker image runs) is `... && tsc && vite build`. So a type error in any
+      # client file sails through this workflow green and only surfaces when the
+      # image is built. That is not hypothetical: #624 shipped 4 TS errors in new
+      # test files with a fully green PR gate (#625). Typecheck the client
+      # explicitly, after the workspace packages it resolves are built (tsc reads
+      # their .d.ts from dist/, so this step MUST stay below the build steps).
+      # tsconfig `include` covers src/**, so *.spec/*.test files are checked too —
+      # that is the point: #624's four errors were all in test files.
+      - name: Typecheck client
+        run: pnpm --filter client typecheck
+
       - name: Run unit tests
         run: pnpm -r test
 
