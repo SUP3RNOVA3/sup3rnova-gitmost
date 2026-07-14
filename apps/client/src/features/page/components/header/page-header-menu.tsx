@@ -77,6 +77,11 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
   const { data: page } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
+  // #563 — the header is now rendered from the boot cache BEFORE this query
+  // resolves, so `page` is legitimately undefined on a reload. Nothing here may
+  // dereference it unguarded; the edit-only entry points additionally require the
+  // LIVE page (their mutations all need server-confirmed rights anyway).
+  const isPageLoaded = !!page;
   const isDeleted = !!page?.deletedAt;
   const [workspace] = useAtom(workspaceAtom);
   const collabProvider = useAtomValue(collabProviderAtom);
@@ -136,12 +141,12 @@ export default function PageHeaderMenu({ readOnly }: PageHeaderMenuProps) {
     <>
       <ConnectionWarning />
 
-      {!readOnly && <PageEditModeToggle size="xs" />}
+      {isPageLoaded && !readOnly && <PageEditModeToggle size="xs" />}
 
       {/* Hide the Share entry point for readers; the toggle inside is inert
           without edit permission, so gate it like other edit-only actions
           (issue #133) */}
-      {!readOnly && !workspaceSharingDisabled && (
+      {isPageLoaded && !readOnly && !workspaceSharingDisabled && (
         <ShareModal readOnly={false} />
       )}
 
@@ -179,7 +184,7 @@ function PageActionMenu({ readOnly, onSaveVersion }: PageActionMenuProps) {
   const [, setHistoryModalOpen] = useAtom(historyAtoms);
   const clipboard = useClipboard({ timeout: 500 });
   const { pageSlug, spaceSlug } = useParams();
-  const { data: page, isLoading } = usePageMetaQuery({
+  const { data: page } = usePageMetaQuery({
     pageId: extractPageSlugId(pageSlug),
   });
   const { handleDelete } = useTreeMutation(page?.spaceId ?? "");
@@ -263,6 +268,27 @@ function PageActionMenu({ readOnly, onSaveVersion }: PageActionMenuProps) {
       addFavoriteMutation.mutate(params);
     }
   };
+
+  // #563 — the chrome now paints from the boot cache BEFORE this query resolves,
+  // so on a reload `page` is undefined here while the header is already on
+  // screen. Every item below needs the LIVE page (its id/slugId drive copy-link,
+  // export, move, delete, watch…), and the boot cache deliberately carries no
+  // authority to act. So render the trigger INERT until the response lands —
+  // never a throw (the unguarded `page.id` / `page.lastUpdatedBy` reads below
+  // used to blow up the whole page through the ErrorBoundary), and never an
+  // action that could fire against a page we have not re-validated.
+  if (!page) {
+    return (
+      <ActionIcon
+        variant="subtle"
+        color="dark"
+        aria-label={t("Page actions")}
+        disabled
+      >
+        <IconDots size={20} />
+      </ActionIcon>
+    );
+  }
 
   return (
     <>

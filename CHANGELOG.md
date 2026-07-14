@@ -146,6 +146,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Page chrome paints from a local boot cache instead of waiting for the page
+  request.** With the new `LOCAL_FIRST_ENABLED` env var (default `false`), the
+  client keeps a small per-(workspace, user) `localStorage` cache of page
+  metadata (title, icon), so opening or reloading a page renders its title,
+  header and breadcrumbs without waiting for `/pages/info` — the page is still
+  revalidated on every mount and the fresh response always wins. Edit
+  affordances are deliberately NOT served from the cache: they stay disabled
+  until the live response confirms the permissions. The cache holds no page
+  content and no permissions, is purged on logout / sign-in / `401`, and a page
+  that returns `403`/`404` is evicted immediately. With the flag off, nothing is
+  read or written and behaviour is unchanged. (#563)
+
 - **Changing the embedding model no longer empties semantic search.** The
   embeddings now have a versioned lifecycle: the workspace stores which embedding
   generation search actually serves, and a model/revision/prefix change starts a

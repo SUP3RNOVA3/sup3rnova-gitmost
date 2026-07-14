@@ -243,6 +243,19 @@ export class EnvironmentService {
     return enabled === 'true';
   }
 
+  /**
+   * Operator toggle for the local-first page boot cache (#563). DEFAULT OFF:
+   * mirrored into window.CONFIG so the client only persists/restores the
+   * localStorage page-meta cache when the operator opts in. Off => the client
+   * keeps today's behavior (skeleton until the page query resolves).
+   */
+  isLocalFirstEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('LOCAL_FIRST_ENABLED', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
   getStripePublishableKey(): string {
     return this.configService.get<string>('STRIPE_PUBLISHABLE_KEY');
   }

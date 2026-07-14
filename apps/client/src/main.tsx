@@ -23,6 +23,7 @@ import {
   isPostHogEnabled,
 } from "@/lib/config.ts";
 import { initVitals } from "@/lib/telemetry/vitals";
+import { installPageMetaEviction } from "@/features/page/atoms/page-meta-cache-atom";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -34,6 +35,12 @@ export const queryClient = new QueryClient({
     },
   },
 });
+
+// #563 — evict a page from the localStorage boot cache as soon as ANY page query
+// fails with 403/404 (deleted / access revoked), regardless of what is mounted.
+// Without this, a revoked page would keep painting stale chrome from the cache
+// on every subsequent visit.
+installPageMetaEviction(queryClient);
 
 // #355 — client perf-telemetry. Decides sampling ONCE (25%/session) before
 // subscribing to any observer; non-sampled sessions send nothing.

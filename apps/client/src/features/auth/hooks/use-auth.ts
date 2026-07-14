@@ -36,6 +36,20 @@ export default function useAuth() {
 
     try {
       await login(data);
+
+      // Cross-user hygiene (#563). Logging OUT purges the persisted caches, but a
+      // session can also end without a logout (expired cookie, closed tab), which
+      // leaves the previous user's tree + page-meta caches — and their `currentUser`
+      // — in localStorage. Sign-in is an SPA navigation, and `currentUser` is only
+      // replaced by `/me` a tick later, so without this the first commit after
+      // sign-in would render the NEW user under the OLD user's scope key and paint
+      // the old user's cached page titles/icons.
+      // RESET makes the scope `anon` (fail-closed: both caches refuse it) and the
+      // sweep drops the previous user's blobs from disk. `freezeWrites: false`:
+      // unlike logout, we stay in this session, so persistence must keep working.
+      setCurrentUser(RESET);
+      clearPersistedTreeCaches({ freezeWrites: false });
+
       setIsLoading(false);
 
       navigate(getPostLoginRedirect());

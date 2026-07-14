@@ -38,6 +38,8 @@ import { validate as isValidUuid } from "uuid";
 import { useTranslation } from "react-i18next";
 import { useSetAtom, useStore } from "jotai";
 import { treeDataAtom } from "@/features/page/tree/atoms/tree-data-atom";
+import { writePageMetaAtom } from "@/features/page/atoms/page-meta-cache-atom";
+import { isLocalFirstEnabled } from "@/lib/config";
 import { treeModel } from "@/features/page/tree/model/tree-model";
 import { SpaceTreeNode } from "@/features/page/tree/types";
 import { useQueryEmit } from "@/features/websocket/use-query-emit";
@@ -46,6 +48,7 @@ import { moveToTrashNotificationMessage } from "@/features/page/components/move-
 export function usePageQuery(
   pageInput: Partial<IPageInput>,
 ): UseQueryResult<IPage, Error> {
+  const store = useStore();
   const query = useQuery({
     queryKey: ["pages", pageInput.pageId],
     queryFn: () => getPageById(pageInput),
@@ -55,6 +58,15 @@ export function usePageQuery(
     // instead of flashing a blank/skeleton frame (the new page's content
     // streams in when ready). isLoading stays true only for the very first load.
     placeholderData: keepPreviousData,
+    // #563 — FORCED reconciliation of the page-meta boot cache. This query feeds
+    // the localStorage cache the chrome paints from, so it must revalidate on
+    // EVERY mount: the global defaults (refetchOnMount:false + staleTime 5min,
+    // main.tsx) would otherwise suppress the refetch inside a 5-minute window,
+    // and a page renamed / deleted / access-revoked less than 5 minutes ago
+    // would keep showing stale chrome with nothing ever correcting it. The
+    // refetch is a background one (cached data stays on screen), and it is gated
+    // on the flag so a flag-off deployment behaves exactly as it does today.
+    refetchOnMount: isLocalFirstEnabled() ? "always" : false,
   });
 
   useEffect(() => {
@@ -64,8 +76,13 @@ export function usePageQuery(
       } else {
         queryClient.setQueryData(["pages", query.data.id], query.data);
       }
+      // Write-through to the boot cache (no-op when the flag is off or the user
+      // is not resolved yet). Reconciliation: the freshly fetched page always
+      // overwrites the cached entry, so a server-side rename/icon/permission
+      // change lands in the cache the moment it arrives.
+      store.set(writePageMetaAtom, query.data);
     }
-  }, [query.data]);
+  }, [query.data, store]);
 
   return query;
 }
@@ -96,6 +113,7 @@ function selectPageMeta(page: IPage): IPageMeta {
 export function usePageMetaQuery(
   pageInput: Partial<IPageInput>,
 ): UseQueryResult<IPageMeta, Error> {
+  const store = useStore();
   const query = useQuery({
     queryKey: ["pages", pageInput.pageId],
     queryFn: () => getPageById(pageInput),
@@ -120,7 +138,10 @@ export function usePageMetaQuery(
     } else {
       queryClient.setQueryData(["pages", full.id], full);
     }
-  }, [query.data]);
+    // #563 — same write-through as usePageQuery: any resolved page keeps the
+    // boot cache current, whichever hook fetched it.
+    store.set(writePageMetaAtom, full);
+  }, [query.data, store]);
 
   return query;
 }

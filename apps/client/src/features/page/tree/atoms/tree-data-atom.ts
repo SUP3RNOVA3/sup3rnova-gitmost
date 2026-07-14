@@ -6,6 +6,11 @@ import {
   OPEN_TREE_NODES_KEY_PREFIX,
   scopeKeyAtom,
 } from "./open-tree-nodes-atom";
+import {
+  PAGE_META_KEY_PREFIX,
+  disablePageMetaPersistence,
+  dropPendingPageMetaWrites,
+} from "@/features/page/atoms/page-meta-cache-atom";
 
 // The sidebar tree is persisted to localStorage so a page reload can paint the
 // last-known tree IMMEDIATELY (no blank sidebar while the root query runs) and
@@ -94,10 +99,30 @@ export function flushPendingTreeDataWrites(): void {
 // users, the `anon:anon` fallback — are purged too. Pending debounced writes
 // are DISCARDED first (not flushed): a queued write firing after the sweep
 // would silently resurrect a removed key.
-export function clearPersistedTreeCaches(): void {
+//
+// The page-meta boot cache (#563) stores titles/icons too and shares this exact
+// lifecycle, so it is swept by the SAME function (covering all call sites — the
+// logout button and the SIGN-IN in use-auth.ts, and the 401 forced logout in
+// api-client.ts).
+//
+// `freezeWrites` (default true) additionally arms both caches' persistence
+// kill-switch, so nothing can be written back AFTER the sweep. That is correct
+// for LOGOUT, where every caller immediately does a full-page navigation and
+// tears this module down. SIGN-IN must pass `false`: it continues in the same
+// SPA session (`navigate()`, no reload), so freezing would leave both boot caches
+// unable to persist anything for the entire session the user just started.
+export function clearPersistedTreeCaches(options?: {
+  freezeWrites?: boolean;
+}): void {
+  const freezeWrites = options?.freezeWrites ?? true;
   // Disable persistence FIRST so no write can be queued (or flushed) between
-  // the sweep below and the full-page navigation every caller performs next.
-  persistenceDisabled = true;
+  // the sweep below and the full-page navigation every logout caller performs.
+  if (freezeWrites) {
+    persistenceDisabled = true;
+    disablePageMetaPersistence();
+  } else {
+    dropPendingPageMetaWrites();
+  }
   if (flushTimer !== null) {
     clearTimeout(flushTimer);
     flushTimer = null;
@@ -112,7 +137,8 @@ export function clearPersistedTreeCaches(): void {
       if (
         key !== null &&
         (key.startsWith(TREE_DATA_KEY_PREFIX) ||
-          key.startsWith(OPEN_TREE_NODES_KEY_PREFIX))
+          key.startsWith(OPEN_TREE_NODES_KEY_PREFIX) ||
+          key.startsWith(PAGE_META_KEY_PREFIX))
       ) {
         keysToRemove.push(key);
       }
@@ -139,6 +165,19 @@ if (
 // lazy loads; websockets already keep every open tab live. Each tab keeps its
 // own in-memory tree — localStorage only seeds the next boot.
 const treeDataStorage = {
+  // KNOWN LATENT BUG (not fixed here — behavior predates #563 and a tree write is
+  // idempotently repaired by the next tree event / root refetch, so the blast
+  // radius is a stale sidebar rather than lost data): this `getItem` reads only
+  // what was FLUSHED to localStorage, ignoring `pendingWrites`. jotai re-reads
+  // storage in the atom's onMount — i.e. every time the first subscriber mounts,
+  // not just at init — so a sidebar remount INSIDE the 500 ms debounce window
+  // resurrects the last flushed blob and silently drops the queued write.
+  // Likewise, a write that FAILED to persist (quota/oversize) is dropped from the
+  // queue by flushPendingTreeDataWrites() below, after which the next onMount
+  // re-read serves the older on-disk blob back over the newer in-memory tree —
+  // contradicting the "in-memory atom is the source of truth" claim above.
+  // The page-meta boot cache (page-meta-cache-atom.ts) fixes BOTH in its own
+  // storage adapter; porting the fix here needs its own tests (follow-up issue).
   getItem: (key: string, initialValue: SpaceTreeNode[]): SpaceTreeNode[] => {
     // Defensive: jsdom test shims may lack methods, stored JSON may be
     // corrupted or of a wrong shape. Any failure falls back to the empty tree.
