@@ -15,6 +15,10 @@ export const ALLOWED_METRIC_NAMES = new Set<string>([
   'editor_tx_ms',
   'page_open_ms',
   'longtask_ms',
+  // #563 — page-meta boot-cache counters (hit / miss / evict-on-denied).
+  'page_meta_hit',
+  'page_meta_miss',
+  'page_meta_evict',
 ]);
 
 // The only rating values accepted (web-vitals). Anything else -> null.
