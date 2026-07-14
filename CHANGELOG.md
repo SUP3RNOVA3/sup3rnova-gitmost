@@ -387,6 +387,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A public share no longer serves an attachment whose page has been trashed.**
+  The public file endpoint validated the share token but never re-read the
+  soft-delete state, so a valid (1-hour) attachment token kept streaming the
+  bytes after the page was moved to the trash. This became reachable with the
+  `approved` share mode: the published content is a FROZEN saved version that
+  still references the attachment, whereas a live draft simply drops the node.
+  The endpoint now re-checks the page (and the attachment row) on every public
+  hit and answers with the same `404 File not found` it already used for a
+  mismatched token, so nothing about the file's existence leaks. Note that an
+  already-served response stays cacheable for up to an hour (`Cache-Control:
+  public, max-age=3600`), so the guard applies to origin hits. (#574)
+
 - **A lost draw.io/Excalidraw diagram is no longer unnamed in the MCP integrity
   guard.** The structural integrity guard behind `diffPageVersions` and the
   post-write verify report counted images/links/tables/callouts/code blocks, but
