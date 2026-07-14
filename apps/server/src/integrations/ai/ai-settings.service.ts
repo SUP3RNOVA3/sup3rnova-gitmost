@@ -120,6 +120,15 @@ export class AiSettingsService {
    * pass is kept and no duplicate is started. The .catch only guards against
    * transport/Redis errors.
    *
+   * #599 (review F1) — that dedupe means a CONFIG CHANGE during an active run
+   * enqueues NOTHING, so the new fingerprint gets no job of its own. What builds
+   * it is the running job itself: it finishes its (now stale) target, sees the
+   * drift in EmbeddingGenerationService.completeRun, and FAILS with
+   * StaleReindexTargetError so BullMQ retries it — and the retry re-resolves the
+   * provider and builds the current target. Kept deliberately: adding a second job
+   * would race the departing one for the same jobId (and lose, which is how the
+   * new generation was silently lost before).
+   *
    * Also cancels any pending delayed WORKSPACE_DELETE_EMBEDDINGS job (scheduled
    * when AI Search was disabled) so it cannot wipe the embeddings we are about
    * to rebuild. The job no-ops if embeddings are unconfigured.

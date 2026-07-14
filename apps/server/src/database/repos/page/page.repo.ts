@@ -252,6 +252,34 @@ export class PageRepo {
   }
 
   /**
+   * #599 (review F2) — the subset of `countEmbeddablePages` that was CREATED OR
+   * MODIFIED after `since` (the start of the reindex run that established the
+   * active generation's recorded coverage).
+   *
+   * These are exactly the pages the completed run's frozen coverage measurement
+   * does NOT describe: it never saw them (created later), or it saw different
+   * content (edited later). The coverage rule therefore excludes them from the
+   * run's measured "chunk-less gap" and counts them on their own, which is what
+   * stops a stale gap from excusing brand-new un-embedded pages (see
+   * computeCoverage). Uses the SAME embeddablePredicate as the denominator, so the
+   * two can never drift.
+   */
+  async countEmbeddablePagesChangedSince(
+    workspaceId: string,
+    since: Date,
+  ): Promise<number> {
+    const row = await this.db
+      .selectFrom('pages as p')
+      .where('p.workspaceId', '=', workspaceId)
+      .where('p.deletedAt', 'is', null)
+      .where('p.updatedAt', '>', since)
+      .where((eb) => this.embeddablePredicate(eb))
+      .select((eb) => eb.fn.countAll().as('count'))
+      .executeTakeFirst();
+    return Number(row?.count ?? 0);
+  }
+
+  /**
    * The "embeddable content" qualifying predicate, shared verbatim by
    * countEmbeddablePages (the steady-state denominator) and getEmbeddablePageIds
    * (the set the bulk reindex iterates). Both MUST use the exact same condition

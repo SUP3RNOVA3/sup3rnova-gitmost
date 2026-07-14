@@ -331,7 +331,11 @@ export class EmbeddingIndexerService {
    *      failures) AND only if the config still resolves to this run's target
    *      (EmbeddingGenerationService.completeRun). A fatal provider abort throws out
    *      of the loop and never reaches this line, so an aborted run NEVER flips the
-   *      pointer (acceptance 4).
+   *      pointer (acceptance 4). If the config moved on MID-RUN, completeRun throws
+   *      StaleReindexTargetError: the job fails, BullMQ retries it, and the retry
+   *      re-resolves the provider here at step 1 and builds the new target (#599
+   *      review F1 — the enqueue that config change attempted was deduped against
+   *      this run, so the retry is the only thing that will ever build it).
    *
    * The legacy NULL-fingerprint rows of an existing instance are covered by exactly
    * the same path: the first run writes the whole workspace under the target
@@ -359,6 +363,15 @@ export class EmbeddingIndexerService {
 
   /** The body of a reindex run; always executed under the per-workspace run lock. */
   private async runReindex(workspaceId: string): Promise<void> {
+    // #599 (review F2) — the instant this run STARTED, recorded with the coverage
+    // numbers at the flip. It is what lets the coverage rule tell the pages this run
+    // measured from the pages that appeared/changed afterwards, so the run's frozen
+    // chunk-less gap can never excuse a brand-new un-embedded page. Taken BEFORE the
+    // first page is read (not at the flip): a page edited mid-run must land on the
+    // "changed since" side, or its re-embedding would be excused by a measurement
+    // that never saw it.
+    const coverageAt = new Date();
+
     // The whole run is wrapped so the per-workspace progress record is ALWAYS
     // cleared in the finally — on success, on a fatal-provider abort, on an
     // unconfigured early-return, or on any unexpected throw — so a failed run
@@ -528,21 +541,30 @@ export class EmbeddingIndexerService {
       }
 
       // The run completed IN FULL (a fatal provider error would have thrown out of
-      // the loop above, skipping this; a partial run returned just above). Publish
-      // the generation: ONE settings write moves the active pointer onto the target
-      // and records `produced` (the pages that really produced a chunk) plus `total`
-      // (the pages the run considered embeddable) as the coverage denominator
-      // measurements — but only if the config STILL resolves to this run's target,
-      // so a config change during the run cannot get a superseded generation
-      // published (the second-swap-during-the-first guard). On a successful flip
-      // completeRun also GCs the superseded generation, ending the transient ~2x
-      // storage.
+      // the loop above, skipping this; a partial run threw just above). Publish the
+      // generation: ONE settings write moves the active pointer onto the target and
+      // records `produced` (the pages that really produced a chunk), `total` (the
+      // pages the run considered embeddable) and `coverageAt` (when the run started)
+      // as the coverage measurements — but only if the config STILL resolves to this
+      // run's target, so a config change during the run cannot get a superseded
+      // generation published (the second-swap-during-the-first guard). On a
+      // successful flip completeRun also GCs the superseded generation, ending the
+      // transient ~2x storage.
+      //
+      // #599 (review F1) — when the config DID move on, completeRun THROWS
+      // (StaleReindexTargetError) rather than skipping quietly, and the throw is
+      // deliberately left to propagate: it fails the BullMQ job, whose retry
+      // re-resolves the provider at the top of this method and builds the NOW-current
+      // target. Nothing else would: the reindex the config change tried to enqueue
+      // was de-duplicated against this very job, so swallowing this would leave the
+      // new fingerprint with zero rows and no job forever.
       await this.generation.completeRun({
         workspaceId,
         target: targetFingerprint,
         targetModel,
         coverageTotal: produced,
         coverageEmbeddable: total,
+        coverageAt,
       });
     } finally {
       // Always remove the progress record so the status reverts to the DB count.

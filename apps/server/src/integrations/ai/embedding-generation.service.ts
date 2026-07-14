@@ -41,6 +41,54 @@ import { AiEmbeddingNotConfiguredException } from './ai-embedding-not-configured
  * Everything here is workspace-scoped and driver-agnostic (SEARCH_DRIVER=database).
  */
 
+/**
+ * #599 (review F1) — the reindex run finished building generation X, but the live
+ * config has since moved to a DIFFERENT fingerprint (the admin changed the model
+ * again while the run was in flight). X must NOT be published (the pointer belongs
+ * to the newest config), yet the new target has NO rows and NO job.
+ *
+ * The lost-generation chain this exists to break: `AiSettingsService.reindex()`
+ * calls `aiQueue.remove(jobId)` — a NO-OP on an ACTIVE job — and then `add(jobId)`,
+ * which BullMQ DE-DUPLICATES against that still-running job. So the config change
+ * enqueues nothing. The running job then completes fp1 successfully, correctly
+ * declines to flip (its target is stale), and is dropped by `removeOnComplete`.
+ * End state: config = fp2, pointer on fp1, zero rows for fp2, no job in any queue,
+ * and nothing anywhere re-triggers a reindex on `config != active` (there is no
+ * reconciler cron). On a MODEL change that is permanent: `modelChanged` keeps the
+ * vector arm down, so semantic search is lexical-only FOREVER, while the settings
+ * panel shows a green, complete "Indexed N of N, reindexing: false" — the pointer
+ * really is on a complete generation. Silent and invisible.
+ *
+ * THROWING is what fixes it: the run's own job fails, BullMQ RETRIES it (`attempts:
+ * 3` + exponential backoff, see workspaceReindexJobOptions — the same policy
+ * PartialReindexError relies on), and the retry re-resolves the provider at the top
+ * of runReindex, so it picks up the NOW-current target (fp2), builds it and flips
+ * onto it. The retry is the re-trigger the dedupe swallowed — and it cannot be
+ * deduped away, because it IS the same job.
+ *
+ * Retries are BOUNDED, so a config that keeps moving cannot loop forever: after the
+ * last attempt the job stays failed and the workspace is left with the OLD, COMPLETE
+ * generation still serving search — degraded (`stale` / lexical-only) but never
+ * corrupt, and loudly logged. The alternative (enqueueing a fresh job from inside
+ * the departing one, delayed past `removeOnComplete` so it cannot dedupe) buys
+ * nothing over this and adds a race with the very dedupe window it is dodging.
+ */
+export class StaleReindexTargetError extends Error {
+  constructor(
+    readonly workspaceId: string,
+    readonly target: string,
+    readonly configFingerprint: string,
+  ) {
+    super(
+      `Reindex of workspace ${workspaceId} built generation ${target}, but the ` +
+        `embedding config now resolves to ${configFingerprint}: the pointer was NOT ` +
+        `flipped (the newest config owns it). Failing the run so it is RETRIED and ` +
+        `rebuilds the CURRENT target — otherwise nothing would ever build it.`,
+    );
+    this.name = 'StaleReindexTargetError';
+  }
+}
+
 /** The two fingerprints of a workspace at a point in time. */
 export interface EmbeddingGeneration {
   /** The generation search/RAG serve (persisted pointer, or the config fp when never flipped). */
@@ -116,6 +164,10 @@ function coverageTtlMs(): number {
  *                    no run has ever completed for it
  * @param completedEmbeddable  how many pages that SAME run considered embeddable
  *                    (null on a record written before this key existed)
+ * @param changedSince  LIVE count of embeddable pages CREATED OR EDITED after that
+ *                    run started (0 when the run recorded no timestamp)
+ * @param indexedChangedSince  how many of THOSE pages the active generation already
+ *                    covers (the event indexer got to them)
  *
  * The denominator cannot be the raw `embeddable` count: that predicate is an
  * OPTIMISTIC over-approximation — a page whose only content is a math block or an
@@ -128,25 +180,59 @@ function coverageTtlMs(): number {
  * denominator, and a workspace with 100 indexed pages and 1000 brand-new un-indexed
  * ones would happily report `full`.
  *
- * So the rule measures the CHUNK-LESS GAP once (`completedEmbeddable -
+ * So the run measures the CHUNK-LESS GAP once (`completedEmbeddable -
  * completedTotal` — how many pages of this workspace look embeddable but produce
- * nothing) and subtracts that gap from the LIVE embeddable count:
+ * nothing) and the rule subtracts that gap from the LIVE embeddable count.
  *
- *     total = max(0, embeddable - gap)
+ * #599 (review F2) — but the gap may only be spent on the pages it was MEASURED
+ * over. Subtracting it from the whole live count lets a stale gap excuse pages the
+ * run never saw:
  *
- * which gives all three required properties:
- *   (a) pages ADDED -> `embeddable` grows -> `total` grows past `indexed` -> stale,
- *       and it converges back to `full` as the event-driven indexer embeds them;
+ *     run: 10 embeddable, 6 produced a chunk        -> gap 4
+ *     the 4 chunk-less pages are DELETED            -> embeddable 6, indexed 6
+ *     3 brand-new pages are created (no vectors yet) -> embeddable 9
+ *     total = max(0, 9 - 4) = 5 -> clamped to 6 -> indexed 6 >= 6 -> "full"
+ *
+ * — `full` while three pages hold no vectors at all. Worse, those 4 numbers alone
+ * CANNOT distinguish that corpus from a legitimately full one (6 producers + 3
+ * surviving chunk-less pages): both give (indexed 6, embeddable 9, completed 6/10).
+ * No rule over those four inputs can be right in both cases, so the rule needs one
+ * more fact — WHICH pages the run actually measured. `changedSince` supplies it (via
+ * the run's recorded `coverageAt`), splitting the corpus in two:
+ *
+ *   OLD bucket — pages the completed run measured (`embeddable - changedSince`).
+ *     The frozen gap belongs here and here only, and is additionally capped at the
+ *     bucket's un-indexed pages: the run's chunk-less pages are old pages that hold
+ *     no rows, so there can never be more of them than that (this is also what keeps
+ *     `total >= indexed`, #599 R4).
+ *   CHANGED bucket — pages created/edited since the run (`changedSince`). The run
+ *     never measured them, so NOTHING excuses them: they count in full, and are
+ *     covered only by really holding rows of the active generation
+ *     (`indexedChangedSince`, which is why the numerator is split too — a page that
+ *     is merely MOVED bumps `updated_at` without losing its vectors, and must not
+ *     inflate the denominator).
+ *
+ *     total = max(0, oldEmbeddable - cappedGap) + changedSince
+ *
+ * which gives all the required properties:
+ *   (a) pages ADDED -> the changed bucket grows -> `total` grows past `indexed` ->
+ *       stale, converging back to `full` as the event indexer embeds them;
  *   (b) pages DELETED -> `embeddable` shrinks and so does `indexed` (both exclude
  *       trashed pages) -> converges to `full`, never a perpetual `stale`;
  *   (c) a workspace whose pages produce NO chunks at all (gap == embeddable) gets
- *       total 0 -> `full`, not the perpetual `stale` of #599 D5.
+ *       total 0 -> `full`, not the perpetual `stale` of #599 D5;
+ *   (d) a shrunken corpus can no longer leave stale slack behind: the gap is spent
+ *       only over pages that still exist AND are still un-indexed (review F2).
  *
- * Known imprecision (deliberate): a chunk-less page CREATED after the run inflates
- * `embeddable` without ever being able to raise `indexed`, so the state reads
- * `stale` until the next completed run re-measures the gap. That errs on the side of
- * "a reindex would help" — the safe direction; the opposite error (claiming `full`
- * while pages are missing from the index) is the one that matters.
+ * Known imprecision (deliberate, unchanged): a chunk-less page created/edited after
+ * the run sits in the CHANGED bucket and can never raise `indexed`, so the state
+ * reads `stale` until the next completed run re-measures the gap. That errs on the
+ * side of "a reindex would help" — the safe direction; the opposite error (claiming
+ * `full` while pages are missing from the index) is the one that matters.
+ *
+ * Back-compat: `changedSince`/`indexedChangedSince` default to 0, which is exactly
+ * "nothing changed since the run" and reduces the rule to the pure frozen-gap form —
+ * what a pointer flipped by a build that predates `coverageAt` gets.
  *
  * Bootstrap (`completedTotal == null`: legacy/fresh instance, or a config change
  * whose run has not completed) falls back to `embeddable`, so an un-indexed
@@ -157,6 +243,8 @@ export function computeCoverage(params: {
   embeddable: number;
   completedTotal: number | null;
   completedEmbeddable: number | null;
+  changedSince?: number;
+  indexedChangedSince?: number;
 }): EmbeddingCoverage {
   const { indexed, embeddable, completedTotal, completedEmbeddable } = params;
 
@@ -169,24 +257,51 @@ export function computeCoverage(params: {
     return { indexed, total, state: indexed >= total ? 'full' : 'stale' };
   }
 
+  // The two live counts are independent COUNTs taken a moment apart, so clamp them
+  // into a consistent shape rather than trusting their arithmetic: `changed` cannot
+  // exceed the corpus, and the changed pages that ARE indexed cannot exceed either
+  // the changed bucket or the numerator.
+  const changed = Math.min(Math.max(0, params.changedSince ?? 0), embeddable);
+  const indexedChanged = Math.min(
+    Math.max(0, params.indexedChangedSince ?? 0),
+    changed,
+    indexed,
+  );
+
+  // The bucket the completed run actually measured, and the part of the numerator
+  // that belongs to it.
+  const oldEmbeddable = Math.max(0, embeddable - changed);
+  const oldIndexed = Math.max(0, indexed - indexedChanged);
+
   // Pages that look embeddable but produce no chunk, as MEASURED by the run that
   // built the active generation. A pre-D3 record has no `completedEmbeddable`: gap
   // 0 is the conservative choice (it can only make the state read `stale`, never a
   // false `full`), and the next completed run records both keys and self-heals.
-  const gap =
+  const rawGap =
     completedEmbeddable != null
       ? Math.max(0, completedEmbeddable - completedTotal)
       : 0;
 
-  // #599 (R4) — the gap is FROZEN at the completed run, so it can over-subtract:
-  // delete the chunk-less pages the run measured and `embeddable` shrinks while the
-  // gap does not, which would print an absurd "indexed 7 / total 4" (the numerator
-  // is live, the gap is not). Clamp the denominator to the numerator: `indexed` is
-  // a real count of pages holding rows of the active generation, so the denominator
-  // can never honestly be below it. The clamp only ever moves the state toward
-  // `full`, which is correct in exactly this case (every indexed page is covered),
-  // and it cannot manufacture a false `full` — it never lowers `indexed`.
-  const total = Math.max(Math.max(0, embeddable - gap), indexed);
+  // The chunk-less pages the run measured are OLD pages that hold NO rows of the
+  // active generation, so the gap can never exceed the old bucket's un-indexed
+  // pages. Capping it here is what stops a FROZEN gap from out-living the pages it
+  // measured (#599 R4 / review F2): delete them and the excuse dies with them,
+  // instead of silently excusing whatever un-indexed page shows up next. It also
+  // guarantees total >= indexed on this path (an "indexed 7 / total 4" is never
+  // printable).
+  const gap = Math.min(rawGap, Math.max(0, oldEmbeddable - oldIndexed));
+
+  // The run's bucket keeps its measured excuse; the changed bucket gets none.
+  //
+  // The final clamp to `indexed` (#599 R4) is kept as a belt-and-braces invariant:
+  // the gap cap above already guarantees total >= indexed whenever the live counts
+  // are CONSISTENT, but `indexed` and `embeddable` are separate COUNTs taken a
+  // moment apart, so a page deleted between them can momentarily put the numerator
+  // above the corpus. An "indexed 7 / total 4" must never be printable. It can only
+  // ever RAISE the denominator to the numerator, so it cannot manufacture a false
+  // `full` (it never lowers `indexed`, and it never lowers a denominator that the
+  // rule above put ABOVE `indexed` — which is exactly the review-F2 case).
+  const total = Math.max(Math.max(0, oldEmbeddable - gap) + changed, indexed);
 
   // total === 0 = every embeddable page is chunk-less (or the workspace is empty):
   // there is nothing the index COULD hold, so it is trivially covered.
@@ -444,16 +559,25 @@ export class EmbeddingGenerationService {
    *
    * GUARD — the flip happens ONLY if the live config STILL resolves to `target`.
    * If the admin changed the model again while this run was in flight, the config
-   * now points at a THIRD fingerprint and a second reindex is already queued for
-   * it; flipping onto this run's target would publish a generation nobody is
-   * maintaining and would immediately be superseded (the "second swap during the
-   * first" hazard). We skip the flip and let the newer run own the pointer — this
-   * run's rows are simply an extra generation, reclaimed by the next run's start
-   * GC.
+   * now points at a THIRD fingerprint; flipping onto this run's target would publish
+   * a generation nobody is maintaining and that is already superseded (the "second
+   * swap during the first" hazard). The pointer belongs to the newest config.
+   *
+   * #599 (review F1) — but we must NOT skip QUIETLY. The comment that used to sit
+   * here claimed "a second reindex is already queued for it", and that was FALSE:
+   * the config change went through `AiSettingsService.reindex()`, whose
+   * `remove(jobId)` is a no-op on an ACTIVE job and whose `add(jobId)` is then
+   * DE-DUPLICATED against this very run. Nothing was queued. Returning false here
+   * therefore completed the job successfully, `removeOnComplete` dropped it, and the
+   * new target was left with zero rows, no job, and no reconciler to notice (see
+   * StaleReindexTargetError). We THROW instead, so THIS job is retried and its retry
+   * rebuilds the now-current target.
    *
    * Returns true when the pointer was flipped (or re-affirmed on the no-swap path,
    * where active already equals target — the coverage total still has to be
-   * recorded, it is what turns the state from `stale` into `full`).
+   * recorded, it is what turns the state from `stale` into `full`). Returns false
+   * only when there is nothing to publish at all (the provider was removed mid-run);
+   * a config DRIFT throws.
    */
   async completeRun(params: {
     workspaceId: string;
@@ -463,6 +587,8 @@ export class EmbeddingGenerationService {
     coverageTotal: number;
     /** Pages this run CONSIDERED embeddable — the gap measurement of #599 D3. */
     coverageEmbeddable: number;
+    /** When this run STARTED — partitions the corpus for computeCoverage (review F2). */
+    coverageAt: Date;
   }): Promise<boolean> {
     const {
       workspaceId,
@@ -470,6 +596,7 @@ export class EmbeddingGenerationService {
       targetModel,
       coverageTotal,
       coverageEmbeddable,
+      coverageAt,
     } = params;
 
     // Re-resolve the CONFIG fingerprint right before the write.
@@ -490,19 +617,27 @@ export class EmbeddingGenerationService {
     }
 
     if (configFingerprint !== target) {
+      // The generation we just built is stale. Do NOT flip it — and do NOT return
+      // quietly either: nothing else is building the config's current target (the
+      // enqueue that would have was deduped against THIS job). Fail so the job is
+      // retried and its retry builds it. See StaleReindexTargetError.
       this.logger.warn(
         `embedding.swap.skipped workspace=${workspaceId} reason=config-changed ` +
-          `target=${target} config=${configFingerprint}`,
+          `target=${target} config=${configFingerprint} — failing the run so it is ` +
+          `RETRIED against the current config (the rows just written stay as an extra ` +
+          `generation and are reclaimed by the retry's start GC)`,
       );
-      return false;
+      throw new StaleReindexTargetError(workspaceId, target, configFingerprint);
     }
 
-    // ONE settings write: pointer + model + denominator move together or not at all.
+    // ONE settings write: pointer + model + denominators + the coverage timestamp
+    // move together or not at all.
     await this.workspaceRepo.setEmbeddingGeneration(workspaceId, {
       activeFingerprint: target,
       activeModel: targetModel,
       coverageTotal,
       coverageEmbeddable,
+      coverageAt,
     });
     this.invalidateCoverage(workspaceId);
     this.logger.log(
@@ -537,30 +672,53 @@ export class EmbeddingGenerationService {
       return cached.value;
     }
 
-    // #599 D3 — the LIVE embeddable count is now needed on EVERY path, not only on
-    // bootstrap: it is what makes the denominator grow when pages are ADDED (the
-    // frozen completed-run total never does, so the state could never leave `full`
-    // no matter how many un-indexed pages appeared). It is one COUNT over `pages`,
-    // and the whole coverage result is TTL-cached, so it is not paid per keystroke.
-    const [indexed, embeddable, stored] = await Promise.all([
-      this.pageEmbeddingRepo.countPagesByFingerprint(
-        workspaceId,
-        activeFingerprint,
-      ),
-      this.pageRepo.countEmbeddablePages(workspaceId),
-      this.workspaceRepo.getEmbeddingGeneration(workspaceId),
-    ]);
-
-    // The recorded denominator belongs to the generation the pointer names. If the
+    // The stored record decides WHICH counts we need, so it is read first. The
+    // recorded denominator belongs to the generation the pointer names: if the
     // caller is asking about a DIFFERENT generation (it never should — readers pass
     // the active pointer), the total does not apply and we fall back to bootstrap.
+    const stored = await this.workspaceRepo.getEmbeddingGeneration(workspaceId);
     const forActive = stored.activeFingerprint === activeFingerprint;
+    // The instant the run that produced the stored numbers started (#599 review F2).
+    // Absent on a pointer flipped by a build that predates the key -> the two
+    // `changedSince` counts are skipped entirely and computeCoverage degrades to the
+    // pure frozen-gap rule.
+    const since = forActive ? stored.coverageAt : null;
+
+    // #599 D3 — the LIVE embeddable count is needed on EVERY path, not only on
+    // bootstrap: it is what makes the denominator grow when pages are ADDED (the
+    // frozen completed-run total never does, so the state could never leave `full`
+    // no matter how many un-indexed pages appeared).
+    //
+    // #599 (review F2) — the two `changedSince` counts split that corpus into the
+    // pages the completed run measured and the pages it did not, so its frozen
+    // chunk-less gap can only excuse the former. All of it is TTL-cached, so these
+    // COUNTs are not paid per keystroke.
+    const [indexed, embeddable, indexedChangedSince, changedSince] =
+      await Promise.all([
+        this.pageEmbeddingRepo.countPagesByFingerprint(
+          workspaceId,
+          activeFingerprint,
+        ),
+        this.pageRepo.countEmbeddablePages(workspaceId),
+        since
+          ? this.pageEmbeddingRepo.countPagesByFingerprint(
+              workspaceId,
+              activeFingerprint,
+              since,
+            )
+          : Promise.resolve(0),
+        since
+          ? this.pageRepo.countEmbeddablePagesChangedSince(workspaceId, since)
+          : Promise.resolve(0),
+      ]);
 
     const coverage = computeCoverage({
       indexed,
       embeddable,
       completedTotal: forActive ? stored.coverageTotal : null,
       completedEmbeddable: forActive ? stored.coverageEmbeddable : null,
+      changedSince,
+      indexedChangedSince,
     });
 
     if (ttl > 0) {

@@ -138,9 +138,7 @@ export class WorkspaceRepo {
     return query.executeTakeFirst();
   }
 
-  async findLicenseKeyById(
-    workspaceId: string,
-  ): Promise<string | undefined> {
+  async findLicenseKeyById(workspaceId: string): Promise<string | undefined> {
     const row = await this.db
       .selectFrom('workspaces')
       .select('licenseKey')
@@ -382,12 +380,15 @@ export class WorkspaceRepo {
     activeModel: string | null;
     coverageTotal: number | null;
     coverageEmbeddable: number | null;
+    coverageAt: Date | null;
   }> {
     const db = dbOrTx(this.db, trx);
     const row = await db
       .selectFrom('workspaces')
       .select([
-        sql<string | null>`settings->'ai'->'embedding'->>'activeFingerprint'`.as(
+        sql<
+          string | null
+        >`settings->'ai'->'embedding'->>'activeFingerprint'`.as(
           'activeFingerprint',
         ),
         sql<string | null>`settings->'ai'->'embedding'->>'activeModel'`.as(
@@ -396,8 +397,13 @@ export class WorkspaceRepo {
         sql<string | null>`settings->'ai'->'embedding'->>'coverageTotal'`.as(
           'coverageTotal',
         ),
-        sql<string | null>`settings->'ai'->'embedding'->>'coverageEmbeddable'`.as(
+        sql<
+          string | null
+        >`settings->'ai'->'embedding'->>'coverageEmbeddable'`.as(
           'coverageEmbeddable',
+        ),
+        sql<string | null>`settings->'ai'->'embedding'->>'coverageAt'`.as(
+          'coverageAt',
         ),
       ])
       .where('id', '=', workspaceId)
@@ -411,11 +417,22 @@ export class WorkspaceRepo {
       const parsed = raw == null || raw === '' ? NaN : Number(raw);
       return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
     };
+    // `coverageAt` is stored as an ISO string. A missing key (a pointer flipped by
+    // a build that predates it) or an unparseable value must read as null, which
+    // makes computeCoverage fall back to its pure frozen-gap rule — never a bogus
+    // Invalid Date, which would silently make every `updated_at > $since`
+    // comparison false and hide every changed page.
+    const at = (raw: string | null | undefined): Date | null => {
+      if (!raw) return null;
+      const parsed = new Date(raw);
+      return Number.isFinite(parsed.getTime()) ? parsed : null;
+    };
     return {
       activeFingerprint: row?.activeFingerprint || null,
       activeModel: row?.activeModel || null,
       coverageTotal: count(row?.coverageTotal),
       coverageEmbeddable: count(row?.coverageEmbeddable),
+      coverageAt: at(row?.coverageAt),
     };
   }
 
@@ -424,10 +441,17 @@ export class WorkspaceRepo {
    * to the generation a completed reindex just built, and record that run's
    * coverage denominator, in ONE settings write.
    *
-   * All four keys are written by a single UPDATE (one jsonb `||` merge), so a
+   * All five keys are written by a single UPDATE (one jsonb `||` merge), so a
    * reader can never observe the new fingerprint with the old run's coverage total
    * (or vice-versa) — the flip is all-or-nothing. Sibling `settings.ai.*` keys
    * (provider / search / chat / mcp) are preserved by the merge.
+   *
+   * `coverageAt` (#599 review F2) is the instant the run that produced these
+   * numbers STARTED: it partitions the corpus into the pages the run measured and
+   * the pages it did not (created/edited since), which is what keeps the frozen
+   * chunk-less gap from excusing brand-new un-embedded pages. It rides in the same
+   * write for the same reason as the counts — a coverage timestamp that did not
+   * match the coverage numbers would be worse than none.
    *
    * #599 (D6) — BOTH `settings->'ai'` and `settings->'ai'->'embedding'` are wrapped
    * in a `jsonb_typeof = 'object'` CASE. `COALESCE` only guards a NULL value; if
@@ -449,6 +473,8 @@ export class WorkspaceRepo {
       activeModel: string;
       coverageTotal: number;
       coverageEmbeddable: number;
+      /** When the run that measured the coverage STARTED (see the doc above). */
+      coverageAt: Date;
     },
     trx?: KyselyTransaction,
   ): Promise<void> {
@@ -469,7 +495,8 @@ export class WorkspaceRepo {
                  'activeFingerprint', ${generation.activeFingerprint}::text,
                  'activeModel', ${generation.activeModel}::text,
                  'coverageTotal', ${count(generation.coverageTotal)}::text,
-                 'coverageEmbeddable', ${count(generation.coverageEmbeddable)}::text
+                 'coverageEmbeddable', ${count(generation.coverageEmbeddable)}::text,
+                 'coverageAt', ${generation.coverageAt.toISOString()}::text
                )
           ))`,
         updatedAt: new Date(),
@@ -551,5 +578,4 @@ export class WorkspaceRepo {
     await this.bustWorkspaceCache(workspace, trx);
     return workspace;
   }
-
 }

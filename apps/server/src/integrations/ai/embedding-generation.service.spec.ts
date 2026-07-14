@@ -1,6 +1,7 @@
 import {
   computeCoverage,
   EmbeddingGenerationService,
+  StaleReindexTargetError,
 } from './embedding-generation.service';
 import { AiService } from './ai.service';
 import { AiEmbeddingNotConfiguredException } from './ai-embedding-not-configured.exception';
@@ -83,15 +84,24 @@ function makeLockDb(locked: boolean, failUnlock = false) {
   return { db: db as unknown as KyselyDB, executed };
 }
 
+/** The instant a completed run started (drives the review-F2 `changedSince` split). */
+const RUN_AT = new Date('2026-07-01T00:00:00.000Z');
+
 function makeService(opts?: {
   active?: string | null;
   activeModel?: string | null;
   coverageTotal?: number | null;
   coverageEmbeddable?: number | null;
+  coverageAt?: Date | null;
   configFingerprint?: string | null; // null => no provider configured
   configModel?: string;
   indexed?: number;
   embeddable?: number;
+  // #599 review F2 — the LIVE counts over the pages the completed run never
+  // measured (created/edited since coverageAt), and how many of those the active
+  // generation already covers.
+  changedSince?: number;
+  indexedChangedSince?: number;
   lockAvailable?: boolean;
   failUnlock?: boolean;
 }) {
@@ -100,6 +110,7 @@ function makeService(opts?: {
     activeModel: opts?.activeModel ?? null,
     coverageTotal: opts?.coverageTotal ?? null,
     coverageEmbeddable: opts?.coverageEmbeddable ?? null,
+    coverageAt: opts?.coverageAt ?? null,
   };
 
   const aiService = {
@@ -132,23 +143,33 @@ function makeService(opts?: {
           activeModel: string;
           coverageTotal: number;
           coverageEmbeddable: number;
+          coverageAt: Date;
         },
       ) => {
         stored.activeFingerprint = gen.activeFingerprint;
         stored.activeModel = gen.activeModel;
         stored.coverageTotal = gen.coverageTotal;
         stored.coverageEmbeddable = gen.coverageEmbeddable;
+        stored.coverageAt = gen.coverageAt;
       },
     ),
   };
 
   const pageEmbeddingRepo = {
-    countPagesByFingerprint: jest.fn(async () => opts?.indexed ?? 0),
+    // The 3rd arg is the review-F2 `changedSince` cutoff: with it, the repo counts
+    // only the pages TOUCHED since the run that ARE covered by the generation.
+    countPagesByFingerprint: jest.fn(
+      async (_ws: string, _fp: string, changedSince?: Date) =>
+        changedSince ? (opts?.indexedChangedSince ?? 0) : (opts?.indexed ?? 0),
+    ),
     deleteOtherGenerations: jest.fn(async () => 0),
   };
 
   const pageRepo = {
     countEmbeddablePages: jest.fn(async () => opts?.embeddable ?? 0),
+    countEmbeddablePagesChangedSince: jest.fn(
+      async () => opts?.changedSince ?? 0,
+    ),
   };
 
   const { db, executed } = makeLockDb(
@@ -341,6 +362,131 @@ describe('computeCoverage (#599) — the gap-corrected denominator', () => {
     // Conservative: reports `stale` (a reindex re-measures the gap and self-heals).
     expect(cov).toEqual({ indexed: 98, total: 100, state: 'stale' });
   });
+
+  // --- review F2: the frozen gap may only be spent on the pages it MEASURED -----
+
+  /**
+   * The reviewer's counterexample. Run: 10 embeddable, 6 produced a chunk -> gap 4.
+   * The 4 chunk-less pages are then DELETED (embeddable 6) and 3 REAL pages are
+   * created (embeddable 9) that no one has embedded yet.
+   *
+   * The frozen gap of 4 used to be subtracted from the LIVE count — `total =
+   * max(0, 9 - 4) = 5`, clamped up to `indexed` 6 — so the state read `full` while
+   * three pages held no vectors at all: the indicator lied in exactly the direction
+   * the whole PR exists to prevent, and the settings panel showed a green "Indexed
+   * 6 of 6".
+   *
+   * NOTE the 4 numbers of the old signature CANNOT decide this case: they are
+   * identical to the legitimately-full corpus in the next test. What breaks the tie
+   * is `changedSince` — the 3 pages are NEW, so the run's gap (measured over pages
+   * that no longer exist) cannot excuse them.
+   *
+   * NON-VACUITY: drop the `changedSince` split (spend the gap over the whole live
+   * count, i.e. the pre-fix `total = max(0, embeddable - gap)`) and this reddens —
+   * it goes back to reporting `full`.
+   */
+  it('review F2 — a shrunken corpus cannot leave stale slack: 3 un-embedded new pages => stale', () => {
+    const cov = computeCoverage({
+      indexed: 6,
+      embeddable: 9,
+      completedTotal: 6,
+      completedEmbeddable: 10,
+      // The 3 new pages were created after the run and hold no rows.
+      changedSince: 3,
+      indexedChangedSince: 0,
+    });
+    expect(cov).toEqual({ indexed: 6, total: 9, state: 'stale' });
+  });
+
+  it('review F2 — the twin corpus (a chunk-less page merely DELETED) stays honestly full', () => {
+    // Same run (10 embeddable / 6 produced), but here ONE chunk-less page was
+    // deleted and nothing was added: 6 producers + 3 surviving chunk-less pages.
+    // Numerically identical to the case above on the old 4-input signature
+    // (indexed 6, embeddable 9, completed 6/10) — yet the truth is the opposite.
+    // `changedSince: 0` (nothing was created/edited since the run) is what says so,
+    // and the run's measured gap still legitimately excuses the 3 chunk-less pages.
+    const cov = computeCoverage({
+      indexed: 6,
+      embeddable: 9,
+      completedTotal: 6,
+      completedEmbeddable: 10,
+      changedSince: 0,
+      indexedChangedSince: 0,
+    });
+    expect(cov).toEqual({ indexed: 6, total: 6, state: 'full' });
+  });
+
+  it('review F2 — converges back to full once the event indexer embeds the new pages', () => {
+    // The same 3 new pages, now carrying rows of the active generation: they are in
+    // the changed bucket AND in the numerator, so they cancel out.
+    const cov = computeCoverage({
+      indexed: 9,
+      embeddable: 9,
+      completedTotal: 6,
+      completedEmbeddable: 10,
+      changedSince: 3,
+      indexedChangedSince: 3,
+    });
+    expect(cov).toEqual({ indexed: 9, total: 9, state: 'full' });
+  });
+
+  it('review F2 — a MOVED (touched but still indexed) page does not inflate the denominator', () => {
+    // A page move bumps `updated_at` without touching content or vectors: it lands
+    // in the changed bucket but keeps its rows, so it must not read as un-covered.
+    // (This is why the numerator is split too, not just the denominator.)
+    const cov = computeCoverage({
+      indexed: 98,
+      embeddable: 100,
+      completedTotal: 98,
+      completedEmbeddable: 100,
+      changedSince: 5,
+      indexedChangedSince: 5,
+    });
+    expect(cov).toEqual({ indexed: 98, total: 98, state: 'full' });
+  });
+
+  it('review F2 — the gap still excuses chunk-less pages that are UNTOUCHED (no D5 regression)', () => {
+    // 2 chunk-less pages from the run survive untouched while 4 new pages were added
+    // and embedded: the gap is spent on the old bucket only, and the state stays full.
+    const cov = computeCoverage({
+      indexed: 102,
+      embeddable: 104,
+      completedTotal: 98,
+      completedEmbeddable: 100,
+      changedSince: 4,
+      indexedChangedSince: 4,
+    });
+    expect(cov).toEqual({ indexed: 102, total: 102, state: 'full' });
+  });
+
+  it('review F2 — an un-indexed OLD page beyond the measured gap is still reported (no blanket excuse)', () => {
+    // The run measured a gap of 2, but 10 old pages now hold no rows (someone purged
+    // rows out-of-band). The gap excuses 2 of them; the other 8 keep the state stale.
+    const cov = computeCoverage({
+      indexed: 90,
+      embeddable: 100,
+      completedTotal: 98,
+      completedEmbeddable: 100,
+      changedSince: 0,
+      indexedChangedSince: 0,
+    });
+    expect(cov).toEqual({ indexed: 90, total: 98, state: 'stale' });
+  });
+
+  it('review F2 — the denominator is never below the numerator, whatever the live counts say', () => {
+    // Deliberately inconsistent inputs (the counts are separate COUNTs taken a
+    // moment apart, and `changedSince` could momentarily exceed `embeddable`).
+    const cov = computeCoverage({
+      indexed: 7,
+      embeddable: 4,
+      completedTotal: 4,
+      completedEmbeddable: 10,
+      changedSince: 99,
+      indexedChangedSince: 99,
+    });
+    expect(cov.total).toBeGreaterThanOrEqual(cov.indexed);
+    expect(cov.state).toBe('full');
+  });
 });
 
 describe('EmbeddingGenerationService.getCoverage', () => {
@@ -370,6 +516,60 @@ describe('EmbeddingGenerationService.getCoverage', () => {
       total: 1100,
       state: 'stale',
     });
+  });
+
+  it('review F2 — reports STALE for the reviewer corpus (chunk-less pages deleted, real pages added)', async () => {
+    // End-to-end through the service: the stored record has the run's gap (6 of 10
+    // produced) AND its timestamp, and the live counts say 9 embeddable / 6 indexed
+    // with 3 of them created since the run and holding no rows. The frozen gap must
+    // not excuse those 3.
+    const { service, pageRepo, pageEmbeddingRepo } = makeService({
+      active: 'fp-A',
+      coverageTotal: 6,
+      coverageEmbeddable: 10,
+      coverageAt: RUN_AT,
+      indexed: 6,
+      embeddable: 9,
+      changedSince: 3,
+      indexedChangedSince: 0,
+    });
+
+    await expect(service.getCoverage(WS, 'fp-A')).resolves.toEqual({
+      indexed: 6,
+      total: 9,
+      state: 'stale',
+    });
+
+    // The changed-bucket counts are really taken against the recorded run instant
+    // (a wrong/absent cutoff would silently make every page look "old" again).
+    expect(pageRepo.countEmbeddablePagesChangedSince).toHaveBeenCalledWith(
+      WS,
+      RUN_AT,
+    );
+    expect(pageEmbeddingRepo.countPagesByFingerprint).toHaveBeenCalledWith(
+      WS,
+      'fp-A',
+      RUN_AT,
+    );
+  });
+
+  it('review F2 — a record with no coverageAt (pre-key flip) skips the extra counts and keeps the old rule', async () => {
+    const { service, pageRepo } = makeService({
+      active: 'fp-A',
+      coverageTotal: 98,
+      coverageEmbeddable: 100,
+      coverageAt: null, // flipped by a build that predates the key
+      indexed: 98,
+      embeddable: 100,
+    });
+
+    await expect(service.getCoverage(WS, 'fp-A')).resolves.toEqual({
+      indexed: 98,
+      total: 98,
+      state: 'full',
+    });
+    // No timestamp -> no cutoff to count against -> the two extra COUNTs are skipped.
+    expect(pageRepo.countEmbeddablePagesChangedSince).not.toHaveBeenCalled();
   });
 
   it('caches per (workspace, fingerprint) for the TTL', async () => {
@@ -498,9 +698,10 @@ describe('EmbeddingGenerationService.completeRun — the ATOMIC flip + its guard
     targetModel: 'model-1',
     coverageTotal,
     coverageEmbeddable,
+    coverageAt: RUN_AT,
   });
 
-  it('flips the pointer and records model + denominators in ONE settings write', async () => {
+  it('flips the pointer and records model + denominators + coverageAt in ONE settings write', async () => {
     const { service, workspaceRepo, stored } = makeService({
       active: 'fp-A',
       configFingerprint: 'fp-B',
@@ -514,30 +715,73 @@ describe('EmbeddingGenerationService.completeRun — the ATOMIC flip + its guard
       activeModel: 'model-1',
       coverageTotal: 98,
       coverageEmbeddable: 100,
+      coverageAt: RUN_AT,
     });
     expect(stored).toEqual({
       activeFingerprint: 'fp-B',
       activeModel: 'model-1',
       coverageTotal: 98,
       coverageEmbeddable: 100,
+      coverageAt: RUN_AT,
     });
   });
 
-  it('does NOT flip when the config changed DURING the run (second swap during the first)', async () => {
-    // The run targeted fp-B, but the admin has since switched the model again:
-    // the config now resolves to fp-C and a NEW reindex owns the pointer.
+  /**
+   * #599 review F1 — the config moved on WHILE this run was building fp-B, so the
+   * pointer must not be flipped onto it. The old behaviour returned false, the job
+   * COMPLETED successfully and was dropped by removeOnComplete — and because the
+   * config change's own `aiQueue.add()` had been de-duplicated against this very
+   * job, NOTHING was left to build fp-C: no rows, no job, no reconciler. On a model
+   * change that meant permanently lexical-only search behind a green "Indexed N of
+   * N" panel.
+   *
+   * The flip is still refused; the difference is that the run now FAILS, so BullMQ
+   * retries it and the retry rebuilds the current target.
+   */
+  it('review F1 — THROWS a retryable error when the config changed DURING the run (never a silent skip)', async () => {
     const { service, workspaceRepo, stored } = makeService({
       active: 'fp-A',
       configFingerprint: 'fp-C',
     });
 
-    await expect(service.completeRun(run('fp-B'))).resolves.toBe(false);
-
-    // NON-VACUITY: removing the `configFingerprint !== target` guard in
-    // completeRun makes this expectation fail (the pointer would be flipped onto
-    // fp-B, a generation nobody maintains).
+    // NON-VACUITY (the guard): drop the `configFingerprint !== target` check and
+    // the pointer is flipped onto fp-B — a generation nobody maintains.
+    await expect(service.completeRun(run('fp-B'))).rejects.toBeInstanceOf(
+      StaleReindexTargetError,
+    );
     expect(workspaceRepo.setEmbeddingGeneration).not.toHaveBeenCalled();
     expect(stored.activeFingerprint).toBe('fp-A');
+  });
+
+  it('review F1 — the thrown error names the built target and the current config', async () => {
+    const { service } = makeService({
+      active: 'fp-A',
+      configFingerprint: 'fp-C',
+    });
+
+    // NON-VACUITY (the RE-TRIGGER): revert the throw to `return false` and this
+    // reddens — which is the whole bug, because a successful return is precisely
+    // what let the job complete and vanish without anyone building fp-C.
+    await expect(service.completeRun(run('fp-B'))).rejects.toMatchObject({
+      name: 'StaleReindexTargetError',
+      workspaceId: WS,
+      target: 'fp-B',
+      configFingerprint: 'fp-C',
+    });
+  });
+
+  it('review F1 — the stale run never GCs (its rows are left for the retry to reclaim)', async () => {
+    const { service, pageEmbeddingRepo } = makeService({
+      active: 'fp-A',
+      configFingerprint: 'fp-C',
+    });
+
+    await expect(service.completeRun(run('fp-B'))).rejects.toBeInstanceOf(
+      StaleReindexTargetError,
+    );
+    // A post-flip GC here (keep = [fp-B]) would destroy fp-A — the generation still
+    // serving search — on behalf of a generation that was never published.
+    expect(pageEmbeddingRepo.deleteOtherGenerations).not.toHaveBeenCalled();
   });
 
   it('does NOT flip (and never GCs) when the provider disappeared mid-run', async () => {
@@ -546,6 +790,9 @@ describe('EmbeddingGenerationService.completeRun — the ATOMIC flip + its guard
       configFingerprint: null,
     });
 
+    // No provider = there is no target generation to build, so there is nothing for
+    // a retry to do either: this one stays a quiet, successful no-op (unlike a
+    // config DRIFT, which must be retried).
     await expect(service.completeRun(run('fp-B', 1, 1))).resolves.toBe(false);
     expect(workspaceRepo.setEmbeddingGeneration).not.toHaveBeenCalled();
     expect(pageEmbeddingRepo.deleteOtherGenerations).not.toHaveBeenCalled();
@@ -577,6 +824,7 @@ describe('EmbeddingGenerationService.completeRun — the ATOMIC flip + its guard
       activeModel: 'model-1',
       coverageTotal: 42,
       coverageEmbeddable: 45,
+      coverageAt: RUN_AT,
     });
   });
 });

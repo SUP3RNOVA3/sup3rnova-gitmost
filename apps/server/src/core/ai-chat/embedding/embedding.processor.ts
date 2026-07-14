@@ -93,6 +93,12 @@ export class EmbeddingProcessor extends WorkerHost implements OnModuleDestroy {
         // the workspace remains in the safe old-generation-serving state — degraded
         // and VISIBLE (`stale`), never a silent success.
         //
+        // #599 (review F1) — the SAME rethrow carries StaleReindexTargetError: a run
+        // whose config changed mid-flight must not report success either. Its retry
+        // is the ONLY thing that will ever build the new target, because the reindex
+        // that config change tried to enqueue was de-duplicated against this very
+        // job (a stable per-workspace jobId).
+        //
         // Only the WORKSPACE-level run is retried this way: the per-page jobs above
         // keep their per-item isolation (one bad page must not re-run the others).
         try {

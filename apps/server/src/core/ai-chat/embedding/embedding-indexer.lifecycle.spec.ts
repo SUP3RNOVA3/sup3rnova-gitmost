@@ -6,8 +6,12 @@ import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { AiService } from '../../../integrations/ai/ai.service';
-import { EmbeddingGenerationService } from '../../../integrations/ai/embedding-generation.service';
+import {
+  EmbeddingGenerationService,
+  StaleReindexTargetError,
+} from '../../../integrations/ai/embedding-generation.service';
 import { EmbeddingReindexProgressService } from '../../../integrations/ai/embedding-reindex-progress.service';
+import { workspaceReindexJobOptions } from '../../../integrations/queue/constants/queue.constants';
 
 /**
  * #599 — the reindex run as the unit that owns a fingerprint TRANSITION:
@@ -161,6 +165,9 @@ describe('reindexWorkspace — generational GC + atomic flip (#599)', () => {
       // The run considered 3 pages embeddable; only 2 produced a chunk. The GAP
       // (3 - 2) is what keeps a chunk-less page from pinning coverage at `stale`.
       coverageEmbeddable: 3,
+      // #599 review F2 — the run's START instant rides along, so the coverage rule
+      // can tell the pages this run measured from the ones that appeared later.
+      coverageAt: expect.any(Date),
     });
   });
 
@@ -208,6 +215,7 @@ describe('reindexWorkspace — generational GC + atomic flip (#599)', () => {
       targetModel: 'e5-small',
       coverageTotal: 3,
       coverageEmbeddable: 3,
+      coverageAt: expect.any(Date),
     });
   });
 
@@ -322,6 +330,7 @@ describe('reindexWorkspace — a PARTIAL run never flips, and is RETRIED (#599 D
       targetModel: 'e5-small',
       coverageTotal: 3,
       coverageEmbeddable: 3,
+      coverageAt: expect.any(Date),
     });
   });
 });
@@ -447,5 +456,296 @@ describe('reindexPage — fingerprint-scoped replace (#599 acceptance 3)', () =>
       .mockResolvedValue({ ...page('p1'), textContent: '   ', content: null });
 
     await expect(service.reindexPage('p1')).resolves.toBe(0);
+  });
+});
+
+/**
+ * #599 (review F1) — A CONFIG CHANGE DURING A SUCCESSFUL RUN MUST NOT LOSE THE NEW
+ * GENERATION.
+ *
+ * The chain that used to lose it, end to end:
+ *
+ *   1. a reindex run X is in flight, building generation fp-1;
+ *   2. the admin picks another model -> the config resolves to fp-2, and
+ *      AiSettingsService.reindex() fires: `aiQueue.remove(jobId)` is a NO-OP on an
+ *      ACTIVE job, and `aiQueue.add(jobId)` is then DE-DUPLICATED against X. So the
+ *      config change enqueues NOTHING;
+ *   3. X finishes fp-1 with zero failures, and completeRun correctly refuses to flip
+ *      (its target is stale);
+ *   4. X is dropped by removeOnComplete.
+ *
+ * End state: config = fp-2, pointer still on fp-1, ZERO rows for fp-2, no job in the
+ * queue, and no cron/reconciler anywhere that re-triggers a reindex on
+ * `config != active`. On a MODEL change (the normal dropdown case) `modelChanged`
+ * keeps the vector arm down forever: semantic search is permanently lexical-only,
+ * while the settings panel shows a green "Indexed N of N, reindexing: false" — the
+ * pointer really IS on a complete generation. Invisible.
+ *
+ * The fix: completeRun THROWS StaleReindexTargetError instead of returning quietly,
+ * so the job FAILS and BullMQ retries it — and the retry re-resolves the provider,
+ * picks up fp-2, builds it and flips onto it.
+ *
+ * These tests wire the REAL EmbeddingGenerationService (real completeRun, real
+ * generationForTarget, real flip against a stateful workspace-settings double) to
+ * the REAL indexer, and drive them through a retry loop that mirrors BullMQ's
+ * `attempts` — the actual policy from workspaceReindexJobOptions, so the test cannot
+ * pass on a retry budget the queue does not really grant.
+ */
+describe('reindexWorkspace — a config change DURING the run (#599 review F1)', () => {
+  /** The live provider config; mutating it IS the admin changing the model. */
+  type Config = { fingerprint: string; modelId: string };
+
+  function makeRealStack(opts: {
+    storedActive: string | null;
+    storedModel: string | null;
+    config: Config;
+    pageIds?: string[];
+    /**
+     * Called after each page is indexed, with the page just written — the hook a
+     * test uses to move the config MID-RUN. Keyed on the page id (not a running
+     * counter) so it fires on the same page of EVERY run, which is what a config
+     * that "keeps moving" needs.
+     */
+    onPageIndexed?: (pageId: string) => void;
+  }) {
+    const pageIds = opts.pageIds ?? ['p1', 'p2', 'p3'];
+    const config = { ...opts.config };
+
+    // The workspace settings, as a stateful double: the flip really writes here and
+    // the next run really reads it back (that round trip is the point).
+    const stored = {
+      activeFingerprint: opts.storedActive,
+      activeModel: opts.storedModel,
+      coverageTotal: null as number | null,
+      coverageEmbeddable: null as number | null,
+      coverageAt: null as Date | null,
+    };
+
+    const workspaceRepo = {
+      getEmbeddingGeneration: jest.fn(async () => ({ ...stored })),
+      setEmbeddingGeneration: jest.fn(
+        async (
+          _ws: string,
+          gen: {
+            activeFingerprint: string;
+            activeModel: string;
+            coverageTotal: number;
+            coverageEmbeddable: number;
+            coverageAt: Date;
+          },
+        ) => {
+          stored.activeFingerprint = gen.activeFingerprint;
+          stored.activeModel = gen.activeModel;
+          stored.coverageTotal = gen.coverageTotal;
+          stored.coverageEmbeddable = gen.coverageEmbeddable;
+          stored.coverageAt = gen.coverageAt;
+        },
+      ),
+    };
+
+    // Rows actually written, keyed by fingerprint -> the pages carrying them. This
+    // is what proves the NEW generation gets BUILT, not merely pointed at.
+    const rowsByFingerprint = new Map<string, Set<string>>();
+    const pageEmbeddingRepo = {
+      deleteOtherGenerations: jest.fn(async (_ws: string, keep: string[]) => {
+        for (const fp of [...rowsByFingerprint.keys()]) {
+          if (!keep.includes(fp)) rowsByFingerprint.delete(fp);
+        }
+        return 0;
+      }),
+      countPagesByFingerprint: jest.fn(
+        async (_ws: string, fp: string) => rowsByFingerprint.get(fp)?.size ?? 0,
+      ),
+      deleteByPage: jest.fn(async () => undefined),
+      insertChunks: jest.fn(
+        async (rows: { pageId: string; fingerprint: string }[]) => {
+          for (const row of rows) {
+            const set =
+              rowsByFingerprint.get(row.fingerprint) ?? new Set<string>();
+            set.add(row.pageId);
+            rowsByFingerprint.set(row.fingerprint, set);
+          }
+        },
+      ),
+    };
+
+    const pageRepo = {
+      getEmbeddablePageIds: jest.fn(async () => [...pageIds]),
+      countEmbeddablePages: jest.fn(async () => pageIds.length),
+      countEmbeddablePagesChangedSince: jest.fn(async () => 0),
+    };
+
+    const aiService = {
+      // Resolved fresh on EVERY call — exactly like the real one, which is what
+      // lets a mid-run config change be observed by completeRun's re-resolve.
+      resolveEmbeddingProvider: jest.fn(async () => ({
+        model: { modelId: config.modelId },
+        modelId: config.modelId,
+        queryPrefix: 'query: ',
+        docPrefix: 'passage: ',
+        fingerprint: config.fingerprint,
+      })),
+      embedWithModel: jest.fn(async () => [[0.1, 0.2, 0.3]]),
+    };
+
+    const reindexProgress = {
+      start: jest.fn(async () => undefined),
+      increment: jest.fn(async () => undefined),
+      clear: jest.fn(async () => undefined),
+    };
+
+    const db = { transaction: () => ({ execute: (cb: any) => cb({}) }) };
+
+    const generation = new EmbeddingGenerationService(
+      aiService as any,
+      workspaceRepo as any,
+      pageEmbeddingRepo as any,
+      pageRepo as any,
+      db as any,
+    );
+    // The per-workspace advisory lock is exercised by its own SQL-level tests; here
+    // it would only need a live Postgres. Run the body straight through.
+    jest
+      .spyOn(generation, 'runExclusive')
+      .mockImplementation(async (_ws: string, fn: () => Promise<void>) => {
+        await fn();
+        return true;
+      });
+
+    const service = new EmbeddingIndexerService(
+      pageRepo as any,
+      pageEmbeddingRepo as any,
+      aiService as any,
+      reindexProgress as any,
+      generation,
+      db as any,
+    );
+
+    // A real-ish per-page indexer: it writes rows under the LIVE config fingerprint
+    // (as reindexPage does) and lets the test move the config mid-run.
+    jest.spyOn(service, 'reindexPage').mockImplementation(async (pageId) => {
+      await pageEmbeddingRepo.insertChunks([
+        { pageId, fingerprint: config.fingerprint },
+      ]);
+      opts.onPageIndexed?.(pageId);
+      return 1;
+    });
+
+    return { service, generation, config, stored, rowsByFingerprint, pageRepo };
+  }
+
+  /**
+   * BullMQ, faithfully enough: run the job; on failure retry it until the REAL
+   * `attempts` budget from workspaceReindexJobOptions is exhausted. The retry runs
+   * the SAME job — which is the whole point, since a fresh `add()` would be deduped.
+   */
+  async function runJobWithRetries(
+    run: () => Promise<void>,
+  ): Promise<{ attempts: number; lastError: unknown }> {
+    const { attempts } = workspaceReindexJobOptions(WS);
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await run();
+        return { attempts: attempt, lastError: null };
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    return { attempts, lastError };
+  }
+
+  it('the retried job REBUILDS and FLIPS onto the new target (the generation is not lost)', async () => {
+    const stack = makeRealStack({
+      storedActive: 'fp-0',
+      storedModel: 'e5-small',
+      config: { fingerprint: 'fp-1', modelId: 'e5-small' },
+      onPageIndexed: (pageId) => {
+        // The admin switches the model to bge WHILE the run is on its 2nd page.
+        if (pageId === 'p2' && stack.config.fingerprint === 'fp-1') {
+          stack.config.fingerprint = 'fp-2';
+          stack.config.modelId = 'bge-base';
+        }
+      },
+    });
+
+    const { attempts, lastError } = await runJobWithRetries(() =>
+      stack.service.reindexWorkspace(WS),
+    );
+
+    // Attempt 1 built fp-1, found the config on fp-2, and FAILED (not "succeeded
+    // quietly"). Attempt 2 re-resolved the provider, built fp-2 and flipped.
+    expect(attempts).toBe(2);
+    expect(lastError).toBeNull();
+
+    // THE ASSERTION THAT MATTERS: the new target is really BUILT (every page) and
+    // really SERVED (the pointer names it, with the new model recorded).
+    expect(stack.stored.activeFingerprint).toBe('fp-2');
+    expect(stack.stored.activeModel).toBe('bge-base');
+    expect(stack.rowsByFingerprint.get('fp-2')?.size).toBe(3);
+
+    // NON-VACUITY: make completeRun's config-drift branch `return false` again (the
+    // pre-fix behaviour) and this whole test reds — attempt 1 "succeeds", the loop
+    // stops at attempts === 1, the pointer stays on fp-0 and fp-2 holds no rows at
+    // all: config fp-2, pointer fp-0, nothing building it, forever.
+    const genForNewConfig = await stack.generation.resolveGeneration(WS);
+    expect(genForNewConfig).toMatchObject({
+      active: 'fp-2',
+      target: 'fp-2',
+      swapping: false,
+      // The vector arm can be raised again: the served rows and the query now come
+      // from the SAME model. Before the fix this stayed modelChanged: true forever.
+      modelChanged: false,
+    });
+  });
+
+  it('the superseded generation is reclaimed and the old one kept serving until the flip', async () => {
+    const stack = makeRealStack({
+      storedActive: 'fp-0',
+      storedModel: 'e5-small',
+      config: { fingerprint: 'fp-1', modelId: 'e5-small' },
+      onPageIndexed: (pageId) => {
+        if (pageId === 'p2' && stack.config.fingerprint === 'fp-1') {
+          stack.config.fingerprint = 'fp-2';
+          stack.config.modelId = 'bge-base';
+        }
+      },
+    });
+
+    await runJobWithRetries(() => stack.service.reindexWorkspace(WS));
+
+    // After the successful flip onto fp-2, the post-flip GC keeps ONLY fp-2: the
+    // abandoned fp-1 rows the failed attempt wrote are reclaimed, and so is fp-0.
+    expect([...stack.rowsByFingerprint.keys()]).toEqual(['fp-2']);
+  });
+
+  it('a config that keeps moving cannot loop forever: attempts are BOUNDED and the old generation still serves', async () => {
+    let generationCounter = 1;
+    const stack = makeRealStack({
+      storedActive: 'fp-0',
+      storedModel: 'e5-small',
+      config: { fingerprint: 'fp-1', modelId: 'm-1' },
+      onPageIndexed: (pageId) => {
+        // The config moves on EVERY run (mid-run, on the same page each time), so no
+        // run can ever catch up with it.
+        if (pageId === 'p2') {
+          generationCounter++;
+          stack.config.fingerprint = `fp-${generationCounter}`;
+          stack.config.modelId = `m-${generationCounter}`;
+        }
+      },
+    });
+
+    const { attempts, lastError } = await runJobWithRetries(() =>
+      stack.service.reindexWorkspace(WS),
+    );
+
+    // Bounded by the queue's real budget — it does not spin.
+    expect(attempts).toBe(workspaceReindexJobOptions(WS).attempts);
+    expect(lastError).toBeInstanceOf(StaleReindexTargetError);
+
+    // And the fallout is SAFE: the pointer never moved onto a stale generation, so
+    // the OLD, complete generation is still what search serves.
+    expect(stack.stored.activeFingerprint).toBe('fp-0');
   });
 });

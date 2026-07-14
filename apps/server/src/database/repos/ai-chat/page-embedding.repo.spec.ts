@@ -27,7 +27,12 @@ describe('PageEmbeddingRepo.searchByEmbedding', () => {
     } as unknown as KyselyDB;
 
     const repo = new PageEmbeddingRepo(throwingDb);
-    const result = await repo.searchByEmbedding('ws-1', [0.1, 0.2, 0.3], [], 10);
+    const result = await repo.searchByEmbedding(
+      'ws-1',
+      [0.1, 0.2, 0.3],
+      [],
+      10,
+    );
     expect(result).toEqual([]);
   });
 });
@@ -188,15 +193,39 @@ describe('PageEmbeddingRepo.deleteOtherGenerations (#599)', () => {
     expect(parameters).toContain('fp-target');
   });
 
-  it('with nothing to keep, every row of the workspace is a stale generation', async () => {
+  /**
+   * #599 (review F3) — an EMPTY `keep` must FAIL CLOSED.
+   *
+   * The guard used to be inverted: with `kept.length === 0` the fingerprint
+   * predicate was DROPPED, leaving `DELETE FROM page_embeddings WHERE workspace_id
+   * = $1` — a full wipe of the workspace's vector index, the generation currently
+   * serving search included. It is unreachable from today's two call sites (both
+   * pass a resolved sha256 fingerprint), but "unreachable" is exactly the state a
+   * refactor changes, and the defensive branch of a bulk DELETE must be the SAFE
+   * one: an empty keep-set can only mean the caller lost its fingerprints, never
+   * "purge everything" (that is deleteByWorkspace).
+   */
+  it('review F3 — an EMPTY keep set deletes NOTHING (fail-closed, not a full wipe)', async () => {
     const { db, compiled } = makeRecordingDb();
     const repo = new PageEmbeddingRepo(db as unknown as KyselyDB);
 
-    await repo.deleteOtherGenerations('ws-1', []);
+    await expect(repo.deleteOtherGenerations('ws-1', [])).resolves.toBe(0);
 
-    expect(compiled).toHaveLength(1);
-    expect(compiled[0].sql).toMatch(/delete from "pageEmbeddings"/i);
-    // No generation is kept -> no NOT IN filter: every row is an old generation.
-    expect(compiled[0].sql).not.toMatch(/not in/i);
+    // NON-VACUITY: restore the old `if (kept.length > 0)` wrapper (fail-open) and
+    // this reddens — a DELETE with no fingerprint predicate is compiled and every
+    // embedding row of the workspace goes.
+    expect(compiled).toHaveLength(0);
+  });
+
+  it('review F3 — a keep set of only blank/invalid entries is empty too, and still deletes NOTHING', async () => {
+    const { db, compiled } = makeRecordingDb();
+    const repo = new PageEmbeddingRepo(db as unknown as KyselyDB);
+
+    // The filter drops non-strings/blanks; what survives is [] -> fail closed.
+    await expect(
+      repo.deleteOtherGenerations('ws-1', ['', null as unknown as string]),
+    ).resolves.toBe(0);
+
+    expect(compiled).toHaveLength(0);
   });
 });
