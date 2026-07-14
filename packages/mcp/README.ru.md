@@ -389,6 +389,56 @@ npm run build
 }
 ```
 
+## Подключение к встроенному HTTP-эндпоинту `/mcp` (Bearer api_key — **без OAuth**)
+
+Тот же сервер встроен в Gitmost и отдаётся по HTTP на `/mcp` (включается в
+Workspace settings → AI). Строка подключения:
+
+```bash
+claude mcp add --transport http gitmost https://<host>/mcp \
+  --header "Authorization: Bearer <api_key>"
+```
+
+`<api_key>` создаётся в **Workspace settings → API keys**. MCP-сессия работает с
+правами владельца ключа; отзыв ключа мгновенно отзывает доступ. Если в деплое задан
+`MCP_TOKEN`, добавьте ещё `--header "X-MCP-Token: <MCP_TOKEN>"` (отдельный заголовок —
+`Authorization` зарезервирован под api_key).
+
+**OAuth не поддерживается.** Единственная схема — `Authorization: Bearer <api_key>`.
+Своего OAuth-сервера авторизации у Gitmost нет, метаданные
+`/.well-known/oauth-protected-resource` и `/.well-known/oauth-authorization-server`
+не публикуются (эти пути честно отвечают `404`), динамической регистрации клиентов
+тоже нет. Если MCP-клиент после `401` показывает кнопку **Authenticate** — она не
+заработает: вместо неё положите api_key в заголовок `Authorization`. Сам `401` от
+`/mcp` прямо об этом говорит:
+
+```
+WWW-Authenticate: Bearer realm="mcp", error="invalid_token", error_description="MCP requires a Bearer api_key token (Authorization: Bearer <api_key>)."
+```
+
+Если в деплое задан `MCP_TOKEN`, то запрос без (или с неверным) общим секретом
+`X-MCP-Token` получает challenge, который называет именно этот заголовок — одного
+api_key тут не хватит:
+
+```
+WWW-Authenticate: Bearer realm="mcp", error="invalid_token", error_description="MCP requires the shared secret in the X-MCP-Token header (X-MCP-Token: <MCP_TOKEN>) plus a Bearer api_key token (Authorization: Bearer <api_key>)."
+```
+
+По RFC 6750 §3.1 код `error="invalid_token"` ставится только тогда, когда те учётные
+данные, о которых говорит *именно этот* challenge, были присланы и отвергнуты. Если
+их не присылали вовсе — нет заголовка `Authorization` или (на деплое с `MCP_TOKEN`)
+нет `X-MCP-Token` — тот же challenge приходит **без** кода: ничего не прислали,
+значит, ничего и не было «невалидным», и клиента не отправляют искать токен, который
+он никогда не отправлял. Пустое значение заголовка (`X-MCP-Token:`) считается за «не
+прислали».
+
+**Миграция старых конфигов.** Раньше `/mcp` принимал HTTP Basic `email:password`,
+пользовательский ACCESS-токен сессии и сервисный аккаунт
+`MCP_DOCMOST_EMAIL`/`MCP_DOCMOST_PASSWORD` — всё это удалено (см. Breaking Changes в
+CHANGELOG). Конфиг с `Authorization: Basic <base64 email:password>` теперь получает
+`401`, а спеко-совместимый клиент по этому `401` уходит в бесполезный OAuth-флоу.
+Замените заголовок на `Authorization: Bearer <api_key>`.
+
 ## Разработка
 
 ```bash

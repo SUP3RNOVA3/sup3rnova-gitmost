@@ -458,6 +458,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/.well-known/*` no longer answers with the SPA's HTML, and a `/mcp` `401`
+  now says how to authenticate.** The SPA catch-all served `index.html` with
+  `200 text/html` for *any* unknown GET — including the `/.well-known/`
+  namespace that RFC 8615 reserves for machine-readable metadata. An MCP client
+  that (per the 2025-06-18 spec) starts OAuth discovery after a `401` from
+  `/mcp` fetched `/.well-known/oauth-protected-resource`, got the HTML shell
+  with a `200`, and died on `SDK auth failed: Failed to parse JSON` — after
+  showing the user a useless **Authenticate** button. `/.well-known` and
+  `/.well-known/*` now return `404` with a JSON body — including the spellings
+  that do not literally start with `/.well-known/` but resolve to it, such as
+  `/%2ewell-known/...` and `/a/..%2f.well-known/...`; ordinary SPA routes (`/`,
+  `/p/<slug>`, `/settings/...`, the app's own 404 page) still get `index.html`
+  with `200`. In addition, every `401` from `/mcp` now carries the RFC 6750 §3
+  challenge naming the credential it actually wants:
+
+  ```
+  WWW-Authenticate: Bearer realm="mcp", error="invalid_token", error_description="MCP requires a Bearer api_key token (Authorization: Bearer <api_key>)."
+  ```
+
+  On a deployment that sets `MCP_TOKEN`, a request missing (or mis-sending) the
+  shared secret is told about *that* header instead — adding the api_key alone
+  would never satisfy it, so the old challenge looped such a client forever:
+
+  ```
+  WWW-Authenticate: Bearer realm="mcp", error="invalid_token", error_description="MCP requires the shared secret in the X-MCP-Token header (X-MCP-Token: <MCP_TOKEN>) plus a Bearer api_key token (Authorization: Bearer <api_key>)."
+  ```
+
+  Per RFC 6750 §3.1 the `error="invalid_token"` code is emitted only when the
+  credential *that challenge asks for* was actually presented and rejected: a
+  request with no `Authorization` header (or, above, no `X-MCP-Token`) gets the
+  same challenge without the code, so it is never told a token it never sent is
+  invalid. An empty header value counts as not presented. The challenge deliberately
+  carries **no** `resource_metadata` parameter: under the MCP spec that would
+  advertise an OAuth authorization server, and Gitmost has none — that false
+  promise was the bug. `WWW-Authenticate` is also added to the CORS
+  `exposedHeaders`, so a browser-based MCP client (e.g. MCP Inspector) can read
+  the challenge at all. OAuth (the "Authenticate" button) is **not supported**;
+  the only accepted scheme is `Authorization: Bearer <api_key>` (Workspace
+  settings → API keys):
+
+  ```bash
+  claude mcp add --transport http gitmost https://<host>/mcp \
+    --header "Authorization: Bearer <api_key>"
+  ```
+
+  *Migration:* an MCP config left over from before the Bearer-api_key-only
+  change above (still sending `Authorization: Basic <base64 email:password>`,
+  a session ACCESS token, or relying on the removed
+  `MCP_DOCMOST_EMAIL`/`MCP_DOCMOST_PASSWORD` service account) now gets a `401`
+  and, in a spec-conformant client, falls straight into that broken OAuth path.
+  Replace the header with `Authorization: Bearer <api_key>`.
+
 - **CI: клиент теперь проверяется тайпчекером на каждом PR.** Скрипт `test` у
   клиента — это `vitest run`, то есть esbuild: он *вырезает* типы, ничего не
   проверяя. А релизный путь (`build`, и он же в docker-образе) — это

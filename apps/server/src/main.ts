@@ -199,7 +199,11 @@ async function bootstrap() {
     }),
   );
 
-  app.enableCors();
+  // #636 — `WWW-Authenticate` is NOT on the CORS-safelisted response headers, so
+  // without exposing it a browser-based MCP client (e.g. MCP Inspector) cannot read
+  // the 401's challenge at all: fetch() hides the header and the client is back to
+  // guessing OAuth — the exact failure the challenge exists to prevent.
+  app.enableCors({ exposedHeaders: ['WWW-Authenticate'] });
   app.useGlobalInterceptors(new TransformHttpResponseInterceptor(reflector));
   app.enableShutdownHooks();
 

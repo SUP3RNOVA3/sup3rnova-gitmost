@@ -375,6 +375,55 @@ Add the server to your MCP configuration (e.g. `claude_desktop_config.json`):
 }
 ```
 
+## Connecting to the embedded HTTP `/mcp` endpoint (Bearer api_key — **no OAuth**)
+
+This same server is also bundled into Gitmost and served over HTTP at `/mcp`
+(enable it under Workspace settings → AI). Connecting to it:
+
+```bash
+claude mcp add --transport http gitmost https://<host>/mcp \
+  --header "Authorization: Bearer <api_key>"
+```
+
+Mint `<api_key>` under **Workspace settings → API keys**. The MCP session then acts
+under that key owner's permissions; revoking the key revokes access immediately.
+If the deployment sets `MCP_TOKEN`, also send `--header "X-MCP-Token: <MCP_TOKEN>"`
+(its own header — `Authorization` is reserved for the api_key).
+
+**OAuth is not supported.** `Authorization: Bearer <api_key>` is the *only* accepted
+scheme. Gitmost runs no OAuth authorization server, publishes no
+`/.well-known/oauth-protected-resource` or `/.well-known/oauth-authorization-server`
+metadata (those paths answer an honest `404`), and offers no dynamic client
+registration. If your MCP client shows an **Authenticate** button after a `401`,
+ignore it — it will not work; put the api_key in the `Authorization` header instead.
+A `401` from `/mcp` says so explicitly:
+
+```
+WWW-Authenticate: Bearer realm="mcp", error="invalid_token", error_description="MCP requires a Bearer api_key token (Authorization: Bearer <api_key>)."
+```
+
+On a deployment that sets `MCP_TOKEN`, a request that is missing (or mis-sending) the
+`X-MCP-Token` shared secret gets a challenge naming *that* header instead — adding the
+api_key alone would never satisfy it:
+
+```
+WWW-Authenticate: Bearer realm="mcp", error="invalid_token", error_description="MCP requires the shared secret in the X-MCP-Token header (X-MCP-Token: <MCP_TOKEN>) plus a Bearer api_key token (Authorization: Bearer <api_key>)."
+```
+
+Per RFC 6750 §3.1, the `error="invalid_token"` code appears only when the credential
+*that particular challenge asks for* was actually sent and rejected. A request that
+never sent it — no `Authorization` header, or (on an `MCP_TOKEN` deployment) no
+`X-MCP-Token` — gets the same challenge *without* the code: nothing was sent, so
+nothing was "invalid", and the client is not sent hunting a token it never used. An
+empty header value (`X-MCP-Token:`) counts as nothing sent.
+
+**Migrating an old config.** `/mcp` used to accept HTTP Basic `email:password`, a
+human session ACCESS token, and a `MCP_DOCMOST_EMAIL`/`MCP_DOCMOST_PASSWORD` service
+account; all three were removed (see the CHANGELOG Breaking Changes entry). A config
+still carrying `Authorization: Basic <base64 email:password>` now gets a `401` — and,
+in a spec-conformant client, that `401` is what triggers the useless OAuth flow.
+Replace the header with `Authorization: Bearer <api_key>`.
+
 ## Development
 
 ```bash
