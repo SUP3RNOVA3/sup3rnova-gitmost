@@ -40,8 +40,8 @@
   "author": "Moritz Krause",
   "license": "MIT",
   "dependencies": {
+    "@docmost/editor-ext": "workspace:*",
     "@docmost/prosemirror-markdown": "workspace:*",
-    "@fellow/prosemirror-recreate-transform": "^1.2.3",
     "@hocuspocus/provider": "^3.4.4",
     "@hocuspocus/transformer": "^3.4.4",
     "@modelcontextprotocol/sdk": "^1.25.3",
