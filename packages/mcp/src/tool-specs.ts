@@ -677,7 +677,9 @@ export const SHARED_TOOL_SPECS = {
     description:
       'Diff two versions of a page and return a Docmost-equivalent change set ' +
       '(inserted/deleted text, integrity counts for images/links/tables/' +
-      'callouts/codeBlocks/drawio/excalidraw/footnote markers, and a ' +
+      'callouts/codeBlocks/drawio/excalidraw/attachments/media (video,audio,' +
+      'pdf)/embeds (embed,youtube,htmlEmbed)/mathBlocks/pageEmbeds/subpages/' +
+      'transclusions/footnote markers, and a ' +
       'human-readable markdown summary). ' +
       "`from`/`to` each accept a historyId, or null/'current' for the page's " +
       'current content (defaults: from=current, to=current — pass a historyId ' +

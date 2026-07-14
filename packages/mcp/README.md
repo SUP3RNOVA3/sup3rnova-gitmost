@@ -244,7 +244,9 @@ All 41 tools, grouped by what you'd reach for them.
   newest first, cursor-paginated. Each item's id is the `historyId`.
 - **`diffPageVersions`** — Diff two versions (or a version against the live page).
   Returns inserted/deleted text, integrity counts (images, links, tables, callouts,
-  code blocks, drawio, excalidraw, footnote markers), and a human-readable Markdown
+  code blocks, drawio, excalidraw, attachments, media — video/audio/pdf, embeds —
+  embed/youtube/htmlEmbed, math blocks, page embeds, subpages, transclusions,
+  footnote markers), and a human-readable Markdown
   summary — computed with the same pipeline Docmost's own history viewer uses.
 - **`restorePageVersion`** — Write a saved version back as the current content. Docmost
   has no restore endpoint, so this creates a **new** snapshot — the restore is itself

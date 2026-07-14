@@ -87,6 +87,34 @@ export interface DiffIntegrity {
    */
   drawio: [number, number];
   excalidraw: [number, number];
+  /**
+   * Block-atom DATA CARRIERS (#619). Same blind zone as the diagram atoms above:
+   * each is a top-level block whose ENTIRE payload lives in `attrs`
+   * (src/attachmentId/sourcePageId/…), so deleting one moves no prose and no
+   * marks — the only trace in the text delta is the single leaf placeholder
+   * `textBetween` emits for an atom, a 1-char change indistinguishable from a
+   * typo fix. The count is what NAMES the loss (attribution), which is the blind
+   * spot codeBlocks/drawio closed for their kinds.
+   *
+   * Counted as SEPARATE keys, never one "media"/"embeds" bucket: a bucket would
+   * report e.g. a video replaced by an audio as `1 -> 1` (clean) and omit it
+   * from `VerifyReport.structure` entirely — recreating the very blind spot this
+   * guard exists to close. `youtube` is a distinct node type from `embed` in the
+   * runtime schema, so both are counted. (Inline atoms mathInline/mention are
+   * out of scope — this guard is for block-atom data carriers.)
+   */
+  attachment: [number, number];
+  video: [number, number];
+  audio: [number, number];
+  pdf: [number, number];
+  embed: [number, number];
+  youtube: [number, number];
+  htmlEmbed: [number, number];
+  mathBlock: [number, number];
+  pageEmbed: [number, number];
+  subpages: [number, number];
+  transclusionSource: [number, number];
+  transclusionReference: [number, number];
   footnoteMarkers: [number[], number[]];
 }
 
@@ -330,6 +358,54 @@ function computeIntegrity(
     countNodes(oldDoc, (n) => n.type === "excalidraw"),
     countNodes(newDoc, (n) => n.type === "excalidraw"),
   ];
+  const attachment: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "attachment"),
+    countNodes(newDoc, (n) => n.type === "attachment"),
+  ];
+  const video: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "video"),
+    countNodes(newDoc, (n) => n.type === "video"),
+  ];
+  const audio: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "audio"),
+    countNodes(newDoc, (n) => n.type === "audio"),
+  ];
+  const pdf: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "pdf"),
+    countNodes(newDoc, (n) => n.type === "pdf"),
+  ];
+  const embed: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "embed"),
+    countNodes(newDoc, (n) => n.type === "embed"),
+  ];
+  const youtube: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "youtube"),
+    countNodes(newDoc, (n) => n.type === "youtube"),
+  ];
+  const htmlEmbed: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "htmlEmbed"),
+    countNodes(newDoc, (n) => n.type === "htmlEmbed"),
+  ];
+  const mathBlock: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "mathBlock"),
+    countNodes(newDoc, (n) => n.type === "mathBlock"),
+  ];
+  const pageEmbed: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "pageEmbed"),
+    countNodes(newDoc, (n) => n.type === "pageEmbed"),
+  ];
+  const subpages: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "subpages"),
+    countNodes(newDoc, (n) => n.type === "subpages"),
+  ];
+  const transclusionSource: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "transclusionSource"),
+    countNodes(newDoc, (n) => n.type === "transclusionSource"),
+  ];
+  const transclusionReference: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "transclusionReference"),
+    countNodes(newDoc, (n) => n.type === "transclusionReference"),
+  ];
   const fns: [number[], number[]] = [
     footnoteMarkers(oldDoc, notesHeading),
     footnoteMarkers(newDoc, notesHeading),
@@ -342,6 +418,18 @@ function computeIntegrity(
     codeBlocks,
     drawio,
     excalidraw,
+    attachment,
+    video,
+    audio,
+    pdf,
+    embed,
+    youtube,
+    htmlEmbed,
+    mathBlock,
+    pageEmbed,
+    subpages,
+    transclusionSource,
+    transclusionReference,
     footnoteMarkers: fns,
   };
 }
@@ -498,6 +586,32 @@ function renderMarkdown(
     `- excalidraw: ${integrity.excalidraw[0]} -> ${integrity.excalidraw[1]}`,
   );
   lines.push(
+    `- attachment: ${integrity.attachment[0]} -> ${integrity.attachment[1]}`,
+  );
+  lines.push(`- video: ${integrity.video[0]} -> ${integrity.video[1]}`);
+  lines.push(`- audio: ${integrity.audio[0]} -> ${integrity.audio[1]}`);
+  lines.push(`- pdf: ${integrity.pdf[0]} -> ${integrity.pdf[1]}`);
+  lines.push(`- embed: ${integrity.embed[0]} -> ${integrity.embed[1]}`);
+  lines.push(`- youtube: ${integrity.youtube[0]} -> ${integrity.youtube[1]}`);
+  lines.push(
+    `- htmlEmbed: ${integrity.htmlEmbed[0]} -> ${integrity.htmlEmbed[1]}`,
+  );
+  lines.push(
+    `- mathBlock: ${integrity.mathBlock[0]} -> ${integrity.mathBlock[1]}`,
+  );
+  lines.push(
+    `- pageEmbed: ${integrity.pageEmbed[0]} -> ${integrity.pageEmbed[1]}`,
+  );
+  lines.push(
+    `- subpages: ${integrity.subpages[0]} -> ${integrity.subpages[1]}`,
+  );
+  lines.push(
+    `- transclusionSource: ${integrity.transclusionSource[0]} -> ${integrity.transclusionSource[1]}`,
+  );
+  lines.push(
+    `- transclusionReference: ${integrity.transclusionReference[0]} -> ${integrity.transclusionReference[1]}`,
+  );
+  lines.push(
     `- footnoteMarkers: [${integrity.footnoteMarkers[0].join(", ")}] -> [${integrity.footnoteMarkers[1].join(", ")}]`,
   );
   lines.push("");
@@ -646,8 +760,10 @@ export function summarizeChange(before: any, after: any): VerifyReport {
     }
 
     // Structural integrity delta from diffDocs: count-based [old,new] tuples for
-    // images/links/tables/callouts/codeBlocks/drawio/excalidraw. Include a type only when
-    // old != new.
+    // images/links/tables/callouts/codeBlocks/drawio/excalidraw plus the #619
+    // block-atom data carriers (attachment/video/audio/pdf/embed/youtube/
+    // htmlEmbed/mathBlock/pageEmbed/subpages/transclusionSource/
+    // transclusionReference). Include a type only when old != new.
     const integrity = diff.integrity;
     const structure: Record<string, [number, number]> = {};
     const countTypes: [
@@ -658,6 +774,18 @@ export function summarizeChange(before: any, after: any): VerifyReport {
       "codeBlocks",
       "drawio",
       "excalidraw",
+      "attachment",
+      "video",
+      "audio",
+      "pdf",
+      "embed",
+      "youtube",
+      "htmlEmbed",
+      "mathBlock",
+      "pageEmbed",
+      "subpages",
+      "transclusionSource",
+      "transclusionReference",
     ] = [
       "images",
       "links",
@@ -666,6 +794,18 @@ export function summarizeChange(before: any, after: any): VerifyReport {
       "codeBlocks",
       "drawio",
       "excalidraw",
+      "attachment",
+      "video",
+      "audio",
+      "pdf",
+      "embed",
+      "youtube",
+      "htmlEmbed",
+      "mathBlock",
+      "pageEmbed",
+      "subpages",
+      "transclusionSource",
+      "transclusionReference",
     ];
     for (const type of countTypes) {
       const [b, a] = integrity[type];
