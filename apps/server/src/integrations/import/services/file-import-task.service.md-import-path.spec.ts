@@ -216,6 +216,33 @@ function findFirst(node: any, type: string): any {
   return null;
 }
 
+/**
+ * Find the first TEXT node carrying a given mark type. Asserting on a bare
+ * `text` node proves nothing (every non-empty document has one) — the mark is
+ * what the fidelity claim is about.
+ */
+function findTextWithMark(node: any, mark: string): any {
+  if (!node || typeof node !== 'object') return null;
+  if (
+    node.type === 'text' &&
+    (node.marks ?? []).some((m: any) => m?.type === mark)
+  ) {
+    return node;
+  }
+  for (const child of node.content ?? []) {
+    const hit = findTextWithMark(child, mark);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/** Concatenate every text node in a PM content tree (document order). */
+function allText(node: any): string {
+  if (!node || typeof node !== 'object') return '';
+  if (node.type === 'text') return typeof node.text === 'string' ? node.text : '';
+  return (node.content ?? []).map((c: any) => allText(c)).join('');
+}
+
 /** Definition body texts of the (single) footnotesList, in list order. */
 function footnoteListBodies(content: any): string[] {
   const list = (content?.content ?? []).find(
@@ -271,6 +298,14 @@ describe('zip .md import path — fidelity of the PM->HTML->PM hop (#555)', () =
       '',
       '> quoted',
       '',
+      '1. first',
+      '2. second',
+      '   - nested bullet',
+      '',
+      'A ~~struck~~ word and an escaped \\*literal asterisk\\*.',
+      '',
+      '---',
+      '',
       'Refs [^c] and [^a] and [^b] and again [^a].',
       '',
       '[^a]: note A',
@@ -303,8 +338,14 @@ describe('zip .md import path — fidelity of the PM->HTML->PM hop (#555)', () =
     expect(findFirst(zipPage.content, 'codeBlock')).toBeTruthy();
     expect(findFirst(zipPage.content, 'taskList')).toBeTruthy();
     expect(findFirst(zipPage.content, 'hardBreak')).toBeTruthy();
-    const code = findFirst(zipPage.content, 'text');
-    expect(code).toBeTruthy();
+    expect(findFirst(zipPage.content, 'orderedList')).toBeTruthy();
+    expect(findFirst(zipPage.content, 'horizontalRule')).toBeTruthy();
+    // A text node actually carrying the `code` MARK — not merely "some text
+    // node" (which any non-empty document has, so it would assert nothing).
+    expect(findTextWithMark(zipPage.content, 'code')?.text).toBe('a_b_c');
+    // The strike mark and the escaped asterisk survive as content, not markup.
+    expect(findTextWithMark(zipPage.content, 'strike')?.text).toBe('struck');
+    expect(allText(zipPage.content)).toContain('*literal asterisk*');
   });
 
   /**
