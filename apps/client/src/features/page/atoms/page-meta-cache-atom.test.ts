@@ -368,14 +368,14 @@ describe("pageMetaCacheAtom (localStorage boot cache)", () => {
     expect(
       derivePageChromeCanEdit({
         deletedAt: null,
-        permissions: { canEdit: true },
+        permissions: { canEdit: true, hasRestriction: false },
       }),
     ).toBe(true);
     // A trashed page is never editable, even with canEdit permissions.
     expect(
       derivePageChromeCanEdit({
-        deletedAt: "2026-07-01T00:00:00.000Z",
-        permissions: { canEdit: true },
+        deletedAt: new Date("2026-07-01T00:00:00.000Z"),
+        permissions: { canEdit: true, hasRestriction: false },
       }),
     ).toBe(false);
     expect(

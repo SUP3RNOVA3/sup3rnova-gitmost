@@ -149,7 +149,9 @@ describe("Page chrome (local-first boot cache)", () => {
     // viewer) still returns a perfectly readable page — no 403/404 — so nothing
     // would ever evict that cached `canEdit`. Edit affordances therefore wait for
     // the live response; only the chrome paints from the cache.
-    const store = makeStore(cachedPage({ permissions: { canEdit: true } }));
+    const store = makeStore(
+      cachedPage({ permissions: { canEdit: true, hasRestriction: false } }),
+    );
     const { rerender } = renderPage(store);
 
     expect(chromeTitle()).toContain("Cached title");
