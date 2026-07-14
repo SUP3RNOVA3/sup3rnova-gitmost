@@ -49,6 +49,7 @@ import {
   FootnotesList,
   FootnoteDefinition,
   PageEmbed,
+  Code,
 } from '@docmost/editor-ext';
 import { convertProseMirrorToMarkdown } from '@docmost/prosemirror-markdown';
 import { generateText, getSchema, JSONContent } from '@tiptap/core';
@@ -67,7 +68,13 @@ export const tiptapExtensions = [
     link: false,
     trailingNode: false,
     heading: false,
+    // #515: StarterKit's stock `code` mark ships `excludes: "_"`, which strips
+    // every co-occurring inline mark on the HTML -> PM parse (htmlToJson) and on
+    // editor transactions. Use the shared Docmost `Code` (excludes: "") instead,
+    // so bold/italic/… around inline code survive import and editing.
+    code: false,
   }),
+  Code,
   Heading,
   UniqueID.configure({
     types: ['heading', 'paragraph', 'transclusionSource'],

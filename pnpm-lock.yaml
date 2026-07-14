@@ -555,6 +555,9 @@ importers:
       '@clickhouse/client':
         specifier: ^1.18.2
         version: 1.18.2
+      '@docmost/editor-ext':
+        specifier: workspace:*
+        version: link:../../packages/editor-ext
       '@docmost/mcp':
         specifier: workspace:*
         version: link:../../packages/mcp
@@ -1104,6 +1107,9 @@ importers:
       '@tiptap/core':
         specifier: 3.20.4
         version: 3.20.4(@tiptap/pm@3.20.4)
+      '@tiptap/extension-code':
+        specifier: 3.20.4
+        version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))
       '@tiptap/extension-highlight':
         specifier: 3.20.4
         version: 3.20.4(@tiptap/core@3.20.4(@tiptap/pm@3.20.4))

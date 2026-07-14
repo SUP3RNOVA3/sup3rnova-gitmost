@@ -20,6 +20,7 @@ import Image from "@tiptap/extension-image";
 import TaskList from "@tiptap/extension-task-list";
 import TaskItem from "@tiptap/extension-task-item";
 import Highlight from "@tiptap/extension-highlight";
+import { Code } from "@tiptap/extension-code";
 import Subscript from "@tiptap/extension-subscript";
 import Superscript from "@tiptap/extension-superscript";
 import { Node, Extension, Mark } from "@tiptap/core";
@@ -1481,7 +1482,20 @@ export const docmostExtensions = [
     codeBlock: {},
     heading: {},
     link: { openOnClick: false },
+    // #515: StarterKit's stock `code` mark declares `excludes: "_"`, which makes
+    // ProseMirror drop EVERY co-occurring inline mark on the HTML -> PM parse
+    // (generateJSON). CommonMark parses ``**`code`**`` as
+    // `<strong><code>code</code></strong>`, so bold/italic/… around inline code
+    // were silently lost (or slid onto the separator) on markdown import.
+    // Disable it and register the local `excludes: ""` override below.
+    code: false,
   }),
+  // Canonical policy lives in `@docmost/editor-ext` (`Code`), but this vendored
+  // mirror must stay framework-free (importing editor-ext would drag React node
+  // views into the markdown converter — see the header and #293), so the SAME
+  // `excludes: ""` is set locally. `test/schema-code-excludes-parity.test.ts`
+  // fails loudly if the two ever drift apart.
+  Code.extend({ excludes: "" }),
   // Preserve image width/height as the AUTHORED string. Without an explicit
   // parseHTML the stock Image node attribute falls back to tiptap core's
   // `fromString`, which coerces a numeric width like "320" into the number 320

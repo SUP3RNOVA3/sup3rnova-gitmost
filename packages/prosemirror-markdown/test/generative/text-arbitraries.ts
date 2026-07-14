@@ -11,11 +11,30 @@
  *
  * The corpus deliberately spans the CommonMark / canon hostile alphabet
  * (`* _ [ ] ( ) { } | < > & # ! ~ = + -`), unicode / emoji / RTL, and the legal
- * mark combinations on runs (including the `code` mark, which the schema's
- * `excludes: "_"` makes suppress every co-occurring mark — so it is never
- * combined with another mark in the byte-stable space).
+ * mark combinations on runs — INCLUDING the `code` mark combined with other
+ * marks, which #515 made legal (the schema's `code` mark now declares
+ * `excludes: ""`, and the serializer nests the backtick span inside the other
+ * marks, falling back to lossless schema-HTML for a heterogeneous neighbour run).
  */
 import fc from 'fast-check';
+import { getSchema } from '@tiptap/core';
+
+import { docmostExtensions } from '../../src/lib/docmost-schema.js';
+
+// ---------------------------------------------------------------------------
+// Canonical mark order (#515).
+//
+// ProseMirror stores a text node's marks sorted by their SCHEMA RANK, and the
+// importer therefore always hands back e.g. [bold, code] (never [code, bold]).
+// Read the rank straight from the mirror schema so the generators cannot drift
+// from it, and sort every multi-mark run through `canonicalMarks`.
+// ---------------------------------------------------------------------------
+const MARK_RANK: Record<string, number> = Object.fromEntries(
+  Object.keys(getSchema(docmostExtensions).marks).map((name, i) => [name, i]),
+);
+
+const canonicalMarks = (marks: any[]): any[] =>
+  [...marks].sort((a, b) => (MARK_RANK[a.type] ?? 0) - (MARK_RANK[b.type] ?? 0));
 
 // ---------------------------------------------------------------------------
 // Words and the hostile special-character alphabet.
@@ -48,9 +67,41 @@ export const unicodeWordArb = fc.constantFrom(
 );
 
 /**
+ * ASTRAL (non-BMP) code points — an emoji, a mathematical bold letter (a Unicode
+ * LETTER), and a CJK extension-B ideograph — each glued to an ASCII letter so the
+ * token is still a single markdown-inert "word".
+ *
+ * These exist to reach a shape the corpus was STRUCTURALLY unable to generate
+ * (#515 review F2): an astral code point sitting IMMEDIATELY BEFORE or AFTER a
+ * text run, with no space between. safeTextArb below always used to open and
+ * close a run with an ASCII word, so an astral character could never land on a
+ * run BOUNDARY — and a boundary is exactly where it matters: the serializer's
+ * emphasis-flanking guard inspects the neighbouring character, and reading it as
+ * a UTF-16 unit yields a lone SURROGATE, which used to be misclassified as a word
+ * boundary and made the exporter emit markdown whose emphasis `marked` then
+ * refuses to open (a byte-STABLE mark loss the round-trip property cannot see).
+ *
+ * `astralHeadArb` puts the astral char FIRST (it becomes the character right
+ * after the preceding run), `astralTailArb` puts it LAST (right before the
+ * following run). Markdown-inert by construction, so they cannot destabilize any
+ * other property.
+ */
+const ASTRAL_CHARS = ['\u{1F642}', '\u{1F680}', '\u{1D400}', '\u{20000}'];
+
+export const astralHeadArb: fc.Arbitrary<string> = fc
+  .tuple(fc.constantFrom(...ASTRAL_CHARS), wordArb)
+  .map(([c, w]) => c + w);
+
+export const astralTailArb: fc.Arbitrary<string> = fc
+  .tuple(wordArb, fc.constantFrom(...ASTRAL_CHARS))
+  .map(([w, c]) => w + c);
+
+/**
  * A "safe special" text string: a space-joined sequence of tokens that always
- * BEGINS and ENDS with an alphanumeric word, with any isolated special chars (or
- * unicode words) confined to the MIDDLE, each space-flanked by words.
+ * BEGINS and ENDS with an alphanumeric word (or, since #515, a word carrying an
+ * ASTRAL code point on that very edge — see astralHeadArb/astralTailArb), with
+ * any isolated special chars (or unicode words) confined to the MIDDLE, each
+ * space-flanked by words.
  *
  * Both boundary guarantees matter (verbatim from the sibling test):
  *   * Leading word: the line never opens with a block/inline trigger
@@ -59,15 +110,24 @@ export const unicodeWordArb = fc.constantFrom(
  *     ending in a bare "<" beside a run starting with a letter would form a fake
  *     HTML tag. Ending every run with a word keeps every special internal and
  *     space-flanked even after concatenation.
+ * An astral-bearing edge token preserves BOTH (an astral letter/emoji is not a
+ * markdown trigger and cannot combine with a neighbouring run's characters into
+ * one), while exposing the flanking boundary the corpus previously hid.
  */
 export const safeTextArb: fc.Arbitrary<string> = fc
   .tuple(
-    wordArb,
+    fc.oneof(
+      { weight: 5, arbitrary: wordArb },
+      { weight: 1, arbitrary: astralHeadArb },
+    ),
     fc.array(fc.oneof(wordArb, specialCharArb, unicodeWordArb), {
       minLength: 0,
       maxLength: 3,
     }),
-    wordArb,
+    fc.oneof(
+      { weight: 5, arbitrary: wordArb },
+      { weight: 1, arbitrary: astralTailArb },
+    ),
   )
   .map(([first, middle, last]) => [first, ...middle, last].join(' '));
 
@@ -105,17 +165,24 @@ export const urlArb: fc.Arbitrary<string> = fc
 
 /**
  * A text run with an OPTIONAL single non-code formatting mark (bold/italic/
- * strike/underline/superscript/subscript/spoiler), or a SOLE `code` mark, or a
- * link, or an inline comment anchor. `code` is NEVER combined with another mark
- * in the byte-stable space (that combination is a documented converter
- * limitation — the schema's `code` mark declares `excludes: "_"`). Marks wrap
- * `safeTextArb`, which stays stable even when it contains isolated specials.
+ * strike/underline/superscript/subscript/spoiler), a `code` mark ALONE or
+ * COMBINED with another mark (#515 — `code` declares `excludes: ""` now, so the
+ * combination is legal and byte-stable: the serializer nests the backtick span
+ * inside the other marks, and a heterogeneous run of neighbours takes the
+ * lossless schema-HTML fallback), or a link, or an inline comment anchor. Marks
+ * wrap `safeTextArb`, which stays stable even when it contains isolated specials.
  *
  * The mark set here is broadened past the sibling test's {bold,italic,strike}
  * to also cover underline / superscript / subscript / spoiler / textStyle /
- * highlight (all single, non-code marks), so the marks-on-text generator
- * exercises every mark the schema declares except the deliberately-excluded
- * `code`+other combination.
+ * highlight, so the marks-on-text generator exercises every mark the schema
+ * declares — now INCLUDING the `code`+other combinations (#515).
+ *
+ * Multi-mark runs are emitted in the schema's CANONICAL mark order (see
+ * `canonicalMarks`): ProseMirror stores a node's marks sorted by schema rank, so
+ * a generated doc that listed them in any other order would not be a doc the
+ * editor can produce — and the P1 semantic property (which compares the
+ * re-imported doc against the generated one field by field) would red on the
+ * ORDER rather than on any real converter defect.
  */
 export const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // Plain text.
@@ -138,6 +205,48 @@ export const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // Sole code mark (backtick span). safeTextArb is backtick-free, so the span
   // content cannot contain an inner backtick.
   safeTextArb.map((t) => ({ type: 'text', text: t, marks: [{ type: 'code' }] })),
+  // #515: `code` COMBINED with another attribute-free mark (bold/italic/strike/
+  // underline/superscript/subscript/spoiler) or a color-less highlight — the
+  // combination the schema used to forbid via `excludes: "_"`.
+  fc
+    .tuple(
+      safeTextArb,
+      fc.constantFrom(
+        'bold',
+        'italic',
+        'strike',
+        'underline',
+        'superscript',
+        'subscript',
+        'spoiler',
+        'highlight',
+      ),
+    )
+    .map(([t, m]) => ({
+      type: 'text',
+      text: t,
+      marks: canonicalMarks([{ type: 'code' }, { type: m }]),
+    })),
+  // #515: `code` + link (the code span becomes the link text: [`x`](href)).
+  fc
+    .tuple(phraseArb, urlArb)
+    .map(([t, href]) => ({
+      type: 'text',
+      text: t,
+      marks: canonicalMarks([{ type: 'code' }, { type: 'link', attrs: { href } }]),
+    })),
+  // #515: `code` + a COLORED highlight (an HTML-form mark, so the code span is
+  // wrapped in <mark style=…> rather than `==…==`).
+  fc
+    .tuple(safeTextArb, fc.constantFrom('#ffcc00', 'yellow'))
+    .map(([t, color]) => ({
+      type: 'text',
+      text: t,
+      marks: canonicalMarks([
+        { type: 'code' },
+        { type: 'highlight', attrs: { color } },
+      ]),
+    })),
   // Link with safe text, a paren/space-free href, optionally a letter-bearing
   // title (a purely numeric title is coerced to a number and dropped).
   fc
@@ -179,6 +288,36 @@ export const mentionArb: fc.Arbitrary<any> = fc
   }));
 
 export const hardBreakArb: fc.Arbitrary<any> = fc.constant({ type: 'hardBreak' });
+
+/**
+ * #515 review F2: a code+EMPHASIS run (the only shape that can glue a bare `**` /
+ * `*` / `~~` / `==` delimiter to a backtick) sandwiched with NO separator between
+ * a run ENDING in an astral code point and a run STARTING with one.
+ *
+ * This adjacency is what the serializer's flanking guard has to judge, and it is
+ * the shape that used to lose the emphasis mark BYTE-STABLY (so P2, the byte
+ * fixpoint, is blind to it; only P1's semantic comparison sees the missing mark).
+ * Letting safeTextArb merely *permit* astral edges is not enough — the three
+ * pieces have to LAND next to each other, which random assembly of a paragraph's
+ * runs does only once in some hundreds of documents. Emitting them as one segment
+ * makes the property reach the case on essentially every run of the suite.
+ */
+export const astralAdjacentCodeEmphasisArb: fc.Arbitrary<any[]> = fc
+  .tuple(
+    astralTailArb,
+    phraseArb,
+    fc.constantFrom('bold', 'italic', 'strike', 'highlight'),
+    astralHeadArb,
+  )
+  .map(([before, codeText, emphasis, after]) => [
+    { type: 'text', text: before },
+    {
+      type: 'text',
+      text: codeText,
+      marks: canonicalMarks([{ type: 'code' }, { type: emphasis }]),
+    },
+    { type: 'text', text: after },
+  ]);
 
 const sameMarks = (a: any[] | undefined, b: any[] | undefined): boolean =>
   JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
@@ -294,6 +433,7 @@ export const inlineContentArb: fc.Arbitrary<any[]> = fc
         { weight: 1, arbitrary: hardBreakArb.map((n) => [n]) },
         { weight: 2, arbitrary: hardBreakThenTriggerArb },
         { weight: 2, arbitrary: hardBreakThenSetextArb },
+        { weight: 2, arbitrary: astralAdjacentCodeEmphasisArb },
       ),
       { minLength: 0, maxLength: 4 },
     ),

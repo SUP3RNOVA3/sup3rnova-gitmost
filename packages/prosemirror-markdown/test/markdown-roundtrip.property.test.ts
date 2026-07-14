@@ -76,16 +76,16 @@ import { stripBlockIds } from './roundtrip-helpers.js';
 //     A real ProseMirror doc never stores split same-mark runs (the editor
 //     coalesces them) -> the generator merges them too (normalizeInline).
 //
-// The GENUINE, real-but-intentional non-roundtrip limitations are kept HONEST as
-// `it.fails` blocks below (so the suite stays green only because they are marked
-// expected-to-fail, never by hiding them):
+// The GENUINE, real-but-intentional non-roundtrip limitations are documented as
+// dedicated blocks below (so the suite never goes green by hiding them):
 //
-//   1. The `code` mark COMBINED with any other mark. The converter emits nested
-//      HTML (`<strong><code>x</code></strong>`), but the schema's `code` mark
-//      declares `excludes: "_"`, so on import every co-occurring mark is dropped
-//      and the run comes back as `code` only -> md2 == "`x`". Acknowledged in
-//      markdown-converter.ts (the long comment above the marks switch);
-//      impossible to round-trip both while `code` excludes them.
+//   1. FIXED in #515 (was: the `code` mark COMBINED with any other mark did not
+//      round-trip, because the schema's `code` mark declared `excludes: "_"` and
+//      import dropped every co-occurring mark -> the run came back as `code`
+//      only). The mark now declares `excludes: ""`, the serializer nests the
+//      backtick span INSIDE the other marks (``**`x`**``), and both marks survive
+//      the cycle. The block below is now a REAL round-trip property (marks +
+//      bytes), no longer a documented bug.
 //   2. A BLOCK-level `image` placed BETWEEN other blocks. The Docmost image node
 //      is block-level but `![](url)` is inline; marked wraps it in a <p>, the
 //      schema hoists the <img> out and leaves an empty paragraph sibling, which
@@ -166,11 +166,12 @@ const letterPhraseArb: fc.Arbitrary<string> = fc
   .map(([head, rest]) => [head, ...rest].join(' '));
 
 
-// A text run with an OPTIONAL single non-code mark (bold/italic/strike), or a
-// SOLE `code` mark, or a link. `code` is never combined with another mark in
-// the byte-stable arbitrary (that combination is the known bug, exercised
-// separately in the it.fails block). Marks wrap safe text, which stays stable
-// even when it contains isolated specials.
+// A text run with an OPTIONAL single non-code mark (bold/italic/strike), a
+// `code` mark ALONE or COMBINED with another mark (#515 — `code` no longer
+// excludes the other marks; the combination is byte-stable, either as nested
+// markdown or, for a heterogeneous neighbour pair, via the lossless HTML
+// fallback), or a link. Marks wrap safe text, which stays stable even when it
+// contains isolated specials.
 const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // Plain text.
   safeTextArb.map((t) => ({ type: 'text', text: t })),
@@ -182,6 +183,17 @@ const markedTextRunArb: fc.Arbitrary<any> = fc.oneof(
   // code span content cannot contain an inner backtick (which would be
   // ambiguous to re-parse).
   safeTextArb.map((t) => ({ type: 'text', text: t, marks: [{ type: 'code' }] })),
+  // #515: `code` COMBINED with another mark on the same run.
+  fc
+    .tuple(
+      safeTextArb,
+      fc.constantFrom('bold', 'italic', 'strike', 'underline', 'highlight'),
+    )
+    .map(([t, m]) => ({
+      type: 'text',
+      text: t,
+      marks: [{ type: 'code' }, { type: m }],
+    })),
   // Link with safe text and a paren/space-free href, optionally with a title.
   // The title rides in a markdown link-title attribute; a purely numeric title
   // is coerced to a number and dropped on re-import (same class of quirk as the
@@ -655,44 +667,316 @@ describe('markdown <-> ProseMirror round-trip (property-based)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // KNOWN, DOCUMENTED non-roundtrip bug #1 (kept honest as it.fails).
-  //
-  // BUG: the `code` mark combined with ANY other mark does NOT round-trip.
-  // The converter emits nested HTML so the output is well-formed, e.g.
-  //   marks [code, bold]  ->  md1 = "<strong><code>x</code></strong>"
-  // but the schema's `code` mark declares `excludes: "_"`, so on import the
-  // co-occurring mark is dropped and the run comes back as code-only:
-  //   md2 = "`x`"   (=> md2 !== md1).
-  // Minimal repro doc:
-  //   { type:'doc', content:[ { type:'paragraph', content:[
-  //       { type:'text', text:'x', marks:[{type:'code'},{type:'bold'}] } ] } ] }
-  // This is acknowledged in markdown-converter.ts (the long comment above the
-  // marks switch): preserving both marks is impossible while `code` excludes
-  // them. Documented here, not "fixed", because the source must not change.
+  // #515: the `code` mark COMBINED with another mark. Formerly documented bug #1
+  // (the schema's `code` mark declared `excludes: "_"`, so import dropped every
+  // co-occurring mark and the run came back code-only). Now a REAL round-trip
+  // property: the combination must be byte-stable AND both marks must survive the
+  // import (a byte-stable-but-lossy export would silently pass the byte check, so
+  // the mark set is asserted explicitly).
   // -------------------------------------------------------------------------
-  it(
-    'code mark combined with another mark is byte-stable',
-    async () => {
-      const codeComboArb = fc
-        .tuple(safeTextArb, fc.constantFrom('bold', 'italic', 'strike'))
-        .map(([t, other]) => ({
+  it('the code mark combined with another mark round-trips (bytes + marks)', async () => {
+    const codeComboArb = fc
+      .tuple(
+        safeTextArb,
+        fc.constantFrom('bold', 'italic', 'strike', 'underline', 'highlight'),
+      )
+      .map(([t, other]) => ({
+        type: 'doc',
+        content: [
+          {
+            type: 'paragraph',
+            content: [
+              { type: 'text', text: t, marks: [{ type: 'code' }, { type: other }] },
+            ],
+          },
+        ],
+      }));
+    await fc.assert(
+      fc.asyncProperty(codeComboArb, async (doc) => {
+        const { md1, md2, doc2 } = await roundTrip(doc);
+        expect(md2).toBe(md1);
+        // The re-imported run still carries BOTH marks (co-mark not dropped).
+        const runs = doc2.content[0].content as any[];
+        const marks = new Set(
+          runs.flatMap((r) => (r.marks || []).map((m: any) => m.type)),
+        );
+        expect(marks.has('code')).toBe(true);
+        const other = doc.content[0].content[0].marks[1].type;
+        expect(marks.has(other)).toBe(true);
+      }),
+      { numRuns: 20, seed: SEED },
+    );
+  });
+
+  // A code span inside a LINK keeps both marks: `[`x`](href)`.
+  it('a code+link run round-trips (bytes + marks)', async () => {
+    const doc = {
+      type: 'doc',
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            {
+              type: 'text',
+              text: 'x',
+              marks: [{ type: 'code' }, { type: 'link', attrs: { href: 'http://a.aa' } }],
+            },
+          ],
+        },
+      ],
+    };
+    const { md1, md2, doc2 } = await roundTrip(doc);
+    expect(md1).toBe('[`x`](http://a.aa)');
+    expect(md2).toBe(md1);
+    const marks = (doc2.content[0].content[0].marks || []).map((m: any) => m.type);
+    expect(new Set(marks)).toEqual(new Set(['code', 'link']));
+  });
+
+  // #515 case 2 from the bug report: a HOMOGENEOUS code-emphasis run (code spans
+  // and their separator all carry the same bold) is factored to ONE pair of `**`
+  // delimiters — never the dangling `` `aaa`** + **`bbb` `` form.
+  it('a homogeneous code-emphasis run factors the shared mark out once', async () => {
+    const bold = { type: 'bold' };
+    const doc = {
+      type: 'doc',
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'aaa', marks: [{ type: 'code' }, bold] },
+            { type: 'text', text: ' + ', marks: [bold] },
+            { type: 'text', text: 'bbb', marks: [{ type: 'code' }, bold] },
+          ],
+        },
+      ],
+    };
+    const { md1, md2 } = await roundTrip(doc);
+    expect(md1).toBe('**`aaa` + `bbb`**');
+    expect(md2).toBe(md1);
+  });
+
+  // #515 ANTI-COLLISION: a `[code,bold]` run IMMEDIATELY followed (no separator)
+  // by an `[italic]` run is a HETEROGENEOUS code-emphasis run. Emitting each node
+  // as markdown would produce ``**`a`***b*`` — whose `***` re-parses as a single
+  // (mis-nested) emphasis delimiter run, losing the bold. The converter must take
+  // the lossless schema-HTML fallback instead, and the cycle must be stable with
+  // every mark intact.
+  it('an adjacent [code,bold] · [italic] pair takes the lossless HTML fallback', async () => {
+    const doc = {
+      type: 'doc',
+      content: [
+        {
+          type: 'paragraph',
+          content: [
+            { type: 'text', text: 'a', marks: [{ type: 'code' }, { type: 'bold' }] },
+            { type: 'text', text: 'b', marks: [{ type: 'italic' }] },
+          ],
+        },
+      ],
+    };
+    const { md1, md2, doc2 } = await roundTrip(doc);
+    expect(md1).not.toContain('***');
+    expect(md1).toBe('<strong><code>a</code></strong><em>b</em>');
+    expect(md2).toBe(md1);
+    const runs = doc2.content[0].content as any[];
+    expect(runs.map((r) => (r.marks || []).map((m: any) => m.type).sort())).toEqual([
+      ['bold', 'code'],
+      ['italic'],
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #515 review F1 — a code node with NO emphasis is NOT a run seed.
+//
+// The coalescing pass above exists because a code node that ITSELF carries a
+// bare-delimiter emphasis mark can glue an emphasis delimiter to a backtick.
+// A code node WITHOUT an emphasis mark can never do that, and the shapes below
+// (an emphasized run ADJACENT to a plain code span) were ALWAYS representable —
+// `excludes: "_"` only ever forbade code+mark on the SAME node. They live in the
+// git-sync repos as plain markdown today, and re-import losslessly.
+//
+// If they were pulled into a code-emphasis run they would take the HTML fallback,
+// and EVERY existing markdown file carrying such a construct would rewrite itself
+// to HTML on the next sync — a mass phantom diff and a violation of the design's
+// "non-code output stays byte-identical" promise. So each shape is pinned to the
+// EXACT legacy markdown it has always produced.
+// ---------------------------------------------------------------------------
+describe('#515 F1: a plain code span next to an emphasized run stays MARKDOWN', () => {
+  const t = (text: string, ...marks: string[]) => ({
+    type: 'text',
+    text,
+    ...(marks.length ? { marks: marks.map((m) => ({ type: m })) } : {}),
+  });
+  const para = (content: any[]) => ({
+    type: 'doc',
+    content: [{ type: 'paragraph', content }],
+  });
+
+  const cases: [string, any[], string][] = [
+    ['bold then code', [t('bold', 'bold'), t('c', 'code')], '**bold**`c`'],
+    ['code then bold', [t('c', 'code'), t('bold', 'bold')], '`c`**bold**'],
+    ['italic then code', [t('i', 'italic'), t('c', 'code')], '*i*`c`'],
+    [
+      'bold code bold',
+      [t('a', 'bold'), t('c', 'code'), t('b', 'bold')],
+      '**a**`c`**b**',
+    ],
+    [
+      'code italic code',
+      [t('c1', 'code'), t('i', 'italic'), t('c2', 'code')],
+      '`c1`*i*`c2`',
+    ],
+    ['strike then code', [t('s', 'strike'), t('c', 'code')], '~~s~~`c`'],
+    ['color-less highlight then code', [t('h', 'highlight'), t('c', 'code')], '==h==`c`'],
+  ];
+
+  for (const [name, content, expected] of cases) {
+    it(`${name} keeps its legacy markdown (no HTML degradation)`, async () => {
+      const doc = para(content);
+      const { md1, md2, doc2 } = await roundTrip(doc);
+      // The exact bytes this document has always produced.
+      expect(md1).toBe(expected);
+      expect(md1).not.toContain('<code>');
+      expect(md2).toBe(md1);
+      // ...and it still re-imports to the same marked runs (lossless).
+      const runs = doc2.content[0].content as any[];
+      expect(
+        runs.map((r) => [r.text, (r.marks || []).map((m: any) => m.type).sort()]),
+      ).toEqual(
+        content.map((r: any) => [
+          r.text,
+          (r.marks || []).map((m: any) => m.type).sort(),
+        ]),
+      );
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #515 review F2 — the flanking guard must work on CODE POINTS.
+//
+// The guard decides whether an emphasis delimiter glued to a backtick can still
+// flank, by inspecting the neighbouring character. Reading it with `slice(-1)` /
+// `slice(0, 1)` returns a lone SURROGATE half of an astral character; the lone
+// half matches neither `\s` nor `\p{P}`/`\p{S}`, so the guard used to call it a
+// word boundary, emit markdown — and `marked` then refused to open the emphasis,
+// SILENTLY DROPPING the mark on re-import.
+//
+// The export is BYTE-STABLE in that state (`md2 === md1`), so the byte-stability
+// property CANNOT see the loss: the document just quietly mutates. These tests
+// therefore assert the MARK SET survives the md -> pm import, not just the bytes.
+//
+// The same hole applies to any character marked does not count as whitespace or
+// punctuation — a combining mark, a ZWJ, a soft hyphen — which the old
+// `!/[\p{L}\p{N}]/u` formulation also mislabelled as a boundary.
+// ---------------------------------------------------------------------------
+describe('#515 F2: astral / non-punctuation neighbours never silently drop a mark', () => {
+  const NEIGHBOURS: [string, string][] = [
+    ['astral emoji', '\u{1F642}'],
+    ['astral math letter', '\u{1D400}'],
+    ['astral CJK extension B', '\u{20000}'],
+    ['combining acute', '́'],
+    ['zero-width joiner', '‍'],
+    ['soft hyphen', '­'],
+  ];
+
+  for (const [name, ch] of NEIGHBOURS) {
+    for (const mark of ['bold', 'italic', 'strike'] as const) {
+      it(`${mark} + code preceded by ${name}: both marks survive re-import`, async () => {
+        const doc = {
           type: 'doc',
           content: [
             {
               type: 'paragraph',
               content: [
-                { type: 'text', text: t, marks: [{ type: 'code' }, { type: other }] },
+                { type: 'text', text: `a${ch}` },
+                {
+                  type: 'text',
+                  text: 'x',
+                  marks: [{ type: mark }, { type: 'code' }],
+                },
               ],
             },
           ],
-        }));
-      await fc.assert(
-        fc.asyncProperty(codeComboArb, async (doc) => {
-          const { md1, md2 } = await roundTrip(doc);
-          expect(md2).toBe(md1);
-        }),
-        { numRuns: 20, seed: SEED },
+        };
+        const { md1, md2, doc2 } = await roundTrip(doc);
+        expect(md2).toBe(md1);
+        const runs = doc2.content[0].content as any[];
+        const marked = runs.find((r) => r.text === 'x');
+        expect(marked, `run "x" survived as its own run in ${md1}`).toBeTruthy();
+        expect(new Set((marked.marks || []).map((m: any) => m.type))).toEqual(
+          new Set([mark, 'code']),
+        );
+      });
+
+      it(`${mark} + code followed by ${name}: both marks survive re-import`, async () => {
+        const doc = {
+          type: 'doc',
+          content: [
+            {
+              type: 'paragraph',
+              content: [
+                {
+                  type: 'text',
+                  text: 'x',
+                  marks: [{ type: mark }, { type: 'code' }],
+                },
+                { type: 'text', text: `${ch}a` },
+              ],
+            },
+          ],
+        };
+        const { md1, md2, doc2 } = await roundTrip(doc);
+        expect(md2).toBe(md1);
+        const runs = doc2.content[0].content as any[];
+        const marked = runs.find((r) => r.text === 'x');
+        expect(marked, `run "x" survived as its own run in ${md1}`).toBeTruthy();
+        expect(new Set((marked.marks || []).map((m: any) => m.type))).toEqual(
+          new Set([mark, 'code']),
+        );
+      });
+    }
+  }
+
+  // The BOUNDARY side of the rule: a genuine whitespace/punctuation/symbol
+  // neighbour must still take the clean MARKDOWN form (the guard must not
+  // over-trigger into HTML for ordinary prose — that is the F1 failure mode in
+  // its other guise).
+  const SAFE: [string, string][] = [
+    ['space', ' '],
+    ['period', '.'],
+    ['euro sign', '€'],
+    ['arrow', '→'],
+    ['degree sign', '°'],
+    ['non-breaking space', ' '],
+  ];
+  for (const [name, ch] of SAFE) {
+    it(`a ${name} neighbour keeps the markdown form and both marks`, async () => {
+      const doc = {
+        type: 'doc',
+        content: [
+          {
+            type: 'paragraph',
+            content: [
+              { type: 'text', text: `a${ch}` },
+              {
+                type: 'text',
+                text: 'x',
+                marks: [{ type: 'bold' }, { type: 'code' }],
+              },
+            ],
+          },
+        ],
+      };
+      const { md1, md2, doc2 } = await roundTrip(doc);
+      expect(md1).toBe(`a${ch}**\`x\`**`);
+      expect(md1).not.toContain('<code>');
+      expect(md2).toBe(md1);
+      const marked = (doc2.content[0].content as any[]).find((r) => r.text === 'x');
+      expect(new Set((marked.marks || []).map((m: any) => m.type))).toEqual(
+        new Set(['bold', 'code']),
       );
-    },
-  );
+    });
+  }
 });
