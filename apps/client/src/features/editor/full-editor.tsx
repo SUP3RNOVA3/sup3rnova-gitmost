@@ -4,6 +4,7 @@ import { TitleEditor } from "@/features/editor/title-editor";
 import PageEditor from "@/features/editor/page-editor";
 import {
   ActionIcon,
+  Alert,
   Container,
   Divider,
   Group,
@@ -13,7 +14,7 @@ import {
   Tooltip,
   UnstyledButton,
 } from "@mantine/core";
-import { IconInfoCircle } from "@tabler/icons-react";
+import { IconInfoCircle, IconWifiOff } from "@tabler/icons-react";
 import { useAtom, useAtomValue } from "jotai";
 import {
   userAtom,
@@ -32,6 +33,7 @@ import { DeletedPageBanner } from "@/features/page/trash/components/deleted-page
 import { TemporaryNoteBanner } from "@/features/page/components/temporary-note-banner.tsx";
 import clsx from "clsx";
 import {
+  bodyLocalOnlyAtom,
   currentPageEditModeAtom,
   pageEditorAtom,
 } from "@/features/editor/atoms/editor-atoms.ts";
@@ -105,6 +107,7 @@ export function FullEditor({
   contributors,
   canComment,
 }: FullEditorProps) {
+  const { t } = useTranslation();
   const [user] = useAtom(userAtom);
   const workspace = useAtomValue(workspaceAtom);
   const isDictationEnabled = workspace?.settings?.ai?.dictation === true;
@@ -119,6 +122,12 @@ export function FullEditor({
   const [currentPageEditMode, setCurrentPageEditMode] = useAtom(
     currentPageEditModeAtom,
   );
+  // #564 — the body is showing an un-reconciled LOCAL copy while the collab room
+  // is Disconnected. The banner sits above the title on purpose: chrome (title /
+  // icon, from #563's page-meta boot cache) and body (from the ydoc) are
+  // different points in time, so the whole page — chrome included — must be
+  // marked stale.
+  const { isOffline: isBodyOffline } = useAtomValue(bodyLocalOnlyAtom);
   const userPageEditMode =
     user.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
   const isEditMode = currentPageEditMode === PageEditMode.Edit;
@@ -220,6 +229,22 @@ export function FullEditor({
     >
       {editorToolbarEnabled && editable && isEditMode && (
         <MemoizedFixedToolbar />
+      )}
+      {isBodyOffline && (
+        <Alert
+          role="status"
+          aria-live="polite"
+          variant="light"
+          color="yellow"
+          icon={<IconWifiOff size={18} />}
+          mb="md"
+          className="print-hide"
+          data-testid="page-offline-banner"
+        >
+          {t(
+            "You're offline — showing the last copy saved on this device. Editing is disabled until the connection is restored.",
+          )}
+        </Alert>
       )}
       <MemoizedDeletedPageBanner slugId={slugId} />
       <MemoizedTemporaryNoteBanner slugId={slugId} />

@@ -146,13 +146,92 @@ describe("useSwapHeightReservation", () => {
     expect(result.current.reservedHeight).toBeNull();
   });
 
+  // (c2) #564 guard 6 — an EARLY (local-first) swap paints the ydoc's content,
+  // whose height may legitimately differ a little from the network-seeded static
+  // copy. Demanding an exact height MATCH would pin the reservation to the 4s cap
+  // and leave dead space under the body, so early-swap releases at a TOLERANCE
+  // (80%) of the reserved height.
+  //
+  // The tolerance is the whole point of this test: it must NOT be "any non-zero
+  // height". The live editor's first laid-out frames are routinely a small
+  // fraction of the final height (lazy images, excalidraw / drawio / page-embed
+  // nodes all measure to ~0 until they load), and releasing there would collapse
+  // the document and clamp the scroll to the top — exactly the bug the
+  // reservation exists to prevent.
+  it("(c2) early swap holds the reservation through a COLLAPSED frame, releases within tolerance", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(0);
+    const { ref, setScrollHeight } = makeMenuRef();
+    setScrollHeight(0);
+    const { result, rerender } = renderHook(
+      ({ showStatic }) => useSwapHeightReservation(showStatic, ref, true),
+      { initialProps: { showStatic: true } },
+    );
+
+    act(() => {
+      result.current.captureReservation(H);
+    });
+    rerender({ showStatic: false });
+
+    // Nothing laid out yet -> still reserved (the document must not collapse).
+    act(() => {
+      tickRaf();
+    });
+    expect(result.current.reservedHeight).toBe(H);
+
+    // A laid-out but COLLAPSED frame (images/embeds not loaded yet): non-zero,
+    // but far below the reserved height. Releasing here is the F7 bug — the
+    // document would collapse under the reader.
+    setScrollHeight(120);
+    act(() => {
+      tickRaf();
+    });
+    expect(result.current.reservedHeight).toBe(H);
+
+    // A legitimately shorter local copy, within tolerance -> release (this is the
+    // case earlySwap exists for: a strict match would pin it to the 4s cap).
+    setScrollHeight(H * 0.85);
+    act(() => {
+      tickRaf();
+    });
+    expect(result.current.reservedHeight).toBeNull();
+  });
+
+  // (c3) The strict (flag-off / post-sync) rule is untouched: a shorter live doc
+  // holds the reservation until the 4s cap, exactly as before #564.
+  it("(c3) non-early swap still demands a full height match", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(0);
+    const { ref, setScrollHeight } = makeMenuRef();
+    const { result, rerender } = renderHook(
+      ({ showStatic }) => useSwapHeightReservation(showStatic, ref, false),
+      { initialProps: { showStatic: true } },
+    );
+
+    act(() => {
+      result.current.captureReservation(H);
+    });
+    rerender({ showStatic: false });
+
+    // 85% would release under the EARLY rule; the strict rule holds on.
+    setScrollHeight(H * 0.85);
+    act(() => {
+      tickRaf();
+    });
+    expect(result.current.reservedHeight).toBe(H);
+
+    setScrollHeight(H);
+    act(() => {
+      tickRaf();
+    });
+    expect(result.current.reservedHeight).toBeNull();
+  });
+
   // (d) non-swap: without a capture (and while static is shown) there is no
   // reservation and the release loop never arms, so no rAF is scheduled.
   it("(d) reserves nothing and arms no loop when the swap never happens", () => {
     const { ref } = makeMenuRef();
-    const { result } = renderHook(() =>
-      useSwapHeightReservation(true, ref),
-    );
+    const { result } = renderHook(() => useSwapHeightReservation(true, ref));
 
     expect(result.current.reservedHeight).toBeNull();
     expect(rafQueue.length).toBe(0); // release loop never armed

@@ -1451,6 +1451,8 @@
   "This role is no longer in the catalog": "This role is no longer in the catalog",
   "This language is no longer available in the catalog": "This language is no longer available in the catalog",
   "Connecting… (read-only)": "Connecting… (read-only)",
+  "You're offline — showing the last copy saved on this device. Editing is disabled until the connection is restored.": "You're offline — showing the last copy saved on this device. Editing is disabled until the connection is restored.",
+  "Still syncing with the server — please wait for the connection and try again.": "Still syncing with the server — please wait for the connection and try again.",
   "Apply": "Apply",
   "Applied": "Applied",
   "Suggestion applied": "Suggestion applied",
