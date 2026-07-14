@@ -14,6 +14,7 @@ import {
   pageEditorAtom,
   titleEditorAtom,
 } from "@/features/editor/atoms/editor-atoms";
+import { useBodyWriteBlocked } from "@/features/editor/hooks/use-body-write-blocked";
 import { useSpaceAbility } from "@/features/space/permissions/use-space-ability";
 import { useSpaceQuery } from "@/features/space/queries/space-query";
 import {
@@ -30,6 +31,10 @@ export function useHistoryRestore() {
   const mainEditor = useAtomValue(pageEditorAtom);
   const mainEditorTitle = useAtomValue(titleEditorAtom);
   const setHistoryModalOpen = useSetAtom(historyAtoms);
+  // #564 — the body's Yjs write guard is rejecting every doc change (local-first
+  // read-only window). `setContent` below would be silently dropped, so restoring
+  // now would toast "Successfully restored" over an unchanged document.
+  const { refuseIfBlocked } = useBodyWriteBlocked();
 
   const { spaceSlug } = useParams();
   const { data: space } = useSpaceQuery(spaceSlug);
@@ -42,6 +47,11 @@ export function useHistoryRestore() {
 
   const handleRestore = useCallback(() => {
     if (!activeHistoryData) return;
+
+    // Refuse rather than lie: the write would not reach the document (#564).
+    // Checked here (not only on the button) so the confirm-modal window — the
+    // user can open it before the socket drops and confirm after — is covered.
+    if (refuseIfBlocked()) return;
 
     mainEditorTitle
       .chain()
@@ -57,7 +67,14 @@ export function useHistoryRestore() {
 
     setHistoryModalOpen(false);
     notifications.show({ message: t("Successfully restored") });
-  }, [activeHistoryData, mainEditor, mainEditorTitle, setHistoryModalOpen, t]);
+  }, [
+    activeHistoryData,
+    refuseIfBlocked,
+    mainEditor,
+    mainEditorTitle,
+    setHistoryModalOpen,
+    t,
+  ]);
 
   const confirmRestore = useCallback(() => {
     modals.openConfirmModal({

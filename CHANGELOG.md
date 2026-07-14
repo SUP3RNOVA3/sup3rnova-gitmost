@@ -157,6 +157,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   content and no permissions, is purged on logout / sign-in / `401`, and a page
   that returns `403`/`404` is evicted immediately. With the flag off, nothing is
   read or written and behaviour is unchanged. (#563)
+- **The page body paints from the local collab replica instead of waiting for
+  the collab server.** Under `LOCAL_FIRST_ENABLED` (default `false`), reopening a
+  page whose local ydoc already holds content renders the real body immediately —
+  no network round-trip — and keeps it strictly READ-ONLY until the collab room
+  confirms a sync: no keystroke, no programmatic command and no plugin
+  transaction can reach the Y.Doc in that window, so a stale local copy can never
+  clobber newer server content on merge. An empty local ydoc keeps today's
+  server-seeded static copy (no blank body on a first visit), a real disconnect
+  raises a page-wide "offline, showing the cached copy" banner (a healthy
+  connection stays silent), and a page that returns `403`/`404` has its local ydoc
+  destroyed on disk. With the flag off, behaviour is unchanged. (#564)
+
 
 - **Changing the embedding model no longer empties semantic search.** The
   embeddings now have a versioned lifecycle: the workspace stores which embedding

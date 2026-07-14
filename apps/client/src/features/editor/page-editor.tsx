@@ -31,6 +31,8 @@ import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
+  bodyLocalOnlyAtom,
+  bodyWriteBlockedAtom,
   collabProviderAtom,
   currentPageEditModeAtom,
   dictationAvailabilityAtom,
@@ -97,10 +99,22 @@ import { PageEmbedAncestryProvider } from "@/features/editor/components/page-emb
 import PageEmbedPicker from "@/features/editor/components/page-embed/page-embed-picker";
 import { useTranslation } from "react-i18next";
 import {
+  computeBodyIndicator,
   computeDictationAvailability,
   isBodyEditable,
   isCollabSynced,
+  shouldSwapToLive,
 } from "@/features/editor/editor-sync-state";
+import {
+  createBodyWriteGuard,
+  isYdocBodyNonEmpty,
+} from "@/features/editor/local-first-body";
+import {
+  pageYdocName,
+  registerPageYdoc,
+  unregisterPageYdoc,
+} from "@/features/editor/page-ydoc-eviction";
+import { isLocalFirstEnabled } from "@/lib/config.ts";
 import {
   isVitalsActive,
   measurePageOpen,
@@ -138,6 +152,22 @@ export default function PageEditor({
   const [showReadOnlyCommentPopup] = useAtom(showReadOnlyCommentPopupAtom);
   const [isLocalSynced, setIsLocalSynced] = useState(false);
   const [isRemoteSynced, setIsRemoteSynced] = useState(false);
+  // #564 — the local ydoc actually holds body content (y-indexeddb emits
+  // "synced" for an EMPTY doc too, so the event alone proves nothing).
+  const [ydocNonEmpty, setYdocNonEmpty] = useState(false);
+  // #564 — the remote room confirmed a sync at least once for THIS page. Sticky
+  // (a later disconnect does not revoke it, matching today's post-sync offline
+  // editing), reset on page switch. This — NOT the static->live swap — is what
+  // makes the body editable.
+  const [isRemoteConfirmed, setIsRemoteConfirmed] = useState(false);
+  // Mirror for the Yjs write guard, which is read from a ProseMirror plugin and
+  // must see the CURRENT value without recreating the editor.
+  const isRemoteConfirmedRef = useRef(false);
+  // Read the flag once per mount: a mid-session flip must not move the editor
+  // between two different state machines.
+  const localFirst = useMemo(() => isLocalFirstEnabled(), []);
+  const setBodyLocalOnly = useSetAtom(bodyLocalOnlyAtom);
+  const setBodyWriteBlocked = useSetAtom(bodyWriteBlockedAtom);
   const [yjsConnectionStatus, setYjsConnectionStatus] = useAtom(
     yjsConnectionStatusAtom,
   );
@@ -166,27 +196,73 @@ export default function PageEditor({
     local: IndexeddbPersistence;
     remote: HocuspocusProvider;
     socket: HocuspocusProviderWebsocket;
+    ydoc: Y.Doc;
+    documentName: string;
   } | null>(null);
-  const [providersReady, setProvidersReady] = useState(false);
+  // #564 — the ACTIVE providers, tagged with the pageId they belong to, held in
+  // STATE (not just the ref) so the extensions memo below can never bind the
+  // editor to a provider from a different page. On a pageId change React renders
+  // BEFORE the provider effect re-runs, so a memo reading `providersRef` would
+  // rebuild the collab extensions against the PREVIOUS page's ydoc — and, since
+  // the memo would not recompute again once the new providers landed, the editor
+  // would stay bound to it for the rest of the page's life.
+  const [activeProviders, setActiveProviders] = useState<{
+    pageId: string;
+    remote: HocuspocusProvider;
+  } | null>(null);
+  const providersReady =
+    activeProviders !== null && activeProviders.pageId === pageId;
 
   useEffect(() => {
+    // Guards every provider callback below: after this effect is cleaned up (page
+    // switch / unmount) a late event from the destroyed providers must never
+    // write sync state that now belongs to a DIFFERENT page.
+    let disposed = false;
     if (!providersRef.current) {
-      const documentName = `page.${pageId}`;
+      const documentName = pageYdocName(pageId);
       const ydoc = new Y.Doc();
       const local = new IndexeddbPersistence(documentName, ydoc);
       const socket = new HocuspocusProviderWebsocket({
         url: collaborationURL,
       });
       const onLocalSyncedHandler = () => {
+        if (disposed) return;
         setIsLocalSynced(true);
+        // y-indexeddb emits "synced" even when the stored doc is EMPTY, so probe
+        // the actual body fragment: an empty ydoc must NOT trigger the early swap
+        // (it would blank the body until the network answers — guard 1).
+        setYdocNonEmpty(isYdocBodyNonEmpty(ydoc));
       };
       const onStatusHandler = (event: onStatusParameters) => {
+        if (disposed) return;
         setYjsConnectionStatus(event.status);
       };
       const onSyncedHandler = (event: onSyncedParameters) => {
+        if (disposed) return;
         setIsRemoteSynced(event.state);
+        // #564, guard 2 — THIS event IS the remote confirmation, so the write
+        // guard must open SYNCHRONOUSLY here, inside the same emit.
+        //
+        // Load-bearing: extensions dispatch from `provider.on("synced")` and then
+        // immediately unsubscribe. @tiptap/extension-unique-id is the canonical
+        // one — its `createIds` runs in this very emit, does a single
+        // `view.dispatch(tr)` and calls `provider.off("synced", ...)` right after.
+        // If the guard were still closed at that instant (React state only lands
+        // after a re-render), that transaction would be REJECTED and the
+        // extension would already be gone — leaving every node without a
+        // `data-id` for the life of the editor, which silently breaks comment
+        // anchors, transclusions and the TOC. A later empty flush transaction
+        // cannot repair it: UniqueID's appendTransaction requires `docChanged`.
+        //
+        // The React state below drives the UI and is intentionally async; the ref
+        // is what the ProseMirror plugin reads.
+        if (event.state) {
+          isRemoteConfirmedRef.current = true;
+          setIsRemoteConfirmed(true);
+        }
       };
       const onStatelessHandler = ({ payload }: onStatelessParameters) => {
+        if (disposed) return;
         try {
           const message = JSON.parse(payload);
           // #370 — a version was saved somewhere; live-refresh the history panel
@@ -223,6 +299,10 @@ export default function PageEditor({
         }
       };
       const onAuthenticationFailedHandler = () => {
+        // Late auth failure after teardown: the socket below is already
+        // destroyed, so reconnecting it would resurrect a dead provider (and,
+        // after a page switch, connect to the WRONG page's room).
+        if (disposed) return;
         // Read the latest token via the ref (the closure-captured `collabQuery`
         // may be stale). Guard the decode: a missing or unparseable token must
         // not throw "Invalid token specified" and should trigger a refresh so
@@ -242,13 +322,13 @@ export default function PageEditor({
         }
         if (!needsRefresh) return;
         refetchCollabToken().then((result) => {
-          if (result.data?.token) {
-            socket.disconnect();
-            setTimeout(() => {
-              remote.configuration.token = result.data.token;
-              socket.connect();
-            }, 100);
-          }
+          if (disposed || !result.data?.token) return;
+          socket.disconnect();
+          setTimeout(() => {
+            if (disposed) return;
+            remote.configuration.token = result.data.token;
+            socket.connect();
+          }, 100);
         });
       };
       const remote = new HocuspocusProvider({
@@ -263,21 +343,40 @@ export default function PageEditor({
       });
 
       local.on("synced", onLocalSyncedHandler);
-      providersRef.current = { socket, local, remote };
+      providersRef.current = { socket, local, remote, ydoc, documentName };
+      // #564, guard 3 — hand the LIVE persistence to the global 403/404
+      // subscriber (installed at app level in main.tsx, because the revoked-page
+      // case never mounts this component at all), keyed by both aliases a page
+      // query can use. This registration only makes eviction of a page open RIGHT
+      // NOW cheaper/synchronous — the subscriber resolves pages this session
+      // never opened from the persisted #563 meta cache on its own.
+      if (localFirst) {
+        registerPageYdoc({
+          documentName,
+          persistence: local,
+          keys: [pageId, slugId],
+        });
+      }
       // #370 — publish the provider so the header menu can emit save-version.
       setCollabProvider(remote);
-      setProvidersReady(true);
+      setActiveProviders({ pageId, remote });
     } else {
       setCollabProvider(providersRef.current.remote);
-      setProvidersReady(true);
+      setActiveProviders({ pageId, remote: providersRef.current.remote });
     }
     // Only destroy on final unmount
     return () => {
+      disposed = true;
       setCollabProvider(null);
+      setActiveProviders(null);
+      const documentName = providersRef.current?.documentName;
       providersRef.current?.socket.destroy();
       providersRef.current?.remote.destroy();
       providersRef.current?.local.destroy();
       providersRef.current = null;
+      // The persistence is gone; keep only the pageId/slugId -> doc-name alias
+      // so a 403/404 landing AFTER unmount still deletes the IDB database.
+      if (documentName) unregisterPageYdoc(documentName);
     };
   }, [pageId]);
 
@@ -311,18 +410,34 @@ export default function PageEditor({
     providersRef.current?.remote.attach();
   }, [providersReady, pageId]);
 
+  // `pageId` is a dependency on purpose: the providers are recreated per pageId,
+  // so without it a page switch that does not remount would leave the extensions
+  // (and therefore the editor) bound to the DESTROYED provider / previous page's
+  // ydoc (#564).
   const extensions = useMemo(() => {
-    if (!providersReady || !providersRef.current || !currentUser?.user) {
+    if (
+      !activeProviders ||
+      activeProviders.pageId !== pageId ||
+      !currentUser?.user
+    ) {
       return mainExtensions;
     }
 
-    const remoteProvider = providersRef.current.remote;
+    const remoteProvider = activeProviders.remote;
 
     return [
       ...mainExtensions,
       ...collabExtensions(remoteProvider, currentUser?.user),
+      // #564, guard 2 (Yjs-level half): while the body is live but the remote
+      // room has not confirmed a sync, NO local doc mutation may reach the Y.Doc
+      // — not a keystroke, not a plugin's appendTransaction. Both predicates are
+      // read live, so flipping them never recreates the editor.
+      createBodyWriteGuard({
+        isActive: () => localFirst,
+        canWrite: () => isRemoteConfirmedRef.current,
+      }),
     ];
-  }, [providersReady, currentUser?.user]);
+  }, [activeProviders, currentUser?.user, pageId, localFirst]);
 
   // getJSON() serialization + cache write live in the hook, off the keystroke
   // path, and flush on unmount so the last snapshot survives navigation (#343).
@@ -522,6 +637,36 @@ export default function PageEditor({
 
   const hasConnectedOnceRef = useRef(false);
   const [showStatic, setShowStatic] = useState(true);
+  // #564 — the swap happened EARLY (from the local ydoc, before remote sync), so
+  // the height reservation must be released on the live editor's first laid-out
+  // frame rather than waiting for it to match the static copy's height (guard 6).
+  const [earlySwap, setEarlySwap] = useState(false);
+
+  // #564 — a page switch that does NOT remount this component (page.tsx keys
+  // FullEditor by page.id today, but nothing here may rely on that) must not
+  // carry the previous page's sync state over: with local-first that would swap
+  // the new page straight to a live editor on the strength of the OLD page's
+  // flags, i.e. paint the previous page's ydoc state. Reset during render, so it
+  // lands BEFORE any effect of the new pageId runs (React's sanctioned
+  // "adjust state when a prop changes" pattern).
+  const [syncStatePageId, setSyncStatePageId] = useState(pageId);
+  if (syncStatePageId !== pageId) {
+    setSyncStatePageId(pageId);
+    setIsLocalSynced(false);
+    setIsRemoteSynced(false);
+    setYdocNonEmpty(false);
+    setIsRemoteConfirmed(false);
+    isRemoteConfirmedRef.current = false;
+    setShowStatic(true);
+    setEarlySwap(false);
+    hasConnectedOnceRef.current = false;
+    // NOTE: the jotai stores (bodyLocalOnlyAtom / bodyWriteBlockedAtom) are
+    // deliberately NOT written here. Setting an atom other components subscribe
+    // to during THIS component's render phase is a React violation ("Cannot
+    // update a component while rendering a different component"). They are
+    // published from the effects below instead, which re-run on this very render
+    // because the state reset above recomputes their inputs.
+  }
 
   // Reserved height held across the static -> live editor swap. The live editor
   // lays out its content over a few frames, so replacing the (full-height) static
@@ -537,6 +682,7 @@ export default function PageEditor({
   const { reservedHeight, captureReservation } = useSwapHeightReservation(
     showStatic,
     menuContainerRef,
+    earlySwap,
   );
 
   useEffect(() => {
@@ -550,26 +696,32 @@ export default function PageEditor({
   }, [yjsConnectionStatus, isSynced]);
   useEffect(() => {
     if (!editor) return;
-    // Keep the body read-only until the collab doc has synced (showStatic), so
-    // early keystrokes on a freshly created page can't be lost (#218).
+    // The body is editable ONLY once the remote room has confirmed a sync
+    // (#564, guard 2). With local-first the live editor can be on screen long
+    // before that (painted from the local ydoc), so gating on `!showStatic`
+    // alone would re-open #218 (keystrokes into an unreconciled doc) and risk
+    // clobbering newer remote content on merge.
     editor.setEditable(
       isBodyEditable({
         editable,
         inEditMode: currentPageEditMode === PageEditMode.Edit,
         showStatic,
+        isRemoteConfirmed,
       }),
     );
-  }, [currentPageEditMode, editor, editable, showStatic]);
+  }, [currentPageEditMode, editor, editable, showStatic, isRemoteConfirmed]);
 
   // Publish whether dictation can start and, if not, the cause-specific reason
   // the mic button surfaces. Recomputed on the same signals that drive body
-  // editability so the tooltip never lies about the current state.
+  // editability so the tooltip never lies about the current state (#309): in the
+  // pre-remote live window the reason is "connecting"/"offline", NOT "read-only".
   useEffect(() => {
     setDictationAvailability(
       computeDictationAvailability({
         editable,
         inEditMode: currentPageEditMode === PageEditMode.Edit,
         showStatic,
+        isRemoteConfirmed,
         isDisconnected: yjsConnectionStatus === WebSocketStatus.Disconnected,
       }),
     );
@@ -577,127 +729,219 @@ export default function PageEditor({
     editable,
     currentPageEditMode,
     showStatic,
+    isRemoteConfirmed,
     yjsConnectionStatus,
     setDictationAvailability,
   ]);
 
   useEffect(() => {
-    if (
-      !hasConnectedOnceRef.current &&
-      isCollabSynced(yjsConnectionStatus, isSynced)
-    ) {
-      hasConnectedOnceRef.current = true;
-      // Capture the current (static, full-height) content height BEFORE the swap
-      // so the wrapper can reserve it while the live editor lays out — otherwise
-      // the transient shrink clamps window scroll to the top.
-      captureReservation(swapWrapperRef.current?.offsetHeight ?? null);
-      setShowStatic(false);
+    const collabSynced = isCollabSynced(yjsConnectionStatus, isSynced);
+    if (collabSynced && !isRemoteConfirmedRef.current) {
+      // Sticky: the remote room has reconciled this page's doc at least once, so
+      // local writes can no longer clobber unseen server content. A later drop
+      // does not revoke it (today's post-sync offline editing is unchanged).
+      isRemoteConfirmedRef.current = true;
+      setIsRemoteConfirmed(true);
     }
-  }, [yjsConnectionStatus, isSynced]);
+    if (!hasConnectedOnceRef.current && collabSynced) {
+      hasConnectedOnceRef.current = true;
+    }
+    if (!showStatic) return;
+    if (
+      !shouldSwapToLive({
+        localFirst,
+        isLocalSynced,
+        ydocNonEmpty,
+        collabSynced,
+      })
+    ) {
+      return;
+    }
+    // Capture the current (static, full-height) content height BEFORE the swap
+    // so the wrapper can reserve it while the live editor lays out — otherwise
+    // the transient shrink clamps window scroll to the top.
+    captureReservation(swapWrapperRef.current?.offsetHeight ?? null);
+    setEarlySwap(!collabSynced);
+    setShowStatic(false);
+  }, [
+    yjsConnectionStatus,
+    isSynced,
+    isLocalSynced,
+    ydocNonEmpty,
+    showStatic,
+    localFirst,
+  ]);
+
+  // #564 — re-run the plugin appendTransaction pass once writes are allowed, for
+  // the plugins whose pass the guard rejected during the read-only window.
+  //
+  // Scope, precisely: an EMPTY transaction only revives plugins whose
+  // appendTransaction does NOT require `docChanged` (TrailingNode is the one that
+  // matters — it re-appends the trailing paragraph). It does NOT revive
+  // @tiptap/extension-unique-id, whose appendTransaction is `docChanged`-gated —
+  // that extension is instead handled at the source, by opening the guard
+  // synchronously inside the provider's "synced" emit (see onSyncedHandler).
+  useEffect(() => {
+    if (!localFirst || !isRemoteConfirmed || !editor || editor.isDestroyed) {
+      return;
+    }
+    editor.view.dispatch(editor.state.tr);
+  }, [localFirst, isRemoteConfirmed, editor]);
+
+  // #564, guard 2 — publish the "programmatic writes are being dropped" window
+  // so the paths that write to the body without typing (history restore, comment
+  // resolve/delete mark updates) can refuse instead of silently doing nothing and
+  // reporting success. Mirrors the guard's own predicate exactly.
+  const bodyWriteBlocked = localFirst && !isRemoteConfirmed;
+  useEffect(() => {
+    setBodyWriteBlocked(bodyWriteBlocked);
+    return () => setBodyWriteBlocked(false);
+  }, [bodyWriteBlocked, setBodyWriteBlocked]);
+
+  // #564, guards 4+5 — what the user is told about the un-reconciled state.
+  const bodyIndicator = computeBodyIndicator({
+    localFirst,
+    showStatic,
+    isRemoteConfirmed,
+    isDisconnected: yjsConnectionStatus === WebSocketStatus.Disconnected,
+    canEdit: editable && currentPageEditMode === PageEditMode.Edit,
+  });
+
+  // The "offline, showing the cached copy" state is published for FullEditor, so
+  // the banner can cover the page CHROME as well as the body (guard 5).
+  useEffect(() => {
+    setBodyLocalOnly({ isOffline: bodyIndicator === "offline" });
+    return () => setBodyLocalOnly({ isOffline: false });
+  }, [bodyIndicator, setBodyLocalOnly]);
 
   // Restore the reader's scroll position across the static -> live editor swap.
   // The wiring (early pre-paint restore + post-swap re-assert) lives in the hook
   // so its triggers/guard are directly unit-testable.
   useScrollRestoreOnSwap(pageId, editor, showStatic);
 
+  // The quiet pre-sync badge. Same markup as before, but now rendered in BOTH
+  // branches: after an early local-first swap the body is live yet still
+  // read-only, and that window needs the very same (unobtrusive) signal — while
+  // a real disconnect gets the page-wide banner instead (guard 4).
+  const connectingBadge = bodyIndicator === "connecting" && (
+    <div
+      role="status"
+      aria-live="polite"
+      className="print-hide"
+      data-testid="body-connecting-badge"
+      style={{
+        position: "absolute",
+        top: 0,
+        right: 0,
+        zIndex: 2,
+        padding: "2px 8px",
+        fontSize: "12px",
+        borderRadius: "4px",
+        background: "var(--mantine-color-gray-light)",
+        color: "var(--mantine-color-dimmed)",
+        pointerEvents: "none",
+      }}
+    >
+      {t("Connecting… (read-only)")}
+    </div>
+  );
+
   return (
     <TransclusionLookupProvider>
       <PageEmbedLookupProvider>
         <PageEmbedAncestryProvider hostPageId={pageId}>
-      <div
-        ref={swapWrapperRef}
-        style={
-          reservedHeight != null ? { minHeight: reservedHeight } : undefined
-        }
-      >
-      {showStatic ? (
-        <div style={{ position: "relative" }}>
-          {/* Surface the pre-sync read-only window so edits typed before the
+          <div
+            ref={swapWrapperRef}
+            style={
+              reservedHeight != null ? { minHeight: reservedHeight } : undefined
+            }
+          >
+            {showStatic ? (
+              <div style={{ position: "relative" }}>
+                {/* Surface the pre-sync read-only window so edits typed before the
               collab provider connects aren't silently swallowed (#218). Shown
               only when the user is otherwise allowed to edit. */}
-          {editable && currentPageEditMode === PageEditMode.Edit && (
-            <div
-              role="status"
-              aria-live="polite"
-              className="print-hide"
-              style={{
-                position: "absolute",
-                top: 0,
-                right: 0,
-                zIndex: 2,
-                padding: "2px 8px",
-                fontSize: "12px",
-                borderRadius: "4px",
-                background: "var(--mantine-color-gray-light)",
-                color: "var(--mantine-color-dimmed)",
-                pointerEvents: "none",
-              }}
-            >
-              {t("Connecting… (read-only)")}
-            </div>
-          )}
-          <EditorProvider
-            editable={false}
-            immediatelyRender={true}
-            extensions={mainExtensions}
-            content={content}
-            editorProps={{
-              attributes: {
-                "aria-label": t("Page content"),
-              },
-            }}
-          />
-        </div>
-      ) : (
-        <div className="editor-container" style={{ position: "relative" }}>
-          <div ref={menuContainerRef}>
-            <EditorContent editor={editor} />
+                {connectingBadge}
+                <EditorProvider
+                  editable={false}
+                  immediatelyRender={true}
+                  extensions={mainExtensions}
+                  content={content}
+                  editorProps={{
+                    attributes: {
+                      "aria-label": t("Page content"),
+                    },
+                  }}
+                />
+              </div>
+            ) : (
+              <div
+                className="editor-container"
+                style={{ position: "relative" }}
+              >
+                {/* Local-first read-only window: the body is live from the local ydoc
+              but the remote room has not confirmed yet (#564). */}
+                {connectingBadge}
+                <div ref={menuContainerRef}>
+                  <EditorContent editor={editor} />
 
-            <CommentHoverPreview
-              pageId={pageId}
-              containerRef={menuContainerRef}
-            />
+                  <CommentHoverPreview
+                    pageId={pageId}
+                    containerRef={menuContainerRef}
+                  />
 
-            {editor && (
-              <SearchAndReplaceDialog editor={editor} editable={editable} />
-            )}
+                  {editor && (
+                    <SearchAndReplaceDialog
+                      editor={editor}
+                      editable={editable}
+                    />
+                  )}
 
-            {editor && editorIsEditable && (
-              <div>
-                <EditorLinkMenu editor={editor} />
-                <EditorBubbleMenu editor={editor} />
-                <TableMenu editor={editor} />
-                <TableHandlesLayer editor={editor} />
-                <ImageMenu editor={editor} />
-                <VideoMenu editor={editor} />
-                <AudioMenu editor={editor} />
-                <PdfMenu editor={editor} />
-                <CalloutMenu editor={editor} />
-                <SubpagesMenu editor={editor} />
-                <ExcalidrawMenu editor={editor} />
-                <DrawioMenu editor={editor} />
-                <ColumnsMenu editor={editor} />
+                  {editor && editorIsEditable && (
+                    <div>
+                      <EditorLinkMenu editor={editor} />
+                      <EditorBubbleMenu editor={editor} />
+                      <TableMenu editor={editor} />
+                      <TableHandlesLayer editor={editor} />
+                      <ImageMenu editor={editor} />
+                      <VideoMenu editor={editor} />
+                      <AudioMenu editor={editor} />
+                      <PdfMenu editor={editor} />
+                      <CalloutMenu editor={editor} />
+                      <SubpagesMenu editor={editor} />
+                      <ExcalidrawMenu editor={editor} />
+                      <DrawioMenu editor={editor} />
+                      <ColumnsMenu editor={editor} />
+                    </div>
+                  )}
+                  {/* #564 — NOT offered while the write guard is rejecting: this menu
+                only creates comments, and a comment created here would land in
+                the DB while its inline mark was dropped by the guard, leaving an
+                anchorless comment. On develop this window did not exist (the live
+                editor was only ever shown post-sync), so gating it restores
+                exactly that reachability. */}
+                  {editor &&
+                    !editorIsEditable &&
+                    !bodyWriteBlocked &&
+                    (editable || canComment) &&
+                    providersRef.current && (
+                      <ReadonlyBubbleMenu editor={editor} />
+                    )}
+                  {showCommentPopup && (
+                    <CommentDialog editor={editor} pageId={pageId} />
+                  )}
+                  {showReadOnlyCommentPopup && (
+                    <CommentDialog editor={editor} pageId={pageId} readOnly />
+                  )}
+                  {editor && editorIsEditable && <PageEmbedPicker />}
+                </div>
+                <div
+                  onClick={() => editor.commands.focus("end")}
+                  style={{ paddingBottom: "20vh" }}
+                ></div>
               </div>
             )}
-            {editor &&
-              !editorIsEditable &&
-              (editable || canComment) &&
-              providersRef.current && <ReadonlyBubbleMenu editor={editor} />}
-            {showCommentPopup && (
-              <CommentDialog editor={editor} pageId={pageId} />
-            )}
-            {showReadOnlyCommentPopup && (
-              <CommentDialog editor={editor} pageId={pageId} readOnly />
-            )}
-            {editor && editorIsEditable && <PageEmbedPicker />}
           </div>
-          <div
-            onClick={() => editor.commands.focus("end")}
-            style={{ paddingBottom: "20vh" }}
-          ></div>
-        </div>
-      )}
-      </div>
         </PageEmbedAncestryProvider>
       </PageEmbedLookupProvider>
     </TransclusionLookupProvider>
