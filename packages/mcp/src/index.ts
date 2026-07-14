@@ -689,5 +689,93 @@ server.registerTool(
   },
 );
 
+// Tool: downloadFile (issue #613)
+// INLINE, MCP-ONLY (mirrors uploadFile, deliberately NOT shared): the in-app AI
+// chat has its own `viewImage` for reading an attachment's bytes, so this
+// external-only download primitive — the symmetric partner of uploadFile and the
+// elegant fix for the cross-instance image-migration blocker — is registered only
+// on this external MCP surface, never in the shared registry the in-app agent draws
+// from. The url branch owns its own MCP envelope (resource_link + structuredContent,
+// like stashPage), so it is NOT wrapped in jsonContent.
+server.registerTool(
+  "downloadFile",
+  {
+    description:
+      "Download an INTERNAL Docmost attachment's bytes by its `/api/files/<id>/<name>` " +
+      "src/url — the value getPageJson/getNode/uploadFile hand you (an image node's " +
+      "`src`, an attachment node's `url`). The file is ALWAYS fetched from THIS Docmost " +
+      "instance: if you pass an ABSOLUTE url its HOST is IGNORED and only the " +
+      "/api/files/... PATH is used, so a url copied from ANOTHER instance does NOT " +
+      "download that instance's file (you get this instance's file with that id, or a " +
+      "404) — to move a file between instances, call downloadFile on the SOURCE instance " +
+      "and uploadFile on the target. A src whose path is not /api/files/<id>/<name> is " +
+      "rejected. The result is DISCRIMINATED by `kind`: `base64` returns the bytes " +
+      "base64-encoded INTO the context (use for SMALL files only — it costs tokens) plus " +
+      "{ mime, fileName, attachmentId, size }; `url` returns a short ANONYMOUS URL any " +
+      "server can fetch WITHOUT auth (the way to hand a file to insertImage/replaceImage " +
+      "on another instance) plus { sha256, mime, fileName, size } — that URL is PUBLIC and " +
+      "NON-revocable until it expires (~1h TTL, RAM-only). `format` (default 'auto'): " +
+      "'base64' bytes-in-context, 'url' anonymous URL, 'auto' picks base64 when it fits " +
+      "the context ceiling (~1 MiB) else the anonymous URL. Oversize files error with the " +
+      "exact byte limit and the alternative to use.",
+    inputSchema: {
+      src: z
+        .string()
+        .min(1)
+        .describe(
+          "Internal attachment URL/src: /api/files/<id>/<fileName> (the bare /files/... form is also accepted). If you pass an absolute URL, its host is IGNORED — only this path is used and the file is fetched from THIS instance.",
+        ),
+      format: z
+        .enum(["base64", "url", "auto"])
+        .optional()
+        .describe(
+          "Return shape: 'base64' (bytes in context — small files only), 'url' (anonymous ~1h URL), 'auto' (default: base64 if small else url)",
+        ),
+      maxBase64Bytes: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Override the base64 ceiling in bytes (still clamped to a context-safe maximum)",
+        ),
+    },
+  },
+  async ({ src, format, maxBase64Bytes }) => {
+    const result = await docmostClient.downloadFile(src, {
+      format,
+      maxBase64Bytes,
+    });
+    if (result.kind === "url") {
+      // Mirror stashPage's envelope: deliver the blob as a resource_link (the URL
+      // and the bytes stay OUT of the model context) PLUS a structuredContent
+      // mirror of the documented shape.
+      return {
+        content: [
+          {
+            type: "resource_link" as const,
+            uri: result.uri,
+            name: result.fileName ?? "attachment",
+            mimeType: result.mime,
+            size: result.size,
+          },
+        ],
+        structuredContent: {
+          kind: result.kind,
+          uri: result.uri,
+          sha256: result.sha256,
+          mime: result.mime,
+          fileName: result.fileName,
+          attachmentId: result.attachmentId,
+          size: result.size,
+        },
+      };
+    }
+    // base64: the bytes are intentionally in-context (the caller asked for / auto
+    // chose a small file) → the standard JSON text envelope.
+    return jsonContent(result);
+  },
+);
+
   return server;
 }

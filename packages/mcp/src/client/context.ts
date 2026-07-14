@@ -74,10 +74,20 @@ export type DocmostMcpConfig = { apiUrl: string } & (
     // when absent, stashPage throws a clear "not configured" error. The
     // optional `has`/`evict` probes let stashPage keep its mirror counts honest
     // under the store's FIFO eviction (see stashPage); older sinks omit them.
+    //
+    // `maxBytes` / `maxImageBytes` (#613) are the sink's REAL per-blob caps —
+    // the host reads them from its own configuration (on the Docmost server:
+    // SANDBOX_MAX_BYTES / SANDBOX_MAX_IMAGE_BYTES, which an operator may raise)
+    // and passes them in, so downloadFile pre-checks and error messages quote
+    // the values the sink will ACTUALLY enforce instead of a compile-time guess.
+    // Omitted by a standalone/stdio host (or an older binding) → downloadFile
+    // falls back to the upstream DEFAULTS (8 MiB / 20 MiB).
     sandbox?: {
       put: SandboxPut;
       has?: (uri: string) => boolean;
       evict?: (uri: string) => void;
+      maxBytes?: number;
+      maxImageBytes?: number;
     };
     // Dependency-neutral metrics sink. When present, the client emits generic
     // (name, value, labels) samples; the HOST maps those names onto its own
@@ -172,6 +182,13 @@ export abstract class DocmostClientContext {
   // op's image blobs if the final doc put throws. Null when the sink omits them.
   protected sandboxHas: ((uri: string) => boolean) | null = null;
   protected sandboxEvict: ((uri: string) => void) | null = null;
+  // The sink's REAL per-blob caps, as reported by the host (#613). Null when the
+  // host does not report them (standalone/stdio, or an older binding) → the
+  // consumer (downloadFile) falls back to the upstream defaults. A non-finite /
+  // non-positive value from a misconfigured host is IGNORED (treated as absent)
+  // so a bad number can never disable or zero out the size guards.
+  protected sandboxMaxBytes: number | null = null;
+  protected sandboxMaxImageBytes: number | null = null;
   // Optional dependency-neutral metrics sink (see DocmostMcpConfig.onMetric).
   // Null on the legacy positional form and whenever the host omits it → no-op.
   protected onMetricFn:
@@ -299,6 +316,10 @@ export abstract class DocmostClientContext {
       this.sandboxPut = config.sandbox.put;
       this.sandboxHas = config.sandbox.has ?? null;
       this.sandboxEvict = config.sandbox.evict ?? null;
+      const positive = (v: unknown): number | null =>
+        typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null;
+      this.sandboxMaxBytes = positive(config.sandbox.maxBytes);
+      this.sandboxMaxImageBytes = positive(config.sandbox.maxImageBytes);
     }
     // Legacy positional form carries no onMetric → null (complete no-op).
     this.onMetricFn = config.onMetric ?? null;
@@ -405,6 +426,7 @@ export abstract class DocmostClientContext {
   }
   protected fetchInternalFile(
     _src: string,
+    _maxBytes?: number,
   ): Promise<{ buffer: Buffer; mime: string }> {
     throw new Error("fetchInternalFile not wired (missing StashMixin)");
   }

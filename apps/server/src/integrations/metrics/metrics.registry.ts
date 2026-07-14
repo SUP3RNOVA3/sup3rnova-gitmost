@@ -26,6 +26,7 @@ import {
   METRIC_MCP_TOOL_DURATION,
   METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL,
   METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL,
+  METRIC_MCP_DOWNLOAD_BYTES_TOTAL,
   METRIC_API_KEY_AUTH_DENIED_TOTAL,
   sizeBucket,
 } from './metrics.constants';
@@ -67,6 +68,8 @@ let mcpToolHist: Histogram<'tool'> | null = null;
 // #479 — getPage conversion-cache hit/miss counters.
 let getPageCacheHitsCounter: Counter | null = null;
 let getPageCacheMissesCounter: Counter | null = null;
+// #613 — bytes read over the loopback by the MCP downloadFile tool, by tool label.
+let mcpDownloadBytesCounter: Counter<'tool'> | null = null;
 // #558 — api-key auth denials, by bounded reason label.
 let apiKeyAuthDeniedCounter: Counter<'reason'> | null = null;
 
@@ -196,6 +199,13 @@ function init(): void {
     registers: [registry],
   });
 
+  mcpDownloadBytesCounter = new Counter({
+    name: METRIC_MCP_DOWNLOAD_BYTES_TOTAL,
+    help: 'Total bytes read over the loopback by the MCP downloadFile tool, by tool name',
+    labelNames: ['tool'],
+    registers: [registry],
+  });
+
   apiKeyAuthDeniedCounter = new Counter({
     name: METRIC_API_KEY_AUTH_DENIED_TOTAL,
     help: 'Total api-key auth denials in ApiKeyService.validate, by bounded reason',
@@ -291,6 +301,18 @@ export function incGetPageCacheMiss(): void {
  */
 export function incApiKeyAuthDenied(reason: string): void {
   apiKeyAuthDeniedCounter?.inc({ reason });
+}
+
+/**
+ * #613 — add the bytes ONE MCP download read over the loopback. `tool` MUST be a
+ * bounded, registration-derived MCP tool name (the package's onMetric labels every
+ * sample with the tool that emitted it) — never free-form input — so the label
+ * cardinality stays bounded. A non-finite/negative value is dropped: prom-client
+ * throws on a negative inc(), and a metric must never be able to break a download.
+ */
+export function addMcpDownloadBytes(tool: string, bytes: number): void {
+  if (!Number.isFinite(bytes) || bytes < 0) return;
+  mcpDownloadBytesCounter?.inc({ tool }, bytes);
 }
 
 export function observeMcpTool(tool: string, seconds: number): void {

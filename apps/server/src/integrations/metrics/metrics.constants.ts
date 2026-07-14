@@ -34,6 +34,15 @@ export const METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL =
 export const METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL =
   'mcp_getpage_cache_misses_total';
 
+// #613 — downloadFile volume. The MCP package meters the BYTES it reads over the
+// authenticated loopback for every successful downloadFile (its onMetric sink),
+// and the mcp.service router adds them to this counter, labelled by the tool that
+// read them. Access itself stays inside the service account's CASL scope, but the
+// VOLUME an external agent pulls out is otherwise invisible to the operator; this
+// is the signal a bulk export shows up in. The `tool` label is registration-derived
+// (bounded cardinality). Same "do not rename" contract.
+export const METRIC_MCP_DOWNLOAD_BYTES_TOTAL = 'mcp_download_bytes_total';
+
 // #558 — api-key auth denial observability. Every DEFINITE deny in
 // ApiKeyService.validate (shared by REST jwt.strategy and the /mcp Bearer path)
 // increments this counter, labelled by the BOUNDED deny reason. It replaces the

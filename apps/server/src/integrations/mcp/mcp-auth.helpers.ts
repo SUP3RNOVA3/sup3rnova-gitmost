@@ -29,6 +29,13 @@ export type DocmostMcpConfig = {
     // sink type); older bindings omit them.
     has?: (uri: string) => boolean;
     evict?: (uri: string) => void;
+    // The store's REAL per-blob caps (#613), read from SANDBOX_MAX_BYTES /
+    // SANDBOX_MAX_IMAGE_BYTES by SandboxStore.asSink(). downloadFile pre-checks
+    // and error-messages against THESE, so raising the env raises what the tool
+    // delivers. Optional: a binding that omits them leaves the package on the
+    // upstream defaults (8 MiB / 20 MiB).
+    maxBytes?: number;
+    maxImageBytes?: number;
   };
   // Dependency-neutral metrics sink injected by McpService (mirror of the
   // package's onMetric). The package emits generic (name, value, labels)

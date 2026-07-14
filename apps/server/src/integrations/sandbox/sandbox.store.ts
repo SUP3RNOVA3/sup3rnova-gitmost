@@ -109,22 +109,35 @@ export class SandboxStore implements OnModuleDestroy {
   }
 
   /**
-   * Adapter to the package's blob-sandbox sink contract `{ put, has, evict }`.
+   * Adapter to the package's blob-sandbox sink contract
+   * `{ put, has, evict, maxBytes, maxImageBytes }`.
    * The sink speaks anonymous `uri`s while the store is keyed by `id`, so this is
    * the ONE place that maps a sandbox uri back to its id (the last path segment).
    * Both wiring sites (embedded MCP + in-app agent tools) use this so the uri↔id
    * mapping and URL composition live next to putAndLink, not copy-pasted.
+   *
+   * The two per-blob caps are REPORTED to the package (#613) so downloadFile can
+   * pre-check and error against the caps this store will ACTUALLY enforce, rather
+   * than a compile-time copy of their defaults — an operator who raises
+   * SANDBOX_MAX_BYTES therefore raises what downloadFile delivers. They are read
+   * from the environment HERE (the package still never touches env), and asSink()
+   * is called per MCP request / per in-app tool binding, so a value is never
+   * staler than one request. put() re-reads them anyway, so it stays authoritative.
    */
   asSink(): {
     put: (buf: Buffer, mime: string) => { uri: string; sha256: string; size: number };
     has: (uri: string) => boolean;
     evict: (uri: string) => void;
+    maxBytes: number;
+    maxImageBytes: number;
   } {
     const idOf = (uri: string) => uri.substring(uri.lastIndexOf('/') + 1);
     return {
       put: (buf, mime) => this.putAndLink(buf, mime),
       has: (uri) => this.has(idOf(uri)),
       evict: (uri) => this.remove(idOf(uri)),
+      maxBytes: this.environmentService.getSandboxMaxBytes(),
+      maxImageBytes: this.environmentService.getSandboxMaxImageBytes(),
     };
   }
 
