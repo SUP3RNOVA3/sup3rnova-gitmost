@@ -294,10 +294,11 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
     );
   });
 
-  // 5. code + link co-occur: the schema's `code` mark excludes all other marks
-  //    (including link), so the link cannot survive import. The lossless,
-  //    byte-stable behavior is to emit ONLY the backtick code span (code wins).
-  it('a code+link run emits the backtick code form (code wins, link dropped)', () => {
+  // 5. code + link co-occur (#515): the `code` mark no longer excludes the other
+  //    marks, so a linked code span keeps BOTH — the backtick span is the link
+  //    TEXT (CommonMark: [`x`](href) is <a><code>x</code></a>), which is exactly
+  //    what the importer rebuilds.
+  it('a code+link run emits the code span as the link text (#515)', () => {
     const out = convertProseMirrorToMarkdown(
       doc(
         para({
@@ -310,7 +311,7 @@ describe('converter gap coverage — emission branches (specs 1–11)', () => {
         }),
       ),
     );
-    expect(out).toBe('`x`');
+    expect(out).toBe('[`x`](http://a?b&c"d)');
   });
 
   // 6. hardBreak inside a heading: prefix applied once, "  \n" between a and b.
@@ -849,5 +850,90 @@ describe('heading.textAlign round-trip (A1)', () => {
     expect(
       convertProseMirrorToMarkdown(doc(alignedHeading(2, 'left', text('Plain')))),
     ).toBe('## Plain');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// KNOWN GAP (PRE-EXISTING, not a #515 regression): an inline `code` run whose
+// text contains an UNBALANCED `[` or `]` inside a FOOTNOTE BODY silently mutates.
+//
+// A footnote body is serialized inline as `^[…]`, and the importer's tokenizer
+// locates the closing `]` by COUNTING BRACKETS — it does not know what a code
+// span is. So a stray bracket anywhere in the body must be backslash-escaped
+// (`balanceBrackets`), or the footnote fails to parse at all (verified: with a
+// raw `[` inside the code span the whole `^[…]` degrades to literal prose, taking
+// the footnote AND the code mark with it). But a code span's content is LITERAL
+// on import — marked never decodes escapes between backticks — so the escape's
+// backslash lands IN THE TEXT: `` `a [ 0` `` re-imports as `` `a \[ 0` ``, and
+// every git-sync cycle grows another backslash-bearing diff.
+//
+// Verified PRE-EXISTING: the serializer at `gitea/develop` produces the identical
+// `` `a \[ 0` `` for this document (whose code run carries NO other mark, so the
+// shape long predates #515's `excludes: ""`). Closing it requires a footnote-canon
+// change — the bracket can be neither left raw (parse breaks) nor backslash-
+// escaped (content mutates), so the code span needs a different in-footnote form
+// (e.g. an entity-encoded `<code>`), which is a separate decision.
+//
+// Pinned here so the behavior is DOCUMENTED and the day it is fixed this test
+// turns green and demands attention. The generative corpus excludes the shape
+// (see node-generators.ts `withoutBracketsInCodeRuns`).
+// ---------------------------------------------------------------------------
+describe('footnote body + inline code + bracket (pre-existing gap)', () => {
+  const footnoteDoc = (codeText: string) => ({
+    type: 'doc',
+    content: [
+      para(text('A'), { type: 'footnoteReference', attrs: { id: 'fn1' } }),
+      {
+        type: 'footnotesList',
+        content: [
+          {
+            type: 'footnoteDefinition',
+            attrs: { id: 'fn1' },
+            content: [
+              para(text('body '), {
+                type: 'text',
+                text: codeText,
+                marks: [{ type: 'code' }],
+              }),
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  const codeRunText = (d: any): string | undefined => {
+    let found: string | undefined;
+    const walk = (n: any) => {
+      if (
+        n.type === 'text' &&
+        (n.marks || []).some((m: any) => m.type === 'code')
+      ) {
+        found ??= n.text;
+      }
+      (n.content || []).forEach(walk);
+    };
+    walk(d);
+    return found;
+  };
+
+  it.fails(
+    'a code run with a stray "[" inside a footnote body keeps its text (KNOWN BUG: gains a backslash)',
+    async () => {
+      const md1 = convertProseMirrorToMarkdown(footnoteDoc('a [ 0'));
+      const doc2 = await markdownToProseMirror(md1);
+      // Today: "a \[ 0" — the balanceBrackets escape leaks into the literal
+      // code-span content.
+      expect(codeRunText(doc2)).toBe('a [ 0');
+    },
+  );
+
+  it('a code run with BALANCED brackets inside a footnote body is unaffected', async () => {
+    // The balance pass only escapes STRAY brackets, so a matched pair inside a
+    // code span survives untouched — the gap above is strictly about unbalanced
+    // brackets.
+    const md1 = convertProseMirrorToMarkdown(footnoteDoc('a [ ] 0'));
+    const doc2 = await markdownToProseMirror(md1);
+    expect(codeRunText(doc2)).toBe('a [ ] 0');
   });
 });
