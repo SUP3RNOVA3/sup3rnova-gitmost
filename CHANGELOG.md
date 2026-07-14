@@ -387,6 +387,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lost draw.io/Excalidraw diagram is no longer unnamed in the MCP integrity
+  guard.** The structural integrity guard behind `diffPageVersions` and the
+  post-write verify report counted images/links/tables/callouts/code blocks, but
+  no diagram kind — and a diagram is a block ATOM whose whole payload lives in
+  its attributes, so deleting one moves no prose and no marks: the only trace was
+  the single leaf placeholder an atom leaves in the text delta, i.e. a 1-char
+  change indistinguishable from fixing a typo (the same blind spot a vanished
+  code block used to have). `drawio` and `excalidraw` are now counted as their
+  own integrity kinds: losing (or gaining) one raises the same class of flag as
+  losing a table — a `drawio: N -> N-1` line in the diff's `## Integrity` block
+  and a `structure.drawio` entry with `changed: true` in the write report, so the
+  loss is NAMED rather than hidden in a text delta. They are deliberately two
+  keys, not one `diagrams` bucket: a bucket would report a drawio swapped for an
+  excalidraw as `1 -> 1` (clean) and omit it from the report entirely. Detection
+  only: this makes such a loss loud, it does not prevent it.
+
 - **MCP write tools no longer report a false failure that provokes a duplicate
   write.** `drawioCreate` used to throw when the diagram landed as a NESTED block
   (anchored inside a callout or table cell) because there is no `#<index>` handle

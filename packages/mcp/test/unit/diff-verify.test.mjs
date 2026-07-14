@@ -151,6 +151,64 @@ test("summarizeChange surfaces a codeBlock-count change (1->0)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #600: the guard is symmetric — an ADDED code block is surfaced exactly like
+// an added table/image, with no text delta of its own to lean on.
+// ---------------------------------------------------------------------------
+test("summarizeChange surfaces a codeBlock-count change (0->1)", () => {
+  const before = doc(para(t("intro")));
+  const after = doc(
+    para(t("intro")),
+    { type: "codeBlock", attrs: { language: "c" }, content: [t("int x = 1;")] },
+  );
+  const r = summarizeChange(before, after);
+
+  assert.equal(r.changed, true, "an added codeBlock is a change");
+  assert.deepEqual(r.structure.codeBlocks, [0, 1]);
+  assert.match(r.summary, /codeBlocks 0→1/);
+});
+
+// ---------------------------------------------------------------------------
+// #600: no false positive — a doc whose code blocks all survive must not report
+// a codeBlocks entry (only CHANGED kinds appear in `structure`).
+// ---------------------------------------------------------------------------
+test("summarizeChange omits codeBlocks when every code block survives", () => {
+  const code = { type: "codeBlock", attrs: { language: "c" }, content: [t("int x = 1;")] };
+  const before = doc(para(t("intro")), code);
+  const after = doc(para(t("intro, edited")), JSON.parse(JSON.stringify(code)));
+  const r = summarizeChange(before, after);
+
+  assert.equal(r.changed, true, "the prose edit is still a change");
+  // The code block survived, so no structural flag is raised for it.
+  assert.equal("codeBlocks" in (r.structure ?? {}), false);
+  assert.ok(!r.summary.includes("codeBlocks"));
+});
+
+// ---------------------------------------------------------------------------
+// #600 (issue item 5): a vanished drawio diagram — pure attrs, no prose, no
+// marks — must raise the same class of flag as a vanished table/codeBlock.
+// Without the counter the only trace is a 1-char leaf placeholder, so the loss
+// is unnamed and reads like a typo fix.
+// ---------------------------------------------------------------------------
+test("summarizeChange surfaces a vanished drawio diagram (drawio 1->0)", () => {
+  const before = doc(
+    para(t("architecture")),
+    { type: "drawio", attrs: { src: "/api/files/d.svg", attachmentId: "d1" } },
+  );
+  const after = doc(para(t("architecture")));
+  const r = summarizeChange(before, after);
+
+  assert.equal(r.changed, true, "a vanished drawio diagram is a change");
+  assert.deepEqual(r.structure.drawio, [1, 0]);
+  assert.match(r.summary, /drawio 1→0/);
+  // No marks moved, and the atom contributes only a leaf placeholder to the text
+  // diff (textBetween renders an atom as a single " "), so the prose deltas can
+  // neither prove nor name the loss — the count is the only real signal.
+  assert.deepEqual(r.marks, {});
+  assert.equal(r.textInserted, 0);
+  assert.ok(r.textDeleted <= 1, "at most the atom's leaf placeholder");
+});
+
+// ---------------------------------------------------------------------------
 // Robustness: a malformed pair must never throw; it degrades gracefully.
 // ---------------------------------------------------------------------------
 test("summarizeChange never throws on a pathological pair", () => {

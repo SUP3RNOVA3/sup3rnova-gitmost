@@ -86,6 +86,103 @@ test("diffDocs reports integrity counts as [old,new] tuples", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #600: a GAINED code block is counted exactly like a gained table — the guard
+// is a count delta in BOTH directions, not a loss-only detector.
+// ---------------------------------------------------------------------------
+test("diffDocs counts an ADDED codeBlock (0 -> 1), like a table", () => {
+  const table = {
+    type: "table",
+    content: [
+      {
+        type: "tableRow",
+        content: [{ type: "tableCell", content: [para(t("cell"))] }],
+      },
+    ],
+  };
+  const oldDoc = doc(para(t("А можно сделать вот так:")));
+  const newDoc = doc(
+    para(t("А можно сделать вот так:")),
+    { type: "codeBlock", attrs: { language: "c" }, content: [t("int x = 1;")] },
+    table,
+  );
+  const r = diffDocs(oldDoc, newDoc);
+
+  assert.deepEqual(r.integrity.codeBlocks, [0, 1]);
+  assert.deepEqual(r.integrity.tables, [0, 1]);
+  assert.match(r.markdown, /- codeBlocks: 0 -> 1/);
+});
+
+// ---------------------------------------------------------------------------
+// #600: a doc that KEEPS its code blocks must not move the counter (no false
+// positive on an ordinary text edit around the code).
+// ---------------------------------------------------------------------------
+test("diffDocs keeps codeBlocks steady when only prose around them changes", () => {
+  const code = (src) => ({
+    type: "codeBlock",
+    attrs: { language: "c" },
+    content: [t(src)],
+  });
+  const oldDoc = doc(para(t("before")), code("int x = 1;"), code("int y = 2;"));
+  const newDoc = doc(para(t("before, edited")), code("int x = 1;"), code("int y = 2;"));
+  const r = diffDocs(oldDoc, newDoc);
+
+  assert.deepEqual(r.integrity.codeBlocks, [2, 2], "both code blocks survive");
+  assert.ok(r.summary.inserted > 0, "the prose edit is still reported as text");
+  assert.match(r.markdown, /- codeBlocks: 2 -> 2/);
+});
+
+// ---------------------------------------------------------------------------
+// #600 (issue item 5): diagram atoms (drawio / excalidraw) are data carriers
+// whose whole payload lives in attrs — deleting one moves no prose and no marks,
+// leaving only the 1-char leaf placeholder an atom contributes to the text delta
+// (indistinguishable from a typo fix). The count is what NAMES the loss. They
+// are counted as TWO kinds, not one bucket — see the cross-kind swap test below.
+// ---------------------------------------------------------------------------
+test("diffDocs counts drawio/excalidraw as separate integrity kinds", () => {
+  const drawio = {
+    type: "drawio",
+    attrs: { src: "/api/files/d.svg", attachmentId: "d1" },
+  };
+  const excalidraw = {
+    type: "excalidraw",
+    attrs: { src: "/api/files/e.svg", attachmentId: "e1" },
+  };
+  const oldDoc = doc(para(t("architecture")), drawio, excalidraw);
+  // The drawio diagram silently vanishes; the prose is untouched.
+  const newDoc = doc(para(t("architecture")), excalidraw);
+
+  const r = diffDocs(oldDoc, newDoc);
+  assert.deepEqual(r.integrity.drawio, [1, 0], "the lost drawio is counted");
+  assert.deepEqual(r.integrity.excalidraw, [1, 1], "the excalidraw survived");
+  assert.match(r.markdown, /- drawio: 1 -> 0/);
+  assert.match(r.markdown, /- excalidraw: 1 -> 1/);
+  // Nothing else moved: the loss is unnamed by every OTHER integrity kind,
+  // which is exactly why it needs its own counter.
+  assert.deepEqual(r.integrity.images, [0, 0]);
+  assert.deepEqual(r.integrity.codeBlocks, [0, 0]);
+});
+
+// A drawio swapped for an excalidraw: a single "diagrams" BUCKET would report
+// this as `1 -> 1` (clean) and omit it from the write report entirely, hiding a
+// destroyed diagram behind a same-cardinality total. Two keys name it.
+test("diffDocs names a drawio->excalidraw swap (a bucket would report 1 -> 1)", () => {
+  const oldDoc = doc(
+    para(t("architecture")),
+    { type: "drawio", attrs: { src: "/api/files/d.svg", attachmentId: "d1" } },
+  );
+  const newDoc = doc(
+    para(t("architecture")),
+    { type: "excalidraw", attrs: { src: "/api/files/e.svg", attachmentId: "e1" } },
+  );
+
+  const r = diffDocs(oldDoc, newDoc);
+  assert.deepEqual(r.integrity.drawio, [1, 0], "the drawio is gone");
+  assert.deepEqual(r.integrity.excalidraw, [0, 1], "an excalidraw took its place");
+  assert.match(r.markdown, /- drawio: 1 -> 0/);
+  assert.match(r.markdown, /- excalidraw: 0 -> 1/);
+});
+
+// ---------------------------------------------------------------------------
 // Footnote markers stop at the notes heading
 // ---------------------------------------------------------------------------
 test("diffDocs footnote markers ignore the notes section", () => {
