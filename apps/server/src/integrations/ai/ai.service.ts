@@ -30,9 +30,20 @@ import { createHash } from 'node:crypto';
  * embedding model; `queryPrefix`/`docPrefix` are prepended to a query / a stored
  * chunk respectively (e5-style `"query: "` / `"passage: "`, empty for a non-e5
  * provider); `fingerprint` is the deterministic id of the whole configuration.
+ *
+ * #599 `modelId` — the bare model NAME (the same value the indexer stamps into
+ * `page_embeddings.model_name`). It is a COARSER key than the fingerprint: a
+ * revision bump or a prefix toggle changes the fingerprint but NOT the model id.
+ * That distinction is what lets a reader decide whether the old generation's rows
+ * are still comparable with a query vector from the CURRENT model: same model =>
+ * same embedding SPACE (a prefix/revision change only shifts it slightly), a
+ * different model => a different space entirely, where cosine against the old rows
+ * is noise. See EmbeddingGenerationService.generationForTarget.
  */
 export interface ResolvedEmbeddingProvider {
   model: EmbeddingModel;
+  /** Bare model name, mirrored per row in `page_embeddings.model_name` (#599). */
+  modelId: string;
   queryPrefix: string;
   docPrefix: string;
   fingerprint: string;
@@ -47,6 +58,22 @@ export interface ResolvedEmbeddingProvider {
  *
  * Exported as a pure function so it can be unit-tested in isolation and reused by
  * the indexer without a service instance.
+ *
+ * KNOWN GAP (#599 R8b, inherited from PR-1 — follow-up, NOT fixed here): the
+ * fingerprint does NOT include the provider ENDPOINT (`embeddingBaseUrl` /
+ * `EMBEDDING_ENDPOINT`) or the driver. Repoint a workspace at a DIFFERENT service
+ * that happens to serve a SAME-NAMED model (a private fine-tune called
+ * `bge-base-en`, a second TEI sidecar with different weights, a proxy that maps the
+ * name elsewhere) and the fingerprint is IDENTICAL: no swap window opens, the
+ * generation pointer never moves, `modelChanged` stays false — and the D2 guard,
+ * whose whole premise is "a different embedding space always shows up as a
+ * different model name", is bypassed. Search then serves a cross-space cosine
+ * (query from the new weights vs rows from the old ones) and RRF promotes the
+ * resulting noise. Mitigating it means folding the endpoint (and driver) into the
+ * fingerprint, which forces a full reindex on any endpoint move — including benign
+ * ones (a host rename, an HA re-address), so it is a deliberate follow-up decision,
+ * not a drive-by change here. Until then: an operator who repoints the embedding
+ * endpoint at different weights MUST click "Reindex now".
  */
 export function computeEmbeddingFingerprint(parts: {
   modelId: string;
@@ -160,7 +187,9 @@ export class AiService {
         // Fail explicitly (503) — a dedicated per-driver ollama endpoint is not
         // supported yet. The same-driver ollama case (handled outside this block)
         // legitimately reuses the workspace's ollama endpoint and is unaffected.
-        const who = override?.roleName ? ` for role "${override.roleName}"` : '';
+        const who = override?.roleName
+          ? ` for role "${override.roleName}"`
+          : '';
         throw new AiNotConfiguredException(
           `An ollama model override${who} requires a dedicated ollama endpoint, ` +
             `which is not supported when the workspace driver is "${cfg.driver}". ` +
@@ -179,7 +208,9 @@ export class AiService {
           // Explicit 503: the role chose a provider that is not set up. Name the
           // driver (and role, when known) so the admin can fix it — no silent
           // fallback to the workspace model (error-handling convention).
-          const who = override?.roleName ? ` for role "${override.roleName}"` : '';
+          const who = override?.roleName
+            ? ` for role "${override.roleName}"`
+            : '';
           throw new AiNotConfiguredException(
             `The model provider "${overrideDriver}"${who} is selected but not ` +
               `configured (no API key). Configure ${overrideDriver} in AI ` +
@@ -430,6 +461,7 @@ export class AiService {
       // A per-workspace (typically non-e5) provider gets no e5-style prefixes.
       return {
         model,
+        modelId,
         queryPrefix: '',
         docPrefix: '',
         fingerprint: computeEmbeddingFingerprint({
@@ -460,6 +492,7 @@ export class AiService {
       const dimensions = Number.isFinite(dimRaw) && dimRaw > 0 ? dimRaw : null;
       return {
         model,
+        modelId: globalModel,
         queryPrefix,
         docPrefix,
         fingerprint: computeEmbeddingFingerprint({
@@ -482,12 +515,15 @@ export class AiService {
    * (SEARCH_EMBED_TIMEOUT_MS, default 800ms) — NOT the long batch-indexing
    * timeout — so a slow/hung sidecar degrades search fast. Throws on
    * timeout/error (the caller degrades to the lexical-only path). Returns the
-   * vector plus the active fingerprint used to filter candidate rows.
+   * vector plus the fingerprint AND the model id of the provider that produced it
+   * (#599: the model id is the key the reader compares against the ACTIVE
+   * generation's model to decide whether the two live in the same embedding space
+   * — see EmbeddingGenerationService.embedQueryForActiveGeneration).
    */
   async embedQuery(
     workspaceId: string,
     text: string,
-  ): Promise<{ vector: number[]; fingerprint: string }> {
+  ): Promise<{ vector: number[]; fingerprint: string; modelId: string }> {
     const provider = await this.resolveEmbeddingProvider(workspaceId);
     const [vector] = await this.embedWithModel(
       provider.model,
@@ -495,7 +531,11 @@ export class AiService {
       [provider.queryPrefix + text],
       AiService.searchEmbedTimeoutMs(),
     );
-    return { vector, fingerprint: provider.fingerprint };
+    return {
+      vector,
+      fingerprint: provider.fingerprint,
+      modelId: provider.modelId,
+    };
   }
 
   /**

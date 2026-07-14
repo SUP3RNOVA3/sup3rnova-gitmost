@@ -48,10 +48,14 @@ describe('SearchService.searchPage — scope-security early returns', () => {
       shareRepo as any,
       spaceMemberRepo as any,
       pagePermissionRepo as any,
-      // #530 semantic path off for these query-mode unit tests: a stubbed
-      // embedQuery that throws makes the service degrade to the lexical path.
-      { embedQuery: jest.fn().mockRejectedValue(new Error('no embed')) } as any,
       { vectorCandidateArm: jest.fn() } as any,
+      // #530/#599 semantic path off for these query-mode unit tests: the query-embed
+      // funnel throws, so the service degrades to the byte-identical lexical path.
+      {
+        embedQueryForActiveGeneration: jest
+          .fn()
+          .mockRejectedValue(new Error('no embed')),
+      } as any,
     );
     return { service, pageRepo, shareRepo, spaceMemberRepo, pagePermissionRepo };
   }

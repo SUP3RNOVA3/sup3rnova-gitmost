@@ -88,6 +88,9 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
 
@@ -206,6 +209,9 @@ describe('AiChatToolsService expanded toolset guardrails', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
 
@@ -334,6 +340,9 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
 
@@ -553,6 +562,9 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
 
@@ -686,6 +698,9 @@ describe('AiChatToolsService #294 changed execute wirings', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
   afterEach(() => jest.restoreAllMocks());
@@ -791,6 +806,9 @@ describe('AiChatToolsService #410 footnote + image tools', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
   afterEach(() => jest.restoreAllMocks());
@@ -889,6 +907,9 @@ describe('AiChatToolsService getCurrentPage selection (#388)', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
 
@@ -976,6 +997,9 @@ describe('AiChatToolsService drawio layout passthrough (#440)', () => {
       {
         asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
       } as never,
+      // #599: EmbeddingGenerationService (active-generation fingerprint for
+      // the hybrid RAG read). Unused by this spec (the RAG path falls back).
+      {} as never,
     );
   });
 
