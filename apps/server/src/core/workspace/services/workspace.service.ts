@@ -33,7 +33,11 @@ import { DISALLOWED_HOSTNAMES, WorkspaceStatus } from '../workspace.constants';
 import { isAdminActingOnOwner } from '../workspace.util';
 import { v4 } from 'uuid';
 import { InjectQueue } from '@nestjs/bullmq';
-import { QueueJob, QueueName } from '../../../integrations/queue/constants';
+import {
+  QueueJob,
+  QueueName,
+  workspaceReindexJobOptions,
+} from '../../../integrations/queue/constants';
 import { Queue } from 'bullmq';
 import {
   generateRandomSuffixNumbers,
@@ -91,7 +95,15 @@ export class WorkspaceService {
   async getWorkspacePublicData(workspaceId: string) {
     const workspace = await this.db
       .selectFrom('workspaces')
-      .select(['id', 'name', 'logo', 'hostname', 'enforceSso', 'licenseKey', 'plan'])
+      .select([
+        'id',
+        'name',
+        'logo',
+        'hostname',
+        'enforceSso',
+        'licenseKey',
+        'plan',
+      ])
       .select((eb) =>
         jsonArrayFrom(
           eb
@@ -358,10 +370,14 @@ export class WorkspaceService {
       // updateAiSettings(workspaceId, 'mcp', ...) below.
 
       if (typeof updateWorkspaceDto.isScimEnabled !== 'undefined') {
-        if (!this.licenseCheckService.hasFeature(ws.licenseKey, Feature.SCIM, ws.plan)) {
-          throw new ForbiddenException(
-            'This feature requires a valid license',
-          );
+        if (
+          !this.licenseCheckService.hasFeature(
+            ws.licenseKey,
+            Feature.SCIM,
+            ws.plan,
+          )
+        ) {
+          throw new ForbiddenException('This feature requires a valid license');
         }
       }
 
@@ -371,10 +387,14 @@ export class WorkspaceService {
         typeof updateWorkspaceDto.restrictApiToAdmins !== 'undefined' ||
         typeof updateWorkspaceDto.allowMemberTemplates !== 'undefined'
       ) {
-        if (!this.licenseCheckService.hasFeature(ws.licenseKey, Feature.SECURITY_SETTINGS, ws.plan)) {
-          throw new ForbiddenException(
-            'This feature requires a valid license',
-          );
+        if (
+          !this.licenseCheckService.hasFeature(
+            ws.licenseKey,
+            Feature.SECURITY_SETTINGS,
+            ws.plan,
+          )
+        ) {
+          throw new ForbiddenException('This feature requires a valid license');
         }
       }
 
@@ -613,16 +633,15 @@ export class WorkspaceService {
       await this.aiQueue
         .remove(`ai-search-disabled-${workspaceId}`)
         .catch(() => undefined);
-      // Stable jobId de-duplicates with the manual "Reindex now" path and with
-      // repeated enable toggles (one full reindex at a time).
+      // Stable jobId de-duplicates with the manual "Reindex now" path, with the
+      // automatic fingerprint-change reindex, and with repeated enable toggles (one
+      // full reindex at a time). The shared options also carry the #599 retry policy
+      // (attempts: 3 + backoff) — a run left partial by a transient embedding failure
+      // must be RE-RUN, or the workspace stays in the swap window forever.
       await this.aiQueue.add(
         QueueJob.WORKSPACE_CREATE_EMBEDDINGS,
         { workspaceId },
-        {
-          jobId: `ai-reindex-${workspaceId}`,
-          removeOnComplete: true,
-          removeOnFail: true,
-        },
+        workspaceReindexJobOptions(workspaceId),
       );
     } else if (after.aiSearch === false) {
       const deleteJobId = `ai-search-disabled-${workspaceId}`;

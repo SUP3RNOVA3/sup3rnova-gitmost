@@ -345,6 +345,142 @@ export class WorkspaceRepo {
   }
 
   /**
+   * #599 — read the workspace's EMBEDDING GENERATION pointer
+   * (`settings.ai.embedding`).
+   *
+   *  - `activeFingerprint`: the generation search/RAG currently SERVE from. It is
+   *    the workspace's persisted pointer, deliberately NOT derived from the live
+   *    provider config: changing the model/revision/prefix changes the config
+   *    (TARGET) fingerprint instantly, but the pointer only moves after a full
+   *    target reindex completes (the atomic flip). null = never flipped (a fresh
+   *    or legacy instance), and callers then fall back to the config fingerprint.
+   *  - `activeModel`: the bare model NAME of that generation (`page_embeddings.
+   *    model_name` of its rows). Recorded at the flip so a reader can tell a
+   *    same-model fingerprint change (revision/prefix — same embedding space, the
+   *    old rows stay comparable) from a MODEL change (a different space, where a
+   *    cosine of the new model's query against the old model's rows is noise). null
+   *    = never flipped, or flipped by a build that predates this key.
+   *  - `coverageTotal`: the number of pages that actually produced >= 1 chunk in
+   *    the completed run that established `activeFingerprint`. It is the coverage
+   *    DENOMINATOR (see EmbeddingGenerationService.computeCoverage) — the raw
+   *    embeddable count cannot be used, because pages with no extractable text
+   *    never produce a row and would pin the state at `stale` forever.
+   *  - `coverageEmbeddable`: how many pages that same run considered EMBEDDABLE.
+   *    `coverageEmbeddable - coverageTotal` is the measured number of pages that
+   *    look embeddable but yield no chunk; the live denominator subtracts it from
+   *    the CURRENT embeddable count, which is what lets coverage go `stale` when
+   *    pages are ADDED without pinning a chunk-less workspace at `stale` forever.
+   *
+   * Values are read with `->>` (jsonb text extraction), so a corrupted/absent key
+   * degrades to null rather than throwing.
+   */
+  async getEmbeddingGeneration(
+    workspaceId: string,
+    trx?: KyselyTransaction,
+  ): Promise<{
+    activeFingerprint: string | null;
+    activeModel: string | null;
+    coverageTotal: number | null;
+    coverageEmbeddable: number | null;
+  }> {
+    const db = dbOrTx(this.db, trx);
+    const row = await db
+      .selectFrom('workspaces')
+      .select([
+        sql<string | null>`settings->'ai'->'embedding'->>'activeFingerprint'`.as(
+          'activeFingerprint',
+        ),
+        sql<string | null>`settings->'ai'->'embedding'->>'activeModel'`.as(
+          'activeModel',
+        ),
+        sql<string | null>`settings->'ai'->'embedding'->>'coverageTotal'`.as(
+          'coverageTotal',
+        ),
+        sql<string | null>`settings->'ai'->'embedding'->>'coverageEmbeddable'`.as(
+          'coverageEmbeddable',
+        ),
+      ])
+      .where('id', '=', workspaceId)
+      .executeTakeFirst();
+
+    // NOTE `Number(null) === 0` — an ABSENT key must stay null (= "no completed run
+    // for this generation", which drives the bootstrap denominator), never 0 (which
+    // would read as "this generation covers a workspace of zero pages" = a vacuous
+    // `full`). So the null check comes BEFORE the numeric parse.
+    const count = (raw: string | null | undefined): number | null => {
+      const parsed = raw == null || raw === '' ? NaN : Number(raw);
+      return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+    };
+    return {
+      activeFingerprint: row?.activeFingerprint || null,
+      activeModel: row?.activeModel || null,
+      coverageTotal: count(row?.coverageTotal),
+      coverageEmbeddable: count(row?.coverageEmbeddable),
+    };
+  }
+
+  /**
+   * #599 — the ATOMIC POINTER FLIP: move `settings.ai.embedding.activeFingerprint`
+   * to the generation a completed reindex just built, and record that run's
+   * coverage denominator, in ONE settings write.
+   *
+   * All four keys are written by a single UPDATE (one jsonb `||` merge), so a
+   * reader can never observe the new fingerprint with the old run's coverage total
+   * (or vice-versa) — the flip is all-or-nothing. Sibling `settings.ai.*` keys
+   * (provider / search / chat / mcp) are preserved by the merge.
+   *
+   * #599 (D6) — BOTH `settings->'ai'` and `settings->'ai'->'embedding'` are wrapped
+   * in a `jsonb_typeof = 'object'` CASE. `COALESCE` only guards a NULL value; if
+   * either key somehow holds a scalar or an array (a hand-edited row, a bad
+   * migration), `'"x"'::jsonb || '{...}'::jsonb` raises
+   * `cannot concatenate a non-object jsonb` and every flip of that workspace fails
+   * forever. The CASE self-heals it to `{}` instead (the same weakness exists in
+   * `updateAiProviderSettings` for `ai`; fixed here for this writer).
+   *
+   * The "is the config still on this target?" guard lives at the call site
+   * (EmbeddingGenerationService.completeRun) — it re-resolves the provider right
+   * before this write, so a config change DURING the run never gets a pointer
+   * flipped onto a generation nobody is building any more.
+   */
+  async setEmbeddingGeneration(
+    workspaceId: string,
+    generation: {
+      activeFingerprint: string;
+      activeModel: string;
+      coverageTotal: number;
+      coverageEmbeddable: number;
+    },
+    trx?: KyselyTransaction,
+  ): Promise<void> {
+    const db = dbOrTx(this.db, trx);
+    const count = (n: number): string => String(Math.max(0, Math.floor(n)));
+    const workspace = await db
+      .updateTable('workspaces')
+      .set({
+        settings: sql`COALESCE(settings, '{}'::jsonb) || jsonb_build_object(
+          'ai',
+          (CASE WHEN jsonb_typeof(settings->'ai') = 'object'
+                THEN settings->'ai' ELSE '{}'::jsonb END)
+          || jsonb_build_object(
+            'embedding',
+            (CASE WHEN jsonb_typeof(settings->'ai'->'embedding') = 'object'
+                  THEN settings->'ai'->'embedding' ELSE '{}'::jsonb END)
+            || jsonb_build_object(
+                 'activeFingerprint', ${generation.activeFingerprint}::text,
+                 'activeModel', ${generation.activeModel}::text,
+                 'coverageTotal', ${count(generation.coverageTotal)}::text,
+                 'coverageEmbeddable', ${count(generation.coverageEmbeddable)}::text
+               )
+          ))`,
+        updatedAt: new Date(),
+      })
+      .where('id', '=', workspaceId)
+      .returning(this.baseFields)
+      .executeTakeFirst();
+    await this.bustWorkspaceCache(workspace, trx);
+  }
+
+  /**
    * Set a single scalar key at the TOP LEVEL of `settings` (e.g.
    * `settings.htmlEmbed`). Mirrors `updateAiSettings`/`updateSharingSettings`
    * but without a nested namespace object. `prefKey` comes from a fixed

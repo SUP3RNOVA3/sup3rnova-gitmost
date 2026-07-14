@@ -113,14 +113,30 @@ describe('SearchService #529 lexical overhaul [integration]', () => {
           },
         }
       : realRepo;
+    // #599: the reader funnel. It wraps the SAME fake embedQuery above and reports
+    // the generation the vector arm must filter by. These Phase-B PR-1 cases run at
+    // the steady state (no swap in flight: active === target), and coverage is
+    // reported `full` so the semantic block keeps its PR-1 shape — the lifecycle's
+    // own states (stale/swap/flip/GC) are covered by the unit specs.
+    const embeddingGeneration = {
+      embedQueryForActiveGeneration: async () => {
+        const { vector, fingerprint } = await aiService.embedQuery();
+        return {
+          vector,
+          fingerprint,
+          generation: { active: fingerprint, target: fingerprint, swapping: false },
+        };
+      },
+      getCoverage: async () => ({ indexed: 1, total: 1, state: 'full' as const }),
+    };
     return new SearchService(
       db as any,
       pageRepo as any,
       {} as any,
       spaceMemberRepo as any,
       pagePermissionRepo as any,
-      aiService as any,
       pageEmbeddingRepo as any,
+      embeddingGeneration as any,
     );
   }
 

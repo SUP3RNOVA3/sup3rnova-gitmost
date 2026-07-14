@@ -11,8 +11,8 @@ describe('SearchService', () => {
       {} as any, // shareRepo
       {} as any, // spaceMemberRepo
       {} as any, // pagePermissionRepo
-      {} as any, // aiService
       {} as any, // pageEmbeddingRepo
+      {} as any, // embeddingGeneration (#599)
     );
     expect(service).toBeDefined();
   });
@@ -63,8 +63,8 @@ describe('SearchService.searchSuggestions — onlyTemplates filter', () => {
       shareRepo as any,
       spaceMemberRepo as any,
       pagePermissionRepo as any,
-      {} as any, // aiService (searchSuggestions never embeds)
       {} as any, // pageEmbeddingRepo
+      {} as any, // embeddingGeneration (#599; searchSuggestions has no vector arm)
     );
 
     return { service, db, pageBuilder };

@@ -127,3 +127,76 @@ describe('PageEmbeddingRepo.hybridSearch fingerprint filter (#571)', () => {
     expect(compiled).toHaveLength(0);
   });
 });
+
+/**
+ * #599 — FINGERPRINT-SCOPED deleteByPage. The indexer's delete+insert replace must
+ * only ever remove the generation it is REWRITING while a swap is in flight;
+ * removing every row of the page would delete its ACTIVE-generation rows too and
+ * drop the page out of semantic search for the whole reindex window (acceptance 3).
+ * The PURGE paths (page deleted / emptied) keep the unscoped behaviour.
+ */
+describe('PageEmbeddingRepo.deleteByPage fingerprint scope (#599)', () => {
+  it('adds a fingerprint IN (...) predicate when a scope is supplied', async () => {
+    const { db, compiled } = makeRecordingDb();
+    const repo = new PageEmbeddingRepo(db as unknown as KyselyDB);
+
+    await repo.deleteByPage('page-1', 'ws-1', undefined, ['fp-target']);
+
+    expect(compiled).toHaveLength(1);
+    const { sql, parameters } = compiled[0];
+    // NOTE: the recording Kysely has no camelCase plugin, so identifiers compile
+    // as the TS names ("pageEmbeddings"); the real app maps them to snake_case.
+    expect(sql).toMatch(/delete from "pageEmbeddings"/i);
+    expect(sql).toMatch(/"fingerprint" in \(\$\d+\)/i);
+    expect(parameters).toContain('fp-target');
+  });
+
+  it('deletes EVERY row of the page when no scope is supplied (purge path)', async () => {
+    const { db, compiled } = makeRecordingDb();
+    const repo = new PageEmbeddingRepo(db as unknown as KyselyDB);
+
+    await repo.deleteByPage('page-1', 'ws-1');
+
+    expect(compiled).toHaveLength(1);
+    // No fingerprint predicate at all -> every generation of this page is purged.
+    expect(compiled[0].sql).not.toMatch(/fingerprint/i);
+  });
+});
+
+/**
+ * #599 — the GENERATIONAL GC. `deleteOtherGenerations` must reclaim every row that
+ * belongs to neither of the kept generations, INCLUDING legacy NULL-fingerprint
+ * rows: `fingerprint NOT IN (...)` alone evaluates to NULL (not true) for them, so
+ * they would survive forever without the explicit `IS NULL` arm.
+ */
+describe('PageEmbeddingRepo.deleteOtherGenerations (#599)', () => {
+  it('deletes rows outside the kept generations AND the legacy NULL-fingerprint rows', async () => {
+    const { db, compiled } = makeRecordingDb();
+    const repo = new PageEmbeddingRepo(db as unknown as KyselyDB);
+
+    await repo.deleteOtherGenerations('ws-1', ['fp-active', 'fp-target']);
+
+    expect(compiled).toHaveLength(1);
+    const { sql, parameters } = compiled[0];
+    expect(sql).toMatch(/delete from "pageEmbeddings"/i);
+    expect(sql).toMatch(/"workspaceId" = \$\d+/i);
+    // Both generations are kept...
+    expect(sql).toMatch(/"fingerprint" not in \(\$\d+, \$\d+\)/i);
+    // ...and NULL rows (a very old generation) are explicitly reclaimed.
+    expect(sql).toMatch(/"fingerprint" is null/i);
+    expect(parameters).toContain('fp-active');
+    expect(parameters).toContain('fp-target');
+  });
+
+  it('with nothing to keep, every row of the workspace is a stale generation', async () => {
+    const { db, compiled } = makeRecordingDb();
+    const repo = new PageEmbeddingRepo(db as unknown as KyselyDB);
+
+    await repo.deleteOtherGenerations('ws-1', []);
+
+    expect(compiled).toHaveLength(1);
+    expect(compiled[0].sql).toMatch(/delete from "pageEmbeddings"/i);
+    // No generation is kept -> no NOT IN filter: every row is an old generation.
+    expect(compiled[0].sql).not.toMatch(/not in/i);
+  });
+});

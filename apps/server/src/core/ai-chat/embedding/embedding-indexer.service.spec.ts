@@ -1,9 +1,42 @@
-import { EmbeddingIndexerService } from './embedding-indexer.service';
+import {
+  EmbeddingIndexerService,
+  PartialReindexError,
+} from './embedding-indexer.service';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageEmbeddingRepo } from '@docmost/db/repos/ai-chat/page-embedding.repo';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { AiService } from '../../../integrations/ai/ai.service';
+import { EmbeddingGenerationService } from '../../../integrations/ai/embedding-generation.service';
 import { EmbeddingReindexProgressService } from '../../../integrations/ai/embedding-reindex-progress.service';
+
+/**
+ * #599: the fingerprint-lifecycle collaborator. These specs cover the BATCH
+ * control flow / the per-page write, so the lifecycle is stubbed at its no-swap
+ * steady state (active === target). The lifecycle itself (start GC, atomic flip +
+ * its config-changed guard, post-flip GC, abort => no flip, fp-scoped delete) is
+ * covered in embedding-indexer.lifecycle.spec.ts.
+ */
+function makeGenerationStub(fingerprint = 'fp-test') {
+  return {
+    generationForTarget: jest.fn().mockResolvedValue({
+      active: fingerprint,
+      target: fingerprint,
+      swapping: false,
+      modelChanged: false,
+      activeModel: 'some-model',
+      targetModel: 'some-model',
+    }),
+    gcGenerations: jest.fn().mockResolvedValue(0),
+    completeRun: jest.fn().mockResolvedValue(true),
+    // #599 D4: the run lock. The stub is a pass-through single-flight — these specs
+    // cover the batch control flow, not the lock protocol (that lives in
+    // embedding-generation.service.spec.ts).
+    runExclusive: jest.fn(async (_ws: string, fn: () => Promise<void>) => {
+      await fn();
+      return true;
+    }),
+  };
+}
 import { AiEmbeddingNotConfiguredException } from '../../../integrations/ai/ai-embedding-not-configured.exception';
 
 /**
@@ -36,6 +69,7 @@ describe('EmbeddingIndexerService.reindexWorkspace fail-fast', () => {
       // or global). Resolve it so the batch control flow under test proceeds.
       resolveEmbeddingProvider: jest.fn().mockResolvedValue({
         model: 'some-model',
+        modelId: 'some-model',
         queryPrefix: '',
         docPrefix: '',
         fingerprint: 'fp-test',
@@ -51,11 +85,13 @@ describe('EmbeddingIndexerService.reindexWorkspace fail-fast', () => {
     };
     const db = {};
 
+    const generation = makeGenerationStub('fp-test');
     const service = new EmbeddingIndexerService(
       pageRepo as unknown as PageRepo,
       pageEmbeddingRepo as unknown as PageEmbeddingRepo,
       aiService as unknown as AiService,
       reindexProgress as unknown as EmbeddingReindexProgressService,
+      generation as unknown as EmbeddingGenerationService,
       db as unknown as KyselyDB,
     );
     return { service, pageRepo, aiService, reindexProgress };
@@ -82,8 +118,13 @@ describe('EmbeddingIndexerService.reindexWorkspace fail-fast', () => {
       .spyOn(service, 'reindexPage')
       .mockRejectedValue(new Error('boom'));
 
-    // Resolves (does not throw) even though every page failed.
-    await expect(service.reindexWorkspace(WORKSPACE_ID)).resolves.toBeUndefined();
+    // The BATCH is not aborted (that is the isolation): all three pages are still
+    // attempted. It does end in a PartialReindexError though — #599 R2: a run with
+    // failed pages must FAIL the job so BullMQ retries it, instead of completing
+    // "successfully" and leaving the workspace stuck in the swap window forever.
+    await expect(service.reindexWorkspace(WORKSPACE_ID)).rejects.toBeInstanceOf(
+      PartialReindexError,
+    );
     // All three pages were attempted despite the failures.
     expect(reindexPage).toHaveBeenCalledTimes(3);
   });
@@ -92,9 +133,12 @@ describe('EmbeddingIndexerService.reindexWorkspace fail-fast', () => {
     const { service } = makeService();
     const reindexPage = jest
       .spyOn(service, 'reindexPage')
-      .mockResolvedValue(undefined);
+      // #599: reindexPage now returns the number of chunk rows it wrote.
+      .mockResolvedValue(1);
 
-    await expect(service.reindexWorkspace(WORKSPACE_ID)).resolves.toBeUndefined();
+    await expect(
+      service.reindexWorkspace(WORKSPACE_ID),
+    ).resolves.toBeUndefined();
     expect(reindexPage).toHaveBeenCalledTimes(3);
   });
 });
@@ -120,6 +164,7 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
       // or global). Resolve it so the batch control flow under test proceeds.
       resolveEmbeddingProvider: jest.fn().mockResolvedValue({
         model: 'some-model',
+        modelId: 'some-model',
         queryPrefix: '',
         docPrefix: '',
         fingerprint: 'fp-test',
@@ -132,11 +177,13 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
       get: jest.fn().mockResolvedValue(null),
     };
     const db = {};
+    const generation = makeGenerationStub('fp-test');
     const service = new EmbeddingIndexerService(
       pageRepo as unknown as PageRepo,
       pageEmbeddingRepo as unknown as PageEmbeddingRepo,
       aiService as unknown as AiService,
       reindexProgress as unknown as EmbeddingReindexProgressService,
+      generation as unknown as EmbeddingGenerationService,
       db as unknown as KyselyDB,
     );
     return { service, pageRepo, aiService, reindexProgress };
@@ -144,7 +191,7 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
 
   it('sets total at start, increments done per page, and clears in finally', async () => {
     const { service, reindexProgress } = makeService(['p1', 'p2', 'p3']);
-    jest.spyOn(service, 'reindexPage').mockResolvedValue(undefined);
+    jest.spyOn(service, 'reindexPage').mockResolvedValue(1);
 
     await service.reindexWorkspace(WORKSPACE_ID);
 
@@ -162,7 +209,11 @@ describe('EmbeddingIndexerService.reindexWorkspace progress', () => {
     // No statusCode -> non-fatal -> isolate and continue; each counts as done.
     jest.spyOn(service, 'reindexPage').mockRejectedValue(new Error('boom'));
 
-    await service.reindexWorkspace(WORKSPACE_ID);
+    // Ends in a partial-run failure (#599 R2 — retried by BullMQ), but the progress
+    // record is still advanced per page and cleared in the finally.
+    await expect(service.reindexWorkspace(WORKSPACE_ID)).rejects.toBeInstanceOf(
+      PartialReindexError,
+    );
 
     expect(reindexProgress.increment).toHaveBeenCalledTimes(3);
     expect(reindexProgress.clear).toHaveBeenCalledTimes(1);
@@ -238,6 +289,9 @@ describe('EmbeddingIndexerService.reindexPage doc-prefix + fingerprint (#530)', 
     const aiService = {
       resolveEmbeddingProvider: jest.fn().mockResolvedValue({
         model: { modelId: 'e5-small' },
+        // #599: the resolved provider now reports the bare model id directly (the
+        // indexer stamps it per row and the flip records it with the pointer).
+        modelId: 'e5-small',
         queryPrefix: 'query: ',
         docPrefix,
         fingerprint: 'fp-gen-1',
@@ -249,11 +303,13 @@ describe('EmbeddingIndexerService.reindexPage doc-prefix + fingerprint (#530)', 
     const db = {
       transaction: () => ({ execute: (cb: any) => cb({}) }),
     };
+    const generation = makeGenerationStub('fp-gen-1');
     const service = new EmbeddingIndexerService(
       pageRepo as unknown as PageRepo,
       pageEmbeddingRepo as unknown as PageEmbeddingRepo,
       aiService as unknown as AiService,
       reindexProgress as unknown as EmbeddingReindexProgressService,
+      generation as unknown as EmbeddingGenerationService,
       db as unknown as KyselyDB,
     );
     return { service, embedWithModel, insertChunks };

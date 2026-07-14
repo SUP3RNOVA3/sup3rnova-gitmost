@@ -81,6 +81,7 @@ describe('AiService.embedQuery (#530)', () => {
     const svc = makeService();
     jest.spyOn(svc, 'resolveEmbeddingProvider').mockResolvedValue({
       model: { modelId: 'm' } as any,
+      modelId: 'm',
       queryPrefix: 'query: ',
       docPrefix: 'passage: ',
       fingerprint: 'fp-active',
@@ -99,7 +100,14 @@ describe('AiService.embedQuery (#530)', () => {
     // Bound by the SHORT search-embed timeout (default 800ms), not the 120000ms
     // batch timeout.
     expect(timeoutArg).toBe(800);
-    expect(res).toEqual({ vector: [0.1, 0.2, 0.3], fingerprint: 'fp-active' });
+    // #599: embedQuery also reports the MODEL id, which the reader compares against
+    // the served generation's model to decide whether the two share an embedding
+    // space (a cross-model cosine is noise; see EmbeddingGenerationService).
+    expect(res).toEqual({
+      vector: [0.1, 0.2, 0.3],
+      fingerprint: 'fp-active',
+      modelId: 'm',
+    });
   });
 
   it('propagates a no-provider error (drives the no-provider degrade)', async () => {

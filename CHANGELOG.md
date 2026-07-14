@@ -146,6 +146,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Changing the embedding model no longer empties semantic search.** The
+  embeddings now have a versioned lifecycle: the workspace stores which embedding
+  generation search actually serves, and a model/revision/prefix change starts a
+  background reindex into a NEW generation while the OLD one keeps answering
+  queries. The pointer flips to the new generation atomically, and only after the
+  reindex has covered every page — a run with failures or a fatal provider abort
+  leaves the previous generation serving instead of publishing a half-built index,
+  and is retried automatically with backoff (a transient embedding-sidecar timeout
+  no longer parks the workspace in a half-swapped state until someone notices).
+  Superseded generations (including pre-existing rows written before fingerprints
+  existed, which until now were silently invisible to search) are reclaimed by a
+  generational GC capped at two live generations. Search responses report the
+  state (`off` / `stale` / `full`) with an indexed/total count, so a degraded or
+  in-progress index is visible instead of silently returning fewer results. If the
+  configured model differs from the one the served generation was built with,
+  search and the AI agent's retrieval fall back to lexical-only rather than
+  comparing vectors from two different embedding spaces (which would rank random
+  pages above genuine matches). A reindex of one workspace is serialised, so a
+  retried background job can never corrupt an in-flight one. (#599)
 - **A drifted comment suggestion can be re-synced instead of failing forever
   with a 409.** A suggestion whose stored anchor no longer matched the live
   document used to reject every apply attempt with an unrecoverable conflict; a
