@@ -212,6 +212,18 @@ vi.mock(
   () => ({ default: () => null }),
 );
 
+// PageEditor renders the lazy Excalidraw menu as soon as the editor becomes
+// editable. Under vitest that `import()` reaches the real `@excalidraw/excalidraw`
+// package, which is externalized to node and whose chunk imports the extensionless
+// specifier "roughjs/bin/rough" — unresolvable by Node's ESM loader. The rejected
+// lazy import lands as an UNHANDLED rejection some ticks later and vitest charges
+// it to whichever test happens to be running, failing tests at random. It is a
+// module-resolution artifact of the test runner and the menu has nothing to do
+// with #564, so it is stubbed out.
+vi.mock("@/features/editor/components/excalidraw/excalidraw-menu-lazy", () => ({
+  default: () => null,
+}));
+
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>();
   return { ...actual, useParams: () => ({ pageSlug: "page-slug-1" }) };

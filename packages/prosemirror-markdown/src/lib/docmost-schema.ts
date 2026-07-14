@@ -1487,15 +1487,20 @@ export const docmostExtensions = [
     // (generateJSON). CommonMark parses ``**`code`**`` as
     // `<strong><code>code</code></strong>`, so bold/italic/… around inline code
     // were silently lost (or slid onto the separator) on markdown import.
-    // Disable it and register the local `excludes: ""` override below.
+    // Disable it and register the local `excludes: "code"` override below.
     code: false,
   }),
   // Canonical policy lives in `@docmost/editor-ext` (`Code`), but this vendored
   // mirror must stay framework-free (importing editor-ext would drag React node
   // views into the markdown converter — see the header and #293), so the SAME
-  // `excludes: ""` is set locally. `test/schema-code-excludes-parity.test.ts`
+  // `excludes: "code"` is set locally. `test/schema-code-excludes-parity.test.ts`
   // fails loudly if the two ever drift apart.
-  Code.extend({ excludes: "" }),
+  //
+  // `"code"` (exclude only myself = ProseMirror's default), NOT `""` (exclude
+  // nothing): y-prosemirror hashes the Yjs attribute key of any mark that does
+  // not exclude itself (`code--<hash>`), which would give inline code a SECOND
+  // persistence canon — see the rationale on the canonical mark in editor-ext.
+  Code.extend({ excludes: "code" }),
   // Preserve image width/height as the AUTHORED string. Without an explicit
   // parseHTML the stock Image node attribute falls back to tiptap core's
   // `fromString`, which coerces a numeric width like "320" into the number 320

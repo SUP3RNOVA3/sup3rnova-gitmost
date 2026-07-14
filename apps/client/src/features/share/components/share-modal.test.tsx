@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
 // matchMedia / storage are stubbed globally in vitest.setup.ts.
@@ -15,9 +16,20 @@ const deleteMutateAsync = vi.fn(async () => ({}));
 // No existing share for this page (toggle starts OFF).
 let shareData: any = undefined;
 
-vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
-}));
+// Partial mock: ShareModal's import graph reaches `src/i18n.ts`, which calls
+// `.use(initReactI18next)` at module scope, so the real exports must stay.
+vi.mock("react-i18next", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, useTranslation: () => ({ t: (key: string) => key }) };
+});
+
+// ShareModal transitively imports `@/main.tsx` (via page-history-query), whose
+// module scope mounts the React root off `#root` — absent in jsdom. Only its
+// `queryClient` export is needed here.
+vi.mock("@/main.tsx", async () => {
+  const { QueryClient } = await import("@tanstack/react-query");
+  return { queryClient: new QueryClient() };
+});
 
 vi.mock("@/features/share/queries/share-query.ts", () => ({
   useCreateShareMutation: () => ({ mutateAsync: createMutateAsync }),
@@ -38,12 +50,20 @@ vi.mock("@/features/space/queries/space-query.ts", () => ({
 import ShareModal from "./share-modal";
 
 function renderModal() {
+  // ShareModal itself runs `usePageHistoryListQuery` (react-query), so it needs
+  // a real QueryClient in context; the share/page/space queries it drives are
+  // mocked above.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <MemoryRouter>
-      <MantineProvider>
-        <ShareModal readOnly={false} />
-      </MantineProvider>
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <MantineProvider>
+          <ShareModal readOnly={false} />
+        </MantineProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

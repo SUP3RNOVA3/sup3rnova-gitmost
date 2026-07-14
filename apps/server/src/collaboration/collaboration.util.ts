@@ -70,7 +70,7 @@ export const tiptapExtensions = [
     heading: false,
     // #515: StarterKit's stock `code` mark ships `excludes: "_"`, which strips
     // every co-occurring inline mark on the HTML -> PM parse (htmlToJson) and on
-    // editor transactions. Use the shared Docmost `Code` (excludes: "") instead,
+    // editor transactions. Use the shared Docmost `Code` (excludes: "code") instead,
     // so bold/italic/… around inline code survive import and editing.
     code: false,
   }),

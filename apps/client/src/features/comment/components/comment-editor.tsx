@@ -46,7 +46,7 @@ const CommentEditor = forwardRef(
           link: false,
           // #515: replace StarterKit's stock `code` mark (which ships
           // `excludes: "_"` and therefore strips every co-occurring inline mark)
-          // with the shared Docmost `Code` mark (`excludes: ""`), so a comment
+          // with the shared Docmost `Code` mark (`excludes: "code"`), so a comment
           // body imported with e.g. **`code`** keeps both marks when edited here.
           code: false,
         }),

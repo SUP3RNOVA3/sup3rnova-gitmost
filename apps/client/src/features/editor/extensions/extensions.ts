@@ -154,7 +154,7 @@ export const mainExtensions = [
     code: false,
   }),
   // The shared `Code` mark from @docmost/editor-ext (single source of the
-  // `excludes: ""` policy — #515: inline code must be able to carry bold /
+  // `excludes: "code"` policy — #515: inline code must be able to carry bold /
   // italic / … like CommonMark) re-extended here with the CLIENT-only input
   // rule and keyboard shortcut.
   //

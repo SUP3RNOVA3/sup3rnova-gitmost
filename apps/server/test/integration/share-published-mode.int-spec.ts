@@ -5,7 +5,7 @@ import { ShareService } from 'src/core/share/share.service';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageHistoryRepo } from '@docmost/db/repos/page/page-history.repo';
-import * as publishedModeMigration from 'src/database/migrations/20260712T130000-shares-published-mode';
+import * as publishedModeMigration from 'src/database/migrations/20260714T180000-shares-published-mode';
 import {
   getTestDb,
   destroyTestDb,
