@@ -66,6 +66,33 @@ export interface INodesWriteMixin {
   deleteNode(pageId: string, nodeId: string): any;
 }
 
+/**
+ * Reject a ProseMirror doc that carries a sandbox `/api/sb/` src anywhere
+ * (#629). Those srcs only ever originate from stashPage's one-way publication
+ * view (RAM-only, TTL-bound blobs); persisting one as page content would leave a
+ * link that 404s once the blob expires. Throws with the offending src.
+ */
+function assertNoSandboxSrc(doc: unknown): void {
+  const visit = (node: any): void => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const src = node.attrs?.src;
+    if (typeof src === "string" && src.includes("/api/sb/")) {
+      throw new Error(
+        `updatePageJson: refusing a src that points at the blob sandbox ` +
+          `("${src}"). That is a stashPage publication-view URL (RAM-only, ` +
+          `expires) — do NOT write a stashed doc back as page content.`,
+      );
+    }
+    if (Array.isArray(node.content)) for (const child of node.content) visit(child);
+  };
+  visit(doc);
+}
+
 export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>>(Base: TBase): GConstructor<DocmostClientContext & INodesWriteMixin> & TBase {
   abstract class NodesWriteMixin extends Base implements INodesWriteMixin {
   /**
@@ -129,6 +156,13 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
     // the markdown link path (which TipTap sanitizes), raw JSON could otherwise
     // inject javascript:/data: link hrefs or media srcs straight into the doc.
     this.validateDocUrls(doc);
+
+    // Reject a doc carrying a sandbox `/api/sb/` src (#629): stashPage returns a
+    // PUBLICATION VIEW (its drawio diagrams become `image` nodes pointing at
+    // ephemeral RAM-only sandbox blobs, and every internal image is rewritten to
+    // one). Writing that back as page content would persist dead links that 404
+    // as soon as the blob's TTL lapses — the stash is one-way, never round-trip.
+    assertNoSandboxSrc(doc);
 
     // Canonicalize footnotes (idempotent): an agent-authored JSON doc cannot
     // leave footnotes out of order, orphaned, or in multiple lists — the bottom

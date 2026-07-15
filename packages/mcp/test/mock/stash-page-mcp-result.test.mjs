@@ -140,6 +140,8 @@ test("stashPage MCP tool returns a resource_link AND a structuredContent mirror"
     assert.match(sc.sha256, /^[0-9a-f]{64}$/); // 64-hex ETag
     assert.equal(typeof sc.size, "number");
     assert.deepEqual(sc.images, { mirrored: 1, failed: 0 });
+    // No drawio nodes on this page -> both diagram counts are zero.
+    assert.deepEqual(sc.diagrams, { rasterized: 0, degraded: 0 });
 
     // Deep-equal the whole structured payload against what the mock implies.
     assert.deepEqual(sc, {
@@ -147,6 +149,7 @@ test("stashPage MCP tool returns a resource_link AND a structuredContent mirror"
       sha256: sc.sha256,
       size: sc.size,
       images: { mirrored: 1, failed: 0 },
+      diagrams: { rasterized: 0, degraded: 0 },
     });
   } finally {
     await client.close();

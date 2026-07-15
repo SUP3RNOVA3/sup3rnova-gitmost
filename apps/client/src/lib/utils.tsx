@@ -67,11 +67,33 @@ function decodeBase64(base64: string): string {
 
 export function decodeBase64ToSvgString(base64Data: string): string {
   const base64Prefix = "data:image/svg+xml;base64,";
-  if (base64Data.startsWith(base64Prefix)) {
-    base64Data = base64Data.replace(base64Prefix, "");
+  if (base64Data.startsWith("data:")) {
+    if (base64Data.startsWith(base64Prefix)) {
+      base64Data = base64Data.slice(base64Prefix.length);
+    } else {
+      // #629 (A5) — reject a non-SVG data: URL (e.g. data:image/png;base64,…)
+      // outright. A one-line prefix-strip that silently decoded a PNG here would
+      // open a path to uploading a PNG under the .svg name (acceptance #7).
+      throw new Error(
+        "decodeBase64ToSvgString: expected an image/svg+xml data URL",
+      );
+    }
   }
 
-  return decodeBase64(base64Data);
+  const decoded = decodeBase64(base64Data);
+
+  // #629 (A5) — the decoded payload MUST actually be an SVG document. A bare
+  // base64 that decodes to PNG (or any non-SVG) bytes must not flow into the
+  // .svg upload path. Real SVGs open with `<svg` or an `<?xml …?>` prolog; the
+  // #584 UTF-8 behavior above is unchanged for those.
+  const head = decoded.replace(/^\uFEFF/, "").trimStart();
+  if (!head.startsWith("<svg") && !head.startsWith("<?xml")) {
+    throw new Error(
+      "decodeBase64ToSvgString: decoded payload is not an SVG document",
+    );
+  }
+
+  return decoded;
 }
 
 export function capitalizeFirstChar(string: string) {

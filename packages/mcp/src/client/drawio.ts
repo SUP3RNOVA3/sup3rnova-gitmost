@@ -27,6 +27,8 @@ import {
   mxHash,
   normalizeXml,
   countUserCells,
+  extractDrawioRaster,
+  stripRasterAttr,
 } from "../lib/drawio-xml.js";
 import { renderDiagramShapes } from "../lib/drawio-preview.js";
 import { applyElkLayout } from "../lib/drawio-layout.js";
@@ -56,7 +58,7 @@ import {
 // carries the base's protected shared state, which would otherwise trip TS4094).
 // Derived from the class below; `implements IDrawioMixin` fails to compile on drift.
 export interface IDrawioMixin {
-  drawioGet(pageId: string, node: string, format?: "xml" | "svg"): Promise<{ pageId: string; nodeId: string; format: "xml" | "svg"; content: string; meta: { attachmentId: string | null; title: string | null; width: number | null; height: number | null; cellCount: number; hash: string; }; }>;
+  drawioGet(pageId: string, node: string, format?: "xml" | "svg"): Promise<{ pageId: string; nodeId: string; format: "xml" | "svg"; content: string; meta: { attachmentId: string | null; title: string | null; width: number | null; height: number | null; cellCount: number; hash: string; hasRaster: boolean; }; }>;
   drawioCreate(pageId: string, where: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }, xml: string, title?: string, layout?: "elk"): Promise<{ success: boolean; nodeId: string | null; attachmentId: string; warnings: string[]; verify?: any; }>;
   drawioUpdate(pageId: string, node: string, xml: string, baseHash: string, layout?: "elk"): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; verify?: any; }>;
   drawioEditCells(pageId: string, node: string, operations: CellOp[], baseHash: string): Promise<{ success: boolean; nodeId: string; attachmentId: string; warnings: string[]; verify?: any; }>;
@@ -115,6 +117,7 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
       height: number | null;
       cellCount: number;
       hash: string;
+      hasRaster: boolean;
     };
   }> {
     await this.ensureAuthenticated();
@@ -126,7 +129,14 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
         `drawio: node "${node}" on page ${pageId} has no src to read`,
       );
     }
-    const svg = await this.fetchAttachmentText(src);
+    const rawSvg = await this.fetchAttachmentText(src);
+    // A `.drawio.svg` may carry a ~100 KB browser-embedded PNG raster (#629).
+    // Detect it (validated) for meta.hasRaster, then STRIP the attribute at the
+    // string level BEFORE the decodeDrawioSvg jsdom parse (so a huge attribute
+    // never reaches jsdom) and before returning the svg (so it never bloats the
+    // model context on format:"svg").
+    const hasRaster = extractDrawioRaster(rawSvg) !== null;
+    const svg = stripRasterAttr(rawSvg);
     const modelXml = decodeDrawioSvg(svg);
     const meta = {
       attachmentId: attrs.attachmentId ?? null,
@@ -135,6 +145,7 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
       height: attrs.height != null ? Number(attrs.height) : null,
       cellCount: countUserCells(modelXml),
       hash: mxHash(modelXml),
+      hasRaster,
     };
     return {
       pageId,
