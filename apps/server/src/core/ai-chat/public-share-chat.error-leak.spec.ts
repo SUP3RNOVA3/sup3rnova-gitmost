@@ -167,8 +167,15 @@ async function runStream(
     model: model as never,
     role: null,
   });
-  // Let the piped stream drain fully.
-  await new Promise((r) => setTimeout(r, 300));
+  // Wait for the piped stream to drain fully. pipeUIMessageStreamToResponse
+  // calls res.end() on completion, which sets FakeSocket.writableEnded — poll
+  // for that instead of a fixed sleep, which raced the tool round-trip on a
+  // loaded CI runner and flaked (#652). Bounded so a stream that never ends
+  // fails the assertion rather than hanging the suite.
+  const deadline = Date.now() + 5000;
+  while (!socket.writableEnded && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 10));
+  }
   return socket;
 }
 

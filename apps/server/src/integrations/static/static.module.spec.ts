@@ -232,6 +232,7 @@ describe('StaticModule.onModuleInit — the real SPA catch-all (#636, integratio
       getPostHogKey: () => '',
       isClientTelemetryEnabled: () => false,
       isLocalFirstEnabled: () => false,
+      isDrawioRasterEnabled: () => false,
     };
 
     const staticModule = new StaticModule(
