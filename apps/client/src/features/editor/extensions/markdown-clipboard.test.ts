@@ -10,6 +10,7 @@ import {
 import {
   normalizeTableColumnWidths,
   classifyClipboardSelection,
+  stripHeaderSeparator,
 } from "./markdown-clipboard";
 
 // normalizeTableColumnWidths mutates a DOM subtree (jsdom provides document).
@@ -178,6 +179,81 @@ describe("classifyClipboardSelection", () => {
       ]),
     ).toEqual({ asMarkdown: false, wrapBareRows: false });
   });
+
+  it("treats a single copied cell (one bare row, one cell) as plain text", () => {
+    expect(
+      classifyClipboardSelection([
+        { name: "tableRow", childCount: 1, cellCount: 1 },
+      ]),
+    ).toEqual({ asMarkdown: false, wrapBareRows: false });
+  });
+
+  it("treats a single-cell whole-table slice as plain text", () => {
+    // A rowspan>1 single cell yields one `table` node whose cells sum to 1.
+    expect(
+      classifyClipboardSelection([
+        { name: "table", childCount: 1, cellCount: 1 },
+      ]),
+    ).toEqual({ asMarkdown: false, wrapBareRows: false });
+  });
+
+  it("serializes a multi-cell partial row (bare rows) without treating it as one cell", () => {
+    expect(
+      classifyClipboardSelection([
+        { name: "tableRow", childCount: 3, cellCount: 3 },
+      ]),
+    ).toEqual({ asMarkdown: true, wrapBareRows: true });
+  });
+
+  it("serializes a 1×N single-row table as markdown (cellCount, not table.childCount)", () => {
+    // A 1×3 table has childCount===1 (one ROW) but 3 cells: it must NOT be
+    // mistaken for a single cell — the guard sums cells across rows.
+    expect(
+      classifyClipboardSelection([
+        { name: "table", childCount: 1, cellCount: 3 },
+      ]),
+    ).toEqual({ asMarkdown: true, wrapBareRows: false });
+  });
+});
+
+describe("stripHeaderSeparator", () => {
+  it("drops the header separator line (line index 1) of a bare-rows pipe table", () => {
+    expect(stripHeaderSeparator("| a | b |\n| --- | --- |")).toBe("| a | b |");
+  });
+
+  it("drops a center-aligned separator marker (:-:)", () => {
+    expect(stripHeaderSeparator("| a |\n| :-: |\n| b |")).toBe("| a |\n| b |");
+  });
+
+  it("leaves a single-line input unchanged", () => {
+    expect(stripHeaderSeparator("| a | b |")).toBe("| a | b |");
+  });
+
+  it("leaves the HTML fallback (starts with '<') untouched", () => {
+    const html = "<table><tbody><tr><td>a</td></tr></tbody></table>";
+    expect(stripHeaderSeparator(html)).toBe(html);
+  });
+
+  it("leaves a MULTI-LINE HTML fallback with a separator-shaped interior line untouched", () => {
+    // A spanned / multi-block cell selection serializes to a raw <table> HTML
+    // fallback, not a GFM pipe table. A code-block cell inlines its text VERBATIM
+    // with its "\n"s, so the fallback is multi-line and line index 1 is arbitrary
+    // cell content — here a code line that is literally "| --- |". It must NOT be
+    // treated as a header separator and spliced out (the bail on non-"|" leading
+    // input protects it).
+    const html =
+      "<table><tbody><tr><td><pre><code>x\n| --- |\ny</code></pre></td>" +
+      "<td><p>plain</p></td></tr></tbody></table>";
+    expect(stripHeaderSeparator(html)).toBe(html);
+  });
+
+  it("strips ONLY line index 1 even when the first cell's data is literally '---'", () => {
+    // First data cell is the text "---"; only the true separator at index 1
+    // (a full separator ROW) is removed, the data row above it is kept.
+    expect(stripHeaderSeparator("| --- |\n| --- |\n| x |")).toBe(
+      "| --- |\n| x |",
+    );
+  });
 });
 
 // Output-level tests for the table clipboard regression: copying a table must
@@ -223,10 +299,11 @@ describe("table clipboard markdown output (convertProseMirrorToMarkdown)", () =>
   });
   const row = (nodes: any[]) => ({ type: "tableRow", content: nodes });
 
-  it("serializes a header-less partial cell selection (bare rows) as a valid GFM pipe table", () => {
-    // Mirror the serializer's `wrapBareRows` branch: bare tableRow nodes are
-    // wrapped in a synthetic `table` and convertProseMirrorToMarkdown is called
-    // (see markdown-clipboard.ts clipboardTextSerializer).
+  it("CONVERTER: wrapping bare rows in a synthetic table yields a GFM table WITH a header separator (pre-strip)", () => {
+    // This pins the CONVERTER output the serializer's `wrapBareRows` branch
+    // starts from — BEFORE stripHeaderSeparator runs. The converter always
+    // emits a header separator (line index 1); the serializer then strips it
+    // for a header-less partial selection (see the clipboard-level test below).
     const rows = [
       row([cell("a"), cell("b")]),
       row([cell("c"), cell("d")]),
@@ -237,13 +314,39 @@ describe("table clipboard markdown output (convertProseMirrorToMarkdown)", () =>
     });
     const ls = lines(md);
 
-    // Valid GFM: a header/data separator row is present.
+    // The converter DOES emit a separator row (which the serializer strips).
     expect(ls.some(isSeparatorRow)).toBe(true);
     // NOT the old broken "one value per line" shape: every line is pipe-delimited.
     expect(ls.every((l) => l.includes("|"))).toBe(true);
     expect(md).not.toMatch(/^\s*(a|b|c|d)\s*$/m);
     // The cell values land in real pipe-delimited data rows.
     const dataRows = ls.filter((l) => !isSeparatorRow(l)).map(cells);
+    expect(dataRows).toContainEqual(["a", "b"]);
+    expect(dataRows).toContainEqual(["c", "d"]);
+  });
+
+  it("CLIPBOARD: a header-less partial cell selection yields pipe rows WITHOUT the spurious separator", () => {
+    // What actually lands in the plain-text clipboard for the `wrapBareRows`
+    // branch: convertProseMirrorToMarkdown(...) THEN stripHeaderSeparator(...).
+    // The `| --- |` header syntax must be gone (it is table structure, not the
+    // copied data).
+    const rows = [
+      row([cell("a"), cell("b")]),
+      row([cell("c"), cell("d")]),
+    ];
+    const md = stripHeaderSeparator(
+      convertProseMirrorToMarkdown({
+        type: "doc",
+        content: [{ type: "table", content: rows }],
+      }),
+    );
+    const ls = lines(md);
+
+    // No separator row survives — the spurious GFM header syntax is stripped.
+    expect(ls.some(isSeparatorRow)).toBe(false);
+    // The real data rows remain, pipe-delimited.
+    expect(ls.every((l) => l.includes("|"))).toBe(true);
+    const dataRows = ls.map(cells);
     expect(dataRows).toContainEqual(["a", "b"]);
     expect(dataRows).toContainEqual(["c", "d"]);
   });
