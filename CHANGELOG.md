@@ -146,6 +146,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **draw.io diagrams reach external publications as a real raster instead of
+  silently vanishing.** A draw.io diagram is a single `.drawio.svg` whose visible
+  captions live in `<foreignObject>`, which only a browser renders — so any
+  server-side rasterizer (resvg, Habr, Inkscape) saw truncated `<text>` fallbacks
+  and a "Text is not SVG" banner, and the publication pipeline dropped the node
+  entirely, its only trace a warning the agent never relayed. With the new
+  `DRAWIO_RASTER_ENABLED` env var (default `false`, so file size stays unchanged
+  until an operator opts in), the draw.io editor now embeds the browser-rendered
+  PNG of the diagram INTO the same `.drawio.svg` as an inert root
+  `data-raster="data:image/png;base64,…"` attribute on save. The visible vector
+  body is untouched and re-opening the diagram still extracts its source, so the
+  raster and the source can never drift — they are the same bytes written by the
+  same writer. Consumers read it back: `stashPage` rewrites a rasterized diagram
+  to an `image` node backed by the PNG (and reports `diagrams.{rasterized,degraded}`),
+  `viewImage` feeds the model the embedded PNG instead of a garbage resvg render,
+  and `drawioGet(format:"svg")` strips the heavy attribute out of the model
+  context (with `meta.hasRaster`). Every consumer validates an 8-byte PNG
+  signature, so a forged `data-raster` can never masquerade as a real image, and
+  the client's write guardrail makes it impossible to overwrite the single source
+  copy with a PNG. A diagram with no usable raster degrades loudly (an explicit
+  "open it in the editor and save" message), never a silent captionless vector.
+  Excalidraw is out of scope (its SVG is not broken); tracked separately (#632).
+  The habr-mcp receiver's hard-fail safety net is a separate repo (habr-mcp#1).
+
 - **Page chrome paints from a local boot cache instead of waiting for the page
   request.** With the new `LOCAL_FIRST_ENABLED` env var (default `false`), the
   client keeps a small per-(workspace, user) `localStorage` cache of page

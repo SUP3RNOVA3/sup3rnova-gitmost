@@ -134,6 +134,23 @@ describe("decodeBase64ToSvgString (drawio editor load path, #584)", () => {
     expect(dataUrl).not.toContain("Наладка");
   });
 
+  // #629 (A5 / acceptance #7): the decoder must THROW rather than hand back a
+  // non-SVG payload, so a PNG can never be smuggled into the `.svg` upload path.
+  const PNG_BODY_B64 =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+  it("throws on a data:image/png data URL (never decodes a PNG as SVG)", () => {
+    expect(() =>
+      decodeBase64ToSvgString("data:image/png;base64," + PNG_BODY_B64),
+    ).toThrow();
+  });
+
+  it("throws on a bare base64 that decodes to non-SVG (PNG) bytes", () => {
+    // No data: prefix, but the decoded bytes are a PNG (start with the 0x89 'PNG'
+    // signature), not `<svg`/`<?xml` -> must throw.
+    expect(() => decodeBase64ToSvgString(PNG_BODY_B64)).toThrow();
+  });
+
   it("back-compat: a legacy base64 content= diagram still decodes/opens", () => {
     // Older attachments stored the mxfile as base64 inside content= (not entity
     // XML). decodeBase64ToSvgString only decodes the OUTER data-URL base64, so

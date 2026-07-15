@@ -890,15 +890,19 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'stashPage',
     writeClass: 'readOnly',
     description:
-      'Serialize a whole page (the full ProseMirror JSON, as getPageJson ' +
-      'returns) into an ephemeral in-memory blob and return ONLY a short ' +
-      'anonymous URL to it — the body NEVER enters the model context, so this ' +
-      'is the way to hand a large page (or its images) to an external consumer ' +
-      'without truncation. Every internal file/image attachment is mirrored ' +
+      'Serialize a whole page (its full ProseMirror JSON) into an ephemeral ' +
+      'in-memory blob and return ONLY a short anonymous URL to it — the body ' +
+      'NEVER enters the model context, so this is the way to hand a large page ' +
+      '(or its images) to an external consumer without truncation. The result ' +
+      'is a PUBLICATION VIEW — one-way: do NOT write it back as page content. ' +
+      'Every internal file/image attachment is mirrored ' +
       'into the same sandbox and its src rewritten to a sandbox URL, so the ' +
       'consumer can fetch the images anonymously too; external http(s) images ' +
-      'are left untouched. Returns { uri, size, sha256, images:{mirrored, ' +
-      'failed} }. Integrity: the blob is served with ETag = its sha256, so a ' +
+      'are left untouched. A draw.io diagram with a browser-rendered raster is ' +
+      'converted to an image PNG (rasterized); one without (e.g. a page never ' +
+      'opened since the diagram was migrated) is left as-is (degraded). Returns ' +
+      '{ uri, size, sha256, images:{mirrored, failed}, diagrams:{rasterized, ' +
+      'degraded} }. Integrity: the blob is served with ETag = its sha256, so a ' +
       'truncated/corrupted fetch is detectable. Blobs are RAM-only: they expire ' +
       'after a short TTL (~1h) and are cleared on restart — consume the URL ' +
       'within the TTL and one uptime, or re-stash. A blob is bound to the ' +
@@ -935,6 +939,7 @@ export const SHARED_TOOL_SPECS = {
           sha256: result.sha256,
           size: result.size,
           images: result.images,
+          diagrams: result.diagrams,
         },
       };
     },

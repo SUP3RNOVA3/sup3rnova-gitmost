@@ -23,6 +23,10 @@ import {
   DrawioLintError,
   inflateDiagramPayload,
   MAX_INFLATED_DIAGRAM_BYTES,
+  extractDrawioRaster,
+  stripRasterAttr,
+  DRAWIO_RASTER_ATTR,
+  MAX_RASTER_BASE64_LENGTH,
 } from "../../build/lib/drawio-xml.js";
 
 // A well-formed model with one vertex and a valid edge to it.
@@ -579,4 +583,98 @@ test("#507 F1: regex fallback decodes tab/newline/CR char-refs (agrees with DOM 
   assert.equal(decodeDrawioSvg(malformedSvg), CTRL_MODEL);
   // The well-formed (DOM) path yields the identical result.
   assert.equal(decodeDrawioSvg(svg), CTRL_MODEL);
+});
+
+// --- embedded browser raster (#629) ----------------------------------------
+//
+// Shared contract: the browser embeds a real PNG of the diagram into the root
+// SVG attribute data-raster="data:image/png;base64,<b64>". The extractor must
+// validate the 8-byte PNG signature so a fake/corrupt raster never passes.
+
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// A minimal but signature-valid PNG buffer (sig + a few bytes).
+const PNG_BYTES = Buffer.concat([PNG_SIG, Buffer.from([0x00, 0x11, 0x22, 0x33])]);
+const PNG_B64 = PNG_BYTES.toString("base64");
+
+// Build a `.drawio.svg` carrying a data-raster attribute on the ROOT <svg>.
+function svgWithRaster(dataUri, { content = "&lt;mxfile/&gt;" } = {}) {
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" ` +
+    `data-raster="${dataUri}" content="${content}">` +
+    `<image href="x"/></svg>`
+  );
+}
+
+test("#629 DRAWIO_RASTER_ATTR is the shared 'data-raster' constant", () => {
+  assert.equal(DRAWIO_RASTER_ATTR, "data-raster");
+});
+
+test("#629 extractDrawioRaster: a valid raster -> PNG Buffer with the signature", () => {
+  const svg = svgWithRaster(`data:image/png;base64,${PNG_B64}`);
+  const png = extractDrawioRaster(svg);
+  assert.ok(Buffer.isBuffer(png), "returns a Buffer");
+  assert.ok(png.subarray(0, 8).equals(PNG_SIG), "buffer starts with the PNG signature");
+  assert.ok(png.equals(PNG_BYTES), "decodes the exact PNG bytes");
+});
+
+test("#629 extractDrawioRaster: absent attribute -> null", () => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile/&gt;"><g/></svg>`;
+  assert.equal(extractDrawioRaster(svg), null);
+});
+
+test("#629 extractDrawioRaster: wrong mime -> null (never accept a non-png)", () => {
+  const jpegUri = `data:image/jpeg;base64,${PNG_B64}`; // png bytes, jpeg prefix
+  assert.equal(extractDrawioRaster(svgWithRaster(jpegUri)), null);
+  // A bare (non data-URI) value is rejected too.
+  assert.equal(extractDrawioRaster(svgWithRaster(PNG_B64)), null);
+});
+
+test("#629 extractDrawioRaster: truncated/garbage base64 -> null (signature check)", () => {
+  // Valid data-URI prefix but the decoded bytes are NOT a PNG.
+  const notPng = Buffer.from("this is not a png at all").toString("base64");
+  assert.equal(extractDrawioRaster(svgWithRaster(`data:image/png;base64,${notPng}`)), null);
+  // A JPEG signature (FF D8 FF) must not pass as a PNG.
+  const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]).toString("base64");
+  assert.equal(extractDrawioRaster(svgWithRaster(`data:image/png;base64,${jpegBytes}`)), null);
+});
+
+test("#629 extractDrawioRaster: oversized attribute -> null without decoding it", () => {
+  // A base64 string longer than the cap: must be rejected BEFORE Buffer.from.
+  const huge = "A".repeat(MAX_RASTER_BASE64_LENGTH + 8);
+  const svg = svgWithRaster(`data:image/png;base64,${huge}`);
+  assert.equal(extractDrawioRaster(svg), null);
+});
+
+test("#629 extractDrawioRaster: reads the ROOT attribute, not a nested element's", () => {
+  // A nested element carries a VALID-looking data-raster; the root has none.
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" content="&lt;mxfile/&gt;">` +
+    `<image data-raster="data:image/png;base64,${PNG_B64}" href="x"/></svg>`;
+  assert.equal(extractDrawioRaster(svg), null);
+});
+
+test("#629 stripRasterAttr: removes ONLY data-raster, leaves content= byte-intact", () => {
+  const content = "&lt;mxfile host=&quot;drawio&quot;/&gt;";
+  const svg = svgWithRaster(`data:image/png;base64,${PNG_B64}`, { content });
+  const stripped = stripRasterAttr(svg);
+  assert.ok(!stripped.includes("data-raster"), "data-raster is gone");
+  // The content= attribute is untouched, byte for byte.
+  assert.equal(/content="([^"]*)"/.exec(stripped)[1], content);
+  // A svg without a raster is returned unchanged.
+  const plain = `<svg xmlns="x" content="${content}"><g/></svg>`;
+  assert.equal(stripRasterAttr(plain), plain);
+});
+
+test("#629 round-trip: strip a raster then decodeDrawioSvg still yields the model", () => {
+  const inner = "<g/>";
+  const base = buildDrawioSvg(normalizeXml(VALID_MODEL), inner, { width: 200, height: 120 });
+  // Inject a data-raster onto the root <svg> (as the browser would, Part A).
+  const withRaster = base.replace(
+    /^<svg /,
+    `<svg data-raster="data:image/png;base64,${PNG_B64}" `,
+  );
+  assert.ok(extractDrawioRaster(withRaster).equals(PNG_BYTES));
+  const stripped = stripRasterAttr(withRaster);
+  assert.ok(!stripped.includes("data-raster"));
+  assert.equal(decodeDrawioSvg(stripped), normalizeXml(VALID_MODEL));
 });

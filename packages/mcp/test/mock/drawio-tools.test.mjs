@@ -270,6 +270,57 @@ test("drawioGet: format=svg returns the raw .drawio.svg", async () => {
   assert.equal(res.content, svg);
 });
 
+test("drawioGet: format=svg strips data-raster and reports meta.hasRaster (#629)", async () => {
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const rasterB64 = Buffer.concat([PNG_SIG, Buffer.from([1, 2, 3])]).toString("base64");
+  const base = svgFor(MODEL);
+  // Inject a browser-embedded raster onto the root <svg> (as Part A would).
+  const withRaster = base.replace(
+    /^<svg /,
+    `<svg data-raster="data:image/png;base64,${rasterB64}" `,
+  );
+  const pageDoc = {
+    type: "doc",
+    content: [
+      { type: "drawio", attrs: { id: "d1", src: "/api/files/att-1/x.svg", attachmentId: "att-1" } },
+    ],
+  };
+  const { client } = makeClient({ pageDoc, attachmentSvg: withRaster });
+  const res = await client.drawioGet("page1", "d1", "svg");
+  // The returned svg carries NO data-raster (it never bloats model context)...
+  assert.ok(!res.content.includes("data-raster"));
+  // ...but content= is byte-intact, so the model still decodes.
+  assert.equal(res.content, base);
+  assert.equal(res.meta.hasRaster, true);
+});
+
+test("drawioGet: meta.hasRaster is false on a plain diagram; huge raster does not crash (#629)", async () => {
+  const pageDoc = {
+    type: "doc",
+    content: [
+      { type: "drawio", attrs: { id: "d1", src: "/api/files/att-1/x.svg", attachmentId: "att-1" } },
+    ],
+  };
+  // Plain diagram (no raster).
+  const plain = makeClient({ pageDoc, attachmentSvg: svgFor(MODEL) });
+  const r1 = await plain.client.drawioGet("page1", "d1", "svg");
+  assert.equal(r1.meta.hasRaster, false);
+  assert.equal(r1.content, svgFor(MODEL));
+
+  // A HUGE (invalid) data-raster must not crash the jsdom parse — it is stripped
+  // before decode and reported as no valid raster.
+  const huge = "A".repeat(300000);
+  const withHuge = svgFor(MODEL).replace(
+    /^<svg /,
+    `<svg data-raster="data:image/png;base64,${huge}" `,
+  );
+  const big = makeClient({ pageDoc, attachmentSvg: withHuge });
+  const r2 = await big.client.drawioGet("page1", "d1", "svg");
+  assert.equal(r2.meta.hasRaster, false); // invalid -> not a usable raster
+  assert.ok(!r2.content.includes("data-raster"));
+  assert.equal(r2.content, svgFor(MODEL));
+});
+
 test("drawioGet: reads a HUMAN-saved compressed diagram losslessly (pako)", async () => {
   const pageDoc = {
     type: "doc",

@@ -60,6 +60,24 @@ test("updatePageJson canonicalizes the persisted full doc (out-of-order -> refer
   assert.equal(findAll(calls.replaced[0].doc, "footnotesList").length, 1);
 });
 
+test("updatePageJson REJECTS a doc carrying a sandbox /api/sb/ src (#629)", async () => {
+  const { client, calls } = makeClient();
+  // A stashPage publication view (drawio -> image pointing at a RAM-only blob)
+  // must never be written back as page content — it would 404 once the TTL laps.
+  const stashed = {
+    type: "doc",
+    content: [
+      { type: "image", attrs: { src: "https://sb.test/api/sb/id-0", alt: "diagram" } },
+    ],
+  };
+  await assert.rejects(
+    () => client.updatePageJson("p1", stashed),
+    /blob sandbox|\/api\/sb\//,
+  );
+  // Nothing was persisted.
+  assert.equal(calls.replaced.length, 0);
+});
+
 test("copyPageContent canonicalizes the persisted copy (orphan definition dropped)", async () => {
   const sourceDoc = {
     type: "doc",

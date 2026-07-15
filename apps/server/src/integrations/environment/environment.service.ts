@@ -256,6 +256,20 @@ export class EnvironmentService {
     return enabled === 'true';
   }
 
+  /**
+   * #629 — mirrored into window.CONFIG so the draw.io editor only embeds a PNG
+   * raster into the saved .drawio.svg when the operator opts in. Off (default)
+   * => today's behavior (svg-only save), so the file-size cost of the embedded
+   * raster is instantly reversible. Gates GENERATION only; consumption of an
+   * already-embedded raster is unconditional.
+   */
+  isDrawioRasterEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('DRAWIO_RASTER_ENABLED', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
   getStripePublishableKey(): string {
     return this.configService.get<string>('STRIPE_PUBLISHABLE_KEY');
   }

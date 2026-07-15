@@ -104,6 +104,15 @@ export function getDrawioUrl() {
   return getConfigValue("DRAWIO_URL", "https://embed.diagrams.net");
 }
 
+// #629 — operator kill-switch for embedding a PNG raster into the saved
+// .drawio.svg (Part A). DEFAULT OFF: the server mirrors DRAWIO_RASTER_ENABLED
+// into window.CONFIG; when off the client saves an svg-only diagram exactly as
+// before, so the added file-size is instantly reversible by a flag flip. This
+// gates GENERATION only; consumption (Part B: server/mcp) is independent.
+export function isDrawioRasterEnabled(): boolean {
+  return castToBoolean(getConfigValue("DRAWIO_RASTER_ENABLED", "false"));
+}
+
 export function getBillingTrialDays() {
   return getConfigValue("BILLING_TRIAL_DAYS");
 }

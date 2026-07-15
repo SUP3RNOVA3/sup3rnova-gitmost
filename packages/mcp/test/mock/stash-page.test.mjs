@@ -93,6 +93,36 @@ function makeSandbox({ maxTotal = Infinity, throwOnJson = false } = {}) {
 
 const IMAGE_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]); // "PNG" header-ish
 
+// A signature-valid PNG for the #629 embedded-raster diagram tests.
+const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_RASTER = Buffer.concat([PNG_SIG, Buffer.from([1, 2, 3, 4])]);
+// Build a `.drawio.svg` with (optionally) a browser-embedded PNG raster on root.
+function drawioSvg({ raster } = {}) {
+  const rasterAttr = raster ? ` data-raster="${raster}"` : "";
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg"${rasterAttr} ` +
+    `content="&lt;mxfile/&gt;"><switch><foreignObject>caption</foreignObject>` +
+    `<text>trunc</text></switch></svg>`
+  );
+}
+function drawioPageDoc() {
+  return {
+    type: "doc",
+    content: [
+      {
+        type: "drawio",
+        attrs: {
+          src: "/api/files/dg-1/diagram.drawio.svg",
+          attachmentId: "dg-1",
+          title: "My diagram",
+          width: 320,
+          align: "center",
+        },
+      },
+    ],
+  };
+}
+
 function pageDoc() {
   return {
     type: "doc",
@@ -375,4 +405,107 @@ test("stashPage mirrors a file with no Content-Type as octet-stream (fetchIntern
   const imagePut = sandbox.puts.find((p) => p.mime !== "application/json");
   assert.ok(imagePut, "expected an image put");
   assert.equal(imagePut.mime, "application/octet-stream");
+});
+
+// --- draw.io diagram rasterization (#629) ----------------------------------
+
+test("stashPage rasterizes a drawio node with a valid embedded raster (#629)", async () => {
+  const sandbox = makeSandbox();
+  const raster = `data:image/png;base64,${PNG_RASTER.toString("base64")}`;
+  const svg = drawioSvg({ raster });
+  const client = await buildClient(sandbox, {
+    doc: drawioPageDoc(),
+    fileBytes: Buffer.from(svg, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  const result = await client.stashPage("page-1");
+
+  assert.equal(result.diagrams.rasterized, 1);
+  assert.equal(result.diagrams.degraded, 0);
+
+  // The sandbox blob for the diagram is a PNG (89 50 4E 47), NOT the SVG.
+  const pngPut = sandbox.puts.find((p) => p.mime === "image/png");
+  assert.ok(pngPut, "a PNG blob was stored");
+  assert.deepEqual([...pngPut.buf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+  // The SVG itself was never stored.
+  assert.ok(!sandbox.puts.some((p) => p.buf.toString("utf8").includes("<svg")));
+
+  // The drawio node became an image node pointing at the sandbox PNG, carrying
+  // alt <- title, width and align.
+  const docPut = sandbox.puts.find((p) => p.mime === "application/json");
+  const stashed = JSON.parse(docPut.buf.toString("utf8"));
+  const node = stashed.content.content[0];
+  assert.equal(node.type, "image");
+  assert.equal(node.attrs.src, pngPut ? `https://sb.test/api/sb/${pngPut.id}` : "");
+  assert.equal(node.attrs.alt, "My diagram");
+  assert.equal(node.attrs.width, 320);
+  assert.equal(node.attrs.align, "center");
+});
+
+test("stashPage degrades a non-migrated diagram (no raster) without throwing (#629)", async () => {
+  const sandbox = makeSandbox();
+  const svg = drawioSvg(); // NO data-raster
+  const client = await buildClient(sandbox, {
+    doc: drawioPageDoc(),
+    fileBytes: Buffer.from(svg, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  const result = await client.stashPage("page-1");
+
+  assert.equal(result.diagrams.rasterized, 0);
+  assert.equal(result.diagrams.degraded, 1);
+  // No PNG blob stored; the node stays a drawio node with its ORIGINAL src.
+  assert.ok(!sandbox.puts.some((p) => p.mime === "image/png"));
+  const docPut = sandbox.puts.find((p) => p.mime === "application/json");
+  const node = JSON.parse(docPut.buf.toString("utf8")).content.content[0];
+  assert.equal(node.type, "drawio");
+  assert.equal(node.attrs.src, "/api/files/dg-1/diagram.drawio.svg");
+});
+
+test("stashPage never stores a FAKE (non-PNG) data-raster as image/png (#629)", async () => {
+  const sandbox = makeSandbox();
+  // A valid data-URI prefix but the bytes are NOT a PNG -> signature check fails.
+  const fake = `data:image/png;base64,${Buffer.from("not a png").toString("base64")}`;
+  const svg = drawioSvg({ raster: fake });
+  const client = await buildClient(sandbox, {
+    doc: drawioPageDoc(),
+    fileBytes: Buffer.from(svg, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  const result = await client.stashPage("page-1");
+
+  // Rejected as invalid -> degraded, and NOTHING put as image/png.
+  assert.equal(result.diagrams.rasterized, 0);
+  assert.equal(result.diagrams.degraded, 1);
+  assert.ok(!sandbox.puts.some((p) => p.mime === "image/png"));
+  const docPut = sandbox.puts.find((p) => p.mime === "application/json");
+  const node = JSON.parse(docPut.buf.toString("utf8")).content.content[0];
+  assert.equal(node.type, "drawio");
+});
+
+test("stashPage HARD-FAILS if a synthesized diagram raster is FIFO-evicted (#629)", async () => {
+  // Two distinct diagrams, each rasterizing to a ~2000-byte PNG. With a tight
+  // cap, storing the doc (newest) FIFO-evicts a synthesized raster the doc now
+  // references as an image -> a hard failure (throw + clean up), never a silent
+  // revert to a broken state.
+  const BIG_RASTER = Buffer.concat([PNG_SIG, Buffer.alloc(4000, 0x42)]);
+  const raster = `data:image/png;base64,${BIG_RASTER.toString("base64")}`;
+  const sandbox = makeSandbox({ maxTotal: 5000 });
+  const doc = {
+    type: "doc",
+    content: [
+      { type: "drawio", attrs: { src: "/api/files/dg-0/d.drawio.svg", attachmentId: "dg-0" } },
+      { type: "drawio", attrs: { src: "/api/files/dg-1/d.drawio.svg", attachmentId: "dg-1" } },
+    ],
+  };
+  const client = await buildClient(sandbox, {
+    doc,
+    fileBytes: Buffer.from(drawioSvg({ raster }), "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  await assert.rejects(() => client.stashPage("page-1"), /synthesized diagram raster/);
 });

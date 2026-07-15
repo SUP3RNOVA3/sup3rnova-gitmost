@@ -146,6 +146,10 @@ export class StaticModule implements OnModuleInit {
         // #563 — mirrors LOCAL_FIRST_ENABLED so the client's page-meta boot
         // cache (instant chrome) is only active when the operator opts in.
         LOCAL_FIRST_ENABLED: this.environmentService.isLocalFirstEnabled(),
+        // #629 — mirrors DRAWIO_RASTER_ENABLED so the draw.io editor only embeds
+        // a PNG raster into the saved .drawio.svg when the operator opts in
+        // (off => today's svg-only save; the file-size cost is reversible).
+        DRAWIO_RASTER_ENABLED: this.environmentService.isDrawioRasterEnabled(),
       };
 
       const windowScriptContent = `<script>window.CONFIG=${JSON.stringify(configString)};</script>`;

@@ -208,16 +208,24 @@ describe('runViewImage (#588 classification + cache + note)', () => {
     });
   });
 
-  it('DRAWIO node type is rasterized as SVG even if the file server labels it octet-stream', async () => {
-    const png = Buffer.from([9, 9]);
-    rasterizeMock.mockResolvedValue({ png, width: 10, height: 20 });
+  it('DRAWIO node type is handled as SVG even if the file server labels it octet-stream (#629: via its embedded raster)', async () => {
+    // #629: a drawio node is handled by the SVG branch regardless of the served
+    // Content-Type. With an embedded raster present it is preferred directly (no
+    // resvg), which also covers the octet-stream robustness fallback.
+    const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const raster = Buffer.concat([sig, Buffer.from([5, 6])]);
+    const svg = Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" ` +
+        `data-raster="data:image/png;base64,${raster.toString('base64')}" ` +
+        `content="&lt;mxfile/&gt;"><switch/></svg>`,
+    );
     const cache: ViewImageCache = new Map();
     const client = makeClient({
       node: {
         type: 'drawio',
         node: { attrs: { src: '/api/files/d/x.drawio.svg' } },
       },
-      bytes: { buffer: Buffer.from('<svg/>'), mime: 'application/octet-stream' },
+      bytes: { buffer: svg, mime: 'application/octet-stream' },
     });
     const res = await runViewImage(
       client,
@@ -225,9 +233,100 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       'c',
       cache,
     );
-    expect(rasterizeMock).toHaveBeenCalled();
+    expect(rasterizeMock).not.toHaveBeenCalled();
     expect(res.mediaType).toBe('image/png');
-    expect(cache.get('c')?.mediaType).toBe('image/png');
+    expect(cache.get('c')).toEqual({
+      data: raster.toString('base64'),
+      mediaType: 'image/png',
+    });
+  });
+
+  // --- #629 embedded draw.io raster ---------------------------------------
+
+  const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const drawioSvg = (rasterDataUri?: string) => {
+    const attr = rasterDataUri ? ` data-raster="${rasterDataUri}"` : '';
+    return Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg"${attr} content="&lt;mxfile/&gt;">` +
+        `<switch><foreignObject>cap</foreignObject><text>trunc</text></switch></svg>`,
+      'utf8',
+    );
+  };
+  const drawioNode = (src = '/api/files/d/x.drawio.svg') => ({
+    type: 'drawio',
+    node: { attrs: { src } },
+  });
+
+  it('#629 PREFERS a valid embedded raster: no resvg call, embedded PNG cached', async () => {
+    const png = Buffer.concat([PNG_SIG, Buffer.from([1, 2, 3, 4])]);
+    const svg = drawioSvg(`data:image/png;base64,${png.toString('base64')}`);
+    const cache: ViewImageCache = new Map();
+    const client = makeClient({
+      node: drawioNode(),
+      bytes: { buffer: svg, mime: 'image/svg+xml' },
+    });
+
+    const res = await runViewImage(
+      client,
+      { pageId: 'p', node: 'n' },
+      'c-raster',
+      cache,
+    );
+
+    // resvg is NOT touched — the embedded PNG is used directly.
+    expect(rasterizeMock).not.toHaveBeenCalled();
+    expect(res.mediaType).toBe('image/png');
+    expect(cache.get('c-raster')).toEqual({
+      data: png.toString('base64'),
+      mediaType: 'image/png',
+    });
+  });
+
+  it('#629 a drawio with NO usable raster surfaces an explicit message, not a captionless vector', async () => {
+    const svg = drawioSvg(); // no data-raster
+    const cache: ViewImageCache = new Map();
+    const client = makeClient({
+      node: drawioNode(),
+      bytes: { buffer: svg, mime: 'image/svg+xml' },
+    });
+    await expect(
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache),
+    ).rejects.toThrow(/no embedded raster/i);
+    // Never fell back to rasterizing the captionless vector.
+    expect(rasterizeMock).not.toHaveBeenCalled();
+    expect(cache.size).toBe(0);
+  });
+
+  it('#629 an OVERSIZED embedded raster falls back to resvg on the stripped SVG', async () => {
+    // A valid PNG whose decoded size exceeds VIEW_MAX_RASTER_BYTES (but whose
+    // base64 stays under the extractor's decode cap).
+    const big = Buffer.concat([PNG_SIG, Buffer.alloc(VIEW_MAX_RASTER_BYTES)]);
+    const svg = drawioSvg(`data:image/png;base64,${big.toString('base64')}`);
+    const fallbackPng = Buffer.from([9, 8, 7]);
+    rasterizeMock.mockResolvedValue({ png: fallbackPng, width: 5, height: 6 });
+    const cache: ViewImageCache = new Map();
+    const client = makeClient({
+      node: drawioNode(),
+      bytes: { buffer: svg, mime: 'image/svg+xml' },
+    });
+
+    const res = await runViewImage(
+      client,
+      { pageId: 'p', node: 'n' },
+      'c-big',
+      cache,
+    );
+
+    // Fell back to resvg, and it received the SVG with data-raster STRIPPED.
+    expect(rasterizeMock).toHaveBeenCalledTimes(1);
+    const passed = rasterizeMock.mock.calls[0][0] as string;
+    expect(passed).not.toContain('data-raster');
+    expect(res.mediaType).toBe('image/png');
+    expect(res.width).toBe(5);
+    expect(cache.get('c-big')).toEqual({
+      data: fallbackPng.toString('base64'),
+      mediaType: 'image/png',
+    });
   });
 
   it('NON-IMAGE node throws "node is not an image" and never fetches bytes', async () => {

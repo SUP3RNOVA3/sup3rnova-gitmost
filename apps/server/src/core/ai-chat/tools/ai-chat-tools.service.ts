@@ -343,6 +343,80 @@ const VIEW_RASTER_MIMES = new Set([
   'image/gif',
 ]);
 
+// --- embedded draw.io raster (issue #629) ---------------------------------
+//
+// SHARED CONTRACT duplicate. draw.io captions live in a browser-only
+// `foreignObject`, so resvg-rasterizing a `.drawio.svg` yields garbage. The
+// browser (Part A) embeds a real PNG of the diagram into the SVG's ROOT
+// `data-raster="data:image/png;base64,<b64>"` attribute; viewImage PREFERS that
+// PNG. `@docmost/mcp` (which owns the canonical extractor) is ESM-only and is
+// reached from this CommonJS server ONLY via the dynamic loader — a static value
+// import would downlevel to `require()` and fail at runtime. Per the
+// no-shared-package convention (see docmost-client.loader.ts's SharedToolSpec /
+// comment-signal mirrors), this small PURE helper is duplicated here with the
+// SAME attribute constant and the SAME 8-byte PNG-signature validation.
+
+/** Root SVG attribute carrying the browser-rendered PNG raster (issue #629). */
+export const DRAWIO_RASTER_ATTR = 'data-raster';
+const RASTER_DATA_URI_PREFIX = 'data:image/png;base64,';
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+/** Cap the base64 length BEFORE decode so a hostile huge attribute never
+ * allocates unbounded memory (8 MiB base64 ≈ 6 MiB PNG). */
+const MAX_RASTER_BASE64_LENGTH = 8 * 1024 * 1024;
+
+/** Read the `data-raster` attribute off the OPENING `<svg …>` tag ONLY (never a
+ * nested element). Pure/string-level — no jsdom on the server. */
+function readRootRasterAttr(svg: string): string | null {
+  const openTag = /<svg\b[^>]*>/i.exec(svg);
+  if (!openTag) return null;
+  const m = new RegExp(`\\b${DRAWIO_RASTER_ATTR}\\s*=\\s*"([^"]*)"`, 'i').exec(
+    openTag[0],
+  );
+  return m ? m[1] : null;
+}
+
+/**
+ * Extract + VALIDATE the browser-embedded PNG raster from a `.drawio.svg`, or
+ * null when there is no usable raster (absent, non-png mime, oversized, or bytes
+ * that fail the PNG signature — a fake/corrupt raster must never pass as a PNG).
+ * Mirror of `@docmost/mcp`'s extractDrawioRaster (issue #629).
+ */
+export function extractDrawioRaster(svg: string): Buffer | null {
+  const raw = readRootRasterAttr(svg);
+  if (raw == null) return null;
+  const comma = raw.indexOf(',');
+  if (comma === -1) return null;
+  if (raw.slice(0, comma + 1) !== RASTER_DATA_URI_PREFIX) return null;
+  const base64 = raw.slice(comma + 1);
+  if (base64.length === 0 || base64.length > MAX_RASTER_BASE64_LENGTH) {
+    return null;
+  }
+  const png = Buffer.from(base64, 'base64');
+  if (png.length < PNG_SIGNATURE.length) return null;
+  if (!png.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) return null;
+  return png;
+}
+
+/** Remove the `data-raster="…"` attribute from the opening `<svg …>` tag,
+ * leaving `content=` byte-intact. Mirror of `@docmost/mcp`'s stripRasterAttr. */
+export function stripRasterAttr(svg: string): string {
+  const openTag = /<svg\b[^>]*>/i.exec(svg);
+  if (!openTag) return svg;
+  const tag = openTag[0];
+  const stripped = tag.replace(
+    new RegExp(`\\s*\\b${DRAWIO_RASTER_ATTR}\\s*=\\s*"[^"]*"`, 'i'),
+    '',
+  );
+  if (stripped === tag) return svg;
+  return (
+    svg.slice(0, openTag.index) +
+    stripped +
+    svg.slice(openTag.index + tag.length)
+  );
+}
+
 /**
  * The read-only client surface {@link runViewImage} needs (#588): resolve the
  * node's JSON (for its type + attrs.src) and pull the attachment bytes through
@@ -414,16 +488,34 @@ export async function runViewImage(
     data = buffer;
     mediaType = mime;
   } else if (mime === 'image/svg+xml' || res.type === 'drawio') {
-    // SVG (incl. .drawio.svg) -> PNG via the #586 in-process rasterizer. The
-    // drawio node type is a robustness fallback: a drawio attachment is always an
-    // SVG even if the file server labels it with a non-svg Content-Type.
-    const { png, width: w, height: h } = await rasterizeSvgToPng(
-      buffer.toString('utf8'),
-    );
-    data = png;
-    mediaType = 'image/png';
-    width = w;
-    height = h;
+    // SVG (incl. .drawio.svg). A .drawio.svg's captions live in a browser-only
+    // `foreignObject`, so resvg-rasterizing the vector yields garbage (#629).
+    // PREFER a browser-embedded PNG raster when the SVG carries a valid one.
+    const svgText = buffer.toString('utf8');
+    const embedded = extractDrawioRaster(svgText);
+    if (embedded && embedded.length <= VIEW_MAX_RASTER_BYTES) {
+      // Use the embedded PNG directly — no resvg call. width/height unknown.
+      data = embedded;
+      mediaType = 'image/png';
+    } else if (!embedded && res.type === 'drawio') {
+      // A drawio node with NO usable raster: do NOT silently return a
+      // captionless vector rasterization — surface an explicit, actionable text.
+      throw new Error(
+        'this diagram has no embedded raster preview yet; open it in the ' +
+          'draw.io editor and save it to generate one, then view it again',
+      );
+    } else {
+      // A plain SVG image, OR a drawio with an OVERSIZED embedded raster: strip
+      // any (stale/huge) data-raster so resvg does not choke on it, then
+      // rasterize the vector via the #586 in-process rasterizer as before.
+      const { png, width: w, height: h } = await rasterizeSvgToPng(
+        stripRasterAttr(svgText),
+      );
+      data = png;
+      mediaType = 'image/png';
+      width = w;
+      height = h;
+    }
   } else {
     throw new Error('unsupported type ' + mime);
   }

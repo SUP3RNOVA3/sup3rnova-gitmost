@@ -7,6 +7,7 @@ import {
   normalizeFileUrl,
   resolveInternalFilePath,
 } from "../lib/internal-file-urls.js";
+import { extractDrawioRaster } from "../lib/drawio-xml.js";
 
 // downloadFile (#613) — base64 branch ceiling.
 // The base64 branch returns the bytes base64-encoded INTO the tool result, which
@@ -105,7 +106,7 @@ export type DownloadFileResult =
 // carries the base's protected shared state, which would otherwise trip TS4094).
 // Derived from the class below; `implements IStashMixin` fails to compile on drift.
 export interface IStashMixin {
-  stashPage(pageId: string): Promise<{ uri: string; sha256: string; size: number; images: { mirrored: number; failed: number }; }>;
+  stashPage(pageId: string): Promise<{ uri: string; sha256: string; size: number; images: { mirrored: number; failed: number }; diagrams: { rasterized: number; degraded: number }; }>;
   downloadFile(src: string, opts?: { format?: "base64" | "url" | "auto"; maxBase64Bytes?: number }): Promise<DownloadFileResult>;
 }
 
@@ -173,14 +174,27 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
    * URLs within the TTL and one uptime. A failed image fetch never aborts the
    * doc: the original src is kept and the failure counted.
    *
-   * Returns { uri, sha256, size, images:{mirrored, failed} }. `uri` and `sha256`
-   * are for the document blob; `sha256` is also the blob's ETag (integrity).
+   * DIAGRAMS (issue #629): a `drawio` node is NOT mirrored as its raw
+   * `.drawio.svg` (that renders as garbage server-side — draw.io captions live
+   * in a browser-only `foreignObject`). Instead, if the SVG carries a valid
+   * browser-embedded PNG raster (DRAWIO_RASTER_ATTR), the PNG is stashed and the
+   * node is rewritten in-place to an `image` node pointing at it (`rasterized`).
+   * A diagram with no/invalid raster (e.g. a not-yet-migrated wiki, or a
+   * server-regenerated `.drawio.svg`) DEGRADES best-effort: it stays a drawio
+   * node with its original internal src, counted as `degraded` — this reader
+   * never throws on that, so "hand this to a translator" keeps working.
+   *
+   * Returns { uri, sha256, size, images:{mirrored, failed},
+   * diagrams:{rasterized, degraded} }. `uri` and `sha256` are for the document
+   * blob; `sha256` is also the blob's ETag (integrity). This result is a
+   * PUBLICATION VIEW — one-way; do NOT write it back as page content.
    */
   async stashPage(pageId: string): Promise<{
     uri: string;
     sha256: string;
     size: number;
     images: { mirrored: number; failed: number };
+    diagrams: { rasterized: number; degraded: number };
   }> {
     if (!this.sandboxPut) {
       throw new Error(
@@ -201,7 +215,18 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     // differ (e.g. `/api/files/...` vs the bare `/files/...`), so on a revert we
     // must restore each node's own original value, not the group key.
     const bySrc = new Map<string, Array<{ node: any; origSrc: string }>>();
+    // drawio nodes are handled by a SEPARATE diagram pass (#629) — never mirror
+    // their raw `.drawio.svg` (it rasterizes to garbage). Group them by src too
+    // so a copied diagram (two nodes, one src) is fetched/extracted once.
+    const diagramBySrc = new Map<string, any[]>();
     for (const node of collectInternalFileNodes(cloned.content)) {
+      if (node.type === "drawio") {
+        const src = normalizeFileUrl(String(node.attrs.src));
+        const group = diagramBySrc.get(src);
+        if (group) group.push(node);
+        else diagramBySrc.set(src, [node]);
+        continue;
+      }
       const origSrc = String(node.attrs.src);
       const src = normalizeFileUrl(origSrc);
       const entry = { node, origSrc };
@@ -247,6 +272,76 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       );
     }
 
+    // --- diagram pass (#629) -------------------------------------------------
+    // For each drawio node: fetch its `.drawio.svg`, extract+validate the
+    // browser-embedded PNG raster. If present -> stash the PNG and rewrite the
+    // node IN-PLACE to an `image` node pointing at it. If absent/invalid ->
+    // best-effort DEGRADE (leave it a drawio node with its original src). A
+    // synthesized PNG blob participates in the same FIFO-eviction reconciliation
+    // as image mirrors below, but with a STRICTER policy: once the node has been
+    // converted to an `image`, there is no drawio fallback, so an evicted
+    // synthesized blob is a HARD FAILURE (clean up this op's blobs and throw),
+    // never a silent revert to a broken state.
+    let rasterized = 0;
+    let degraded = 0;
+    const synthesized: Array<{ uri: string; nodes: any[] }> = [];
+    const diagramGroups = [...diagramBySrc.entries()];
+    for (let i = 0; i < diagramGroups.length; i += MAX_CONCURRENCY) {
+      const batch = diagramGroups.slice(i, i + MAX_CONCURRENCY);
+      await Promise.all(
+        batch.map(async ([src, nodes]) => {
+          let png: Buffer | null = null;
+          try {
+            const { buffer } = await this.fetchInternalFile(src);
+            png = extractDrawioRaster(buffer.toString("utf-8"));
+          } catch (err) {
+            png = null;
+            console.warn(
+              `stashPage: failed to read diagram "${src}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+          if (!png) {
+            // No/invalid raster -> degrade: leave the drawio node untouched.
+            degraded++;
+            return;
+          }
+          let stored: { uri: string; sha256: string; size: number };
+          try {
+            stored = this.sandboxPut!(png, "image/png");
+          } catch (err) {
+            // The synthesized PNG could not be stored (e.g. exceeds a per-blob
+            // cap). Degrade rather than abort — the node is still a valid drawio
+            // node pointing at its original src (nothing was mutated yet).
+            degraded++;
+            console.warn(
+              `stashPage: failed to stash diagram raster for "${src}": ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+            return;
+          }
+          // Convert each node in-place: drawio -> image, carrying alt (<- alt ||
+          // title), width and align, and pointing src at the sandbox PNG. The
+          // SVG itself is NOT put into the sandbox.
+          for (const node of nodes) {
+            const alt = node.attrs.alt ?? node.attrs.title;
+            const width = node.attrs.width;
+            const align = node.attrs.align;
+            node.type = "image";
+            const attrs: any = { src: stored.uri };
+            if (alt != null) attrs.alt = alt;
+            if (width != null) attrs.width = width;
+            if (align != null) attrs.align = align;
+            node.attrs = attrs;
+          }
+          synthesized.push({ uri: stored.uri, nodes });
+          rasterized++;
+        }),
+      );
+    }
+
     // Revert one mirror's nodes to their original internal srcs and re-count it
     // as failed (its blob was FIFO-evicted before the doc could reference it
     // safely).
@@ -263,16 +358,43 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       );
     };
 
+    // Free every blob this op stored (image mirrors + synthesized diagram
+    // rasters). Used on a HARD failure so nothing leaks in RAM for the TTL.
+    let liveMirrors = mirrors;
+    const cleanupOpBlobs = () => {
+      if (!this.sandboxEvict) return;
+      for (const mirror of liveMirrors) this.sandboxEvict(mirror.uri);
+      for (const s of synthesized) this.sandboxEvict(s.uri);
+    };
+    // A synthesized diagram raster evicted before the doc can reference it is a
+    // hard failure: its drawio node is already an `image` node (no fallback), so
+    // silently keeping a dead sandbox URL would ship a broken publication view.
+    const assertSynthLive = () => {
+      if (!this.sandboxHas) return;
+      const dead = synthesized.filter((s) => !this.sandboxHas!(s.uri));
+      if (dead.length > 0) {
+        cleanupOpBlobs();
+        throw new Error(
+          `stashPage: a synthesized diagram raster (${dead[0].uri}) was evicted ` +
+            `from the sandbox before the document could reference it — aborting ` +
+            `rather than shipping a broken publication view. Retry, or reduce the ` +
+            `page's attachment volume.`,
+        );
+      }
+    };
+
     // Pre-put reconciliation: an image put earlier in THIS stash can FIFO-evict
     // an even-earlier image of the same stash. Drop those from the live set
     // first so the first serialized doc is already mostly correct.
-    let liveMirrors = mirrors;
     if (this.sandboxHas) {
       liveMirrors = [];
       for (const mirror of mirrors) {
         if (this.sandboxHas(mirror.uri)) liveMirrors.push(mirror);
         else revertMirror(mirror);
       }
+      // A synthesized raster evicted by a later put (image or another raster) in
+      // this same stash -> hard failure.
+      assertSynthLive();
     }
 
     // Put the document, then reconcile against eviction caused by the doc put
@@ -287,17 +409,22 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
         docStored = this.sandboxPut(docBuf, "application/json");
       } catch (err) {
         // The doc put failed (e.g. doc exceeds the cap). Free this op's image
-        // blobs instead of leaking them in RAM for the whole TTL, then
-        // re-throw.
-        if (this.sandboxEvict) {
-          for (const mirror of liveMirrors) this.sandboxEvict(mirror.uri);
-        }
+        // AND synthesized-raster blobs instead of leaking them in RAM for the
+        // whole TTL, then re-throw.
+        cleanupOpBlobs();
         throw err;
       }
 
       if (!this.sandboxHas) {
         stored = docStored;
         break;
+      }
+      // The doc put (newest) can FIFO-evict this stash's oldest blobs. If it
+      // evicted a SYNTHESIZED raster, that is a hard failure (drop the doc blob
+      // first, then clean up + throw) — never a silent revert.
+      if (synthesized.some((s) => !this.sandboxHas!(s.uri))) {
+        if (this.sandboxEvict) this.sandboxEvict(docStored.uri);
+        assertSynthLive();
       }
       const evictedNow = liveMirrors.filter((m) => !this.sandboxHas!(m.uri));
       if (evictedNow.length === 0) {
@@ -316,6 +443,7 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       sha256: stored.sha256,
       size: stored.size,
       images: { mirrored, failed },
+      diagrams: { rasterized, degraded },
     };
   }
 

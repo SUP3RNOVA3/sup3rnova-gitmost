@@ -8,9 +8,8 @@ import {
   useComputedColorScheme,
 } from "@mantine/core";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { uploadFile } from "@/features/page/services/page-service.ts";
 import { useDisclosure } from "@mantine/hooks";
-import { getDrawioUrl } from "@/lib/config.ts";
+import { getDrawioUrl, isDrawioRasterEnabled } from "@/lib/config.ts";
 import {
   DrawIoEmbed,
   DrawIoEmbedRef,
@@ -18,55 +17,35 @@ import {
   EventExport,
   EventSave,
 } from "react-drawio";
-import { IAttachment } from "@/features/attachments/types/attachment.types";
-import { decodeBase64ToSvgString, svgStringToFile } from "@/lib/utils";
 import clsx from "clsx";
 import { IconEdit } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { modals } from "@mantine/modals";
+import { useDrawioRasterSave } from "./use-drawio-raster-save.ts";
 
 export default function DrawioView(props: NodeViewProps) {
   const { t } = useTranslation();
   const { node, updateAttributes, editor, selected } = props;
-  const { attachmentId } = node.attrs;
   const drawioRef = useRef<DrawIoEmbedRef>(null);
   const [initialXML, setInitialXML] = useState<string>("");
   const [opened, { open, close }] = useDisclosure(false);
   const computedColorScheme = useComputedColorScheme();
   const isDirtyRef = useRef(false);
-  const isSavingRef = useRef(false);
-  const [isSaving, setIsSaving] = useState(false);
 
-  const handleOpen = async () => {
-    if (!editor.isEditable) {
-      return;
-    }
-    isDirtyRef.current = false;
-    open();
-  };
-
-  const saveData = async (svgXml: string, updateSrc = true) => {
-    if (isSavingRef.current) return;
-
-    isSavingRef.current = true;
-    setIsSaving(true);
-
-    try {
-      const svgString = decodeBase64ToSvgString(svgXml);
-      const fileName = "diagram.drawio.svg";
-      const drawioSVGFile = await svgStringToFile(svgString, fileName);
-
-      //@ts-ignore
-      const pageId = editor.storage?.pageId;
-
-      let attachment: IAttachment = null;
-      if (attachmentId) {
-        attachment = await uploadFile(drawioSVGFile, pageId, attachmentId);
-      } else {
-        attachment = await uploadFile(drawioSVGFile, pageId);
-      }
-
+  const raster = useDrawioRasterSave<void>({
+    getDrawio: () => drawioRef.current,
+    // @ts-ignore — pageId is stashed on editor.storage by the editor host.
+    getPageId: () => editor.storage?.pageId,
+    getAttachmentId: () => node.attrs.attachmentId,
+    // Autosave MUST NOT write `src`: the drawio.ts nodeview destroys the live
+    // editor+iframe the moment `src` appears (see drawio.ts view.update rule).
+    updateSrcOnAutoSave: false,
+    rasterEnabled: isDrawioRasterEnabled(),
+    beginTarget: () => undefined,
+    applyAttributes: (attachment, updateSrc) => {
       if (updateSrc) {
+        // NodeViewProps.updateAttributes targets THIS node, so it is already
+        // position-safe (unlike the bubble-menu's selection-based write).
         updateAttributes({
           src: `/api/files/${attachment.id}/${attachment.fileName}?t=${new Date(attachment.updatedAt).getTime()}`,
           title: attachment.fileName,
@@ -78,12 +57,17 @@ export default function DrawioView(props: NodeViewProps) {
           attachmentId: attachment.id,
         });
       }
-
       isDirtyRef.current = false;
-    } finally {
-      isSavingRef.current = false;
-      setIsSaving(false);
+    },
+    t,
+  });
+
+  const handleOpen = async () => {
+    if (!editor.isEditable) {
+      return;
     }
+    isDirtyRef.current = false;
+    open();
   };
 
   const handleClose = useCallback(() => {
@@ -104,21 +88,29 @@ export default function DrawioView(props: NodeViewProps) {
       confirmProps: { color: "red" },
       onConfirm: () => {
         isDirtyRef.current = false;
+        // Cancel any in-flight save so it cannot upload / write attributes
+        // after the user discarded (A7).
+        raster.cancel();
         close();
       },
     });
-  }, [close, t]);
+  }, [close, t, raster]);
+
+  // Cancel any in-flight save on unmount so it cannot write to a torn-down node.
+  useEffect(() => {
+    return () => raster.cancel();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!opened) return;
 
     const interval = setInterval(() => {
-      if (isDirtyRef.current && !isSavingRef.current && drawioRef.current) {
-        drawioRef.current.exportDiagram({ format: "xmlsvg" });
-      }
+      raster.autoSaveTick();
     }, 30_000);
 
     return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [opened]);
 
   useEffect(() => {
@@ -147,7 +139,7 @@ export default function DrawioView(props: NodeViewProps) {
         <Modal.Overlay />
         <Modal.Content style={{ overflow: "hidden" }}>
           <Modal.Body pos="relative">
-            <LoadingOverlay visible={isSaving} />
+            <LoadingOverlay visible={raster.isSaving} />
             <div style={{ height: "100vh" }}>
               <DrawIoEmbed
                 ref={drawioRef}
@@ -165,7 +157,7 @@ export default function DrawioView(props: NodeViewProps) {
                   if (data.parentEvent !== "save") {
                     return;
                   }
-                  saveData(data.xml, true).then(() => close()).catch(() => {});
+                  raster.saveAndClose(data, close);
                 }}
                 onClose={(data: EventExit) => {
                   if (data.parentEvent) {
@@ -175,9 +167,10 @@ export default function DrawioView(props: NodeViewProps) {
                 }}
                 onAutoSave={() => {
                   isDirtyRef.current = true;
+                  raster.markDirty();
                 }}
                 onExport={(data: EventExport) => {
-                  saveData(data.data, false).catch(() => {});
+                  raster.handleExport(data);
                 }}
               />
             </div>
