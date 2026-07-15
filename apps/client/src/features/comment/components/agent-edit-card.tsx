@@ -109,7 +109,20 @@ function DiffLine({
       >
         {sign}
       </Text>
-      <Text fz={13.5} c={baseColor} style={{ lineHeight: 1.45 }}>
+      <Text
+        fz={13.5}
+        c={baseColor}
+        style={{
+          lineHeight: 1.45,
+          // Let this flex child shrink below its content width (default
+          // min-width:auto would keep the row as wide as the text) and break
+          // long runs at the card edge. Needed because visibleWhitespace()
+          // turns a long insertion into one unbreakable "word" (spaces become
+          // ␣), which otherwise overflows the card to the right.
+          minWidth: 0,
+          overflowWrap: "anywhere",
+        }}
+      >
         {segments.map((seg, i) =>
           seg.changed ? (
             <Box
