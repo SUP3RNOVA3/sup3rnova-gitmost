@@ -458,6 +458,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Copying a PARTIAL table selection no longer puts GFM table syntax into the
+  plain-text clipboard.** Selecting one cell used to copy `| T2 |` plus a
+  `| --- |` header-separator line instead of the cell's text; selecting one row
+  copied the pipe row plus a spurious `| --- |` under it. The separator is GFM
+  header syntax, not data — pasted into an existing markdown table it broke the
+  structure, read by a human it was noise. Now: a single cell copies its bare
+  text; a partial multi-cell selection (row / column / block) copies pipe rows
+  WITHOUT the separator; a whole table copied in full still yields a complete,
+  valid GFM table (header + separator) as before. Only the `text/plain` payload
+  changes — the `text/html` payload (and internal copy/paste back into the
+  editor) is untouched. A spanned or multi-block cell still serializes to the
+  converter's raw `<table>` HTML fallback, whose interior is left verbatim.
+
 - **`/.well-known/*` no longer answers with the SPA's HTML, and a `/mcp` `401`
   now says how to authenticate.** The SPA catch-all served `index.html` with
   `200 text/html` for *any* unknown GET — including the `/.well-known/`
