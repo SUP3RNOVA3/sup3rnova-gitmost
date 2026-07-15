@@ -645,6 +645,26 @@ test("#629 extractDrawioRaster: oversized attribute -> null without decoding it"
   assert.equal(extractDrawioRaster(svg), null);
 });
 
+test("#629 extractDrawioRaster: an oversized value whose bytes WOULD be a valid PNG is rejected by the length cap ALONE (memory guard is non-vacuous)", () => {
+  // The "A".repeat(...) case above decodes to 0x00-bytes, which the PNG-signature
+  // check would ALSO reject — so disabling the length cap leaves it null and the
+  // guard goes untested (the reviewer's mutation: 0 failures). Here the oversized
+  // bytes START WITH the PNG signature, so ONLY the pre-decode length cap can
+  // reject them. Disabling `base64.length > MAX_RASTER_BASE64_LENGTH` makes this
+  // decode to a valid PNG Buffer and the assertion turns RED — pinning the guard.
+  const nBytes = 6 * 1024 * 1024 + 64; // base64 length then exceeds the 8 MiB cap
+  const wouldBeValidPng = Buffer.alloc(nBytes);
+  PNG_SIG.copy(wouldBeValidPng, 0); // a valid PNG signature at the front
+  const oversized = wouldBeValidPng.toString("base64");
+  assert.ok(
+    oversized.length > MAX_RASTER_BASE64_LENGTH,
+    "precondition: the base64 must exceed the pre-decode cap",
+  );
+  const svg = svgWithRaster(`data:image/png;base64,${oversized}`);
+  // Rejected purely by the length cap — the decoded PNG bytes are never produced.
+  assert.equal(extractDrawioRaster(svg), null);
+});
+
 test("#629 extractDrawioRaster: reads the ROOT attribute, not a nested element's", () => {
   // A nested element carries a VALID-looking data-raster; the root has none.
   const svg =

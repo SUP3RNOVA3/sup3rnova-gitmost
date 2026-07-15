@@ -82,6 +82,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       { pageId: 'p1', node: 'n1' },
       'call-A',
       cache,
+      false,
     );
 
     // Small, byte-free result with the ephemeral-tense note.
@@ -114,6 +115,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
         { pageId: 'p', node: 'n' },
         'c',
         cache,
+        false,
       );
       expect(res.mediaType).toBe(mime);
       expect(cache.get('c')).toEqual({
@@ -131,7 +133,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       bytes: { buffer, mime: 'image/png' },
     });
     await expect(
-      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache),
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache, false),
     ).rejects.toThrow('image too large');
     expect(cache.size).toBe(0);
   });
@@ -147,7 +149,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       bytes: { buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png' },
     });
     await expect(
-      runViewImage(client, { pageId: 'p', node: 'n' }, 'new', cache),
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'new', cache, false),
     ).rejects.toThrow(/too many images/i);
     // The refused call must not add its entry.
     expect(cache.size).toBe(VIEW_MAX_LIVE_IMAGES);
@@ -169,7 +171,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       bytes: { buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mime: 'image/png' },
     });
     await expect(
-      runViewImage(client, { pageId: 'p', node: 'n' }, 'new', cache),
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'new', cache, false),
     ).rejects.toThrow(/too many images/i);
     expect(cache.has('new')).toBe(false);
   });
@@ -189,6 +191,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       { pageId: 'p', node: 'n' },
       'c-svg',
       cache,
+      false,
     );
 
     // The rasterizer received the SVG source as a UTF-8 string.
@@ -232,6 +235,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       { pageId: 'p', node: 'n' },
       'c',
       cache,
+      false,
     );
     expect(rasterizeMock).not.toHaveBeenCalled();
     expect(res.mediaType).toBe('image/png');
@@ -257,9 +261,49 @@ describe('runViewImage (#588 classification + cache + note)', () => {
     node: { attrs: { src } },
   });
 
-  it('#629 PREFERS a valid embedded raster: no resvg call, embedded PNG cached', async () => {
-    const png = Buffer.concat([PNG_SIG, Buffer.from([1, 2, 3, 4])]);
-    const svg = drawioSvg(`data:image/png;base64,${png.toString('base64')}`);
+  // #629 F1/F2: the LAST runViewImage arg is `rasterEnabled` (mirror of
+  // DRAWIO_RASTER_ENABLED). It gates ONLY a drawio node with no usable raster
+  // (missing OR oversized): flag ON => actionable throw; flag OFF => inert resvg
+  // fallback (pre-PR behavior). A valid in-budget raster is used directly under
+  // BOTH flags — consumption is unconditional.
+
+  it.each([false, true])(
+    '#629 PREFERS a valid in-budget embedded raster and uses it DIRECTLY (rasterEnabled=%s): no resvg call, embedded PNG cached',
+    async (rasterEnabled) => {
+      const png = Buffer.concat([PNG_SIG, Buffer.from([1, 2, 3, 4])]);
+      const svg = drawioSvg(`data:image/png;base64,${png.toString('base64')}`);
+      const cache: ViewImageCache = new Map();
+      const client = makeClient({
+        node: drawioNode(),
+        bytes: { buffer: svg, mime: 'image/svg+xml' },
+      });
+
+      const res = await runViewImage(
+        client,
+        { pageId: 'p', node: 'n' },
+        'c-raster',
+        cache,
+        rasterEnabled,
+      );
+
+      // resvg is NOT touched — the embedded PNG is used directly, regardless of
+      // the flag (consumption stays unconditional).
+      expect(rasterizeMock).not.toHaveBeenCalled();
+      expect(res.mediaType).toBe('image/png');
+      expect(cache.get('c-raster')).toEqual({
+        data: png.toString('base64'),
+        mediaType: 'image/png',
+      });
+    },
+  );
+
+  it('#629 F1 flag OFF: a drawio with NO usable raster falls back to resvg (INERT), does NOT throw', async () => {
+    // The DEFAULT deploy (DRAWIO_RASTER_ENABLED=false): generation is disabled, so
+    // "open it in the editor and save" is unactionable — viewImage must stay inert
+    // and degrade to the pre-PR resvg render rather than deny all draw.io viewing.
+    const svg = drawioSvg(); // no data-raster
+    const fallbackPng = Buffer.from([4, 5, 6]);
+    rasterizeMock.mockResolvedValue({ png: fallbackPng, width: 7, height: 8 });
     const cache: ViewImageCache = new Map();
     const client = makeClient({
       node: drawioNode(),
@@ -269,20 +313,25 @@ describe('runViewImage (#588 classification + cache + note)', () => {
     const res = await runViewImage(
       client,
       { pageId: 'p', node: 'n' },
-      'c-raster',
+      'c-off',
       cache,
+      false,
     );
 
-    // resvg is NOT touched — the embedded PNG is used directly.
-    expect(rasterizeMock).not.toHaveBeenCalled();
+    expect(rasterizeMock).toHaveBeenCalledTimes(1);
+    const passed = rasterizeMock.mock.calls[0][0] as string;
+    expect(passed).not.toContain('data-raster');
     expect(res.mediaType).toBe('image/png');
-    expect(cache.get('c-raster')).toEqual({
-      data: png.toString('base64'),
+    expect(res.width).toBe(7);
+    expect(cache.get('c-off')).toEqual({
+      data: fallbackPng.toString('base64'),
       mediaType: 'image/png',
     });
   });
 
-  it('#629 a drawio with NO usable raster surfaces an explicit message, not a captionless vector', async () => {
+  it('#629 F1 flag ON: a drawio with NO usable raster surfaces an explicit, actionable message (no captionless vector)', async () => {
+    // With generation ENABLED the remediation works, so throw the loud text
+    // instead of returning a captionless resvg render.
     const svg = drawioSvg(); // no data-raster
     const cache: ViewImageCache = new Map();
     const client = makeClient({
@@ -290,14 +339,14 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       bytes: { buffer: svg, mime: 'image/svg+xml' },
     });
     await expect(
-      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache),
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache, true),
     ).rejects.toThrow(/no embedded raster/i);
     // Never fell back to rasterizing the captionless vector.
     expect(rasterizeMock).not.toHaveBeenCalled();
     expect(cache.size).toBe(0);
   });
 
-  it('#629 an OVERSIZED embedded raster falls back to resvg on the stripped SVG', async () => {
+  it('#629 F2 flag OFF: an OVERSIZED-but-valid embedded raster falls back to resvg on the stripped SVG (INERT)', async () => {
     // A valid PNG whose decoded size exceeds VIEW_MAX_RASTER_BYTES (but whose
     // base64 stays under the extractor's decode cap).
     const big = Buffer.concat([PNG_SIG, Buffer.alloc(VIEW_MAX_RASTER_BYTES)]);
@@ -315,6 +364,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       { pageId: 'p', node: 'n' },
       'c-big',
       cache,
+      false,
     );
 
     // Fell back to resvg, and it received the SVG with data-raster STRIPPED.
@@ -329,6 +379,23 @@ describe('runViewImage (#588 classification + cache + note)', () => {
     });
   });
 
+  it('#629 F2 flag ON: an OVERSIZED-but-valid embedded raster throws the actionable message (not a garbage resvg render)', async () => {
+    // Oversized-valid is treated the SAME as no-usable-raster: under flag ON it
+    // must NOT be sent to a captionless resvg render — it throws instead.
+    const big = Buffer.concat([PNG_SIG, Buffer.alloc(VIEW_MAX_RASTER_BYTES)]);
+    const svg = drawioSvg(`data:image/png;base64,${big.toString('base64')}`);
+    const cache: ViewImageCache = new Map();
+    const client = makeClient({
+      node: drawioNode(),
+      bytes: { buffer: svg, mime: 'image/svg+xml' },
+    });
+    await expect(
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'c-big-on', cache, true),
+    ).rejects.toThrow(/no embedded raster/i);
+    expect(rasterizeMock).not.toHaveBeenCalled();
+    expect(cache.size).toBe(0);
+  });
+
   it('NON-IMAGE node throws "node is not an image" and never fetches bytes', async () => {
     let fetched = false;
     const cache: ViewImageCache = new Map();
@@ -339,7 +406,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       },
     });
     await expect(
-      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache),
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache, false),
     ).rejects.toThrow('node is not an image');
     expect(fetched).toBe(false);
     expect(cache.size).toBe(0);
@@ -352,7 +419,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       bytes: { buffer: Buffer.from('%PDF'), mime: 'application/pdf' },
     });
     await expect(
-      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache),
+      runViewImage(client, { pageId: 'p', node: 'n' }, 'c', cache, false),
     ).rejects.toThrow('unsupported type application/pdf');
     expect(cache.size).toBe(0);
   });
@@ -367,7 +434,7 @@ describe('runViewImage (#588 classification + cache + note)', () => {
       onGetNode: (a) => (getNodeArgs = a),
       onFetch: (s) => (fetchedSrc = s),
     });
-    await runViewImage(client, { pageId: 'PID', node: 'NREF' }, 'c', cache);
+    await runViewImage(client, { pageId: 'PID', node: 'NREF' }, 'c', cache, false);
     // getNode MUST be called with format 'json' (markdown drops attachmentId/src).
     expect(getNodeArgs).toEqual(['PID', 'NREF', 'json']);
     expect(fetchedSrc).toBe('/api/files/att-9/p.png');
@@ -426,6 +493,9 @@ describe('AiChatToolsService.forUser viewImage gate (#588)', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 

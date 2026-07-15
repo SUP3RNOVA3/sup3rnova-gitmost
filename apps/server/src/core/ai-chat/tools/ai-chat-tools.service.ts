@@ -23,6 +23,7 @@ import { parseNodeArg } from '@docmost/prosemirror-markdown';
 import { modelFriendlyInput } from './model-friendly-input';
 import { rasterizeSvgToPng } from '../../../integrations/ai/rasterize';
 import { SandboxStore } from '../../../integrations/sandbox/sandbox.store';
+import { EnvironmentService } from '../../../integrations/environment/environment.service';
 import {
   buildInAppDeferredCatalog,
   type ToolCatalogEntry,
@@ -446,10 +447,20 @@ export interface ViewImageResult {
  *
  * Classification:
  *  - png/jpeg/webp/gif  -> passthrough; oversized (> VIEW_MAX_RASTER_BYTES) throws;
- *  - image/svg+xml (incl. a drawio node's `.drawio.svg`) -> rasterized to PNG via
- *    #586's rasterizeSvgToPng (the drawio node type is treated as SVG regardless
- *    of the served Content-Type, since a drawio attachment is always an SVG);
+ *  - image/svg+xml (incl. a drawio node's `.drawio.svg`) -> a plain SVG is
+ *    rasterized to PNG via #586's rasterizeSvgToPng (drawio node type is treated
+ *    as SVG regardless of the served Content-Type). A `.drawio.svg` PREFERS its
+ *    browser-embedded PNG raster (#629) when one is valid and in-budget; without
+ *    a usable raster the behavior depends on `rasterEnabled` (see below);
  *  - anything else -> throws `unsupported type <mime>`.
+ *
+ * `rasterEnabled` mirrors DRAWIO_RASTER_ENABLED (#629). It ONLY affects a drawio
+ * node that has NO usable embedded raster (missing OR oversized): with generation
+ * ON the "open it in the editor and save" remediation is actionable, so we throw
+ * that loud text instead of returning a captionless resvg render; with generation
+ * OFF that advice is unactionable, so viewImage falls back to the pre-PR resvg
+ * render (INERT). A valid in-budget embedded raster is used directly under BOTH
+ * flags — consumption is unconditional. Plain SVGs ignore the flag entirely.
  *
  * getNode is called with format='json' DELIBERATELY: the markdown rendering drops
  * `attrs` (incl. the attachment `src`), so JSON is the only form that yields the
@@ -460,6 +471,9 @@ export async function runViewImage(
   args: { pageId: string; node: string },
   toolCallId: string,
   cache: ViewImageCache,
+  // #629: DRAWIO_RASTER_ENABLED mirror. Gates ONLY the drawio no-usable-raster
+  // remediation (throw vs. inert resvg fallback); see the doc block above.
+  rasterEnabled: boolean,
 ): Promise<ViewImageResult> {
   const res = (await client.getNode(args.pageId, args.node, 'json')) as {
     type?: string;
@@ -494,20 +508,28 @@ export async function runViewImage(
     const svgText = buffer.toString('utf8');
     const embedded = extractDrawioRaster(svgText);
     if (embedded && embedded.length <= VIEW_MAX_RASTER_BYTES) {
-      // Use the embedded PNG directly — no resvg call. width/height unknown.
+      // A valid, in-budget embedded PNG raster: used directly — no resvg call,
+      // width/height unknown. UNCONDITIONAL (independent of rasterEnabled) so
+      // consumption of an already-embedded raster never regresses (#629).
       data = embedded;
       mediaType = 'image/png';
-    } else if (!embedded && res.type === 'drawio') {
-      // A drawio node with NO usable raster: do NOT silently return a
-      // captionless vector rasterization — surface an explicit, actionable text.
+    } else if (res.type === 'drawio' && rasterEnabled) {
+      // A drawio node with NO usable raster — missing (F1) OR oversized-but-valid
+      // (F2). With generation ENABLED the remediation actually works, so do NOT
+      // silently return a captionless vector rasterization; surface an explicit,
+      // actionable text instead. (This also guards a flag-ON deploy whose
+      // png-export server is broken — a flag-ON operational concern, throw is ok.)
       throw new Error(
         'this diagram has no embedded raster preview yet; open it in the ' +
           'draw.io editor and save it to generate one, then view it again',
       );
     } else {
-      // A plain SVG image, OR a drawio with an OVERSIZED embedded raster: strip
-      // any (stale/huge) data-raster so resvg does not choke on it, then
-      // rasterize the vector via the #586 in-process rasterizer as before.
+      // A plain SVG image (flag-agnostic), OR — under flag-OFF — a drawio with no
+      // usable raster (missing/oversized/stale). Generation is off (or this is a
+      // plain SVG), so the "save to generate one" advice is unactionable: fall
+      // back to the pre-PR resvg render (INERT). Strip any (stale/huge)
+      // data-raster first so resvg does not choke on it, then rasterize the
+      // vector via the #586 in-process rasterizer as before.
       const { png, width: w, height: h } = await rasterizeSvgToPng(
         stripRasterAttr(svgText),
       );
@@ -570,6 +592,12 @@ export class AiChatToolsService {
     // lockstep with SearchService's vector arm (both serve the active fingerprint,
     // never a half-built target one).
     private readonly embeddingGeneration: EmbeddingGenerationService,
+    // #629: mirrors DRAWIO_RASTER_ENABLED. Gates only the loud "no raster yet"
+    // remediation in viewImage's drawio branch — with generation ON the advice is
+    // actionable, so a captionless resvg fallback is refused; with generation OFF
+    // it would be unactionable, so viewImage stays INERT (pre-PR resvg fallback).
+    // Consumption of a valid embedded raster stays unconditional either way.
+    private readonly environmentService: EnvironmentService,
   ) {}
 
   /**
@@ -1083,7 +1111,10 @@ export class AiChatToolsService {
           'pageId and a node reference (the image/drawio node\'s attrs.id, or ' +
           '"#<index>" for a top-level block), the image is shown to you as a ' +
           'separate message on THIS step only. Raster images (png/jpeg/webp/gif) ' +
-          'are shown as-is; SVG and draw.io diagrams are rendered to PNG first. ' +
+          'are shown as-is; a plain SVG is rendered to PNG. A draw.io diagram is ' +
+          'shown from its embedded PNG preview when it has one; otherwise, ' +
+          'depending on server config, you get a rendered fallback or an error ' +
+          'telling you to open and save the diagram in the editor first. ' +
           'The image is NOT retained on later turns — call viewImage again if you ' +
           'need to see it after this turn. Use it to answer questions about what ' +
           'an image, screenshot, or diagram actually depicts.',
@@ -1098,7 +1129,16 @@ export class AiChatToolsService {
             ),
         }),
         execute: async ({ pageId, node }, { toolCallId }) =>
-          runViewImage(client, { pageId, node }, toolCallId, viewImageCache),
+          runViewImage(
+            client,
+            { pageId, node },
+            toolCallId,
+            viewImageCache,
+            // #629: gates ONLY the drawio no-usable-raster remediation. Read here
+            // (the call site holds the NestJS EnvironmentService) so a valid raster
+            // is still consumed unconditionally regardless of the flag.
+            this.environmentService.isDrawioRasterEnabled(),
+          ),
       });
     }
 

@@ -313,6 +313,9 @@ describe('AiChatToolsService forUser + comment signal (real tracker)', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   }
 

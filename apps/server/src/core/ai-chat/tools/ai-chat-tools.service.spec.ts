@@ -91,6 +91,9 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -212,6 +215,9 @@ describe('AiChatToolsService expanded toolset guardrails', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -343,6 +349,9 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -565,6 +574,9 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -701,6 +713,9 @@ describe('AiChatToolsService #294 changed execute wirings', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
   afterEach(() => jest.restoreAllMocks());
@@ -809,6 +824,9 @@ describe('AiChatToolsService #410 footnote + image tools', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
   afterEach(() => jest.restoreAllMocks());
@@ -910,6 +928,9 @@ describe('AiChatToolsService getCurrentPage selection (#388)', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -1000,6 +1021,9 @@ describe('AiChatToolsService drawio layout passthrough (#440)', () => {
       // #599: EmbeddingGenerationService (active-generation fingerprint for
       // the hybrid RAG read). Unused by this spec (the RAG path falls back).
       {} as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
