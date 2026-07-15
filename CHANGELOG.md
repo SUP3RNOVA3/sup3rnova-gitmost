@@ -546,6 +546,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already-served response stays cacheable for up to an hour (`Cache-Control:
   public, max-age=3600`), so the guard applies to origin hits. (#574)
 
+- **The MCP integrity guard now names a lost attachment / media / embed /
+  transclusion, not only diagrams.** Extending the draw.io/Excalidraw fix below,
+  the structural integrity guard behind `diffPageVersions` and the post-write
+  verify report now counts every remaining block ATOM whose whole payload lives
+  in its attributes — `attachment`, `video`, `audio`, `pdf`, `embed`, `youtube`,
+  `htmlEmbed`, `mathBlock`, `pageEmbed`, `subpages`, and the two transclusion
+  nodes. Deleting one of these moves no prose and no marks, so it left only the
+  single leaf placeholder an atom emits in the text delta — a 1-char change
+  indistinguishable from fixing a typo (the same blind spot code blocks and
+  diagrams already closed). This is most painful for `attachment`: an agent that
+  uploads a file and inserts the node could silently drop it on a later edit with
+  nothing to name the loss. Each type is now its own `[old, new]` integrity kind
+  — a `video: N -> N-1` line in `## Integrity` and a `structure.video` entry in
+  the write report. They are counted SEPARATELY, never in one `media`/`embeds`
+  bucket: a bucket would report a `video` swapped for an `audio` as `1 -> 1`
+  (clean) and omit it from the report, recreating the very blind spot. Detection
+  only, as before: it makes such a loss loud, it does not prevent it. Like
+  `images`, the count catches CARDINALITY, not a mutated `src`/`attrs` on a
+  surviving node.
+
 - **A lost draw.io/Excalidraw diagram is no longer unnamed in the MCP integrity
   guard.** The structural integrity guard behind `diffPageVersions` and the
   post-write verify report counted images/links/tables/callouts/code blocks, but

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { diffDocs } from "../../build/lib/diff.js";
+import { diffDocs, summarizeChange } from "../../build/lib/diff.js";
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -189,6 +189,115 @@ test("diffDocs names a drawio->excalidraw swap (a bucket would report 1 -> 1)", 
   assert.deepEqual(r.integrity.excalidraw, [0, 1], "an excalidraw took its place");
   assert.match(r.markdown, /- drawio: 1 -> 0/);
   assert.match(r.markdown, /- excalidraw: 0 -> 1/);
+});
+
+// ---------------------------------------------------------------------------
+// #619: block-atom DATA CARRIERS. Each is a top-level block whose whole payload
+// lives in attrs (src/attachmentId/sourcePageId/…). Deleting one moves no prose
+// and no marks — only the 1-char leaf placeholder an atom contributes to the
+// text delta (indistinguishable from a typo fix). The count is what NAMES the
+// loss. They get SEPARATE counters (never a "media"/"embeds" bucket) — see the
+// cross-kind substitution tests below.
+// ---------------------------------------------------------------------------
+
+// Per-type minimal, schema-valid nodes for the 12 carriers, keyed by the
+// integrity key. transclusionSource is the only one with required content.
+const carrier = {
+  attachment: { type: "attachment", attrs: { url: "http://x/f.zip", name: "f.zip" } },
+  video: { type: "video", attrs: { src: "http://x/v.mp4" } },
+  audio: { type: "audio", attrs: { src: "http://a.mp3" } },
+  pdf: { type: "pdf", attrs: { src: "http://p.pdf" } },
+  embed: { type: "embed", attrs: { src: "http://e", provider: "iframe" } },
+  youtube: { type: "youtube", attrs: { src: "http://y/watch" } },
+  htmlEmbed: { type: "htmlEmbed", attrs: { source: "<b>hi</b>", height: 200 } },
+  mathBlock: { type: "mathBlock", attrs: { text: "x^2" } },
+  pageEmbed: { type: "pageEmbed", attrs: { sourcePageId: "p1" } },
+  subpages: { type: "subpages" },
+  transclusionSource: {
+    type: "transclusionSource",
+    attrs: { id: "s1" },
+    content: [para(t("shared"))],
+  },
+  transclusionReference: {
+    type: "transclusionReference",
+    attrs: { sourcePageId: "p1", transclusionId: "s1" },
+  },
+};
+
+for (const [key, node] of Object.entries(carrier)) {
+  test(`diffDocs counts a lost ${key} block atom (1 -> 0) and names it`, () => {
+    const oldDoc = doc(para(t("keep this prose")), node);
+    const newDoc = doc(para(t("keep this prose")));
+    const r = diffDocs(oldDoc, newDoc);
+
+    assert.deepEqual(
+      r.integrity[key],
+      [1, 0],
+      `the vanished ${key} must be counted`,
+    );
+    assert.match(
+      r.markdown,
+      new RegExp(`- ${key}: 1 -> 0`),
+      `markdown names the lost ${key}`,
+    );
+  });
+
+  test(`diffDocs counts a gained ${key} block atom (0 -> 1)`, () => {
+    const oldDoc = doc(para(t("keep this prose")));
+    const newDoc = doc(para(t("keep this prose")), node);
+    const r = diffDocs(oldDoc, newDoc);
+
+    assert.deepEqual(r.integrity[key], [0, 1], `the added ${key} is counted`);
+    assert.match(r.markdown, new RegExp(`- ${key}: 0 -> 1`));
+  });
+}
+
+// A video swapped for an audio: a single "media" BUCKET would report this as
+// `1 -> 1` (clean) and omit it from the write report entirely, hiding a
+// destroyed carrier behind a same-cardinality total. Separate keys name it, and
+// BOTH show up in summarizeChange's structure delta.
+test("diffDocs names a video->audio swap (a media bucket would report 1 -> 1)", () => {
+  const oldDoc = doc(para(t("clip")), carrier.video);
+  const newDoc = doc(para(t("clip")), carrier.audio);
+  const r = diffDocs(oldDoc, newDoc);
+
+  assert.deepEqual(r.integrity.video, [1, 0], "the video is gone");
+  assert.deepEqual(r.integrity.audio, [0, 1], "an audio took its place");
+  assert.match(r.markdown, /- video: 1 -> 0/);
+  assert.match(r.markdown, /- audio: 0 -> 1/);
+
+  const rep = summarizeChange(oldDoc, newDoc);
+  assert.deepEqual(rep.structure.video, [1, 0], "structure names the lost video");
+  assert.deepEqual(rep.structure.audio, [0, 1], "structure names the new audio");
+});
+
+// embed vs youtube are distinct schema node types (not one "embeds" bucket).
+test("diffDocs names an embed->youtube swap (both are distinct kinds)", () => {
+  const oldDoc = doc(para(t("iframe")), carrier.embed);
+  const newDoc = doc(para(t("iframe")), carrier.youtube);
+  const r = diffDocs(oldDoc, newDoc);
+
+  assert.deepEqual(r.integrity.embed, [1, 0]);
+  assert.deepEqual(r.integrity.youtube, [0, 1]);
+  assert.match(r.markdown, /- embed: 1 -> 0/);
+  assert.match(r.markdown, /- youtube: 0 -> 1/);
+});
+
+// transclusionSource vs transclusionReference stay distinct: a bucket would hide
+// a source (that carries live content) being downgraded to a bare reference.
+test("diffDocs names a transclusionSource->transclusionReference swap", () => {
+  const oldDoc = doc(para(t("doc")), carrier.transclusionSource);
+  const newDoc = doc(para(t("doc")), carrier.transclusionReference);
+  const r = diffDocs(oldDoc, newDoc);
+
+  assert.deepEqual(r.integrity.transclusionSource, [1, 0]);
+  assert.deepEqual(r.integrity.transclusionReference, [0, 1]);
+  assert.match(r.markdown, /- transclusionSource: 1 -> 0/);
+  assert.match(r.markdown, /- transclusionReference: 0 -> 1/);
+
+  const rep = summarizeChange(oldDoc, newDoc);
+  assert.deepEqual(rep.structure.transclusionSource, [1, 0]);
+  assert.deepEqual(rep.structure.transclusionReference, [0, 1]);
 });
 
 // ---------------------------------------------------------------------------
