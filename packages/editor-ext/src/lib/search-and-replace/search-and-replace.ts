@@ -29,7 +29,6 @@ import {
   type Transaction,
 } from "@tiptap/pm/state";
 import { Node as PMNode, Mark } from "@tiptap/pm/model";
-import { findOccurrences } from "./find-occurrences";
 
 declare module "@tiptap/core" {
   interface Storage {
@@ -77,6 +76,11 @@ declare module "@tiptap/core" {
   }
 }
 
+interface TextNodesWithPosition {
+  text: string;
+  pos: number;
+}
+
 const getRegex = (
   s: string,
   disableRegex: boolean,
@@ -100,6 +104,10 @@ function processSearches(
   resultIndex: number,
 ): ProcessedSearches {
   const decorations: Decoration[] = [];
+  const results: Range[] = [];
+
+  let textNodesWithPosition: TextNodesWithPosition[] = [];
+  let index = 0;
 
   if (!searchTerm) {
     return {
@@ -108,8 +116,43 @@ function processSearches(
     };
   }
 
-  // Shared find-all-occurrences primitive (also used by multi-cursor).
-  const results: Range[] = findOccurrences(doc, searchTerm);
+  doc?.descendants((node, pos) => {
+    if (node.isText) {
+      if (textNodesWithPosition[index]) {
+        textNodesWithPosition[index] = {
+          text: textNodesWithPosition[index].text + node.text,
+          pos: textNodesWithPosition[index].pos,
+        };
+      } else {
+        textNodesWithPosition[index] = {
+          text: `${node.text}`,
+          pos,
+        };
+      }
+    } else {
+      index += 1;
+    }
+  });
+
+  textNodesWithPosition = textNodesWithPosition.filter(Boolean);
+
+  for (const element of textNodesWithPosition) {
+    const { text, pos } = element;
+    const matches = Array.from(text.matchAll(searchTerm)).filter(
+      ([matchText]) => matchText.trim(),
+    );
+
+    for (const m of matches) {
+      if (m[0] === "") break;
+
+      if (m.index !== undefined) {
+        results.push({
+          from: pos + m.index,
+          to: pos + m.index + m[0].length,
+        });
+      }
+    }
+  }
 
   for (let i = 0; i < results.length; i += 1) {
     const r = results[i];
