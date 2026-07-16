@@ -622,12 +622,18 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    */
   async getOutline(pageId: string) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: if this client wrote to the page within its
+    // RYOW window, hint the server to serve the LIVE (acked-but-maybe-unflushed)
+    // content instead of the debounce-stale DB row, then run the SAME extraction.
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     return {
       pageId,
       slugId: data.slugId,
       title: data.title,
       outline: buildOutline(data.content ?? { type: "doc", content: [] }),
+      ...(freshness ? { freshness } : {}),
     };
   }
 
@@ -658,7 +664,10 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     format: "markdown" | "json" = "markdown",
   ) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: prefer the live doc when we just wrote (below).
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     const hit = getNodeByRef(
       data.content ?? { type: "doc", content: [] },
       nodeId,
@@ -679,6 +688,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
         type: hit.type,
         format: "json" as const,
         node: hit.node,
+        ...(freshness ? { freshness } : {}),
       };
     }
 
@@ -697,6 +707,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       type: hit.type,
       format: "markdown" as const,
       markdown,
+      ...(freshness ? { freshness } : {}),
     };
   }
 
@@ -714,13 +725,16 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    */
   async searchInPage(pageId: string, query: string, opts: SearchOptions = {}) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: prefer the live doc when we just wrote.
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     const result = searchInDoc(
       data.content ?? { type: "doc", content: [] },
       query,
       opts,
     );
-    return { pageId, query, ...result };
+    return { pageId, query, ...result, ...(freshness ? { freshness } : {}) };
   }
 
   /**
@@ -732,7 +746,10 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    */
   async getTable(pageId: string, tableRef: string) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: prefer the live doc when we just wrote.
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     const t = readTable(data.content ?? { type: "doc", content: [] }, tableRef);
     if (!t) {
       throw new Error(
@@ -747,6 +764,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       path: t.path,
       cells: t.cells,
       cellIds: t.cellIds,
+      ...(freshness ? { freshness } : {}),
     };
   }
 

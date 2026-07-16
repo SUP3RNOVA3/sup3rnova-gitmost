@@ -108,6 +108,25 @@ export class PageController {
       contentHash = pair.contentHash;
     }
 
+    // #654 §Server — opt-in read-your-own-writes for the structural read tools.
+    // Runs AFTER the permission gate above and ONLY when requested, and probes
+    // the owner by the resolved `page.id` (never the raw slug). `effectiveContent`
+    // is used INDEPENDENTLY of the `&& content` format gate below, so a doc that
+    // is loaded-but-not-yet-flushed (DB row still empty) still returns its live
+    // body. `contentSource`/`fallbackReason` are additive sibling fields on the
+    // response root (existing consumers ignore unknown fields).
+    let contentSource: 'live' | 'db' | undefined;
+    let fallbackReason: 'not_loaded' | 'owner_unreachable' | undefined;
+    if (dto.preferLive) {
+      const live = await this.pageService.resolvePreferLiveContent(
+        page.id,
+        page.content,
+      );
+      content = live.content;
+      contentSource = live.contentSource;
+      fallbackReason = live.fallbackReason;
+    }
+
     if (dto.format && dto.format !== 'json' && content) {
       let contentOutput: string;
       if (dto.format === 'markdown') {
@@ -123,6 +142,8 @@ export class PageController {
         ...page,
         content: contentOutput,
         ...(contentHash !== undefined ? { contentHash } : {}),
+        ...(contentSource !== undefined ? { contentSource } : {}),
+        ...(fallbackReason !== undefined ? { fallbackReason } : {}),
         permissions,
       };
     }
@@ -131,6 +152,8 @@ export class PageController {
       ...page,
       content,
       ...(contentHash !== undefined ? { contentHash } : {}),
+      ...(contentSource !== undefined ? { contentSource } : {}),
+      ...(fallbackReason !== undefined ? { fallbackReason } : {}),
       permissions,
     };
   }

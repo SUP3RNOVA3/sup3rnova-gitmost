@@ -269,6 +269,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return r.doc;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if ((results?.length ?? 0) === 0 && (failed?.length ?? 0) > 0) {
       // No edit applied: surface an aggregated, actionable error so the caller
@@ -447,6 +449,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
     // the write for any count !== 1). Single shared guard (#159, #185 review).
@@ -543,6 +547,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return mergeFootnoteDefinitions(spliced, definitions);
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // Surface the guard rejection with an actionable message (nothing written).
     if (guardAttrs != null) {
@@ -693,6 +699,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return mergeFootnoteDefinitions(res.doc, definitions);
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if (!inserted) {
       const anchorDesc = opts.anchorNodeId
@@ -751,6 +759,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
     // the write for any count !== 1). Single shared guard (#159, #185 review).

@@ -170,6 +170,8 @@ export function TablesMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if (!inserted) {
       throw new Error(
@@ -212,6 +214,8 @@ export function TablesMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if (!deleted) {
       throw new Error(
@@ -264,6 +268,8 @@ export function TablesMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if (!updated) {
       throw new Error(

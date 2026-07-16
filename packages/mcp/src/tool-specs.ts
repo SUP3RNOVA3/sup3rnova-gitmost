@@ -314,7 +314,9 @@ export const SHARED_TOOL_SPECS = {
       'id, level, firstText}; tables add rows/cols/header; lists add item ' +
       'count) WITHOUT the full document body. Use it to locate sections/tables ' +
       'and grab block ids cheaply before fetching, patching or inserting ' +
-      'individual blocks.',
+      'individual blocks. Reflects your own just-made edit immediately ' +
+      '(read-after-write); a rare freshness:"stale-fallback" in the result ' +
+      'means re-read shortly for the settled version.',
     tier: 'core',
     catalogLine:
       "getOutline — compact outline of a page's top-level blocks with their ids.",
@@ -341,7 +343,9 @@ export const SHARED_TOOL_SPECS = {
       'Pass format:"json" for the raw lossless ProseMirror subtree (for precise ' +
       'attr/mark work). A node that cannot be a document top-level block ' +
       '(tableRow/tableCell/tableHeader via "#<index>") auto-falls back to JSON with ' +
-      'format:"json" in the response.',
+      'format:"json" in the response. Reflects your own just-made edit immediately ' +
+      '(read-after-write); a rare freshness:"stale-fallback" in the response means ' +
+      're-read shortly for the settled version.',
     tier: 'core',
     catalogLine:
       "getNode — fetch one block (markdown by default; json for the raw subtree).",
@@ -393,7 +397,10 @@ export const SHARED_TOOL_SPECS = {
       '(?=…)/(?<=…) and backreferences \\1 are NOT supported) and ' +
       'caseSensitive:true to match case. Ideal for systematic ' +
       'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
-      'invalid regex or an empty query returns a clear error to fix.',
+      'invalid regex or an empty query returns a clear error to fix. Reflects ' +
+      'your own just-made edit immediately (read-after-write); a rare ' +
+      'freshness:"stale-fallback" in the result means re-read shortly for the ' +
+      'settled version.',
     tier: 'core',
     catalogLine:
       'searchInPage — find every occurrence of a string/regex inside one page, with locations.',

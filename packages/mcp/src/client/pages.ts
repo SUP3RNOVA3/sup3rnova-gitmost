@@ -7,7 +7,6 @@ import axios, { AxiosInstance } from "axios";
 import { convertProseMirrorToMarkdown } from "../lib/markdown-converter.js";
 import {
   updatePageContentRealtime,
-  replacePageContent,
   markdownToProseMirror,
   markdownToProseMirrorCanonical,
   mutatePageContent,
@@ -261,6 +260,9 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       baseHash,
     );
 
+    // #654 RYOW: a successful guarded replace always changed the body (it applied or 409'd), so arm the read-your-own-write hint for this client's next structural read.
+    this.rememberWrite(pageUuid, { changed: true });
+
     // Body persisted successfully — now it is safe to set the title.
     if (title) {
       await this.client.post("/pages/update", { pageId, title });
@@ -452,7 +454,10 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
     const pageUuid = await this.resolvePageId(pageId);
-    const mutation = await replacePageContent(
+    // #654 RYOW: route through the replacePage seam (not the free replacePageContent)
+    // — the seam arms the read-your-own-write window itself on a real change, exactly
+    // like copyPageContent/updatePageJson, so no explicit rememberWrite is needed here.
+    const mutation = await this.replacePage(
       pageUuid,
       doc,
       collabToken,
@@ -634,6 +639,8 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       this.apiUrl,
       () => version.content,
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
     return {
       pageId: version.pageId,
       restoredFrom: historyId,
