@@ -479,7 +479,11 @@ export async function runViewImage(
     type?: string;
     node?: { attrs?: { src?: unknown } };
   };
-  if (res?.type !== 'image' && res?.type !== 'drawio') {
+  if (
+    res?.type !== 'image' &&
+    res?.type !== 'drawio' &&
+    res?.type !== 'excalidraw'
+  ) {
     throw new Error('node is not an image');
   }
   const src = res.node?.attrs?.src;
@@ -501,10 +505,18 @@ export async function runViewImage(
     }
     data = buffer;
     mediaType = mime;
-  } else if (mime === 'image/svg+xml' || res.type === 'drawio') {
-    // SVG (incl. .drawio.svg). A .drawio.svg's captions live in a browser-only
-    // `foreignObject`, so resvg-rasterizing the vector yields garbage (#629).
-    // PREFER a browser-embedded PNG raster when the SVG carries a valid one.
+  } else if (
+    mime === 'image/svg+xml' ||
+    res.type === 'drawio' ||
+    res.type === 'excalidraw'
+  ) {
+    // SVG (incl. .drawio.svg / .excalidraw.svg). A .drawio.svg's captions live in
+    // a browser-only `foreignObject`, so resvg-rasterizing the vector yields
+    // garbage (#629) — hence it PREFERS a browser-embedded PNG raster. An
+    // excalidraw SVG is itself VALID for resvg (real `<text>`), so #632 gives it
+    // a correct degrade path: prefer an embedded raster if present, ELSE just
+    // resvg the SVG. Excalidraw therefore NEVER takes drawio's flag-gated
+    // "no raster -> throw" branch below (that stays `res.type === 'drawio'`).
     const svgText = buffer.toString('utf8');
     const embedded = extractDrawioRaster(svgText);
     if (embedded && embedded.length <= VIEW_MAX_RASTER_BYTES) {

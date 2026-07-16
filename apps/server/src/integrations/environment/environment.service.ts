@@ -270,6 +270,20 @@ export class EnvironmentService {
     return enabled === 'true';
   }
 
+  /**
+   * #632 — mirrored into window.CONFIG so the Excalidraw editor only embeds a PNG
+   * raster into the saved .excalidraw.svg when the operator opts in (symmetric to
+   * isDrawioRasterEnabled). Off (default) => today's svg-only save (byte-
+   * identical), so the file-size cost is instantly reversible. Gates GENERATION
+   * only; consumption of an already-embedded raster is unconditional.
+   */
+  isExcalidrawRasterEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('EXCALIDRAW_RASTER_ENABLED', 'false')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
   getStripePublishableKey(): string {
     return this.configService.get<string>('STRIPE_PUBLISHABLE_KEY');
   }

@@ -146,6 +146,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Excalidraw diagrams no longer vanish from external publications either.**
+  The companion to the draw.io fix below: `habr-mcp` did not know the `excalidraw`
+  node type and silently dropped it. Symmetric to draw.io, the excalidraw editor
+  now embeds a PNG `data-raster` into the saved `.excalidraw.svg` on save (behind
+  the new `EXCALIDRAW_RASTER_ENABLED` env var, default off), and the MCP consumers
+  (`stashPage`, `viewImage`) accept the `excalidraw` node type. Unlike draw.io,
+  excalidraw's SVG is itself valid (real `<text>`), so it has a correct degrade
+  path: with no usable raster, `stashPage` rewrites the node to an `image` backed
+  by the mirrored SVG (rather than dropping it), and `viewImage` rasterizes the
+  SVG server-side — excalidraw never takes draw.io's "no raster → error" branch.
+
 - **draw.io diagrams reach external publications as a real raster instead of
   silently vanishing.** A draw.io diagram is a single `.drawio.svg` whose visible
   captions live in `<foreignObject>`, which only a browser renders — so any
