@@ -24,6 +24,8 @@ import {
   desktopSidebarAtom,
   mobileSidebarAtom,
   sidebarWidthAtom,
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_MAX_WIDTH,
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import SidebarToggle from "@/components/ui/sidebar-toggle-button.tsx";
 import { useTranslation } from "react-i18next";
@@ -80,12 +82,12 @@ export default function ShareShell({
       if (!isResizing || !sidebarRef.current) return;
       const newWidth =
         e.clientX - sidebarRef.current.getBoundingClientRect().left;
-      if (newWidth < 220) {
-        setSidebarWidth(220);
+      if (newWidth < SIDEBAR_MIN_WIDTH) {
+        setSidebarWidth(SIDEBAR_MIN_WIDTH);
         return;
       }
-      if (newWidth > 600) {
-        setSidebarWidth(600);
+      if (newWidth > SIDEBAR_MAX_WIDTH) {
+        setSidebarWidth(SIDEBAR_MAX_WIDTH);
         return;
       }
       setSidebarWidth(newWidth);

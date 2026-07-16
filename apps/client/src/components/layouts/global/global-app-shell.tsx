@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import SettingsSidebar from "@/components/settings/settings-sidebar.tsx";
 import { useAtom, useAtomValue } from "jotai";
 import { aiChatWindowOpenAtom } from "@/features/ai-chat/atoms/ai-chat-atom.ts";
+import { workspaceAtom } from "@/features/user/atoms/current-user-atom";
 import {
   APP_NAVBAR_ID,
   NAVBAR_COLLAPSE_BREAKPOINT,
@@ -12,6 +13,8 @@ import {
   desktopSidebarAtom,
   mobileSidebarAtom,
   sidebarWidthAtom,
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_MAX_WIDTH,
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { SpaceSidebar } from "@/features/space/components/sidebar/space-sidebar.tsx";
 import { AppHeader } from "@/components/layouts/global/app-header.tsx";
@@ -54,11 +57,24 @@ export default function GlobalAppShell({
   // Latch: once the AI chat window has been opened, keep it mounted so an
   // in-flight stream is never torn down. Before the first open the AI chat chunk
   // is never fetched.
+  //
+  // The `ai.chat` kill-switch must SUPPRESS mounting (gate BOTH the latch and the
+  // render). The latch is one-way, so gating the effect alone can never unmount:
+  // now that the open-state is persisted, a user who left the chat open reloads
+  // with `currentUser` hydrated from disk carrying a STALE `ai.chat: true`; the
+  // child-first passive effects arm the latch on that stale tick before
+  // UserProvider's `setCurrentUser(/me)` lands, so the render gate is what tears
+  // the window down when the fresh `ai.chat: false` arrives. Suppress only on a
+  // POSITIVE false — a transient null workspace (the sign-in setCurrentUser(RESET)
+  // window) must not tear down a live stream, and must not erase the persisted
+  // open flag (which a "write windowOpen=false" gate would).
+  const workspace = useAtomValue(workspaceAtom);
+  const aiChatAllowed = workspace?.settings?.ai?.chat !== false;
   const aiChatOpen = useAtomValue(aiChatWindowOpenAtom);
   const [aiChatEverOpened, setAiChatEverOpened] = useState(false);
   useEffect(() => {
-    if (aiChatOpen) setAiChatEverOpened(true);
-  }, [aiChatOpen]);
+    if (aiChatOpen && aiChatAllowed) setAiChatEverOpened(true);
+  }, [aiChatOpen, aiChatAllowed]);
 
   const startResizing = React.useCallback((mouseDownEvent) => {
     mouseDownEvent.preventDefault();
@@ -75,12 +91,12 @@ export default function GlobalAppShell({
         const newWidth =
           mouseMoveEvent.clientX -
           sidebarRef.current.getBoundingClientRect().left;
-        if (newWidth < 220) {
-          setSidebarWidth(220);
+        if (newWidth < SIDEBAR_MIN_WIDTH) {
+          setSidebarWidth(SIDEBAR_MIN_WIDTH);
           return;
         }
-        if (newWidth > 600) {
-          setSidebarWidth(600);
+        if (newWidth > SIDEBAR_MAX_WIDTH) {
+          setSidebarWidth(SIDEBAR_MAX_WIDTH);
           return;
         }
         setSidebarWidth(newWidth);
@@ -199,7 +215,7 @@ export default function GlobalAppShell({
         position: fixed and self-hides when closed, so its place in the tree is
         not critical. Kept mounted after the first open so a live stream is not
         aborted. */}
-    {aiChatEverOpened && (
+    {aiChatEverOpened && aiChatAllowed && (
       <Suspense fallback={null}>
         <AiChatWindow />
       </Suspense>
