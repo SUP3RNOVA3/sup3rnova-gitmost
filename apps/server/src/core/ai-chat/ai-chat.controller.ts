@@ -36,7 +36,9 @@ import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
 import { AiChatRunStepRepo } from '@docmost/db/repos/ai-chat/ai-chat-run-step.repo';
+import { AiChatPageBindingRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-binding.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { incAiChatBindSkipped } from '../../integrations/metrics/metrics.registry';
 import { UserThrottlerGuard } from '../../integrations/throttle/user-throttler.guard';
 import { AI_CHAT_THROTTLER } from '../../integrations/throttle/throttler-names';
 import { FileInterceptor } from '../../common/interceptors/file.interceptor';
@@ -50,6 +52,7 @@ import {
 import { AiChatRunService } from './ai-chat-run.service';
 import { AiTranscriptionService } from './ai-transcription.service';
 import {
+  BindPageDto,
   BoundChatDto,
   ChatIdDto,
   ExportChatDto,
@@ -137,6 +140,10 @@ export class AiChatController {
     // specs compile unchanged; when absent, hydration is skipped (old-era rows
     // already carry inline parts, so nothing to reconstruct).
     private readonly aiChatRunStepRepo?: AiChatRunStepRepo,
+    // #665: the mutable page->chat binding repo, behind bound-chat (read) and
+    // bind-page (write). OPTIONAL so existing positional controller specs compile
+    // unchanged; Nest always injects the real singleton in production.
+    private readonly aiChatPageBindingRepo?: AiChatPageBindingRepo,
   ) {}
 
   /**
@@ -177,17 +184,19 @@ export class AiChatController {
   }
 
   /**
-   * Resolve the chat bound to a document for the requesting user: the most-recent
-   * non-deleted chat created on that page (ai_chats.page_id). Returns
-   * { chatId: null } when the page has no owned chat (-> a fresh chat).
+   * Resolve the chat bound to a document for the requesting user (#665): the chat
+   * the `ai_chat_page_bindings` pointer holds for (user, page). Returns
+   * { chatId: null } when nothing is bound (-> a fresh empty chat). There is NO
+   * fallback to the retired #191 findLatestByPage heuristic — after "New chat" the
+   * binding row is gone, and a fallback would resurrect the unbound chat.
    *
    * `dto.pageId` carries EITHER a page slugId (10-char nanoid, sent by the client
    * off a slug URL) OR a page uuid, so it must be resolved to a real page uuid
-   * before it touches the uuid ai_chats.page_id column — passing a slugId straight
-   * through triggered a Postgres 22P02 "invalid input syntax for type uuid" 500
-   * (#312). PageRepo.findById accepts both forms. The workspace guard rejects an
-   * unknown or cross-workspace page (-> { chatId: null }) so a foreign id cannot
-   * probe another workspace's chats. Only the caller's OWN chats are then matched.
+   * before it touches the uuid page_id column — passing a slugId straight through
+   * triggered a Postgres 22P02 "invalid input syntax for type uuid" 500 (#312).
+   * PageRepo.findById accepts both forms. The workspace guard rejects an unknown or
+   * cross-workspace page (-> { chatId: null }) so a foreign id cannot probe another
+   * workspace's chats. The binding resolver then re-checks chat ownership itself.
    */
   @HttpCode(HttpStatus.OK)
   @Post('bound-chat')
@@ -200,12 +209,79 @@ export class AiChatController {
     if (!page || page.workspaceId !== workspace.id) {
       return { chatId: null }; // unknown or foreign-workspace page — no binding, no leak
     }
-    const chat = await this.aiChatRepo.findLatestByPage(
+    const chatId = await this.aiChatPageBindingRepo.findChatIdByPage(
       user.id,
       workspace.id,
       page.id, // the real uuid, never the incoming slugId
     );
-    return { chatId: chat?.id ?? null };
+    return { chatId };
+  }
+
+  /**
+   * Move (or clear) the page->chat binding for the requesting user (#665). Called
+   * on a CONSCIOUS open: the client's history select re-binds the page to the
+   * chosen chat; "New chat" clears it (`chatId: null`). The header button and the
+   * agent-badge deeplink deliberately do NOT call this.
+   *
+   * Binding is a convenience, not access control, so every "not applied" outcome is
+   * a fail-SOFT `200 { chatId: null }` with NO write — but each one emits a WARN +
+   * a bounded skip-counter, because otherwise a no-op is indistinguishable from a
+   * success in the HTTP histogram. `dto.pageId` accepts a slugId OR uuid (resolved
+   * before touching the uuid column, #312). A `chatId` that does not exist / is not
+   * the caller's / left the workspace / is soft-deleted is fail-CLOSED: never write
+   * a pointer to a chat the user does not own. The response body is a debug aid, NOT
+   * a postcondition — the client ignores it and never blocks the UI on this call.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('bind-page')
+  async bindPage(
+    @Body() dto: BindPageDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ chatId: string | null }> {
+    const page = await this.pageRepo.findById(dto.pageId); // accepts slugId OR uuid
+    if (!page || page.workspaceId !== workspace.id) {
+      // Unknown / foreign-workspace page: no write, existing binding untouched, no
+      // probe of another workspace (mirrors boundChat).
+      this.logger.warn(
+        `bind-page skipped: page unresolved (user ${user.id}, reason=page_unresolved)`,
+      );
+      incAiChatBindSkipped('page_unresolved');
+      return { chatId: null };
+    }
+
+    // Clear ("New chat").
+    if (dto.chatId === null || dto.chatId === undefined) {
+      await this.aiChatPageBindingRepo.clear(user.id, page.id);
+      return { chatId: null };
+    }
+
+    // Re-bind: the chat must exist, be the caller's, in this workspace, and live.
+    // findOwnershipById selects the ownership triple WITHOUT filtering so the three
+    // failure modes stay distinguishable (a plain findById would collapse them into
+    // one `undefined`, making the chat_deleted reason unobservable).
+    const owned = await this.aiChatRepo.findOwnershipById(dto.chatId);
+    if (
+      !owned ||
+      owned.creatorId !== user.id ||
+      owned.workspaceId !== workspace.id
+    ) {
+      this.logger.warn(
+        `bind-page skipped: chat ${dto.chatId} not owned by user ${user.id} (reason=chat_not_owned)`,
+      );
+      incAiChatBindSkipped('chat_not_owned');
+      return { chatId: null };
+    }
+    if (owned.deletedAt !== null) {
+      this.logger.warn(
+        `bind-page skipped: chat ${dto.chatId} is deleted (reason=chat_deleted)`,
+      );
+      incAiChatBindSkipped('chat_deleted');
+      return { chatId: null };
+    }
+
+    await this.aiChatPageBindingRepo.upsert(user.id, page.id, dto.chatId);
+    return { chatId: dto.chatId };
   }
 
   /** Fetch the messages of a chat (oldest first, paginated). */

@@ -729,6 +729,22 @@ export interface AiChatPageSnapshots {
   updatedAt: Generated<Timestamp>;
 }
 
+// The MUTABLE page->chat binding (#665): "for THIS user, on THIS page, this is
+// the chat that opens." Mirrors migration 20260716T130000-ai-chat-page-bindings.ts.
+// Distinct from AiChats.pageId (immutable provenance): this is the STATE the
+// header button reads and the history-select / "New chat" / first-message writers
+// mutate. One row per (userId, pageId) — UNIQUE(user_id, page_id); the writes
+// upsert / delete on that key. All three FKs are ON DELETE CASCADE. Absence of a
+// row == "nothing bound" == an empty chat opens. NB: no `workspace_id` column (it
+// is functionally determined by page_id/chat_id — see the migration).
+export interface AiChatPageBindings {
+  id: Generated<string>;
+  userId: string;
+  pageId: string;
+  chatId: string;
+  updatedAt: Generated<Timestamp>;
+}
+
 export interface UserSessions {
   id: Generated<string>;
   userId: string;
@@ -751,6 +767,7 @@ export interface DB {
   aiChatRuns: AiChatRuns;
   aiChatRunSteps: AiChatRunSteps;
   aiChatPageSnapshots: AiChatPageSnapshots;
+  aiChatPageBindings: AiChatPageBindings;
   apiKeys: ApiKeys;
   attachments: Attachments;
   audit: Audit;
