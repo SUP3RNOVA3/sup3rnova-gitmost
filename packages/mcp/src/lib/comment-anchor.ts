@@ -33,14 +33,14 @@
  */
 
 import { stripInlineMarkdown } from "./text-normalize.js";
+import {
+  DOUBLE_QUOTES,
+  SINGLE_QUOTES,
+  DASHES,
+  isLegacySpace,
+  foldInvisibles,
+} from "@docmost/prosemirror-markdown";
 import { docmostSchema } from "./docmost-schema.js";
-
-/** Typographic double-quote variants mapped to ASCII `"`. */
-const DOUBLE_QUOTES = "«»„“”‟〝〞＂";
-/** Typographic single-quote/apostrophe variants mapped to ASCII `'`. */
-const SINGLE_QUOTES = "‘’‚‛";
-/** Dash variants mapped to ASCII `-`. */
-const DASHES = "–—―−‐‑‒";
 
 /** Guard against pathological/cyclic documents in the depth-first walk. */
 const MAX_DEPTH = 200;
@@ -72,24 +72,6 @@ function makeCommentMark(commentId: string): any {
   return { type: "comment", attrs: { commentId, resolved: false } };
 }
 
-/** True for any character we collapse/replace with a single normal space. */
-function isWhitespaceChar(ch: string): boolean {
-  // Regular ASCII whitespace plus the special spaces called out in the spec:
-  // nbsp, narrow nbsp, en/em/thin/hair/figure spaces, etc. \s covers tab and
-  // newline; the explicit code points cover the non-breaking variants \s misses
-  // in some engines, so list them for determinism.
-  return (
-    /\s/.test(ch) ||
-    ch === " " || // no-break space
-    ch === " " || // figure space
-    ch === " " || // narrow no-break space
-    ch === " " || // thin space
-    ch === " " || // hair space
-    ch === " " || // en space
-    ch === " " // em space
-  );
-}
-
 /**
  * Normalize a string for matching and return both the normalized text and a
  * `map` where `map[i]` is the index into the ORIGINAL `s` of the i-th
@@ -99,6 +81,11 @@ function isWhitespaceChar(ch: string): boolean {
  * collapse any run of whitespace to a SINGLE space (whose map entry points at
  * the FIRST raw whitespace char of the run), and DO NOT lowercase (anchoring is
  * case-sensitive to match the exact document text).
+ *
+ * Whitespace class + glyph tables come from the shared fold canon (#658,
+ * `@docmost/prosemirror-markdown`) — `isLegacySpace` is byte-identical to the
+ * former local `isWhitespaceChar` (U+FEFF stays a SPACE here), so this rebuild
+ * is provably equivalent to the historic normalizer (golden test).
  */
 export function normalizeForMatch(s: string): { norm: string; map: number[] } {
   let norm = "";
@@ -106,10 +93,10 @@ export function normalizeForMatch(s: string): { norm: string; map: number[] } {
   let i = 0;
   while (i < s.length) {
     const ch = s[i];
-    if (isWhitespaceChar(ch)) {
+    if (isLegacySpace(ch)) {
       // Collapse the whole whitespace run to one space mapped to the run start.
       const runStart = i;
-      while (i < s.length && isWhitespaceChar(s[i])) i++;
+      while (i < s.length && isLegacySpace(s[i])) i++;
       norm += " ";
       map.push(runStart);
       continue;
@@ -124,6 +111,29 @@ export function normalizeForMatch(s: string): { norm: string; map: number[] } {
   }
   return { norm, map };
 }
+
+/**
+ * FOLD variant of {@link normalizeForMatch} for the createComment fold TIER
+ * (#658): fold invisible characters (delete SHY/ZWSP/ZWJ/WJ/BOM, collapse
+ * NBSP-family runs) AND typographic quotes/dashes, returning the same
+ * `{ norm, map }` shape so every anchoring call site can consume it identically.
+ * Built on the canonical `foldInvisibles` for the invisible-char + run-collapse
+ * map, then the same 1:1 quote/dash glyph mapping normalizeForMatch applies.
+ */
+export function foldForMatch(s: string): { norm: string; map: number[] } {
+  const { folded, map } = foldInvisibles(s);
+  let norm = "";
+  for (const ch of folded) {
+    if (DOUBLE_QUOTES.indexOf(ch) !== -1) norm += '"';
+    else if (SINGLE_QUOTES.indexOf(ch) !== -1) norm += "'";
+    else if (DASHES.indexOf(ch) !== -1) norm += "-";
+    else norm += ch;
+  }
+  return { norm, map };
+}
+
+/** A locator normalizer used by an anchoring tier: raw text -> {norm, map}. */
+export type MatchNormalizer = (s: string) => { norm: string; map: number[] };
 
 /** Descriptor of a matched range inside one block's `content` array. */
 export interface AnchorMatch {
@@ -150,10 +160,11 @@ interface RawLoc {
 export function findAnchorInBlock(
   blockContent: any[],
   selection: string,
+  normalizer: MatchNormalizer = normalizeForMatch,
 ): AnchorMatch | null {
   if (!Array.isArray(blockContent)) return null;
 
-  const normSelObj = normalizeForMatch(selection);
+  const normSelObj = normalizer(selection);
   // Trim leading/trailing spaces on the NORMALIZED selection only.
   const normSel = normSelObj.norm.trim();
   if (normSel.length === 0) return null;
@@ -181,7 +192,7 @@ export function findAnchorInBlock(
     }
 
     // Try to match within this run.
-    const { norm, map } = normalizeForMatch(rawRun);
+    const { norm, map } = normalizer(rawRun);
     const idx = norm.indexOf(normSel);
     if (idx !== -1) {
       const rawStart = map[idx];
@@ -231,10 +242,11 @@ function hasCommentMark(node: any): boolean {
 function findFreeAnchorInBlock(
   blockContent: any[],
   selection: string,
+  normalizer: MatchNormalizer = normalizeForMatch,
 ): AnchorMatch | null {
   if (!Array.isArray(blockContent)) return null;
 
-  const normSel = normalizeForMatch(selection).norm.trim();
+  const normSel = normalizer(selection).norm.trim();
   if (normSel.length === 0) return null;
 
   let i = 0;
@@ -261,7 +273,7 @@ function findFreeAnchorInBlock(
 
     // Walk every non-overlapping occurrence in this run; return the FIRST whose
     // matched child range is free of a pre-existing comment mark.
-    const { norm, map } = normalizeForMatch(rawRun);
+    const { norm, map } = normalizer(rawRun);
     let from = 0;
     for (;;) {
       const idx = norm.indexOf(normSel, from);
@@ -340,14 +352,17 @@ function reconstructRawText(blockContent: any[], match: AnchorMatch): string {
  * un-appliable (spurious 409).
  */
 export function getAnchoredText(doc: any, selection: string): string | null {
-  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  const { selection: effective, found, normalizer } = resolveAnchorSelection(
+    doc,
+    selection,
+  );
   if (!found) return null;
   const visit = (node: any, depth: number): string | null => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return null;
     if (!Array.isArray(node.content)) return null;
     // Own-content match only where a comment mark may live (see canMatchIn).
     const match = canMatchIn(node)
-      ? findAnchorInBlock(node.content, effective)
+      ? findAnchorInBlock(node.content, effective, normalizer)
       : null;
     if (match) return reconstructRawText(node.content, match);
     for (const child of node.content) {
@@ -375,13 +390,14 @@ function rawCanAnchorInDoc(
   doc: any,
   selection: string,
   includeMarkForbidding = false,
+  normalizer: MatchNormalizer = normalizeForMatch,
 ): boolean {
   const visit = (node: any, depth: number): boolean => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return false;
     if (!Array.isArray(node.content)) return false;
     if (
       (includeMarkForbidding || canMatchIn(node)) &&
-      findAnchorInBlock(node.content, selection)
+      findAnchorInBlock(node.content, selection, normalizer)
     )
       return true;
     for (const child of node.content) {
@@ -412,6 +428,15 @@ function rawCanAnchorInDoc(
  * the selection WOULD have matched inside such a block (e.g. a codeBlock) —
  * so callers can explain WHY anchoring is refused instead of claiming the text
  * is missing. `found` stays false either way.
+ *
+ * FOLD TIER (#658): the fallback lattice is two-axis — { verbatim, md-strip } ×
+ * { pass-1, fold } — tried in the fixed order pass-1/verbatim → pass-1/md-strip
+ * → fold/verbatim → fold/md-strip. pass-1 tiers run FIRST and byte-for-byte
+ * unchanged, so an existing anchor's first match never shifts; the fold tiers
+ * add anchors only where pass-1 found ZERO (a selection built from searchInPage
+ * output — which carries the document's invisibles — still anchors). The winning
+ * normalizer is returned so uniqueness counting runs in the SAME tier's space
+ * (no count-vs-anchor drift, #494).
  */
 export function resolveAnchorSelection(
   doc: any,
@@ -420,30 +445,64 @@ export function resolveAnchorSelection(
   selection: string;
   found: boolean;
   normalized: boolean;
+  /** The normalizer of the WINNING tier — count in the same space (#494). */
+  normalizer: MatchNormalizer;
+  /** True when the fold tier (not pass-1) won. */
+  foldPass?: boolean;
   /** The selection matches ONLY inside a mark-forbidding block (codeBlock). */
   inMarkForbiddingBlock?: boolean;
 } {
-  if (rawCanAnchorInDoc(doc, selection)) {
-    return { selection, found: true, normalized: false };
-  }
   const stripped = stripInlineMarkdown(selection);
-  if (stripped !== selection && rawCanAnchorInDoc(doc, stripped)) {
-    return { selection: stripped, found: true, normalized: true };
+  // Fixed-order tier lattice; first anchoring tier wins.
+  if (rawCanAnchorInDoc(doc, selection, false, normalizeForMatch)) {
+    return { selection, found: true, normalized: false, normalizer: normalizeForMatch };
+  }
+  if (
+    stripped !== selection &&
+    rawCanAnchorInDoc(doc, stripped, false, normalizeForMatch)
+  ) {
+    return { selection: stripped, found: true, normalized: true, normalizer: normalizeForMatch };
+  }
+  if (rawCanAnchorInDoc(doc, selection, false, foldForMatch)) {
+    return {
+      selection,
+      found: true,
+      normalized: false,
+      normalizer: foldForMatch,
+      foldPass: true,
+    };
+  }
+  if (
+    stripped !== selection &&
+    rawCanAnchorInDoc(doc, stripped, false, foldForMatch)
+  ) {
+    return {
+      selection: stripped,
+      found: true,
+      normalized: true,
+      normalizer: foldForMatch,
+      foldPass: true,
+    };
   }
   // Anchors nowhere in allowed content: flag when the miss is caused by the
-  // mark-forbidding guard (both selection forms are re-checked, guard off).
+  // mark-forbidding guard (all four tiers are re-checked, guard off).
   if (
-    rawCanAnchorInDoc(doc, selection, true) ||
-    (stripped !== selection && rawCanAnchorInDoc(doc, stripped, true))
+    rawCanAnchorInDoc(doc, selection, true, normalizeForMatch) ||
+    (stripped !== selection &&
+      rawCanAnchorInDoc(doc, stripped, true, normalizeForMatch)) ||
+    rawCanAnchorInDoc(doc, selection, true, foldForMatch) ||
+    (stripped !== selection &&
+      rawCanAnchorInDoc(doc, stripped, true, foldForMatch))
   ) {
     return {
       selection,
       found: false,
       normalized: false,
+      normalizer: normalizeForMatch,
       inMarkForbiddingBlock: true,
     };
   }
-  return { selection, found: false, normalized: false };
+  return { selection, found: false, normalized: false, normalizer: normalizeForMatch };
 }
 
 /**
@@ -532,8 +591,12 @@ function spliceCommentMark(
  * not use this. (Note: counts OCCURRENCES, not just matching blocks, so two
  * occurrences inside one block are correctly reported as 2.)
  */
-function rawCountAnchorMatches(doc: any, selection: string): number {
-  const normSel = normalizeForMatch(selection).norm.trim();
+function rawCountAnchorMatches(
+  doc: any,
+  selection: string,
+  normalizer: MatchNormalizer = normalizeForMatch,
+): number {
+  const normSel = normalizer(selection).norm.trim();
   if (normSel.length === 0) return 0;
 
   // Count non-overlapping occurrences of the normalized selection within a
@@ -557,7 +620,7 @@ function rawCountAnchorMatches(doc: any, selection: string): number {
         rawRun += typeof n.text === "string" ? n.text : "";
         j++;
       }
-      const norm = normalizeForMatch(rawRun).norm;
+      const norm = normalizer(rawRun).norm;
       // Count every non-overlapping occurrence in this run.
       let from = 0;
       for (;;) {
@@ -602,9 +665,12 @@ function rawCountAnchorMatches(doc: any, selection: string): number {
  * selection falls back to the stripped form's count).
  */
 export function countAnchorMatches(doc: any, selection: string): number {
-  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  const { selection: effective, found, normalizer } = resolveAnchorSelection(
+    doc,
+    selection,
+  );
   if (!found) return 0;
-  return rawCountAnchorMatches(doc, effective);
+  return rawCountAnchorMatches(doc, effective, normalizer);
 }
 
 /**
@@ -634,7 +700,10 @@ export function applyCommentMarkInDoc(
   selection: string,
   commentMark: any,
 ): boolean {
-  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  const { selection: effective, found, normalizer } = resolveAnchorSelection(
+    doc,
+    selection,
+  );
   if (!found) return false;
   const visit = (node: any, depth: number): boolean => {
     if (depth > MAX_DEPTH || !node || typeof node !== "object") return false;
@@ -643,7 +712,7 @@ export function applyCommentMarkInDoc(
     // the schema rejects it and y-prosemirror would delete the whole node on
     // the next materialization. Recursion into children stays unguarded.
     const match = canMatchIn(node)
-      ? findAnchorInBlock(node.content, effective)
+      ? findAnchorInBlock(node.content, effective, normalizer)
       : null;
     if (match) {
       spliceCommentMark(node.content, match, commentMark);
@@ -675,7 +744,10 @@ function graftFreeCommentMark(
   selection: string,
   commentMark: any,
 ): "grafted" | "collision" | "no-match" {
-  const { selection: effective, found } = resolveAnchorSelection(doc, selection);
+  const { selection: effective, found, normalizer } = resolveAnchorSelection(
+    doc,
+    selection,
+  );
   // `found` is true iff SOME raw (or stripped) occurrence exists; if we then fail
   // to place the mark it is because every occurrence is already taken (collision),
   // not because the text is gone (no-match).
@@ -687,7 +759,7 @@ function graftFreeCommentMark(
     // never place a mark inside a mark-forbidding block (#603), even if the
     // identical text also occurs in one earlier in document order.
     const match = canMatchIn(node)
-      ? findFreeAnchorInBlock(node.content, effective)
+      ? findFreeAnchorInBlock(node.content, effective, normalizer)
       : null;
     if (match) {
       spliceCommentMark(node.content, match, commentMark);

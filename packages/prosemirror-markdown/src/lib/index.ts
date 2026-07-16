@@ -108,6 +108,21 @@ export {
   stripWrappersAndLinks,
 } from "./text-normalize.js";
 
+// Fold canon (#658): the single source of truth for the invisible-character /
+// typography fold tables, shared by mcp editPageText, createComment anchoring
+// and footnote-normalize-merge (R3 — no more forked copies).
+export {
+  DOUBLE_QUOTES,
+  SINGLE_QUOTES,
+  DASHES,
+  isFoldDelete,
+  isFoldSpace,
+  isLegacySpace,
+  foldInvisibles,
+  foldTypography,
+  escapeInvisibles,
+} from "./text-normalize.js";
+
 // Inline-footnote authoring convention (#414: single copy, formerly the mcp
 // `footnote-authoring.ts` fork), shared with the importer's `assembleFootnotes`.
 export {

@@ -41,45 +41,19 @@
  * so no spurious mutations / git-sync churn).
  */
 
+import {
+  DOUBLE_QUOTES,
+  SINGLE_QUOTES,
+  DASHES,
+  isLegacySpace,
+} from "@docmost/prosemirror-markdown";
+
 const FOOTNOTE_DEFINITION_NAME = "footnoteDefinition";
 const FOOTNOTE_REFERENCE_NAME = "footnoteReference";
-
-/**
- * Typographic glyph maps. DUPLICATED from `comment-anchor.ts` (the source of
- * truth, `normalizeForMatch`) on purpose: those constants are private there and
- * bound to that module's anchor-matching golden tests, so extracting them would
- * risk changing anchor behaviour. Keeping a local copy makes this pass fully
- * self-contained. If the anchor maps grow, mirror the change here.
- */
-/** Typographic double-quote variants mapped to ASCII `"`. */
-const DOUBLE_QUOTES = "«»„“”‟〝〞＂";
-/** Typographic single-quote/apostrophe variants mapped to ASCII `'`. */
-const SINGLE_QUOTES = "‘’‚‛";
-/** Dash variants mapped to ASCII `-`. */
-const DASHES = "–—―−‐‑‒";
 
 function cloneJson<T>(v: T): T {
   if (typeof structuredClone === "function") return structuredClone(v);
   return JSON.parse(JSON.stringify(v)) as T;
-}
-
-/**
- * True for any character we collapse/replace with a single normal space.
- * Mirrors `comment-anchor.ts`'s `isWhitespaceChar`: ASCII whitespace (`\s`
- * covers tab/newline) plus the non-breaking / special spaces listed explicitly
- * for determinism across engines.
- */
-function isWhitespaceChar(ch: string): boolean {
-  return (
-    /\s/.test(ch) ||
-    ch === " " || // no-break space
-    ch === " " || // figure space
-    ch === " " || // narrow no-break space
-    ch === " " || // thin space
-    ch === " " || // hair space
-    ch === " " || // en space
-    ch === " " // em space
-  );
 }
 
 /**
@@ -93,8 +67,8 @@ function normalizeAndCollapse(s: string): string {
   let i = 0;
   while (i < s.length) {
     const ch = s[i];
-    if (isWhitespaceChar(ch)) {
-      while (i < s.length && isWhitespaceChar(s[i])) i++;
+    if (isLegacySpace(ch)) {
+      while (i < s.length && isLegacySpace(s[i])) i++;
       out += " ";
       continue;
     }
