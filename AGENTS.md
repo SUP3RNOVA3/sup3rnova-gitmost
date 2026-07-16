@@ -133,8 +133,9 @@ to design or think through a feature, or to draft an issue («спроектир
 «продумай фичу», «составь ишью», "design X", "write an issue for X") — invoke
 the `orchestrator-feature-designer` skill (Skill tool) BEFORE any other work.
 It is the default operating mode for design work in this repository: research
-→ design checklist (R1–R10) → forks resolved with the human → adversarial
-self-attack → filed PR-sized issues. Do not design features or write issues
+→ premise ledger agreed with the human BEFORE designing on it → design
+checklist (R1–R11) → forks resolved with the human → adversarial self-attack
+(premise lens included) → filed PR-sized issues. Do not design features or write issues
 ad-hoc while this skill is available. This does not apply to non-design work
 (bug fixes, reviews, retrospectives, refactors already specified by an issue).
 
