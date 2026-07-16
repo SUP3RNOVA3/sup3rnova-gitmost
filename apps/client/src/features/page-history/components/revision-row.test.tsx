@@ -55,13 +55,13 @@ describe("RevisionRow (#568 dense row)", () => {
       ...base,
       isAgent: true,
       agentName: "Corrector",
-      agentEmoji: "🛠",
+      agentEmoji: '{"name":"wrench"}',
       launcherName: "Bob",
       saved: false,
     });
-    // Square role glyph carries the emoji.
+    // Square role glyph renders the Lucide icon (never the raw stored JSON).
     const glyph = screen.getByTestId("revision-agent-glyph");
-    expect(glyph.textContent).toBe("🛠");
+    expect(glyph.textContent ?? "").not.toContain('{"name"');
     expect(screen.getByText("Corrector")).toBeDefined();
     // "· via Bob" provenance.
     expect(screen.getByText(/via/)).toBeDefined();

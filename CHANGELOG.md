@@ -157,6 +157,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by the mirrored SVG (rather than dropping it), and `viewImage` rasterizes the
   SVG server-side — excalidraw never takes draw.io's "no raster → error" branch.
 
+- **Page icons and AI-agent role glyphs are now Lucide icons, not native emoji.**
+  A page icon is picked from the Lucide set plus a preset color palette
+  (background + glyph); a role glyph is a Lucide icon over the role's existing
+  gradient avatar. Both are stored as a small `{"name":…,"color":…}` JSON string
+  in the existing `pages.icon` / `aiAgentRoles.emoji` columns (not renamed). A
+  defensive parser renders the context's default glyph for anything that is not a
+  valid icon reference, so a legacy emoji value — or any malformed value — never
+  shows raw JSON; a boot migration NULLs the old emoji values so they fall back to
+  the default. Callout and inline-text emoji are unchanged (out of scope).
+
 - **draw.io diagrams reach external publications as a real raster instead of
   silently vanishing.** A draw.io diagram is a single `.drawio.svg` whose visible
   captions live in `<foreignObject>`, which only a browser renders — so any

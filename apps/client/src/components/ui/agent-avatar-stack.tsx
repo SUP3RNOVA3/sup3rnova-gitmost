@@ -4,6 +4,8 @@ import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { useSetAtom } from "jotai";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
+import { LucideGlyph } from "@/components/ui/lucide/lucide-glyph.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 import { avatarStyle, avatarBackgroundCss } from "@/lib/avatar-palette";
 import {
   activeAiChatIdAtom,
@@ -16,6 +18,8 @@ import {
 // on the internal-vs-MCP provenance — it just renders whatever it is handed.
 export interface AgentInfo {
   name: string;
+  // The role glyph. Holds a serialized IconRef (a Lucide icon; see
+  // lib/icon-ref.ts), NOT a native emoji — the column keeps its `emoji` name.
   emoji?: string | null;
   avatarUrl?: string | null;
 }
@@ -33,7 +37,7 @@ const LAUNCHER_OVERHANG = 8;
 /**
  * The front avatar. Image-source priority (#300):
  *   1. agent.avatarUrl -> a real avatar image (external MCP agent account).
- *   2. agent.emoji     -> the role emoji on a per-agent gradient circle.
+ *   2. agent.emoji     -> the role's Lucide icon on a per-agent gradient circle.
  *   3. otherwise       -> the IconSparkles glyph on a per-agent gradient circle.
  */
 function AgentGlyph({ agent }: { agent: AgentInfo }) {
@@ -75,13 +79,14 @@ function AgentGlyph({ agent }: { agent: AgentInfo }) {
         lineHeight: 1,
       }}
     >
-      {agent.emoji ? (
-        <span style={{ fontSize: Math.round(GLYPH_SIZE * 0.5) }} aria-hidden>
-          {agent.emoji}
-        </span>
-      ) : (
-        <IconSparkles size={Math.round(GLYPH_SIZE * 0.55)} stroke={2} />
-      )}
+      <LucideGlyph
+        name={parseIconRef(agent.emoji)?.name}
+        size={Math.round(GLYPH_SIZE * 0.55)}
+        strokeWidth={2}
+        fallback={
+          <IconSparkles size={Math.round(GLYPH_SIZE * 0.55)} stroke={2} />
+        }
+      />
     </Box>
   );
 }

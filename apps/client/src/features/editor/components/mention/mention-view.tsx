@@ -1,6 +1,7 @@
 import { NodeViewProps, NodeViewWrapper } from "@tiptap/react";
 import { ActionIcon, Anchor, Text } from "@mantine/core";
 import { IconFileDescription } from "@tabler/icons-react";
+import { PageIcon } from "@/components/ui/page-icon.tsx";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { usePageMetaQuery } from "@/features/page/queries/page-query.ts";
 import { useSharePageQuery } from "@/features/share/queries/share-query.ts";
@@ -130,19 +131,11 @@ export function MentionContent({ attrs }: { attrs: MentionAttrs }) {
           underline="never"
           className={classes.pageMentionLink}
         >
-          {page?.icon ? (
-            <span style={{ marginRight: "4px" }}>{page.icon}</span>
-          ) : (
-            <ActionIcon
-              variant="transparent"
-              color="gray"
-              component="span"
-              size={18}
-              style={{ verticalAlign: "text-bottom" }}
-            >
-              <IconFileDescription size={18} />
-            </ActionIcon>
-          )}
+          <span
+            style={{ marginRight: "4px", verticalAlign: "text-bottom" }}
+          >
+            <PageIcon value={page?.icon} size={18} />
+          </span>
 
           <span className={classes.pageMentionText}>
             {page?.title || label}
