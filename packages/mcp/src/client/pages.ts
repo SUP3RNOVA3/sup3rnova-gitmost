@@ -266,6 +266,11 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       await this.client.post("/pages/update", { pageId, title });
     }
 
+    // Arm the read-your-own-write window (#654): this body write goes through the
+    // free updatePageContentRealtime path (not a class seam), so it must arm here
+    // — else a following structural read (getOutline/getNode/...) would miss it.
+    this.rememberWrite(pageUuid, mutation.verify);
+
     return {
       success: true,
       modified: true,
@@ -458,6 +463,9 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       collabToken,
       this.apiUrl,
     );
+    // Arm the read-your-own-write window (#654): this full-replace via the free
+    // function bypasses the replacePage class seam, so arm it explicitly here.
+    this.rememberWrite(pageUuid, mutation.verify);
     // Collect distinct comment ids that actually became comment marks in the doc.
     const collectCommentIds = (node: any, acc: Set<string>): Set<string> => {
       if (!node || typeof node !== "object") return acc;
@@ -634,6 +642,8 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       this.apiUrl,
       () => version.content,
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
     return {
       pageId: version.pageId,
       restoredFrom: historyId,

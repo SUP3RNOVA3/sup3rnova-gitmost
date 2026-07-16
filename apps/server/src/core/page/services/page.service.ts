@@ -525,6 +525,45 @@ export class PageService {
   }
 
   /**
+   * #654 §Server — the read-your-own-writes resolution for the structural read
+   * tools' opt-in `preferLive` hint. Consumes the SAME non-claiming, non-force-
+   * loading `readLiveIfLoaded` primitive (#647) but, unlike getLiveContentPair,
+   * returns NO hash and falls back to the raw `page.content` DB row (NOT a
+   * transient ydoc reconstruction) — a stale read is acceptable here (this feeds
+   * structural views, not a CAS base hash), so we keep the fallback cheap.
+   *
+   * Three outcomes (contract point 4 of the primitive), mapped to a metric-
+   * distinguishable `fallbackReason`:
+   *  - loaded            -> live content, `contentSource:'live'`.
+   *  - not loaded        -> `dbContent`, `contentSource:'db'`, `not_loaded`.
+   *  - owner unreachable -> `dbContent`, `contentSource:'db'`, `owner_unreachable`.
+   *
+   * ALWAYS fails open to the DB row — it never throws, so a hung/absent owner
+   * degrades to a (possibly stale) read within the primitive's short probe
+   * timeout instead of erroring or stalling the hot read path.
+   */
+  async resolvePreferLiveContent(
+    pageId: string,
+    dbContent: any,
+  ): Promise<{
+    content: any;
+    contentSource: 'live' | 'db';
+    fallbackReason?: 'not_loaded' | 'owner_unreachable';
+  }> {
+    const documentName = `page.${pageId}`;
+    const live = await this.collaborationGateway.readLiveIfLoaded(documentName);
+    if (live.loaded) {
+      return { content: live.content, contentSource: 'live' };
+    }
+    // Not loaded (no owner / not hydrated) vs owner present but the short probe
+    // timed out / errored — different metrics, same fail-open to the DB row.
+    const fallbackReason = (live as { unreachable?: boolean }).unreachable
+      ? 'owner_unreachable'
+      : 'not_loaded';
+    return { content: dbContent, contentSource: 'db', fallbackReason };
+  }
+
+  /**
    * #647 B1 — materialize a page's ProseMirror JSON the SAME way onLoadDocument
    * hydrates it, so a hash over the result matches what the collab process holds:
    * prefer the persisted ydoc bytes, else convert `page.content`, else an empty

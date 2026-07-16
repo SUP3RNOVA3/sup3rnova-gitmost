@@ -708,6 +708,8 @@ export function MediaMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
         return doc;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     return {
       success: true,
