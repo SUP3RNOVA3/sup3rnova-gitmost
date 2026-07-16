@@ -58,3 +58,31 @@ describe('CollaborationGateway.handleYjsEvent (no-Redis fallback)', () => {
     expect(result).not.toBeUndefined();
   });
 });
+
+/**
+ * #647 refinement B — readLiveIfLoaded on the COLLAB_DISABLE_REDIS path. With no
+ * RedisSyncExtension, the gateway must read via the local `readLiveContent`
+ * handler (non-force-loading) and return its verdict, not silently no-op.
+ */
+describe('CollaborationGateway.readLiveIfLoaded (no-Redis path)', () => {
+  it('delegates to the local readLiveContent handler and returns its result', async () => {
+    const collabHandler = new CollaborationHandler();
+    const loaded = { loaded: true, content: { type: 'doc' }, hash: 'h' };
+    const readLiveContent = jest.fn().mockResolvedValue(loaded);
+    jest
+      .spyOn(collabHandler, 'getHandlers')
+      .mockReturnValue({ readLiveContent } as any);
+
+    const gateway = new CollaborationGateway(
+      stubExtension,
+      stubExtension,
+      stubExtension,
+      makeEnv(),
+      collabHandler,
+    );
+
+    const res = await gateway.readLiveIfLoaded('page.uuid-1');
+    expect(readLiveContent).toHaveBeenCalledWith('page.uuid-1');
+    expect(res).toEqual(loaded);
+  });
+});

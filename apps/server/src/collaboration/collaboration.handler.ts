@@ -5,6 +5,7 @@ import {
   prosemirrorNodeToYElement,
   tiptapExtensions,
 } from './collaboration.util';
+import { pageContentHash } from './content-hash.util';
 import {
   removeYjsMarkByAttribute,
   replaceYjsMarkedText,
@@ -18,6 +19,21 @@ import { User } from '@docmost/db/types/entity.types';
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
 >;
+
+/**
+ * #647 refinement B — result of the `readLiveContent` probe (the owner-side half
+ * of the `readLiveIfLoaded` primitive #654 depends on).
+ *  - `loaded:true`  → the document IS in this instance's memory and `content`/
+ *    `hash` are the FULLY HYDRATED live doc (property 5). `hash` is coherent with
+ *    `content` (both derived from the same `fromYdoc`).
+ *  - `loaded:false` → the document is not loaded on this instance. The probe NEVER
+ *    force-loads it (property 2) and NEVER claims ownership (property 3).
+ * The `unreachable` case (owner exists but the probe timed out / errored) is
+ * produced by the BRIDGE layer, not this handler.
+ */
+export type ReadLiveContentResult =
+  | { loaded: true; content: any; hash: string }
+  | { loaded: false };
 
 @Injectable()
 export class CollaborationHandler {
@@ -180,6 +196,29 @@ export class CollaborationHandler {
             }
           },
         );
+      },
+      /**
+       * #647 refinement B — NON-CLAIMING, NON-FORCE-LOADING read of the live doc.
+       *
+       * The owner-side half of `readLiveIfLoaded` (#654's gating primitive). It
+       * reads ONLY what is already hydrated in this instance's memory:
+       *  - property 2 (no force-load): we consult `hocuspocus.documents` directly
+       *    and NEVER call `openDirectConnection` (which would load from the DB);
+       *  - property 3 (non-claiming): no lock is taken here — the bridge decides
+       *    routing with a plain GET, and this local read touches no lock key;
+       *  - property 5 (loaded ⇒ hydrated): a doc present in `documents` has already
+       *    run `onLoadDocument` (synchronous `Y.applyUpdate`), so `fromYdoc` yields
+       *    the fully hydrated live content, hashed coherently in the SAME pass.
+       */
+      readLiveContent: async (
+        documentName: string,
+      ): Promise<ReadLiveContentResult> => {
+        const doc = hocuspocus.documents.get(documentName);
+        if (!doc) {
+          return { loaded: false };
+        }
+        const content = TiptapTransformer.fromYdoc(doc, 'default');
+        return { loaded: true, content, hash: pageContentHash(content) };
       },
     };
   }

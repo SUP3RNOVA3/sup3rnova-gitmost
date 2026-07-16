@@ -42,6 +42,17 @@ export class PageInfoDto extends PageIdDto {
   @IsBoolean()
   includeContent: boolean;
 
+  // #647 §E / R2 — opt-in ONLY (set by getPage/getPageJson). When true, the
+  // response carries a `contentHash` computed COHERENTLY with the returned
+  // content (live when the doc is loaded, else a transient ydoc reconstruction),
+  // and the returned `content` is that same live-when-loaded materialization —
+  // the base hash for a guarded-replace and the cache key that gives getPage
+  // read-your-own-writes. Every OTHER reader omits it and keeps the cheap path
+  // (no hash, no live read).
+  @IsOptional()
+  @IsBoolean()
+  includeContentHash?: boolean;
+
   @IsOptional()
   @Transform(({ value }) => value?.toLowerCase())
   @IsIn(['json', 'markdown', 'html', 'text'])

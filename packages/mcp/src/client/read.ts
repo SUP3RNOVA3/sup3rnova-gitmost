@@ -468,7 +468,12 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       };
     }
 
-    const resultData = await this.getPageRaw(pageId);
+    // #647 §E/§F — request the coherent contentHash. When the collab doc is
+    // loaded, the server returns the LIVE content under it, so getPage reflects
+    // unflushed edits (read-your-own-writes) instead of the debounce-stale DB row.
+    const resultData = await this.getPageRaw(pageId, undefined, {
+      includeContentHash: true,
+    });
 
     // Agent read: hide resolved-comment anchors so the agent sees only active
     // discussions. Active anchors are kept. (The lossless exportPageMarkdown
@@ -477,25 +482,38 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     //
     // Content-addressed conversion cache (issue #479): the PM->Markdown walk is
     // the dominant cost of this hot read op. Key on the page's canonical UUID +
-    // updatedAt (both from THIS /pages/info response, so mutually consistent) +
-    // a hash of the conversion options. A hit returns the cached markdown and
-    // skips the walk; a miss converts and stores. The cached value is the
-    // conversion output BEFORE the {{SUBPAGES}} substitution below, which uses
+    // a VERSION token + a hash of the conversion options. A hit returns the cached
+    // markdown and skips the walk; a miss converts and stores. The cached value is
+    // the conversion output BEFORE the {{SUBPAGES}} substitution below, which uses
     // live subpage data and stays outside the cache — so the final result is
     // byte-identical to the uncached path.
+    //
+    // #647 refinement A — the version token is the server's `contentHash` when
+    // present, NOT `updatedAt`. On the live branch the server serves fresh content
+    // under a DEBOUNCE-STALE `updatedAt`, so keying by `updatedAt` would cache the
+    // fresh markdown under the old key and the NEXT read (updatedAt still unmoved)
+    // would hit that entry and serve stale markdown — getPage would not be RYOW.
+    // `contentHash` changes exactly when the content changes, so it is the correct
+    // cache-invalidation key. `updatedAt` remains the fallback for any caller/
+    // server that does not surface a hash (older server, unexpected shape).
     const convertOptions = { dropResolvedCommentAnchors: true };
     let content = "";
     if (resultData.content) {
-      // Only cache when we have a stable identity+version for the key. Both come
-      // from the same response; if either is missing (unexpected server shape),
-      // fall back to converting uncached rather than keying on a partial tuple.
-      const cacheable =
-        typeof resultData.id === "string" &&
-        typeof resultData.updatedAt === "string";
+      // Prefer the content-coherent hash; fall back to updatedAt.
+      const versionToken =
+        typeof resultData.contentHash === "string" && resultData.contentHash
+          ? resultData.contentHash
+          : typeof resultData.updatedAt === "string"
+            ? resultData.updatedAt
+            : null;
+      // Only cache when we have a stable identity+version for the key. If either
+      // is missing (unexpected server shape), fall back to converting uncached
+      // rather than keying on a partial tuple.
+      const cacheable = typeof resultData.id === "string" && versionToken != null;
       const cacheKey = cacheable
         ? GetPageConversionCache.key(
             resultData.id,
-            resultData.updatedAt,
+            versionToken as string,
             hashConvertOptions(convertOptions),
           )
         : null;

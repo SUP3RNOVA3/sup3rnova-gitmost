@@ -957,10 +957,20 @@ export abstract class DocmostClientContext {
    * rather than shipping a second one. Every other caller omits `format` and
    * gets the JSON content unchanged.
    */
-  async getPageRaw(pageId: string, format?: "text") {
+  async getPageRaw(
+    pageId: string,
+    format?: "text",
+    opts?: { includeContentHash?: boolean },
+  ) {
     await this.ensureAuthenticated();
     const body: Record<string, unknown> = { pageId };
     if (format) body.format = format;
+    // #647 §E/§F — opt-in ONLY (getPage requests it). When set, the server
+    // returns a `contentHash` computed coherently with the (live-when-loaded)
+    // `content`, which getPage uses to key its conversion cache so a read right
+    // after a write returns the fresh markdown (RYOW), not a stale cache entry
+    // addressed by a debounce-lagging updatedAt.
+    if (opts?.includeContentHash) body.includeContentHash = true;
     const response = await this.client.post("/pages/info", body);
     return response.data?.data ?? response.data;
   }
