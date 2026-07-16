@@ -30,6 +30,14 @@ export interface TextEditResult {
   replacements: number;
   /** True when the match required the markdown-stripped fallback locator. */
   normalized?: boolean;
+  /**
+   * Set when an edit applied via the literal-marker exception while ALSO being a
+   * formatting toggle (strip-sides equal): the `find` matched LITERAL markers
+   * present verbatim in the text, so it was allowed, but the caller may have
+   * intended to change real formatting and hit the wrong target. Observable and
+   * self-correcting; blocks nothing.
+   */
+  warning?: string;
 }
 
 export interface TextEditFailure {
@@ -179,6 +187,37 @@ function commonSuffixLen(a: string, b: string, cap: number): number {
 }
 
 /**
+ * True when `s` contains at least one BALANCED inline-markdown marker PAIR (or a
+ * link/image) — markup that editPageText would write as LITERAL visible text.
+ *
+ * Two roles:
+ *  - in a `replace`, it flags smuggled formatting markers (refuse), and
+ *  - in a `find` matched VERBATIM (not markdown-stripped), it proves the LITERAL
+ *    markers already exist in the document — the literal-exception that lets a
+ *    cleanup edit (`**bold**` -> `bold`) through.
+ *
+ * Detected: `**bold**`, `__bold__`, `~~strike~~`, `` `code` ``, and
+ * `[text](url)` / `![alt](src)` links/images. Single `*`/`_` runs are
+ * DELIBERATELY NOT detected: `my_var_name` (`_var_` is balanced), `2 * 3 * 4`,
+ * and a lone `*x*` italic wrapper would all false-positive; a lone italic added
+ * to a `replace` is still caught by the symmetric formattingOnly toggle. A
+ * dunder identifier (`__init__`) is an ACCEPTED false positive — refusing beats
+ * silent corruption, and the reason offers a patchNode-with-node-JSON hatch.
+ * A code-like `arr[i](x)` / `callbacks[0](evt)` string is the same ACCEPTED false
+ * positive against the link pattern: refused with the same content hatch.
+ */
+function containsLiteralMarkerPairs(s: string): boolean {
+  if (typeof s !== "string" || s.length === 0) return false;
+  return (
+    /\*\*[^*]+\*\*/.test(s) ||
+    /__[^_]+__/.test(s) ||
+    /~~[^~]+~~/.test(s) ||
+    /`[^`]+`/.test(s) ||
+    /!?\[[^\]]*\]\([^)]*\)/.test(s)
+  );
+}
+
+/**
  * Apply one edit to one block's flattened slot array.
  *
  * The caller passes only VALID (atom-free) match positions (see
@@ -283,32 +322,6 @@ export function applyTextEdits(
   for (const edit of edits) {
     if (!edit.find) throw new Error("edit.find must be a non-empty string");
 
-    // HARD-REFUSE formatting changes. editPageText edits PLAIN TEXT only and
-    // writes the replacement verbatim, so it cannot add/remove marks. We refuse
-    // only a pure formatting TOGGLE: find and replace differ ONLY by balanced
-    // markdown markers (e.g. find:"~~$69~~" / replace:"$69", or find:"M5Stack" /
-    // replace:"**M5Stack**" which would write literal `**`).
-    //
-    // The detector is the STRICT stripBalancedWrappers, NOT the lenient locator
-    // stripInlineMarkdown: the lenient one also trims whitespace/emoji and
-    // collapses lone `*`/`_` runs, which gives false positives on ordinary
-    // plain-text edits (trailing-space trim, snake_case, `2 * 3 * 4`, URLs with
-    // underscores) and wrongly refuses them. Comparing the strict strip of both
-    // sides symmetrically catches every real formatting toggle while leaving
-    // plain text alone; a typo fix wrapped in markdown still applies because its
-    // stripped find != stripped replace.
-    const formattingOnly =
-      edit.find !== edit.replace &&
-      stripBalancedWrappers(edit.find) === stripBalancedWrappers(edit.replace);
-    if (formattingOnly) {
-      failed.push({
-        find: edit.find,
-        reason:
-          "editPageText edits plain text only and cannot add or remove formatting marks (bold/italic/strike/code/link); it writes the replacement as LITERAL text. This edit looks like a formatting change (markdown markers in find/replace). To change marks, read the block with getPageJson and use patchNode (or updatePageJson) to set the node's marks array.",
-      });
-      continue;
-    }
-
     // HARD-REFUSE inline footnote tokens (#410). `^[...]` in a `replace` is
     // markdown that only becomes a real footnote when a whole markdown body is
     // written (createPage / update_page_content / importPageMarkdown). Written
@@ -392,6 +405,56 @@ export function applyTextEdits(
       failed.push({ find: edit.find, reason });
       continue;
     }
+
+    // ---- INTENT REFUSALS (AFTER localization) ----
+    // editPageText edits PLAIN TEXT only and writes `replace` verbatim, so it
+    // cannot add/remove marks and any markdown in `replace` becomes literal
+    // asterisks/backticks in the page. These refusals run AFTER localization so
+    // (a) a toggle whose `find` matched nothing already returned not-found (the
+    // honest answer — the text isn't there), and (b) we can tell whether the
+    // LITERAL markers are actually in the document.
+    //
+    // The LITERAL-EXCEPTION (shared by both checks below): bypass the refusal IFF
+    // `find` matched via a NON-stripping tier (verbatim, i.e. normalized===false)
+    // AND `find` itself contains literal marker-pairs. That strict conjunction
+    // proves the LITERAL markers — not merely the text — are present, so a
+    // cleanup edit (`**bold**` -> `bold`) applies as ordinary text. A bare
+    // exact-match exception would revive the original bug for single markers
+    // (`find:"жирный", replace:"*жирный*"` exact-matches, single `*` undetected).
+    const literalException =
+      normalized === false && containsLiteralMarkerPairs(edit.find);
+
+    // A pure formatting TOGGLE: find/replace differ ONLY by balanced markdown
+    // markers (strict stripBalancedWrappers, symmetric, to avoid the lenient
+    // locator's false positives on trailing-space/snake_case/`2 * 3 * 4`/URLs).
+    const formattingOnly =
+      edit.find !== edit.replace &&
+      stripBalancedWrappers(edit.find) === stripBalancedWrappers(edit.replace);
+    if (formattingOnly && !literalException) {
+      failed.push({
+        find: edit.find,
+        reason:
+          "editPageText edits plain text only and cannot add or remove formatting marks (bold/italic/strike/code/link); it writes the replacement as LITERAL text. This edit looks like a formatting change (markdown markers in find/replace). To change marks, read the block with getPageJson and use patchNode to set the node's marks array. If you meant literal markers as content — use patchNode with node JSON (text there is literal).",
+      });
+      continue;
+    }
+
+    // MARKERS-IN-REPLACE: `replace` smuggles literal marker-pairs (a MIXED edit
+    // — text change + markers — that the old formattingOnly toggle missed,
+    // silently writing literal `**`). Refuse unless the literal-exception holds.
+    // The reason branches by the tier that located `find` (a single text would
+    // lie on some paths).
+    if (containsLiteralMarkerPairs(edit.replace) && !literalException) {
+      const reason = normalized
+        ? // find located via markdown-strip: the markers are NOT in the document.
+          "find matched after stripping markdown — there are no literal markers in the document; remove the markers from replace (the unchanged part keeps its formatting); to change formatting use getNode(format:\"json\") + patchNode."
+        : // find matched verbatim but carries no marker-pairs (plain find +
+          // `[link](url)`/`__init__` in replace): the replace is written literally.
+          "replace is written literally; its markers become visible text. For formatting/links use patchNode; if the markers are content (`__init__`) use patchNode with node JSON (text there is literal).";
+      failed.push({ find: edit.find, reason });
+      continue;
+    }
+
     if (total > 1 && !edit.replaceAll) {
       failed.push({
         find: edit.find,
@@ -444,6 +507,14 @@ export function applyTextEdits(
     // Keep `find: edit.find` (the original) so the caller can correlate.
     const result: TextEditResult = { find: edit.find, replacements: spliced };
     if (normalized) result.normalized = true;
+    // WARN on a formatting-toggle that only applied because the literal-exception
+    // held: a markdown-docs page may hold BOTH a literal `**bold**` example and a
+    // real bold word, so an exact match on the example silently edits the wrong
+    // target instead of the guaranteed refusal. Observable + self-correcting.
+    if (formattingOnly && literalException) {
+      result.warning =
+        "edited LITERAL markers found verbatim in the text; to change real formatting use patchNode.";
+    }
     results.push(result);
   }
 
