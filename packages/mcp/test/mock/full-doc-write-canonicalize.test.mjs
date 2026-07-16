@@ -39,6 +39,12 @@ function makeClient(sourceDoc) {
       calls.replaced.push({ pageId, doc });
       return { doc, verify: { ok: true } };
     }
+    // #647 §G — updatePageJson now writes through the server-side guarded replace;
+    // capture the final doc here (symmetric to the old replacePage seam).
+    async guardedReplacePage(pageId, content, format, baseHash) {
+      calls.replaced.push({ pageId, doc: content, format, baseHash });
+      return { applied: true, newHash: "h-new" };
+    }
   }
   const client = new TestClient("http://127.0.0.1:1/api", "e@x.com", "pw");
   return { client, calls };
@@ -53,7 +59,7 @@ test("updatePageJson canonicalizes the persisted full doc (out-of-order -> refer
       list(def("a", "A"), def("b", "B")),
     ],
   };
-  await client.updatePageJson("p1", outOfOrder);
+  await client.updatePageJson("p1", outOfOrder, undefined, "base-hash");
   assert.equal(calls.replaced.length, 1);
   // Definitions reordered to reference order [b, a] before persisting.
   assert.deepEqual(defIds(calls.replaced[0].doc), ["b", "a"]);

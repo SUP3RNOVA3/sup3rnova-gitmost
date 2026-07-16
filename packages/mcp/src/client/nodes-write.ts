@@ -59,7 +59,7 @@ import { normalizeAndMergeFootnotes } from "../lib/footnote-normalize-merge.js";
 // carries the base's protected shared state, which would otherwise trip TS4094).
 // Derived from the class below; `implements INodesWriteMixin` fails to compile on drift.
 export interface INodesWriteMixin {
-  updatePageJson(pageId: string, doc?: any, title?: string): any;
+  updatePageJson(pageId: string, doc?: any, title?: string, baseHash?: string): any;
   editPageText(pageId: string, edits: TextEdit[]): any;
   patchNode(pageId: string, nodeId: string, input: { markdown?: string; node?: any }): any;
   insertNode(pageId: string, input: { markdown?: string; node?: any }, opts: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }): any;
@@ -105,7 +105,12 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
    *                        touched/resent (no collab write happens).
    *  - neither given    -> throws (nothing to update).
    */
-  async updatePageJson(pageId: string, doc?: any, title?: string) {
+  async updatePageJson(
+    pageId: string,
+    doc?: any,
+    title?: string,
+    baseHash?: string,
+  ) {
     await this.ensureAuthenticated();
 
     // Title-only / no-op handling: when no document is supplied, do NOT write
@@ -172,17 +177,25 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
     doc = normalizeAndMergeFootnotes(doc);
     doc = canonicalizeFootnotes(doc);
 
+    // #647 §G — a full body overwrite goes through the SERVER-side write-CAS
+    // (guarded replace), not the old client-collab seam. `baseHash` is MANDATORY
+    // when writing content: it is the opaque hash the agent got from the read
+    // (getPageJson/getPage). Refuse rather than silently accept-and-ignore it —
+    // an ignored baseHash would give a false sense of safety while still
+    // clobbering a concurrent edit (the exact bug this closes). A title-only
+    // update (doc omitted) needs no baseHash and never reaches here.
+    if (!baseHash) {
+      throw new Error(
+        "updatePageJson: baseHash is required when writing content. Read the " +
+          "page first with getPageJson (or getPage) to obtain baseHash, pass it " +
+          "here, and on a conflict re-read to get a fresh baseHash and retry.",
+      );
+    }
+
     // Write the BODY first, then the title (#159 split-brain): a failed body
-    // write (e.g. persist timeout) must not leave a new title over the old body.
-    const collabToken = await this.getCollabTokenWithReauth();
-    // Open the collab doc by the canonical UUID, never the slugId (#260).
-    const pageUuid = await this.resolvePageId(pageId);
-    const mutation = await this.replacePage(
-      pageUuid,
-      doc,
-      collabToken,
-      this.apiUrl,
-    );
+    // write (e.g. a 409 conflict) must not leave a new title over the old body.
+    // The guarded replace throws ConflictError on a baseHash mismatch (409).
+    const result = await this.guardedReplacePage(pageId, doc, "json", baseHash);
 
     // Body persisted successfully — now it is safe to set the title.
     if (title) {
@@ -194,7 +207,7 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
       modified: true,
       message: "Page content replaced from ProseMirror JSON.",
       pageId,
-      verify: mutation.verify,
+      newHash: result.newHash,
     };
   }
 

@@ -84,7 +84,7 @@ function __assertClientCallContract(client: DocmostClientLike): void {
   void client.exportPageMarkdown(s);
   // --- write (page) ---
   void client.createPage(s, s, s, s);
-  void client.updatePage(s, s, s);
+  void client.updatePage(s, s, s, s);
   void client.renamePage(s, s);
   void client.movePage(s, s, s);
   void client.deletePage(s);
@@ -100,7 +100,7 @@ function __assertClientCallContract(client: DocmostClientLike): void {
     },
   );
   void client.deleteNode(s, s);
-  void client.updatePageJson(s, node, s);
+  void client.updatePageJson(s, node, s, s);
   void client.tableInsertRow(s, s, cells, n);
   void client.tableDeleteRow(s, s, n);
   void client.tableUpdateCell(s, s, n, n, s);

@@ -453,7 +453,10 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     // renderer emits no such placeholder). Use it to diff a page you wrote as a
     // config/prose against what was stored.
     if (format === "text") {
-      const textData = await this.getPageRaw(pageId, "text");
+      // #647 §F — surface baseHash here too so a text read can also seed a write.
+      const textData = await this.getPageRaw(pageId, "text", {
+        includeContentHash: true,
+      });
       let subpages: any[] = [];
       try {
         subpages = await this.listSidebarPages(textData.spaceId, textData.id);
@@ -463,7 +466,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       const textContent =
         typeof textData.content === "string" ? textData.content : "";
       return {
-        data: filterPage(textData, textContent, subpages),
+        data: { ...filterPage(textData, textContent, subpages), baseHash: textData.contentHash },
         success: true,
       };
     }
@@ -563,14 +566,25 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     }
 
     return {
-      data: filterPage(resultData, content, subpages),
+      // #647 §F — surface the coherent contentHash as `baseHash` so the agent can
+      // read → hash → write (updatePageJson / updatePageMarkdown). The in-app
+      // projection in tool-specs must carry it through too (B3-crit, §14).
+      data: { ...filterPage(resultData, content, subpages), baseHash: resultData.contentHash },
       success: true,
     };
   }
 
   /** Page info + raw ProseMirror JSON content (lossless representation). */
   async getPageJson(pageId: string) {
-    const data = await this.getPageRaw(pageId);
+    // #647 §F — request the coherent contentHash and return it as `baseHash`.
+    // The agent passes this opaque hash straight back to updatePageJson /
+    // updatePageMarkdown; the server-side write-CAS applies the write only if the
+    // page still hashes to it (else 409 → re-read + retry). Because the flag is
+    // set, when the collab doc is loaded the server also returns the LIVE content
+    // here (read-your-own-writes) coherently with the hash.
+    const data = await this.getPageRaw(pageId, undefined, {
+      includeContentHash: true,
+    });
     return {
       id: data.id,
       slugId: data.slugId,
@@ -579,6 +593,9 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       spaceId: data.spaceId,
       updatedAt: data.updatedAt,
       content: data.content || { type: "doc", content: [] },
+      // Opaque write-CAS base hash (undefined only against an older server that
+      // does not surface it — updatePageJson then reports baseHash is required).
+      baseHash: data.contentHash,
     };
   }
 

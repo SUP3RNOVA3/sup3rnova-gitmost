@@ -35,6 +35,7 @@ import {
   mergeFootnoteDefinitions,
 } from "../lib/transforms.js";
 import { normalizeAndMergeFootnotes } from "../lib/footnote-normalize-merge.js";
+import { regraftResolvedComments } from "../lib/comment-anchor.js";
 import vm from "node:vm";
 
 // Public method surface of PagesMixin (issue #450) — a NAMED type so the factory
@@ -43,7 +44,7 @@ import vm from "node:vm";
 // Derived from the class below; `implements IPagesMixin` fails to compile on drift.
 export interface IPagesMixin {
   createPage(title: string, content: string, spaceId: string, parentPageId?: string): any;
-  updatePage(pageId: string, content: string, title?: string): any;
+  updatePage(pageId: string, content: string, title?: string, baseHash?: string): any;
   renamePage(pageId: string, title: string): any;
   movePage(pageId: string, parentPageId: string | null, position?: string): any;
   deletePage(pageId: string): any;
@@ -171,43 +172,94 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
    * NOTE: full re-import — block ids regenerate. For surgical changes
    * use editPageText / updatePageJson instead.
    */
-  async updatePage(pageId: string, content: string, title?: string) {
+  async updatePage(
+    pageId: string,
+    content: string,
+    title?: string,
+    baseHash?: string,
+  ) {
     await this.ensureAuthenticated();
+
+    // #647 §H — baseHash is MANDATORY (updatePageMarkdown always writes the
+    // body). It is the opaque hash the agent got from its read (getPage /
+    // getPageJson). Refuse when missing rather than silently accept-and-ignore.
+    if (!baseHash) {
+      throw new Error(
+        "updatePageMarkdown: baseHash is required. Read the page first with " +
+          "getPage (or getPageJson) to obtain baseHash, pass it here, and on a " +
+          "conflict re-read to get a fresh baseHash and retry.",
+      );
+    }
+
     // Open the collab doc by the canonical UUID, never the slugId (#260). The
     // REST /pages/update title write below keeps the agent-supplied id (the
     // server resolves a slugId there).
     const pageUuid = await this.resolvePageId(pageId);
 
-    // Write the BODY first, then the title (#159 split-brain). If the collab
-    // body write fails (e.g. a persist timeout), the title must be left
-    // UNTOUCHED so the page never ends up with a new title over its old body.
-    // A title write failing AFTER a successful body is rarer (REST is fast) and
-    // leaves correct content under a stale title — the lesser inconsistency.
-    let collabToken = "";
-    let mutation;
+    // Import the markdown to a ProseMirror doc. #502: the agent-authored body is
+    // plain prose/config, so the two layered markdown extensions are OFF (a
+    // `$…$` span stays literal, a schemeless `www.host`/email is not autolinked).
+    const importedJson = await markdownToProseMirrorCanonical(content, {
+      parseMath: false,
+      fuzzyLinkify: false,
+    });
+
+    // #493/#647 §H — an agent read HIDES resolved-comment anchors (#337), so the
+    // markdown it sends no longer carries them; a naive full rewrite would erase
+    // every resolved comment mark. Re-graft the resolved marks from the LIVE doc
+    // onto the freshly-imported body. Migrated off the collab-session transform:
+    // we fetch the coherent live content via /pages/info?includeContentHash (the
+    // live-when-loaded content, coherent with the server hash). Best-effort — a
+    // resolved span whose text the agent changed simply does not re-anchor and is
+    // surfaced (#555). We do NOT use this fetch's hash for the CAS: the CAS must
+    // check the AGENT's baseHash (did the page change since the AGENT read it);
+    // if it moved, the guarded replace 409s and the agent re-reads.
+    // Fail-closed (#647 review): the regraft below needs the LIVE doc to recover
+    // the resolved-comment anchors that the agent's read HID (#337). If this fetch
+    // fails — or returns no usable content — we cannot know whether the page
+    // carries resolved comments, so we must NOT fall through to the guarded write:
+    // when baseHash still matches, that write would land a body missing those
+    // anchors and silently drop them — the exact data-loss this epic prevents.
+    // Throw a retryable error instead; the caller should re-read (fresh baseHash)
+    // and retry. No write is attempted here, so the page is left untouched.
+    let liveContent: any;
     try {
-      collabToken = await this.getCollabTokenWithReauth();
-      mutation = await updatePageContentRealtime(
-        pageUuid,
-        content,
-        collabToken,
-        this.apiUrl,
+      const live = await this.getPageRaw(pageUuid, undefined, {
+        includeContentHash: true,
+      });
+      liveContent = live?.content;
+    } catch (e: any) {
+      throw new Error(
+        `updatePageMarkdown: failed to fetch live content required to preserve ` +
+          `resolved comment anchors (${e?.message ?? e}). No write was attempted; ` +
+          `re-read the page to get a fresh baseHash and retry.`,
       );
-    } catch (error: any) {
-      // Verbose diagnostics (incl. anything that could expose a token prefix)
-      // are gated behind DEBUG; the thrown Error below carries no token data.
-      if (process.env.DEBUG) {
-        console.error(
-          "Failed to update page content via realtime collaboration:",
-          error,
-        );
-        const tokenPreview = collabToken
-          ? collabToken.substring(0, 15) + "..."
-          : "null";
-        console.error(`Collab token preview: ${tokenPreview}`);
-      }
-      throw new Error(`Failed to update page content: ${error.message}`);
     }
+    if (!liveContent) {
+      throw new Error(
+        `updatePageMarkdown: live-content fetch returned no usable content, so ` +
+          `resolved comment anchors cannot be preserved. No write was attempted; ` +
+          `re-read the page to get a fresh baseHash and retry.`,
+      );
+    }
+    const finalDoc = regraftResolvedComments(liveContent, importedJson, (w) =>
+      console.error(
+        `[regraft] page ${pageId}: dropped resolved comment ${w.commentId} ` +
+          `(${w.code}) — anchor text ${JSON.stringify(
+            w.text.length > 80 ? `${w.text.slice(0, 80)}…` : w.text,
+          )} could not be re-grafted onto the rewritten body.`,
+      ),
+    );
+
+    // Write the BODY first, then the title (#159 split-brain). The guarded
+    // replace throws ConflictError on a baseHash mismatch (409); the title is
+    // left UNTOUCHED so the page never ends up with a new title over its old body.
+    const result = await this.guardedReplacePage(
+      pageUuid,
+      finalDoc,
+      "json",
+      baseHash,
+    );
 
     // Body persisted successfully — now it is safe to set the title.
     if (title) {
@@ -219,7 +271,7 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       modified: true,
       message: "Page updated successfully.",
       pageId: pageId,
-      verify: mutation.verify,
+      newHash: result.newHash,
       // Non-fatal footnote diagnostics (#166); omitted when there are none.
       ...footnoteWarningsField(content),
     };

@@ -145,10 +145,30 @@ function seed() {
 }
 
 test("updatePageMarkdown wiring: extensions OFF — `$…$` literal, www not linked, https links", async () => {
-  const { state, baseURL } = await spawnCollabStack(seed());
-  const client = new DocmostClient(baseURL, "e@x.com", "pw");
+  // #647 §H — updatePageMarkdown now imports the markdown client-side and writes
+  // through the server-side guarded replace (REST), so we capture the final doc at
+  // that seam instead of reading it back from a live collab stack. The importer
+  // options under test (parseMath:false, fuzzyLinkify:false) are unchanged by the
+  // migration; flipping either still flips these assertions.
+  const state = { lastDoc: null };
+  class TestClient extends DocmostClient {
+    async ensureAuthenticated() {}
+    async getPageRaw() {
+      return { id: PAGE, content: { type: "doc", content: [] } };
+    }
+    async guardedReplacePage(pageId, content) {
+      state.lastDoc = content;
+      return { applied: true, newHash: "h" };
+    }
+  }
+  const client = new TestClient("http://127.0.0.1:1/api", "e@x.com", "pw");
 
-  await client.updatePage(PAGE, "cfg $x=1$ and www.host.com and https://ex.com");
+  await client.updatePage(
+    PAGE,
+    "cfg $x=1$ and www.host.com and https://ex.com",
+    undefined,
+    "base-hash",
+  );
 
   assert.ok(state.lastDoc, "a document was persisted");
   assert.equal(findAll(state.lastDoc, "mathInline").length, 0, "no phantom math from an agent write");
