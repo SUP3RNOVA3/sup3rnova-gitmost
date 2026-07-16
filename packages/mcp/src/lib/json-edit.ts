@@ -206,6 +206,36 @@ function commonSuffixLen(a: string, b: string, cap: number): number {
  * A code-like `arr[i](x)` / `callbacks[0](evt)` string is the same ACCEPTED false
  * positive against the link pattern: refused with the same content hatch.
  */
+/**
+ * Linear-time detector for a markdown `[text](url)` / `![alt](src)` link/image,
+ * equivalent (as a boolean) to `/!?\[[^\]]*\]\([^)]*\)/`. Written as a single
+ * left-to-right pass instead of a regex because the regex is O(n^2) on a long
+ * run of unmatched `[` (each `[` restarts the `[^\]]*` scan) — an agent-supplied
+ * `replace` of `"[".repeat(100000)` would synchronously block the MCP server's
+ * event loop for seconds (#657 review). A four-phase state machine can't
+ * backtrack, so it is O(n) on every input.
+ */
+function hasMarkdownLinkPattern(s: string): boolean {
+  // phase 0: seeking '['; 1: seeking ']' (after '['); 2: expecting '(' right
+  // after ']'; 3: seeking ')'. Phase 1 accepts any char except ']' (mirrors
+  // `[^\]]*`, which allows a nested '['); phase 3 accepts any char except ')'.
+  let phase = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (phase === 0) {
+      if (c === "[") phase = 1;
+    } else if (phase === 1) {
+      if (c === "]") phase = 2;
+    } else if (phase === 2) {
+      if (c === "(") phase = 3;
+      else phase = c === "[" ? 1 : 0; // `]` not followed by `(` — restart
+    } else {
+      if (c === ")") return true;
+    }
+  }
+  return false;
+}
+
 function containsLiteralMarkerPairs(s: string): boolean {
   if (typeof s !== "string" || s.length === 0) return false;
   return (
@@ -213,7 +243,7 @@ function containsLiteralMarkerPairs(s: string): boolean {
     /__[^_]+__/.test(s) ||
     /~~[^~]+~~/.test(s) ||
     /`[^`]+`/.test(s) ||
-    /!?\[[^\]]*\]\([^)]*\)/.test(s)
+    hasMarkdownLinkPattern(s)
   );
 }
 

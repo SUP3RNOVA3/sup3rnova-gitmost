@@ -34,8 +34,54 @@ const WRAPPER_PATTERNS: RegExp[] = [
   /`([^`]+?)`/g, // `x`
 ];
 
-/** Links/images -> their visible text. `!?` covers both `[t](u)` and `![a](s)`. */
-const LINK_IMAGE_RE = /!?\[([^\]]*)\]\([^)]*\)/g;
+/**
+ * Links/images -> their visible text: `[text](url)` -> `text`, `![alt](src)` ->
+ * `alt`. A boolean/string equivalent of `/!?\[([^\]]*)\]\([^)]*\)/g` with `"$1"`,
+ * written as a single left-to-right pass. The regex is O(n^2) on a long run of
+ * unmatched `[` (each `[` restarts the `[^\]]*` scan and backtracks), so an
+ * agent-supplied `replace` of `"[".repeat(100000)` fed through
+ * `stripBalancedWrappers` would block the event loop for seconds. This scanner
+ * never re-scans: on a `[` that cannot complete a link it jumps `i` past the
+ * first `]` (no `[` before it can form a link either), and a missing `]`/`)`
+ * short-circuits the rest — so it is O(n) on every input.
+ */
+function stripLinks(s: string): string {
+  let out = "";
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const bracket =
+      s[i] === "!" && s[i + 1] === "[" ? i + 1 : s[i] === "[" ? i : -1;
+    if (bracket === -1) {
+      out += s[i];
+      i++;
+      continue;
+    }
+    const close = s.indexOf("]", bracket + 1);
+    if (close === -1) {
+      // No `]` anywhere after this `[` — no link can start here or later.
+      out += s.slice(i);
+      break;
+    }
+    if (s[close + 1] === "(") {
+      const rparen = s.indexOf(")", close + 2);
+      if (rparen === -1) {
+        // `](` with no closing `)` anywhere after — no link can complete.
+        out += s.slice(i);
+        break;
+      }
+      out += s.slice(bracket + 1, close); // the visible text ($1)
+      i = rparen + 1;
+      continue;
+    }
+    // `[...]` present but not followed by `(...)`: not a link. Emit up to and
+    // including this `]` — no `[` in this span can form a link (its first `]`
+    // is this one, which isn't followed by a matched `(...)`).
+    out += s.slice(i, close + 1);
+    i = close + 1;
+  }
+  return out;
+}
 
 /**
  * Apply the two balanced/link passes: first collapse links/images to their
@@ -44,8 +90,8 @@ const LINK_IMAGE_RE = /!?\[([^\]]*)\]\([^)]*\)/g;
  * exactly the transformed string.
  */
 export function stripWrappersAndLinks(s: string): string {
-  // 1. Links/images -> their visible text.
-  let out = s.replace(LINK_IMAGE_RE, "$1");
+  // 1. Links/images -> their visible text (linear, see stripLinks).
+  let out = stripLinks(s);
 
   // 2. Strip balanced wrappers, repeating until the string is stable so nested
   //    wrappers (`**_x_**`) and adjacent runs both collapse.

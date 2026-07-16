@@ -321,3 +321,31 @@ test("#657 a toggle whose find matched nothing returns not-found, not format adv
     "not-found, not the format toggle advice",
   );
 });
+
+// (657-h) The marker detector must be LINEAR: an agent-supplied replace of a long
+// unmatched-`[` run must not block the event loop (the old link regex was O(n^2),
+// ~28s on 200k). A real `[a](b)` link in replace is still refused; a huge bare
+// `[` run carries no real link so the edit applies (nothing to refuse).
+test("#657 the marker detector stays linear on a pathological `[` run", () => {
+  const input = doc(paragraph(textNode("keep this text here")));
+  const t0 = Date.now();
+  const { results, failed } = applyTextEdits(input, [
+    { find: "keep this text here", replace: "x " + "[".repeat(200000) },
+  ]);
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1000, `detector must be linear, took ${elapsed}ms`);
+  // A bare `[` run is not a link → no marker refusal → the edit applies.
+  assert.equal(failed.length, 0);
+  assert.equal(results.length, 1);
+});
+
+// (657-i) A real link in replace is still refused (parity with the old regex).
+test("#657 a real [text](url) link in replace is still refused", () => {
+  const input = doc(paragraph(textNode("see the docs")));
+  const { results, failed } = applyTextEdits(input, [
+    { find: "see the docs", replace: "see [the docs](https://x.com)" },
+  ]);
+  assert.equal(results.length, 0);
+  assert.equal(failed.length, 1);
+  assert.match(failed[0].reason, /literal|patchNode/i);
+});
