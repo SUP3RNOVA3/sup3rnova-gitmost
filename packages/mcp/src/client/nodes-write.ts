@@ -269,12 +269,21 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
     // Edits matched but produced no content change (identical document): report
     // a successful no-op — NOT a failure — and do not falsely claim a write.
     if (!wrote) {
+      // A fold-tier no-op means the edit only differed in invisible characters,
+      // which fold-matching treats as already-equal: point the caller at the
+      // self-correction path (#658).
+      const foldNoop = (results ?? []).some(
+        (r) => r.matchedVia === "fold" || r.matchedVia === "markdown+fold",
+      );
+      const message = foldNoop
+        ? "No changes written (edits produced identical content). The find matched the same text modulo invisible characters (e.g. soft hyphen / NBSP), so there was nothing to change. To edit invisible characters, copy the exact document text (e.g. from a searchInPage match) into find."
+        : "No changes written (edits produced identical content).";
       return {
         success: true,
         pageId,
         applied: results,
         failed,
-        message: "No changes written (edits produced identical content).",
+        message,
         verify: mutation.verify,
       };
     }

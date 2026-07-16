@@ -861,7 +861,9 @@ export const SHARED_TOOL_SPECS = {
       'Examples: edits:[{find:"teh",replace:"the"}]; edits:[{find:"Hello ' +
       'world",replace:"Hello there"}] (crosses a bold boundary). Exception: ' +
       'literal markers found verbatim in the document are allowed (e.g. ' +
-      'cleaning up a stray find:"**bold**", replace:"bold").',
+      'cleaning up a stray find:"**bold**", replace:"bold"). Matching is ' +
+      'tolerant of invisible characters (soft hyphen/NBSP/zero-width) and ' +
+      'markdown in find; on a miss, failed[] carries a precise self-diagnosis.',
     tier: 'core',
     catalogLine:
       "editPageText — surgical find/replace of plain text in a page, preserving ids/marks.",

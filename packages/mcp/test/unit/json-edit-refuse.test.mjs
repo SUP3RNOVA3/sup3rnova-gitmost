@@ -179,7 +179,7 @@ test("plain find/replace is not refused", () => {
     { find: "teh", replace: "the" },
   ]);
   assert.equal(failed.length, 0);
-  assert.deepEqual(results, [{ find: "teh", replacements: 1 }]);
+  assert.deepEqual(results, [{ find: "teh", replacements: 1, matchedVia: "exact" }]);
 });
 
 // ===========================================================================

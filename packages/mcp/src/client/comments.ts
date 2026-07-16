@@ -44,6 +44,7 @@ import {
   resolveAnchorSelection,
   selectionOnlyInMarkForbiddingBlock,
   normalizeForMatch,
+  foldForMatch,
 } from "../lib/comment-anchor.js";
 import { closestBlockHint } from "../lib/text-normalize.js";
 import {
@@ -245,15 +246,23 @@ export function CommentsMixin<TBase extends GConstructor<DocmostClientContext>>(
    * normalizeForMatch) so a selection whose parts are separated by a paragraph
    * break still matches. Callers only reach here after single-block anchoring
    * (incl. the markdown-strip fallback) has already failed.
+   *
+   * Checked in BOTH the pass-1 (normalizeForMatch) and fold (foldForMatch) tier
+   * spaces (#658): a selection that straddles a block boundary only once its
+   * invisible characters are folded is still diagnosed as multi-block, instead
+   * of degrading to a "closest block" hint in exactly the target case.
    */
   protected selectionSpansMultipleBlocks(
     blockTexts: string[],
     selection: string,
   ): boolean {
-    const normSel = normalizeForMatch(selection).norm.trim();
-    if (normSel.length === 0) return false;
-    const joined = normalizeForMatch(blockTexts.join("\n")).norm;
-    return joined.indexOf(normSel) !== -1;
+    for (const normalizer of [normalizeForMatch, foldForMatch]) {
+      const normSel = normalizer(selection).norm.trim();
+      if (normSel.length === 0) continue;
+      const joined = normalizer(blockTexts.join("\n")).norm;
+      if (joined.indexOf(normSel) !== -1) return true;
+    }
+    return false;
   }
 
   /**

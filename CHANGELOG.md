@@ -146,6 +146,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`editPageText` and comment-anchoring now match across invisible characters.**
+  The matcher gained a `fold` tier: after the existing exact and markdown-strip
+  passes miss, it retries with a fold pass that collapses soft-hyphens
+  (`U+00AD`), zero-width and BOM characters (`U+200B`–`U+200D`, `U+FEFF`,
+  `U+2060`), and the whole NBSP/figure/thin-space family into their visible
+  equivalents — so a `find` typed with ordinary spaces still locates text that
+  the editor stored with an NBSP, and vice versa. A `find`/`replace` that itself
+  removes or inserts invisibles (e.g. stripping a stray soft-hyphen) keeps going
+  through the exact tier, so those edits are unaffected. `replaceAll` merges the
+  exact and fold hits into one disjoint plan; every reported match now carries a
+  `matchedVia` field naming the tier that hit. When nothing matches, the tool
+  now returns a targeted self-diagnosis of *why* (invisible-char mismatch,
+  markdown-vs-plain, whitespace run) instead of a bare "not found". Comment
+  anchoring gained the same two-tier (verbatim + fold) lattice. The invisible-
+  folding, typography and dash/quote normalization tables are consolidated into
+  one canon in `@docmost/prosemirror-markdown`, shared by the matcher, comment
+  anchoring and footnote merging (previously duplicated across three files).
+
 - **Excalidraw diagrams no longer vanish from external publications either.**
   The companion to the draw.io fix below: `habr-mcp` did not know the `excalidraw`
   node type and silently dropped it. Symmetric to draw.io, the excalidraw editor

@@ -13,11 +13,23 @@
 import {
   stripInlineMarkdown,
   stripWrappersAndLinks,
+  foldInvisibles,
+  escapeInvisibles,
 } from "@docmost/prosemirror-markdown";
 
 // Re-export the canonical locator normalizer so mcp call sites keep importing it
 // from `./text-normalize.js` unchanged.
 export { stripInlineMarkdown };
+
+// Re-export the fold canon (#658) so mcp call sites import it from
+// `./text-normalize.js` alongside the other locator helpers.
+export {
+  foldInvisibles,
+  foldTypography,
+  escapeInvisibles,
+  isFoldDelete,
+  isFoldSpace,
+} from "@docmost/prosemirror-markdown";
 
 /**
  * STRICT formatting detector — distinct from the lenient locator normalization.
@@ -58,6 +70,7 @@ export function stripBalancedWrappers(s: string): string {
 export function closestBlockHint(
   blockTexts: string[],
   locator: string,
+  escape = false,
 ): string {
   if (typeof locator !== "string" || locator.length === 0) return "";
   const stripped = stripInlineMarkdown(locator);
@@ -72,7 +85,10 @@ export function closestBlockHint(
   // Truncate by code point (spread iterates by code point) so a surrogate pair
   // is never split; append the ellipsis only when the text was actually longer.
   const points = [...hitBlock];
-  const snippet =
+  const truncated =
     points.length > 120 ? points.slice(0, 120).join("") + "…" : hitBlock;
+  // When quoting a MISS diagnostic, make invisible characters visible so the
+  // agent sees WHY its (visually identical) find did not match (#658).
+  const snippet = escape ? escapeInvisibles(truncated) : truncated;
   return ` Closest block text: "${snippet}".`;
 }
