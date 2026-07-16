@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { Provider, createStore } from "jotai";
@@ -40,6 +40,14 @@ function renderStack(props: Props) {
 }
 
 describe("AgentAvatarStack", () => {
+  // aiChatWindowOpenAtom now persists to localStorage (getOnInit), and its onMount
+  // re-reads storage — so a setWindowOpen(true) from one test (the deep-link case)
+  // would leak into the next, since a fresh createStore does not isolate the shared
+  // localStorage. Clear it between tests (#662).
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   it("internal chat WITH role: Lucide glyph + human launcher badge in front", () => {
     const { container } = renderStack({
       agent: { name: "Researcher", emoji: '{"name":"microscope"}', avatarUrl: null },

@@ -28,6 +28,7 @@ import { parseIconRef } from "@/lib/icon-ref.ts";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
+  aiChatWindowMinimizedAtom,
   aiChatWindowGeomAtom,
   aiChatWindowDockedAtom,
   aiChatDraftAtom,
@@ -122,27 +123,36 @@ function computeInitialGeom() {
   return { left, top, width, height };
 }
 
-// Clamp a geometry so the window stays within the current viewport.
+// Clamp a geometry so the window stays within the current viewport — BOTH
+// position and SIZE. Clamping size (mirroring computeInitialGeom's fit) is
+// essential now that a persisted geometry is honoured on first open (getOnInit):
+// the restore path is the main path, so a size saved on a large screen and
+// restored on a small one would otherwise draw the composer and resize handle
+// below a `position: fixed` viewport edge, with no way to shrink it back.
 function clampGeom(g: {
   left: number;
   top: number;
   width: number;
   height: number;
 }) {
-  const effWidth = Math.max(g.width, MIN_WIDTH);
-  const effHeight = Math.max(g.height, MIN_HEIGHT);
-  const maxLeft = Math.max(
-    EDGE_MARGIN,
-    window.innerWidth - effWidth - EDGE_MARGIN,
+  const width = Math.max(
+    MIN_WIDTH,
+    Math.min(g.width, window.innerWidth - 2 * EDGE_MARGIN),
   );
+  const height = Math.max(
+    MIN_HEIGHT,
+    Math.min(g.height, window.innerHeight - 2 * EDGE_MARGIN),
+  );
+  const maxLeft = Math.max(EDGE_MARGIN, window.innerWidth - width - EDGE_MARGIN);
   const maxTop = Math.max(
     EDGE_MARGIN,
-    window.innerHeight - effHeight - EDGE_MARGIN,
+    window.innerHeight - height - EDGE_MARGIN,
   );
   return {
-    ...g,
     left: Math.min(Math.max(EDGE_MARGIN, g.left), maxLeft),
     top: Math.min(Math.max(EDGE_MARGIN, g.top), maxTop),
+    width,
+    height,
   };
 }
 
@@ -188,7 +198,10 @@ export default function AiChatWindow() {
 
   // History section starts collapsed (matches the former panel's behavior).
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [minimized, setMinimized] = useState(false);
+  // Persisted (via the shared chrome key) so a restored-collapsed window stays
+  // collapsed across reload. Reset to expanded on CLOSE, not on open (see the
+  // layout effect below), so restoring a collapsed window survives.
+  const [minimized, setMinimized] = useAtom(aiChatWindowMinimizedAtom);
   // Mirror of `minimized` for handlers wrapped in useCallback([]) (startDrag),
   // which would otherwise close over a stale value. Kept in sync below.
   const minimizedRef = useRef(minimized);
@@ -486,20 +499,39 @@ export default function AiChatWindow() {
     [activeChatId, messageRows],
   );
 
-  // On (re)open, settle the geometry before paint (useLayoutEffect → no
-  // first-frame jump): compute an initial top-right placement the first time,
-  // and re-clamp an existing geometry to the current viewport on later opens
-  // (so a stale placement is not left partly off-screen after a viewport
-  // shrink). setGeom here does not loop — windowOpen is unchanged by it.
+  // Two operators with OPPOSITE lifecycles, so they cannot share a guard:
+  //
+  // - On CLOSE: reset the collapsed state. Doing it here (not on open) is what
+  //   lets a RESTORED-collapsed window stay collapsed across reload — the design
+  //   goal — while still expanding a window that was collapsed→closed→reopened
+  //   within the same session (its close already reset the flag). It also makes
+  //   `{open:false, minimized:true}` unrepresentable. A guard on "previous
+  //   windowOpen" can't work: the latch mounts the window only AFTER windowOpen
+  //   is already true, so its first render can't tell restore from a fresh click.
+  //
+  // - On OPEN: settle the geometry before paint (useLayoutEffect → no first-frame
+  //   jump). With getOnInit the restored geom is already in the atom on this
+  //   first render, so `prev` is non-null and we take the clampGeom branch — this
+  //   is the fix for the old clobber where computeInitialGeom overwrote the saved
+  //   geometry. First placement (prev null) still computes the top-right default.
   useLayoutEffect(() => {
-    if (!windowOpen) return;
+    if (!windowOpen) {
+      setMinimized(false);
+      return;
+    }
     setGeom((prev) => (prev ? clampGeom(prev) : computeInitialGeom()));
-    // Always show the window expanded on (re)open: a collapsed state from a
-    // previous open session must not stick. Runs before paint so the first
-    // frame is already expanded. The composer's autofocus is a focus INSIDE the
-    // window (not an outside mousedown), so it cannot self-collapse the window.
-    setMinimized(false);
   }, [windowOpen]);
+
+  // Docking clears the collapsed flag. Done as an effect on `docked` (not in the
+  // three dock-write call sites) and keyed on the RAW `docked` — not `useDock`:
+  // a docked window whose navbar is collapsed has `useDock === false`, and gating
+  // on useDock would skip exactly that fallback-floating case, leaving
+  // `docked:true + minimized:true` durable (the collapsed view is hidden while
+  // docked and the Minimize button is hidden, so the flag would be stuck and
+  // invisible, then the next Undock would collapse the window to a bare header).
+  useEffect(() => {
+    if (docked) setMinimized(false);
+  }, [docked]);
 
   // While docked, keep the window pinned to the navbar's LIVE rect. useLayoutEffect
   // (not useEffect) so dockRect is measured/committed before the browser paints,

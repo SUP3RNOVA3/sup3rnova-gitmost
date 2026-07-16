@@ -637,7 +637,20 @@ export default function PageEditor({
     };
   }, []);
 
+  // Close the right panel (and clear transient comment UI) when NAVIGATING to a
+  // different page — but NOT on the initial mount, or a reload would immediately
+  // clobber the now-persisted aside state (asideStateAtom) that was restored from
+  // localStorage, defeating "open panel survives reload". Skip the first run;
+  // only real pageId transitions reset. activeCommentId/showCommentPopup start
+  // null/false on a fresh mount anyway, so skipping the mount run drops nothing.
+  const asideResetPageIdRef = useRef<string | null>(null);
   useEffect(() => {
+    if (asideResetPageIdRef.current === null) {
+      asideResetPageIdRef.current = pageId;
+      return;
+    }
+    if (asideResetPageIdRef.current === pageId) return;
+    asideResetPageIdRef.current = pageId;
     setActiveCommentId(null);
     setShowCommentPopup(false);
     setAsideState({ tab: "", isAsideOpen: false });
