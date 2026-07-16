@@ -385,8 +385,10 @@ const YDOC_MIGRATION_FLAG = "pageYdoc.legacyPurged.v1";
  * databases whose name does NOT match the new `page.<scopeKey>.<pageId>` shape
  * (see `isLegacyYdocName`), so the current user's freshly-namespaced databases
  * are never touched. Where enumeration is unavailable (Firefox) it simply marks
- * itself done — the prefix purge in `purgePageYdocDatabases()` still sweeps any
- * legacy database on the next logout/sign-in.
+ * itself done: `purgePageYdocDatabases()` there only walks the localStorage name
+ * registry, which never held the legacy un-namespaced names, so a legacy database
+ * on Firefox is not physically deleted by anything. That is orphan data-at-rest,
+ * not an active leak — the namespacing prevents any new build from opening it.
  */
 export function migratePageYdocDatabasesOnce(): void {
   if (typeof indexedDB === "undefined") return;
@@ -415,8 +417,9 @@ export function migratePageYdocDatabasesOnce(): void {
 
   if (typeof indexedDB.databases !== "function") {
     // Cannot enumerate the legacy names (they predate the registry), so there is
-    // nothing to do here on Firefox. Mark done; the logout/sign-in prefix purge
-    // sweeps any legacy database instead.
+    // nothing to do here on Firefox — and the registry-only purge cannot reach
+    // them either, so a legacy database persists as orphan data-at-rest. The
+    // namespacing still prevents any new build from opening it. Mark done.
     markDone();
     return;
   }
