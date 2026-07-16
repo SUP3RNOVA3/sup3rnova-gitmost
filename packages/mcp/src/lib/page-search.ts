@@ -33,7 +33,7 @@
 
 import RE2 from "re2";
 
-import { blockPlainText } from "@docmost/prosemirror-markdown";
+import { blockPlainText, foldInvisibles } from "@docmost/prosemirror-markdown";
 
 /** An RE2 regex instance (RE2 extends `RegExp`, so it is usable as one). */
 type Re2Regex = InstanceType<typeof RE2>;
@@ -96,6 +96,16 @@ export interface SearchMatch {
   match: string;
   /** ~40 chars of context immediately after the match (from THIS container). */
   after: string;
+  /**
+   * LITERAL mode only (#659): present and `true` IFF the invisible-fold actually
+   * changed the matched DOCUMENT fragment — i.e. `match` (the original substring)
+   * contains removed/collapsed invisibles (soft hyphen, NBSP, zero-width chars,
+   * a whitespace run) so it differs from its folded form. Independent of case:
+   * a hit that differs from the query only by letter case does NOT get `folded`.
+   * Omitted on plain matches (byte-identical to pre-#659 output) and in regex
+   * mode (which never folds).
+   */
+  folded?: boolean;
 }
 
 /** The search result. `truncated` is true when `total > matches.length`. */
@@ -126,19 +136,36 @@ function resolveLimit(limit: number | undefined): number {
 }
 
 /**
- * Yield the [start, length] of every occurrence of the engine in `text`, in
- * order. A literal engine uses indexOf (case-folded when requested); a regex
- * engine uses a global RE2 regex (RE2 extends `RegExp`, so `.exec` advances
- * `lastIndex` exactly like the native engine). Zero-length regex matches (e.g.
- * `\b`, `a*`) are SKIPPED and lastIndex is advanced, so a pattern that can match
- * the empty string cannot flood the results or spin forever.
+ * Yield `[start, length, folded]` for every occurrence of the engine in `text`,
+ * in order — offsets index the ORIGINAL `text` and `folded` is true only when
+ * the invisible-fold changed the matched fragment (literal mode only).
+ *
+ * A regex engine uses a global RE2 regex (RE2 extends `RegExp`, so `.exec`
+ * advances `lastIndex` exactly like the native engine); it does NOT fold and
+ * never sets `folded`. Zero-length regex matches (e.g. `\b`, `a*`) are SKIPPED
+ * and lastIndex is advanced, so a pattern that can match the empty string cannot
+ * flood the results or spin forever.
+ *
+ * LITERAL engine (#659): folds invisibles on BOTH sides so a needle matches
+ * across soft hyphens, NBSP, zero-width chars and collapsed whitespace runs —
+ * exactly like editPageText's fold tier (json-edit.ts). It folds `text` into
+ * `{ folded, map }` (via the shared `foldInvisibles` canon), searches the FOLDED
+ * (and, when case-insensitive, case-folded) space with indexOf using the caller-
+ * folded `foldQuery`, then maps each folded hit at [fi, fi+flen) back to the
+ * ORIGINAL range [map[fi], map[fi+flen)) — the SAME folded->original offset
+ * mapping comment-anchor's findAnchorInBlock uses (end-boundary clamps to
+ * `text.length` when the match reaches the string end). Offsets are into the
+ * ORIGINAL text so the reported match/context keep the document's real casing
+ * and invisible characters (needed to build a unique createComment selection).
+ * `folded` is true iff the original matched fragment differs from its own fold
+ * (it held removed/collapsed invisibles) — independent of case.
  */
 function* eachMatch(
   text: string,
-  query: string,
+  foldQuery: string,
   re: Re2Regex | null,
   caseSensitive: boolean,
-): Generator<[number, number]> {
+): Generator<[number, number, boolean]> {
   if (re) {
     re.lastIndex = 0;
     let m: RegExpExecArray | null;
@@ -149,23 +176,36 @@ function* eachMatch(
         re.lastIndex = m.index + 1;
         continue;
       }
-      yield [m.index, len];
+      yield [m.index, len, false];
     }
     return;
   }
 
-  // Literal engine. For case-insensitive search, fold BOTH sides only to locate
-  // the indices; the reported match/context are always sliced from the original
-  // text so the caller gets the real casing (needed to build a unique selection).
-  const haystack = caseSensitive ? text : text.toLowerCase();
-  const needle = caseSensitive ? query : query.toLowerCase();
-  const len = needle.length;
+  // Literal engine with invisible-fold. Fold the haystack once; `foldQuery` is
+  // already folded by the caller. For case-insensitive search, case-fold BOTH
+  // folded strings only to LOCATE the indices; the reported match/context are
+  // sliced from the ORIGINAL text via the fold map so the caller gets the real
+  // casing AND the original invisible characters.
+  const { folded: hayFolded, map } = foldInvisibles(text);
+  const haystack = caseSensitive ? hayFolded : hayFolded.toLowerCase();
+  const needle = caseSensitive ? foldQuery : foldQuery.toLowerCase();
+  const flen = needle.length;
   let from = 0;
   for (;;) {
-    const idx = haystack.indexOf(needle, from);
-    if (idx === -1) return;
-    yield [idx, len];
-    from = idx + len;
+    const fi = haystack.indexOf(needle, from);
+    if (fi === -1) return;
+    // Map the folded range [fi, fi+flen) back to the original range [oi, oj).
+    const oi = map[fi];
+    const oj = fi + flen < map.length ? map[fi + flen] : text.length;
+    // The fold changed the matched DOCUMENT fragment iff the original substring
+    // differs from its own fold (removed/collapsed invisibles inside it). This
+    // is independent of case — foldInvisibles never touches letter case.
+    const frag = text.slice(oi, oj);
+    const folded = foldInvisibles(frag).folded !== frag;
+    yield [oi, oj - oi, folded];
+    // Advance in FOLDED space so occurrences are non-overlapping (no exact-vs-
+    // fold double counting — a single folded pass finds plain matches too).
+    from = fi + flen;
   }
 }
 
@@ -199,6 +239,24 @@ export function searchInDoc(
 
   const caseSensitive = opts.caseSensitive === true;
   const limit = resolveLimit(opts.limit);
+
+  // LITERAL mode (#659): fold invisibles on the query once, up front, so it can
+  // match through soft hyphens / NBSP / zero-width chars / collapsed whitespace
+  // runs — consistent with editPageText (#658). Regex mode never folds (folding
+  // would break RE2 offsets, char classes and group semantics), so foldQuery is
+  // unused there.
+  let foldQuery = "";
+  if (opts.regex !== true) {
+    foldQuery = foldInvisibles(query).folded;
+    // Empty fold-guard: a query made only of invisible/whitespace chars folds to
+    // empty (or a lone space) and would otherwise match every space; reject it
+    // via the SAME error as a raw-empty query so the agent gets one clear signal.
+    if (foldQuery.length === 0 || foldQuery === " ") {
+      throw new Error(
+        "searchInPage: query is empty — pass the text (or regex) to look for.",
+      );
+    }
+  }
 
   // Compile the pattern up front with RE2 (linear-time, ReDoS-safe) so a bad
   // pattern is a clean tool error rather than a failure deep in the traversal —
@@ -246,17 +304,27 @@ export function searchInDoc(
           ? node.attrs.id
           : topRef;
 
-      for (const [idx, len] of eachMatch(text, query, re, caseSensitive)) {
+      for (const [idx, len, folded] of eachMatch(
+        text,
+        foldQuery,
+        re,
+        caseSensitive,
+      )) {
         total++;
         if (matches.length < limit) {
-          matches.push({
+          const hit: SearchMatch = {
             nodeId: id,
             blockIndex,
             type: node.type,
             before: text.slice(Math.max(0, idx - CONTEXT), idx),
             match: text.slice(idx, idx + len),
             after: text.slice(idx + len, idx + len + CONTEXT),
-          });
+          };
+          // Additive flag: only when the fold actually changed the matched
+          // fragment (omit on plain matches so they stay byte-identical to
+          // pre-#659 output).
+          if (folded) hit.folded = true;
+          matches.push(hit);
         }
       }
       // A text container holds inline content only — no nested containers to

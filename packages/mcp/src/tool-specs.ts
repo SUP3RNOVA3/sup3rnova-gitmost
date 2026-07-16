@@ -391,11 +391,16 @@ export const SHARED_TOOL_SPECS = {
       'getOutline index; `before`/`after` give ~40 chars of context to build ' +
       'that unique selection. `total` counts all ' +
       'hits and `truncated` is true when more than `limit` were found (nothing ' +
-      'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
+      'is silently dropped). Default is a literal, case-INSENSITIVE substring ' +
+      'that matches THROUGH invisible characters — soft hyphen, NBSP, zero-width ' +
+      'chars and collapsed whitespace runs — so "в людях" finds "в люд­ях" ' +
+      '(the hit carries folded:true and match keeps the original invisibles). ' +
       'set regex:true for an RE2 regular expression (linear-time, ReDoS-safe: ' +
       'char classes, word boundaries, anchors and quantifiers work; lookaround ' +
       '(?=…)/(?<=…) and backreferences \\1 are NOT supported) and ' +
-      'caseSensitive:true to match case. Ideal for systematic ' +
+      'caseSensitive:true to match case. Regex mode does NOT fold invisibles — a ' +
+      'pattern that must span them has to match them explicitly (e.g. the soft-' +
+      'hyphen codepoint \\x{00ad}). Ideal for systematic ' +
       'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
       'invalid regex or an empty query returns a clear error to fix. Reflects ' +
       'your own just-made edit immediately (read-after-write); a rare ' +
