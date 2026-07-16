@@ -192,6 +192,75 @@ test("criterion 15: RAW-diff edits of the invisibles themselves still work", () 
   }
 });
 
+// ── F1: off-by-one endSlot on a collapsed multi-char run (#658) ──────────────
+
+test("F1: replaceAll over a two-NBSP run consumes the WHOLE run", () => {
+  // Two NBSPs collapse to one folded space; exact misses (no plain space), the
+  // fold tier matches. The old endSlot (map[last]+1) landed on the SECOND NBSP,
+  // leaving it behind ("X<NBSP>b") while still reporting 1.
+  const input = doc(paragraph(textNode("a" + NBSP + NBSP + "b")));
+  const { doc: out, results, failed } = applyTextEdits(input, [
+    { find: "a ", replace: "X", replaceAll: true },
+  ]);
+  assert.equal(failed.length, 0);
+  assert.equal(results[0].matchedVia, "fold");
+  assert.equal(results[0].replacements, 1);
+  assert.equal(plain(out.content[0]), "Xb");
+});
+
+test("F1 control: single-NBSP run is fully consumed too", () => {
+  const input = doc(paragraph(textNode("a" + NBSP + "b")));
+  const { doc: out, results } = applyTextEdits(input, [
+    { find: "a ", replace: "X", replaceAll: true },
+  ]);
+  assert.equal(results[0].matchedVia, "fold");
+  assert.equal(results[0].replacements, 1);
+  assert.equal(plain(out.content[0]), "Xb");
+});
+
+test("F1: an atom right after the collapsed run stays put (boundary is exclusive)", () => {
+  // A real atom cannot sit STRICTLY inside a fold-space run (an atom breaks the
+  // run), so the atom-scan's run-tail coverage is exercised at the boundary: the
+  // whole run is consumed and the trailing atom (hardBreak) is preserved — no
+  // wrong splice reaches past the run into the atom.
+  const input = doc(
+    paragraph(textNode("a" + NBSP + NBSP), { type: "hardBreak" }, textNode("b")),
+  );
+  const { doc: out, results } = applyTextEdits(input, [
+    { find: "a ", replace: "X", replaceAll: true },
+  ]);
+  assert.equal(results[0].matchedVia, "fold");
+  assert.equal(results[0].replacements, 1);
+  // Run gone, atom (￼) preserved: "X￼b".
+  assert.equal(plain(out.content[0]), "X￼b");
+});
+
+// ── F2: a fold-sensitive invisible in `replace` suppresses the fold tier (#658)
+
+test("F2: replace's SHY cannot be applied through fold → honest miss, doc unchanged", () => {
+  // Doc carries a ZWSP so exact misses; the fold tier WOULD localize, but the
+  // replace's only difference (a SHY) folds away, so applying via fold would be a
+  // silent no-op reported as 1. Fold is suppressed → honest replacements:0.
+  const input = doc(paragraph(textNode("лю" + ZWSP + "дях")));
+  const snapshot = JSON.parse(JSON.stringify(input));
+  const { doc: out, results, failed } = applyTextEdits(input, [
+    { find: "людях", replace: "лю" + SHY + "дях" },
+  ]);
+  assert.equal(results.length, 0);
+  assert.equal(failed.length, 1);
+  assert.deepEqual(out, snapshot);
+});
+
+test("F2 positive control: a RAW match still applies the SHY via the exact tier", () => {
+  const input = doc(paragraph(textNode("людях")));
+  const { doc: out, results } = applyTextEdits(input, [
+    { find: "людях", replace: "лю" + SHY + "дях" },
+  ]);
+  assert.equal(results[0].matchedVia, "exact");
+  assert.equal(results[0].replacements, 1);
+  assert.equal(plain(out.content[0]), "лю" + SHY + "дях");
+});
+
 // ── §2 merge-selection counterexamples (criterion 17) ────────────────────────
 
 test("counterexample x␣␣a / ␣a: one splice, exact preferred", () => {

@@ -19,6 +19,8 @@ import {
   foldInvisibles,
   foldTypography,
   escapeInvisibles,
+  isFoldDelete,
+  isFoldSpace,
 } from "./text-normalize.js";
 
 /** Which locator tier localized an edit (additive result field, #658). */
@@ -363,8 +365,23 @@ function isFoldTier(tier: MatchedVia): boolean {
 }
 
 /**
+ * True when `s` carries a fold-SENSITIVE invisible: a char the fold erases
+ * (isFoldDelete) or collapses away (a non-space fold-space, e.g. NBSP). A plain
+ * space is fold-space too but survives the fold, so it does NOT count (#658 F2).
+ */
+function hasFoldSensitiveInvisible(s: string): boolean {
+  for (const c of s) {
+    if (isFoldDelete(c) || (isFoldSpace(c) && c !== " ")) return true;
+  }
+  return false;
+}
+
+/**
  * Scan a block's FOLDED haystack for `needle`, mapping each atom-free match to a
- * slot range (`[map[i], map[i+L-1]+1)`) plus its fold index. `overlapping`
+ * slot range starting at `map[i]` and ending at the exclusive end of the LAST
+ * matched folded char's own extent (a copied char spans one slot; a collapsed
+ * whitespace run spans the whole run — a plain `map[i+L-1]+1` would leave the
+ * run's tail behind, see the endSlot computation) plus its fold index. `overlapping`
  * resumes one folded char past a valid match (for the replaceAll merge scan);
  * otherwise it resumes past the whole match (non-overlapping). A candidate whose
  * slot range touches an atom slot is skipped (range validity by slots, #658).
@@ -382,7 +399,23 @@ function findValidFoldMatches(
   let idx = folded.indexOf(needle);
   while (idx !== -1) {
     const startSlot = map[idx];
-    const endSlot = map[idx + L - 1] + 1;
+    // Exclusive end = the end of the LAST matched folded char's own extent.
+    // `map[idx+L-1]+1` is right for a copied char but lands INSIDE a collapsed
+    // multi-char whitespace run (e.g. two NBSPs -> one space), leaving the run's
+    // tail behind; `map[idx+L]` (next folded char) overshoots when a standalone
+    // DELETE char (a SHY between two visible chars) sits in the gap, so an append
+    // would jump PAST that invisible. So: if the last matched folded char is a
+    // whitespace run, extend through its fold-space/delete chars; else +1 (#658 F1).
+    const lastSlot = map[idx + L - 1];
+    let endSlot = lastSlot + 1;
+    if (isFoldSpace(chars[lastSlot].ch)) {
+      while (
+        endSlot < chars.length &&
+        (isFoldSpace(chars[endSlot].ch) || isFoldDelete(chars[endSlot].ch))
+      ) {
+        endSlot++;
+      }
+    }
     let hasAtom = false;
     for (let s = startSlot; s < endSlot; s++) {
       if (chars[s] && chars[s].atom) {
@@ -493,6 +526,12 @@ function diagnoseMiss(
   //    BEFORE fold (so a space adjacent to a hardBreak folds into the run and the
   //    "space before break" case is detected instead of a false not-found).
   for (let b = 0; b < blockChars.length; b++) {
+    // Rule 1 diagnoses an ATOM crossing only. A block with no atom that still
+    // "hits" here would have been matched by the exact/fold tiers (so we'd never
+    // reach diagnoseMiss) — EXCEPT when the fold tier was suppressed for a
+    // fold-sensitive invisible in `replace` (#658 F2); in that case the honest
+    // reason is the invisible/typography diff (rule 3), never a phantom break.
+    if (!blockChars[b].some((c) => c.atom)) continue;
     const raw = blockPlain[b];
     const rawHit =
       raw.indexOf(find) !== -1 || (hasStripped && raw.indexOf(stripped) !== -1);
@@ -655,9 +694,19 @@ export function applyTextEdits(
     const stripped = stripInlineMarkdown(edit.find);
     const hasStripped = stripped !== edit.find && stripped.length > 0;
     const foldFind = foldInvisibles(edit.find).folded;
-    const foldFindOk = foldFind.length > 0 && foldFind.trim().length > 0;
+    // Suppress the fold tiers when `replace` carries a fold-sensitive invisible:
+    // the fold diff runs in a space where those invisibles are ERASED, so it
+    // cannot faithfully apply a `replace` whose only difference from the matched
+    // span is such an invisible (it would diff to an empty insert — a silent
+    // no-op reported as replacements:1). Let only the exact/markdown (raw-diff)
+    // tiers anchor it; if they miss, the honest result is replacements:0 (#658 F2).
+    const replaceHasFoldSensitiveInvisible = hasFoldSensitiveInvisible(edit.replace);
+    const foldEnabled = !replaceHasFoldSensitiveInvisible;
+    const foldFindOk =
+      foldEnabled && foldFind.length > 0 && foldFind.trim().length > 0;
     const foldStrippedFull = hasStripped ? foldInvisibles(stripped).folded : "";
     const foldStrippedOk =
+      foldEnabled &&
       hasStripped &&
       foldStrippedFull.length > 0 &&
       foldStrippedFull.trim().length > 0;
