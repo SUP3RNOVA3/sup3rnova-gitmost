@@ -503,6 +503,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A page's local editor cache is no longer shared across users on the same
+  device.** The offline ydoc was stored in IndexedDB under `page.<pageId>` with no
+  workspace/user namespace and was never purged on logout, so on a shared machine
+  the next person who opened the same page (or a same-id page in another
+  workspace) got the previous user's local content as the starting state — and,
+  with the local-first boot cache, it could flash on screen before the server
+  answered 403/404. The ydoc database is now namespaced by the same
+  `<workspace>:<user>` scope key the tree/meta caches use, so different users'
+  copies can never physically collide; the `page.*` databases are purged on an
+  explicit logout and on sign-in as a different user; and a one-time boot
+  migration drops the old un-namespaced databases. A bare `401` deliberately does
+  NOT purge the ydoc — unlike the server-authoritative tree/meta caches, the local
+  ydoc can hold unsynced offline edits, and a session that expired while offline
+  gets a `401` on reconnect before the edits sync, so purging there would lose
+  them; the namespacing is what isolates users in the meantime. (Firefox lacks
+  `indexedDB.databases()`, so the purge there falls back to a name registry; the
+  namespacing is the primary, browser-independent defense.)
+
 - **`editPageText` no longer writes literal markdown markers from a `replace`
   into the page.** The tool documents that a `replace` carrying `**bold**` /
   `~~strike~~` / `` `code` `` wrappers is refused, but it only refused a *pure*

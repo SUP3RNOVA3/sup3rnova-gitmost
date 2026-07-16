@@ -24,7 +24,10 @@ import {
 } from "@/lib/config.ts";
 import { initVitals } from "@/lib/telemetry/vitals";
 import { installPageMetaEviction } from "@/features/page/atoms/page-meta-cache-atom";
-import { installPageYdocEvictionOnce } from "@/features/editor/page-ydoc-eviction";
+import {
+  installPageYdocEvictionOnce,
+  migratePageYdocDatabasesOnce,
+} from "@/features/editor/page-ydoc-eviction";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -47,6 +50,12 @@ export const queryClient = new QueryClient({
 //    installPageMetaEviction() deletes on the very same event. Query-cache
 //    listeners run in registration order, so this one must read the alias first.
 installPageYdocEvictionOnce(queryClient);
+
+// #626 — one-time cleanup of the pre-namespacing legacy `page.<pageId>` ydoc
+// databases (they had no workspace/user scope, so a shared browser could serve
+// one user's local page body to the next). Runs once (localStorage-flagged) and
+// only deletes un-namespaced databases, never the current user's scoped ones.
+migratePageYdocDatabasesOnce();
 
 // #563 — evict a page from the localStorage boot cache as soon as ANY page query
 // fails with 403/404 (deleted / access revoked), regardless of what is mounted.

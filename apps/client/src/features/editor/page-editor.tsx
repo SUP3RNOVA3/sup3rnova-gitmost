@@ -112,8 +112,10 @@ import {
 import {
   pageYdocName,
   registerPageYdoc,
+  rememberYdocDbName,
   unregisterPageYdoc,
 } from "@/features/editor/page-ydoc-eviction";
+import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
 import { isLocalFirstEnabled } from "@/lib/config.ts";
 import {
   isVitalsActive,
@@ -144,6 +146,11 @@ export default function PageEditor({
   }, []);
 
   const [currentUser] = useAtom(currentUserAtom);
+  // #626 — the (workspace, user) scope that namespaces this page's local ydoc
+  // database, so a shared browser never serves one user's local body to another.
+  // Stable for the editor's lifetime: the editor only mounts after `/me`
+  // resolves, and a user switch tears it down (full-page nav / remount).
+  const ydocScopeKey = useAtomValue(scopeKeyAtom);
   const [, setEditor] = useAtom(pageEditorAtom);
   const setCollabProvider = useSetAtom(collabProviderAtom);
   const [, setAsideState] = useAtom(asideStateAtom);
@@ -219,7 +226,10 @@ export default function PageEditor({
     // write sync state that now belongs to a DIFFERENT page.
     let disposed = false;
     if (!providersRef.current) {
-      const documentName = pageYdocName(pageId);
+      const documentName = pageYdocName(pageId, ydocScopeKey);
+      // Record the scoped DB name so the cross-user purge can delete it by name
+      // on browsers without `indexedDB.databases()` (Firefox).
+      rememberYdocDbName(documentName);
       const ydoc = new Y.Doc();
       const local = new IndexeddbPersistence(documentName, ydoc);
       const socket = new HocuspocusProviderWebsocket({

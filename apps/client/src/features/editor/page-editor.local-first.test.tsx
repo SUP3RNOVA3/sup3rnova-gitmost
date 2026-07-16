@@ -258,6 +258,9 @@ import type { Editor } from "@tiptap/react";
 
 const PAGE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const PAGE_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+// #626 — the ydoc DB name is now namespaced by the (workspace, user) scope key.
+// The `currentUser` seeded in beforeEach below resolves scopeKeyAtom to this.
+const SCOPE = "w-1:u-1";
 
 const STATIC_CONTENT = {
   type: "doc",
@@ -590,7 +593,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
     expect(persistenceA.destroyed).toBe(true);
     const persistenceB = lastPersistence();
     expect(persistenceB).not.toBe(persistenceA);
-    expect(persistenceB.name).toBe(`page.${PAGE_B}`);
+    expect(persistenceB.name).toBe(`page.${SCOPE}.${PAGE_B}`);
 
     // The sync state did NOT carry over: page B is back on the static copy and
     // page A's body is nowhere on screen.

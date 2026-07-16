@@ -78,6 +78,14 @@ function redirectToLogin() {
     // only cleanup that runs on that path. It also disables further cache
     // persistence until the full page load below.
     clearPersistedTreeCaches();
+    // #626 — deliberately do NOT purge the page-body ydoc databases here. Unlike
+    // the tree/meta caches (server-authoritative, safe to drop), the local ydoc
+    // can hold UNSYNCED offline edits: a session that expired while offline gets a
+    // 401 on reconnect BEFORE the collab provider re-syncs, so purging on a bare
+    // 401 would silently lose that work. The ydoc is scrubbed only on an explicit
+    // logout or sign-in-as-a-different-user; the per-(workspace,user) namespacing
+    // is what isolates users on a shared machine in the meantime, and the next
+    // user's sign-in purges the previous user's databases anyway.
     const redirectTo = window.location.pathname;
     if (redirectTo === APP_ROUTE.HOME) {
       window.location.href = APP_ROUTE.AUTH.LOGIN;

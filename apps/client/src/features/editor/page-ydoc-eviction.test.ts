@@ -19,6 +19,9 @@ import type { ICurrentUser } from "@/features/user/types/user.types";
 const PAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SLUG_ID = "slugid1";
 const SCOPE_STORAGE_KEY = "pageMeta:v1:w1:u1";
+// The scope key `scopeKeyAtom` yields for the `currentUser()` below
+// (`<workspace>:<user>`), which now namespaces every ydoc database name.
+const SCOPE = "w1:u1";
 
 let localFirstEnabled = true;
 
@@ -104,7 +107,7 @@ describe("evictPageYdoc", () => {
     const mod = await freshImport();
     const persistence = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID),
+      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
       persistence,
       keys: [PAGE_ID, SLUG_ID],
     });
@@ -117,16 +120,16 @@ describe("evictPageYdoc", () => {
     const mod = await freshImport();
     const persistence = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID),
+      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
       persistence,
       keys: [PAGE_ID, SLUG_ID],
     });
     // The editor unmounted (page.tsx swapped to not-found) BEFORE the 403 landed.
-    mod.unregisterPageYdoc(mod.pageYdocName(PAGE_ID));
+    mod.unregisterPageYdoc(mod.pageYdocName(PAGE_ID, SCOPE));
 
     await expect(mod.evictPageYdoc(SLUG_ID)).resolves.toBe(true);
     expect(persistence.clearData).not.toHaveBeenCalled();
-    expect(deleteDatabase).toHaveBeenCalledWith(`page.${PAGE_ID}`);
+    expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
   });
 
   it("falls back to the raw db delete when clearData throws", async () => {
@@ -137,13 +140,13 @@ describe("evictPageYdoc", () => {
       }),
     } as unknown as IndexeddbPersistence;
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID),
+      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
       persistence,
       keys: [PAGE_ID],
     });
 
     await mod.evictPageYdoc(PAGE_ID);
-    expect(deleteDatabase).toHaveBeenCalledWith(`page.${PAGE_ID}`);
+    expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
   });
 
   it("evicts a slugId this session never opened, via the persisted boot cache", async () => {
@@ -156,14 +159,14 @@ describe("evictPageYdoc", () => {
     const mod = await freshImport();
 
     await expect(mod.evictPageYdoc(SLUG_ID)).resolves.toBe(true);
-    expect(deleteDatabase).toHaveBeenCalledWith(`page.${PAGE_ID}`);
+    expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
   });
 
   it("evicts a never-opened page by pageId; a slugId known to NOTHING is a no-op", async () => {
     const mod = await freshImport();
     // A bare uuid IS the ydoc name by construction, so no alias is needed.
     await expect(mod.evictPageYdoc(PAGE_ID)).resolves.toBe(true);
-    expect(deleteDatabase).toHaveBeenCalledWith(`page.${PAGE_ID}`);
+    expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
 
     deleteDatabase.mockClear();
     // A slugId in neither the session map nor the boot cache addresses a page
@@ -181,7 +184,7 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
 
     const revoked = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID),
+      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
       persistence: revoked,
       keys: [PAGE_ID, SLUG_ID],
     });
@@ -191,7 +194,7 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
     const deleted = fakePersistence();
     const otherPage = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(otherPage),
+      documentName: mod.pageYdocName(otherPage, SCOPE),
       persistence: deleted,
       keys: [otherPage],
     });
@@ -213,7 +216,7 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
     await failPageQuery(queryClient, SLUG_ID, 403);
 
     await vi.waitFor(() =>
-      expect(deleteDatabase).toHaveBeenCalledWith(`page.${PAGE_ID}`),
+      expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`),
     );
     unsubscribe();
   });
@@ -239,7 +242,7 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
 
     const persistence = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID),
+      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
       persistence,
       keys: [PAGE_ID, SLUG_ID],
     });
@@ -262,5 +265,127 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
     expect(deleteDatabase).not.toHaveBeenCalled();
 
     unsubscribe();
+  });
+});
+
+describe("pageYdocName (namespacing by scope, #626)", () => {
+  it("produces page.<scopeKey>.<pageId>", async () => {
+    const mod = await freshImport();
+    expect(mod.pageYdocName(PAGE_ID, "w1:u1")).toBe(`page.w1:u1.${PAGE_ID}`);
+  });
+
+  it("differs across scopes (non-vacuity: fails if the scope is ignored)", async () => {
+    const mod = await freshImport();
+    const a = mod.pageYdocName(PAGE_ID, "wA:uA");
+    const b = mod.pageYdocName(PAGE_ID, "wB:uB");
+    // The SAME page id in two scopes must NOT share a database — this is the
+    // whole point of #626. If pageYdocName dropped its scope argument these
+    // would be equal and the assertion would fail.
+    expect(a).not.toBe(b);
+  });
+
+  it("is stable within a scope", async () => {
+    const mod = await freshImport();
+    expect(mod.pageYdocName(PAGE_ID, "w1:u1")).toBe(
+      mod.pageYdocName(PAGE_ID, "w1:u1"),
+    );
+  });
+
+  it("gives an anon scope a distinct, non-colliding name", async () => {
+    const mod = await freshImport();
+    // scopeKeyAtom yields "anon:anon" when signed out; real ids are uuids and
+    // never the literal "anon", so the two namespaces can never collide.
+    const anon = mod.pageYdocName(PAGE_ID, "anon:anon");
+    const real = mod.pageYdocName(PAGE_ID, "w1:u1");
+    expect(anon).toBe(`page.anon:anon.${PAGE_ID}`);
+    expect(anon).not.toBe(real);
+  });
+});
+
+/** An indexedDB stub whose `databases()` resolves to the given name list. */
+function idbWithDatabases(names: string[]) {
+  const del = vi.fn(() => ({}) as IDBOpenDBRequest);
+  return {
+    del,
+    idb: {
+      deleteDatabase: del,
+      databases: vi.fn(async () => names.map((name) => ({ name }))),
+    },
+  };
+}
+
+describe("purgePageYdocDatabases (#626)", () => {
+  it("deletes ONLY page.-prefixed databases, not others", async () => {
+    const mod = await freshImport();
+    const { del, idb } = idbWithDatabases([
+      "page.w1:u1.pageA",
+      "page.w2:u2.pageB",
+      "keyval-store", // an unrelated app database — must survive
+      "someOtherDb",
+    ]);
+    vi.stubGlobal("indexedDB", idb);
+
+    mod.purgePageYdocDatabases();
+
+    await vi.waitFor(() => {
+      expect(del).toHaveBeenCalledWith("page.w1:u1.pageA");
+      expect(del).toHaveBeenCalledWith("page.w2:u2.pageB");
+    });
+    expect(del).not.toHaveBeenCalledWith("keyval-store");
+    expect(del).not.toHaveBeenCalledWith("someOtherDb");
+  });
+
+  it("does not throw and still deletes via the registry when databases() is unavailable (Firefox)", async () => {
+    const mod = await freshImport();
+    // Firefox: no `indexedDB.databases()`. The registry (localStorage) is the
+    // only way to know which names to delete.
+    mod.rememberYdocDbName("page.w1:u1.pageA");
+    mod.rememberYdocDbName("not-a-page-db"); // ignored by rememberYdocDbName
+    const del = vi.fn(() => ({}) as IDBOpenDBRequest);
+    vi.stubGlobal("indexedDB", { deleteDatabase: del }); // no databases()
+
+    expect(() => mod.purgePageYdocDatabases()).not.toThrow();
+    expect(del).toHaveBeenCalledWith("page.w1:u1.pageA");
+    expect(del).not.toHaveBeenCalledWith("not-a-page-db");
+    // The registry is cleared after a purge.
+    expect(localStorage.getItem("pageYdoc.dbNames.v1")).toBeNull();
+  });
+});
+
+describe("migratePageYdocDatabasesOnce (#626 legacy cleanup)", () => {
+  it("deletes legacy page.<pageId> but leaves page.<scope>.<pageId> intact, and runs once", async () => {
+    const mod = await freshImport();
+    const legacy = `page.${PAGE_ID}`; // un-namespaced (no scope colon)
+    const namespaced = `page.w1:u1.${PAGE_ID}`; // current user's DB — must survive
+    const { del, idb } = idbWithDatabases([legacy, namespaced, "keyval-store"]);
+    vi.stubGlobal("indexedDB", idb);
+
+    mod.migratePageYdocDatabasesOnce();
+
+    await vi.waitFor(() =>
+      expect(del).toHaveBeenCalledWith(legacy),
+    );
+    expect(del).not.toHaveBeenCalledWith(namespaced);
+    expect(del).not.toHaveBeenCalledWith("keyval-store");
+    // The one-time flag is now set.
+    expect(localStorage.getItem("pageYdoc.legacyPurged.v1")).toBe("1");
+
+    // Second call is a no-op: the flag short-circuits before any enumeration.
+    del.mockClear();
+    idb.databases.mockClear();
+    mod.migratePageYdocDatabasesOnce();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(idb.databases).not.toHaveBeenCalled();
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("marks itself done without deleting when databases() is unavailable (Firefox)", async () => {
+    const mod = await freshImport();
+    const del = vi.fn(() => ({}) as IDBOpenDBRequest);
+    vi.stubGlobal("indexedDB", { deleteDatabase: del }); // no databases()
+
+    expect(() => mod.migratePageYdocDatabasesOnce()).not.toThrow();
+    expect(del).not.toHaveBeenCalled();
+    expect(localStorage.getItem("pageYdoc.legacyPurged.v1")).toBe("1");
   });
 });
