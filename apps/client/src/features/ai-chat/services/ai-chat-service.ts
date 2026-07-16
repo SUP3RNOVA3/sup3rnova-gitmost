@@ -114,6 +114,26 @@ export async function getBoundChat(slugId: string): Promise<string | null> {
   return req.data.chatId;
 }
 
+/**
+ * Move (or clear) the page->chat binding for the current user (#665). Called on a
+ * CONSCIOUS open: the history select re-binds the page to the chosen chat; "New
+ * chat" clears it (`chatId: null`). Binding is a convenience, not access control,
+ * so callers fire this WITHOUT blocking the UI on it (`void bindPage(...).catch`).
+ * `pageId` accepts a slugId or a uuid (resolved server-side, #312). The response
+ * `chatId` is a debug aid, NOT a postcondition — the requested binding, or null
+ * when it was not applied (page/chat unresolved); callers ignore it.
+ */
+export async function bindPage(
+  pageId: string,
+  chatId: string | null,
+): Promise<{ chatId: string | null }> {
+  const req = await api.post<{ chatId: string | null }>("/ai-chat/bind-page", {
+    pageId,
+    chatId,
+  });
+  return req.data;
+}
+
 /** Rename a chat. */
 export async function renameAiChat(data: {
   chatId: string;

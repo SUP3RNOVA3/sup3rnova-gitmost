@@ -25,6 +25,7 @@ import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
 import { AiChatRunStepRepo } from '@docmost/db/repos/ai-chat/ai-chat-run-step.repo';
 import { AiChatPageSnapshotRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-snapshot.repo';
+import { AiChatPageBindingRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-binding.repo';
 import { AiAgentRoleRepo } from '@docmost/db/repos/ai-agent-roles/ai-agent-roles.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageAccessService } from '../page/page-access/page-access.service';
@@ -76,6 +77,7 @@ import {
   truncateDegeneratedTail,
   shouldCheckDegeneration,
 } from './output-degeneration';
+import { incAiChatBindSkipped } from '../../integrations/metrics/metrics.registry';
 
 // Max agent steps per turn. One step = one model generation; a step that calls
 // tools is followed by another step carrying the tool results. Raised from 8 so
@@ -633,6 +635,12 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
     // Nest injects the real singleton. When ABSENT the per-step path falls back to
     // the pre-#492 full-row flush (no regression, only no WAL win).
     private readonly aiChatRunStepRepo?: AiChatRunStepRepo,
+    // #665: the mutable page->chat binding repo. The server is the BIRTH writer —
+    // it upserts the binding right after the FIRST user message of a chat sent from
+    // a page. OPTIONAL and injected LAST so existing positional constructions
+    // (int-specs) compile unchanged; absent => the birth-bind is silently skipped
+    // (no crash), present in production (Nest injects the singleton).
+    private readonly aiChatPageBindingRepo?: AiChatPageBindingRepo,
   ) {}
 
   // #487: periodic reconcile timer (single-process phase 1). Started in
@@ -1290,6 +1298,46 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         // parts (never the raw client parts) so the row is always convertible.
         metadata: (sanitizedParts ? { parts: sanitizedParts } : null) as never,
       });
+
+      // #665 BIRTH BIND: on the FIRST saved user message of this chat sent FROM a
+      // page, point that page's binding at this chat. The gate is a FACT, not a
+      // code path — `oldHistory.length === 0` (loaded above, WITHOUT the row just
+      // inserted) means "this is the first user message this chat ever persisted".
+      // It deliberately is NOT `isNewChat`: a chat orphaned when runHooks.begin
+      // failed has isNewChat=false on its retry but still oldHistory.length===0, and
+      // must bind then (else its page never rebinds). Later turns (oldHistory>0)
+      // never rebind — which preserves the agent-badge deeplink and "navigation
+      // doesn't bind" decisions.
+      //
+      // The bound page is `openPageContext.id` — the VALIDATED page the message was
+      // sent from (not `ai_chats.page_id`): on an orphan retry from another page Y
+      // we bind Y ("the page you're standing on"), while page_id stays the birth
+      // page X as provenance. `openPageContext === null` (off a document) => no write.
+      //
+      // Written AFTER the message insert (so "bound => the chat has >= 1 message"),
+      // and fail-SOFT (NOT transactional): a binding-write failure must never roll
+      // back the user's message or fail the turn. Worst case is "message saved, page
+      // still points at the old chat" — the declared safe degradation.
+      if (
+        oldHistory.length === 0 &&
+        openPageContext &&
+        this.aiChatPageBindingRepo
+      ) {
+        try {
+          await this.aiChatPageBindingRepo.upsert(
+            user.id,
+            openPageContext.id,
+            chatId,
+          );
+        } catch (err) {
+          this.logger.warn(
+            `Birth page-binding failed for chat ${chatId} on page ${openPageContext.id} (reason=birth_bind_failed): ${
+              err instanceof Error ? err.message : 'unknown error'
+            }`,
+          );
+          incAiChatBindSkipped('birth_bind_failed');
+        }
+      }
 
       // Interrupt-resume detection (#198): the client "send now" flag is only a
       // hint — confirm it against the persisted history (the preceding assistant

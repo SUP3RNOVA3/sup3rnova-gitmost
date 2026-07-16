@@ -92,6 +92,16 @@ const DEGRADED_POLL_IDLE_MAX_MS = 10 * 60_000;
 // than any network socket timeout — not a network read timeout.
 const RECONNECT_RESEED_TIMEOUT_MS = 4_000;
 
+// #665: how long the FIRST send of a fresh thread waits for an in-flight "New
+// chat" unbind (DELETE /bind-page) before sending anyway. It closes the "New
+// chat -> instant role-card click" race (the DELETE and the birth UPSERT are two
+// independent requests) by sequencing the send after the DELETE. Ample for a
+// round-trip to our own backend (hundreds of ms) yet below the threshold where a
+// send delay is noticeable; on timeout we send regardless (falling back to the
+// original, harmless race). No env override: exceeding it only reverts to that
+// benign race, so a knob would save nothing.
+const AI_CHAT_UNBIND_GATE_TIMEOUT_MS = 1500;
+
 /** The #487 active (non-terminal) run statuses — mirrors the server's
  *  ACTIVE_RUN_STATUSES. A run-fact is "active" only for these. */
 function isActiveRunStatus(status: string | null | undefined): boolean {
@@ -188,6 +198,12 @@ interface ChatThreadProps {
   /** #184: request the server-side stop of this chat's active run. Called with the
    *  resolved chat id when the user presses Stop in autonomous mode. */
   onServerStop?: (chatId: string) => void;
+  /** #665: a WINDOW-owned ref holding the last "New chat" unbind (DELETE
+   *  /bind-page) promise. The first send of a fresh thread reads-and-clears it and
+   *  waits (bounded) so an instant role-card click can't race its DELETE past the
+   *  server's birth UPSERT. The ref must live in the window (not here): "New chat"
+   *  remounts this component, which would lose a ref held inside it. */
+  pendingUnbindRef?: React.MutableRefObject<Promise<unknown> | null>;
 }
 
 /**
@@ -246,6 +262,7 @@ export default function ChatThread({
   polledRunFact,
   autonomousRunsEnabled,
   onServerStop,
+  pendingUnbindRef,
 }: ChatThreadProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -278,6 +295,13 @@ export default function ChatThread({
   onResumeFallbackRef.current = onResumeFallback;
   const onServerStopRef = useRef<typeof onServerStop>(onServerStop);
   onServerStopRef.current = onServerStop;
+  // #665: mirror the WINDOW-owned unbind ref into a STABLE local ref so the
+  // useCallback([]) localSend can read the current unbind promise without
+  // capturing a per-render prop. `.current` is the window's ref object (stable
+  // identity), whose `.current` is the promise.
+  const pendingUnbindRefRef =
+    useRef<typeof pendingUnbindRef>(pendingUnbindRef);
+  pendingUnbindRefRef.current = pendingUnbindRef;
 
   // Live mount flag: the attach GET / a resumed onFinish are async and can land
   // AFTER unmount (the parent remounts per chat). The epoch (I1) drops stale FSM
@@ -480,7 +504,38 @@ export default function ChatThread({
   dispatchRef.current = dispatch;
 
   // FIFO dequeue + local send of the next queued message (no-op when empty).
-  const localSend = useCallback((text: string) => {
+  // #665: async because the FIRST send of a fresh thread must sequence AFTER a
+  // pending "New chat" unbind (DELETE /bind-page), so a poll/starvation timer can't
+  // arm against a phantom turn. Ordering matters: await the gate BEFORE dispatch,
+  // so the FSM never sits in `sending` with no request in flight.
+  const localSend = useCallback(async (text: string) => {
+    // Read-and-CLEAR the window's last unbind promise. Read-and-clear so localSend
+    // does not stay async-waiting on a long-settled promise on every later send.
+    const unbindRef = pendingUnbindRefRef.current;
+    const pendingUnbind = unbindRef?.current ?? null;
+    if (unbindRef) unbindRef.current = null;
+    if (pendingUnbind) {
+      // Wait for the DELETE, but no longer than the gate timeout (a wedged DELETE
+      // must not block the send indefinitely — fall back to the benign race). Never
+      // let a rejected/500 unbind throw here: that would eat the user's message.
+      // Capture the timer id and clear it once the race settles, so an unbind that
+      // WINS does not leave a dangling <=1.5s timer alive.
+      let gateTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          pendingUnbind.catch(() => undefined),
+          new Promise((resolve) => {
+            gateTimer = setTimeout(resolve, AI_CHAT_UNBIND_GATE_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (gateTimer !== undefined) clearTimeout(gateTimer);
+      }
+      // A second "New chat" during the wait remounted this component; its dispatch/
+      // sendMessage refs belong to a dead store. Bail (precedent: the async paths
+      // below all guard on mountedRef after an await).
+      if (!mountedRef.current) return;
+    }
     dispatchRef.current({ type: "SEND_LOCAL" });
     // F1: this local stream's onFinish is stamped with the just-bumped generation.
     turnEpochRef.current = epochRef.current;
@@ -490,7 +545,9 @@ export default function ChatThread({
     const { head, rest } = dequeue(queuedRef.current);
     if (!head) return false;
     setQueue(rest);
-    localSend(head.text);
+    // localSend is async now (the #665 unbind gate); the dequeue decision is still
+    // synchronous, so flushNext stays a synchronous boolean.
+    void localSend(head.text);
     return true;
   }, [setQueue, localSend]);
 
@@ -1190,7 +1247,7 @@ export default function ChatThread({
       }
       // Nothing live to interrupt (idle, or A already settled): send it now.
       setQueue(removeQueuedById(queuedRef.current, id));
-      localSend(msg.text);
+      void localSend(msg.text);
     },
     [setQueue, autonomousRunsEnabled, dispatch, localSend],
   );
@@ -1243,7 +1300,7 @@ export default function ChatThread({
       t("Take a look at the current document"),
     );
     if (launch !== null) {
-      localSend(launch);
+      void localSend(launch);
     } else {
       setRolePickedNoSend(true);
     }
@@ -1373,7 +1430,7 @@ export default function ChatThread({
           </Stack>
         )}
         <ChatInput
-          onSend={(text) => localSend(text)}
+          onSend={(text) => void localSend(text)}
           onQueue={enqueue}
           onStop={handleStop}
           isStreaming={isStreaming}

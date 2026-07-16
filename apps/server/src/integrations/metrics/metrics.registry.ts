@@ -28,6 +28,7 @@ import {
   METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL,
   METRIC_MCP_DOWNLOAD_BYTES_TOTAL,
   METRIC_API_KEY_AUTH_DENIED_TOTAL,
+  METRIC_AI_CHAT_BIND_SKIPPED_TOTAL,
   sizeBucket,
 } from './metrics.constants';
 
@@ -72,6 +73,8 @@ let getPageCacheMissesCounter: Counter | null = null;
 let mcpDownloadBytesCounter: Counter<'tool'> | null = null;
 // #558 — api-key auth denials, by bounded reason label.
 let apiKeyAuthDeniedCounter: Counter<'reason'> | null = null;
+// #665 — page->chat binding skips, by bounded reason label.
+let aiChatBindSkippedCounter: Counter<'reason'> | null = null;
 
 // #402 — read-on-scrape source for collab_docs_open. The gauge is NEVER
 // inc/dec'd (that drifts under crashes/handoffs); instead its collect() callback
@@ -212,6 +215,13 @@ function init(): void {
     labelNames: ['reason'],
     registers: [registry],
   });
+
+  aiChatBindSkippedCounter = new Counter({
+    name: METRIC_AI_CHAT_BIND_SKIPPED_TOTAL,
+    help: 'Total page->chat binding writes skipped (#665), by bounded reason',
+    labelNames: ['reason'],
+    registers: [registry],
+  });
 }
 
 // Runs once when this module is first imported. Safe to call again (idempotent).
@@ -301,6 +311,23 @@ export function incGetPageCacheMiss(): void {
  */
 export function incApiKeyAuthDenied(reason: string): void {
   apiKeyAuthDeniedCounter?.inc({ reason });
+}
+
+/**
+ * #665 — record one page->chat binding SKIP, labelled by its BOUNDED reason. A
+ * no-op when metrics are disabled (so the paired WARN is the primary channel).
+ * `reason` MUST come from the fixed AiChatBindSkipReason set (never free-form /
+ * attacker-controlled input) so the label cardinality stays bounded. Module-level
+ * (no DI) so both the controller and the service can call it.
+ */
+export type AiChatBindSkipReason =
+  | 'page_unresolved'
+  | 'chat_not_owned'
+  | 'chat_deleted'
+  | 'birth_bind_failed';
+
+export function incAiChatBindSkipped(reason: AiChatBindSkipReason): void {
+  aiChatBindSkippedCounter?.inc({ reason });
 }
 
 /**

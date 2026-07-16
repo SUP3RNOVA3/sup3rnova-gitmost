@@ -6,6 +6,7 @@ import {
   AiChatRuns,
   AiChatRunSteps,
   AiChatPageSnapshots,
+  AiChatPageBindings,
   Attachments,
   Comments,
   Groups,
@@ -79,6 +80,11 @@ export type InsertableAiChatPageSnapshot = Insertable<AiChatPageSnapshots>;
 export type UpdatableAiChatPageSnapshot = Updateable<
   Omit<AiChatPageSnapshots, 'id'>
 >;
+
+// AI Chat Page Binding (#665): the mutable per-(user,page) pointer to the chat
+// that opens on that page. Distinct from the immutable ai_chats.page_id provenance.
+export type AiChatPageBinding = Selectable<AiChatPageBindings>;
+export type InsertableAiChatPageBinding = Insertable<AiChatPageBindings>;
 
 // AI Provider Credentials
 // SECURITY (D9/§8.1): holds encrypted per-workspace provider API keys.
