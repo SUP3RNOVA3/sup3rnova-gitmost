@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from "axios";
 import APP_ROUTE from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
 import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
+import { purgePageYdocDatabases } from "@/features/editor/page-ydoc-eviction";
 
 const api: AxiosInstance = axios.create({
   baseURL: "/api",
@@ -78,6 +79,9 @@ function redirectToLogin() {
     // only cleanup that runs on that path. It also disables further cache
     // persistence until the full page load below.
     clearPersistedTreeCaches();
+    // #626 — a forced logout (expired session on a shared machine) must also drop
+    // the local page-body ydoc databases, mirroring the meta/tree cache purge.
+    purgePageYdocDatabases();
     const redirectTo = window.location.pathname;
     if (redirectTo === APP_ROUTE.HOME) {
       window.location.href = APP_ROUTE.AUTH.LOGIN;

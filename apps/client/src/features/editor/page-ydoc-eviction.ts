@@ -2,6 +2,7 @@ import { getDefaultStore } from "jotai";
 import type { QueryClient } from "@tanstack/react-query";
 import type { IndexeddbPersistence } from "y-indexeddb";
 import { pageMetaCacheAtom } from "@/features/page/atoms/page-meta-cache-atom";
+import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
 import { isLocalFirstEnabled } from "@/lib/config";
 
 /**
@@ -31,9 +32,37 @@ import { isLocalFirstEnabled } from "@/lib/config";
  *    session-scoped map a successful mount populates.
  */
 
-/** The y-indexeddb database name the page editor uses for a page's body. */
-export function pageYdocName(pageId: string): string {
-  return `page.${pageId}`;
+/**
+ * Prefix shared by EVERY page-body ydoc IndexedDB database. The namespacing
+ * below, the enumeration-based purge, the Firefox registry fallback, and the
+ * legacy migration all key off this single constant so they can never drift
+ * apart.
+ */
+export const PAGE_YDOC_PREFIX = "page.";
+
+/**
+ * The y-indexeddb database name the page editor uses for a page's body.
+ *
+ * NAMESPACED BY SCOPE (#626). Before this, the body ydoc lived under a bare
+ * `page.<pageId>` with NO workspace/user namespace, so on a shared device the
+ * next user who opened the same page id (in this or ANOTHER workspace) inherited
+ * the PREVIOUS user's local ydoc as the starting state — and with local-first
+ * phase 2 (#564) the body is painted from that local ydoc BEFORE the network
+ * answers 403/404, flashing another user's content on screen.
+ *
+ * The name now embeds the SAME `<workspace>:<user>` scope key the tree/meta boot
+ * caches use (`scopeKeyAtom`, the #563 mechanism), yielding
+ * `page.<scopeKey>.<pageId>`. Two scopes therefore get two distinct databases.
+ *
+ * Fail-closed for anon: a signed-out / not-yet-resolved state resolves the scope
+ * to `anon:anon` (see `scopeKeyAtom`). Real ids are uuids and never the literal
+ * "anon", so an anon name can never collide with a real user's — mirroring how
+ * the #563 caches treat the `anon` segment (they additionally REFUSE it; the
+ * ydoc cannot refuse — the editor always needs a doc — but the editor only ever
+ * mounts after `/me` resolves, so a real scope is in hand by then anyway).
+ */
+export function pageYdocName(pageId: string, scopeKey: string): string {
+  return `${PAGE_YDOC_PREFIX}${scopeKey}.${pageId}`;
 }
 
 // Query keys are `["pages", <pageId | slugId>]`, while the ydoc is named by
@@ -106,14 +135,19 @@ function resolveYdocName(queryKeyId: string): string | null {
   const known = ydocNameByQueryKey.get(queryKeyId);
   if (known) return known;
 
+  // The ydoc name is scoped by (workspace, user). A 403/404 belongs to the
+  // CURRENTLY signed-in user whose page it is, so the name to destroy is built
+  // from the current scope — the same value page-editor used to create the doc.
+  const scopeKey = getDefaultStore().get(scopeKeyAtom);
+
   try {
     const cached = getDefaultStore().get(pageMetaCacheAtom)[queryKeyId];
-    if (cached?.id) return pageYdocName(cached.id);
+    if (cached?.id) return pageYdocName(cached.id, scopeKey);
   } catch {
     // A cache read must never block eviction; fall through to the uuid rule.
   }
 
-  return UUID_RE.test(queryKeyId) ? pageYdocName(queryKeyId) : null;
+  return UUID_RE.test(queryKeyId) ? pageYdocName(queryKeyId, scopeKey) : null;
 }
 
 /** Best-effort raw delete of the IDB database backing a destroyed ydoc. */
@@ -214,4 +248,206 @@ export function installPageYdocEvictionOnce(queryClient: QueryClient): void {
   if (installed) return;
   installed = true;
   installPageYdocEviction(queryClient);
+}
+
+// ---------------------------------------------------------------------------
+// #626 — cross-user hygiene for the page-body ydoc databases.
+//
+// Namespacing (above) is the PRIMARY defense: a new user simply cannot address
+// the previous user's scoped database. The purge + migration below are
+// belt-and-suspenders — they physically remove the on-disk copies so revoked /
+// signed-out content leaves the machine, and they clean up the pre-#626 legacy
+// `page.<pageId>` databases that predate namespacing.
+// ---------------------------------------------------------------------------
+
+// Firefox does NOT implement `indexedDB.databases()`, so enumeration-based purge
+// cannot see the ydoc databases there. We keep a best-effort registry of the
+// ydoc DB names this browser has opened (in localStorage) so the purge can still
+// delete them by name on Firefox. Enumeration remains the primary path where it
+// exists; the registry is a superset-covering fallback.
+const YDOC_DB_REGISTRY_KEY = "pageYdoc.dbNames.v1";
+// Bound the registry like the session alias map: a long-lived browser must not
+// grow this array without limit.
+const MAX_REGISTRY_ENTRIES = 500;
+
+function readYdocDbRegistry(): string[] {
+  try {
+    if (typeof localStorage === "undefined") return [];
+    const raw = localStorage.getItem(YDOC_DB_REGISTRY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((n): n is string => typeof n === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Record a ydoc database name so the Firefox purge fallback can find it later.
+ * Called by page-editor when it opens the local persistence. No-op for names
+ * that aren't ours, and never throws (storage may be disabled/full).
+ */
+export function rememberYdocDbName(name: string): void {
+  if (!name.startsWith(PAGE_YDOC_PREFIX)) return;
+  try {
+    if (typeof localStorage === "undefined") return;
+    const names = readYdocDbRegistry().filter((n) => n !== name);
+    names.push(name);
+    while (names.length > MAX_REGISTRY_ENTRIES) names.shift();
+    localStorage.setItem(YDOC_DB_REGISTRY_KEY, JSON.stringify(names));
+  } catch {
+    // best-effort registry — the namespacing is the real defense
+  }
+}
+
+function clearYdocDbRegistry(): void {
+  try {
+    if (typeof localStorage === "undefined") return;
+    localStorage.removeItem(YDOC_DB_REGISTRY_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * A ydoc database name is LEGACY (pre-#626) when it is un-namespaced:
+ * `page.<pageId>`. Since every namespaced name embeds the `<workspace>:<user>`
+ * scope key — which ALWAYS contains a `:` — while a bare pageId (a uuid) never
+ * does, the presence of a `:` after the prefix cleanly distinguishes the new
+ * shape from the legacy one. This is scope-independent, so the migration can
+ * never mistake the CURRENT user's freshly-namespaced database for a legacy one.
+ */
+function isLegacyYdocName(name: string): boolean {
+  if (!name.startsWith(PAGE_YDOC_PREFIX)) return false;
+  return !name.slice(PAGE_YDOC_PREFIX.length).includes(":");
+}
+
+/**
+ * Purge EVERY `page.`-prefixed ydoc IndexedDB database. Called wherever the
+ * meta/tree boot caches are swept (logout, sign-in-as-different-user, 401), so
+ * one user's local page bodies never survive into another user's session on a
+ * shared device.
+ *
+ * Degrades gracefully and NEVER throws:
+ *  - the localStorage registry is deleted SYNCHRONOUSLY first, so on Firefox (no
+ *    `indexedDB.databases()`) and on every browser the known names are dropped
+ *    before the caller's full-page navigation tears this module down;
+ *  - where `indexedDB.databases()` exists, it additionally sweeps any
+ *    `page.`-prefixed database the registry missed (e.g. opened by another tab).
+ *
+ * A database currently OPEN by the active editor is not force-closed here — the
+ * browser defers such a delete until the last connection closes ("blocked"),
+ * which `deleteYdocDatabase` logs. On logout/401 the imminent full-page reload
+ * closes it; the namespacing already prevents cross-user reads in the meantime.
+ */
+export function purgePageYdocDatabases(): void {
+  if (typeof indexedDB === "undefined") return;
+
+  // 1. Registry-driven, synchronous, Firefox-safe.
+  for (const name of readYdocDbRegistry()) {
+    if (name.startsWith(PAGE_YDOC_PREFIX)) deleteYdocDatabase(name);
+  }
+  clearYdocDbRegistry();
+
+  // 2. Enumeration-driven, best-effort (unsupported in Firefox → skipped).
+  if (typeof indexedDB.databases === "function") {
+    try {
+      indexedDB
+        .databases()
+        .then((dbs) => {
+          for (const db of dbs) {
+            if (db.name && db.name.startsWith(PAGE_YDOC_PREFIX)) {
+              deleteYdocDatabase(db.name);
+            }
+          }
+        })
+        .catch(() => {
+          // enumeration failed at runtime — the registry path already ran
+        });
+    } catch {
+      // some environments throw synchronously — ignore
+    }
+  }
+}
+
+// One-time legacy migration guard. `v1` so a future re-migration can bump it.
+const YDOC_MIGRATION_FLAG = "pageYdoc.legacyPurged.v1";
+
+/**
+ * ONE-TIME migration (#626): on the first launch of the namespaced build, delete
+ * the legacy un-namespaced `page.<pageId>` databases left by earlier versions.
+ * The body is authoritative on the server; the local ydoc is only a cache, so
+ * dropping it is safe (it re-hydrates from collab on next open).
+ *
+ * Guarded by a localStorage flag so it runs exactly once. It only ever deletes
+ * databases whose name does NOT match the new `page.<scopeKey>.<pageId>` shape
+ * (see `isLegacyYdocName`), so the current user's freshly-namespaced databases
+ * are never touched. Where enumeration is unavailable (Firefox) it simply marks
+ * itself done — the prefix purge in `purgePageYdocDatabases()` still sweeps any
+ * legacy database on the next logout/sign-in.
+ */
+export function migratePageYdocDatabasesOnce(): void {
+  if (typeof indexedDB === "undefined") return;
+
+  let alreadyRun = false;
+  try {
+    alreadyRun =
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem(YDOC_MIGRATION_FLAG) === "1";
+  } catch {
+    // Storage unreadable → cannot record the run, so skip to avoid re-sweeping
+    // on every boot. The prefix purge still covers legacy DBs on logout/sign-in.
+    return;
+  }
+  if (alreadyRun) return;
+
+  const markDone = () => {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(YDOC_MIGRATION_FLAG, "1");
+      }
+    } catch {
+      // best-effort — nothing else to do
+    }
+  };
+
+  if (typeof indexedDB.databases !== "function") {
+    // Cannot enumerate the legacy names (they predate the registry), so there is
+    // nothing to do here on Firefox. Mark done; the logout/sign-in prefix purge
+    // sweeps any legacy database instead.
+    markDone();
+    return;
+  }
+
+  try {
+    indexedDB
+      .databases()
+      .then((dbs) => {
+        for (const db of dbs) {
+          if (db.name && isLegacyYdocName(db.name)) {
+            deleteYdocDatabase(db.name);
+          }
+        }
+      })
+      .catch(() => {
+        // enumeration failed — leave legacy DBs for the prefix purge
+      })
+      .finally(markDone);
+  } catch {
+    // synchronous throw — record the run so we don't retry every boot
+    markDone();
+  }
+}
+
+/** Test-only: reset the one-time migration flag. */
+export function resetPageYdocMigrationForTests(): void {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(YDOC_MIGRATION_FLAG);
+    }
+  } catch {
+    // ignore
+  }
 }
