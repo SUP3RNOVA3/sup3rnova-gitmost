@@ -35,7 +35,11 @@ import {
   htmlToJson,
   jsonToNode,
   jsonToText,
+  tiptapExtensions,
 } from 'src/collaboration/collaboration.util';
+import { pageContentHash } from 'src/collaboration/content-hash.util';
+import { TiptapTransformer } from '@hocuspocus/transformer';
+import * as Y from 'yjs';
 import {
   CopyPageMapEntry,
   ICopyPageAttachment,
@@ -380,6 +384,63 @@ export class PageService {
       documentName,
       { operation, prosemirrorJson, user },
     );
+  }
+
+  /**
+   * #647 §B/§E — coherent `{ content, contentHash }` for the opt-in
+   * `/pages/info?includeContentHash` read path (and the base hash a future
+   * guarded-replace re-checks). The hash is computed over `fromYdoc(D)`, NEVER the
+   * raw `page.content` (#647 B1: `fromYdoc(toYdoc(x)) !== x`, so hashing raw
+   * content would produce a permanent false 409), and the returned `content` is
+   * the SAME materialization, so a caller keying a cache by this hash gets true
+   * read-your-own-writes.
+   *
+   * When the collab doc is LOADED on some instance we take its live content via
+   * the non-claiming `readLiveIfLoaded` primitive (RYOW even while the DB row is
+   * debounce-stale). When it is NOT loaded we reconstruct a TRANSIENT ydoc from
+   * the DB exactly as `onLoadDocument` would (page.ydoc → applyUpdate, else
+   * toYdoc(page.content)) and hash that — WITHOUT force-loading the document.
+   */
+  async getLiveContentPair(
+    pageId: string,
+  ): Promise<{ content: any; contentHash: string }> {
+    const documentName = `page.${pageId}`;
+    const live = await this.collaborationGateway.readLiveIfLoaded(documentName);
+    if (live.loaded) {
+      return { content: live.content, contentHash: live.hash };
+    }
+
+    // Not loaded (or owner unreachable): reconstruct a transient ydoc from the DB
+    // and hash the SAME `fromYdoc` materialization the load path would produce.
+    const page = await this.pageRepo.findById(pageId, {
+      includeContent: true,
+      includeYdoc: true,
+    });
+    const content = this.reconstructContentFromDb(page);
+    return { content, contentHash: pageContentHash(content) };
+  }
+
+  /**
+   * #647 B1 — materialize a page's ProseMirror JSON the SAME way onLoadDocument
+   * hydrates it, so a hash over the result matches what the collab process holds:
+   * prefer the persisted ydoc bytes, else convert `page.content`, else an empty
+   * doc. Uses a throwaway Y.Doc — it never touches the live collab instance.
+   */
+  private reconstructContentFromDb(page: Page | null | undefined): any {
+    if (page?.ydoc) {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, new Uint8Array(page.ydoc as any));
+      return TiptapTransformer.fromYdoc(doc, 'default');
+    }
+    if (page?.content) {
+      const doc = TiptapTransformer.toYdoc(
+        page.content,
+        'default',
+        tiptapExtensions,
+      );
+      return TiptapTransformer.fromYdoc(doc, 'default');
+    }
+    return { type: 'doc', content: [] };
   }
 
   async getSidebarPages(

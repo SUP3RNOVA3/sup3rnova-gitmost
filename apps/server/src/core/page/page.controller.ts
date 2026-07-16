@@ -95,25 +95,44 @@ export class PageController {
 
     const permissions = { canEdit, hasRestriction };
 
-    if (dto.format && dto.format !== 'json' && page.content) {
+    // #647 §E — opt-in coherent content hash (getPage/getPageJson only). When
+    // requested we resolve the LIVE content (via the non-claiming
+    // readLiveIfLoaded primitive) so `content` reflects unflushed edits and
+    // `contentHash` is coherent with it — read-your-own-writes for getPage and
+    // the base hash a guarded-replace re-checks. Every other reader skips this.
+    let content = page.content;
+    let contentHash: string | undefined;
+    if (dto.includeContentHash) {
+      const pair = await this.pageService.getLiveContentPair(page.id);
+      content = pair.content;
+      contentHash = pair.contentHash;
+    }
+
+    if (dto.format && dto.format !== 'json' && content) {
       let contentOutput: string;
       if (dto.format === 'markdown') {
-        contentOutput = jsonToMarkdown(page.content);
+        contentOutput = jsonToMarkdown(content);
       } else if (dto.format === 'text') {
         // #502: flat, deterministic, machine-diffable text (block-per-line,
         // inline marks/anchors dropped, non-text nodes -> stable placeholders).
-        contentOutput = jsonToText(page.content, { deterministic: true });
+        contentOutput = jsonToText(content, { deterministic: true });
       } else {
-        contentOutput = jsonToHtml(page.content);
+        contentOutput = jsonToHtml(content);
       }
       return {
         ...page,
         content: contentOutput,
+        ...(contentHash !== undefined ? { contentHash } : {}),
         permissions,
       };
     }
 
-    return { ...page, permissions };
+    return {
+      ...page,
+      content,
+      ...(contentHash !== undefined ? { contentHash } : {}),
+      permissions,
+    };
   }
 
   @HttpCode(HttpStatus.OK)
