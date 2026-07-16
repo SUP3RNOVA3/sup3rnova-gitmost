@@ -44,6 +44,7 @@ import {
   TiptapPdf,
   PageBreak,
   SearchAndReplace,
+  MultiCursor,
   Mention,
   TableDndExtension,
   TableHandleCommandsExtension,
@@ -452,6 +453,10 @@ export const mainExtensions = [
       };
     },
   }).configure(),
+  // Multi-cursor editing (MVP / Variant A): select-all-occurrences + type into
+  // all at once. Does not depend on collaboration, so it lives in mainExtensions
+  // (available in both the plain and collaborative editors).
+  MultiCursor,
   Columns,
   Column,
   AutoJoiner.configure({
