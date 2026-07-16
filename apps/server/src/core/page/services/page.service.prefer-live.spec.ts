@@ -9,9 +9,12 @@ const LIVE = { type: 'doc', content: [{ type: 'paragraph' }] };
 const DB = { type: 'doc', content: [] };
 
 function makeService(readLiveResult: any): PageService {
-  const collaborationGateway = {
+  return makeServiceWithGateway({
     readLiveIfLoaded: jest.fn().mockResolvedValue(readLiveResult),
-  };
+  });
+}
+
+function makeServiceWithGateway(collaborationGateway: any): PageService {
   return new PageService(
     {} as any, // pageRepo
     {} as any, // pagePermissionRepo
@@ -47,6 +50,20 @@ describe('PageService.resolvePreferLiveContent (#654)', () => {
 
   it('owner unreachable -> DB row content, contentSource:"db", reason owner_unreachable', async () => {
     const service = makeService({ loaded: false, unreachable: true });
+    const res = await service.resolvePreferLiveContent('uuid-1', DB);
+    expect(res.content).toBe(DB);
+    expect(res.contentSource).toBe('db');
+    expect(res.fallbackReason).toBe('owner_unreachable');
+  });
+
+  it('live-read gateway REJECTS -> fails OPEN to the DB row (contentSource:"db", owner_unreachable), never throws', async () => {
+    // #654 hardening: readLiveIfLoaded's non-remote branch delegates to an
+    // unwrapped redis pub.get — a redis reject must NOT bubble a 500 out of
+    // /pages/info. The method's "ALWAYS fails open" contract must hold: degrade to
+    // the SAME db row a plain read returns (never another page's content).
+    const service = makeServiceWithGateway({
+      readLiveIfLoaded: jest.fn().mockRejectedValue(new Error('redis down')),
+    });
     const res = await service.resolvePreferLiveContent('uuid-1', DB);
     expect(res.content).toBe(DB);
     expect(res.contentSource).toBe('db');

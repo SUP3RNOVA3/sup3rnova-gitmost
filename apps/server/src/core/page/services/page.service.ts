@@ -551,7 +551,19 @@ export class PageService {
     fallbackReason?: 'not_loaded' | 'owner_unreachable';
   }> {
     const documentName = `page.${pageId}`;
-    const live = await this.collaborationGateway.readLiveIfLoaded(documentName);
+    let live: Awaited<
+      ReturnType<typeof this.collaborationGateway.readLiveIfLoaded>
+    >;
+    try {
+      live = await this.collaborationGateway.readLiveIfLoaded(documentName);
+    } catch {
+      // Fail OPEN (the docstring's "never throws" contract): ANY error while
+      // probing the owner — e.g. an unwrapped redis reject in readLiveIfLoaded's
+      // non-remote pub.get branch — must degrade to the DB row, not 500 the hot
+      // /pages/info read path. Fail-CLOSED in the sense that matters: we return
+      // the SAME dbContent a plain read returns, never another page's content.
+      return { content: dbContent, contentSource: 'db', fallbackReason: 'owner_unreachable' };
+    }
     if (live.loaded) {
       return { content: live.content, contentSource: 'live' };
     }

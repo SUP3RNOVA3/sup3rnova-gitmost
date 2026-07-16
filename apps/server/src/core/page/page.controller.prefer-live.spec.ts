@@ -14,13 +14,16 @@ const LIVE_CONTENT = {
   content: [{ type: 'heading', attrs: { level: 1 }, content: [{ type: 'text', text: 'fresh' }] }],
 };
 
-function makeController(page: any, preferLiveResult?: any) {
+function makeController(
+  page: any,
+  preferLiveResult?: any,
+  gateError?: Error,
+) {
   const pageRepo = { findById: jest.fn().mockResolvedValue(page) } as any;
-  const pageAccessService = {
-    validateCanViewWithPermissions: jest
-      .fn()
-      .mockResolvedValue({ canEdit: true, hasRestriction: false }),
-  } as any;
+  const validateCanViewWithPermissions = gateError
+    ? jest.fn().mockRejectedValue(gateError)
+    : jest.fn().mockResolvedValue({ canEdit: true, hasRestriction: false });
+  const pageAccessService = { validateCanViewWithPermissions } as any;
   const resolvePreferLiveContent = jest
     .fn()
     .mockResolvedValue(preferLiveResult);
@@ -35,7 +38,7 @@ function makeController(page: any, preferLiveResult?: any) {
     undefined as any, // labelService
     undefined as any, // auditService
   );
-  return { controller, resolvePreferLiveContent };
+  return { controller, resolvePreferLiveContent, validateCanViewWithPermissions };
 }
 
 const user = { id: 'u1' } as any;
@@ -84,6 +87,23 @@ describe('PageController.getPage — preferLive (#654)', () => {
     );
     expect(res.content).toBe(LIVE_CONTENT);
     expect(res.contentSource).toBe('live');
+  });
+
+  it('permission gate REJECTS -> error propagates AND the preferLive probe is NEVER reached (no IDOR leak)', async () => {
+    // The view gate runs BEFORE the `if (dto.preferLive)` block. If a refactor
+    // ever hoisted the preferLive resolve above the gate, a non-viewer would leak
+    // live/unflushed content — this asserts the ORDER: the throw must short-circuit
+    // the request before resolvePreferLiveContent is ever called.
+    const denied = new Error('forbidden');
+    const { controller, resolvePreferLiveContent } = makeController(
+      { id: 'p1', content: DB_CONTENT },
+      { content: LIVE_CONTENT, contentSource: 'live' },
+      denied,
+    );
+    await expect(
+      controller.getPage({ pageId: 'p1', preferLive: true } as any, user),
+    ).rejects.toBe(denied);
+    expect(resolvePreferLiveContent).not.toHaveBeenCalled();
   });
 
   it('WITHOUT preferLive -> live probe NOT called, no contentSource/fallbackReason', async () => {

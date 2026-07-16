@@ -186,6 +186,63 @@ test("an unknown slug (never written/resolved) does NOT set the hint", async () 
   assert.equal(calls[0].preferLive, false);
 });
 
+// --- F1 (#654): the two write arms that route through the post-#672 write path ---
+// updatePage (now a server-side guarded replace via the guardedReplacePage seam)
+// and importPageMarkdown (now via the replacePage seam) must ARM the RYOW window
+// after a changed write. Deleting either arm previously left the suite green. These
+// tests exercise the REAL write method (stubbing ONLY the seams beneath it) and
+// assert the arm landed via shouldPreferLive, so removing the arm turns RED.
+function makeWriteClient() {
+  class TestClient extends DocmostClient {
+    async ensureAuthenticated() {}
+    async getCollabTokenWithReauth() {
+      return "collab-token";
+    }
+    // updatePage fetches the LIVE doc (to re-graft resolved comments) before its
+    // guarded write — return a usable ProseMirror body so the regraft passes.
+    async getPageRaw() {
+      return { id: P, slugId: "s10", title: "P", spaceId: "sp", content: doc("live") };
+    }
+    // updatePage's server-side CAS body-write seam (post-#672): report success so
+    // the arm right after it (updatePage's own rememberWrite) fires.
+    async guardedReplacePage() {
+      return { applied: true, newHash: "h" };
+    }
+    // Stub BENEATH the replacePage seam (its collab write), so the REAL replacePage
+    // runs and arms the RYOW window itself (context.ts) — importPageMarkdown relies on
+    // that seam arm, so removing the seam's rememberWrite (not any arm in pages.ts)
+    // turns this test RED. Report a real change so the arm fires.
+    async writeWithCollabAuthRetry() {
+      return { verify: { changed: true } };
+    }
+    // Expose the protected read-side gate the arm feeds.
+    prefers(uuid) {
+      return this.shouldPreferLive(uuid);
+    }
+  }
+  return new TestClient({
+    apiUrl: "http://127.0.0.1:1/api",
+    email: "e@x.com",
+    password: "pw",
+  });
+}
+
+test("updatePage arms RYOW (arm @ the guardedReplacePage call site in updatePage)", async () => {
+  const client = makeWriteClient();
+  assert.equal(client.prefers(P), false, "not armed before the write");
+  // baseHash is MANDATORY post-#647/#672; no title -> no REST title write.
+  await client.updatePage(P, "# hello", undefined, "base-hash-1");
+  assert.equal(client.prefers(P), true, "updatePage armed the RYOW window");
+});
+
+test("importPageMarkdown arms RYOW via the replacePage seam", async () => {
+  const client = makeWriteClient();
+  assert.equal(client.prefers(P), false, "not armed before the import");
+  const res = await client.importPageMarkdown(P, "# hello world");
+  assert.equal(res.success, true);
+  assert.equal(client.prefers(P), true, "importPageMarkdown armed the RYOW window");
+});
+
 test("expired RYOW window -> no hint + expired metric (not a dbrow fallback)", async () => {
   const prev = process.env.GITMOST_RYOW_WINDOW_MS;
   process.env.GITMOST_RYOW_WINDOW_MS = "1"; // 1ms window

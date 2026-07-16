@@ -7,7 +7,6 @@ import axios, { AxiosInstance } from "axios";
 import { convertProseMirrorToMarkdown } from "../lib/markdown-converter.js";
 import {
   updatePageContentRealtime,
-  replacePageContent,
   markdownToProseMirror,
   markdownToProseMirrorCanonical,
   mutatePageContent,
@@ -261,15 +260,13 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       baseHash,
     );
 
+    // #654 RYOW: a successful guarded replace always changed the body (it applied or 409'd), so arm the read-your-own-write hint for this client's next structural read.
+    this.rememberWrite(pageUuid, { changed: true });
+
     // Body persisted successfully — now it is safe to set the title.
     if (title) {
       await this.client.post("/pages/update", { pageId, title });
     }
-
-    // Arm the read-your-own-write window (#654): this body write goes through the
-    // free updatePageContentRealtime path (not a class seam), so it must arm here
-    // — else a following structural read (getOutline/getNode/...) would miss it.
-    this.rememberWrite(pageUuid, mutation.verify);
 
     return {
       success: true,
@@ -457,15 +454,15 @@ export function PagesMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     const collabToken = await this.getCollabTokenWithReauth();
     // Open the collab doc by the canonical UUID, never the slugId (#260).
     const pageUuid = await this.resolvePageId(pageId);
-    const mutation = await replacePageContent(
+    // #654 RYOW: route through the replacePage seam (not the free replacePageContent)
+    // — the seam arms the read-your-own-write window itself on a real change, exactly
+    // like copyPageContent/updatePageJson, so no explicit rememberWrite is needed here.
+    const mutation = await this.replacePage(
       pageUuid,
       doc,
       collabToken,
       this.apiUrl,
     );
-    // Arm the read-your-own-write window (#654): this full-replace via the free
-    // function bypasses the replacePage class seam, so arm it explicitly here.
-    this.rememberWrite(pageUuid, mutation.verify);
     // Collect distinct comment ids that actually became comment marks in the doc.
     const collectCommentIds = (node: any, acc: Set<string>): Set<string> => {
       if (!node || typeof node !== "object") return acc;
