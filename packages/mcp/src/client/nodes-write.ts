@@ -291,16 +291,25 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
       verify: mutation.verify,
     };
 
-    // If any applied edit matched only after stripping markdown (the
-    // normalized fallback), warn that editPageText preserved existing marks
-    // and did NOT change formatting — so a caller who intended a formatting
-    // change is pointed at patchNode.
-    if (results?.some((r) => r.normalized === true)) {
-      result.warning =
-        "Some edits matched only after stripping markdown from your find string; " +
-        "editPageText preserved existing marks (it did not change bold/strike/etc.). " +
-        "If you intended a formatting change, use patchNode.";
+    // Surface per-edit warnings from applyTextEdits (mirrors the `normalized`
+    // channel). Two sources, joined into the single result.warning string:
+    //  - literal-marker toggles that applied via the literal-exception (each
+    //    result carries its own `.warning`); and
+    //  - edits that matched only after stripping markdown (normalized): warn that
+    //    editPageText preserved existing marks and did NOT change formatting, so a
+    //    caller who intended a formatting change is pointed at patchNode.
+    const warnings: string[] = [];
+    for (const r of results ?? []) {
+      if (r.warning) warnings.push(`"${r.find}": ${r.warning}`);
     }
+    if (results?.some((r) => r.normalized === true)) {
+      warnings.push(
+        "Some edits matched only after stripping markdown from your find string; " +
+          "editPageText preserved existing marks (it did not change bold/strike/etc.). " +
+          "If you intended a formatting change, use patchNode.",
+      );
+    }
+    if (warnings.length > 0) result.warning = warnings.join(" ");
 
     return result;
   }

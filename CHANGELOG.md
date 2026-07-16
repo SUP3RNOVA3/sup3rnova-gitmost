@@ -482,6 +482,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`editPageText` no longer writes literal markdown markers from a `replace`
+  into the page.** The tool documents that a `replace` carrying `**bold**` /
+  `~~strike~~` / `` `code` `` wrappers is refused, but it only refused a *pure*
+  formatting toggle — a mixed edit (text change plus markers in `replace`) slipped
+  through and wrote literal asterisks (silent content corruption for an agent that
+  copied markdown out of `getNode`). It now refuses any `replace` containing a
+  balanced marker pair, and — because the refusal checks now run *after* the find
+  is located — it no longer wrongly blocks a legitimate cleanup of literal
+  `**bold**` that is verbatim in the page (that applies, with a self-correcting
+  warning). A refused edit fails closed; sibling edits in the batch are unaffected.
+
 - **Copying a PARTIAL table selection no longer puts GFM table syntax into the
   plain-text clipboard.** Selecting one cell used to copy `| T2 |` plus a
   `| --- |` header-separator line instead of the cell's text; selecting one row

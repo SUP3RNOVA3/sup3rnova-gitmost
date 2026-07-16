@@ -859,7 +859,9 @@ export const SHARED_TOOL_SPECS = {
       'failed[]. To change bold/italic/strike/code/link, read the block as ' +
       'page JSON and use a structural node patch/update to set its marks. ' +
       'Examples: edits:[{find:"teh",replace:"the"}]; edits:[{find:"Hello ' +
-      'world",replace:"Hello there"}] (crosses a bold boundary).',
+      'world",replace:"Hello there"}] (crosses a bold boundary). Exception: ' +
+      'literal markers found verbatim in the document are allowed (e.g. ' +
+      'cleaning up a stray find:"**bold**", replace:"bold").',
     tier: 'core',
     catalogLine:
       "editPageText — surgical find/replace of plain text in a page, preserving ids/marks.",
