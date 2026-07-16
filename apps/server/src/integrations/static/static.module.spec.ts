@@ -233,6 +233,7 @@ describe('StaticModule.onModuleInit — the real SPA catch-all (#636, integratio
       isClientTelemetryEnabled: () => false,
       isLocalFirstEnabled: () => false,
       isDrawioRasterEnabled: () => false,
+      isExcalidrawRasterEnabled: () => false,
     };
 
     const staticModule = new StaticModule(

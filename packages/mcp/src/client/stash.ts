@@ -174,15 +174,19 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
    * URLs within the TTL and one uptime. A failed image fetch never aborts the
    * doc: the original src is kept and the failure counted.
    *
-   * DIAGRAMS (issue #629): a `drawio` node is NOT mirrored as its raw
-   * `.drawio.svg` (that renders as garbage server-side — draw.io captions live
-   * in a browser-only `foreignObject`). Instead, if the SVG carries a valid
-   * browser-embedded PNG raster (DRAWIO_RASTER_ATTR), the PNG is stashed and the
-   * node is rewritten in-place to an `image` node pointing at it (`rasterized`).
-   * A diagram with no/invalid raster (e.g. a not-yet-migrated wiki, or a
-   * server-regenerated `.drawio.svg`) DEGRADES best-effort: it stays a drawio
-   * node with its original internal src, counted as `degraded` — this reader
-   * never throws on that, so "hand this to a translator" keeps working.
+   * DIAGRAMS (issue #629 draw.io, #632 excalidraw): a `drawio`/`excalidraw` node
+   * is NOT mirrored as its raw `.svg` under its own type (habr does not know
+   * these node types and would drop them; draw.io captions also live in a
+   * browser-only `foreignObject` that renders as garbage server-side). Instead,
+   * if the SVG carries a valid browser-embedded PNG raster (DRAWIO_RASTER_ATTR),
+   * the PNG is stashed and the node is rewritten in-place to an `image` node
+   * pointing at it (`rasterized`). A diagram with no/invalid raster diverges by
+   * type: a `drawio` node DEGRADES in place (stays a drawio node with its
+   * original src, counted `degraded`); an `excalidraw` node — whose SVG is itself
+   * VALID (real `<text>`) — instead has its SVG mirrored into the sandbox and the
+   * node rewritten to an `image` pointing at that SVG (also counted `degraded`),
+   * so habr renders it as an image rather than dropping it. This reader never
+   * throws on the no-raster case, so "hand this to a translator" keeps working.
    *
    * Returns { uri, sha256, size, images:{mirrored, failed},
    * diagrams:{rasterized, degraded} }. `uri` and `sha256` are for the document
@@ -220,7 +224,7 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     // so a copied diagram (two nodes, one src) is fetched/extracted once.
     const diagramBySrc = new Map<string, any[]>();
     for (const node of collectInternalFileNodes(cloned.content)) {
-      if (node.type === "drawio") {
+      if (node.type === "drawio" || node.type === "excalidraw") {
         const src = normalizeFileUrl(String(node.attrs.src));
         const group = diagramBySrc.get(src);
         if (group) group.push(node);
@@ -285,16 +289,33 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     let rasterized = 0;
     let degraded = 0;
     const synthesized: Array<{ uri: string; nodes: any[] }> = [];
+    // #632: excalidraw nodes with NO usable raster do NOT degrade in place (that
+    // drops them from habr, which does not know the `excalidraw` type). Because
+    // an excalidraw SVG is itself VALID (real `<text>`, no browser-only
+    // foreignObject), we MIRROR the SVG into the sandbox and rewrite the node to
+    // an `image` pointing at it. Unlike a synthesized PNG raster, this is a SOFT
+    // mirror: an eviction reverts the node to an in-place degrade (still counted
+    // as `degraded`), never a hard failure. Each entry snapshots the original
+    // node type+attrs so the revert can restore the excalidraw node exactly.
+    const svgMirrors: Array<{
+      uri: string;
+      orig: Array<{ node: any; type: string; attrs: any }>;
+    }> = [];
     const diagramGroups = [...diagramBySrc.entries()];
     for (let i = 0; i < diagramGroups.length; i += MAX_CONCURRENCY) {
       const batch = diagramGroups.slice(i, i + MAX_CONCURRENCY);
       await Promise.all(
         batch.map(async ([src, nodes]) => {
+          // A group shares one src => one attachment => one node type.
+          const nodeType = nodes[0]?.type;
+          let svgBuffer: Buffer | null = null;
           let png: Buffer | null = null;
           try {
             const { buffer } = await this.fetchInternalFile(src);
+            svgBuffer = buffer;
             png = extractDrawioRaster(buffer.toString("utf-8"));
           } catch (err) {
+            svgBuffer = null;
             png = null;
             console.warn(
               `stashPage: failed to read diagram "${src}": ${
@@ -303,7 +324,48 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
             );
           }
           if (!png) {
-            // No/invalid raster -> degrade: leave the drawio node untouched.
+            // No/invalid raster. For excalidraw the SVG is valid, so mirror it as
+            // an image instead of dropping it (below). For drawio (or an
+            // excalidraw whose SVG could not be fetched) -> degrade in place.
+            if (nodeType === "excalidraw" && svgBuffer) {
+              let storedSvg: { uri: string; sha256: string; size: number };
+              try {
+                storedSvg = this.sandboxPut!(svgBuffer, "image/svg+xml");
+              } catch (err) {
+                // Could not stash the SVG (e.g. exceeds a per-blob cap) ->
+                // degrade in place (leave the excalidraw node untouched).
+                degraded++;
+                console.warn(
+                  `stashPage: failed to mirror excalidraw SVG for "${src}": ${
+                    err instanceof Error ? err.message : String(err)
+                  }`,
+                );
+                return;
+              }
+              // Snapshot BEFORE mutating so an eviction can restore the exact
+              // excalidraw node (type + attrs).
+              const orig = nodes.map((node) => ({
+                node,
+                type: node.type,
+                attrs: node.attrs,
+              }));
+              for (const node of nodes) {
+                const alt = node.attrs.alt ?? node.attrs.title;
+                const width = node.attrs.width;
+                const align = node.attrs.align;
+                node.type = "image";
+                const attrs: any = { src: storedSvg.uri };
+                if (alt != null) attrs.alt = alt;
+                if (width != null) attrs.width = width;
+                if (align != null) attrs.align = align;
+                node.attrs = attrs;
+              }
+              svgMirrors.push({ uri: storedSvg.uri, orig });
+              // The diagram did not get a raster -> still counted as degraded.
+              degraded++;
+              return;
+            }
+            // drawio (or excalidraw with no fetchable SVG) -> degrade in place.
             degraded++;
             return;
           }
@@ -312,7 +374,7 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
             stored = this.sandboxPut!(png, "image/png");
           } catch (err) {
             // The synthesized PNG could not be stored (e.g. exceeds a per-blob
-            // cap). Degrade rather than abort — the node is still a valid drawio
+            // cap). Degrade rather than abort — the node is still a valid diagram
             // node pointing at its original src (nothing was mutated yet).
             degraded++;
             console.warn(
@@ -322,7 +384,7 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
             );
             return;
           }
-          // Convert each node in-place: drawio -> image, carrying alt (<- alt ||
+          // Convert each node in-place: diagram -> image, carrying alt (<- alt ||
           // title), width and align, and pointing src at the sandbox PNG. The
           // SVG itself is NOT put into the sandbox.
           for (const node of nodes) {
@@ -342,10 +404,10 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       );
     }
 
-    // Revert one mirror's nodes to their original internal srcs and re-count it
-    // as failed (its blob was FIFO-evicted before the doc could reference it
-    // safely).
-    const revertMirror = (mirror: {
+    // Revert one image mirror's nodes to their original internal srcs and
+    // re-count it as failed (its blob was FIFO-evicted before the doc could
+    // reference it safely).
+    const revertImageMirror = (mirror: {
       uri: string;
       entries: Array<{ node: any; origSrc: string }>;
     }) => {
@@ -358,9 +420,38 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       );
     };
 
-    // Free every blob this op stored (image mirrors + synthesized diagram
-    // rasters). Used on a HARD failure so nothing leaks in RAM for the TTL.
-    let liveMirrors = mirrors;
+    // Revert one excalidraw SVG mirror (#632): its sandbox SVG blob was evicted,
+    // so restore the ORIGINAL excalidraw node (type + attrs) — an in-place
+    // degrade, which is a correct fallback (the excalidraw SVG stays valid). The
+    // node was already counted as `degraded`, so no counter changes here.
+    const revertSvgMirror = (mirror: {
+      uri: string;
+      orig: Array<{ node: any; type: string; attrs: any }>;
+    }) => {
+      for (const o of mirror.orig) {
+        o.node.type = o.type;
+        o.node.attrs = o.attrs;
+      }
+      console.warn(
+        `stashPage: mirrored excalidraw SVG blob ${mirror.uri} was evicted ` +
+          `before the doc could reference it; reverted the node to an in-place ` +
+          `degrade`,
+      );
+    };
+
+    // Unified SOFT-revert mirror set (image mirrors + excalidraw SVG mirrors):
+    // both follow the FIFO-eviction revert path, as opposed to synthesized PNG
+    // rasters (which HARD-FAIL). Each carries its own revert closure so the
+    // reconciliation below is type-agnostic.
+    type SoftMirror = { uri: string; revert: () => void };
+    let liveMirrors: SoftMirror[] = [
+      ...mirrors.map((m) => ({ uri: m.uri, revert: () => revertImageMirror(m) })),
+      ...svgMirrors.map((m) => ({ uri: m.uri, revert: () => revertSvgMirror(m) })),
+    ];
+
+    // Free every blob this op stored (image mirrors + excalidraw SVG mirrors +
+    // synthesized diagram rasters). Used on a HARD failure so nothing leaks in
+    // RAM for the TTL.
     const cleanupOpBlobs = () => {
       if (!this.sandboxEvict) return;
       for (const mirror of liveMirrors) this.sandboxEvict(mirror.uri);
@@ -383,15 +474,17 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       }
     };
 
-    // Pre-put reconciliation: an image put earlier in THIS stash can FIFO-evict
-    // an even-earlier image of the same stash. Drop those from the live set
-    // first so the first serialized doc is already mostly correct.
+    // Pre-put reconciliation: a put earlier in THIS stash can FIFO-evict an
+    // even-earlier soft mirror of the same stash. Drop those from the live set
+    // first (reverting each) so the first serialized doc is already mostly
+    // correct.
     if (this.sandboxHas) {
-      liveMirrors = [];
-      for (const mirror of mirrors) {
-        if (this.sandboxHas(mirror.uri)) liveMirrors.push(mirror);
-        else revertMirror(mirror);
+      const stillLive: SoftMirror[] = [];
+      for (const mirror of liveMirrors) {
+        if (this.sandboxHas(mirror.uri)) stillLive.push(mirror);
+        else mirror.revert();
       }
+      liveMirrors = stillLive;
       // A synthesized raster evicted by a later put (image or another raster) in
       // this same stash -> hard failure.
       assertSynthLive();
@@ -434,7 +527,7 @@ export function StashMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
       // The doc we just stored references now-dead blobs. Revert those nodes,
       // drop the stale doc blob, and loop to re-serialize + re-put the
       // corrected doc.
-      for (const mirror of evictedNow) revertMirror(mirror);
+      for (const mirror of evictedNow) mirror.revert();
       liveMirrors = liveMirrors.filter((m) => this.sandboxHas!(m.uri));
       if (this.sandboxEvict) this.sandboxEvict(docStored.uri);
     }
