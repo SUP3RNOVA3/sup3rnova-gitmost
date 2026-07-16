@@ -12,7 +12,6 @@ import clsx from "clsx";
 import {
   IconChevronDown,
   IconChevronRight,
-  IconFileDescription,
   IconPointFilled,
 } from "@tabler/icons-react";
 import { ActionIcon, Box } from "@mantine/core";
@@ -20,7 +19,7 @@ import { extractPageSlugId } from "@/lib";
 import classes from "@/features/page/tree/styles/tree.module.css";
 import styles from "./share.module.css";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
-import EmojiPicker from "@/components/ui/emoji-picker.tsx";
+import { PageIcon } from "@/components/ui/page-icon.tsx";
 import {
   DocTree,
   type DocTreeApi,
@@ -154,19 +153,7 @@ function SharedTreeRow({
         onToggle={toggleOpen}
       />
       <div style={{ marginRight: "4px" }}>
-        <EmojiPicker
-          onEmojiSelect={() => {}}
-          icon={
-            node.icon ? (
-              node.icon
-            ) : (
-              <IconFileDescription size="18" />
-            )
-          }
-          readOnly={true}
-          removeEmojiAction={() => {}}
-          actionIconProps={{ tabIndex: -1 }}
-        />
+        <PageIcon value={node.icon} size={18} />
       </div>
       <span className={classes.text}>{node.name || t("untitled")}</span>
     </Box>

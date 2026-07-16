@@ -32,6 +32,8 @@ import {
   useUpdateAiRoleFromCatalogMutation,
 } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import { IAiRole } from "@/features/ai-chat/types/ai-chat.types.ts";
+import { LucideGlyph } from "@/components/ui/lucide/lucide-glyph.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 import {
   bundleCounts,
   bundlePhase,
@@ -835,7 +837,14 @@ function RoleRow({ role: r, checked, busy, onToggle, onUpdate }: RoleRowProps) {
       style={{ borderTop: "1px solid var(--mantine-color-default-border)" }}
     >
       <Text fz="lg" w={24} ta="center" style={{ flexShrink: 0 }}>
-        {r.emoji ?? ""}
+        {/* The catalog is a REMOTE preset source with its own glyph contract
+            (still native emoji today); render a Lucide glyph if the value is an
+            IconRef, otherwise show the remote string as-is — never raw JSON. */}
+        {parseIconRef(r.emoji) ? (
+          <LucideGlyph name={parseIconRef(r.emoji)?.name} size={18} />
+        ) : (
+          (r.emoji ?? "")
+        )}
       </Text>
       <div style={{ flex: 1, minWidth: 0 }}>
         <Group gap={6} align="baseline">

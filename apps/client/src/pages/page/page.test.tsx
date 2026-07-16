@@ -138,7 +138,9 @@ describe("Page chrome (local-first boot cache)", () => {
 
     // Title + header are on screen even though the page query is still pending.
     expect(chromeTitle()).toContain("Cached title");
-    expect(chromeTitle()).toContain("🚀");
+    // The page icon is a Lucide IconRef now, not a glyph renderable in a
+    // text-only <title>; the legacy emoji no longer prefixes the tab title.
+    expect(chromeTitle()).not.toContain("🚀");
     expect(screen.getByTestId("page-header")).toBeDefined();
     // The BODY is untouched by phase 1: still the network swap (skeleton).
     expect(screen.queryByTestId("full-editor")).toBeNull();

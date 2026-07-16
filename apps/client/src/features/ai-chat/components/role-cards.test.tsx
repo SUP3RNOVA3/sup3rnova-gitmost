@@ -10,7 +10,7 @@ const roles: IAiRole[] = [
   {
     id: "r1",
     name: "Pirate",
-    emoji: "🏴‍☠️",
+    emoji: '{"name":"anchor"}',
     description: "Talks like a pirate",
     enabled: true,
     autoStart: true,
@@ -37,13 +37,17 @@ function renderCards(onPick = vi.fn()) {
 }
 
 describe("RoleCards", () => {
-  it("renders one card per role with name, emoji, and description", () => {
-    renderCards();
+  it("renders one card per role with name, glyph, and description", () => {
+    const { container } = render(
+      <MantineProvider>
+        <RoleCards roles={roles} onPick={vi.fn()} />
+      </MantineProvider>,
+    );
     expect(screen.getByText("Pirate")).toBeDefined();
     expect(screen.getByText("Talks like a pirate")).toBeDefined();
     expect(screen.getByText("Grandpa")).toBeDefined();
-    // The emoji is shown for the role that has one.
-    expect(screen.getByText("🏴‍☠️")).toBeDefined();
+    // The role with an IconRef renders a Lucide glyph, never the raw JSON.
+    expect(container.textContent ?? "").not.toContain('{"name"');
   });
 
   it("does NOT render a Universal assistant card", () => {

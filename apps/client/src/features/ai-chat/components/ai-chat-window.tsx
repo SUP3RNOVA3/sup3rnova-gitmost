@@ -23,6 +23,8 @@ import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { useLocation, useMatch } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
+import { LucideGlyph } from "@/components/ui/lucide/lucide-glyph.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
@@ -817,7 +819,12 @@ export default function AiChatWindow() {
             a universal (no-role) chat. */}
         {currentRole && (
           <span className={classes.badge} title={t("Agent role")}>
-            {currentRole.emoji ? `${currentRole.emoji} ` : ""}
+            {parseIconRef(currentRole.emoji)?.name && (
+              <LucideGlyph
+                name={parseIconRef(currentRole.emoji)?.name}
+                size={14}
+              />
+            )}
             {currentRole.name}
           </span>
         )}

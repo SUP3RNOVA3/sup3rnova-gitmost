@@ -27,10 +27,20 @@ import { extractPageSlugId } from "@/lib";
 import { useCachedPageMeta } from "@/features/page/atoms/page-meta-cache-atom";
 import { useMediaQuery } from "@mantine/hooks";
 import { useTranslation } from "react-i18next";
+import { PageIcon } from "@/components/ui/page-icon.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 
-function getTitle(name: string, icon: string) {
-  if (icon) {
-    return `${icon} ${name}`;
+function getTitle(name: string, icon: string | null | undefined) {
+  // Render the Lucide glyph only when a valid IconRef is set (breadcrumb nodes
+  // without an icon stay text-only, as before); a legacy/invalid value shows no
+  // glyph rather than leaking raw JSON.
+  if (parseIconRef(icon)) {
+    return (
+      <>
+        <PageIcon value={icon} size={16} />
+        <span style={{ marginLeft: 4 }}>{name}</span>
+      </>
+    );
   }
   return name;
 }

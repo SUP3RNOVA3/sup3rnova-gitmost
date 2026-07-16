@@ -162,7 +162,9 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
   return (
     <div>
       <Helmet>
-        <title>{`${chromeMeta.icon || ""}  ${chromeMeta.title || t("Untitled")}`}</title>
+        {/* The page icon is now a Lucide IconRef (JSON), not a renderable glyph
+            in a text-only <title>; show just the title so no raw value leaks. */}
+        <title>{chromeMeta.title || t("Untitled")}</title>
       </Helmet>
 
       <MemoizedPageHeader readOnly={!canEdit} />

@@ -869,17 +869,21 @@ export default function AiProviderSettings() {
     !enabledRoles.some((r: IAiRole) => r.id === selectedRoleId)
       ? (roles ?? []).find((r: IAiRole) => r.id === selectedRoleId)
       : undefined;
+  // A Select option label is a plain string used for display AND filtering, so
+  // it cannot embed a rendered Lucide glyph — the role glyph (now a serialized
+  // IconRef, not a native emoji) is intentionally omitted here; the label is the
+  // role name only so no raw JSON can leak.
   const roleOptions = [
     { value: "", label: t("Built-in assistant persona") },
     ...enabledRoles.map((r: IAiRole) => ({
       value: r.id,
-      label: r.emoji ? `${r.emoji} ${r.name}` : r.name,
+      label: r.name,
     })),
     ...(selectedDisabledRole
       ? [
           {
             value: selectedDisabledRole.id,
-            label: `${selectedDisabledRole.emoji ? `${selectedDisabledRole.emoji} ` : ""}${selectedDisabledRole.name} (${t("disabled")})`,
+            label: `${selectedDisabledRole.name} (${t("disabled")})`,
           },
         ]
       : []),
