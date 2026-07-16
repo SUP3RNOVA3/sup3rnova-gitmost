@@ -381,11 +381,17 @@ test("updatePageMarkdown spec exists, pairs with updatePageJson, builds { pageId
   // Same tier as its JSON sibling.
   assert.equal(spec.tier, SHARED_TOOL_SPECS.updatePageJson.tier);
   const shape = spec.buildShape(z);
-  assert.deepEqual(Object.keys(shape).sort(), ["content", "pageId", "title"]);
-  // pageId + content required, title optional.
+  // #647 §H — baseHash is now part of the shape and MANDATORY (content is always
+  // written by updatePageMarkdown, so the guarded write always needs a base).
+  assert.deepEqual(Object.keys(shape).sort(), ["baseHash", "content", "pageId", "title"]);
+  // pageId + content + baseHash required, title optional.
   const schema = z.object(shape);
-  assert.doesNotThrow(() => schema.parse({ pageId: "p1", content: "# Hi" }));
+  assert.doesNotThrow(() =>
+    schema.parse({ pageId: "p1", content: "# Hi", baseHash: "h" }),
+  );
   assert.throws(() => schema.parse({ pageId: "p1" }));
+  // baseHash is mandatory: a write missing it is rejected at the schema.
+  assert.throws(() => schema.parse({ pageId: "p1", content: "# Hi" }));
   // The description must flag the `^[...]` inline-footnote parse path so the
   // markdown->footnote canonicalization guarantee stays documented (#411).
   assert.match(spec.description, /\^\[/);

@@ -1,8 +1,11 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { CreatePageDto, ContentFormat } from '../dto/create-page.dto';
 import { ContentOperation, UpdatePageDto } from '../dto/update-page.dto';
@@ -289,6 +292,28 @@ export class PageService {
     const iconChanged =
       updatePageDto.icon !== undefined && updatePageDto.icon !== page.icon;
 
+    // #647 §D — a guarded 'replace' (content + operation:'replace' + baseHash)
+    // runs the server-side write-CAS FIRST, before any metadata write, so a
+    // REJECTED write (409/422/503, thrown here) touches NOTHING — no bumped
+    // updatedAt/contributors and no history version. On success we fall through
+    // to the normal metadata/title write below (the bottom content block skips
+    // the already-applied guarded body). Non-guarded writes are unchanged.
+    const isGuardedReplace =
+      !!updatePageDto.content &&
+      updatePageDto.operation === 'replace' &&
+      !!updatePageDto.format &&
+      updatePageDto.baseHash !== undefined;
+    if (isGuardedReplace) {
+      await this.replacePageContentGuarded(
+        page.id,
+        updatePageDto.content!,
+        updatePageDto.format!,
+        updatePageDto.baseHash!,
+        user,
+        provenance,
+      );
+    }
+
     await this.pageRepo.updatePage(
       {
         title: updatePageDto.title,
@@ -337,10 +362,13 @@ export class PageService {
       );
 
     if (
+      !isGuardedReplace &&
       updatePageDto.content &&
       updatePageDto.operation &&
       updatePageDto.format
     ) {
+      // Non-guarded write: append/prepend, or a legacy 'replace' WITHOUT baseHash
+      // (back-compat, unchanged). The guarded 'replace' already ran above.
       await this.updatePageContent(
         page.id,
         updatePageDto.content,
@@ -384,6 +412,82 @@ export class PageService {
       documentName,
       { operation, prosemirrorJson, user },
     );
+  }
+
+  /**
+   * #647 §C/§D — guarded full replace (server-side write-CAS). Parses + footnote-
+   * canonicalizes the incoming body exactly like `updatePageContent`'s 'replace',
+   * then routes `replaceIfMatch` to the document owner: the base-hash compare and
+   * the structural overwrite happen ATOMICALLY on the authoritative live doc.
+   *
+   * Fail-closed on every non-apply outcome (§R4):
+   *  - hash mismatch → HTTP 409 + `currentHash` (a concurrent edit landed; the
+   *    client re-reads and retries). No content written, no history version.
+   *  - empty-over-non-empty (§C/B4) → HTTP 422 (would clear the page; refused).
+   *  - owner unreachable / bridge timeout → HTTP 503 (retryable). We NEVER read a
+   *    stale DB snapshot to satisfy the compare, so an unreachable owner can never
+   *    be clobbered.
+   *
+   * B3 attribution: the request provenance (`actor`/`aiChatId`/`apiKeyId`) is
+   * threaded into the collab connection context so the debounced store stamps the
+   * write as agent-authored and preserves the api-key/ai-chat identity.
+   */
+  async replacePageContentGuarded(
+    pageId: string,
+    content: string | object,
+    format: ContentFormat,
+    baseHash: string,
+    user: User,
+    provenance?: AuthProvenanceData,
+  ): Promise<{ applied: true; newHash: string }> {
+    let prosemirrorJson = await this.parseProsemirrorContent(content, format);
+    prosemirrorJson = canonicalizeFootnotes(prosemirrorJson);
+
+    const documentName = `page.${pageId}`;
+    let result;
+    try {
+      result = await this.collaborationGateway.handleYjsEvent(
+        'replaceIfMatch',
+        documentName,
+        {
+          prosemirrorJson,
+          baseHash,
+          user,
+          actor: provenance?.actor,
+          aiChatId: provenance?.aiChatId ?? null,
+          apiKeyId: provenance?.apiKeyId ?? null,
+        },
+      );
+    } catch (err) {
+      // Bridge timeout / no live collaboration instance: the owner is
+      // unreachable. Fail CLOSED (retryable) — do NOT fall back to a DB compare.
+      this.logger.warn(
+        `Guarded replace for ${pageId} could not reach the collab owner: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      throw new ServiceUnavailableException(
+        'Could not reach the live document to verify baseHash; retry shortly.',
+      );
+    }
+
+    if (!result.applied) {
+      if (result.reason === 'empty-replace-refused') {
+        throw new UnprocessableEntityException(
+          'Refusing a guarded replace that would empty a non-empty page. ' +
+            'Clear the page explicitly instead of overwriting it with an empty body.',
+        );
+      }
+      // Hash mismatch → 409 with the current hash so the client can re-read.
+      throw new ConflictException({
+        message:
+          'Page changed since it was read (baseHash mismatch). Re-read the ' +
+          'page to get a fresh baseHash and retry the write.',
+        currentHash: result.currentHash,
+      });
+    }
+
+    return result;
   }
 
   /**

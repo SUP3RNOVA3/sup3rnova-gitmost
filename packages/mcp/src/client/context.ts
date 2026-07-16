@@ -24,6 +24,7 @@ import {
   isCollabAuthFailedError,
 } from "../lib/collab-session.js";
 import { withPageLock, isUuid } from "../lib/page-lock.js";
+import { ConflictError } from "./conflict-error.js";
 import type { PageId } from "../lib/page-id.js";
 import { getCollabToken, performLogin } from "../lib/auth-utils.js";
 import {
@@ -1079,6 +1080,60 @@ export abstract class DocmostClientContext {
         this.toolAbortSignal ?? undefined,
       ),
     );
+  }
+
+  /**
+   * #647 §D/§G/§H — server-side GUARDED full replace. POSTs the final document to
+   * `/pages/update` as `operation:'replace'` + `baseHash`, so the authoritative
+   * collab process applies it ONLY if the live page still hashes to `baseHash`
+   * (compare-and-swap on the owner). This REPLACES the old client-collab write
+   * seam (`replacePage` / `mutatePageContent`) for the two full-overwrite tools:
+   * with the CAS on the server, the client no longer needs `withPageLock` or a
+   * collab-WS session (both are gone from this path — the server CAS is the
+   * concurrency control now).
+   *
+   * On HTTP 409 the server rejected the write (a concurrent edit landed); we
+   * translate it to a typed {@link ConflictError} carrying the server's
+   * `currentHash` so the caller can surface a "re-read and retry" message. Any
+   * other error propagates unchanged.
+   *
+   * `content` is sent as-is (a ProseMirror JSON object for format:'json', a
+   * markdown string for format:'markdown'); the server parses/canonicalizes it
+   * through the SAME path as a normal update before the CAS.
+   */
+  protected async guardedReplacePage(
+    pageId: string,
+    content: unknown,
+    format: "json" | "markdown",
+    baseHash: string,
+  ): Promise<{ applied: true; newHash?: string }> {
+    const pageUuid = await this.resolvePageId(pageId);
+    try {
+      const response = await this.client.post("/pages/update", {
+        pageId: pageUuid,
+        content,
+        operation: "replace",
+        format,
+        baseHash,
+      });
+      const data = response.data?.data ?? response.data;
+      // The REST update returns the refreshed page; the CAS applied (a rejection
+      // would have been a 409 thrown above). Surface the server hash if present.
+      return { applied: true, newHash: data?.contentHash };
+    } catch (e: any) {
+      if (axios.isAxiosError(e) && e.response?.status === 409) {
+        const body: any = e.response.data;
+        const currentHash =
+          body?.currentHash ?? body?.message?.currentHash ?? undefined;
+        throw new ConflictError(
+          `Page ${pageId} changed since it was read (baseHash ${baseHash} != ` +
+            `current ${currentHash ?? "unknown"}). Re-read the page ` +
+            `(getPageJson / getPage) to get a fresh baseHash, then retry.`,
+          currentHash,
+        );
+      }
+      throw e;
+    }
   }
 
   /**

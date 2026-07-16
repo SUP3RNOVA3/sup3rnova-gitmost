@@ -59,6 +59,7 @@ import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
 // see:https://github.com/ueberdosis/tiptap/issues/4089
 //import { generateJSON } from '@tiptap/html';
 import { Node, Schema } from '@tiptap/pm/model';
+import { updateYFragment } from 'y-prosemirror';
 import * as Y from 'yjs';
 import { Logger } from '@nestjs/common';
 
@@ -293,6 +294,31 @@ export function prosemirrorNodeToYElement(node: any): Y.XmlElement | Y.XmlText {
     element.insert(0, children);
   }
   return element;
+}
+
+/**
+ * #647 §C / R1 — write a ProseMirror JSON doc into the live Yjs fragment by
+ * STRUCTURAL DIFF (`updateYFragment`), the exact routine the editor itself uses
+ * to sync ProseMirror edits into Yjs. It diffs the new node against the current
+ * fragment and touches only the changed children, so unchanged nodes keep their
+ * Yjs identity (node ids). y-prosemirror anchors the editor selection to those
+ * ids, so a naive `fragment.delete(0,len)` + `toYdoc` + `applyUpdate` full replace
+ * (what `updatePageContent` operation='replace' does) discards every id and snaps
+ * an idle human editor's cursor to the end of the document on every agent write
+ * (the #152 regression). The guarded CAS replace uses THIS instead.
+ *
+ * MUST run inside a `doc.transact` (the caller's `connection.transact`) so the
+ * diff applies atomically with no remote update interleaving. Mirrors the MCP
+ * client's `applyDocToFragment` (packages/mcp/src/lib/collaboration.ts) but over
+ * the server's own schema (`jsonToNode`, which strips unknown node types).
+ */
+export function applyPmJsonToFragment(doc: Y.Doc, pmJson: JSONContent): void {
+  const pmNode = jsonToNode(pmJson);
+  const fragment = doc.getXmlFragment('default');
+  updateYFragment(doc, fragment, pmNode as any, {
+    mapping: new Map(),
+    isOMark: new Map(),
+  });
 }
 
 export function jsonToMarkdown(tiptapJson: any): string {
