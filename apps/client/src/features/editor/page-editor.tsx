@@ -111,6 +111,7 @@ import {
 } from "@/features/editor/local-first-body";
 import {
   pageYdocName,
+  pageYdocRoomName,
   registerPageYdoc,
   rememberYdocDbName,
   unregisterPageYdoc,
@@ -343,7 +344,12 @@ export default function PageEditor({
       };
       const remote = new HocuspocusProvider({
         websocketProvider: socket,
-        name: documentName,
+        // The collab ROOM name must stay `page.<pageId>` (NOT the scoped DB name):
+        // the server resolves the page via documentName.split('.')[1], so a scoped
+        // name would resolve the scope instead of the pageId and reject every
+        // authenticated connection (#626 regression). Local isolation is in the
+        // IndexedDB db name (`documentName`), never the room name.
+        name: pageYdocRoomName(pageId),
         document: ydoc,
         token: collabQuery?.token,
         onAuthenticationFailed: onAuthenticationFailedHandler,

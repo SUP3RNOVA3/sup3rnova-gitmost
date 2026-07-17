@@ -389,3 +389,31 @@ describe("migratePageYdocDatabasesOnce (#626 legacy cleanup)", () => {
     expect(localStorage.getItem("pageYdoc.legacyPurged.v1")).toBe("1");
   });
 });
+
+describe("pageYdocRoomName vs pageYdocName (collab room != db name)", () => {
+  // Mirrors the SERVER contract in apps/server/src/collaboration/
+  // collaboration.util.ts: getPageId(documentName) = documentName.split(".")[1].
+  // The collab ROOM name is what the client passes to HocuspocusProvider.name, so
+  // it MUST resolve back to the pageId here. #626 wired the scoped DB name into the
+  // room name, so the server resolved the scope instead of the pageId and rejected
+  // every authenticated collab connection — this locks that regression out.
+  const serverGetPageId = (documentName: string) => documentName.split(".")[1];
+
+  it("room name resolves to the pageId under the server's getPageId contract", async () => {
+    const mod = await freshImport();
+    const room = mod.pageYdocRoomName(PAGE_ID);
+    expect(room).toBe(`page.${PAGE_ID}`);
+    expect(serverGetPageId(room)).toBe(PAGE_ID);
+  });
+
+  it("the SCOPED db name must NOT be used as the room name (it resolves to the scope)", async () => {
+    const mod = await freshImport();
+    const dbName = mod.pageYdocName(PAGE_ID, SCOPE);
+    // The db name is deliberately 3-segment (page.<scope>.<pageId>); feeding it to
+    // the collab room resolves the SCOPE, not the pageId — the #626 break.
+    expect(serverGetPageId(dbName)).toBe(SCOPE);
+    expect(serverGetPageId(dbName)).not.toBe(PAGE_ID);
+    // The room name and the db name are distinct by construction.
+    expect(mod.pageYdocRoomName(PAGE_ID)).not.toBe(dbName);
+  });
+});
