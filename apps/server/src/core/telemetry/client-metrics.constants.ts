@@ -19,6 +19,14 @@ export const ALLOWED_METRIC_NAMES = new Set<string>([
   'page_meta_hit',
   'page_meta_miss',
   'page_meta_evict',
+  // #639 — offline-mode measurability. `page_open_body_ms` measures time to the
+  // first frame REAL body content is painted; `body_paint_timeout` is the
+  // survivorship-bias guard (body never painted within the timeout window). Both
+  // MUST also be in the client allowlist + union type (vitals.ts) — a name
+  // missing from EITHER side is silently dropped. `client_metrics.name` is plain
+  // text (no CHECK/enum), so no migration is needed.
+  'page_open_body_ms',
+  'body_paint_timeout',
 ]);
 
 // The only rating values accepted (web-vitals). Anything else -> null.

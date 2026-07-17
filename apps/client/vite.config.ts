@@ -62,6 +62,17 @@ export default defineConfig(({ mode }) => {
     BILLING_TRIAL_DAYS,
     POSTHOG_HOST,
     POSTHOG_KEY,
+    // #639 — these three flags reach the client ONLY through `window.CONFIG` in
+    // prod (static.module.ts), but in DEV the client reads `process.env` baked
+    // in here. They were absent from this allowlist, so `getConfigValue` read
+    // `undefined` in dev and e.g. `isLocalFirstEnabled()` was ALWAYS false —
+    // making the flag unreachable for any dev measurement. Prod is untouched.
+    LOCAL_FIRST_ENABLED,
+    CLIENT_TELEMETRY_ENABLED,
+    COMPACT_PAGE_TREE,
+    // #639 §4 — dev override of the telemetry sampling rate, so a dev taking a
+    // baseline by reloading does not silently collect nothing 3/4 of the time.
+    CLIENT_TELEMETRY_SAMPLE_RATE,
   } = loadEnv(mode, envPath, "");
 
   return {
@@ -77,6 +88,12 @@ export default defineConfig(({ mode }) => {
         BILLING_TRIAL_DAYS,
         POSTHOG_HOST,
         POSTHOG_KEY,
+        // #639 — see the loadEnv note above: without these keys the dev bundle
+        // reads `undefined` for the flags and always behaves as flag-OFF.
+        LOCAL_FIRST_ENABLED,
+        CLIENT_TELEMETRY_ENABLED,
+        COMPACT_PAGE_TREE,
+        CLIENT_TELEMETRY_SAMPLE_RATE,
       },
       APP_VERSION: JSON.stringify(appVersion),
     },

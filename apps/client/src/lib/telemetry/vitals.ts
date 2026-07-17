@@ -8,8 +8,11 @@ import {
   type LCPMetricWithAttribution,
   type TTFBMetricWithAttribution,
 } from "web-vitals/attribution";
-import { isClientTelemetryEnabled } from "@/lib/config";
-import { currentRouteTemplate } from "./route-template";
+import {
+  getClientTelemetrySampleRate,
+  isClientTelemetryEnabled,
+} from "@/lib/config";
+import { currentRouteTemplate, templateRoute } from "./route-template";
 
 /**
  * Client perf-telemetry (#355): web-vitals + custom metrics buffered and posted
@@ -32,6 +35,36 @@ const MAX_BUFFER = 40; // flush early if the buffer fills between timers
 const MAX_ATTR_LENGTH = 120;
 const EDITOR_TX_MIN_MS = 8; // only report editor transactions slower than this
 
+// #639 — hard cap on a mark-less (timeOrigin) page_open_body_ms measurement.
+// The mark-less start counts from `performance.timeOrigin`, i.e. document boot.
+// A programmatic (non-<a>) navigation after minutes of idle carries NO click
+// mark, so without a cap it would report the whole idle time (~300000 ms) and
+// single-handedly wreck the baseline's p75/p95. 60s is an order of magnitude
+// above the worst plausible cold-cache reload-to-paint (the lazy editor chunk on
+// a slow connection is a few seconds), yet far below the idle-then-navigate
+// inflation this cap exists to reject.
+const PAGE_OPEN_MAX_MS = 60_000;
+
+// #639 — survivorship-bias guard window. `page_open_body_ms` only reports on a
+// SUCCESSFUL paint; a body that never paints (offline, empty ydoc, REST never
+// arrived) would otherwise emit nothing and fall out of the sample, so p75
+// "improves" exactly when the feature fails. If the body is not painted within
+// this window of mount we emit `body_paint_timeout` instead. 15s is comfortably
+// longer than a cold-cache editor paint on a slow connection (so a slow-but-
+// successful paint cancels the timer first) and equals one FLUSH_INTERVAL_MS, so
+// a genuinely stuck body is recorded within a single flush window.
+const BODY_PAINT_TIMEOUT_MS = 15_000;
+
+// #639 — the route templates that own a page BODY editor. A mark-less
+// (reload/timeOrigin) measurement is only attributed when the document BOOTED on
+// one of these; see INITIAL_PATHNAME.
+const PAGE_ROUTE_TEMPLATES = new Set<string>([
+  "/s/:space/p/:slug",
+  "/p/:slug",
+  "/share/:shareId/p/:slug",
+  "/share/p/:slug",
+]);
+
 const ALLOWED_NAMES = new Set([
   "INP",
   "LCP",
@@ -44,6 +77,11 @@ const ALLOWED_NAMES = new Set([
   "page_meta_hit",
   "page_meta_miss",
   "page_meta_evict",
+  // #639 — real-body-paint latency + the never-painted survivorship counter.
+  // Must ALSO be in reportClientMetric's union type below AND the server
+  // ALLOWED_METRIC_NAMES; a name missing from EITHER side is silently dropped.
+  "page_open_body_ms",
+  "body_paint_timeout",
 ]);
 
 interface VitalEvent {
@@ -60,6 +98,41 @@ let initialised = false;
 let buffer: VitalEvent[] = [];
 let longtaskSum = 0; // accumulated longtask duration (ms) for the current window
 
+// #639 — the pathname the document BOOTED on, captured ONCE at module init.
+// Read LIVE, a later SPA navigation would make a mark-less programmatic open
+// (navigate(), not an <a> click) look like a fresh page load and attribute
+// minutes of idle time from timeOrigin. `navigation.type` does NOT help — it
+// stays "navigate" for the whole SPA document lifetime.
+const INITIAL_PATHNAME = readInitialPathname();
+
+// Body-paint latch state — one-shot per document (pageId). While a page open is
+// being measured its key is `bodyPaintMeasuringKey`; once it either reports or
+// times out the key moves to `bodyPaintResolvedKey`, so a second paint (the
+// static->live swap, or an editor re-creation) is a no-op.
+let bodyPaintMeasuringKey: string | null = null;
+let bodyPaintResolvedKey: string | null = null;
+let bodyPaintTimer: ReturnType<typeof setTimeout> | null = null;
+
+function readInitialPathname(): string {
+  try {
+    return window.location.pathname;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Parse the optional dev sampling-rate override (#639 §4) to a clamped [0,1]
+ * number, or null when unset/invalid (default 25% session sampling applies).
+ */
+function sampleRateOverride(): number | null {
+  const raw = getClientTelemetrySampleRate();
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n > 1 ? 1 : n;
+}
+
 /**
  * Decide once per session whether this session is sampled. Cached in
  * sessionStorage so the choice is stable across reloads within the session and
@@ -67,6 +140,14 @@ let longtaskSum = 0; // accumulated longtask duration (ms) for the current windo
  */
 export function isVitalsSampled(): boolean {
   if (sampledCache !== null) return sampledCache;
+  // #639 §4 — a forced rate (bench/baseline) decides WITHOUT reading the
+  // persisted sessionStorage choice: a dev turning the override on must not be
+  // silenced by an earlier tab-session's "not sampled". Cached like the normal
+  // path so the decision stays stable for every caller this module load.
+  const override = sampleRateOverride();
+  if (override !== null) {
+    return (sampledCache = override >= 1 ? true : Math.random() < override);
+  }
   try {
     const stored = sessionStorage.getItem(SAMPLE_KEY);
     if (stored === "1") return (sampledCache = true);
@@ -142,7 +223,11 @@ export function reportClientMetric(
     | "page_open_ms"
     | "page_meta_hit"
     | "page_meta_miss"
-    | "page_meta_evict",
+    | "page_meta_evict"
+    // #639 — must stay in lockstep with ALLOWED_NAMES above and the server
+    // ALLOWED_METRIC_NAMES; a name missing from any of the three is dropped.
+    | "page_open_body_ms"
+    | "body_paint_timeout",
   value: number,
   extra?: { docSize?: number },
 ): void {
@@ -174,22 +259,116 @@ export function markPageOpenStart(): void {
   }
 }
 
+function clearBodyPaintTimer(): void {
+  if (bodyPaintTimer !== null) {
+    clearTimeout(bodyPaintTimer);
+    bodyPaintTimer = null;
+  }
+}
+
 /**
- * Measure page_open_ms at first editor-content render, if a start mark exists.
- * Consumes the mark so a later render doesn't double-count.
+ * Compute the page_open_body_ms value to report, or null to SUPPRESS (#639).
+ *
+ * Start of count:
+ *  - a click mark (`gm_page_open_start`, set by the tree-row/link listener)
+ *    wins — count from it, and consume it;
+ *  - otherwise (a hard reload has no click) count from `performance.timeOrigin`
+ *    (i.e. `performance.now()`), but ONLY if the document BOOTED on a page route
+ *    AND the value is under the hard cap. Both guards are required: without the
+ *    initial-pathname guard a mark-less programmatic open would be measured at
+ *    all; without the cap an idle-then-navigate open on a page-booted document
+ *    would still slip through with minutes of idle time attributed.
  */
-export function measurePageOpen(): void {
+function computePageOpenElapsed(): number | null {
+  // 1) explicit click mark.
   try {
     const marks = performance.getEntriesByName(PAGE_OPEN_MARK, "mark");
-    if (marks.length === 0) return;
-    const started = marks[0].startTime;
-    const elapsed = performance.now() - started;
-    performance.clearMarks(PAGE_OPEN_MARK);
-    if (elapsed > 0 && Number.isFinite(elapsed)) {
-      reportClientMetric("page_open_ms", elapsed);
+    if (marks.length > 0) {
+      const elapsed = performance.now() - marks[0].startTime;
+      performance.clearMarks(PAGE_OPEN_MARK);
+      // The cap guards the MARK path too, not only the mark-less path: a click
+      // mark can go STALE (a cmd/middle-click or a click that never mounted a
+      // PageEditor in this tab leaves the mark unconsumed; markPageOpenStart only
+      // overwrites it on the NEXT qualifying click, not on a programmatic
+      // navigate()). Without the cap, the next mark-less open (e.g. the "new note"
+      // button) would consume that stale mark and report minutes of idle time,
+      // inflating exactly the baseline this phase exists to measure.
+      return elapsed > 0 && Number.isFinite(elapsed) && elapsed <= PAGE_OPEN_MAX_MS
+        ? elapsed
+        : null;
     }
   } catch {
-    // ignore
+    // fall through to the timeOrigin path
+  }
+  // 2) mark-less (reload) path — guarded.
+  if (!PAGE_ROUTE_TEMPLATES.has(templateRoute(INITIAL_PATHNAME))) return null;
+  const elapsed = performance.now();
+  if (!(elapsed > 0 && Number.isFinite(elapsed)) || elapsed > PAGE_OPEN_MAX_MS) {
+    return null;
+  }
+  return elapsed;
+}
+
+/**
+ * Arm the body-paint latch for a page open (call on mount / page switch), keyed
+ * by the document (pageId). Starts the survivorship-bias timeout: if the body is
+ * not painted within BODY_PAINT_TIMEOUT_MS, `body_paint_timeout` is emitted.
+ * Idempotent per key — an effect re-run for the same page neither restarts the
+ * timer nor re-measures an already-resolved open.
+ */
+export function armBodyPaint(docKey: string): void {
+  if (!isVitalsActive()) return;
+  if (docKey === bodyPaintResolvedKey || docKey === bodyPaintMeasuringKey) {
+    return;
+  }
+  clearBodyPaintTimer();
+  bodyPaintMeasuringKey = docKey;
+  bodyPaintTimer = setTimeout(() => {
+    if (bodyPaintMeasuringKey !== docKey) return;
+    bodyPaintMeasuringKey = null;
+    bodyPaintResolvedKey = docKey;
+    bodyPaintTimer = null;
+    // This open never painted; drop any click mark it was holding so a stale
+    // mark cannot leak forward and inflate the NEXT open's page_open_body_ms.
+    try {
+      performance.clearMarks(PAGE_OPEN_MARK);
+    } catch {
+      // no-op: performance marks are best-effort
+    }
+    reportClientMetric("body_paint_timeout", 1);
+  }, BODY_PAINT_TIMEOUT_MS);
+}
+
+/**
+ * Cancel an armed-but-unresolved body-paint measurement for `docKey` (call from
+ * an effect cleanup on unmount). If the page unmounts before it paints, we drop
+ * the pending survivorship timer instead of firing a `body_paint_timeout` for a
+ * page the user already navigated away from. A no-op once the latch resolved.
+ */
+export function disarmBodyPaint(docKey: string): void {
+  if (docKey !== bodyPaintMeasuringKey) return;
+  bodyPaintMeasuringKey = null;
+  clearBodyPaintTimer();
+}
+
+/**
+ * Record that REAL body content painted for `docKey` (call from BOTH paint
+ * points — the static copy and the swapped-in live editor). One-shot per
+ * document: the first call resolves the latch (cancels the timeout) and reports
+ * `page_open_body_ms` when a valid start is available; every later call for the
+ * same document is a no-op. A paint always resolves the latch even when the
+ * measured value is suppressed (the body DID paint, so it is not a timeout).
+ */
+export function notePageBodyPaint(docKey: string): void {
+  if (docKey !== bodyPaintMeasuringKey) return;
+  bodyPaintMeasuringKey = null;
+  bodyPaintResolvedKey = docKey;
+  clearBodyPaintTimer();
+  try {
+    const elapsed = computePageOpenElapsed();
+    if (elapsed !== null) reportClientMetric("page_open_body_ms", elapsed);
+  } catch {
+    // never let telemetry break rendering
   }
 }
 
@@ -226,6 +405,19 @@ export function initVitals(): void {
 
   // Sampling gate is evaluated BEFORE any observer subscription.
   if (!isVitalsSampled()) return;
+
+  // #639 §4 — a single dev-only confirmation that collection is actually ON, so
+  // a dev taking a baseline can tell "flag off" from "not sampled". Prod builds
+  // strip this branch (import.meta.env.DEV is statically false).
+  if (import.meta.env.DEV) {
+    const rate = sampleRateOverride();
+    // eslint-disable-next-line no-console
+    console.info(
+      `[vitals] client telemetry collection is ON (sample rate=${
+        rate ?? SAMPLE_RATE
+      }${rate !== null ? ", forced via CLIENT_TELEMETRY_SAMPLE_RATE" : ""})`,
+    );
+  }
 
   const report = (
     metric:
@@ -271,9 +463,9 @@ export function initVitals(): void {
     // longtask entry type unsupported: skip silently.
   }
 
-  // page_open_ms start: mark when the user clicks a page link/tree-row (any
+  // page_open_body_ms start: mark when the user clicks a page link/tree-row (any
   // anchor navigating to a page URL). Passive capture listener; the matching
-  // measure fires at first editor-content render (measurePageOpen). No page
+  // measure fires at first REAL body paint (notePageBodyPaint). No page
   // titles/slugs are read — only the click timing is marked.
   document.addEventListener(
     "click",
@@ -297,3 +489,25 @@ export function initVitals(): void {
 
   setInterval(flush, FLUSH_INTERVAL_MS);
 }
+
+/**
+ * Test-only inspection/reset hooks (#639). NOT part of the runtime API: they let
+ * the vitals specs observe the buffered events and reset module state between
+ * cases without a real network sink. Never called by production code.
+ */
+export const __vitalsTestHooks = {
+  drainBuffer(): VitalEvent[] {
+    const events = buffer;
+    buffer = [];
+    return events;
+  },
+  reset(): void {
+    buffer = [];
+    sampledCache = null;
+    initialised = false;
+    longtaskSum = 0;
+    bodyPaintMeasuringKey = null;
+    bodyPaintResolvedKey = null;
+    clearBodyPaintTimer();
+  },
+};

@@ -54,6 +54,15 @@ export function isClientTelemetryEnabled(): boolean {
   return castToBoolean(getConfigValue("CLIENT_TELEMETRY_ENABLED", "false"));
 }
 
+// #639 §4 — optional dev override of the telemetry sampling rate (0..1). When
+// UNSET the default 25% session sampling applies. Set to "1" to force-collect on
+// every reload while taking a baseline, so a stale "not sampled" tab-session
+// decision cannot silently collect nothing. Returns the raw string ("" when
+// unset); parsing/clamping lives in vitals.ts.
+export function getClientTelemetrySampleRate(): string {
+  return getConfigValue("CLIENT_TELEMETRY_SAMPLE_RATE", "");
+}
+
 // #563 — operator toggle for the local-first page boot cache. DEFAULT OFF: the
 // server mirrors LOCAL_FIRST_ENABLED into window.CONFIG; when off the page-meta
 // boot cache is neither written nor read and the page behaves exactly as before

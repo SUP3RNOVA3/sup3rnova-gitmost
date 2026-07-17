@@ -45,6 +45,27 @@ describe('VitalsService.buildRows', () => {
     expect(rows[0].name).toBe('LCP');
   });
 
+  // #639 criterion 6 — the two new body-paint metric names are registered in
+  // ALLOWED_METRIC_NAMES (accepted), while an unknown name is still dropped. A
+  // name missing from this server allowlist is silently dropped even if the
+  // client sends it, so this guards the server half of the 3-site registration.
+  it('accepts page_open_body_ms / body_paint_timeout and still drops unknown names (#639)', () => {
+    const rows = svc.buildRows(
+      {
+        events: [
+          { name: 'page_open_body_ms', value: 842, route: '/s/:space/p/:slug' },
+          { name: 'body_paint_timeout', value: 1, route: '/s/:space/p/:slug' },
+          { name: 'not_a_real_metric', value: 1 }, // still dropped
+        ],
+      },
+      WS,
+    );
+    expect(rows.map((r) => r.name)).toEqual([
+      'page_open_body_ms',
+      'body_paint_timeout',
+    ]);
+  });
+
   it('drops events with a non-numeric or missing value', () => {
     const rows = svc.buildRows(
       {

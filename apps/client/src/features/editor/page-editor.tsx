@@ -118,8 +118,10 @@ import {
 import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
 import { isLocalFirstEnabled } from "@/lib/config.ts";
 import {
+  armBodyPaint,
+  disarmBodyPaint,
   isVitalsActive,
-  measurePageOpen,
+  notePageBodyPaint,
   reportEditorTx,
 } from "@/lib/telemetry/vitals";
 
@@ -525,14 +527,16 @@ export default function PageEditor({
           editorRef.current = editor;
 
           // #355 — perf instrumentation. Skip ALL of it when telemetry is
-          // disabled (F1 flag off) or this session isn't sampled: no page-open
-          // measure, and crucially NO dispatch wrapping, so a non-collecting
-          // session pays zero per-transaction cost.
+          // disabled (F1 flag off) or this session isn't sampled: crucially NO
+          // dispatch wrapping, so a non-collecting session pays zero
+          // per-transaction cost.
+          //
+          // #639 — page_open_body_ms is NO LONGER measured here. onCreate fires
+          // on TipTap object CONSTRUCTION (2-3x per open, on a still-skeleton
+          // screen), not on paint, so it would report a false win once the
+          // local-first gates are lifted. It moved to the body-paint latch below
+          // (notePageBodyPaint), fed from the REAL paint points.
           if (isVitalsActive()) {
-            // page_open_ms: this is the first editor-content render, so measure
-            // against any page-open mark set on the tree-row/link click.
-            measurePageOpen();
-
             // editor_tx_ms: time the SYNCHRONOUS part of applying each
             // transaction (state.apply + updateState) by wrapping the view's
             // dispatch. Only slow syncs (>8ms) are reported (see reportEditorTx),
@@ -690,6 +694,33 @@ export default function PageEditor({
     // published from the effects below instead, which re-run on this very render
     // because the state reset above recomputes their inputs.
   }
+
+  // #639 — body-paint latency latch. Arm on mount / page switch (this also
+  // starts the survivorship-bias timeout), then report `page_open_body_ms` from
+  // whichever REAL paint point lands first. Keyed by pageId, so it is one-shot
+  // per document: the static->live swap and any editor re-creation for the same
+  // page cannot double-count. armBodyPaint/notePageBodyPaint are no-ops when
+  // telemetry is off or this session isn't sampled.
+  useEffect(() => {
+    armBodyPaint(pageId);
+    // Disarm on unmount / before re-arming for another page: if this page leaves
+    // before it paints, drop the pending survivorship timer instead of emitting a
+    // body_paint_timeout for a page the user already navigated away from.
+    return () => disarmBodyPaint(pageId);
+  }, [pageId]);
+
+  // Static-copy paint: PageEditor only mounts after the page content resolved
+  // (page.tsx shows a skeleton until then), so the server-seeded static copy IS
+  // real body content the moment this branch is on screen.
+  useEffect(() => {
+    if (showStatic) notePageBodyPaint(pageId);
+  }, [showStatic, pageId]);
+
+  // Live-editor paint: after the static->live swap the collab-bound editor
+  // renders the body. Whichever branch paints first wins the one-shot latch.
+  useEffect(() => {
+    if (!showStatic && editor) notePageBodyPaint(pageId);
+  }, [showStatic, editor, pageId]);
 
   // Reserved height held across the static -> live editor swap. The live editor
   // lays out its content over a few frames, so replacing the (full-height) static
