@@ -35,7 +35,12 @@ export type SafetyMetricName =
   | "ydoc_idb_quota_error"
   // The tombstone store is unreadable/unwritable, so the local-paint path is
   // disabled for the WHOLE session (fail-closed fallback to the network gate).
-  | "ydoc_local_paint_disabled";
+  | "ydoc_local_paint_disabled"
+  // #641, part 4 — a 5xx response on an OFFLINE-CRITICAL request (/me,
+  // /pages/info, /spaces/*). The server ANSWERED with an error, so this is a
+  // real (possibly partial) outage that must NOT hide behind "offline, cached
+  // copy": it is counted + reported here, distinct from an unreachable network.
+  | "http_server_error";
 
 const ENDPOINT = "/api/telemetry/vitals";
 

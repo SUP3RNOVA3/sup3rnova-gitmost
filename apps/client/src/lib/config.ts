@@ -98,6 +98,25 @@ export function getOfflineGraceMs(): number {
   return parseDurationMs(getConfigValue("OFFLINE_GRACE", "30d"));
 }
 
+// #641, part 5 — per-request timeout for the OFFLINE-CRITICAL requests (/me,
+// /pages/info, /spaces/*) ONLY. It is deliberately NOT set on the axios instance
+// (api-client.ts): uploads, imports and long exports share that instance and
+// must stay untimed (they are already special-cased there). A hung connection —
+// captive portal, half-open TCP after a laptop wake — otherwise never settles,
+// so the page sticks in a skeleton forever with neither data nor error. 15s is
+// well above a slow-mobile TTFB yet bounds such a hang so it resolves into a
+// transport error the offline path can handle.
+export const OFFLINE_CRITICAL_TIMEOUT_MS = 15_000;
+
+/**
+ * Axios per-request config for an offline-critical request. Returns the timeout
+ * ONLY when local-first is enabled, so a flag-OFF deploy is byte-for-behavior
+ * unchanged (axios default: no timeout, requests can hang indefinitely as today).
+ */
+export function offlineCriticalRequestConfig(): { timeout?: number } {
+  return isLocalFirstEnabled() ? { timeout: OFFLINE_CRITICAL_TIMEOUT_MS } : {};
+}
+
 export function getAvatarUrl(
   avatarUrl: string,
   type: AvatarIconType = AvatarIconType.AVATAR,

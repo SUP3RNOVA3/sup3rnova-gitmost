@@ -703,6 +703,29 @@ export default function PageEditor({
   // the height reservation must be released on the live editor's first laid-out
   // frame rather than waiting for it to match the static copy's height (guard 6).
   const [earlySwap, setEarlySwap] = useState(false);
+  // #641, part 6 — offline hysteresis latch. Set once the live-local body is on
+  // screen and we are really offline; cleared only by a real remote sync (below)
+  // or a page switch (the reset block). Holds the banner steady across
+  // Hocuspocus's forever-retry Connecting/Disconnected flaps.
+  const [stickyOffline, setStickyOffline] = useState(false);
+  // #641, part 5 — the offline UI is driven by `navigator.onLine` AND the collab
+  // socket status (which already has a 7500ms fallback), not by a query error
+  // alone. Reactive via the online/offline events so a real network drop flips
+  // the banner without waiting for the socket timeout.
+  const [browserOffline, setBrowserOffline] = useState(
+    () => typeof navigator !== "undefined" && navigator.onLine === false,
+  );
+  useEffect(() => {
+    if (!localFirst || typeof window === "undefined") return;
+    const update = () => setBrowserOffline(navigator.onLine === false);
+    update();
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
+    return () => {
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
+    };
+  }, [localFirst]);
 
   // #564 — a page switch that does NOT remount this component (page.tsx keys
   // FullEditor by page.id today, but nothing here may rely on that) must not
@@ -721,6 +744,7 @@ export default function PageEditor({
     isRemoteConfirmedRef.current = false;
     setShowStatic(true);
     setEarlySwap(false);
+    setStickyOffline(false);
     hasConnectedOnceRef.current = false;
     // NOTE: the jotai stores (bodyLocalOnlyAtom / bodyWriteBlockedAtom) are
     // deliberately NOT written here. Setting an atom other components subscribe
@@ -860,13 +884,28 @@ export default function PageEditor({
     return () => setBodyWriteBlocked(false);
   }, [bodyWriteBlocked, setBodyWriteBlocked]);
 
+  // #641, part 6 — drive the hysteresis latch. Set it once the live-local body is
+  // on screen and we are really offline (dead socket OR the browser reports
+  // offline); clear it the instant a real remote sync confirms. The reset block
+  // above additionally clears it on a page switch.
+  const reallyOffline =
+    yjsConnectionStatus === WebSocketStatus.Disconnected || browserOffline;
+  useEffect(() => {
+    if (isRemoteConfirmed) {
+      setStickyOffline(false);
+      return;
+    }
+    if (!showStatic && reallyOffline) setStickyOffline(true);
+  }, [isRemoteConfirmed, showStatic, reallyOffline]);
+
   // #564, guards 4+5 — what the user is told about the un-reconciled state.
   const bodyIndicator = computeBodyIndicator({
     localFirst,
     showStatic,
     isRemoteConfirmed,
-    isDisconnected: yjsConnectionStatus === WebSocketStatus.Disconnected,
+    isDisconnected: reallyOffline,
     canEdit: editable && currentPageEditMode === PageEditMode.Edit,
+    stickyOffline,
   });
 
   // The "offline, showing the cached copy" state is published for FullEditor, so
