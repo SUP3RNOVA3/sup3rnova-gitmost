@@ -27,6 +27,9 @@ import {
   METRIC_MCP_GETPAGE_CACHE_HITS_TOTAL,
   METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL,
   METRIC_MCP_DOWNLOAD_BYTES_TOTAL,
+  METRIC_MCP_RYOW_LIVE_TOTAL,
+  METRIC_MCP_RYOW_DBROW_TOTAL,
+  METRIC_MCP_RYOW_EXPIRED_TOTAL,
   METRIC_API_KEY_AUTH_DENIED_TOTAL,
   METRIC_AI_CHAT_BIND_SKIPPED_TOTAL,
   sizeBucket,
@@ -71,6 +74,10 @@ let getPageCacheHitsCounter: Counter | null = null;
 let getPageCacheMissesCounter: Counter | null = null;
 // #613 — bytes read over the loopback by the MCP downloadFile tool, by tool label.
 let mcpDownloadBytesCounter: Counter<'tool'> | null = null;
+// #654 — MCP read-your-own-writes freshness counters.
+let mcpRyowLiveCounter: Counter | null = null;
+let mcpRyowDbrowCounter: Counter<'reason'> | null = null;
+let mcpRyowExpiredCounter: Counter | null = null;
 // #558 — api-key auth denials, by bounded reason label.
 let apiKeyAuthDeniedCounter: Counter<'reason'> | null = null;
 // #665 — page->chat binding skips, by bounded reason label.
@@ -209,6 +216,23 @@ function init(): void {
     registers: [registry],
   });
 
+  mcpRyowLiveCounter = new Counter({
+    name: METRIC_MCP_RYOW_LIVE_TOTAL,
+    help: 'Total MCP structural reads served the LIVE collab doc after a read-your-own-writes hint',
+    registers: [registry],
+  });
+  mcpRyowDbrowCounter = new Counter({
+    name: METRIC_MCP_RYOW_DBROW_TOTAL,
+    help: 'Total MCP structural reads that fell back to the DB row despite a read-your-own-writes hint, by bounded reason',
+    labelNames: ['reason'],
+    registers: [registry],
+  });
+  mcpRyowExpiredCounter = new Counter({
+    name: METRIC_MCP_RYOW_EXPIRED_TOTAL,
+    help: 'Total MCP structural reads whose read-your-own-writes window had expired (no preferLive hint was sent)',
+    registers: [registry],
+  });
+
   apiKeyAuthDeniedCounter = new Counter({
     name: METRIC_API_KEY_AUTH_DENIED_TOTAL,
     help: 'Total api-key auth denials in ApiKeyService.validate, by bounded reason',
@@ -340,6 +364,23 @@ export function incAiChatBindSkipped(reason: AiChatBindSkipReason): void {
 export function addMcpDownloadBytes(tool: string, bytes: number): void {
   if (!Number.isFinite(bytes) || bytes < 0) return;
   mcpDownloadBytesCounter?.inc({ tool }, bytes);
+}
+
+export function incMcpRyowLive(): void {
+  mcpRyowLiveCounter?.inc();
+}
+
+// #654 — the RYOW db-row fallback reason is server-derived and BOUNDED
+// ('not_loaded' | 'owner_unreachable'); bound it here defensively so an
+// unexpected/future value can never blow up label cardinality.
+const RYOW_DBROW_REASONS = new Set(['not_loaded', 'owner_unreachable']);
+export function incMcpRyowDbrow(reason?: string): void {
+  const bounded = reason && RYOW_DBROW_REASONS.has(reason) ? reason : 'other';
+  mcpRyowDbrowCounter?.inc({ reason: bounded });
+}
+
+export function incMcpRyowExpired(): void {
+  mcpRyowExpiredCounter?.inc();
 }
 
 export function observeMcpTool(tool: string, seconds: number): void {

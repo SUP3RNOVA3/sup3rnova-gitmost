@@ -29,6 +29,9 @@ import {
   incGetPageCacheHit,
   incGetPageCacheMiss,
   addMcpDownloadBytes,
+  incMcpRyowLive,
+  incMcpRyowDbrow,
+  incMcpRyowExpired,
 } from '../metrics/metrics.registry';
 
 // Minimal shape of the embedded MCP HTTP handler exported by @docmost/mcp/http.
@@ -103,6 +106,12 @@ export function routeMcpMetric(
     incGetPageCacheMiss();
   } else if (name === 'mcp_download_bytes_total') {
     addMcpDownloadBytes(labels?.tool ?? 'other', value);
+  } else if (name === 'mcp_ryow_live_total') {
+    incMcpRyowLive();
+  } else if (name === 'mcp_ryow_dbrow_total') {
+    incMcpRyowDbrow(labels?.reason);
+  } else if (name === 'mcp_ryow_expired_total') {
+    incMcpRyowExpired();
   }
 }
 

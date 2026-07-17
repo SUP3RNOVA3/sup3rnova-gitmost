@@ -127,7 +127,9 @@ async function main() {
     check("editPageText: missing text reported", err2.includes("not found"), err2);
 
     // 5. update_page (markdown): table + callout must survive the re-import
-    await client.updatePage(pageId, MD + "\nДобавленный абзац.\n");
+    // #647/#672 — full-body overwrite is baseHash-guarded: read fresh, then write WITH the hash.
+    const updMdBase = await client.getPageJson(pageId);
+    await client.updatePage(pageId, MD + "\nДобавленный абзац.\n", undefined, updMdBase.baseHash);
     await new Promise((r) => setTimeout(r, 16000));
     const pj3 = await client.getPageJson(pageId);
     const types3 = pj3.content.content.map((n) => n.type);
@@ -143,7 +145,8 @@ async function main() {
       attrs: { id: "testidjsonpush", indent: 0, textAlign: null },
       content: [{ type: "text", text: "Абзац, добавленный через updatePageJson." }],
     });
-    await client.updatePageJson(pageId, pj3.content);
+    // #647/#672 — full-body overwrite is baseHash-guarded: reuse pj3's hash (no intervening write).
+    await client.updatePageJson(pageId, pj3.content, undefined, pj3.baseHash);
     await new Promise((r) => setTimeout(r, 16000));
     const pj4 = await client.getPageJson(pageId);
     const lastNode = pj4.content.content[pj4.content.content.length - 1];
@@ -260,7 +263,9 @@ async function main() {
       const fp = await client.createPage("E2E features " + Date.now(), "init", spaceId);
       const fid = fp.data.id;
       try {
-        await client.updatePage(fid, FMD);
+        // #647/#672 — full-body overwrite is baseHash-guarded: read fresh, then write WITH the hash.
+        const featBase = await client.getPageJson(fid);
+        await client.updatePage(fid, FMD, undefined, featBase.baseHash);
         await new Promise((r) => setTimeout(r, 16000));
         const fj = (await client.getPageJson(fid)).content;
         check("feature: callout type 'warning' preserved (was coerced to info)", findNodes(fj, "callout").some((n) => n.attrs?.type === "warning"), JSON.stringify(findNodes(fj, "callout").map((n) => n.attrs?.type)));
@@ -299,6 +304,8 @@ async function main() {
           content: [{ type: "text", text }],
         });
         // Seed three paragraphs with known ids.
+        // #647/#672 — full-body overwrite is baseHash-guarded: read fresh, then write WITH the hash.
+        const nodeSeedBase = await client.getPageJson(nid);
         await client.updatePageJson(nid, {
           type: "doc",
           content: [
@@ -306,7 +313,7 @@ async function main() {
             mkPara("nodeops-b", "Bravo paragraph."),
             mkPara("nodeops-c", "Charlie paragraph."),
           ],
-        });
+        }, undefined, nodeSeedBase.baseHash);
         await new Promise((r) => setTimeout(r, 16000));
 
         // Read back the ids the server actually assigned.

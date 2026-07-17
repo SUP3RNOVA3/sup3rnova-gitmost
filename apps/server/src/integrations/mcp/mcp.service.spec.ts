@@ -29,6 +29,9 @@ jest.mock('../metrics/metrics.registry', () => ({
   incGetPageCacheHit: jest.fn(),
   incGetPageCacheMiss: jest.fn(),
   addMcpDownloadBytes: jest.fn(),
+  incMcpRyowLive: jest.fn(),
+  incMcpRyowDbrow: jest.fn(),
+  incMcpRyowExpired: jest.fn(),
 }));
 import * as metrics from '../metrics/metrics.registry';
 
@@ -1038,6 +1041,15 @@ describe('routeMcpMetric — the package→prom metric mapping (#402/#479/#613)'
     expect(metrics.observeMcpTool).not.toHaveBeenCalled();
   });
 
+  it('routes the three RYOW freshness samples, dbrow carrying its bounded reason label', () => {
+    routeMcpMetric('mcp_ryow_live_total', 1);
+    routeMcpMetric('mcp_ryow_dbrow_total', 1, { reason: 'owner_unreachable' });
+    routeMcpMetric('mcp_ryow_expired_total', 1);
+    expect(metrics.incMcpRyowLive).toHaveBeenCalledTimes(1);
+    expect(metrics.incMcpRyowDbrow).toHaveBeenCalledWith('owner_unreachable');
+    expect(metrics.incMcpRyowExpired).toHaveBeenCalledTimes(1);
+  });
+
   it('discards an unknown name without throwing (the closed mapping)', () => {
     expect(() =>
       routeMcpMetric('totally_unknown_total', 1, { tool: 'x' }),
@@ -1083,7 +1095,10 @@ describe('routeMcpMetric — the package→prom metric mapping (#402/#479/#613)'
         (metrics.incConnectTimeout as jest.Mock).mock.calls.length +
         (metrics.incGetPageCacheHit as jest.Mock).mock.calls.length +
         (metrics.incGetPageCacheMiss as jest.Mock).mock.calls.length +
-        (metrics.addMcpDownloadBytes as jest.Mock).mock.calls.length;
+        (metrics.addMcpDownloadBytes as jest.Mock).mock.calls.length +
+        (metrics.incMcpRyowLive as jest.Mock).mock.calls.length +
+        (metrics.incMcpRyowDbrow as jest.Mock).mock.calls.length +
+        (metrics.incMcpRyowExpired as jest.Mock).mock.calls.length;
       if (routed !== 1) {
         throw new Error(
           `the package emits "${name}" but routeMcpMetric routed it to ${routed} ` +

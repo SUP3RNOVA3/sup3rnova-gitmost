@@ -13,6 +13,9 @@ import {
   incDocUnload,
   incGetPageCacheHit,
   incGetPageCacheMiss,
+  incMcpRyowDbrow,
+  incMcpRyowExpired,
+  incMcpRyowLive,
   isMetricsEnabled,
   observeCollabAuth,
   observeCollabConnect,
@@ -206,6 +209,10 @@ describe('metrics helpers are safe no-ops when METRICS_PORT is unset', () => {
       // A garbage value must not throw either (prom-client throws on inc(<0)).
       addMcpDownloadBytes('downloadFile', -1);
       addMcpDownloadBytes('downloadFile', Number.NaN);
+      // #654 — the RYOW freshness helpers must be no-ops too when disabled.
+      incMcpRyowLive();
+      incMcpRyowDbrow('owner_unreachable');
+      incMcpRyowExpired();
       // Registering a source must not create the gauge or invoke the fn.
       registerDocsOpenSource(() => {
         throw new Error('docsOpenSource must NOT be called when disabled');

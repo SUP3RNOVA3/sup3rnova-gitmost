@@ -43,6 +43,18 @@ export const METRIC_MCP_GETPAGE_CACHE_MISSES_TOTAL =
 // (bounded cardinality). Same "do not rename" contract.
 export const METRIC_MCP_DOWNLOAD_BYTES_TOTAL = 'mcp_download_bytes_total';
 
+// #654 — MCP read-your-own-writes (RYOW) freshness signals emitted by the
+// @docmost/mcp package's onMetric sink after a structural read that requested
+// the live doc. live = got the live collab doc; dbrow = fell back to the
+// (possibly stale) DB row, labelled by the bounded fallback reason; expired =
+// the client's RYOW window had lapsed so no preferLive hint was even sent.
+// routeMcpMetric routes each onto these counters so the freshness/degradation
+// is visible on /metrics (a package metric with no branch is DISCARDED). Same
+// "do not rename" contract.
+export const METRIC_MCP_RYOW_LIVE_TOTAL = 'mcp_ryow_live_total';
+export const METRIC_MCP_RYOW_DBROW_TOTAL = 'mcp_ryow_dbrow_total';
+export const METRIC_MCP_RYOW_EXPIRED_TOTAL = 'mcp_ryow_expired_total';
+
 // #558 — api-key auth denial observability. Every DEFINITE deny in
 // ApiKeyService.validate (shared by REST jwt.strategy and the /mcp Bearer path)
 // increments this counter, labelled by the BOUNDED deny reason. It replaces the
