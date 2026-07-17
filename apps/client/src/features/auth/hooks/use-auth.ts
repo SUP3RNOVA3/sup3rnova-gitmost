@@ -50,11 +50,13 @@ export default function useAuth() {
       // unlike logout, we stay in this session, so persistence must keep working.
       setCurrentUser(RESET);
       clearPersistedTreeCaches({ freezeWrites: false });
-      // #626 — also drop the previous user's local page-body ydoc databases, so
-      // a different user signing in on a shared browser never inherits them as a
-      // starting state (namespacing already prevents cross-scope reads; this is
-      // the belt-and-suspenders physical delete).
-      purgePageYdocDatabases();
+      // #626 / #640 — also drop the previous user's local page-body ydoc
+      // databases, so a different user signing in on a shared browser never
+      // inherits them (namespacing already prevents cross-scope reads; this is
+      // the belt-and-suspenders physical delete). AWAITED (#640, part 4): the
+      // navigate() below is an SPA transition, and without the await the deletion
+      // would race the next user's first page open.
+      await purgePageYdocDatabases();
 
       setIsLoading(false);
 
@@ -148,9 +150,13 @@ export default function useAuth() {
     // machine. (Only the tree caches are swept; other localStorage entries
     // remain.)
     clearPersistedTreeCaches();
-    // #626 — purge the local page-body ydoc databases too: on a shared machine
-    // they would otherwise stay readable on disk after logout.
-    purgePageYdocDatabases();
+    // #626 / #640 — purge the local page-body ydoc databases too: on a shared
+    // machine they would otherwise stay readable on disk after logout. AWAITED
+    // (#640, part 4) BEFORE the window.location.replace below, otherwise the
+    // synchronous redirect tears this tab down before `deleteDatabase` finishes.
+    // The purge broadcasts a "close your ydocs" message so other tabs release
+    // their IDB handles and the delete is not silently blocked.
+    await purgePageYdocDatabases();
     await logout();
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
   };

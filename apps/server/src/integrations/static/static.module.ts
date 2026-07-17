@@ -146,6 +146,10 @@ export class StaticModule implements OnModuleInit {
         // #563 — mirrors LOCAL_FIRST_ENABLED so the client's page-meta boot
         // cache (instant chrome) is only active when the operator opts in.
         LOCAL_FIRST_ENABLED: this.environmentService.isLocalFirstEnabled(),
+        // #640 — mirrors the network-independent session boundary. After this
+        // long without a successful `/me`, the client refuses to draw ANY local
+        // content and purges it (defaults to JWT_TOKEN_EXPIRES_IN).
+        OFFLINE_GRACE: this.environmentService.getOfflineGrace(),
         // #629 — mirrors DRAWIO_RASTER_ENABLED so the draw.io editor only embeds
         // a PNG raster into the saved .drawio.svg when the operator opts in
         // (off => today's svg-only save; the file-size cost is reversible).

@@ -253,7 +253,20 @@ import PageEditor from "./page-editor";
 import { queryClient } from "@/main.tsx";
 import { bodyLocalOnlyAtom } from "@/features/editor/atoms/editor-atoms";
 import { pageEditorAtom } from "@/features/editor/atoms/editor-atoms";
-import { resetPageYdocRegistryForTests } from "./page-ydoc-eviction";
+import {
+  resetPageYdocRegistryForTests,
+  pageYdocDbName,
+} from "./page-ydoc-eviction";
+import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
+import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
+import {
+  resetTombstonesForTests,
+  addTombstones,
+} from "./page-ydoc-tombstones";
+import {
+  clearSessionVerifiedForTests,
+  recordSessionVerified,
+} from "@/features/user/session-verified";
 import type { Editor } from "@tiptap/react";
 
 const PAGE_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -332,12 +345,38 @@ function getEditor(store: ReturnType<typeof createStore>): Editor {
   return editor;
 }
 
+// Warm the store with the resolved (workspace, user) scope BEFORE the first
+// render. In production the #640 `getOnInit` on `currentUserAtom` reads the
+// persisted user at atom CONSTRUCTION (app boot — localStorage is already
+// populated from the prior session), so the very first frame, and therefore the
+// one-shot `[pageId]` provider effect that reads `scopeKeyAtom`, already sees the
+// real scope. Under vitest the atom module is evaluated BEFORE this file's
+// `beforeEach` sets localStorage, so at getOnInit time storage is still empty and
+// the store starts at "anon:anon"; the storage-backed `onMount` resolves it only
+// one re-render LATER — after the one-shot effect has already run and (correctly)
+// refused to construct a local persistence under an unresolved scope. Seeding the
+// store here reproduces the production first-frame precondition; it changes no
+// assertion, only the precondition the harness cannot express through localStorage
+// timing. (See the note in current-user-atom.ts.)
+function makeStore() {
+  const store = createStore();
+  store.set(currentUserAtom, {
+    user: { id: "u-1", name: "Tester", settings: {} },
+    workspace: { id: "w-1" },
+  } as never);
+  return store;
+}
+
 beforeEach(() => {
   hoisted.providers.length = 0;
   hoisted.persistences.length = 0;
   hoisted.localFirst = true;
   hoisted.idStampAttempts = 0;
   resetPageYdocRegistryForTests();
+  // #640 fail-closed latches are module-level: clear them so one test's tombstone
+  // / expired-session state can never leak into the next.
+  resetTombstonesForTests();
+  clearSessionVerifiedForTests();
   localStorage.setItem(
     "currentUser",
     JSON.stringify({
@@ -350,11 +389,13 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  resetTombstonesForTests();
+  clearSessionVerifiedForTests();
 });
 
 describe("#564 body-instant: live body from the local ydoc, read-only until remote", () => {
   it("renders the body live from a NON-EMPTY local ydoc with no remote connection, read-only", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -405,7 +446,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
   });
 
   it("becomes editable — and edits reach the ydoc — only once the remote syncs", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -451,7 +492,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
     // stay without a `data-id` for the life of the editor, silently breaking
     // comment anchors, transclusions and the TOC. The guard must therefore open
     // SYNCHRONOUSLY inside onSynced.
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -490,7 +531,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
   });
 
   it("keeps the static copy when the local ydoc is EMPTY (guard 1: no blank body)", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence(); // nothing seeded: first visit
@@ -513,7 +554,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
   });
 
   it("a FAILED remote connection leaves a read-only body + the page-wide offline banner", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -546,7 +587,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
   });
 
   it("a remote that syncs and then DROPS keeps the body editable (no regression)", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -574,7 +615,7 @@ describe("#564 body-instant: live body from the local ydoc, read-only until remo
   });
 
   it("a page switch mid local-only never binds the previous page's ydoc", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container, rerender } = renderEditor(store, PAGE_A);
 
     const persistenceA = lastPersistence();
@@ -628,7 +669,7 @@ describe("#564 flag OFF: behavior identical to today", () => {
   });
 
   it("does NOT swap early even with a non-empty local ydoc; swaps + edits on remote sync", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -664,7 +705,7 @@ describe("#564 flag OFF: behavior identical to today", () => {
   });
 
   it("shows no offline banner while disconnected in the static window (today's badge only)", async () => {
-    const store = createStore();
+    const store = makeStore();
     const { container } = renderEditor(store, PAGE_A);
 
     const persistence = lastPersistence();
@@ -677,5 +718,62 @@ describe("#564 flag OFF: behavior identical to today", () => {
       container.querySelector('[data-testid="body-connecting-badge"]'),
     ).not.toBeNull();
     expect(container.querySelector(".editor-container")).toBeNull();
+  });
+});
+
+// #640 (Ф4), rule #8 — the fail-closed local-ydoc gate, tested through the REAL
+// component on its OBSERVABLE property: was ANY `IndexeddbPersistence`
+// constructed? The helpers (canOpenLocalYdoc / isSessionExpired / the anon
+// scope check) are unit-tested elsewhere; this asserts the wiring in
+// page-editor.tsx (`openLocal = scopeResolved && !isSessionExpired() &&
+// canOpenLocalYdoc(dbName) && canOpenLocalYdoc(slug)`) actually gates the
+// CONSTRUCTION — a tombstoned / expired / anon page must open a REMOTE-ONLY ydoc
+// (zero local persistence = no IndexedDB database created), never a local one.
+describe("#640 fail-closed: no local persistence for a revoked / expired / anon page", () => {
+  // 30d, the default OFFLINE_GRACE (getOfflineGraceMs); the mocked config passes
+  // it through from the real module, so a stamp older than this is expired.
+  const OFFLINE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+
+  it("constructs ZERO IndexeddbPersistence for a TOMBSTONED page (remote-only)", () => {
+    // A revoked page: its scoped ydoc DB name is on the denylist. y-indexeddb
+    // creates the DB on construction, so the gate must refuse to construct it.
+    addTombstones([pageYdocDbName(SCOPE, PAGE_A)]);
+
+    const store = makeStore();
+    renderEditor(store, PAGE_A);
+
+    // The observable property: no local persistence was ever built...
+    expect(hoisted.persistences.length).toBe(0);
+    // ...yet the editor is NOT inert — it still opens the remote collab provider,
+    // i.e. it degraded to remote-only rather than skipping the page entirely.
+    expect(hoisted.providers.length).toBeGreaterThan(0);
+  });
+
+  it("constructs ZERO IndexeddbPersistence when the session is EXPIRED past OFFLINE_GRACE", () => {
+    // A stamped-then-long-offline session (> 30d since the last `/me`): local
+    // content must not be drawn, even though the scope resolves and the page is
+    // not tombstoned.
+    recordSessionVerified(Date.now() - OFFLINE_GRACE_MS - 60_000);
+
+    const store = makeStore();
+    renderEditor(store, PAGE_A);
+
+    expect(hoisted.persistences.length).toBe(0);
+    expect(hoisted.providers.length).toBeGreaterThan(0);
+  });
+
+  it("constructs ZERO IndexeddbPersistence under an ANON (unresolved) scope", () => {
+    // Signed-out / not-yet-resolved: scopeKeyAtom is "anon:anon", so a local body
+    // would be written under an anon namespace (invariant 2). The gate's
+    // `scopeResolved` check must block construction. Use an UNWARMED store with no
+    // persisted user so the scope stays anon for the one-shot provider effect.
+    localStorage.removeItem("currentUser");
+    const store = createStore();
+
+    renderEditor(store, PAGE_A);
+
+    expect(store.get(scopeKeyAtom).split(":")).toContain("anon");
+    expect(hoisted.persistences.length).toBe(0);
+    expect(hoisted.providers.length).toBeGreaterThan(0);
   });
 });

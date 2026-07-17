@@ -39,6 +39,7 @@ import { useTranslation } from "react-i18next";
 import { useSetAtom, useStore } from "jotai";
 import { treeDataAtom } from "@/features/page/tree/atoms/tree-data-atom";
 import { writePageMetaAtom } from "@/features/page/atoms/page-meta-cache-atom";
+import { clearPageTombstoneOnAccess } from "@/features/editor/page-ydoc-eviction";
 import { isLocalFirstEnabled } from "@/lib/config";
 import { treeModel } from "@/features/page/tree/model/tree-model";
 import { SpaceTreeNode } from "@/features/page/tree/types";
@@ -81,6 +82,10 @@ export function usePageQuery(
       // overwrites the cached entry, so a server-side rename/icon/permission
       // change lands in the cache the moment it arrives.
       store.set(writePageMetaAtom, query.data);
+      // #640, invariant 7 / acceptance 5 — a successful page fetch PROVES access
+      // returned (restored from trash / access regranted), so lift any ydoc
+      // tombstone under both aliases. This is the ONLY tombstone-removal path.
+      clearPageTombstoneOnAccess(query.data);
     }
   }, [query.data, store]);
 
@@ -141,6 +146,8 @@ export function usePageMetaQuery(
     // #563 — same write-through as usePageQuery: any resolved page keeps the
     // boot cache current, whichever hook fetched it.
     store.set(writePageMetaAtom, full);
+    // #640 — same tombstone lift on proof of access (see usePageQuery).
+    clearPageTombstoneOnAccess(full);
   }, [query.data, store]);
 
   return query;

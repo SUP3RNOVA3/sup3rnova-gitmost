@@ -257,6 +257,21 @@ export class EnvironmentService {
   }
 
   /**
+   * #640 — network-independent session boundary. Mirrored into window.CONFIG so
+   * the client refuses to draw ANY local content (chrome, tree, ydoc body) once
+   * more than this has elapsed since the last successful `/me`, even offline.
+   * Defaults to JWT_TOKEN_EXPIRES_IN (the server treats the session dead after
+   * that anyway), overridable via OFFLINE_GRACE. Returned as the raw duration
+   * string (e.g. "30d"); the client parses it.
+   */
+  getOfflineGrace(): string {
+    return this.configService.get<string>(
+      'OFFLINE_GRACE',
+      this.getJwtTokenExpiresIn(),
+    );
+  }
+
+  /**
    * #629 — mirrored into window.CONFIG so the draw.io editor only embeds a PNG
    * raster into the saved .drawio.svg when the operator opts in. Off (default)
    * => today's behavior (svg-only save), so the file-size cost of the embedded

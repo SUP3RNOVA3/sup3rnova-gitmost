@@ -28,6 +28,7 @@ import {
   installPageYdocEvictionOnce,
   migratePageYdocDatabasesOnce,
 } from "@/features/editor/page-ydoc-eviction";
+import { enforceOfflineSessionBoundary } from "@/features/user/session-boundary";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -51,11 +52,21 @@ export const queryClient = new QueryClient({
 //    listeners run in registration order, so this one must read the alias first.
 installPageYdocEvictionOnce(queryClient);
 
-// #626 — one-time cleanup of the pre-namespacing legacy `page.<pageId>` ydoc
-// databases (they had no workspace/user scope, so a shared browser could serve
-// one user's local page body to the next). Runs once (localStorage-flagged) and
-// only deletes un-namespaced databases, never the current user's scoped ones.
+// #626 / #640 — one-time cleanup of the pre-namespacing legacy `page.<pageId>`
+// ydoc databases (they had no workspace/user scope, so a shared browser could
+// serve one user's local page body to the next). Runs once (localStorage-
+// flagged) and only deletes un-namespaced databases, never the current user's
+// scoped ones. MUST run BEFORE the session-boundary enforcement below clears the
+// page-meta boot cache, because on Firefox the migration derives the legacy
+// names from that cache (there is no `indexedDB.databases()` there).
 migratePageYdocDatabasesOnce();
+
+// #640, part 6 — network-independent session boundary. If the last successful
+// `/me` (sessionVerifiedAt) is older than OFFLINE_GRACE (=30d = JWT token life),
+// refuse to draw ANY local content and purge it — offline or not. Runs at boot,
+// before the first render, so nothing stale is ever painted. This is the only
+// safeguard that needs no network event and the thing that makes Ф5 safe.
+enforceOfflineSessionBoundary();
 
 // #563 — evict a page from the localStorage boot cache as soon as ANY page query
 // fails with 403/404 (deleted / access revoked), regardless of what is mounted.
