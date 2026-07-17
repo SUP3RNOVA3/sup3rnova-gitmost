@@ -427,6 +427,88 @@ describe("migratePageYdocDatabasesOnce (#640 acceptance 9)", () => {
   });
 });
 
+// #641, part 7 — `hasLocalPageBody` is the fail-closed control page.tsx consults
+// (synchronously, no IndexedDB open) to pick offline-local (render the cached
+// body) vs offline-empty. It returns TRUE only when ALL of: the scope is resolved
+// (not anon), the session is within OFFLINE_GRACE, the page is NOT tombstoned
+// under EITHER alias (the security-critical revocation branch, #564/#640), AND
+// the ydoc DB name is in the browser registry (the body was actually written on
+// this device). Each `it` proves the OBSERVABLE decision and is NON-VACUOUS: the
+// header of each case names which branch flips the result vs the positive case.
+describe("hasLocalPageBody fail-closed control (#641 part 7)", () => {
+  const OFFLINE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+
+  it("POSITIVE: resolved scope + registered db (not expired / not tombstoned) → true", async () => {
+    const mod = await freshImport();
+    mod.rememberYdocDbName(mod.pageYdocDbName(SCOPE, PAGE_ID));
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID)).toBe(true);
+  });
+
+  it("anon / unresolved scope → false (the anon guard is the discriminator)", async () => {
+    const mod = await freshImport();
+    // Register the anon-scoped name too, so the ONLY thing forcing false is the
+    // anon guard — not a registry miss (that would make the test vacuous).
+    mod.rememberYdocDbName(mod.pageYdocDbName("anon:anon", PAGE_ID));
+    // Same page under a resolved scope IS reported present (control), so the anon
+    // scope is the sole discriminator.
+    mod.rememberYdocDbName(mod.pageYdocDbName(SCOPE, PAGE_ID));
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID)).toBe(true);
+    expect(mod.hasLocalPageBody("anon:anon", PAGE_ID)).toBe(false);
+  });
+
+  it("session EXPIRED past OFFLINE_GRACE → false (session-boundary branch)", async () => {
+    const mod = await freshImport();
+    const sv = await import("@/features/user/session-verified");
+    mod.rememberYdocDbName(mod.pageYdocDbName(SCOPE, PAGE_ID));
+
+    // A fresh/within-grace stamp still reports the body present (control)...
+    sv.recordSessionVerified(Date.now());
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID)).toBe(true);
+
+    // ...but a stamp older than OFFLINE_GRACE fail-closes to false.
+    sv.recordSessionVerified(Date.now() - OFFLINE_GRACE_MS - 60_000);
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID)).toBe(false);
+  });
+
+  it("tombstoned under the pageId-derived name → false (Ф4 revocation)", async () => {
+    const mod = await freshImport();
+    const tomb = await import("./page-ydoc-tombstones");
+    mod.rememberYdocDbName(mod.pageYdocDbName(SCOPE, PAGE_ID));
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID, SLUG_ID)).toBe(true);
+
+    tomb.addTombstones([mod.pageYdocDbName(SCOPE, PAGE_ID)]);
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID, SLUG_ID)).toBe(false);
+  });
+
+  it("tombstoned under the slugId ALIAS name ONLY (not the pageId name) → STILL false", async () => {
+    // The security-critical alias branch: a revoked page addressed by slug must
+    // not render its cached body even when the pageId-derived name is clean.
+    const mod = await freshImport();
+    const tomb = await import("./page-ydoc-tombstones");
+    // The registry hit is on the pageId name, so the ONLY thing forcing false is
+    // the alias tombstone (a registry miss would make this vacuous).
+    mod.rememberYdocDbName(mod.pageYdocDbName(SCOPE, PAGE_ID));
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID, SLUG_ID)).toBe(true);
+
+    tomb.addTombstones([mod.pageYdocDbName(SCOPE, SLUG_ID)]);
+    // The pageId-derived name is NOT tombstoned...
+    expect(tomb.canOpenLocalYdoc(mod.pageYdocDbName(SCOPE, PAGE_ID))).toBe(true);
+    // ...yet the slug alias tombstone alone must still deny the local body.
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID, SLUG_ID)).toBe(false);
+  });
+
+  it("registry: db name KNOWN → true; ABSENT from the registry → false", async () => {
+    const mod = await freshImport();
+    // Absent from the registry (never opened on this device): the meta cache may
+    // hold the chrome, but the BODY was never written here → false.
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID)).toBe(false);
+
+    // Once the ydoc DB name is registered (opened here at least once) → true.
+    mod.rememberYdocDbName(mod.pageYdocDbName(SCOPE, PAGE_ID));
+    expect(mod.hasLocalPageBody(SCOPE, PAGE_ID)).toBe(true);
+  });
+});
+
 describe("pageYdocRoomName vs pageYdocDbName (collab room != db name)", () => {
   // Mirrors the SERVER contract in apps/server/src/collaboration/
   // collaboration.util.ts: getPageId(documentName) = documentName.split(".")[1].

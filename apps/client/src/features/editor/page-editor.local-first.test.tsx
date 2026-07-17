@@ -777,3 +777,85 @@ describe("#640 fail-closed: no local persistence for a revoked / expired / anon 
     expect(hoisted.providers.length).toBeGreaterThan(0);
   });
 });
+
+// #641, part 6 — the offline-banner hysteresis FSM, tested on the MOUNTED editor
+// through its OBSERVABLE property: `bodyLocalOnlyAtom.isOffline` (the flag
+// FullEditor reads to paint the page-wide offline banner over both the body AND
+// the chrome). `computeBodyIndicator` is unit-tested in editor-sync-state; this
+// asserts the REAL `stickyOffline` / `browserOffline` wiring in page-editor.tsx
+// drives that flag correctly across the transitions Hocuspocus's forever-retry
+// Connecting/Disconnected flaps produce.
+describe("#641 offline banner hysteresis (sticky latch + navigator.onLine)", () => {
+  /** Reach the live-local body window (swapped off the static copy, remote NOT
+   * confirmed) from a non-empty local ydoc. */
+  async function mountLiveLocal(store: ReturnType<typeof createStore>) {
+    const { container } = renderEditor(store, PAGE_A);
+    const persistence = lastPersistence();
+    seedYdoc(persistence.doc, "Local body text");
+    act(() => persistence.emitSynced());
+    await waitFor(() => {
+      expect(container.querySelector(".editor-container")).not.toBeNull();
+    });
+    // Baseline: the live-local body is on screen, remote not yet confirmed, and we
+    // are NOT offline (the quiet connecting badge, never the offline banner).
+    expect(store.get(bodyLocalOnlyAtom).isOffline).toBe(false);
+    return { container };
+  }
+
+  it("holds the offline banner across a Connecting retry blip; clears only on a real remote sync", async () => {
+    const store = makeStore();
+    await mountLiveLocal(store);
+    const provider = lastProvider();
+
+    // The socket drops (or the 7500ms fallback fires): the page-wide offline
+    // banner is published.
+    act(() => provider.emitStatus("disconnected"));
+    await waitFor(() =>
+      expect(store.get(bodyLocalOnlyAtom).isOffline).toBe(true),
+    );
+
+    // A single retry BLIP — Hocuspocus re-attempts forever and emits Connecting on
+    // every attempt. The banner must STAY offline (the sticky latch), never flip
+    // back to the quiet "connecting" badge and flicker the page-wide banner.
+    act(() => provider.emitStatus("connecting"));
+    expect(store.get(bodyLocalOnlyAtom).isOffline).toBe(true);
+    expect(
+      document.querySelector('[data-testid="body-connecting-badge"]'),
+    ).toBeNull();
+
+    // ONLY a real remote sync (isRemoteConfirmed) clears it.
+    act(() => {
+      provider.emitStatus("connected");
+      provider.emitSynced(true);
+    });
+    await waitFor(() =>
+      expect(store.get(bodyLocalOnlyAtom).isOffline).toBe(false),
+    );
+  });
+
+  it("reflects offline from a window `offline` event without waiting for the socket timeout", async () => {
+    const store = makeStore();
+    await mountLiveLocal(store);
+
+    // The collab socket is still merely "connecting" — its 7500ms Disconnected
+    // fallback has NOT fired — so `reallyOffline` here can only come from the
+    // browser's own offline signal.
+    expect(store.get(bodyLocalOnlyAtom).isOffline).toBe(false);
+
+    // A real network drop: navigator.onLine flips false and the browser fires the
+    // `offline` event. The banner must reflect it immediately (no socket timeout).
+    Object.defineProperty(window.navigator, "onLine", {
+      configurable: true,
+      value: false,
+    });
+    try {
+      act(() => window.dispatchEvent(new Event("offline")));
+      await waitFor(() =>
+        expect(store.get(bodyLocalOnlyAtom).isOffline).toBe(true),
+      );
+    } finally {
+      // Restore the prototype accessor (default: online) for the next test.
+      delete (window.navigator as unknown as { onLine?: boolean }).onLine;
+    }
+  });
+});

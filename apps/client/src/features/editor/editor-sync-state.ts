@@ -136,6 +136,15 @@ export function shouldSwapToLive(opts: {
  *
  * With the flag off this collapses to exactly today's rule: the quiet badge, and
  * only inside the static pre-sync window.
+ *
+ * HYSTERESIS (#641, part 6). Hocuspocus retries forever (`maxAttempts: 0`) and
+ * emits `Connecting`/`Disconnected` on EVERY attempt, so over a multi-hour
+ * offline session `isDisconnected` flaps and the yellow banner flickers — right
+ * before Ф5 makes this banner the PRIMARY offline signal. `stickyOffline` holds
+ * "offline" through those flaps: once we are really offline in the live-local
+ * window it stays offline until a REAL remote sync (`isRemoteConfirmed`) clears
+ * it — never merely until the next momentary `Connecting`. The caller owns the
+ * latch (page-editor); this function just honors it.
  */
 export type BodyIndicator = "none" | "connecting" | "offline";
 
@@ -145,6 +154,7 @@ export function computeBodyIndicator(opts: {
   isRemoteConfirmed: boolean;
   isDisconnected: boolean;
   canEdit: boolean;
+  stickyOffline?: boolean;
 }): BodyIndicator {
   if (!opts.localFirst) {
     return opts.showStatic && opts.canEdit ? "connecting" : "none";
@@ -153,6 +163,9 @@ export function computeBodyIndicator(opts: {
   // The static (server-seeded) copy is on screen — never claim it is a stale
   // local copy, however dead the socket is.
   if (opts.showStatic) return opts.canEdit ? "connecting" : "none";
-  if (opts.isDisconnected) return "offline";
+  // Live local body, remote not confirmed: "offline" if the socket is down OR the
+  // hysteresis latch is set (a mid-session retry blip must not flip us back to the
+  // quiet "connecting" badge and flicker the banner).
+  if (opts.isDisconnected || opts.stickyOffline) return "offline";
   return opts.canEdit ? "connecting" : "none";
 }

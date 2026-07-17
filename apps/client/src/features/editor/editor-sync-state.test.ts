@@ -272,4 +272,53 @@ describe("computeBodyIndicator (#564 guards 4+5)", () => {
     ).toBe("none");
     expect(computeBodyIndicator({ ...off, showStatic: false })).toBe("none");
   });
+
+  // #641, part 6 — hysteresis. Over a multi-hour offline session Hocuspocus
+  // flaps Connecting/Disconnected on every retry; the sticky latch holds the
+  // banner steady so it does not flicker (acceptance 7).
+  describe("offline hysteresis (#641 part 6)", () => {
+    it("stays 'offline' during a retry blip (Connecting) once the latch is set", () => {
+      // isDisconnected momentarily false (a Connecting attempt), but stickyOffline
+      // is held: the banner must NOT flip back to the quiet "connecting" badge.
+      expect(
+        computeBodyIndicator({
+          ...base,
+          isDisconnected: false,
+          stickyOffline: true,
+        }),
+      ).toBe("offline");
+    });
+
+    it("without the latch, a Connecting blip returns to 'connecting' (flicker source)", () => {
+      expect(
+        computeBodyIndicator({
+          ...base,
+          isDisconnected: false,
+          stickyOffline: false,
+        }),
+      ).toBe("connecting");
+    });
+
+    it("a REAL remote sync clears offline regardless of the latch", () => {
+      expect(
+        computeBodyIndicator({
+          ...base,
+          isRemoteConfirmed: true,
+          isDisconnected: true,
+          stickyOffline: true,
+        }),
+      ).toBe("none");
+    });
+
+    it("the latch never overrides the static (server-seeded) window", () => {
+      // While the static copy is on screen we must not claim a stale local copy.
+      expect(
+        computeBodyIndicator({
+          ...base,
+          showStatic: true,
+          stickyOffline: true,
+        }),
+      ).toBe("connecting");
+    });
+  });
 });

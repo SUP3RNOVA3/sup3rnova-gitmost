@@ -7,6 +7,7 @@ import type { IPage } from "@/features/page/types/page.types";
 import { isLocalFirstEnabled } from "@/lib/config";
 import { isSessionExpired } from "@/features/user/session-verified";
 import { reportClientMetric } from "@/lib/telemetry/vitals";
+import { httpStatusOf } from "@/lib/http-error";
 
 // Local-first phase 1 (#563): a localStorage BOOT CACHE of page METADATA, so a
 // reload / repeat visit paints the page CHROME (title, breadcrumbs, header)
@@ -466,11 +467,9 @@ export function installPageMetaEviction(queryClient: QueryClient): () => void {
       return;
     }
 
-    const error = query.state.error as
-      | { status?: number; response?: { status?: number } }
-      | null
-      | undefined;
-    const status = error?.status ?? error?.response?.status;
+    // #641, part 1 — status via the shared taxonomy. Eviction stays 403/404-ONLY
+    // (revoked / deleted); a transport/5xx must never drop cached chrome.
+    const status = httpStatusOf(query.state.error);
     if (status !== 403 && status !== 404) return;
 
     const key = queryKey[1];

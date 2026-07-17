@@ -1,6 +1,6 @@
 import { useAtom } from "jotai";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
-import React, { useEffect } from "react";
+import React, { useEffect, useRef } from "react";
 import useCurrentUser from "@/features/user/hooks/use-current-user";
 import { useTranslation } from "react-i18next";
 import { socketAtom } from "@/features/websocket/atoms/socket-atom.ts";
@@ -20,6 +20,10 @@ import {
 } from "@/features/user/guarded-reload.tsx";
 import type { AppVersionSocketPayload } from "@/features/user/version-coherence.ts";
 import { recordSessionVerified } from "@/features/user/session-verified";
+import { isLocalFirstEnabled } from "@/lib/config";
+import { reportOfflineCriticalServerError } from "@/lib/http-error";
+import { resolveUserGate } from "@/features/user/user-provider-gate";
+import { UserDegradedIndicator } from "@/features/user/user-degraded-indicator";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -38,6 +42,17 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   useEffect(() => {
     surfacePreviousReloadBreadcrumb();
   }, []);
+
+  // #641, part 4 — a 5xx on /me is a real (possibly partial) server outage, NOT
+  // an offline condition. Count + report it once per distinct error object,
+  // distinct from an unreachable network (which is the normal degraded mode).
+  const reportedMeErrorRef = useRef<unknown>(null);
+  useEffect(() => {
+    if (!isLocalFirstEnabled() || !isError) return;
+    if (reportedMeErrorRef.current === error) return;
+    reportedMeErrorRef.current = error;
+    reportOfflineCriticalServerError(error, "/users/me");
+  }, [isError, error]);
 
   useEffect(() => {
     if (isLoading || isError) {
@@ -103,14 +118,29 @@ export function UserProvider({ children }: React.PropsWithChildren) {
     document.documentElement.lang = i18n.resolvedLanguage || i18n.language || "en-US";
   }, [i18n.language, i18n.resolvedLanguage]);
 
-  if (isLoading) return <></>;
+  // #641, part 3 — the `/me` gate is now the offline-aware taxonomy (a pure,
+  // tested decision). It keeps the app MOUNTED on a tolerated `/me` failure when
+  // a user is already known, instead of collapsing everything to `<></>`.
+  const gate = resolveUserGate({
+    localFirst: isLocalFirstEnabled(),
+    isLoading,
+    error,
+    hasData: Boolean(data),
+  });
 
-  if (isError && error?.["response"]?.status === 404) {
-    return <Error404 />;
-  }
-
-  if (error) {
-    return <></>;
+  if (gate === "loading") return <></>;
+  if (gate === "error-404") return <Error404 />;
+  if (gate === "blocked") return <></>;
+  if (gate === "degraded") {
+    // A `/me` error is being tolerated because we still have a user. Keep the app
+    // mounted and surface the ONLY user-visible signal that the session is
+    // degraded (silent on a healthy connection, sticky while it is down).
+    return (
+      <>
+        {children}
+        <UserDegradedIndicator />
+      </>
+    );
   }
 
   return <>{children}</>;

@@ -9,6 +9,9 @@ import {
   removeTombstones,
 } from "@/features/editor/page-ydoc-tombstones";
 import { reportSafetyMetric } from "@/lib/telemetry/safety-metrics";
+import { httpStatusOf } from "@/lib/http-error";
+import { canOpenLocalYdoc } from "@/features/editor/page-ydoc-tombstones";
+import { isSessionExpired } from "@/features/user/session-verified";
 
 /**
  * Fail-closed hygiene of a page's LOCAL body ydoc (#564 guard 3, #626, #640).
@@ -305,11 +308,11 @@ export function installPageYdocEviction(queryClient: QueryClient): () => void {
       return;
     }
 
-    const error = query.state.error as
-      | { status?: number; response?: { status?: number } }
-      | null
-      | undefined;
-    const status = error?.status ?? error?.response?.status;
+    // #641, part 1 — read the status through the shared taxonomy. Eviction stays
+    // 403/404-ONLY (revoked / deleted): a 401 redirects + purges everything, and
+    // a transport/5xx must NEVER evict local content (that is the whole point of
+    // Ф5). Semantics unchanged; only the status extraction is unified.
+    const status = httpStatusOf(query.state.error);
     if (status !== 403 && status !== 404) return;
 
     void evictPageYdoc(queryKey[1]);
@@ -406,6 +409,46 @@ function clearYdocDbRegistry(): void {
   } catch {
     // ignore
   }
+}
+
+/**
+ * Was a page's ydoc DB name recorded in this browser's registry? A hit proves
+ * the local body was opened (and, if non-empty, written) on this device at least
+ * once. (#641, part 7.)
+ */
+function ydocDbNameKnown(name: string): boolean {
+  return readYdocDbRegistry().includes(name);
+}
+
+/**
+ * Best-effort SYNCHRONOUS check: is there a usable LOCAL body ydoc for this page?
+ *
+ * page.tsx uses it (#641, part 7) to choose, WITHOUT an async IndexedDB open,
+ * between rendering the cached body offline and the explicit "not available
+ * offline" empty-state. Fail-closed:
+ *  - anon / unresolved scope, or a session past OFFLINE_GRACE → no local body;
+ *  - tombstoned under either alias (access revoked, Ф4) → no local body;
+ *  - the ydoc DB was never opened here (not in the registry) → the page is in the
+ *    boot META cache but its BODY was never written on this device (the exact
+ *    part-7 case: a link/tree entry cached the chrome, the body never loaded).
+ *
+ * A registry hit whose IndexedDB the browser later evicted (Safari) is a
+ * tolerated false-positive: the editor then shows an empty body instead of the
+ * empty-state — no worse than today, and not an eternal silent skeleton because
+ * the offline banner still explains the state.
+ */
+export function hasLocalPageBody(
+  scopeKey: string,
+  pageId: string,
+  slugId?: string | null,
+): boolean {
+  if (isAnonScope(scopeKey)) return false;
+  if (isSessionExpired()) return false;
+  const dbName = pageYdocDbName(scopeKey, pageId);
+  if (!canOpenLocalYdoc(dbName)) return false;
+  const aliasName = pageYdocDbName(scopeKey, slugId ?? pageId);
+  if (!canOpenLocalYdoc(aliasName)) return false;
+  return ydocDbNameKnown(dbName) || ydocDbNameKnown(aliasName);
 }
 
 /**
