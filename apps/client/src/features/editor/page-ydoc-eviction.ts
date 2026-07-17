@@ -65,6 +65,28 @@ export function pageYdocName(pageId: string, scopeKey: string): string {
   return `${PAGE_YDOC_PREFIX}${scopeKey}.${pageId}`;
 }
 
+/**
+ * The collaboration ROOM name for a page — MUST stay `page.<pageId>` with NO
+ * scope namespace, and is DISTINCT from the IndexedDB database name above.
+ *
+ * The server resolves the page from the room name with
+ * `getPageId(documentName) = documentName.split('.')[1]`
+ * (apps/server/src/collaboration/collaboration.util.ts). A scope-namespaced room
+ * name (`page.<scopeKey>.<pageId>`) makes `split('.')[1]` return the SCOPE, not
+ * the pageId → the collab server can't find the page → every authenticated
+ * collab connection is rejected (regression introduced by #626 wiring the
+ * namespaced db name straight into HocuspocusProvider.name). Local-content
+ * isolation lives entirely in the IndexedDB DB name (pageYdocName); the room
+ * name must never carry the scope. It is the SAME room name the MCP agent opens
+ * (`page.<uuid>`), so a scoped name also split the human editor and the agent into
+ * different rooms. Locked on both sides: the room-name construction here by
+ * page-ydoc-eviction.test.ts, and the server getPageId contract by
+ * collaboration.util.spec.ts.
+ */
+export function pageYdocRoomName(pageId: string): string {
+  return `${PAGE_YDOC_PREFIX}${pageId}`;
+}
+
 // Query keys are `["pages", <pageId | slugId>]`, while the ydoc is named by
 // pageId. Aliases seen in THIS session (a mounted page), used ahead of the
 // persisted boot cache: the boot cache is scope-gated (it is empty until `/me`
