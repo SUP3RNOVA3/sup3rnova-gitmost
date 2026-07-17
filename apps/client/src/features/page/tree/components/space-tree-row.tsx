@@ -7,13 +7,12 @@ import {
   IconChevronDown,
   IconChevronRight,
   IconClockHour4,
-  IconFileDescription,
   IconPlus,
   IconPointFilled,
   IconTemplate,
 } from "@tabler/icons-react";
 
-import EmojiPicker from "@/components/ui/emoji-picker.tsx";
+import { PageIconPicker } from "@/components/ui/page-icon.tsx";
 import { queryClient } from "@/main.tsx";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import { getPageById } from "@/features/page/services/page-service.ts";
@@ -95,10 +94,12 @@ export function SpaceTreeRow({
     e.stopPropagation();
   };
 
-  const handleEmojiSelect = (emoji: { native: string }) => {
-    handleUpdateNodeIcon(node.id, emoji.native);
+  // The picker hands back the serialized IconRef JSON (see icon-ref.ts). The
+  // optimistic tree update and the mutation store the string as-is.
+  const handleIconSelect = (icon: string) => {
+    handleUpdateNodeIcon(node.id, icon);
     updatePageMutation
-      .mutateAsync({ pageId: node.id, icon: emoji.native })
+      .mutateAsync({ pageId: node.id, icon })
       .then((data) => {
         setTimeout(() => {
           emit({
@@ -106,7 +107,7 @@ export function SpaceTreeRow({
             spaceId: node.spaceId,
             entity: ["pages"],
             id: node.id,
-            payload: { icon: emoji.native, parentPageId: data.parentPageId },
+            payload: { icon, parentPageId: data.parentPageId },
           });
         }, 50);
       });
@@ -164,13 +165,11 @@ export function SpaceTreeRow({
       />
 
       <div onClick={handleEmojiIconClick} style={{ marginRight: "4px" }}>
-        <EmojiPicker
-          onEmojiSelect={handleEmojiSelect}
-          icon={
-            node.icon ? node.icon : <IconFileDescription size="18" />
-          }
+        <PageIconPicker
+          value={node.icon}
+          onChange={handleIconSelect}
+          onRemove={handleRemoveEmoji}
           readOnly={!canEdit}
-          removeEmojiAction={handleRemoveEmoji}
           actionIconProps={{ tabIndex: -1 }}
         />
       </div>

@@ -190,6 +190,8 @@ export function TransformsMixin<TBase extends GConstructor<DocmostClientContext>
       this.apiUrl,
       runTransform,
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // Optionally delete consumed comments (best-effort; a delete failure must
     // not undo the successful write).

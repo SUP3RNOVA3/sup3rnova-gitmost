@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { Provider, createStore } from "jotai";
@@ -40,16 +40,25 @@ function renderStack(props: Props) {
 }
 
 describe("AgentAvatarStack", () => {
-  it("internal chat WITH role: emoji glyph + human launcher badge in front", () => {
+  // aiChatWindowOpenAtom now persists to localStorage (getOnInit), and its onMount
+  // re-reads storage — so a setWindowOpen(true) from one test (the deep-link case)
+  // would leak into the next, since a fresh createStore does not isolate the shared
+  // localStorage. Clear it between tests (#662).
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("internal chat WITH role: Lucide glyph + human launcher badge in front", () => {
     const { container } = renderStack({
-      agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+      agent: { name: "Researcher", emoji: '{"name":"microscope"}', avatarUrl: null },
       launcher: { name: "Alice", avatarUrl: null },
       aiChatId: "chat-1",
     });
 
-    // Emoji is used as the glyph (priority 2), NOT the sparkles fallback.
-    expect(screen.getByText("🔬")).toBeDefined();
+    // A valid IconRef renders the Lucide glyph (priority 2), NOT the sparkles
+    // fallback, and never leaks the raw stored JSON.
     expect(container.querySelector(".tabler-icon-sparkles")).toBeNull();
+    expect(container.textContent ?? "").not.toContain('{"name"');
     // Label: bold role name + dimmed "· launcher".
     expect(screen.getByText("Researcher")).toBeDefined();
     expect(screen.getByText(/·/)).toBeDefined();
@@ -60,7 +69,7 @@ describe("AgentAvatarStack", () => {
     // Pins the actual fix: the hashed gradient must reach the DOM as an inline
     // `background` on the glyph Box. The pre-fix `Avatar variant="filled"` set no
     // inline background (Mantine's --avatar-bg overrode it), so this fails there.
-    const agent = { name: "Researcher", emoji: "🔬", avatarUrl: null };
+    const agent = { name: "Researcher", emoji: '{"name":"microscope"}', avatarUrl: null };
     const { container } = renderStack({
       agent,
       launcher: { name: "Alice", avatarUrl: null },
@@ -86,12 +95,12 @@ describe("AgentAvatarStack", () => {
     expect(avatarStyle("Researcher").bg).not.toBe(avatarStyle("Нарратор").bg);
 
     const a = renderStack({
-      agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+      agent: { name: "Researcher", emoji: '{"name":"microscope"}', avatarUrl: null },
       launcher: null,
       aiChatId: null,
     });
     const b = renderStack({
-      agent: { name: "Нарратор", emoji: "📖", avatarUrl: null },
+      agent: { name: "Нарратор", emoji: '{"name":"book-open"}', avatarUrl: null },
       launcher: null,
       aiChatId: null,
     });
@@ -108,15 +117,16 @@ describe("AgentAvatarStack", () => {
   });
 
   it("showName=false: renders only the avatars, no inline name label", () => {
-    renderStack({
-      agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+    const { container } = renderStack({
+      agent: { name: "Researcher", emoji: '{"name":"microscope"}', avatarUrl: null },
       launcher: { name: "Alice", avatarUrl: null },
       aiChatId: "chat-1",
       showName: false,
     });
 
-    // The agent glyph is still rendered...
-    expect(screen.getByText("🔬")).toBeDefined();
+    // The agent glyph is still rendered (Lucide, not the sparkles fallback)...
+    expect(container.querySelector('[data-testid="agent-glyph"]')).not.toBeNull();
+    expect(container.querySelector(".tabler-icon-sparkles")).toBeNull();
     // ...but neither the agent NOR the launcher inline name label is rendered
     // (they live only in the hover tooltip, which is not mounted in the initial
     // DOM) — guards against suppressing only the agent name and leaking the
@@ -156,7 +166,7 @@ describe("AgentAvatarStack", () => {
 
   it("click deep-links into the chat when aiChatId is present", () => {
     const { store } = renderStack({
-      agent: { name: "Researcher", emoji: "🔬", avatarUrl: null },
+      agent: { name: "Researcher", emoji: '{"name":"microscope"}', avatarUrl: null },
       launcher: { name: "Alice", avatarUrl: null },
       aiChatId: "chat-1",
     });

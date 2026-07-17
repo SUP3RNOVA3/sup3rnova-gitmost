@@ -27,6 +27,8 @@ import {
   useUpdateAiRoleMutation,
 } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import { IAiRole } from "@/features/ai-chat/types/ai-chat.types.ts";
+import { LucideGlyph } from "@/components/ui/lucide/lucide-glyph.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 import AiAgentRoleForm from "./ai-agent-role-form.tsx";
 import AiAgentRolesCatalogModal from "./ai-agent-roles-catalog-modal.tsx";
 
@@ -141,10 +143,14 @@ export default function AiAgentRoles() {
           <Group key={role.id} justify="space-between" wrap="nowrap">
             <Stack gap={2} style={{ minWidth: 0 }}>
               <Group gap="xs">
-                <Text fw={500} truncate>
-                  {role.emoji ? `${role.emoji} ` : ""}
-                  {role.name}
-                </Text>
+                <Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
+                  {parseIconRef(role.emoji)?.name && (
+                    <LucideGlyph name={parseIconRef(role.emoji)?.name} size={16} />
+                  )}
+                  <Text fw={500} truncate>
+                    {role.name}
+                  </Text>
+                </Group>
                 {role.modelConfig?.chatModel && (
                   <Badge size="xs" variant="light">
                     {role.modelConfig.chatModel}

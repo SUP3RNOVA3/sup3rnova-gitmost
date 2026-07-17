@@ -5,13 +5,20 @@ import {
   createJSONStorage,
 } from "jotai/utils";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
+import { uiLocalStorage } from "@/lib/jotai-helper.ts";
 
 export type OpenMap = Record<string, boolean>;
 
 // Explicit synchronous localStorage so `getOnInit` resolves to the sync overload
 // (the default storage is typed sync+async, which would widen the value type to
 // `OpenMap | Promise<OpenMap>` and break the functional-updater setter below).
-const openTreeNodesStorage = createJSONStorage<OpenMap>(() => localStorage);
+// `uiLocalStorage` (not a bare `() => localStorage`) so a browser that blocks
+// site data degrades to an empty map instead of throwing at atom construction
+// (getOnInit reads synchronously at module eval) — which, with sidebar-atom.ts
+// now guarded, would otherwise make THIS the new top white-screen cause.
+const openTreeNodesStorage = createJSONStorage<OpenMap>(
+  uiLocalStorage as () => Storage,
+);
 
 // Single source of truth for the open-map localStorage key prefix. Exported so
 // the logout cache sweep (tree-data-atom.ts) removes keys by the SAME prefix

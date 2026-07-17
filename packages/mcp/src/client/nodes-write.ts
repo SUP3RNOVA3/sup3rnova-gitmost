@@ -59,7 +59,7 @@ import { normalizeAndMergeFootnotes } from "../lib/footnote-normalize-merge.js";
 // carries the base's protected shared state, which would otherwise trip TS4094).
 // Derived from the class below; `implements INodesWriteMixin` fails to compile on drift.
 export interface INodesWriteMixin {
-  updatePageJson(pageId: string, doc?: any, title?: string): any;
+  updatePageJson(pageId: string, doc?: any, title?: string, baseHash?: string): any;
   editPageText(pageId: string, edits: TextEdit[]): any;
   patchNode(pageId: string, nodeId: string, input: { markdown?: string; node?: any }): any;
   insertNode(pageId: string, input: { markdown?: string; node?: any }, opts: { position: "before" | "after" | "append"; anchorNodeId?: string; anchorText?: string; }): any;
@@ -105,7 +105,12 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
    *                        touched/resent (no collab write happens).
    *  - neither given    -> throws (nothing to update).
    */
-  async updatePageJson(pageId: string, doc?: any, title?: string) {
+  async updatePageJson(
+    pageId: string,
+    doc?: any,
+    title?: string,
+    baseHash?: string,
+  ) {
     await this.ensureAuthenticated();
 
     // Title-only / no-op handling: when no document is supplied, do NOT write
@@ -172,17 +177,25 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
     doc = normalizeAndMergeFootnotes(doc);
     doc = canonicalizeFootnotes(doc);
 
+    // #647 §G — a full body overwrite goes through the SERVER-side write-CAS
+    // (guarded replace), not the old client-collab seam. `baseHash` is MANDATORY
+    // when writing content: it is the opaque hash the agent got from the read
+    // (getPageJson/getPage). Refuse rather than silently accept-and-ignore it —
+    // an ignored baseHash would give a false sense of safety while still
+    // clobbering a concurrent edit (the exact bug this closes). A title-only
+    // update (doc omitted) needs no baseHash and never reaches here.
+    if (!baseHash) {
+      throw new Error(
+        "updatePageJson: baseHash is required when writing content. Read the " +
+          "page first with getPageJson (or getPage) to obtain baseHash, pass it " +
+          "here, and on a conflict re-read to get a fresh baseHash and retry.",
+      );
+    }
+
     // Write the BODY first, then the title (#159 split-brain): a failed body
-    // write (e.g. persist timeout) must not leave a new title over the old body.
-    const collabToken = await this.getCollabTokenWithReauth();
-    // Open the collab doc by the canonical UUID, never the slugId (#260).
-    const pageUuid = await this.resolvePageId(pageId);
-    const mutation = await this.replacePage(
-      pageUuid,
-      doc,
-      collabToken,
-      this.apiUrl,
-    );
+    // write (e.g. a 409 conflict) must not leave a new title over the old body.
+    // The guarded replace throws ConflictError on a baseHash mismatch (409).
+    const result = await this.guardedReplacePage(pageId, doc, "json", baseHash);
 
     // Body persisted successfully — now it is safe to set the title.
     if (title) {
@@ -194,7 +207,7 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
       modified: true,
       message: "Page content replaced from ProseMirror JSON.",
       pageId,
-      verify: mutation.verify,
+      newHash: result.newHash,
     };
   }
 
@@ -256,6 +269,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return r.doc;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if ((results?.length ?? 0) === 0 && (failed?.length ?? 0) > 0) {
       // No edit applied: surface an aggregated, actionable error so the caller
@@ -269,12 +284,21 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
     // Edits matched but produced no content change (identical document): report
     // a successful no-op — NOT a failure — and do not falsely claim a write.
     if (!wrote) {
+      // A fold-tier no-op means the edit only differed in invisible characters,
+      // which fold-matching treats as already-equal: point the caller at the
+      // self-correction path (#658).
+      const foldNoop = (results ?? []).some(
+        (r) => r.matchedVia === "fold" || r.matchedVia === "markdown+fold",
+      );
+      const message = foldNoop
+        ? "No changes written (edits produced identical content). The find matched the same text modulo invisible characters (e.g. soft hyphen / NBSP), so there was nothing to change. To edit invisible characters, copy the exact document text (e.g. from a searchInPage match) into find."
+        : "No changes written (edits produced identical content).";
       return {
         success: true,
         pageId,
         applied: results,
         failed,
-        message: "No changes written (edits produced identical content).",
+        message,
         verify: mutation.verify,
       };
     }
@@ -291,16 +315,25 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
       verify: mutation.verify,
     };
 
-    // If any applied edit matched only after stripping markdown (the
-    // normalized fallback), warn that editPageText preserved existing marks
-    // and did NOT change formatting — so a caller who intended a formatting
-    // change is pointed at patchNode.
-    if (results?.some((r) => r.normalized === true)) {
-      result.warning =
-        "Some edits matched only after stripping markdown from your find string; " +
-        "editPageText preserved existing marks (it did not change bold/strike/etc.). " +
-        "If you intended a formatting change, use patchNode.";
+    // Surface per-edit warnings from applyTextEdits (mirrors the `normalized`
+    // channel). Two sources, joined into the single result.warning string:
+    //  - literal-marker toggles that applied via the literal-exception (each
+    //    result carries its own `.warning`); and
+    //  - edits that matched only after stripping markdown (normalized): warn that
+    //    editPageText preserved existing marks and did NOT change formatting, so a
+    //    caller who intended a formatting change is pointed at patchNode.
+    const warnings: string[] = [];
+    for (const r of results ?? []) {
+      if (r.warning) warnings.push(`"${r.find}": ${r.warning}`);
     }
+    if (results?.some((r) => r.normalized === true)) {
+      warnings.push(
+        "Some edits matched only after stripping markdown from your find string; " +
+          "editPageText preserved existing marks (it did not change bold/strike/etc.). " +
+          "If you intended a formatting change, use patchNode.",
+      );
+    }
+    if (warnings.length > 0) result.warning = warnings.join(" ");
 
     return result;
   }
@@ -416,6 +449,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
     // the write for any count !== 1). Single shared guard (#159, #185 review).
@@ -512,6 +547,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return mergeFootnoteDefinitions(spliced, definitions);
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // Surface the guard rejection with an actionable message (nothing written).
     if (guardAttrs != null) {
@@ -662,6 +699,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return mergeFootnoteDefinitions(res.doc, definitions);
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     if (!inserted) {
       const anchorDesc = opts.anchorNodeId
@@ -720,6 +759,8 @@ export function NodesWriteMixin<TBase extends GConstructor<DocmostClientContext>
         return nd;
       },
     );
+    // #654 — arm read-your-own-writes (no-op when nothing changed).
+    this.rememberWrite(pageUuid, mutation.verify);
 
     // 0 -> "no node"; >1 -> "ambiguous, refused" (the transform already skipped
     // the write for any count !== 1). Single shared guard (#159, #185 review).

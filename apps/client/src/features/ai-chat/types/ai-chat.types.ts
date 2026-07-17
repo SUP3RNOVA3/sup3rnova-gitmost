@@ -48,6 +48,8 @@ export interface IAiRoleModelConfig {
 export interface IAiRole {
   id: string;
   name: string;
+  // The role glyph. Holds a serialized IconRef JSON (a Lucide icon; see
+  // lib/icon-ref.ts) — NOT a native emoji, despite the retained column name.
   emoji: string | null;
   description: string | null;
   instructions?: string;

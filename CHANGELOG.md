@@ -146,6 +146,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`editPageText` and comment-anchoring now match across invisible characters.**
+  The matcher gained a `fold` tier: after the existing exact and markdown-strip
+  passes miss, it retries with a fold pass that collapses soft-hyphens
+  (`U+00AD`), zero-width and BOM characters (`U+200B`–`U+200D`, `U+FEFF`,
+  `U+2060`), and the whole NBSP/figure/thin-space family into their visible
+  equivalents — so a `find` typed with ordinary spaces still locates text that
+  the editor stored with an NBSP, and vice versa. A `find`/`replace` that itself
+  removes or inserts invisibles (e.g. stripping a stray soft-hyphen) keeps going
+  through the exact tier, so those edits are unaffected. `replaceAll` merges the
+  exact and fold hits into one disjoint plan; every reported match now carries a
+  `matchedVia` field naming the tier that hit. When nothing matches, the tool
+  now returns a targeted self-diagnosis of *why* (invisible-char mismatch,
+  markdown-vs-plain, whitespace run) instead of a bare "not found". Comment
+  anchoring gained the same two-tier (verbatim + fold) lattice. The invisible-
+  folding, typography and dash/quote normalization tables are consolidated into
+  one canon in `@docmost/prosemirror-markdown`, shared by the matcher, comment
+  anchoring and footnote merging (previously duplicated across three files).
+
+- **Excalidraw diagrams no longer vanish from external publications either.**
+  The companion to the draw.io fix below: `habr-mcp` did not know the `excalidraw`
+  node type and silently dropped it. Symmetric to draw.io, the excalidraw editor
+  now embeds a PNG `data-raster` into the saved `.excalidraw.svg` on save (behind
+  the new `EXCALIDRAW_RASTER_ENABLED` env var, default off), and the MCP consumers
+  (`stashPage`, `viewImage`) accept the `excalidraw` node type. Unlike draw.io,
+  excalidraw's SVG is itself valid (real `<text>`), so it has a correct degrade
+  path: with no usable raster, `stashPage` rewrites the node to an `image` backed
+  by the mirrored SVG (rather than dropping it), and `viewImage` rasterizes the
+  SVG server-side — excalidraw never takes draw.io's "no raster → error" branch.
+
+- **Page icons and AI-agent role glyphs are now Lucide icons, not native emoji.**
+  A page icon is picked from the Lucide set plus a preset color palette
+  (background + glyph); a role glyph is a Lucide icon over the role's existing
+  gradient avatar. Both are stored as a small `{"name":…,"color":…}` JSON string
+  in the existing `pages.icon` / `aiAgentRoles.emoji` columns (not renamed). A
+  defensive parser renders the context's default glyph for anything that is not a
+  valid icon reference, so a legacy emoji value — or any malformed value — never
+  shows raw JSON; a boot migration NULLs the old emoji values so they fall back to
+  the default. Callout and inline-text emoji are unchanged (out of scope).
+
 - **draw.io diagrams reach external publications as a real raster instead of
   silently vanishing.** A draw.io diagram is a single `.drawio.svg` whose visible
   captions live in `<foreignObject>`, which only a browser renders — so any
@@ -481,6 +520,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base-URL contract is unchanged. (#229)
 
 ### Fixed
+
+- **A page's local editor cache is no longer shared across users on the same
+  device.** The offline ydoc was stored in IndexedDB under `page.<pageId>` with no
+  workspace/user namespace and was never purged on logout, so on a shared machine
+  the next person who opened the same page (or a same-id page in another
+  workspace) got the previous user's local content as the starting state — and,
+  with the local-first boot cache, it could flash on screen before the server
+  answered 403/404. The ydoc database is now namespaced by the same
+  `<workspace>:<user>` scope key the tree/meta caches use, so different users'
+  copies can never physically collide; the `page.*` databases are purged on an
+  explicit logout and on sign-in as a different user; and a one-time boot
+  migration drops the old un-namespaced databases. A bare `401` deliberately does
+  NOT purge the ydoc — unlike the server-authoritative tree/meta caches, the local
+  ydoc can hold unsynced offline edits, and a session that expired while offline
+  gets a `401` on reconnect before the edits sync, so purging there would lose
+  them; the namespacing is what isolates users in the meantime. (Firefox lacks
+  `indexedDB.databases()`, so the purge there falls back to a name registry; the
+  namespacing is the primary, browser-independent defense.)
+
+- **`editPageText` no longer writes literal markdown markers from a `replace`
+  into the page.** The tool documents that a `replace` carrying `**bold**` /
+  `~~strike~~` / `` `code` `` wrappers is refused, but it only refused a *pure*
+  formatting toggle — a mixed edit (text change plus markers in `replace`) slipped
+  through and wrote literal asterisks (silent content corruption for an agent that
+  copied markdown out of `getNode`). It now refuses any `replace` containing a
+  balanced marker pair, and — because the refusal checks now run *after* the find
+  is located — it no longer wrongly blocks a legitimate cleanup of literal
+  `**bold**` that is verbatim in the page (that applies, with a self-correcting
+  warning). A refused edit fails closed; sibling edits in the batch are unaffected.
 
 - **Copying a PARTIAL table selection no longer puts GFM table syntax into the
   plain-text clipboard.** Selecting one cell used to copy `| T2 |` plus a

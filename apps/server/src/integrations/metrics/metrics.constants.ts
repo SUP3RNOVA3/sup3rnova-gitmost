@@ -54,6 +54,16 @@ export const METRIC_MCP_DOWNLOAD_BYTES_TOTAL = 'mcp_download_bytes_total';
 // rename" contract as the other families.
 export const METRIC_API_KEY_AUTH_DENIED_TOTAL = 'api_key_auth_denied_total';
 
+// #665 — page->chat binding-skip observability. Almost every "did not write the
+// binding" outcome is a 200 (page unresolved, chat not owned, chat deleted, or a
+// best-effort birth-bind failure), indistinguishable from success in the HTTP
+// histogram. Each such skip increments this counter, labelled by its BOUNDED
+// reason (see the AiChatBindSkipReason set) — never free-form input — so the label
+// cardinality stays bounded. Paired with a WARN, which is the PRIMARY channel
+// because this counter is a no-op unless METRICS_PORT is set. Same "do not rename"
+// contract as the other families.
+export const METRIC_AI_CHAT_BIND_SKIPPED_TOTAL = 'ai_chat_bind_skipped_total';
+
 // Histogram buckets (seconds). Chosen to give useful p50/p95/p99 resolution
 // for typical web/DB latencies without exploding series cardinality.
 export const HTTP_BUCKETS = [

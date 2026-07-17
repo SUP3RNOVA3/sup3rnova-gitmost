@@ -34,6 +34,7 @@ import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.rep
 import { AiChatRunRepo } from '@docmost/db/repos/ai-chat/ai-chat-run.repo';
 import { AiChatRunStepRepo } from '@docmost/db/repos/ai-chat/ai-chat-run-step.repo';
 import { AiChatPageSnapshotRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-snapshot.repo';
+import { AiChatPageBindingRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-binding.repo';
 import { AiProviderCredentialsRepo } from '@docmost/db/repos/ai-chat/ai-provider-credentials.repo';
 import { AiMcpServerRepo } from '@docmost/db/repos/ai-chat/ai-mcp-server.repo';
 import { AiAgentRoleRepo } from '@docmost/db/repos/ai-agent-roles/ai-agent-roles.repo';
@@ -128,6 +129,7 @@ import { firstSqlToken } from '../integrations/metrics/metrics.constants';
     AiChatRunRepo,
     AiChatRunStepRepo,
     AiChatPageSnapshotRepo,
+    AiChatPageBindingRepo,
     AiProviderCredentialsRepo,
     AiMcpServerRepo,
     AiAgentRoleRepo,
@@ -165,6 +167,7 @@ import { firstSqlToken } from '../integrations/metrics/metrics.constants';
     AiChatRunRepo,
     AiChatRunStepRepo,
     AiChatPageSnapshotRepo,
+    AiChatPageBindingRepo,
     AiProviderCredentialsRepo,
     AiMcpServerRepo,
     AiAgentRoleRepo,

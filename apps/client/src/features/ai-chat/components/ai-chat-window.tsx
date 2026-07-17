@@ -23,9 +23,12 @@ import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { useLocation, useMatch } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
+import { LucideGlyph } from "@/components/ui/lucide/lucide-glyph.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 import {
   activeAiChatIdAtom,
   aiChatWindowOpenAtom,
+  aiChatWindowMinimizedAtom,
   aiChatWindowGeomAtom,
   aiChatWindowDockedAtom,
   aiChatDraftAtom,
@@ -46,6 +49,7 @@ import {
   type EditorSelectionContext,
 } from "@/features/editor/utils/get-editor-selection.ts";
 import { extractPageSlugId } from "@/lib";
+import { resolveOpenPage } from "@/features/ai-chat/utils/resolve-open-page.ts";
 import {
   AI_CHATS_RQ_KEY,
   AI_CHAT_MESSAGES_RQ_KEY,
@@ -57,6 +61,7 @@ import { workspaceAtom } from "@/features/user/atoms/current-user-atom";
 import ConversationList from "@/features/ai-chat/components/conversation-list.tsx";
 import ChatThread from "@/features/ai-chat/components/chat-thread.tsx";
 import {
+  bindPage,
   exportAiChat,
   stopRun,
 } from "@/features/ai-chat/services/ai-chat-service.ts";
@@ -120,27 +125,36 @@ function computeInitialGeom() {
   return { left, top, width, height };
 }
 
-// Clamp a geometry so the window stays within the current viewport.
+// Clamp a geometry so the window stays within the current viewport — BOTH
+// position and SIZE. Clamping size (mirroring computeInitialGeom's fit) is
+// essential now that a persisted geometry is honoured on first open (getOnInit):
+// the restore path is the main path, so a size saved on a large screen and
+// restored on a small one would otherwise draw the composer and resize handle
+// below a `position: fixed` viewport edge, with no way to shrink it back.
 function clampGeom(g: {
   left: number;
   top: number;
   width: number;
   height: number;
 }) {
-  const effWidth = Math.max(g.width, MIN_WIDTH);
-  const effHeight = Math.max(g.height, MIN_HEIGHT);
-  const maxLeft = Math.max(
-    EDGE_MARGIN,
-    window.innerWidth - effWidth - EDGE_MARGIN,
+  const width = Math.max(
+    MIN_WIDTH,
+    Math.min(g.width, window.innerWidth - 2 * EDGE_MARGIN),
   );
+  const height = Math.max(
+    MIN_HEIGHT,
+    Math.min(g.height, window.innerHeight - 2 * EDGE_MARGIN),
+  );
+  const maxLeft = Math.max(EDGE_MARGIN, window.innerWidth - width - EDGE_MARGIN);
   const maxTop = Math.max(
     EDGE_MARGIN,
-    window.innerHeight - effHeight - EDGE_MARGIN,
+    window.innerHeight - height - EDGE_MARGIN,
   );
   return {
-    ...g,
     left: Math.min(Math.max(EDGE_MARGIN, g.left), maxLeft),
     top: Math.min(Math.max(EDGE_MARGIN, g.top), maxTop),
+    width,
+    height,
   };
 }
 
@@ -186,7 +200,10 @@ export default function AiChatWindow() {
 
   // History section starts collapsed (matches the former panel's behavior).
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [minimized, setMinimized] = useState(false);
+  // Persisted (via the shared chrome key) so a restored-collapsed window stays
+  // collapsed across reload. Reset to expanded on CLOSE, not on open (see the
+  // layout effect below), so restoring a collapsed window survives.
+  const [minimized, setMinimized] = useAtom(aiChatWindowMinimizedAtom);
   // Mirror of `minimized` for handlers wrapped in useCallback([]) (startDrag),
   // which would otherwise close over a stale value. Kept in sync below.
   const minimizedRef = useRef(minimized);
@@ -319,18 +336,20 @@ export default function AiChatWindow() {
   // parent layout route, so useParams() can't see :pageSlug. Match the full
   // pathname against the authenticated page route instead so "the current page"
   // resolves regardless of where this component is mounted. On a non-page route
-  // the match is null, so `pageSlug` is undefined, the query is disabled and
-  // `openPage` is null. This is passed to the chat thread as context so the
-  // agent knows what "this page"/"the current page" refers to; the agent still
-  // reads/writes via its CASL-enforced page tools using the id.
+  // the match is null, so `pageSlug` is undefined and the query is disabled. This
+  // is passed to the chat thread as context so the agent knows what "this
+  // page"/"the current page" refers to; the agent still reads/writes via its
+  // CASL-enforced page tools using the id.
   const pageRouteMatch = useMatch("/s/:spaceSlug/p/:pageSlug");
   const pageSlug = pageRouteMatch?.params?.pageSlug;
-  const { data: openPageData } = usePageMetaQuery({
-    pageId: extractPageSlugId(pageSlug),
-  });
-  const openPage = openPageData
-    ? { id: openPageData.id, title: openPageData.title }
-    : null;
+  const routePageId = extractPageSlugId(pageSlug);
+  const { data: openPageData } = usePageMetaQuery({ pageId: routePageId });
+  // #665 live-bug fix: usePageMetaQuery keeps the LAST page's metadata as a
+  // keepPreviousData placeholder when disabled (off a page), so `openPageData` does
+  // NOT go null on /home. resolveOpenPage discards that stale placeholder — the
+  // open page must be the page the ROUTE says we are on, or nothing at all — so the
+  // server binds/reports the right page (or none).
+  const openPage = resolveOpenPage(openPageData, routePageId);
 
   // Live editor handles for the selection snapshot (#388). Both are published by
   // the page editor; the read-only editor is used in read mode. Reading the
@@ -383,8 +402,26 @@ export default function AiChatWindow() {
   // (a no-op for the atom), so the reconciler never fires — explicitly disarm any
   // armed error-path fallback here so a late refetch can't yank the user into a
   // just-failed chat after they chose a fresh one.
+  // #665: the last in-flight "New chat" unbind (DELETE /bind-page). ChatThread's
+  // first send of a fresh thread waits on this so an immediate role-card click
+  // can't race its DELETE past the server's birth UPSERT. It MUST live here (not
+  // in ChatThread): startNewChat remounts ChatThread, so a ref inside it would be
+  // lost at the exact moment the gate is needed. Read-and-cleared by the thread.
+  const pendingUnbindRef = useRef<Promise<unknown> | null>(null);
+
   const startNewChat = useCallback((): void => {
     cancelPendingAdoption();
+    // #665: "New chat" CLEARS the page binding (empty chat = nothing bound). Write
+    // for the LIVE page in the URL (routePageId), not openPage.id (a possibly-stale
+    // placeholder — see the openPage live-bug fix). Off a document => nothing to
+    // unbind. Fire-and-forget (never blocks the UI), and stash the promise so the
+    // fresh thread's first send sequences after it (the New-chat->instant-send
+    // race). `.catch` is mandatory: the only trace + no unhandled rejection.
+    if (routePageId) {
+      pendingUnbindRef.current = bindPage(routePageId, null).catch((err) => {
+        console.error(err);
+      });
+    }
     // Force a fresh, empty thread UNCONDITIONALLY (#161). Pressing "New chat"
     // while a brand-new chat's first turn is still streaming leaves activeChatId
     // null (the real id is adopted only at turn end), so setActiveChatId(null)
@@ -403,11 +440,21 @@ export default function AiChatWindow() {
     setActiveChatId,
     setDraft,
     setSelectedRoleId,
+    routePageId,
   ]);
 
   const selectChat = useCallback(
     (chatId: string): void => {
       cancelPendingAdoption();
+      // #665: choosing a chat from history is a CONSCIOUS open, so it RE-BINDS the
+      // current page to it. Write for the LIVE page in the URL; off a document =>
+      // no binding. Fire-and-forget so the chat opens instantly (the round-trip
+      // never gates the switch); `.catch` is the only error trace.
+      if (routePageId) {
+        void bindPage(routePageId, chatId).catch((err) => {
+          console.error(err);
+        });
+      }
       setActiveChatId(chatId);
       setHistoryOpen(false);
       setDraft("");
@@ -415,7 +462,13 @@ export default function AiChatWindow() {
       // chat's header/assistant-name (which prefers the chat's persisted role).
       setSelectedRoleId(null);
     },
-    [cancelPendingAdoption, setActiveChatId, setDraft, setSelectedRoleId],
+    [
+      cancelPendingAdoption,
+      setActiveChatId,
+      setDraft,
+      setSelectedRoleId,
+      routePageId,
+    ],
   );
 
   // The active chat object (for its title) and an export gate. The export is now
@@ -484,20 +537,39 @@ export default function AiChatWindow() {
     [activeChatId, messageRows],
   );
 
-  // On (re)open, settle the geometry before paint (useLayoutEffect → no
-  // first-frame jump): compute an initial top-right placement the first time,
-  // and re-clamp an existing geometry to the current viewport on later opens
-  // (so a stale placement is not left partly off-screen after a viewport
-  // shrink). setGeom here does not loop — windowOpen is unchanged by it.
+  // Two operators with OPPOSITE lifecycles, so they cannot share a guard:
+  //
+  // - On CLOSE: reset the collapsed state. Doing it here (not on open) is what
+  //   lets a RESTORED-collapsed window stay collapsed across reload — the design
+  //   goal — while still expanding a window that was collapsed→closed→reopened
+  //   within the same session (its close already reset the flag). It also makes
+  //   `{open:false, minimized:true}` unrepresentable. A guard on "previous
+  //   windowOpen" can't work: the latch mounts the window only AFTER windowOpen
+  //   is already true, so its first render can't tell restore from a fresh click.
+  //
+  // - On OPEN: settle the geometry before paint (useLayoutEffect → no first-frame
+  //   jump). With getOnInit the restored geom is already in the atom on this
+  //   first render, so `prev` is non-null and we take the clampGeom branch — this
+  //   is the fix for the old clobber where computeInitialGeom overwrote the saved
+  //   geometry. First placement (prev null) still computes the top-right default.
   useLayoutEffect(() => {
-    if (!windowOpen) return;
+    if (!windowOpen) {
+      setMinimized(false);
+      return;
+    }
     setGeom((prev) => (prev ? clampGeom(prev) : computeInitialGeom()));
-    // Always show the window expanded on (re)open: a collapsed state from a
-    // previous open session must not stick. Runs before paint so the first
-    // frame is already expanded. The composer's autofocus is a focus INSIDE the
-    // window (not an outside mousedown), so it cannot self-collapse the window.
-    setMinimized(false);
   }, [windowOpen]);
+
+  // Docking clears the collapsed flag. Done as an effect on `docked` (not in the
+  // three dock-write call sites) and keyed on the RAW `docked` — not `useDock`:
+  // a docked window whose navbar is collapsed has `useDock === false`, and gating
+  // on useDock would skip exactly that fallback-floating case, leaving
+  // `docked:true + minimized:true` durable (the collapsed view is hidden while
+  // docked and the Minimize button is hidden, so the flag would be stuck and
+  // invisible, then the next Undock would collapse the window to a bare header).
+  useEffect(() => {
+    if (docked) setMinimized(false);
+  }, [docked]);
 
   // While docked, keep the window pinned to the navbar's LIVE rect. useLayoutEffect
   // (not useEffect) so dockRect is measured/committed before the browser paints,
@@ -817,7 +889,12 @@ export default function AiChatWindow() {
             a universal (no-role) chat. */}
         {currentRole && (
           <span className={classes.badge} title={t("Agent role")}>
-            {currentRole.emoji ? `${currentRole.emoji} ` : ""}
+            {parseIconRef(currentRole.emoji)?.name && (
+              <LucideGlyph
+                name={parseIconRef(currentRole.emoji)?.name}
+                size={14}
+              />
+            )}
             {currentRole.name}
           </span>
         )}
@@ -1000,6 +1077,10 @@ export default function AiChatWindow() {
               // ignores).
               autonomousRunsEnabled={autonomousRunsEnabled}
               onServerStop={handleServerStop}
+              // #665: the last "New chat" unbind promise; the thread's first send
+              // of a fresh thread waits on it so an instant role-card click can't
+              // race its DELETE past the server's birth UPSERT.
+              pendingUnbindRef={pendingUnbindRef}
             />
           )}
         </div>

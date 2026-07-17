@@ -371,7 +371,9 @@ server.registerTool(
       "getOutline, or any block id inside the table. Use cellIds with " +
       "patchNode for rich-formatted cell edits. `cols` is the FIRST row's " +
       "width; ragged tables may vary per row, so use the per-row length of " +
-      "`cells` for each row.",
+      "`cells` for each row. Reflects your own just-made edit immediately " +
+      "(read-after-write); a rare freshness:\"stale-fallback\" in the result " +
+      "means re-read shortly for the settled version.",
     inputSchema: {
       pageId: z.string().min(1),
       table: z.string().min(1),

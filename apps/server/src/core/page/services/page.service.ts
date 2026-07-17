@@ -1,8 +1,11 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   Logger,
   NotFoundException,
+  ServiceUnavailableException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { CreatePageDto, ContentFormat } from '../dto/create-page.dto';
 import { ContentOperation, UpdatePageDto } from '../dto/update-page.dto';
@@ -35,7 +38,11 @@ import {
   htmlToJson,
   jsonToNode,
   jsonToText,
+  tiptapExtensions,
 } from 'src/collaboration/collaboration.util';
+import { pageContentHash } from 'src/collaboration/content-hash.util';
+import { TiptapTransformer } from '@hocuspocus/transformer';
+import * as Y from 'yjs';
 import {
   CopyPageMapEntry,
   ICopyPageAttachment,
@@ -285,6 +292,28 @@ export class PageService {
     const iconChanged =
       updatePageDto.icon !== undefined && updatePageDto.icon !== page.icon;
 
+    // #647 §D — a guarded 'replace' (content + operation:'replace' + baseHash)
+    // runs the server-side write-CAS FIRST, before any metadata write, so a
+    // REJECTED write (409/422/503, thrown here) touches NOTHING — no bumped
+    // updatedAt/contributors and no history version. On success we fall through
+    // to the normal metadata/title write below (the bottom content block skips
+    // the already-applied guarded body). Non-guarded writes are unchanged.
+    const isGuardedReplace =
+      !!updatePageDto.content &&
+      updatePageDto.operation === 'replace' &&
+      !!updatePageDto.format &&
+      updatePageDto.baseHash !== undefined;
+    if (isGuardedReplace) {
+      await this.replacePageContentGuarded(
+        page.id,
+        updatePageDto.content!,
+        updatePageDto.format!,
+        updatePageDto.baseHash!,
+        user,
+        provenance,
+      );
+    }
+
     await this.pageRepo.updatePage(
       {
         title: updatePageDto.title,
@@ -333,10 +362,13 @@ export class PageService {
       );
 
     if (
+      !isGuardedReplace &&
       updatePageDto.content &&
       updatePageDto.operation &&
       updatePageDto.format
     ) {
+      // Non-guarded write: append/prepend, or a legacy 'replace' WITHOUT baseHash
+      // (back-compat, unchanged). The guarded 'replace' already ran above.
       await this.updatePageContent(
         page.id,
         updatePageDto.content,
@@ -380,6 +412,190 @@ export class PageService {
       documentName,
       { operation, prosemirrorJson, user },
     );
+  }
+
+  /**
+   * #647 §C/§D — guarded full replace (server-side write-CAS). Parses + footnote-
+   * canonicalizes the incoming body exactly like `updatePageContent`'s 'replace',
+   * then routes `replaceIfMatch` to the document owner: the base-hash compare and
+   * the structural overwrite happen ATOMICALLY on the authoritative live doc.
+   *
+   * Fail-closed on every non-apply outcome (§R4):
+   *  - hash mismatch → HTTP 409 + `currentHash` (a concurrent edit landed; the
+   *    client re-reads and retries). No content written, no history version.
+   *  - empty-over-non-empty (§C/B4) → HTTP 422 (would clear the page; refused).
+   *  - owner unreachable / bridge timeout → HTTP 503 (retryable). We NEVER read a
+   *    stale DB snapshot to satisfy the compare, so an unreachable owner can never
+   *    be clobbered.
+   *
+   * B3 attribution: the request provenance (`actor`/`aiChatId`/`apiKeyId`) is
+   * threaded into the collab connection context so the debounced store stamps the
+   * write as agent-authored and preserves the api-key/ai-chat identity.
+   */
+  async replacePageContentGuarded(
+    pageId: string,
+    content: string | object,
+    format: ContentFormat,
+    baseHash: string,
+    user: User,
+    provenance?: AuthProvenanceData,
+  ): Promise<{ applied: true; newHash: string }> {
+    let prosemirrorJson = await this.parseProsemirrorContent(content, format);
+    prosemirrorJson = canonicalizeFootnotes(prosemirrorJson);
+
+    const documentName = `page.${pageId}`;
+    let result;
+    try {
+      result = await this.collaborationGateway.handleYjsEvent(
+        'replaceIfMatch',
+        documentName,
+        {
+          prosemirrorJson,
+          baseHash,
+          user,
+          actor: provenance?.actor,
+          aiChatId: provenance?.aiChatId ?? null,
+          apiKeyId: provenance?.apiKeyId ?? null,
+        },
+      );
+    } catch (err) {
+      // Bridge timeout / no live collaboration instance: the owner is
+      // unreachable. Fail CLOSED (retryable) — do NOT fall back to a DB compare.
+      this.logger.warn(
+        `Guarded replace for ${pageId} could not reach the collab owner: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      throw new ServiceUnavailableException(
+        'Could not reach the live document to verify baseHash; retry shortly.',
+      );
+    }
+
+    if (!result.applied) {
+      if (result.reason === 'empty-replace-refused') {
+        throw new UnprocessableEntityException(
+          'Refusing a guarded replace that would empty a non-empty page. ' +
+            'Clear the page explicitly instead of overwriting it with an empty body.',
+        );
+      }
+      // Hash mismatch → 409 with the current hash so the client can re-read.
+      throw new ConflictException({
+        message:
+          'Page changed since it was read (baseHash mismatch). Re-read the ' +
+          'page to get a fresh baseHash and retry the write.',
+        currentHash: result.currentHash,
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * #647 §B/§E — coherent `{ content, contentHash }` for the opt-in
+   * `/pages/info?includeContentHash` read path (and the base hash a future
+   * guarded-replace re-checks). The hash is computed over `fromYdoc(D)`, NEVER the
+   * raw `page.content` (#647 B1: `fromYdoc(toYdoc(x)) !== x`, so hashing raw
+   * content would produce a permanent false 409), and the returned `content` is
+   * the SAME materialization, so a caller keying a cache by this hash gets true
+   * read-your-own-writes.
+   *
+   * When the collab doc is LOADED on some instance we take its live content via
+   * the non-claiming `readLiveIfLoaded` primitive (RYOW even while the DB row is
+   * debounce-stale). When it is NOT loaded we reconstruct a TRANSIENT ydoc from
+   * the DB exactly as `onLoadDocument` would (page.ydoc → applyUpdate, else
+   * toYdoc(page.content)) and hash that — WITHOUT force-loading the document.
+   */
+  async getLiveContentPair(
+    pageId: string,
+  ): Promise<{ content: any; contentHash: string }> {
+    const documentName = `page.${pageId}`;
+    const live = await this.collaborationGateway.readLiveIfLoaded(documentName);
+    if (live.loaded) {
+      return { content: live.content, contentHash: live.hash };
+    }
+
+    // Not loaded (or owner unreachable): reconstruct a transient ydoc from the DB
+    // and hash the SAME `fromYdoc` materialization the load path would produce.
+    const page = await this.pageRepo.findById(pageId, {
+      includeContent: true,
+      includeYdoc: true,
+    });
+    const content = this.reconstructContentFromDb(page);
+    return { content, contentHash: pageContentHash(content) };
+  }
+
+  /**
+   * #654 §Server — the read-your-own-writes resolution for the structural read
+   * tools' opt-in `preferLive` hint. Consumes the SAME non-claiming, non-force-
+   * loading `readLiveIfLoaded` primitive (#647) but, unlike getLiveContentPair,
+   * returns NO hash and falls back to the raw `page.content` DB row (NOT a
+   * transient ydoc reconstruction) — a stale read is acceptable here (this feeds
+   * structural views, not a CAS base hash), so we keep the fallback cheap.
+   *
+   * Three outcomes (contract point 4 of the primitive), mapped to a metric-
+   * distinguishable `fallbackReason`:
+   *  - loaded            -> live content, `contentSource:'live'`.
+   *  - not loaded        -> `dbContent`, `contentSource:'db'`, `not_loaded`.
+   *  - owner unreachable -> `dbContent`, `contentSource:'db'`, `owner_unreachable`.
+   *
+   * ALWAYS fails open to the DB row — it never throws, so a hung/absent owner
+   * degrades to a (possibly stale) read within the primitive's short probe
+   * timeout instead of erroring or stalling the hot read path.
+   */
+  async resolvePreferLiveContent(
+    pageId: string,
+    dbContent: any,
+  ): Promise<{
+    content: any;
+    contentSource: 'live' | 'db';
+    fallbackReason?: 'not_loaded' | 'owner_unreachable';
+  }> {
+    const documentName = `page.${pageId}`;
+    let live: Awaited<
+      ReturnType<typeof this.collaborationGateway.readLiveIfLoaded>
+    >;
+    try {
+      live = await this.collaborationGateway.readLiveIfLoaded(documentName);
+    } catch {
+      // Fail OPEN (the docstring's "never throws" contract): ANY error while
+      // probing the owner — e.g. an unwrapped redis reject in readLiveIfLoaded's
+      // non-remote pub.get branch — must degrade to the DB row, not 500 the hot
+      // /pages/info read path. Fail-CLOSED in the sense that matters: we return
+      // the SAME dbContent a plain read returns, never another page's content.
+      return { content: dbContent, contentSource: 'db', fallbackReason: 'owner_unreachable' };
+    }
+    if (live.loaded) {
+      return { content: live.content, contentSource: 'live' };
+    }
+    // Not loaded (no owner / not hydrated) vs owner present but the short probe
+    // timed out / errored — different metrics, same fail-open to the DB row.
+    const fallbackReason = (live as { unreachable?: boolean }).unreachable
+      ? 'owner_unreachable'
+      : 'not_loaded';
+    return { content: dbContent, contentSource: 'db', fallbackReason };
+  }
+
+  /**
+   * #647 B1 — materialize a page's ProseMirror JSON the SAME way onLoadDocument
+   * hydrates it, so a hash over the result matches what the collab process holds:
+   * prefer the persisted ydoc bytes, else convert `page.content`, else an empty
+   * doc. Uses a throwaway Y.Doc — it never touches the live collab instance.
+   */
+  private reconstructContentFromDb(page: Page | null | undefined): any {
+    if (page?.ydoc) {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, new Uint8Array(page.ydoc as any));
+      return TiptapTransformer.fromYdoc(doc, 'default');
+    }
+    if (page?.content) {
+      const doc = TiptapTransformer.toYdoc(
+        page.content,
+        'default',
+        tiptapExtensions,
+      );
+      return TiptapTransformer.fromYdoc(doc, 'default');
+    }
+    return { type: 'doc', content: [] };
   }
 
   async getSidebarPages(

@@ -1,5 +1,7 @@
 import { Badge, Box, Group, Text } from "@mantine/core";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
+import { LucideGlyph } from "@/components/ui/lucide/lucide-glyph.tsx";
+import { parseIconRef } from "@/lib/icon-ref.ts";
 import { useTranslation } from "react-i18next";
 import { memo } from "react";
 import { RevisionRowData } from "@/features/page-history/utils/revision-row";
@@ -78,7 +80,13 @@ const RevisionRow = memo(function RevisionRow({
           }}
           aria-label={row.agentName}
         >
-          {row.agentEmoji ?? row.agentName?.[0]?.toUpperCase() ?? "A"}
+          <LucideGlyph
+            name={parseIconRef(row.agentEmoji)?.name}
+            size={12}
+            fallback={
+              <>{row.agentName?.[0]?.toUpperCase() ?? "A"}</>
+            }
+          />
         </Box>
       ) : (
         <CustomAvatar

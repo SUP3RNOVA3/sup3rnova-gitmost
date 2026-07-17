@@ -95,25 +95,67 @@ export class PageController {
 
     const permissions = { canEdit, hasRestriction };
 
-    if (dto.format && dto.format !== 'json' && page.content) {
+    // #647 §E — opt-in coherent content hash (getPage/getPageJson only). When
+    // requested we resolve the LIVE content (via the non-claiming
+    // readLiveIfLoaded primitive) so `content` reflects unflushed edits and
+    // `contentHash` is coherent with it — read-your-own-writes for getPage and
+    // the base hash a guarded-replace re-checks. Every other reader skips this.
+    let content = page.content;
+    let contentHash: string | undefined;
+    if (dto.includeContentHash) {
+      const pair = await this.pageService.getLiveContentPair(page.id);
+      content = pair.content;
+      contentHash = pair.contentHash;
+    }
+
+    // #654 §Server — opt-in read-your-own-writes for the structural read tools.
+    // Runs AFTER the permission gate above and ONLY when requested, and probes
+    // the owner by the resolved `page.id` (never the raw slug). `effectiveContent`
+    // is used INDEPENDENTLY of the `&& content` format gate below, so a doc that
+    // is loaded-but-not-yet-flushed (DB row still empty) still returns its live
+    // body. `contentSource`/`fallbackReason` are additive sibling fields on the
+    // response root (existing consumers ignore unknown fields).
+    let contentSource: 'live' | 'db' | undefined;
+    let fallbackReason: 'not_loaded' | 'owner_unreachable' | undefined;
+    if (dto.preferLive) {
+      const live = await this.pageService.resolvePreferLiveContent(
+        page.id,
+        page.content,
+      );
+      content = live.content;
+      contentSource = live.contentSource;
+      fallbackReason = live.fallbackReason;
+    }
+
+    if (dto.format && dto.format !== 'json' && content) {
       let contentOutput: string;
       if (dto.format === 'markdown') {
-        contentOutput = jsonToMarkdown(page.content);
+        contentOutput = jsonToMarkdown(content);
       } else if (dto.format === 'text') {
         // #502: flat, deterministic, machine-diffable text (block-per-line,
         // inline marks/anchors dropped, non-text nodes -> stable placeholders).
-        contentOutput = jsonToText(page.content, { deterministic: true });
+        contentOutput = jsonToText(content, { deterministic: true });
       } else {
-        contentOutput = jsonToHtml(page.content);
+        contentOutput = jsonToHtml(content);
       }
       return {
         ...page,
         content: contentOutput,
+        ...(contentHash !== undefined ? { contentHash } : {}),
+        ...(contentSource !== undefined ? { contentSource } : {}),
+        ...(fallbackReason !== undefined ? { fallbackReason } : {}),
         permissions,
       };
     }
 
-    return { ...page, permissions };
+    return {
+      ...page,
+      content,
+      ...(contentHash !== undefined ? { contentHash } : {}),
+      ...(contentSource !== undefined ? { contentSource } : {}),
+      ...(fallbackReason !== undefined ? { fallbackReason } : {}),
+      permissions,
+    };
   }
 
   @HttpCode(HttpStatus.OK)

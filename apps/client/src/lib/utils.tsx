@@ -1,7 +1,7 @@
 import { validate as isValidUUID } from "uuid";
-import { IconFileDescription } from "@tabler/icons-react";
 import { ReactNode } from "react";
 import { TFunction } from "i18next";
+import { PageIcon } from "@/components/ui/page-icon.tsx";
 
 export function formatMemberCount(memberCount: number, t: TFunction): string {
   if (memberCount === 1) {
@@ -100,16 +100,14 @@ export function capitalizeFirstChar(string: string) {
   return string.charAt(0).toUpperCase() + string.slice(1);
 }
 
-export function getPageIcon(icon: string, size = 18): string | ReactNode {
-  return (
-    icon || (
-      <IconFileDescription
-        size={size}
-        color="var(--mantine-color-gray-6)"
-        aria-hidden="true"
-      />
-    )
-  );
+// Renders a page icon from its stored value (IconRef JSON, a legacy emoji, or
+// null). Always goes through <PageIcon> so a raw JSON value can never leak into
+// the UI; null/legacy/invalid values render the neutral default file glyph.
+export function getPageIcon(
+  icon: string | null | undefined,
+  size = 18,
+): ReactNode {
+  return <PageIcon value={icon} size={size} />;
 }
 
 export const normalizeUrl = (url: string): string => {

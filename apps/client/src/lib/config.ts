@@ -113,6 +113,16 @@ export function isDrawioRasterEnabled(): boolean {
   return castToBoolean(getConfigValue("DRAWIO_RASTER_ENABLED", "false"));
 }
 
+// #632 — operator kill-switch for embedding a PNG raster into the saved
+// .excalidraw.svg (Part A), symmetric to DRAWIO_RASTER_ENABLED. DEFAULT OFF: the
+// server mirrors EXCALIDRAW_RASTER_ENABLED into window.CONFIG; when off the
+// client saves an svg-only excalidraw diagram exactly as before (byte-identical),
+// so the added file-size is instantly reversible by a flag flip. This gates
+// GENERATION only; consumption (Part B: server/mcp) is independent.
+export function isExcalidrawRasterEnabled(): boolean {
+  return castToBoolean(getConfigValue("EXCALIDRAW_RASTER_ENABLED", "false"));
+}
+
 export function getBillingTrialDays() {
   return getConfigValue("BILLING_TRIAL_DAYS");
 }

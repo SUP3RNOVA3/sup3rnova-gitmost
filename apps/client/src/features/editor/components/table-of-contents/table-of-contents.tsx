@@ -74,7 +74,12 @@ export const TableOfContents: FC<TableOfContentsProps> = (props) => {
   };
 
   const handleUpdate = () => {
-    const result = recalculateLinks(props.editor?.$nodes("heading"));
+    // `?? []`: with a null editor (the panel restored open before the editor has
+    // mounted) `$nodes` is not called and recalculateLinks receives an empty
+    // array instead of `undefined` — otherwise `Array.from(undefined)` throws,
+    // and the root ChunkLoadErrorBoundary's only control is a reload button,
+    // producing an inescapable reload loop.
+    const result = recalculateLinks(props.editor?.$nodes("heading") ?? []);
 
     setLinks(result.links);
     setHeadingDOMNodes(result.nodes);
@@ -96,12 +101,15 @@ export const TableOfContents: FC<TableOfContentsProps> = (props) => {
     };
   }, [props.editor, debouncedHandleUpdate]);
 
-  useEffect(
-    () => {
-      handleUpdate();
-    },
-    props.isShare ? [props.editor] : [],
-  );
+  // Rescan on mount AND whenever the editor handle changes, in BOTH modes. The
+  // former non-share deps `[]` scanned exactly once at mount; if the editor was
+  // null then (panel restored open before the editor mounted) it would never
+  // rescan (read mode gets no `update` events) and the TOC stayed permanently
+  // empty. Depending on `props.editor` also removes the variable-length deps
+  // array the ternary produced.
+  useEffect(() => {
+    handleUpdate();
+  }, [props.editor]);
 
   useEffect(() => {
     try {
@@ -143,6 +151,13 @@ export const TableOfContents: FC<TableOfContentsProps> = (props) => {
       console.log(err);
     }
   }, [headingDOMNodes, props.editor]);
+
+  // No editor yet (panel restored open on reload before the editor mounts): show
+  // NOTHING rather than the "Add headings…" empty state, which would falsely
+  // assert the user's page has no headings until the editor arrives. Safe at both
+  // call sites: share-shell gates on `readOnlyEditor &&`, and aside.tsx checks the
+  // returned element with `component &&`, so the panel chrome is unaffected.
+  if (!props.editor) return null;
 
   if (!links.length) {
     return (

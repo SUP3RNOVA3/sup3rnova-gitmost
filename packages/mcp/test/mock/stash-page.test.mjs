@@ -123,6 +123,33 @@ function drawioPageDoc() {
   };
 }
 
+// An excalidraw SVG (#632) — its captions are REAL <text>, so the SVG is valid
+// on its own; optionally carrying a browser-embedded PNG raster on root.
+function excalidrawSvg({ raster } = {}) {
+  const rasterAttr = raster ? ` data-raster="${raster}"` : "";
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg"${rasterAttr} ` +
+    `width="100" height="80"><text x="0" y="10">real caption</text></svg>`
+  );
+}
+function excalidrawPageDoc() {
+  return {
+    type: "doc",
+    content: [
+      {
+        type: "excalidraw",
+        attrs: {
+          src: "/api/files/ex-1/diagram.excalidraw.svg",
+          attachmentId: "ex-1",
+          title: "My excalidraw",
+          width: 240,
+          align: "left",
+        },
+      },
+    ],
+  };
+}
+
 function pageDoc() {
   return {
     type: "doc",
@@ -508,4 +535,130 @@ test("stashPage HARD-FAILS if a synthesized diagram raster is FIFO-evicted (#629
   });
 
   await assert.rejects(() => client.stashPage("page-1"), /synthesized diagram raster/);
+});
+
+// --- excalidraw diagram rasterization + SVG-mirror degrade (#632) -----------
+
+test("stashPage rasterizes an excalidraw node with a valid embedded raster (#632)", async () => {
+  const sandbox = makeSandbox();
+  const raster = `data:image/png;base64,${PNG_RASTER.toString("base64")}`;
+  const svg = excalidrawSvg({ raster });
+  const client = await buildClient(sandbox, {
+    doc: excalidrawPageDoc(),
+    fileBytes: Buffer.from(svg, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  const result = await client.stashPage("page-1");
+
+  assert.equal(result.diagrams.rasterized, 1);
+  assert.equal(result.diagrams.degraded, 0);
+
+  // The stored diagram blob is the PNG, not the SVG.
+  const pngPut = sandbox.puts.find((p) => p.mime === "image/png");
+  assert.ok(pngPut, "a PNG blob was stored");
+  assert.deepEqual([...pngPut.buf.subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47]);
+  assert.ok(!sandbox.puts.some((p) => p.mime === "image/svg+xml"));
+
+  // The excalidraw node became an image node pointing at the sandbox PNG.
+  const docPut = sandbox.puts.find((p) => p.mime === "application/json");
+  const node = JSON.parse(docPut.buf.toString("utf8")).content.content[0];
+  assert.equal(node.type, "image");
+  assert.equal(node.attrs.src, `https://sb.test/api/sb/${pngPut.id}`);
+  assert.equal(node.attrs.alt, "My excalidraw");
+  assert.equal(node.attrs.width, 240);
+  assert.equal(node.attrs.align, "left");
+});
+
+test("stashPage degrades an excalidraw node with NO raster to a MIRRORED SVG image (not dropped, no throw) (#632)", async () => {
+  const sandbox = makeSandbox();
+  const svg = excalidrawSvg(); // NO data-raster
+  const client = await buildClient(sandbox, {
+    doc: excalidrawPageDoc(),
+    fileBytes: Buffer.from(svg, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  const result = await client.stashPage("page-1");
+
+  // Counted as degraded (no raster), but NOT dropped and NOT a hard throw.
+  assert.equal(result.diagrams.rasterized, 0);
+  assert.equal(result.diagrams.degraded, 1);
+
+  // The SVG was mirrored into the sandbox as image/svg+xml; no PNG synthesized.
+  const svgPut = sandbox.puts.find((p) => p.mime === "image/svg+xml");
+  assert.ok(svgPut, "the excalidraw SVG was mirrored into the sandbox");
+  assert.ok(svgPut.buf.toString("utf8").includes("<text"));
+  assert.ok(!sandbox.puts.some((p) => p.mime === "image/png"));
+
+  // The excalidraw node became an IMAGE node pointing at the mirrored SVG blob
+  // (so habr renders it instead of dropping an unknown excalidraw node).
+  const docPut = sandbox.puts.find((p) => p.mime === "application/json");
+  const node = JSON.parse(docPut.buf.toString("utf8")).content.content[0];
+  assert.equal(node.type, "image");
+  assert.equal(node.attrs.src, `https://sb.test/api/sb/${svgPut.id}`);
+  assert.equal(node.attrs.alt, "My excalidraw");
+});
+
+test("stashPage rejects a FAKE (non-PNG) excalidraw raster and falls to the SVG-image degrade (#632)", async () => {
+  const sandbox = makeSandbox();
+  // Valid data-URI prefix but non-PNG bytes -> signature check fails.
+  const fake = `data:image/png;base64,${Buffer.from("not a png").toString("base64")}`;
+  const svg = excalidrawSvg({ raster: fake });
+  const client = await buildClient(sandbox, {
+    doc: excalidrawPageDoc(),
+    fileBytes: Buffer.from(svg, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  const result = await client.stashPage("page-1");
+
+  // The fake raster is NOT stored as image/png; instead the valid SVG is mirrored.
+  assert.equal(result.diagrams.rasterized, 0);
+  assert.equal(result.diagrams.degraded, 1);
+  assert.ok(!sandbox.puts.some((p) => p.mime === "image/png"));
+  assert.ok(sandbox.puts.some((p) => p.mime === "image/svg+xml"));
+  const docPut = sandbox.puts.find((p) => p.mime === "application/json");
+  const node = JSON.parse(docPut.buf.toString("utf8")).content.content[0];
+  assert.equal(node.type, "image");
+});
+
+test("stashPage reverts an evicted excalidraw SVG-mirror to an in-place degrade, never a throw (#632)", async () => {
+  // A no-raster excalidraw SVG mirror is a SOFT mirror: if its sandbox blob is
+  // FIFO-evicted by the doc put, the node reverts to the original excalidraw
+  // node (in-place degrade) — NOT the hard failure a synthesized PNG raster
+  // triggers. One big SVG (~4000 bytes) + a bulked doc over a tight cap forces
+  // the doc put to evict the SVG blob.
+  const BIG_SVG =
+    `<svg xmlns="http://www.w3.org/2000/svg"><text>` +
+    "x".repeat(4000) +
+    `</text></svg>`;
+  const sandbox = makeSandbox({ maxTotal: 4200 });
+  const doc = {
+    type: "doc",
+    content: [
+      {
+        type: "excalidraw",
+        attrs: { src: "/api/files/ex-9/d.excalidraw.svg", attachmentId: "ex-9", title: "T" },
+      },
+      // Bulk the doc so its put crosses the cap and evicts the SVG blob.
+      { type: "paragraph", attrs: { filler: "y".repeat(600) }, content: [] },
+    ],
+  };
+  const client = await buildClient(sandbox, {
+    doc,
+    fileBytes: Buffer.from(BIG_SVG, "utf-8"),
+    fileHeaders: { "Content-Type": "image/svg+xml" },
+  });
+
+  // Must NOT throw (excalidraw SVG mirrors soft-revert).
+  const result = await client.stashPage("page-1");
+  assert.equal(result.diagrams.degraded, 1);
+
+  // The final stored doc reverted the node back to an excalidraw node with its
+  // ORIGINAL src (in-place degrade), referencing no dead sandbox blob.
+  const docPut = sandbox.puts.filter((p) => p.mime === "application/json").at(-1);
+  const node = JSON.parse(docPut.buf.toString("utf8")).content.content[0];
+  assert.equal(node.type, "excalidraw");
+  assert.equal(node.attrs.src, "/api/files/ex-9/d.excalidraw.svg");
 });

@@ -252,6 +252,37 @@ export class CollaborationGateway {
     return this.hocuspocus.openDirectConnection(documentName, context);
   }
 
+  /**
+   * #647 refinement B — the `readLiveIfLoaded` primitive (#654's gating
+   * deliverable). NON-CLAIMING, NON-FORCE-LOADING read of a document's live
+   * content: returns `{loaded:true, content, hash}` only if the doc is already
+   * hydrated on some instance, else `{loaded:false}` (or `{loaded:false,
+   * unreachable:true}` when the owner exists but the short probe timed out). See
+   * RedisSyncExtension.readLiveIfLoaded for the full 6-property contract.
+   */
+  async readLiveIfLoaded(
+    documentName: string,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<
+    | { loaded: true; content: any; hash: string }
+    | { loaded: false; unreachable?: boolean }
+  > {
+    if (this.redisSync) {
+      return this.redisSync.readLiveIfLoaded(documentName, opts);
+    }
+
+    // COLLAB_DISABLE_REDIS: one local instance owns every document, so read it
+    // directly through the same non-force-loading handler (it only reads docs
+    // already in `hocuspocus.documents`; a missing doc → {loaded:false}).
+    if (this.hocuspocus) {
+      const handlers = this.collabEventsService.getHandlers(this.hocuspocus);
+      return handlers.readLiveContent(documentName);
+    }
+
+    // Collaboration was never initialized: nothing is loaded anywhere.
+    return { loaded: false };
+  }
+
   /*
    *Can be used before calling openDirectConnection directly
    */

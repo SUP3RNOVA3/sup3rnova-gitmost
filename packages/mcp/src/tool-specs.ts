@@ -293,7 +293,9 @@ export const SHARED_TOOL_SPECS = {
       'Get page details with the raw ProseMirror JSON content (lossless: ' +
       'includes block ids, callouts, tables, link/image attributes) plus the ' +
       'slugId used in URLs. Use the block ids it returns to make precise ' +
-      'structural edits or surgical text edits without resending the page.',
+      'structural edits or surgical text edits without resending the page. Also ' +
+      'returns a `baseHash` — pass it to updatePageJson/updatePageMarkdown when ' +
+      'you overwrite the whole body so a concurrent edit cannot be clobbered.',
     tier: 'deferred',
     catalogLine:
       "getPageJson — get a page's raw ProseMirror JSON (lossless, with block ids).",
@@ -312,7 +314,9 @@ export const SHARED_TOOL_SPECS = {
       'id, level, firstText}; tables add rows/cols/header; lists add item ' +
       'count) WITHOUT the full document body. Use it to locate sections/tables ' +
       'and grab block ids cheaply before fetching, patching or inserting ' +
-      'individual blocks.',
+      'individual blocks. Reflects your own just-made edit immediately ' +
+      '(read-after-write); a rare freshness:"stale-fallback" in the result ' +
+      'means re-read shortly for the settled version.',
     tier: 'core',
     catalogLine:
       "getOutline — compact outline of a page's top-level blocks with their ids.",
@@ -339,7 +343,9 @@ export const SHARED_TOOL_SPECS = {
       'Pass format:"json" for the raw lossless ProseMirror subtree (for precise ' +
       'attr/mark work). A node that cannot be a document top-level block ' +
       '(tableRow/tableCell/tableHeader via "#<index>") auto-falls back to JSON with ' +
-      'format:"json" in the response.',
+      'format:"json" in the response. Reflects your own just-made edit immediately ' +
+      '(read-after-write); a rare freshness:"stale-fallback" in the response means ' +
+      're-read shortly for the settled version.',
     tier: 'core',
     catalogLine:
       "getNode — fetch one block (markdown by default; json for the raw subtree).",
@@ -385,13 +391,21 @@ export const SHARED_TOOL_SPECS = {
       'getOutline index; `before`/`after` give ~40 chars of context to build ' +
       'that unique selection. `total` counts all ' +
       'hits and `truncated` is true when more than `limit` were found (nothing ' +
-      'is silently dropped). Default is a literal, case-INSENSITIVE substring; ' +
+      'is silently dropped). Default is a literal, case-INSENSITIVE substring ' +
+      'that matches THROUGH invisible characters — soft hyphen, NBSP, zero-width ' +
+      'chars and collapsed whitespace runs — so "в людях" finds "в люд­ях" ' +
+      '(the hit carries folded:true and match keeps the original invisibles). ' +
       'set regex:true for an RE2 regular expression (linear-time, ReDoS-safe: ' +
       'char classes, word boundaries, anchors and quantifiers work; lookaround ' +
       '(?=…)/(?<=…) and backreferences \\1 are NOT supported) and ' +
-      'caseSensitive:true to match case. Ideal for systematic ' +
+      'caseSensitive:true to match case. Regex mode does NOT fold invisibles — a ' +
+      'pattern that must span them has to match them explicitly (e.g. the soft-' +
+      'hyphen codepoint \\x{00ad}). Ideal for systematic ' +
       'editorial sweeps (unquoted "ё", straight quotes, "т.е.", stray units). An ' +
-      'invalid regex or an empty query returns a clear error to fix.',
+      'invalid regex or an empty query returns a clear error to fix. Reflects ' +
+      'your own just-made edit immediately (read-after-write); a rare ' +
+      'freshness:"stale-fallback" in the result means re-read shortly for the ' +
+      'settled version.',
     tier: 'core',
     catalogLine:
       'searchInPage — find every occurrence of a string/regex inside one page, with locations.',
@@ -859,7 +873,11 @@ export const SHARED_TOOL_SPECS = {
       'failed[]. To change bold/italic/strike/code/link, read the block as ' +
       'page JSON and use a structural node patch/update to set its marks. ' +
       'Examples: edits:[{find:"teh",replace:"the"}]; edits:[{find:"Hello ' +
-      'world",replace:"Hello there"}] (crosses a bold boundary).',
+      'world",replace:"Hello there"}] (crosses a bold boundary). Exception: ' +
+      'literal markers found verbatim in the document are allowed (e.g. ' +
+      'cleaning up a stray find:"**bold**", replace:"bold"). Matching is ' +
+      'tolerant of invisible characters (soft hyphen/NBSP/zero-width) and ' +
+      'markdown in find; on a miss, failed[] carries a precise self-diagnosis.',
     tier: 'core',
     catalogLine:
       "editPageText — surgical find/replace of plain text in a page, preserving ids/marks.",
@@ -976,7 +994,9 @@ export const SHARED_TOOL_SPECS = {
       'become STABLE placeholders — an image is "[image]" and a table is ' +
       '"[table RxC]" (R rows x C columns). This output is stable across versions ' +
       '(pinned by a snapshot test); use it to diff a config/prose you wrote ' +
-      'against what was stored (an empty diff means it was stored verbatim).',
+      'against what was stored (an empty diff means it was stored verbatim). ' +
+      'Also returns a `baseHash`: pass it to updatePageMarkdown/updatePageJson ' +
+      'when you overwrite the whole body so a concurrent edit cannot be clobbered.',
     tier: 'core',
     catalogLine:
       'getPage — fetch a page by its id (format:"markdown" default, or "text" for a flat machine-diffable read).',
@@ -1000,14 +1020,17 @@ export const SHARED_TOOL_SPECS = {
         (format as 'markdown' | 'text' | undefined) ?? 'markdown',
       ),
     inAppExecute: async (client, { pageId }) => {
-      // getPage(pageId) -> { data: filterPage(page, markdown), success }.
+      // getPage(pageId) -> { data: filterPage(page, markdown) + baseHash, success }.
       const result = (await client.getPage(pageId as string)) as {
-        data?: { title?: string; content?: string };
+        data?: { title?: string; content?: string; baseHash?: string };
       };
       const data = result?.data ?? {};
       return {
         title: data.title ?? '',
         markdown: typeof data.content === 'string' ? data.content : '',
+        // #647 §F/B3-crit (§14): the in-app agent MUST receive baseHash here or
+        // it cannot perform a guarded write (updatePageMarkdown/updatePageJson).
+        baseHash: data.baseHash,
       };
     },
   },
@@ -1344,22 +1367,29 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'updatePageJson',
     writeClass: 'write',
     description:
-      "Replace a page's content with a raw ProseMirror JSON document (lossless " +
-      'write: preserves the block ids, callouts, tables and attributes you pass ' +
-      'in). Typical flow: read the page-JSON view -> modify the JSON -> write it back. ' +
-      'Keep existing node ids intact so heading anchors and history stay ' +
-      'stable. Minimal full-doc example: {"type":"doc","content":[{"type":' +
+      "LAST RESORT full-body overwrite. Prefer the granular tools first " +
+      '(editPageText / patchNode / insertNode / table tools): a full overwrite ' +
+      'REGENERATES block ids and must pass the write-CAS. Replace a page\'s ' +
+      'content with a raw ProseMirror JSON document (lossless write: preserves ' +
+      'the block ids, callouts, tables and attributes you pass in). REQUIRED flow ' +
+      'when writing content: read the page-JSON view (getPageJson) -> keep its ' +
+      '`baseHash` -> modify the JSON -> write it back WITH that `baseHash`. Keep ' +
+      'existing node ids intact so heading anchors and history stay stable. ' +
+      'Minimal full-doc example: {"type":"doc","content":[{"type":' +
       '"paragraph","content":[{"type":"text","text":"Hi"}]}]}. `content` may be ' +
       'a JSON object or a JSON string (both accepted), and is OPTIONAL: omit it ' +
       'to update only the title (though prefer the rename-page tool for a title-only ' +
-      'change). Supplying neither content nor title is an error. EVERY node, ' +
-      'including nested children, must carry a string `type` from the Docmost ' +
-      'schema; text leaves are {"type":"text","text":"..."} (a bare ' +
-      '{"text":"..."} is rejected up front). Reversible: ' +
-      'the previous version is kept in page history.',
+      'change; a title-only update needs no baseHash). Supplying neither content ' +
+      'nor title is an error. `baseHash` is MANDATORY whenever `content` is given. ' +
+      'EVERY node, including nested children, must carry a string `type` from the ' +
+      'Docmost schema; text leaves are {"type":"text","text":"..."} (a bare ' +
+      '{"text":"..."} is rejected up front). CONFLICT: if the page changed since ' +
+      'you read it the write is REJECTED (baseHash mismatch) and nothing is ' +
+      'written — re-read getPageJson for a fresh baseHash and retry a bounded ' +
+      'number of times. Reversible: the previous version is kept in page history.',
     tier: 'deferred',
     catalogLine:
-      "updatePageJson — overwrite a page's body with a full ProseMirror document.",
+      "updatePageJson — overwrite a page's body with a full ProseMirror document (baseHash-guarded; last resort).",
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('ID of the page to update'),
       content: z
@@ -1370,19 +1400,32 @@ export const SHARED_TOOL_SPECS = {
             'JSON string). Omit to update only the title.',
         ),
       title: z.string().optional().describe('Optional new title'),
+      baseHash: z
+        .string()
+        .optional()
+        .describe(
+          'The baseHash from the getPageJson/getPage you based this edit on. ' +
+            'MANDATORY when `content` is provided (the guarded write rejects a ' +
+            'stale overwrite); omit only for a title-only update.',
+        ),
     }),
     // Content normalization is identical on both hosts: only parse/validate the
     // document when actually supplied; undefined/null passes straight through so
     // the client performs a title-only (or no-op) update. A string is JSON.parsed
     // (an empty string "" therefore throws), an object passes through unchanged.
-    execute: (client, { pageId, content, title }) => {
+    execute: (client, { pageId, content, title, baseHash }) => {
       let doc: unknown;
       if (content === undefined || content === null) {
         doc = undefined;
       } else {
         doc = parseNodeArg(content, 'content was a string but not valid JSON');
       }
-      return client.updatePageJson(pageId as string, doc, title as string | undefined);
+      return client.updatePageJson(
+        pageId as string,
+        doc,
+        title as string | undefined,
+        baseHash as string | undefined,
+      );
     },
   },
 
@@ -1401,19 +1444,23 @@ export const SHARED_TOOL_SPECS = {
     inAppKey: 'updatePageMarkdown',
     writeClass: 'write',
     description:
-      "Replace a page's body with new Markdown content (and optionally its " +
-      'title). The whole body is re-imported from the markdown (block ids ' +
-      'regenerate — for surgical or id-preserving edits use the find/replace, ' +
-      'node-patch or page-JSON tools instead). Docmost-flavoured markdown is ' +
-      'parsed, including `^[...]` inline footnotes. Text is taken LITERALLY — ' +
+      "LAST RESORT full-body overwrite from Markdown. Prefer the granular tools " +
+      'first (editPageText / patchNode / insertNode / table tools): the whole ' +
+      'body is re-imported and block ids REGENERATE — for surgical or ' +
+      'id-preserving edits use those instead. REQUIRED flow: read the page ' +
+      '(getPage or getPageJson) -> keep its `baseHash` -> write the new markdown ' +
+      'WITH that `baseHash`. `baseHash` is MANDATORY. Docmost-flavoured markdown ' +
+      'is parsed, including `^[...]` inline footnotes. Text is taken LITERALLY — ' +
       '`$...$`/`$$...$$` are NOT parsed into a math formula and schemeless ' +
       '`www.host` / bare emails are NOT auto-linked (an explicit `https://` URL ' +
       'still links); for a real formula use updatePageJson with ' +
-      '`mathInline`/`mathBlock` nodes instead. Reversible: the previous ' +
-      'version is kept in page history.',
+      '`mathInline`/`mathBlock` nodes instead. CONFLICT: if the page changed ' +
+      'since you read it the write is REJECTED (baseHash mismatch) and nothing ' +
+      'is written — re-read for a fresh baseHash and retry a bounded number of ' +
+      'times. Reversible: the previous version is kept in page history.',
     tier: 'deferred',
     catalogLine:
-      "updatePageMarkdown — replace a page's body (and optionally title) with new Markdown.",
+      "updatePageMarkdown — replace a page's body (and optionally title) with new Markdown (baseHash-guarded; last resort).",
     buildShape: (z) => ({
       pageId: z.string().min(1).describe('The id of the page to update.'),
       content: z.string().describe('The new page body as Markdown.'),
@@ -1421,6 +1468,12 @@ export const SHARED_TOOL_SPECS = {
         .string()
         .optional()
         .describe('Optional new title for the page.'),
+      baseHash: z
+        .string()
+        .describe(
+          'MANDATORY. The baseHash from the getPage/getPageJson you based this ' +
+            'edit on; the guarded write rejects a stale overwrite (re-read on 409).',
+        ),
     }),
     // Single canonical execute on BOTH hosts (the tool was in-app only before,
     // so there is no external-MCP behavior to preserve). NOTE (rename #411): the
@@ -1431,8 +1484,13 @@ export const SHARED_TOOL_SPECS = {
     // (it surfaces footnote/verify warnings), and it matches the on-both-hosts
     // registry convention. The result-shape change is the ONLY behavior delta of
     // this rename; the write path (updatePage -> markdown canonicalize) is identical.
-    execute: (client, { pageId, content, title }) =>
-      client.updatePage(pageId as string, content as string, title as string | undefined),
+    execute: (client, { pageId, content, title, baseHash }) =>
+      client.updatePage(
+        pageId as string,
+        content as string,
+        title as string | undefined,
+        baseHash as string | undefined,
+      ),
   },
 
   exportPageMarkdown: {

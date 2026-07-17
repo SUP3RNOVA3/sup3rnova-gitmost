@@ -47,6 +47,11 @@ function setup(seed?: (store: ReturnType<typeof createStore>) => void) {
 describe("useOpenAiChatForCurrentPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // aiChatWindowOpenAtom now persists (getOnInit) and its onMount re-reads
+    // storage, so `setWindowOpen(true)` would leak across tests and the
+    // `if (windowOpen) return` early-out would misfire. A fresh createStore does
+    // not isolate the shared localStorage — clear it here.
+    localStorage.clear();
     onPage();
   });
 

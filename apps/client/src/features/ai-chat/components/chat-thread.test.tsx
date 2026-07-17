@@ -116,6 +116,20 @@ vi.mock("@/features/ai-chat/components/chat-input.tsx", () => ({
   ),
 }));
 
+// Sandbox gap: `lucide-react` (and `lucide-react/dynamic`) is not installed in
+// this environment, so the two files that statically import it — lucide-glyph and
+// lucide-icon-grid — break vite's import-analysis of ChatThread's graph (via
+// RoleCards). Stub them to null; no test asserts on lucide glyph rendering, so
+// real-CI behavior is unchanged and the full component becomes renderable here.
+vi.mock("@/components/ui/lucide/lucide-glyph.tsx", () => ({
+  default: () => null,
+  LucideGlyph: () => null,
+}));
+vi.mock("@/components/ui/lucide/lucide-icon-grid.tsx", () => ({
+  default: () => null,
+  LucideIconGrid: () => null,
+}));
+
 import ChatThread from "./chat-thread";
 import type { IAiChatMessageRow } from "@/features/ai-chat/types/ai-chat.types.ts";
 
@@ -133,6 +147,7 @@ function renderThread(props?: {
   initialRows?: IAiChatMessageRow[];
   autonomousRunsEnabled?: boolean;
   polledRunFact?: { id: string; status: string } | null;
+  pendingUnbindRef?: { current: Promise<unknown> | null };
 }) {
   const onTurnFinished = vi.fn();
   const onResumeFallback = vi.fn();
@@ -152,6 +167,7 @@ function renderThread(props?: {
           onResumeFallback={onResumeFallback}
           onServerStop={onServerStop}
           polledRunFact={polledRunFact}
+          pendingUnbindRef={props?.pendingUnbindRef}
         />
       </MantineProvider>
     </QueryClientProvider>
@@ -1495,5 +1511,137 @@ describe("ChatThread — live reconnect + stalled", () => {
     );
     // ...and did NOT trigger a fresh reconnect attach.
     expect(h.state.resumeStream).toHaveBeenCalledTimes(1);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// #665 unbind gate (acceptance criterion 10): "New chat" -> instant first send.
+//
+// "New chat" fires a DELETE /bind-page (the unbind) and stores its promise in the
+// window-owned `pendingUnbindRef`. A first send that follows immediately must
+// SEQUENCE after that DELETE — otherwise the send's server-side birth UPSERT could
+// race the DELETE and the page would rebind to the phantom-then-real chat. The
+// gate: localSend read-and-CLEARS pendingUnbindRef, awaits it (bounded by
+// AI_CHAT_UNBIND_GATE_TIMEOUT_MS), swallows a reject (never drops the message), and
+// bails if the wait outlived this mount. These tests drive the REAL localSend via
+// the mocked ChatInput's onSend (see the chat-input mock above).
+// -----------------------------------------------------------------------------
+describe("ChatThread — #665 unbind gate (criterion 10)", () => {
+  beforeEach(resetState);
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  const flush = async () => {
+    // Two microtask turns: one for the awaited Promise.race, one for the code
+    // after the await (mountedRef check -> dispatch -> sendMessage).
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  it("holds the send until the pending unbind settles, then sends (read-and-clears the ref)", async () => {
+    h.state.status = "ready";
+    let resolveUnbind!: () => void;
+    const pending = new Promise<void>((r) => {
+      resolveUnbind = r;
+    });
+    const pendingUnbindRef = { current: pending as Promise<unknown> | null };
+    renderThread({ initialRows: [], pendingUnbindRef });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("send-btn"));
+      await flush();
+    });
+    // Gate holds: nothing sent while the unbind is in flight...
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+    // ...and the ref was read-and-cleared so later sends don't re-await it.
+    expect(pendingUnbindRef.current).toBeNull();
+
+    await act(async () => {
+      resolveUnbind();
+      await flush();
+    });
+    // The DELETE settled -> the send is dispatched exactly once.
+    expect(h.state.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "typed text" });
+  });
+
+  it("swallows a REJECTED unbind (500) without dropping the message", async () => {
+    h.state.status = "ready";
+    const pending = Promise.reject(new Error("bind-page 500"));
+    // Pre-attach a catch so the rejection is never an unhandled rejection.
+    pending.catch(() => undefined);
+    const pendingUnbindRef = { current: pending as Promise<unknown> | null };
+    renderThread({ initialRows: [], pendingUnbindRef });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("send-btn"));
+      await flush();
+    });
+    // The rejected DELETE was swallowed and the message still went out.
+    expect(h.state.sendMessage).toHaveBeenCalledTimes(1);
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "typed text" });
+  });
+
+  it("falls back to sending when the unbind wedges past the gate timeout", async () => {
+    vi.useFakeTimers();
+    h.state.status = "ready";
+    // A never-settling unbind: only the gate timeout can release the send.
+    const pendingUnbindRef = {
+      current: new Promise<void>(() => undefined) as Promise<unknown> | null,
+    };
+    renderThread({ initialRows: [], pendingUnbindRef });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("send-btn"));
+      await Promise.resolve();
+    });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+
+    // Advance past AI_CHAT_UNBIND_GATE_TIMEOUT_MS (1500ms) -> the timeout branch of
+    // the race wins and the send proceeds.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1600);
+    });
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "typed text" });
+  });
+
+  it("bails cleanly if unmounted during the wait (never sends to a dead store)", async () => {
+    h.state.status = "ready";
+    let resolveUnbind!: () => void;
+    const pending = new Promise<void>((r) => {
+      resolveUnbind = r;
+    });
+    const pendingUnbindRef = { current: pending as Promise<unknown> | null };
+    const view = renderThread({ initialRows: [], pendingUnbindRef });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("send-btn"));
+      await flush();
+    });
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+
+    // "New chat" again -> this mount is torn down while still awaiting the gate.
+    view.unmount();
+    await act(async () => {
+      resolveUnbind();
+      await flush();
+    });
+    // The post-await mountedRef guard bailed: no send onto the dead store.
+    expect(h.state.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does NOT gate a send when there is no pending unbind", async () => {
+    h.state.status = "ready";
+    const pendingUnbindRef = { current: null as Promise<unknown> | null };
+    renderThread({ initialRows: [], pendingUnbindRef });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("send-btn"));
+      await flush();
+    });
+    // No unbind in flight -> send is immediate (the ordinary path is untouched).
+    expect(h.state.sendMessage).toHaveBeenCalledWith({ text: "typed text" });
   });
 });

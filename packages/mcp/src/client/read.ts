@@ -453,7 +453,10 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     // renderer emits no such placeholder). Use it to diff a page you wrote as a
     // config/prose against what was stored.
     if (format === "text") {
-      const textData = await this.getPageRaw(pageId, "text");
+      // #647 §F — surface baseHash here too so a text read can also seed a write.
+      const textData = await this.getPageRaw(pageId, "text", {
+        includeContentHash: true,
+      });
       let subpages: any[] = [];
       try {
         subpages = await this.listSidebarPages(textData.spaceId, textData.id);
@@ -463,12 +466,17 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       const textContent =
         typeof textData.content === "string" ? textData.content : "";
       return {
-        data: filterPage(textData, textContent, subpages),
+        data: { ...filterPage(textData, textContent, subpages), baseHash: textData.contentHash },
         success: true,
       };
     }
 
-    const resultData = await this.getPageRaw(pageId);
+    // #647 §E/§F — request the coherent contentHash. When the collab doc is
+    // loaded, the server returns the LIVE content under it, so getPage reflects
+    // unflushed edits (read-your-own-writes) instead of the debounce-stale DB row.
+    const resultData = await this.getPageRaw(pageId, undefined, {
+      includeContentHash: true,
+    });
 
     // Agent read: hide resolved-comment anchors so the agent sees only active
     // discussions. Active anchors are kept. (The lossless exportPageMarkdown
@@ -477,25 +485,38 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     //
     // Content-addressed conversion cache (issue #479): the PM->Markdown walk is
     // the dominant cost of this hot read op. Key on the page's canonical UUID +
-    // updatedAt (both from THIS /pages/info response, so mutually consistent) +
-    // a hash of the conversion options. A hit returns the cached markdown and
-    // skips the walk; a miss converts and stores. The cached value is the
-    // conversion output BEFORE the {{SUBPAGES}} substitution below, which uses
+    // a VERSION token + a hash of the conversion options. A hit returns the cached
+    // markdown and skips the walk; a miss converts and stores. The cached value is
+    // the conversion output BEFORE the {{SUBPAGES}} substitution below, which uses
     // live subpage data and stays outside the cache — so the final result is
     // byte-identical to the uncached path.
+    //
+    // #647 refinement A — the version token is the server's `contentHash` when
+    // present, NOT `updatedAt`. On the live branch the server serves fresh content
+    // under a DEBOUNCE-STALE `updatedAt`, so keying by `updatedAt` would cache the
+    // fresh markdown under the old key and the NEXT read (updatedAt still unmoved)
+    // would hit that entry and serve stale markdown — getPage would not be RYOW.
+    // `contentHash` changes exactly when the content changes, so it is the correct
+    // cache-invalidation key. `updatedAt` remains the fallback for any caller/
+    // server that does not surface a hash (older server, unexpected shape).
     const convertOptions = { dropResolvedCommentAnchors: true };
     let content = "";
     if (resultData.content) {
-      // Only cache when we have a stable identity+version for the key. Both come
-      // from the same response; if either is missing (unexpected server shape),
-      // fall back to converting uncached rather than keying on a partial tuple.
-      const cacheable =
-        typeof resultData.id === "string" &&
-        typeof resultData.updatedAt === "string";
+      // Prefer the content-coherent hash; fall back to updatedAt.
+      const versionToken =
+        typeof resultData.contentHash === "string" && resultData.contentHash
+          ? resultData.contentHash
+          : typeof resultData.updatedAt === "string"
+            ? resultData.updatedAt
+            : null;
+      // Only cache when we have a stable identity+version for the key. If either
+      // is missing (unexpected server shape), fall back to converting uncached
+      // rather than keying on a partial tuple.
+      const cacheable = typeof resultData.id === "string" && versionToken != null;
       const cacheKey = cacheable
         ? GetPageConversionCache.key(
             resultData.id,
-            resultData.updatedAt,
+            versionToken as string,
             hashConvertOptions(convertOptions),
           )
         : null;
@@ -545,14 +566,25 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     }
 
     return {
-      data: filterPage(resultData, content, subpages),
+      // #647 §F — surface the coherent contentHash as `baseHash` so the agent can
+      // read → hash → write (updatePageJson / updatePageMarkdown). The in-app
+      // projection in tool-specs must carry it through too (B3-crit, §14).
+      data: { ...filterPage(resultData, content, subpages), baseHash: resultData.contentHash },
       success: true,
     };
   }
 
   /** Page info + raw ProseMirror JSON content (lossless representation). */
   async getPageJson(pageId: string) {
-    const data = await this.getPageRaw(pageId);
+    // #647 §F — request the coherent contentHash and return it as `baseHash`.
+    // The agent passes this opaque hash straight back to updatePageJson /
+    // updatePageMarkdown; the server-side write-CAS applies the write only if the
+    // page still hashes to it (else 409 → re-read + retry). Because the flag is
+    // set, when the collab doc is loaded the server also returns the LIVE content
+    // here (read-your-own-writes) coherently with the hash.
+    const data = await this.getPageRaw(pageId, undefined, {
+      includeContentHash: true,
+    });
     return {
       id: data.id,
       slugId: data.slugId,
@@ -561,6 +593,9 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       spaceId: data.spaceId,
       updatedAt: data.updatedAt,
       content: data.content || { type: "doc", content: [] },
+      // Opaque write-CAS base hash (undefined only against an older server that
+      // does not surface it — updatePageJson then reports baseHash is required).
+      baseHash: data.contentHash,
     };
   }
 
@@ -587,12 +622,18 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    */
   async getOutline(pageId: string) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: if this client wrote to the page within its
+    // RYOW window, hint the server to serve the LIVE (acked-but-maybe-unflushed)
+    // content instead of the debounce-stale DB row, then run the SAME extraction.
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     return {
       pageId,
       slugId: data.slugId,
       title: data.title,
       outline: buildOutline(data.content ?? { type: "doc", content: [] }),
+      ...(freshness ? { freshness } : {}),
     };
   }
 
@@ -623,7 +664,10 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
     format: "markdown" | "json" = "markdown",
   ) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: prefer the live doc when we just wrote (below).
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     const hit = getNodeByRef(
       data.content ?? { type: "doc", content: [] },
       nodeId,
@@ -644,6 +688,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
         type: hit.type,
         format: "json" as const,
         node: hit.node,
+        ...(freshness ? { freshness } : {}),
       };
     }
 
@@ -662,6 +707,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       type: hit.type,
       format: "markdown" as const,
       markdown,
+      ...(freshness ? { freshness } : {}),
     };
   }
 
@@ -679,13 +725,16 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    */
   async searchInPage(pageId: string, query: string, opts: SearchOptions = {}) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: prefer the live doc when we just wrote.
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     const result = searchInDoc(
       data.content ?? { type: "doc", content: [] },
       query,
       opts,
     );
-    return { pageId, query, ...result };
+    return { pageId, query, ...result, ...(freshness ? { freshness } : {}) };
   }
 
   /**
@@ -697,7 +746,10 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    */
   async getTable(pageId: string, tableRef: string) {
     await this.ensureAuthenticated();
-    const data = await this.getPageRaw(pageId);
+    // #654 — read-your-own-writes: prefer the live doc when we just wrote.
+    const preferLive = this.shouldPreferLive(pageId);
+    const data = await this.getPageRaw(pageId, undefined, { preferLive });
+    const freshness = this.ryowFreshness(preferLive, data);
     const t = readTable(data.content ?? { type: "doc", content: [] }, tableRef);
     if (!t) {
       throw new Error(
@@ -712,6 +764,7 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
       path: t.path,
       cells: t.cells,
       cellIds: t.cellIds,
+      ...(freshness ? { freshness } : {}),
     };
   }
 

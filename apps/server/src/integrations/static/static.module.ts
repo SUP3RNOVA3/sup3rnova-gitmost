@@ -150,6 +150,11 @@ export class StaticModule implements OnModuleInit {
         // a PNG raster into the saved .drawio.svg when the operator opts in
         // (off => today's svg-only save; the file-size cost is reversible).
         DRAWIO_RASTER_ENABLED: this.environmentService.isDrawioRasterEnabled(),
+        // #632 — mirrors EXCALIDRAW_RASTER_ENABLED so the Excalidraw editor only
+        // embeds a PNG raster into the saved .excalidraw.svg when the operator
+        // opts in (off => today's svg-only save; the file-size cost is reversible).
+        EXCALIDRAW_RASTER_ENABLED:
+          this.environmentService.isExcalidrawRasterEnabled(),
       };
 
       const windowScriptContent = `<script>window.CONFIG=${JSON.stringify(configString)};</script>`;

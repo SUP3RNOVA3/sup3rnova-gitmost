@@ -396,6 +396,107 @@ describe('runViewImage (#588 classification + cache + note)', () => {
     expect(cache.size).toBe(0);
   });
 
+  // --- #632 embedded excalidraw raster / valid-SVG degrade -----------------
+
+  const excalidrawSvg = (rasterDataUri?: string) => {
+    const attr = rasterDataUri ? ` data-raster="${rasterDataUri}"` : '';
+    // An excalidraw SVG's caption is a REAL <text>, so the vector is valid for
+    // resvg — unlike a drawio foreignObject.
+    return Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg"${attr} width="100" height="80">` +
+        `<text x="0" y="10">real caption</text></svg>`,
+      'utf8',
+    );
+  };
+  const excalidrawNode = (src = '/api/files/e/x.excalidraw.svg') => ({
+    type: 'excalidraw',
+    node: { attrs: { src } },
+  });
+
+  it.each([false, true])(
+    '#632 excalidraw PREFERS a valid in-budget embedded raster and uses it DIRECTLY (rasterEnabled=%s): no resvg call',
+    async (rasterEnabled) => {
+      const png = Buffer.concat([PNG_SIG, Buffer.from([7, 8, 9])]);
+      const svg = excalidrawSvg(
+        `data:image/png;base64,${png.toString('base64')}`,
+      );
+      const cache: ViewImageCache = new Map();
+      const client = makeClient({
+        node: excalidrawNode(),
+        bytes: { buffer: svg, mime: 'image/svg+xml' },
+      });
+
+      const res = await runViewImage(
+        client,
+        { pageId: 'p', node: 'n' },
+        'c-ex-raster',
+        cache,
+        rasterEnabled,
+      );
+
+      expect(rasterizeMock).not.toHaveBeenCalled();
+      expect(res.mediaType).toBe('image/png');
+      expect(cache.get('c-ex-raster')).toEqual({
+        data: png.toString('base64'),
+        mediaType: 'image/png',
+      });
+    },
+  );
+
+  it.each([false, true])(
+    '#632 excalidraw with NO raster resvg-renders its VALID SVG (never throws) under BOTH flags (rasterEnabled=%s)',
+    async (rasterEnabled) => {
+      // Unlike drawio, excalidraw NEVER takes the flag-gated throw branch — its
+      // SVG is valid, so it always resvg-renders as a correct fallback.
+      const svg = excalidrawSvg(); // no data-raster
+      const fallbackPng = Buffer.from([1, 1, 2, 3]);
+      rasterizeMock.mockResolvedValue({ png: fallbackPng, width: 100, height: 80 });
+      const cache: ViewImageCache = new Map();
+      const client = makeClient({
+        node: excalidrawNode(),
+        bytes: { buffer: svg, mime: 'image/svg+xml' },
+      });
+
+      const res = await runViewImage(
+        client,
+        { pageId: 'p', node: 'n' },
+        'c-ex-off',
+        cache,
+        rasterEnabled,
+      );
+
+      expect(rasterizeMock).toHaveBeenCalledTimes(1);
+      const passed = rasterizeMock.mock.calls[0][0] as string;
+      expect(passed).toContain('<text');
+      expect(res.mediaType).toBe('image/png');
+      expect(res.width).toBe(100);
+      expect(cache.get('c-ex-off')).toEqual({
+        data: fallbackPng.toString('base64'),
+        mediaType: 'image/png',
+      });
+    },
+  );
+
+  it('#632 excalidraw served as octet-stream is still handled as SVG (via node type)', async () => {
+    const svg = excalidrawSvg();
+    const fallbackPng = Buffer.from([5, 5, 6]);
+    rasterizeMock.mockResolvedValue({ png: fallbackPng, width: 10, height: 10 });
+    const cache: ViewImageCache = new Map();
+    const client = makeClient({
+      node: excalidrawNode(),
+      bytes: { buffer: svg, mime: 'application/octet-stream' },
+    });
+    const res = await runViewImage(
+      client,
+      { pageId: 'p', node: 'n' },
+      'c-ex-oct',
+      cache,
+      false,
+    );
+    expect(rasterizeMock).toHaveBeenCalledTimes(1);
+    expect(res.mediaType).toBe('image/png');
+  });
+
   it('NON-IMAGE node throws "node is not an image" and never fetches bytes', async () => {
     let fetched = false;
     const cache: ViewImageCache = new Map();

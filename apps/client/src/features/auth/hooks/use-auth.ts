@@ -24,6 +24,7 @@ import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
 import { RESET } from "jotai/utils";
 import { useTranslation } from "react-i18next";
 import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
+import { purgePageYdocDatabases } from "@/features/editor/page-ydoc-eviction";
 
 export default function useAuth() {
   const { t } = useTranslation();
@@ -49,6 +50,11 @@ export default function useAuth() {
       // unlike logout, we stay in this session, so persistence must keep working.
       setCurrentUser(RESET);
       clearPersistedTreeCaches({ freezeWrites: false });
+      // #626 — also drop the previous user's local page-body ydoc databases, so
+      // a different user signing in on a shared browser never inherits them as a
+      // starting state (namespacing already prevents cross-scope reads; this is
+      // the belt-and-suspenders physical delete).
+      purgePageYdocDatabases();
 
       setIsLoading(false);
 
@@ -142,6 +148,9 @@ export default function useAuth() {
     // machine. (Only the tree caches are swept; other localStorage entries
     // remain.)
     clearPersistedTreeCaches();
+    // #626 — purge the local page-body ydoc databases too: on a shared machine
+    // they would otherwise stay readable on disk after logout.
+    purgePageYdocDatabases();
     await logout();
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
   };

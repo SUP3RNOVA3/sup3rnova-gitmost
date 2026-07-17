@@ -24,6 +24,7 @@ import {
   isCollabAuthFailedError,
 } from "../lib/collab-session.js";
 import { withPageLock, isUuid } from "../lib/page-lock.js";
+import { ConflictError } from "./conflict-error.js";
 import type { PageId } from "../lib/page-id.js";
 import { getCollabToken, performLogin } from "../lib/auth-utils.js";
 import {
@@ -149,6 +150,24 @@ function readSpacesCacheTtlMs(): number {
 }
 
 /**
+ * #654 — read-your-own-writes window in milliseconds. After a write to page P
+ * the client marks P `recentlyWritten` for this long; a structural read of P
+ * within the window sets the `preferLive` hint so the server serves the live
+ * (acked-but-maybe-unflushed) content instead of the debounce-stale DB row.
+ *
+ * Default 60_000 (> Hocuspocus maxDebounce=45_000 + slack): once the window
+ * lapses the DB row is guaranteed to reflect the store, so the hint is pointless
+ * and is dropped (the read reverts to the cheap DB path, no owner probe). Read
+ * fresh from the env on every access (mirroring the caches above) so a rollback
+ * can change it without reloading the module. Unset/unparseable (NaN) or a
+ * non-positive value falls back to the 60s default.
+ */
+function readRyowWindowMs(): number {
+  const raw = parseInt(process.env.GITMOST_RYOW_WINDOW_MS ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 60000;
+}
+
+/**
  * The set of spaces the current token can see, plus a `complete` flag that is
  * false when the /spaces listing was truncated at the pagination ceiling. Used
  * by the enrich-on-404 diagnostics: an authoritative membership test is only
@@ -204,6 +223,16 @@ export abstract class DocmostClientContext {
   // re-fetch /pages/info. A UUID input short-circuits before this cache (see
   // resolvePageId), so only slugId->uuid entries are stored/read here.
   protected pageIdCache = new Map<string, string>();
+
+  // #654 — recently-written pages for read-your-own-writes: maps a page's
+  // canonical UUID to the wall-clock time its RYOW window EXPIRES. Written by
+  // rememberWrite on every content mutation whose verify reports a real change;
+  // read by shouldPreferLive to decide the opt-in `preferLive` freshness hint.
+  // Per-instance (a DocmostClient is built per user / per chat) so it can never
+  // leak across identities, and lost on client teardown (RYOW is intra-turn
+  // only, by design). rememberWrite full-sweeps expired entries on every write,
+  // so the map cannot grow unbounded on a long-lived stdio client.
+  protected recentlyWritten = new Map<string, number>();
 
   // Collab-token cache (issue #435): the last minted collab token plus the
   // wall-clock time it was minted, so a burst of content mutations reuses ONE
@@ -704,25 +733,32 @@ export abstract class DocmostClientContext {
     // Wrap in the collab-auth self-heal (#486): a rejected WS handshake drops the
     // cached collab token and retries once with a fresh one (the retry passes the
     // refreshed token down to acquireCollabSession via `token`).
-    return this.writeWithCollabAuthRetry(collabToken, async (token) => {
-      const session = await acquireCollabSession(pageId, token, this.apiUrl, {
-        // Only the actual 25s collab connect timeout emits this — the connect-vs-
-        // unload signal; the other failure paths must NOT emit it.
-        onConnectTimeout: () =>
-          this.onMetricFn?.("collab_connect_timeouts_total", 1),
-      });
-      try {
-        // #487 PRE-COMMIT safe-point (reentrant twin of mutatePageContent): a
-        // Stop/cap after acquiring the session but before the atomic write skips
-        // this commit. Same limitation applies (stops the NEXT commit only).
-        this.toolAbortSignal?.throwIfAborted();
-        return await session.mutate(transform);
-      } catch (e) {
-        // Drop the session on any failure so the next call reconnects fresh.
-        session.destroy("mutate failed");
-        throw e;
-      }
-    });
+    const result = await this.writeWithCollabAuthRetry(
+      collabToken,
+      async (token) => {
+        const session = await acquireCollabSession(pageId, token, this.apiUrl, {
+          // Only the actual 25s collab connect timeout emits this — the connect-
+          // vs-unload signal; the other failure paths must NOT emit it.
+          onConnectTimeout: () =>
+            this.onMetricFn?.("collab_connect_timeouts_total", 1),
+        });
+        try {
+          // #487 PRE-COMMIT safe-point (reentrant twin of mutatePageContent): a
+          // Stop/cap after acquiring the session but before the atomic write skips
+          // this commit. Same limitation applies (stops the NEXT commit only).
+          this.toolAbortSignal?.throwIfAborted();
+          return await session.mutate(transform);
+        } catch (e) {
+          // Drop the session on any failure so the next call reconnects fresh.
+          session.destroy("mutate failed");
+          throw e;
+        }
+      },
+    );
+    // #654 — replaceImage's write primitive (a THIRD path, not via
+    // mutatePageContent) still arms read-your-own-writes (no-op when unchanged).
+    this.rememberWrite(pageId, result?.verify);
+    return result;
   }
 
   /**
@@ -957,10 +993,26 @@ export abstract class DocmostClientContext {
    * rather than shipping a second one. Every other caller omits `format` and
    * gets the JSON content unchanged.
    */
-  async getPageRaw(pageId: string, format?: "text") {
+  async getPageRaw(
+    pageId: string,
+    format?: "text",
+    opts?: { includeContentHash?: boolean; preferLive?: boolean },
+  ) {
     await this.ensureAuthenticated();
     const body: Record<string, unknown> = { pageId };
     if (format) body.format = format;
+    // #654 — opt-in read-your-own-writes hint. The 4 structural read tools set
+    // this (via shouldPreferLive) after their own recent write; the server then
+    // serves the LIVE content (readLiveIfLoaded) instead of the debounce-stale DB
+    // row. getPageRaw does NOT resolve or decide the hint (that would recurse
+    // through resolvePageId -> getPageRaw) — it only forwards the flag.
+    if (opts?.preferLive) body.preferLive = true;
+    // #647 §E/§F — opt-in ONLY (getPage requests it). When set, the server
+    // returns a `contentHash` computed coherently with the (live-when-loaded)
+    // `content`, which getPage uses to key its conversion cache so a read right
+    // after a write returns the fresh markdown (RYOW), not a stale cache entry
+    // addressed by a debounce-lagging updatedAt.
+    if (opts?.includeContentHash) body.includeContentHash = true;
     const response = await this.client.post("/pages/info", body);
     return response.data?.data ?? response.data;
   }
@@ -1003,6 +1055,76 @@ export abstract class DocmostClientContext {
     return uuid as PageId;
   }
 
+  /**
+   * #654 — record that the current client just committed a real change to a page,
+   * opening its read-your-own-writes window. Called from every content-mutation
+   * seam/site on a verify that reports an ACTUAL change (`changed===true`); a
+   * no-op/aborted write (`changed:false`) is ignored so it never triggers a
+   * needless owner probe. `pageUuid` is the resolved canonical UUID the write
+   * locked on — the SAME key shouldPreferLive/readLiveIfLoaded use.
+   *
+   * Full-sweeps expired entries first (the map is tiny) so it cannot grow on a
+   * long-lived stdio client, then arms P for RYOW_WINDOW_MS.
+   */
+  protected rememberWrite(pageUuid: string, verify: any): void {
+    if (!verify || verify.changed !== true) return;
+    const now = Date.now();
+    for (const [key, expiresAt] of this.recentlyWritten) {
+      if (expiresAt <= now) this.recentlyWritten.delete(key);
+    }
+    this.recentlyWritten.set(pageUuid, now + readRyowWindowMs());
+  }
+
+  /**
+   * #654 — should a structural read of `pageId` set the `preferLive` hint? True
+   * iff this client wrote to the page within its (unexpired) RYOW window.
+   *
+   * Cache-ONLY resolution (NO network, NO resolvePageId — that would recurse into
+   * getPageRaw): a UUID input is its own key; a slugId is resolved via pageIdCache
+   * (populated slug->uuid at write time). An unknown slug -> false (best-effort:
+   * write-by-uuid then read-by-slug cannot match). An expired entry is swept
+   * lazily here and counted as `expired` (a DISTINCT client counter, NOT a
+   * db-row fallback — the hint was never sent).
+   */
+  protected shouldPreferLive(pageId: string): boolean {
+    const uuid = isUuid(pageId) ? pageId : this.pageIdCache.get(pageId);
+    if (!uuid) return false;
+    const expiresAt = this.recentlyWritten.get(uuid);
+    if (expiresAt === undefined) return false;
+    if (Date.now() >= expiresAt) {
+      this.recentlyWritten.delete(uuid);
+      this.onMetricFn?.("mcp_ryow_expired_total", 1);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * #654 — translate a `/pages/info` response's `contentSource`/`fallbackReason`
+   * (present only when `preferLive` was sent) into RYOW metrics, and return the
+   * compact `freshness` token surfaced in the 4 structural tools' RESULTS so the
+   * model can see a degradation and re-read. `live` => the read got the live doc;
+   * `stale-fallback` => it fell back to the (possibly stale) DB row. Returns
+   * undefined when `preferLive` was not requested (no freshness field emitted).
+   */
+  protected ryowFreshness(
+    preferLive: boolean,
+    data: any,
+  ): "live" | "stale-fallback" | undefined {
+    if (!preferLive) return undefined;
+    if (data?.contentSource === "live") {
+      this.onMetricFn?.("mcp_ryow_live_total", 1);
+      return "live";
+    }
+    // contentSource === 'db' (or missing on an older server) -> stale fallback.
+    const reason =
+      typeof data?.fallbackReason === "string"
+        ? data.fallbackReason
+        : "not_loaded";
+    this.onMetricFn?.("mcp_ryow_dbrow_total", 1, { reason });
+    return "stale-fallback";
+  }
+
 
   /**
    * Page-locked write seam over collaboration.mutatePageContent. Production just
@@ -1027,7 +1149,7 @@ export abstract class DocmostClientContext {
     const pageUuid = await this.resolvePageId(pageId);
     // #486: on a rejected collab-WS handshake, invalidate + refresh the token and
     // retry the write once (symmetric to the HTTP-401 reauth path).
-    return this.writeWithCollabAuthRetry(collabToken, (token) =>
+    const result = await this.writeWithCollabAuthRetry(collabToken, (token) =>
       // #487: thread the in-app tool signal to mutatePageContent's pre-commit
       // safe-point so a Stop/cap during the connect/lock window skips the write.
       mutatePageContent(
@@ -1038,6 +1160,9 @@ export abstract class DocmostClientContext {
         this.toolAbortSignal ?? undefined,
       ),
     );
+    // #654 — arm read-your-own-writes for this page (no-op when nothing changed).
+    this.rememberWrite(pageUuid, result?.verify);
+    return result;
   }
 
   /**
@@ -1059,7 +1184,7 @@ export abstract class DocmostClientContext {
     const pageUuid = await this.resolvePageId(pageId);
     // #486: on a rejected collab-WS handshake, invalidate + refresh the token and
     // retry the write once (symmetric to the HTTP-401 reauth path).
-    return this.writeWithCollabAuthRetry(collabToken, (token) =>
+    const result = await this.writeWithCollabAuthRetry(collabToken, (token) =>
       // #487: same pre-commit safe-point as mutatePage, for full-document writes.
       replacePageContent(
         pageUuid,
@@ -1069,6 +1194,63 @@ export abstract class DocmostClientContext {
         this.toolAbortSignal ?? undefined,
       ),
     );
+    // #654 — arm read-your-own-writes for this page (no-op when nothing changed).
+    this.rememberWrite(pageUuid, result?.verify);
+    return result;
+  }
+
+  /**
+   * #647 §D/§G/§H — server-side GUARDED full replace. POSTs the final document to
+   * `/pages/update` as `operation:'replace'` + `baseHash`, so the authoritative
+   * collab process applies it ONLY if the live page still hashes to `baseHash`
+   * (compare-and-swap on the owner). This REPLACES the old client-collab write
+   * seam (`replacePage` / `mutatePageContent`) for the two full-overwrite tools:
+   * with the CAS on the server, the client no longer needs `withPageLock` or a
+   * collab-WS session (both are gone from this path — the server CAS is the
+   * concurrency control now).
+   *
+   * On HTTP 409 the server rejected the write (a concurrent edit landed); we
+   * translate it to a typed {@link ConflictError} carrying the server's
+   * `currentHash` so the caller can surface a "re-read and retry" message. Any
+   * other error propagates unchanged.
+   *
+   * `content` is sent as-is (a ProseMirror JSON object for format:'json', a
+   * markdown string for format:'markdown'); the server parses/canonicalizes it
+   * through the SAME path as a normal update before the CAS.
+   */
+  protected async guardedReplacePage(
+    pageId: string,
+    content: unknown,
+    format: "json" | "markdown",
+    baseHash: string,
+  ): Promise<{ applied: true; newHash?: string }> {
+    const pageUuid = await this.resolvePageId(pageId);
+    try {
+      const response = await this.client.post("/pages/update", {
+        pageId: pageUuid,
+        content,
+        operation: "replace",
+        format,
+        baseHash,
+      });
+      const data = response.data?.data ?? response.data;
+      // The REST update returns the refreshed page; the CAS applied (a rejection
+      // would have been a 409 thrown above). Surface the server hash if present.
+      return { applied: true, newHash: data?.contentHash };
+    } catch (e: any) {
+      if (axios.isAxiosError(e) && e.response?.status === 409) {
+        const body: any = e.response.data;
+        const currentHash =
+          body?.currentHash ?? body?.message?.currentHash ?? undefined;
+        throw new ConflictError(
+          `Page ${pageId} changed since it was read (baseHash ${baseHash} != ` +
+            `current ${currentHash ?? "unknown"}). Re-read the page ` +
+            `(getPageJson / getPage) to get a fresh baseHash, then retry.`,
+          currentHash,
+        );
+      }
+      throw e;
+    }
   }
 
   /**
