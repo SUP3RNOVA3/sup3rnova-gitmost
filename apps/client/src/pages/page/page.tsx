@@ -164,7 +164,6 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
   // the error screen: if we have the cached chrome it renders chrome + the local
   // body (offline-local) or, when no local body exists, an explicit
   // "not available offline" empty-state (offline-empty). See classifyPageError.
-  let offlineLocal = false;
   if (isError || (!isLoading && !page)) {
     const decision = classifyPageError({
       localFirst: isLocalFirstEnabled(),
@@ -212,8 +211,9 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
     }
 
     // decision === "offline-local": fall through to render the cached chrome and
-    // the read-only local body below (from chromeMeta, since `page` is absent).
-    offlineLocal = true;
+    // the read-only local body below. Ф7 (#643) — the body now mounts from
+    // `chromeMeta` with `content={livePage?.content}` (absent here), so the local
+    // ydoc drives it directly; no separate offline-local body branch is needed.
   }
 
   // Cache MISS (first visit to this page in this browser, flag off, corrupt
@@ -232,11 +232,35 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
 
       <MemoizedPageHeader readOnly={!canEdit} />
 
-      {/* BODY — unchanged network swap (making it instant is phase 2, #564): the
-          editor needs the full page (content) and the space settings, so until
-          both resolve it keeps showing today's skeleton. Only the chrome above
-          escaped the network gate. */}
-      {page && space ? (
+      {/* BODY. Ф7 (#643) — with local-first ON the body no longer waits for BOTH
+          `/pages/info` AND `/spaces/info`: the editor mounts on `chromeMeta`
+          (cache or live), keyed by `chromeMeta.id`, and renders from the local
+          ydoc, with its SKELETON / static / live states owned inside PageEditor
+          via `bodyContentPending`. The props contract closes the data-loss traps:
+          `content` comes ONLY from `livePage` (never the possibly-PREVIOUS `page`
+          under keepPreviousData, or B would show A's body); `editable` from
+          `livePage` (fail-closed until the live page confirms); `spaceSlug` from
+          the ROUTE (`useParams`), never the cache (which stores none); `title`/
+          `slugId` from `chromeMeta` for an instant title. Flag OFF → today's
+          `page && space` gate, byte-for-behavior unchanged. */}
+      {isLocalFirstEnabled() ? (
+        <>
+          <MemoizedFullEditor
+            key={chromeMeta.id}
+            pageId={chromeMeta.id}
+            title={chromeMeta.title}
+            content={livePage?.content}
+            slugId={chromeMeta.slugId}
+            spaceSlug={urlSpaceSlug ?? ""}
+            editable={canEdit}
+            creator={livePage?.creator}
+            contributors={livePage?.contributors}
+            canComment={canComment}
+            bodyContentPending={isLoading || !livePage}
+          />
+          <MemoizedHistoryModal pageId={chromeMeta.id} />
+        </>
+      ) : page && space ? (
         <>
           <MemoizedFullEditor
             key={page.id}
@@ -252,22 +276,6 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
           />
           <MemoizedHistoryModal pageId={page.id} />
         </>
-      ) : offlineLocal ? (
-        /* #641 — offline-local: the network is unreachable but this device holds
-           a local body. Mount the editor from the cached META (no live `page`):
-           it opens the local ydoc read-only and the collab socket, once it settles
-           to Disconnected, raises the page-wide offline banner. content="" is the
-           empty static seed the non-empty local ydoc immediately swaps out. */
-        <MemoizedFullEditor
-          key={chromeMeta.id}
-          pageId={chromeMeta.id}
-          title={chromeMeta.title ?? ""}
-          content=""
-          slugId={chromeMeta.slugId}
-          spaceSlug={urlSpaceSlug ?? ""}
-          editable={false}
-          canComment={false}
-        />
       ) : (
         <PageSkeleton />
       )}

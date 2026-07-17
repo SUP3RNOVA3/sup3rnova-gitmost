@@ -87,13 +87,23 @@ function resolveAsideOffsetPx(mainEl: HTMLElement): number {
 export interface FullEditorProps {
   pageId: string;
   slugId: string;
-  title: string;
-  content: string;
+  // Ф7 (#643) — loosened for the local-first mount on cached meta: the title may
+  // be `null` (a titleless page) and the body `content` absent until the LIVE
+  // `/pages/info` resolves (`content` comes ONLY from the live page — never the
+  // possibly-previous `page` under keepPreviousData). `creator`/`contributors`
+  // (the byline) likewise arrive with the live page.
+  title: string | null;
+  content?: string;
   spaceSlug: string;
   editable: boolean;
   creator?: PageUser;
   contributors?: IContributor[];
   canComment?: boolean;
+  // Ф7 (#643) — the live REST body has not resolved for THIS page yet
+  // (`isLoading || !livePage`). Owns the body's SKELETON vs static/live decision
+  // inside PageEditor, and gates the title-editor's canonicalizing navigate /
+  // force-save. Absent (legacy `page && space` mount / flag OFF) ⇒ resolved.
+  bodyContentPending?: boolean;
 }
 
 export function FullEditor({
@@ -106,6 +116,7 @@ export function FullEditor({
   creator,
   contributors,
   canComment,
+  bodyContentPending,
 }: FullEditorProps) {
   const { t } = useTranslation();
   const [user] = useAtom(userAtom);
@@ -131,6 +142,9 @@ export function FullEditor({
   const userPageEditMode =
     user.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
   const isEditMode = currentPageEditMode === PageEditMode.Edit;
+  // Ф7 (#643) — the LIVE page resolved (drives the title-editor's navigate /
+  // force-save gates). Absent prop (legacy mount / flag OFF) ⇒ resolved.
+  const pageResolved = bodyContentPending === undefined ? true : !bodyContentPending;
 
   // Apply the user's saved preference only once on initial load, not on every
   // page navigation — so the mode sticks across navigations within a session.
@@ -254,6 +268,7 @@ export function FullEditor({
         title={title}
         spaceSlug={spaceSlug}
         editable={editable}
+        pageResolved={pageResolved}
       />
       <PageByline
         pageId={pageId}
@@ -269,6 +284,7 @@ export function FullEditor({
         editable={editable}
         content={content}
         canComment={canComment}
+        bodyContentPending={bodyContentPending ?? false}
       />
     </Container>
   );

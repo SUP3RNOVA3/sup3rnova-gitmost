@@ -25,6 +25,14 @@ const TITLE_AUTOFOCUS_DELAY_MS = 300;
 export function useTitleAutofocus(
   titleEditor: Editor | null,
   pageId: string,
+  // Ф7 (#643) — do NOT focus until the LIVE title has resolved. Mounted on
+  // cached meta (local-first phase 7), an autofocus at 300ms would put the field
+  // in focus BEFORE `/pages/info` lands; the title-editor's setContent effect
+  // then skips (it never overwrites a focused field), so the cached/placeholder
+  // title stays put and a navigate-away can persist it over the real one (title
+  // erasure). Gating focus on resolution keeps the field un-focused when the live
+  // title arrives, so setContent applies it. Flag OFF: always `true` (unchanged).
+  resolved: boolean = true,
 ): void {
   const hasSavedScrollRef = useRef<boolean | null>(null);
   if (hasSavedScrollRef.current === null) {
@@ -33,6 +41,7 @@ export function useTitleAutofocus(
 
   useEffect(() => {
     if (hasSavedScrollRef.current) return;
+    if (!resolved) return;
     const timer = setTimeout(() => {
       // guard against "Cannot access view['hasFocus']" before init
       if (!titleEditor?.isInitialized) return;
@@ -41,5 +50,5 @@ export function useTitleAutofocus(
     // Clear the pending focus if the editor changes or the component unmounts
     // (also fixes the previously-uncancelled timer).
     return () => clearTimeout(timer);
-  }, [titleEditor]);
+  }, [titleEditor, resolved]);
 }

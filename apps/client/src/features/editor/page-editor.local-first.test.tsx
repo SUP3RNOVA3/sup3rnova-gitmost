@@ -264,6 +264,10 @@ import {
   addTombstones,
 } from "./page-ydoc-tombstones";
 import {
+  markReconciled,
+  resetReconciledForTests,
+} from "./page-ydoc-reconciled";
+import {
   clearSessionVerifiedForTests,
   recordSessionVerified,
 } from "@/features/user/session-verified";
@@ -302,13 +306,29 @@ function lastProvider() {
   return hoisted.providers[hoisted.providers.length - 1];
 }
 
-function wrap(store: ReturnType<typeof createStore>, pageId: string) {
+interface WrapOpts {
+  content?: any;
+  editable?: boolean;
+  bodyContentPending?: boolean;
+}
+
+function wrap(
+  store: ReturnType<typeof createStore>,
+  pageId: string,
+  opts?: WrapOpts,
+) {
+  const content = opts && "content" in opts ? opts.content : STATIC_CONTENT;
   return (
     <QueryClientProvider client={queryClient}>
       <MantineProvider>
         <Provider store={store}>
           <MemoryRouter>
-            <PageEditor pageId={pageId} editable content={STATIC_CONTENT} />
+            <PageEditor
+              pageId={pageId}
+              editable={opts?.editable ?? true}
+              content={content}
+              bodyContentPending={opts?.bodyContentPending}
+            />
           </MemoryRouter>
         </Provider>
       </MantineProvider>
@@ -376,6 +396,7 @@ beforeEach(() => {
   // #640 fail-closed latches are module-level: clear them so one test's tombstone
   // / expired-session state can never leak into the next.
   resetTombstonesForTests();
+  resetReconciledForTests();
   clearSessionVerifiedForTests();
   localStorage.setItem(
     "currentUser",
@@ -390,6 +411,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   resetTombstonesForTests();
+  resetReconciledForTests();
   clearSessionVerifiedForTests();
 });
 
@@ -857,5 +879,131 @@ describe("#641 offline banner hysteresis (sticky latch + navigator.onLine)", () 
       // Restore the prototype accessor (default: online) for the next test.
       delete (window.navigator as unknown as { onLine?: boolean }).onLine;
     }
+  });
+});
+
+// Ф7 (#643) — the body-instant phase. The gate `page && space` is removed, so
+// PageEditor now mounts on cached meta and owns three body states, plus a lazy
+// collab-token callback and an `editable` that no longer recreates the editor.
+// Tested through the REAL component on its OBSERVABLE properties.
+describe("Ф7 body states: skeleton vs static vs live (parts 3 + 7)", () => {
+  it("crit 2 — first visit (empty ydoc, cache miss, NOT reconciled) shows a body SKELETON, not an empty editor, not a foreign static copy", async () => {
+    const store = makeStore();
+    // Mounted on cached meta with the live REST body still pending, and no
+    // authoritative content (`content: undefined`).
+    const { container, rerender } = render(
+      wrap(store, PAGE_A, { content: undefined, bodyContentPending: true }),
+    );
+
+    // Skeleton on the very first render (before any sync).
+    expect(
+      container.querySelector('[data-testid="body-skeleton"]'),
+    ).not.toBeNull();
+
+    // The local ydoc is EMPTY (first visit): it syncs but must NOT swap to a live
+    // editor, and must NOT fall back to a static copy of some other content.
+    const persistence = lastPersistence();
+    act(() => persistence.emitSynced());
+    expect(
+      container.querySelector('[data-testid="body-skeleton"]'),
+    ).not.toBeNull();
+    expect(container.querySelector(".editor-container")).toBeNull();
+    expect(container.textContent).not.toContain("Server seeded copy");
+
+    // The live REST body resolves → skeleton gives way to the static copy (freshly
+    // MOUNTED with the now-available content: EditorProvider deps=[] never re-reads
+    // it, so mounting it only once content exists is what avoids the empty-forever
+    // trap).
+    await act(async () => {
+      rerender(
+        wrap(store, PAGE_A, {
+          content: STATIC_CONTENT,
+          bodyContentPending: false,
+        }),
+      );
+    });
+    expect(container.querySelector('[data-testid="body-skeleton"]')).toBeNull();
+    await waitFor(() =>
+      expect(container.textContent).toContain("Server seeded copy"),
+    );
+  });
+
+  it("crit 2 non-vacuity — a genuinely LOADED-EMPTY page renders empty static, NOT a skeleton (state derives from bodyContentPending, not falsy content)", () => {
+    const store = makeStore();
+    // Loaded (not pending) but with empty content: this is an empty page, not an
+    // unresolved one — it must render an empty editor, never a skeleton.
+    const { container } = render(
+      wrap(store, PAGE_A, { content: undefined, bodyContentPending: false }),
+    );
+
+    expect(container.querySelector('[data-testid="body-skeleton"]')).toBeNull();
+    // The static editor is mounted (empty), not skeletal.
+    expect(container.querySelector(".ProseMirror")).not.toBeNull();
+  });
+
+  it("part 7 — a reconciled-but-EMPTY page revisited offline renders empty static, NOT an eternal skeleton (keys on durable reconciledAt, not session isRemoteConfirmed)", async () => {
+    // A prior online visit durably reconciled this page's (scoped) ydoc.
+    markReconciled(pageYdocDbName(SCOPE, PAGE_A));
+
+    const store = makeStore();
+    // Offline revisit: the live REST body never resolves (bodyContentPending
+    // stays true), and the local ydoc is empty (the page genuinely has no body).
+    const { container } = render(
+      wrap(store, PAGE_A, { content: undefined, bodyContentPending: true }),
+    );
+    const persistence = lastPersistence();
+    act(() => persistence.emitSynced());
+
+    // Despite bodyContentPending, the DURABLE reconciliation means the (empty)
+    // local ydoc is authoritative → empty static, never a forever-skeleton.
+    await waitFor(() =>
+      expect(container.querySelector(".ProseMirror")).not.toBeNull(),
+    );
+    expect(container.querySelector('[data-testid="body-skeleton"]')).toBeNull();
+  });
+
+  it("crit 9 — the editor is NOT recreated when `editable` flips false→true (/pages/info lands): no editor destroy/recreate in the measured window", async () => {
+    const store = makeStore();
+    const { container, rerender } = render(
+      wrap(store, PAGE_A, { editable: false }),
+    );
+
+    // Reach the live editor from a non-empty local ydoc + a real remote sync.
+    const persistence = lastPersistence();
+    seedYdoc(persistence.doc, "Body text");
+    act(() => persistence.emitSynced());
+    const provider = lastProvider();
+    act(() => {
+      provider.emitStatus("connected");
+      provider.emitSynced(true);
+    });
+    await waitFor(() =>
+      expect(container.querySelector(".editor-container")).not.toBeNull(),
+    );
+
+    const before = getEditor(store);
+    // `/pages/info` lands and flips edit rights false→true. With `editable` OUT of
+    // the useEditor deps, the SAME editor instance must survive (before this fix
+    // it was in the deps → destroy+recreate at exactly this moment).
+    await act(async () => {
+      rerender(wrap(store, PAGE_A, { editable: true }));
+    });
+    const after = getEditor(store);
+    expect(after).toBe(before);
+    // And it became editable via the setEditable effect (the sole owner).
+    await waitFor(() => expect(after.isEditable).toBe(true));
+  });
+
+  it("part 4 — the collab provider is built with a LAZY token CALLBACK (never an empty token at t0)", async () => {
+    const store = makeStore();
+    render(wrap(store, PAGE_A));
+    const provider = lastProvider();
+
+    // Not a by-value token (which at t0 could be empty → server rejects → 100ms
+    // reconnect on the very path Ф7 speeds up): a function hocuspocus awaits.
+    expect(typeof provider.configuration.token).toBe("function");
+    await expect(
+      (provider.configuration.token as () => Promise<string>)(),
+    ).resolves.toBe("test-token");
   });
 });
