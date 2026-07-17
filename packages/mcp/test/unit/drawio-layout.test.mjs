@@ -179,8 +179,13 @@ test("benchmark guard: a worst-case graph AT the cap lays out without wedging th
   assert.equal(verts.length, 500, "all vertices survived");
   const moved = verts.some((v) => v.geometry.x !== 10 || v.geometry.y !== 10);
   assert.ok(moved, "layout was applied (did not time out / fall back)");
-  // Sanity ceiling well under the 5s wall-clock timeout.
-  assert.ok(dt < 5000, `worst-case layout should be under the ceiling, took ${dt}ms`);
+  // Sanity ceiling. `dt` is the TOTAL round-trip (worker-thread startup + elkjs
+  // load + IPC + the layout), so it must allow headroom ABOVE the internal
+  // 5000ms ELK budget (ELK_TIMEOUT_DEFAULT_MS) — a loaded CI runner legitimately needs
+  // a few extra seconds of startup. A real regression (the event loop wedged, or
+  // no fallback) is already caught by the assertions above; this only guards
+  // against a catastrophic hang, so a generous bound is correct.
+  assert.ok(dt < 10000, `worst-case layout should be under the ceiling, took ${dt}ms`);
 });
 
 test("layout is best-effort: an empty/degenerate model is returned intact", async () => {
