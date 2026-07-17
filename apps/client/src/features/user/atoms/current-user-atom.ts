@@ -1,5 +1,5 @@
-import { atom } from "jotai";
-import { atomWithStorage, createJSONStorage } from "jotai/utils";
+import { atom, getDefaultStore } from "jotai";
+import { atomWithStorage, createJSONStorage, RESET } from "jotai/utils";
 import { ICurrentUser, IUser } from "@/features/user/types/user.types";
 import { IWorkspace } from "@/features/workspace/types/workspace.types";
 import { uiLocalStorage } from "@/lib/jotai-helper.ts";
@@ -38,6 +38,17 @@ export const currentUserAtom = atomWithStorage<ICurrentUser | null>(
   currentUserStorage,
   { getOnInit: true },
 );
+
+// #642, part 3 — purge the persisted current user (both the on-disk key and the
+// in-memory jotai value). Called by the api-client 401 interceptor when a session
+// is found dead, BEFORE it redirects to login. RESET on an `atomWithStorage`
+// removes the storage key and reverts the value to `null`, exactly like logout's
+// `setCurrentUser(RESET)` — so a dead-session reload cannot keep seeding the shell
+// and loop between /login and the app. The app uses jotai's default store (no
+// custom Provider), so `getDefaultStore()` is the same store the components read.
+export function clearPersistedCurrentUser(): void {
+  getDefaultStore().set(currentUserAtom, RESET);
+}
 
 export const userAtom = atom(
   (get) => {
