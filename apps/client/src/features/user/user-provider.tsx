@@ -19,6 +19,7 @@ import {
   surfacePreviousReloadBreadcrumb,
 } from "@/features/user/guarded-reload.tsx";
 import type { AppVersionSocketPayload } from "@/features/user/version-coherence.ts";
+import { recordSessionVerified } from "@/features/user/session-verified";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -86,6 +87,12 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   useEffect(() => {
     if (data && data.user && data.workspace) {
       setCurrentUser(data);
+      // #640, part 6 — stamp the network-independent session boundary on EVERY
+      // successful `/me`. This is the only signal that lets the client tell a
+      // session that is merely offline from one that has outlived its 30-day life
+      // (JWT_TOKEN_EXPIRES_IN); past OFFLINE_GRACE the boot enforcement refuses
+      // and purges local content even when no 401 ever arrives.
+      recordSessionVerified();
       i18n.changeLanguage(
         data.user.locale === "en" ? "en-US" : data.user.locale,
       );

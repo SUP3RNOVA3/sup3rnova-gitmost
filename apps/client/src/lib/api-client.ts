@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from "axios";
 import APP_ROUTE from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
 import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
+import { purgePageYdocDatabases } from "@/features/editor/page-ydoc-eviction";
 
 const api: AxiosInstance = axios.create({
   baseURL: "/api",
@@ -63,7 +64,7 @@ api.interceptors.response.use(
   },
 );
 
-function redirectToLogin() {
+async function redirectToLogin() {
   const exemptPaths = [
     APP_ROUTE.AUTH.LOGIN,
     APP_ROUTE.AUTH.SIGNUP,
@@ -78,14 +79,18 @@ function redirectToLogin() {
     // only cleanup that runs on that path. It also disables further cache
     // persistence until the full page load below.
     clearPersistedTreeCaches();
-    // #626 — deliberately do NOT purge the page-body ydoc databases here. Unlike
-    // the tree/meta caches (server-authoritative, safe to drop), the local ydoc
-    // can hold UNSYNCED offline edits: a session that expired while offline gets a
-    // 401 on reconnect BEFORE the collab provider re-syncs, so purging on a bare
-    // 401 would silently lose that work. The ydoc is scrubbed only on an explicit
-    // logout or sign-in-as-a-different-user; the per-(workspace,user) namespacing
-    // is what isolates users on a shared machine in the meantime, and the next
-    // user's sign-in purges the previous user's databases anyway.
+    // #640, invariant 8 — ALSO purge the local page-body ydoc databases on a
+    // forced 401 logout, AWAITED before the navigation below so `deleteDatabase`
+    // actually finishes (a synchronous redirect would cut it short).
+    //
+    // FORWARD-COMPAT (reverses #626 review option-B, deliberately): this is safe
+    // ONLY while the #564 write-guard forbids local edits, so a purged ydoc can
+    // hold no unsent work. The moment offline-editing lands, this purge MUST
+    // become "quarantine, not delete, if the ydoc has unsent updates" (see the
+    // reconciledAt reservation in page-ydoc-reconciled), otherwise a returning
+    // network → 401 → redirectToLogin() would delete the user's unsynced edits
+    // with the very handler meant to protect a shared machine.
+    await purgePageYdocDatabases();
     const redirectTo = window.location.pathname;
     if (redirectTo === APP_ROUTE.HOME) {
       window.location.href = APP_ROUTE.AUTH.LOGIN;

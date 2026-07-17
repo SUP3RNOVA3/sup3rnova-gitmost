@@ -5,6 +5,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
 import type { IPage } from "@/features/page/types/page.types";
 import { isLocalFirstEnabled } from "@/lib/config";
+import { isSessionExpired } from "@/features/user/session-verified";
 import { reportClientMetric } from "@/lib/telemetry/vitals";
 
 // Local-first phase 1 (#563): a localStorage BOOT CACHE of page METADATA, so a
@@ -117,6 +118,21 @@ let persistenceDisabled = false;
  */
 function isCacheUsable(scopeKey: string): boolean {
   if (!isLocalFirstEnabled()) return false;
+  // #640, part 6 — refuse to draw local chrome once the session is past
+  // OFFLINE_GRACE (30d since the last `/me`), offline or not. The boot purge
+  // already deleted the blob; this live gate is belt-and-suspenders so nothing
+  // repaints stale chrome until a fresh `/me` restamps the session.
+  if (isSessionExpired()) return false;
+  return !scopeKey.split(":").includes("anon");
+}
+
+/**
+ * Is the scope resolved enough to DELETE a page's cached meta? (#640, part 7)
+ * Deletion of revoked content must bypass the flag check — a revoked page's meta
+ * surviving a flag-OFF deploy and resurfacing on flip is the exact inconsistency
+ * this fixes. Only the anon scope (no scope to key by) blocks a delete.
+ */
+function isScopeResolvedForDelete(scopeKey: string): boolean {
   return !scopeKey.split(":").includes("anon");
 }
 
@@ -407,7 +423,11 @@ export const removePageMetaAtom = atom(
   null,
   (get, set, pageIdOrSlugId: string) => {
     const scopeKey = get(scopeKeyAtom);
-    if (!isCacheUsable(scopeKey)) return;
+    // #640, part 7 — bypass the flag gate: a fail-closed DELETE is safe always,
+    // and gating it on the flag let a revoked page's meta survive a flag-OFF
+    // deploy and resurface on the next flip. Only an unresolved (anon) scope
+    // blocks the delete.
+    if (!isScopeResolvedForDelete(scopeKey)) return;
     const target = pageMetaFamily(scopeKey);
     const prev = get(target);
     const entry = prev[pageIdOrSlugId];

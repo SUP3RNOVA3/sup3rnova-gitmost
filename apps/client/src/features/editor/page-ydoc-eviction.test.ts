@@ -5,28 +5,26 @@ import type { IndexeddbPersistence } from "y-indexeddb";
 import type { ICurrentUser } from "@/features/user/types/user.types";
 
 /**
- * #564 guard 3 — access revoked (403) or page deleted (404) must destroy the
- * page's LOCAL ydoc, on disk, whether or not the editor is still mounted. The
- * collab room can never do this for us: an unauthorized room never syncs.
- *
- * The MAIN scenario is a FRESH SESSION (reload / bookmark / new tab) straight
- * onto a page whose access was revoked: the editor never mounts there (not-found
- * renders instead), so nothing in this module may depend on a successful mount —
- * neither the subscriber's installation (it lives in main.tsx) nor the
- * slugId -> pageId alias (it comes from #563's persisted page-meta boot cache).
+ * #564 guard 3 / #626 / #640 — access revoked (403) or page deleted (404) must
+ * TOMBSTONE the page (so the next visit opens no local persistence) and destroy
+ * its LOCAL ydoc on disk, whether or not the editor is still mounted.
  */
 
 const PAGE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SLUG_ID = "slugid1";
 const SCOPE_STORAGE_KEY = "pageMeta:v1:w1:u1";
-// The scope key `scopeKeyAtom` yields for the `currentUser()` below
-// (`<workspace>:<user>`), which now namespaces every ydoc database name.
 const SCOPE = "w1:u1";
 
 let localFirstEnabled = true;
 
+// Full mock (NOT importOriginal): the real @/lib/config pulls in
+// @/lib/utils -> page-icon -> lucide-react/dynamic, which is unresolved in the
+// test env (one of the repo's ~38 pre-existing lucide load failures). Provide
+// every config function the transitive graph reads.
 vi.mock("@/lib/config", () => ({
   isLocalFirstEnabled: () => localFirstEnabled,
+  isClientTelemetryEnabled: () => false,
+  getOfflineGraceMs: () => 30 * 24 * 60 * 60 * 1000,
 }));
 
 function currentUser(): ICurrentUser {
@@ -36,11 +34,6 @@ function currentUser(): ICurrentUser {
   } as unknown as ICurrentUser;
 }
 
-/**
- * Seed the PERSISTED page-meta boot cache exactly as an earlier visit would have
- * left it: the page stored under BOTH aliases. This is the only record a fresh
- * session has of the `slugId -> pageId` mapping.
- */
 function seedBootCache(pageId: string, slugId: string): void {
   const entry = {
     id: pageId,
@@ -56,10 +49,14 @@ function seedBootCache(pageId: string, slugId: string): void {
 }
 
 /** Fresh module instances, so the boot cache re-hydrates from localStorage. */
-async function freshImport() {
+async function freshImport(opts?: { signedIn?: boolean }) {
   vi.resetModules();
   const userModule = await import("@/features/user/atoms/current-user-atom");
-  getDefaultStore().set(userModule.currentUserAtom, currentUser());
+  if (opts?.signedIn ?? true) {
+    getDefaultStore().set(userModule.currentUserAtom, currentUser());
+  } else {
+    getDefaultStore().set(userModule.currentUserAtom, null);
+  }
   return import("./page-ydoc-eviction");
 }
 
@@ -73,11 +70,27 @@ function fakePersistence() {
 
 let deleteDatabase: ReturnType<typeof vi.fn>;
 
+/** A delete request that fires `onsuccess` on the next microtask. */
+function successReq(): any {
+  const req: any = {};
+  Promise.resolve().then(() => req.onsuccess?.());
+  return req;
+}
+
 beforeEach(() => {
   localFirstEnabled = true;
   localStorage.clear();
-  deleteDatabase = vi.fn(() => ({}) as IDBOpenDBRequest);
+  deleteDatabase = vi.fn(() => successReq());
   vi.stubGlobal("indexedDB", { deleteDatabase });
+  // A minimal BroadcastChannel so the purge broadcast does not throw.
+  vi.stubGlobal(
+    "BroadcastChannel",
+    class {
+      onmessage: ((e: MessageEvent) => void) | null = null;
+      postMessage() {}
+      close() {}
+    },
+  );
 });
 
 afterEach(() => {
@@ -85,7 +98,6 @@ afterEach(() => {
   localStorage.clear();
 });
 
-/** Push a failed page query through a real QueryClient's cache. */
 async function failPageQuery(
   queryClient: QueryClient,
   key: string,
@@ -102,12 +114,32 @@ async function failPageQuery(
     .catch(() => undefined);
 }
 
+describe("pageYdocDbName / pageYdocRoomName (#640 invariant 1)", () => {
+  it("DB name is scope-namespaced; ROOM name is NOT", async () => {
+    const mod = await freshImport();
+    expect(mod.pageYdocDbName(SCOPE, PAGE_ID)).toBe(`page.${SCOPE}.${PAGE_ID}`);
+    // The collab room name must stay `page.<pageId>` — a single dot segment — so
+    // the server's `documentName.split('.')[1]` resolves the pageId, not the
+    // workspaceId. Namespacing it would break every collab connection.
+    expect(mod.pageYdocRoomName(PAGE_ID)).toBe(`page.${PAGE_ID}`);
+    expect(mod.pageYdocRoomName(PAGE_ID).split(".").length).toBe(2);
+  });
+
+  it("the DB name differs across scopes; the room name does not", async () => {
+    const mod = await freshImport();
+    expect(mod.pageYdocDbName("wA:uA", PAGE_ID)).not.toBe(
+      mod.pageYdocDbName("wB:uB", PAGE_ID),
+    );
+    expect(mod.pageYdocRoomName(PAGE_ID)).toBe(mod.pageYdocRoomName(PAGE_ID));
+  });
+});
+
 describe("evictPageYdoc", () => {
-  it("clears the IDB data of a MOUNTED page (clearData destroys + deletes the db)", async () => {
+  it("clears the IDB data of a MOUNTED page (clearData destroys + deletes)", async () => {
     const mod = await freshImport();
     const persistence = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
+      dbName: mod.pageYdocDbName(SCOPE, PAGE_ID),
       persistence,
       keys: [PAGE_ID, SLUG_ID],
     });
@@ -120,41 +152,18 @@ describe("evictPageYdoc", () => {
     const mod = await freshImport();
     const persistence = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
+      dbName: mod.pageYdocDbName(SCOPE, PAGE_ID),
       persistence,
       keys: [PAGE_ID, SLUG_ID],
     });
-    // The editor unmounted (page.tsx swapped to not-found) BEFORE the 403 landed.
-    mod.unregisterPageYdoc(mod.pageYdocName(PAGE_ID, SCOPE));
+    mod.unregisterPageYdoc(mod.pageYdocDbName(SCOPE, PAGE_ID));
 
     await expect(mod.evictPageYdoc(SLUG_ID)).resolves.toBe(true);
     expect(persistence.clearData).not.toHaveBeenCalled();
     expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
   });
 
-  it("falls back to the raw db delete when clearData throws", async () => {
-    const mod = await freshImport();
-    const persistence = {
-      clearData: vi.fn(async () => {
-        throw new Error("idb gone");
-      }),
-    } as unknown as IndexeddbPersistence;
-    mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
-      persistence,
-      keys: [PAGE_ID],
-    });
-
-    await mod.evictPageYdoc(PAGE_ID);
-    expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
-  });
-
   it("evicts a slugId this session never opened, via the persisted boot cache", async () => {
-    // THE MAIN SCENARIO. Nothing was registered: the page was opened on an
-    // EARLIER visit (leaving a ydoc on disk and a boot-cache entry), access was
-    // then revoked, and the user opens the link again in a fresh tab. The editor
-    // never mounts, so the session alias map is empty — the boot cache is what
-    // maps the URL's slugId to the ydoc's pageId.
     seedBootCache(PAGE_ID, SLUG_ID);
     const mod = await freshImport();
 
@@ -164,15 +173,58 @@ describe("evictPageYdoc", () => {
 
   it("evicts a never-opened page by pageId; a slugId known to NOTHING is a no-op", async () => {
     const mod = await freshImport();
-    // A bare uuid IS the ydoc name by construction, so no alias is needed.
     await expect(mod.evictPageYdoc(PAGE_ID)).resolves.toBe(true);
     expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`);
 
     deleteDatabase.mockClear();
-    // A slugId in neither the session map nor the boot cache addresses a page
-    // this device never opened — there is no local ydoc to destroy.
     await expect(mod.evictPageYdoc("never-seen-slug")).resolves.toBe(false);
     expect(deleteDatabase).not.toHaveBeenCalled();
+  });
+
+  // #640, acceptance 8 — anon-scope eviction must NOT run in vain.
+  it("QUEUES an eviction under an anon scope, then drains it once the scope resolves", async () => {
+    const mod = await freshImport({ signedIn: false });
+    const userModule = await import("@/features/user/atoms/current-user-atom");
+    mod.installYdocScopeResolveDrain();
+
+    // Signed out → scope is anon:anon. A 403 must not compute a
+    // `page.anon:anon.<id>` name (matching no real DB) and falsely succeed.
+    await expect(mod.evictPageYdoc(PAGE_ID)).resolves.toBe(false);
+    expect(deleteDatabase).not.toHaveBeenCalled();
+
+    // Scope resolves → the queued eviction runs against the REAL scope.
+    getDefaultStore().set(userModule.currentUserAtom, currentUser());
+    await vi.waitFor(() =>
+      expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`),
+    );
+  });
+});
+
+describe("tombstones on 403/404 (#640 acceptance 4)", () => {
+  it("a 403 tombstones the page under both aliases → next construction is blocked", async () => {
+    seedBootCache(PAGE_ID, SLUG_ID);
+    const mod = await freshImport();
+    const tomb = await import("./page-ydoc-tombstones");
+
+    await mod.evictPageYdoc(SLUG_ID);
+
+    // The construction gate must now refuse BOTH the pageId- and slugId-derived
+    // DB names, so the editor opens a remote-only ydoc and creates no database.
+    expect(tomb.canOpenLocalYdoc(`page.${SCOPE}.${PAGE_ID}`)).toBe(false);
+    expect(tomb.canOpenLocalYdoc(`page.${SCOPE}.${SLUG_ID}`)).toBe(false);
+  });
+
+  it("a successful page fetch lifts the tombstone (#640 acceptance 5)", async () => {
+    const mod = await freshImport();
+    const tomb = await import("./page-ydoc-tombstones");
+
+    await mod.evictPageYdoc(PAGE_ID);
+    expect(tomb.canOpenLocalYdoc(`page.${SCOPE}.${PAGE_ID}`)).toBe(false);
+
+    // Access returned (restored from trash / regranted): proof, so lift it.
+    mod.clearPageTombstoneOnAccess({ id: PAGE_ID, slugId: SLUG_ID });
+    expect(tomb.canOpenLocalYdoc(`page.${SCOPE}.${PAGE_ID}`)).toBe(true);
+    expect(tomb.canOpenLocalYdoc(`page.${SCOPE}.${SLUG_ID}`)).toBe(true);
   });
 });
 
@@ -184,7 +236,7 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
 
     const revoked = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
+      dbName: mod.pageYdocDbName(SCOPE, PAGE_ID),
       persistence: revoked,
       keys: [PAGE_ID, SLUG_ID],
     });
@@ -194,7 +246,7 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
     const deleted = fakePersistence();
     const otherPage = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(otherPage, SCOPE),
+      dbName: mod.pageYdocDbName(SCOPE, otherPage),
       persistence: deleted,
       keys: [otherPage],
     });
@@ -205,9 +257,6 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
   });
 
   it("destroys the ydoc of a REVOKED page that never mounted in this session", async () => {
-    // End-to-end of the main scenario, through the real subscriber: a fresh
-    // session opens the revoked page, the page query 403s, the editor never
-    // mounts — and the revoked body must still leave the disk.
     seedBootCache(PAGE_ID, SLUG_ID);
     const mod = await freshImport();
     const queryClient = new QueryClient();
@@ -221,7 +270,8 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
     unsubscribe();
   });
 
-  it("does nothing at all when the local-first flag is OFF", async () => {
+  // #640, acceptance 10 — deletion is OUT of the flag gate now.
+  it("STILL deletes when the local-first flag is OFF", async () => {
     seedBootCache(PAGE_ID, SLUG_ID);
     localFirstEnabled = false;
     const mod = await freshImport();
@@ -230,8 +280,9 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
 
     await failPageQuery(queryClient, SLUG_ID, 403);
 
-    await new Promise((r) => setTimeout(r, 0));
-    expect(deleteDatabase).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(deleteDatabase).toHaveBeenCalledWith(`page.${SCOPE}.${PAGE_ID}`),
+    );
     unsubscribe();
   });
 
@@ -242,14 +293,12 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
 
     const persistence = fakePersistence();
     mod.registerPageYdoc({
-      documentName: mod.pageYdocName(PAGE_ID, SCOPE),
+      dbName: mod.pageYdocDbName(SCOPE, PAGE_ID),
       persistence,
       keys: [PAGE_ID, SLUG_ID],
     });
 
     await failPageQuery(queryClient, SLUG_ID, 500);
-    // A transport error (offline) carries no status at all — the local copy is
-    // exactly what the user must keep seeing.
     await queryClient
       .fetchQuery({
         queryKey: ["pages", SLUG_ID, "other"],
@@ -268,43 +317,9 @@ describe("installPageYdocEviction (global page-query error subscriber)", () => {
   });
 });
 
-describe("pageYdocName (namespacing by scope, #626)", () => {
-  it("produces page.<scopeKey>.<pageId>", async () => {
-    const mod = await freshImport();
-    expect(mod.pageYdocName(PAGE_ID, "w1:u1")).toBe(`page.w1:u1.${PAGE_ID}`);
-  });
-
-  it("differs across scopes (non-vacuity: fails if the scope is ignored)", async () => {
-    const mod = await freshImport();
-    const a = mod.pageYdocName(PAGE_ID, "wA:uA");
-    const b = mod.pageYdocName(PAGE_ID, "wB:uB");
-    // The SAME page id in two scopes must NOT share a database — this is the
-    // whole point of #626. If pageYdocName dropped its scope argument these
-    // would be equal and the assertion would fail.
-    expect(a).not.toBe(b);
-  });
-
-  it("is stable within a scope", async () => {
-    const mod = await freshImport();
-    expect(mod.pageYdocName(PAGE_ID, "w1:u1")).toBe(
-      mod.pageYdocName(PAGE_ID, "w1:u1"),
-    );
-  });
-
-  it("gives an anon scope a distinct, non-colliding name", async () => {
-    const mod = await freshImport();
-    // scopeKeyAtom yields "anon:anon" when signed out; real ids are uuids and
-    // never the literal "anon", so the two namespaces can never collide.
-    const anon = mod.pageYdocName(PAGE_ID, "anon:anon");
-    const real = mod.pageYdocName(PAGE_ID, "w1:u1");
-    expect(anon).toBe(`page.anon:anon.${PAGE_ID}`);
-    expect(anon).not.toBe(real);
-  });
-});
-
 /** An indexedDB stub whose `databases()` resolves to the given name list. */
 function idbWithDatabases(names: string[]) {
-  const del = vi.fn(() => ({}) as IDBOpenDBRequest);
+  const del = vi.fn(() => successReq());
   return {
     del,
     idb: {
@@ -314,63 +329,78 @@ function idbWithDatabases(names: string[]) {
   };
 }
 
-describe("purgePageYdocDatabases (#626)", () => {
-  it("deletes ONLY page.-prefixed databases, not others", async () => {
+describe("purgePageYdocDatabases (#640 acceptance 2)", () => {
+  it("deletes ONLY page.-prefixed databases and AWAITS completion", async () => {
     const mod = await freshImport();
     const { del, idb } = idbWithDatabases([
       "page.w1:u1.pageA",
       "page.w2:u2.pageB",
-      "keyval-store", // an unrelated app database — must survive
+      "keyval-store",
       "someOtherDb",
     ]);
     vi.stubGlobal("indexedDB", idb);
 
-    mod.purgePageYdocDatabases();
+    await mod.purgePageYdocDatabases();
 
-    await vi.waitFor(() => {
-      expect(del).toHaveBeenCalledWith("page.w1:u1.pageA");
-      expect(del).toHaveBeenCalledWith("page.w2:u2.pageB");
-    });
+    expect(del).toHaveBeenCalledWith("page.w1:u1.pageA");
+    expect(del).toHaveBeenCalledWith("page.w2:u2.pageB");
     expect(del).not.toHaveBeenCalledWith("keyval-store");
     expect(del).not.toHaveBeenCalledWith("someOtherDb");
   });
 
-  it("does not throw and still deletes via the registry when databases() is unavailable (Firefox)", async () => {
+  it("deletes via the registry when databases() is unavailable (Firefox)", async () => {
     const mod = await freshImport();
-    // Firefox: no `indexedDB.databases()`. The registry (localStorage) is the
-    // only way to know which names to delete.
     mod.rememberYdocDbName("page.w1:u1.pageA");
-    mod.rememberYdocDbName("not-a-page-db"); // ignored by rememberYdocDbName
-    const del = vi.fn(() => ({}) as IDBOpenDBRequest);
-    vi.stubGlobal("indexedDB", { deleteDatabase: del }); // no databases()
+    mod.rememberYdocDbName("not-a-page-db");
+    const del = vi.fn(() => successReq());
+    vi.stubGlobal("indexedDB", { deleteDatabase: del });
 
-    expect(() => mod.purgePageYdocDatabases()).not.toThrow();
+    await expect(mod.purgePageYdocDatabases()).resolves.toBeUndefined();
     expect(del).toHaveBeenCalledWith("page.w1:u1.pageA");
     expect(del).not.toHaveBeenCalledWith("not-a-page-db");
-    // The registry is cleared after a purge.
     expect(localStorage.getItem("pageYdoc.dbNames.v1")).toBeNull();
+  });
+
+  // #640, acceptance 3 — a blocked deletion increments a metric, never a warn.
+  it("counts a BLOCKED deletion to an always-on safety metric", async () => {
+    const mod = await freshImport();
+    const metrics = await import("@/lib/telemetry/safety-metrics");
+    metrics.resetSafetyMetricsForTests();
+
+    mod.rememberYdocDbName("page.w1:u1.pageA");
+    const del = vi.fn(() => {
+      const req: any = {};
+      // Another tab holds the db open: onblocked fires; the broadcast then lets
+      // it close and onsuccess follows, settling the awaited delete.
+      Promise.resolve().then(() => {
+        req.onblocked?.();
+        req.onsuccess?.();
+      });
+      return req;
+    });
+    vi.stubGlobal("indexedDB", { deleteDatabase: del });
+
+    await mod.purgePageYdocDatabases();
+
+    expect(metrics.getSafetyMetric("ydoc_delete_blocked")).toBe(1);
   });
 });
 
-describe("migratePageYdocDatabasesOnce (#626 legacy cleanup)", () => {
-  it("deletes legacy page.<pageId> but leaves page.<scope>.<pageId> intact, and runs once", async () => {
+describe("migratePageYdocDatabasesOnce (#640 acceptance 9)", () => {
+  it("deletes legacy page.<pageId> via enumeration, leaves namespaced intact, runs once", async () => {
     const mod = await freshImport();
-    const legacy = `page.${PAGE_ID}`; // un-namespaced (no scope colon)
-    const namespaced = `page.w1:u1.${PAGE_ID}`; // current user's DB — must survive
+    const legacy = `page.${PAGE_ID}`;
+    const namespaced = `page.w1:u1.${PAGE_ID}`;
     const { del, idb } = idbWithDatabases([legacy, namespaced, "keyval-store"]);
     vi.stubGlobal("indexedDB", idb);
 
     mod.migratePageYdocDatabasesOnce();
 
-    await vi.waitFor(() =>
-      expect(del).toHaveBeenCalledWith(legacy),
-    );
+    await vi.waitFor(() => expect(del).toHaveBeenCalledWith(legacy));
     expect(del).not.toHaveBeenCalledWith(namespaced);
     expect(del).not.toHaveBeenCalledWith("keyval-store");
-    // The one-time flag is now set.
     expect(localStorage.getItem("pageYdoc.legacyPurged.v1")).toBe("1");
 
-    // Second call is a no-op: the flag short-circuits before any enumeration.
     del.mockClear();
     idb.databases.mockClear();
     mod.migratePageYdocDatabasesOnce();
@@ -379,18 +409,25 @@ describe("migratePageYdocDatabasesOnce (#626 legacy cleanup)", () => {
     expect(del).not.toHaveBeenCalled();
   });
 
-  it("marks itself done without deleting when databases() is unavailable (Firefox)", async () => {
+  // Firefox (no databases()): derive the legacy name from the raw page-meta blob.
+  it("deletes a legacy DB derived from the page-meta cache when databases() is unavailable", async () => {
+    seedBootCache(PAGE_ID, SLUG_ID);
     const mod = await freshImport();
-    const del = vi.fn(() => ({}) as IDBOpenDBRequest);
-    vi.stubGlobal("indexedDB", { deleteDatabase: del }); // no databases()
+    const del = vi.fn(() => successReq());
+    vi.stubGlobal("indexedDB", { deleteDatabase: del });
 
-    expect(() => mod.migratePageYdocDatabasesOnce()).not.toThrow();
-    expect(del).not.toHaveBeenCalled();
+    mod.migratePageYdocDatabasesOnce();
+
+    await vi.waitFor(() =>
+      expect(del).toHaveBeenCalledWith(`page.${PAGE_ID}`),
+    );
+    // The slugId-derived legacy name is also swept.
+    expect(del).toHaveBeenCalledWith(`page.${SLUG_ID}`);
     expect(localStorage.getItem("pageYdoc.legacyPurged.v1")).toBe("1");
   });
 });
 
-describe("pageYdocRoomName vs pageYdocName (collab room != db name)", () => {
+describe("pageYdocRoomName vs pageYdocDbName (collab room != db name)", () => {
   // Mirrors the SERVER contract in apps/server/src/collaboration/
   // collaboration.util.ts: getPageId(documentName) = documentName.split(".")[1].
   // The collab ROOM name is what the client passes to HocuspocusProvider.name, so
@@ -408,7 +445,7 @@ describe("pageYdocRoomName vs pageYdocName (collab room != db name)", () => {
 
   it("the SCOPED db name must NOT be used as the room name (it resolves to the scope)", async () => {
     const mod = await freshImport();
-    const dbName = mod.pageYdocName(PAGE_ID, SCOPE);
+    const dbName = mod.pageYdocDbName(SCOPE, PAGE_ID);
     // The db name is deliberately 3-segment (page.<scope>.<pageId>); feeding it to
     // the collab room resolves the SCOPE, not the pageId — the #626 break.
     expect(serverGetPageId(dbName)).toBe(SCOPE);

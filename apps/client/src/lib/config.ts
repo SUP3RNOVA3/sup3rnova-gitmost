@@ -63,6 +63,41 @@ export function isLocalFirstEnabled(): boolean {
   return castToBoolean(getConfigValue("LOCAL_FIRST_ENABLED", "false"));
 }
 
+// #640 — network-independent session boundary. After OFFLINE_GRACE has elapsed
+// since the last successful `/me` (`sessionVerifiedAt`), the client refuses to
+// draw ANY local content (chrome, tree, ydoc body) and purges it — offline or
+// not. Default 30d, equal to JWT_TOKEN_EXPIRES_IN: the server treats the session
+// dead after that, so drawing local content longer would show data beyond the
+// session's life with nothing able to interrupt it. Env-override via
+// OFFLINE_GRACE (mirrored into window.CONFIG by the server).
+const DEFAULT_OFFLINE_GRACE_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Parse a duration like "30d" / "720h" / "43200m" / a bare-ms number. Kept
+// inline (no `ms` dependency in the client bundle) and defensive: anything
+// unparseable falls back to the 30-day default rather than throwing.
+function parseDurationMs(raw: string | undefined): number {
+  if (!raw) return DEFAULT_OFFLINE_GRACE_MS;
+  const trimmed = raw.trim();
+  const match = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)?$/i.exec(trimmed);
+  if (!match) return DEFAULT_OFFLINE_GRACE_MS;
+  const value = parseFloat(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_OFFLINE_GRACE_MS;
+  const unit = (match[2] ?? "ms").toLowerCase();
+  const factor: Record<string, number> = {
+    ms: 1,
+    s: 1000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000,
+    w: 604_800_000,
+  };
+  return value * (factor[unit] ?? 1);
+}
+
+export function getOfflineGraceMs(): number {
+  return parseDurationMs(getConfigValue("OFFLINE_GRACE", "30d"));
+}
+
 export function getAvatarUrl(
   avatarUrl: string,
   type: AvatarIconType = AvatarIconType.AVATAR,

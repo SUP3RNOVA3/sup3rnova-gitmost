@@ -110,12 +110,15 @@ import {
   isYdocBodyNonEmpty,
 } from "@/features/editor/local-first-body";
 import {
-  pageYdocName,
+  pageYdocDbName,
   pageYdocRoomName,
   registerPageYdoc,
   rememberYdocDbName,
   unregisterPageYdoc,
 } from "@/features/editor/page-ydoc-eviction";
+import { canOpenLocalYdoc } from "@/features/editor/page-ydoc-tombstones";
+import { markReconciled } from "@/features/editor/page-ydoc-reconciled";
+import { isSessionExpired } from "@/features/user/session-verified";
 import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
 import { isLocalFirstEnabled } from "@/lib/config.ts";
 import {
@@ -201,11 +204,13 @@ export default function PageEditor({
   const { handleScrollTo } = useEditorScroll({ canScroll });
   // Providers only created once per pageId
   const providersRef = useRef<{
-    local: IndexeddbPersistence;
+    // #640 — remote-only when the page is tombstoned / scope unresolved / session
+    // expired: the local persistence is then not constructed at all.
+    local: IndexeddbPersistence | null;
     remote: HocuspocusProvider;
     socket: HocuspocusProviderWebsocket;
     ydoc: Y.Doc;
-    documentName: string;
+    dbName: string;
   } | null>(null);
   // #564 — the ACTIVE providers, tagged with the pageId they belong to, held in
   // STATE (not just the ref) so the extensions memo below can never bind the
@@ -227,12 +232,34 @@ export default function PageEditor({
     // write sync state that now belongs to a DIFFERENT page.
     let disposed = false;
     if (!providersRef.current) {
-      const documentName = pageYdocName(pageId, ydocScopeKey);
-      // Record the scoped DB name so the cross-user purge can delete it by name
-      // on browsers without `indexedDB.databases()` (Firefox).
-      rememberYdocDbName(documentName);
+      // #640, invariant 1 — the DB name is SCOPE-NAMESPACED, the collab ROOM name
+      // is NOT. The room name must stay `page.<pageId>` or the server resolves the
+      // wrong id and every collab connection breaks (see page-ydoc-eviction).
+      const dbName = pageYdocDbName(ydocScopeKey, pageId);
+      const roomName = pageYdocRoomName(pageId);
+      // #640 — open LOCAL persistence only when it is safe to lean on local
+      // content. Fail-closed on all three:
+      //  - anon scope (not yet resolved): a signed-out/first-frame state must not
+      //    write a body under `anon:anon` (invariant 2);
+      //  - session expired past OFFLINE_GRACE (30d, part 6): refuse local body;
+      //  - the page is TOMBSTONED (access revoked, part 5): y-indexeddb creates
+      //    the DB on construction, so gating here — not at paint — is what keeps a
+      //    revoked page from resurrecting an (empty) database every visit. Checked
+      //    under BOTH aliases so a slugId-only tombstone still blocks.
+      const scopeResolved = !ydocScopeKey.split(":").includes("anon");
+      const openLocal =
+        scopeResolved &&
+        !isSessionExpired() &&
+        canOpenLocalYdoc(dbName) &&
+        canOpenLocalYdoc(pageYdocDbName(ydocScopeKey, slugId ?? pageId));
       const ydoc = new Y.Doc();
-      const local = new IndexeddbPersistence(documentName, ydoc);
+      const local = openLocal ? new IndexeddbPersistence(dbName, ydoc) : null;
+      if (openLocal) {
+        // Record the scoped DB name so the cross-user purge can delete it by name
+        // on browsers without `indexedDB.databases()` (Firefox). Only when a DB is
+        // actually created — a remote-only ydoc leaves nothing on disk.
+        rememberYdocDbName(dbName);
+      }
       const socket = new HocuspocusProviderWebsocket({
         url: collaborationURL,
       });
@@ -270,6 +297,12 @@ export default function PageEditor({
         if (event.state) {
           isRemoteConfirmedRef.current = true;
           setIsRemoteConfirmed(true);
+          // #640 R1 — durable "this ydoc reconciled with the server at least
+          // once" mark, keyed by the scoped DB name. Introduced now, no consumers
+          // yet; Ф7 (offline editing) reads THIS instead of the session-scoped
+          // isRemoteConfirmed. See page-ydoc-reconciled for the forward-compat
+          // purge/quarantine rule.
+          markReconciled(dbName);
         }
       };
       const onStatelessHandler = ({ payload }: onStatelessParameters) => {
@@ -344,12 +377,10 @@ export default function PageEditor({
       };
       const remote = new HocuspocusProvider({
         websocketProvider: socket,
-        // The collab ROOM name must stay `page.<pageId>` (NOT the scoped DB name):
-        // the server resolves the page via documentName.split('.')[1], so a scoped
-        // name would resolve the scope instead of the pageId and reject every
-        // authenticated connection (#626 regression). Local isolation is in the
-        // IndexedDB db name (`documentName`), never the room name.
-        name: pageYdocRoomName(pageId),
+        // #640, invariant 1 — the un-namespaced ROOM name (`page.<pageId>`), never
+        // the scoped DB name, so the server resolves the pageId via split('.')[1]
+        // and every authenticated collab connection succeeds (#626 regression fix).
+        name: roomName,
         document: ydoc,
         token: collabQuery?.token,
         onAuthenticationFailed: onAuthenticationFailedHandler,
@@ -358,17 +389,19 @@ export default function PageEditor({
         onStateless: onStatelessHandler,
       });
 
-      local.on("synced", onLocalSyncedHandler);
-      providersRef.current = { socket, local, remote, ydoc, documentName };
-      // #564, guard 3 — hand the LIVE persistence to the global 403/404
-      // subscriber (installed at app level in main.tsx, because the revoked-page
-      // case never mounts this component at all), keyed by both aliases a page
-      // query can use. This registration only makes eviction of a page open RIGHT
-      // NOW cheaper/synchronous — the subscriber resolves pages this session
-      // never opened from the persisted #563 meta cache on its own.
-      if (localFirst) {
+      local?.on("synced", onLocalSyncedHandler);
+      providersRef.current = { socket, local, remote, ydoc, dbName };
+      // #564 guard 3 / #640 part 7 — hand the LIVE persistence to the global
+      // 403/404 subscriber (installed at app level in main.tsx, because the
+      // revoked-page case never mounts this component at all), keyed by both
+      // aliases a page query can use. Registered whenever a local persistence was
+      // actually opened, regardless of the flag: deleting revoked content is not
+      // gated on the local-first experiment. This only makes eviction of a page
+      // open RIGHT NOW cheaper/synchronous — the subscriber resolves pages this
+      // session never opened from the persisted #563 meta cache on its own.
+      if (local) {
         registerPageYdoc({
-          documentName,
+          dbName,
           persistence: local,
           keys: [pageId, slugId],
         });
@@ -385,14 +418,14 @@ export default function PageEditor({
       disposed = true;
       setCollabProvider(null);
       setActiveProviders(null);
-      const documentName = providersRef.current?.documentName;
+      const dbName = providersRef.current?.dbName;
       providersRef.current?.socket.destroy();
       providersRef.current?.remote.destroy();
-      providersRef.current?.local.destroy();
+      providersRef.current?.local?.destroy();
       providersRef.current = null;
-      // The persistence is gone; keep only the pageId/slugId -> doc-name alias
+      // The persistence is gone; keep only the pageId/slugId -> db-name alias
       // so a 403/404 landing AFTER unmount still deletes the IDB database.
-      if (documentName) unregisterPageYdoc(documentName);
+      if (dbName) unregisterPageYdoc(dbName);
     };
   }, [pageId]);
 
