@@ -142,8 +142,11 @@ describe("Page chrome (local-first boot cache)", () => {
     // text-only <title>; the legacy emoji no longer prefixes the tab title.
     expect(chromeTitle()).not.toContain("🚀");
     expect(screen.getByTestId("page-header")).toBeDefined();
-    // The BODY is untouched by phase 1: still the network swap (skeleton).
-    expect(screen.queryByTestId("full-editor")).toBeNull();
+    // Ф7 (#643) — the body NO LONGER waits for the network: with local-first ON
+    // the editor mounts on the cached meta (it renders from the local ydoc / a
+    // skeleton internally). Phase 1's "body stays skeleton until /pages/info"
+    // assertion is exactly what #643 removes.
+    expect(screen.getByTestId("full-editor")).toBeDefined();
   });
 
   it("FAIL-CLOSED: a cached canEdit:true is read-only until the LIVE response confirms it", () => {

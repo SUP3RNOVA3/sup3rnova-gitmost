@@ -40,6 +40,8 @@ import {
   yjsConnectionStatusAtom,
 } from "@/features/editor/atoms/editor-atoms";
 import { notifications } from "@mantine/notifications";
+import { Skeleton } from "@mantine/core";
+import { getCollabToken } from "@/features/auth/services/auth-service";
 import {
   VERSION_SAVED_MESSAGE_TYPE,
   type VersionSavedMessage,
@@ -117,7 +119,10 @@ import {
   unregisterPageYdoc,
 } from "@/features/editor/page-ydoc-eviction";
 import { canOpenLocalYdoc } from "@/features/editor/page-ydoc-tombstones";
-import { markReconciled } from "@/features/editor/page-ydoc-reconciled";
+import {
+  getReconciledAt,
+  markReconciled,
+} from "@/features/editor/page-ydoc-reconciled";
 import { isSessionExpired } from "@/features/user/session-verified";
 import { scopeKeyAtom } from "@/features/page/tree/atoms/open-tree-nodes-atom";
 import { isLocalFirstEnabled } from "@/lib/config.ts";
@@ -134,6 +139,12 @@ interface PageEditorProps {
   editable: boolean;
   content: any;
   canComment?: boolean;
+  // Ф7 (#643) — the live REST body has not resolved for THIS page yet
+  // (`isLoading || !livePage` in page.tsx). Owns the SKELETON state: while the
+  // static copy is up and no authoritative content exists (no REST body AND the
+  // local ydoc is not reconciled), show a skeleton rather than an empty editor
+  // or another page's static copy. Absent (legacy mount / flag OFF) ⇒ false.
+  bodyContentPending?: boolean;
 }
 
 export default function PageEditor({
@@ -141,6 +152,7 @@ export default function PageEditor({
   editable,
   content,
   canComment,
+  bodyContentPending,
 }: PageEditorProps) {
   const { t } = useTranslation();
   const collaborationURL = useCollaborationUrl();
@@ -179,6 +191,21 @@ export default function PageEditor({
   // Read the flag once per mount: a mid-session flip must not move the editor
   // between two different state machines.
   const localFirst = useMemo(() => isLocalFirstEnabled(), []);
+  // Ф7 (#643), part 7 — the DURABLE reconciliation mark (Ф4's reconciledAt),
+  // keyed by the scoped ydoc DB name, read once per (scope, page). Deliberately
+  // NOT the session-scoped `isRemoteConfirmed` (which is `useState(false)`, never
+  // persisted → forever false offline): keying the new skeleton decision on the
+  // session flag would cement a gate that a future offline-editing phase must
+  // rip out. A reconciliation that happens DURING this session is covered by
+  // `isRemoteConfirmed` in `bodyReconciled` below.
+  const bodyDbName = useMemo(
+    () => pageYdocDbName(ydocScopeKey, pageId),
+    [ydocScopeKey, pageId],
+  );
+  const durablyReconciled = useMemo(
+    () => (localFirst ? getReconciledAt(bodyDbName) !== undefined : false),
+    [localFirst, bodyDbName],
+  );
   const setBodyLocalOnly = useSetAtom(bodyLocalOnlyAtom);
   const setBodyWriteBlocked = useSetAtom(bodyWriteBlockedAtom);
   const [yjsConnectionStatus, setYjsConnectionStatus] = useAtom(
@@ -384,7 +411,21 @@ export default function PageEditor({
         // and every authenticated collab connection succeeds (#626 regression fix).
         name: roomName,
         document: ydoc,
-        token: collabQuery?.token,
+        // Ф7 (#643) — a LAZY token callback, not a by-value token. Hocuspocus
+        // accepts a (possibly async) function and awaits it before authenticating.
+        // At t0 the collab-token query may not have resolved yet; passing an empty
+        // token by value makes the server reject the socket → onAuthenticationFailed
+        // → a 100ms reconnect, growing the read-only window on the very path Ф7
+        // speeds up (and widening the #218 radius). The callback instead WAITS for
+        // the token: it prefers the always-current ref, else ensures the query.
+        token: async () =>
+          collabTokenRef.current ??
+          (
+            await queryClient.ensureQueryData({
+              queryKey: ["collab-token"],
+              queryFn: () => getCollabToken(),
+            })
+          )?.token,
         onAuthenticationFailed: onAuthenticationFailedHandler,
         onStatus: onStatusHandler,
         onSynced: onSyncedHandler,
@@ -499,7 +540,16 @@ export default function PageEditor({
   const editor = useEditor(
     {
       extensions,
-      editable,
+      // Ф7 (#643) — a CONSTANT `false`, NOT the live `editable`, and `editable`
+      // is out of the deps below. `editable` (= derivePageChromeCanEdit(livePage))
+      // flips false→true when `/pages/info` lands; if it were an option dep the
+      // editor would be destroyed+recreated at the exact measured moment (a visual
+      // jump in the Ф3 window). The `editor.setEditable(isBodyEditable(...))`
+      // effect below is the SOLE owner of editability — it already forces `false`
+      // on mount (static / not-yet-remote-confirmed), so seeding `false` here is
+      // behavior-identical while removing the recreation. `editable` participates
+      // in no other editor-option closure (it is only read in the render body).
+      editable: false,
       immediatelyRender: true,
       shouldRerenderOnTransaction: false,
       editorProps: {
@@ -609,7 +659,10 @@ export default function PageEditor({
         debouncedUpdateContent();
       },
     },
-    [pageId, editable, extensions],
+    // Ф7 (#643) — `editable` intentionally removed (see the constant above): the
+    // setEditable effect owns editability, so an `editable` flip no longer
+    // recreates the editor.
+    [pageId, extensions],
   );
 
   const editorIsEditable = useEditorState({
@@ -978,6 +1031,23 @@ export default function PageEditor({
     </div>
   );
 
+  // Ф7 (#643), parts 3 + 7 — the BODY has three states, owned here:
+  //   1. local ydoc synced + NON-EMPTY → live read-only editor (`!showStatic`);
+  //   2. ydoc empty/not-synced, authoritative content exists → static copy;
+  //   3. ydoc empty/not-synced, NO authoritative content yet → SKELETON.
+  // "Authoritative content" = a resolved live REST body (`!bodyContentPending`)
+  // OR a reconciled local ydoc (`bodyReconciled`: durable reconciledAt, or the
+  // session confirmation). Deriving the skeleton from `bodyContentPending`/
+  // reconciliation — NOT from a falsy `content` — is load-bearing: a genuinely
+  // LOADED-EMPTY page, and a reconciled-but-empty page revisited offline, both
+  // render an empty static copy, never an eternal skeleton. A non-empty local
+  // ydoc has already swapped to the live editor, so this only gates the static
+  // window. Flag OFF (or the legacy mount): `bodyContentPending` is false, so
+  // this is never a skeleton — today's static→live behavior exactly.
+  const bodyReconciled = durablyReconciled || isRemoteConfirmed;
+  const showBodySkeleton =
+    localFirst && showStatic && !!bodyContentPending && !bodyReconciled;
+
   return (
     <TransclusionLookupProvider>
       <PageEmbedLookupProvider>
@@ -988,7 +1058,14 @@ export default function PageEditor({
               reservedHeight != null ? { minHeight: reservedHeight } : undefined
             }
           >
-            {showStatic ? (
+            {showBodySkeleton ? (
+              /* Ф7 (#643) — no authoritative body yet (no live REST content AND
+                 the local ydoc is neither non-empty nor reconciled). A skeleton,
+                 NOT an empty editor (the static `EditorProvider` has `deps=[]`
+                 and never re-reads `content`, so a `content=undefined` mount
+                 would stay blank forever) and NOT another page's static copy. */
+              <BodySkeleton />
+            ) : showStatic ? (
               <div style={{ position: "relative" }}>
                 {/* Surface the pre-sync read-only window so edits typed before the
               collab provider connects aren't silently swallowed (#218). Shown
@@ -1077,5 +1154,20 @@ export default function PageEditor({
         </PageEmbedAncestryProvider>
       </PageEmbedLookupProvider>
     </TransclusionLookupProvider>
+  );
+}
+
+// Ф7 (#643) — the body-only loading placeholder (the title + byline chrome
+// already paints from the #563 meta cache above this editor). Approximates the
+// first content lines so a first visit / unresolved body no longer flashes an
+// empty editor.
+function BodySkeleton() {
+  return (
+    <div data-testid="body-skeleton" aria-hidden>
+      <Skeleton height={16} mt="xl" radius="sm" />
+      <Skeleton height={16} mt="sm" radius="sm" />
+      <Skeleton height={16} mt="sm" width="85%" radius="sm" />
+      <Skeleton height={16} mt="sm" width="70%" radius="sm" />
+    </div>
   );
 }
