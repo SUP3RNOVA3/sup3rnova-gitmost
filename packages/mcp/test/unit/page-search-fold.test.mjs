@@ -162,3 +162,26 @@ test("#659 no exact-vs-fold double counting within a block", () => {
   assert.equal("folded" in res.matches[0], false);
   assert.equal(res.matches[1].folded, true);
 });
+
+// Locks the TRAILING fold-boundary of `match`/`folded`: an invisible sitting at
+// the END of the matched range (folded offset fi+flen) must be INCLUDED in
+// `match` and set `folded`. The mid-word tests never exercise this because a real
+// char always follows the last matched char there (so map[fi+flen-1]+1 coincides
+// with map[fi+flen]); here `a` is immediately followed by the SHY, so both classic
+// off-by-one mutations of `oj` (interior map[fi+flen]->map[fi+flen-1]+1 AND the
+// end-clamp text.length->map[fi+flen-1]+1) drop the SHY and turn this RED.
+test("#659 trailing invisible at the fold boundary is kept in match + sets folded", () => {
+  // Interior boundary: `a` matched, SHY right after it, then a real char.
+  const d1 = doc(para("p1", text(`Xa${SHY}bY`)));
+  const r1 = searchInDoc(d1, "a");
+  assert.equal(r1.total, 1);
+  assert.equal(r1.matches[0].match, `a${SHY}`);
+  assert.equal(r1.matches[0].folded, true);
+
+  // End-of-string boundary: the SHY is the last char, exercising the text.length clamp.
+  const d2 = doc(para("p1", text(`a${SHY}`)));
+  const r2 = searchInDoc(d2, "a");
+  assert.equal(r2.total, 1);
+  assert.equal(r2.matches[0].match, `a${SHY}`);
+  assert.equal(r2.matches[0].folded, true);
+});
