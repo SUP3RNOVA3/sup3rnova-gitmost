@@ -115,6 +115,26 @@ describe('schema attribute parity: editor-ext/collab source vs prosemirror-markd
     expect(sharedTypes.length).toBeGreaterThan(20);
     expect(sharedTypes).toContain('node:tableCell');
     expect(sharedTypes).toContain('node:tableHeader');
+
+    // PIN the advertised global-attr coverage (header, "globally-injected attrs
+    // id / textAlign / indent"). Those attrs are folded into `spec.attrs` by an
+    // `addGlobalAttributes()` extension (editor-ext `Indent` + Tiptap TextAlign /
+    // the block-id ext on the SOURCE, `DocmostAttributes` on the MIRROR) rather
+    // than declared node-locally, so they exercise a different build path than
+    // the node-local `align` pin below. Without this assertion, if a Tiptap
+    // upgrade or refactor stopped folding globals into `spec.attrs` on BOTH sides
+    // in lockstep, each node's global set would collapse to [] synchronously —
+    // the diff would stay green (57 > 20, align still node-local) while the
+    // advertised global-drift coverage silently evaporated. This reddens the
+    // instant global materialization regresses on either schema.
+    for (const surface of [source, mirror]) {
+      for (const type of ['node:paragraph', 'node:heading']) {
+        const attrs = surface.get(type)!;
+        for (const global of ['id', 'indent', 'textAlign']) {
+          expect(attrs.has(global)).toBe(true);
+        }
+      }
+    }
   });
 
   it('every shared node/mark has identical attribute sets in both schemas (allowlisted divergences aside)', () => {
