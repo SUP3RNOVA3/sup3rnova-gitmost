@@ -259,3 +259,112 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     await Promise.all(toolset.clients.map((c) => c.close()));
   });
 });
+
+/**
+ * #476/#685 — the recovery-reconnect path (`reconnectServer`) MUST apply the
+ * SAME allowlist semantics as the initial `buildEntry` build: ANY array —
+ * including `[]` — is authoritative, so an empty/deny-all allowlist yields ZERO
+ * tools after a reconnect too. The bug (#685): `reconnectServer` used a
+ * `Array.isArray(allow) && allow.length > 0` guard that read `[]` as falsy and
+ * silently widened deny-all to allow-all EXACTLY on recovery-reconnect — a
+ * fail-closed → fail-open flip precisely when the transport degraded (the repo
+ * also clamps a corrupt allowlist row to `[]` fail-closed).
+ *
+ * The `buildEntry` side of this invariant is pinned in mcp-allowlist-filter.spec.ts
+ * (via `toolsFor`); this pins the recovery side directly on `reconnectServer`.
+ *
+ * MUTATION-VERIFY: reverting the fix to
+ *   `Array.isArray(allow) && allow.length > 0 ? pick(raw, allow) : raw`
+ * reddens the two `[]` cases below (they would expose ALL three tools).
+ */
+describe('reconnectServer honours allowlist deny-all on recovery (#476/#685)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  const RAW = (): Record<string, unknown> => ({
+    alpha: { description: 'x', execute: jest.fn().mockResolvedValue({}) },
+    beta: { description: 'y', execute: jest.fn().mockResolvedValue({}) },
+    gamma: { description: 'z', execute: jest.fn().mockResolvedValue({}) },
+  });
+
+  /** Stub `connect` so the reconnected client lists a fixed raw tool map. */
+  function stubConnectRaw(
+    service: McpClientsService,
+    rawTools: Record<string, unknown>,
+  ) {
+    return jest
+      .spyOn(
+        service as unknown as { connect: (s: FakeServer) => Promise<unknown> },
+        'connect',
+      )
+      .mockImplementation(async () => ({
+        tools: async () => rawTools,
+        close: jest.fn().mockResolvedValue(undefined),
+      }));
+  }
+
+  /** Invoke the private recovery-reconnect and return its resolved tool keys. */
+  async function reconnectKeys(
+    service: McpClientsService,
+    srv: FakeServer,
+  ): Promise<{ keys: string[]; close: () => Promise<void> }> {
+    const { state, lease } = await (
+      service as unknown as {
+        reconnectServer: (
+          s: FakeServer,
+          capMs: number,
+        ) => Promise<{
+          state: { tools: Record<string, unknown> };
+          lease: { close: () => Promise<void> };
+        }>;
+      }
+    ).reconnectServer(srv, 1000);
+    return { keys: Object.keys(state.tools), close: () => lease.close() };
+  }
+
+  it('toolAllowlist:[] yields ZERO tools after a recovery-reconnect (deny-all)', async () => {
+    const { service } = buildService([]);
+    stubConnectRaw(service, RAW());
+    const { keys, close } = await reconnectKeys(
+      service,
+      server({ toolAllowlist: [] }),
+    );
+    expect(keys).toEqual([]);
+    await close();
+  });
+
+  it('a corrupt allowlist clamped to [] by the repo also yields ZERO tools after reconnect', async () => {
+    // The repo fails a present-but-corrupt tool_allowlist CLOSED to `[]`
+    // (ai-mcp-server.repo.ts normalizeRow); recovery must honour that as deny-all.
+    const corruptFallback: string[] = [];
+    const { service } = buildService([]);
+    stubConnectRaw(service, RAW());
+    const { keys, close } = await reconnectKeys(
+      service,
+      server({ toolAllowlist: corruptFallback }),
+    );
+    expect(keys).toEqual([]);
+    await close();
+  });
+
+  it('null (no restriction) still exposes every tool after reconnect', async () => {
+    const { service } = buildService([]);
+    stubConnectRaw(service, RAW());
+    const { keys, close } = await reconnectKeys(
+      service,
+      server({ toolAllowlist: null }),
+    );
+    expect(keys.sort()).toEqual(['alpha', 'beta', 'gamma']);
+    await close();
+  });
+
+  it("['alpha'] exposes ONLY alpha after reconnect (parity with buildEntry)", async () => {
+    const { service } = buildService([]);
+    stubConnectRaw(service, RAW());
+    const { keys, close } = await reconnectKeys(
+      service,
+      server({ toolAllowlist: ['alpha'] }),
+    );
+    expect(keys).toEqual(['alpha']);
+    await close();
+  });
+});
