@@ -49,6 +49,7 @@ import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { WatcherRepo } from '@docmost/db/repos/watcher/watcher.repo';
 import { FavoriteRepo } from '@docmost/db/repos/favorite/favorite.repo';
 import { AuditEvent, AuditResource } from '../../../common/events/audit-events';
+import { McpClientsService } from '../../ai-chat/external-mcp/mcp-clients.service';
 import {
   AUDIT_SERVICE,
   IAuditService,
@@ -77,6 +78,8 @@ export class WorkspaceService {
     @InjectQueue(QueueName.AI_QUEUE) private aiQueue: Queue,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
     private userSessionRepo: UserSessionRepo,
+    // #686: evict a deleted user's per-user external-MCP toolset cache.
+    private readonly mcpClients: McpClientsService,
   ) {}
 
   async findById(workspaceId: string) {
@@ -967,7 +970,23 @@ export class WorkspaceService {
       });
 
       await this.userSessionRepo.revokeByUserId(userId, workspaceId, trx);
+
+      // #686: destroy the user's PERSONAL external MCP servers. The FK is
+      // `ON DELETE CASCADE`, but this is a SOFT delete (the users row survives),
+      // so nothing cascades — delete them explicitly here. Their encrypted
+      // per-user auth blobs (`headersEnc`) must NOT outlive the user, and a
+      // personal row must never be left ownerless (that would leak it into the
+      // whole workspace's agent). Admin rows (`user_id IS NULL`) are untouched.
+      await trx
+        .deleteFrom('aiMcpServers')
+        .where('userId', '=', userId)
+        .execute();
     });
+
+    // Evict this user's per-user external-MCP toolset cache (process-local). Their
+    // sessions are revoked above so they can't start a turn, but drop any warm
+    // entry now rather than waiting out the TTL.
+    this.mcpClients.invalidateUser(workspaceId, userId);
 
     this.auditService.log({
       event: AuditEvent.USER_DELETED,
