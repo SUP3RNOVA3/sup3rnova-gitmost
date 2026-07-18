@@ -150,6 +150,83 @@ describe('AccountMcpServersService [integration]', () => {
       // The rejected create left NO row behind.
       expect((await svc.list(w, u)).length).toBe(0);
     });
+
+    // F-2 (#686 ARCH #8): the SSRF guard also runs on UPDATE when the url
+    // changes (service:120 `if (dto.url !== existing.url) assertMcpUrlAllowed`).
+    // This is defense-in-depth (the primary gate is the unconditional
+    // connect-time re-check), but the create-vs-update asymmetry is cheap to
+    // close: a rejected re-point must throw 400 AND persist nothing (the stored
+    // url is unchanged). Non-vacuous: if the update path dropped the guard, the
+    // blocked url would be persisted and the final assertion would redden.
+    it('re-pointing a server at a blocked (loopback) URL is rejected with 400 and the stored url is unchanged', async () => {
+      const w = (await createWorkspace(db)).id;
+      const u = (await createUser(db, w)).id;
+      const svc = buildService(db, 10);
+
+      const created = await svc.createPersonal(
+        w,
+        u,
+        baseDto({ url: 'https://example.com/mcp' }),
+      );
+
+      // Re-pointing at a loopback target trips the SSRF guard on update.
+      await expect(
+        svc.update(w, u, created.id, { url: 'http://127.0.0.1/mcp' }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+
+      // The blocked url was NOT persisted: the row still holds the original.
+      const after = await svc.list(w, u);
+      expect(after.find((r) => r.id === created.id)?.url).toBe(
+        'https://example.com/mcp',
+      );
+    });
+  });
+
+  // F-1 (#686 ARCH #8): the migration declares
+  //   `user_id ... references users(id) ON DELETE CASCADE`
+  // so a personal server (which holds the encrypted per-user `headersEnc` blob)
+  // MUST be destroyed when its owner is deleted — NOT nulled, which would
+  // silently promote it to an admin/workspace-wide server and expose it. This
+  // is a DB-observable property invisible to a mocked unit test, so it runs
+  // against real Postgres. Non-vacuous: if the FK were `SET NULL` (or had no
+  // ON DELETE action, which would make the user delete fail), the personal row
+  // would survive the owner deletion and the post-delete assertions redden.
+  describe('CASCADE: deleting the owner destroys their personal servers', () => {
+    it('a personal server is GONE after its owning user is deleted', async () => {
+      const w = (await createWorkspace(db)).id;
+      const owner = (await createUser(db, w)).id;
+      const svc = buildService(db, 10);
+
+      const view = await svc.createPersonal(
+        w,
+        owner,
+        baseDto({
+          name: 'cascade-target',
+          headers: { Authorization: 'Bearer owner-secret' },
+        }),
+      );
+
+      // Sanity: the row exists and is owned by this user before the delete.
+      expect((await svc.list(w, owner)).some((r) => r.id === view.id)).toBe(
+        true,
+      );
+
+      // Delete the owner via the same table the harness seeds users into
+      // (mirrors db.ts createUser). The FK CASCADE must take the personal row
+      // with it.
+      await db.deleteFrom('users').where('id', '=', owner).execute();
+
+      // The personal row is gone from EVERY read path: a scope-agnostic raw
+      // lookup finds nothing...
+      const repo = new AiMcpServerRepo(db as any);
+      expect(await repo.findByIdRaw(view.id)).toBeUndefined();
+
+      // ...and it was destroyed, not promoted to an admin (user_id IS NULL)
+      // row: the admin/workspace list does not see it either.
+      expect(
+        (await repo.listByWorkspace(w)).some((r) => r.id === view.id),
+      ).toBe(false);
+    });
   });
 
   describe('per-user cap', () => {
