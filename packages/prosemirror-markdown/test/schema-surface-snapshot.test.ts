@@ -20,6 +20,15 @@ import { docmostExtensions } from "../src/lib/docmost-schema.js";
 // use toMatchSnapshot so the reference lives in this file and is reviewed in the
 // diff of every change.
 //
+// AUTOMATED COMPANION GUARD (#684, invariant #7): this loud review gate no
+// longer stands alone. `apps/server/src/collaboration/schema-attr-parity.spec.ts`
+// now automatically DIFFS the attribute-name set of every shared node/mark
+// between the AUTHORITATIVE write-path schema (`getSchema(tiptapExtensions)`)
+// and this mirror (`getSchema(docmostExtensions)`), in BOTH directions, and
+// fails CI on any unlisted drift — the guard that would have caught the
+// `tableCell`/`tableHeader` `align` drift (mirror-declared, write-path-stripped)
+// before it shipped as silent GFM-alignment loss.
+//
 // WHEN THIS TEST FAILS: do NOT blindly update `expectedSurface`. First confirm
 // the change matches `@docmost/editor-ext` (the canonical schema) so the
 // markdown <-> ProseMirror round-trip stays lossless, THEN copy the new surface
