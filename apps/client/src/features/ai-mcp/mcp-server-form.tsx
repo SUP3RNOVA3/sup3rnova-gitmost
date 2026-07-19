@@ -19,16 +19,16 @@ import { zod4Resolver } from "mantine-form-zod-resolver";
 import { IconCheck, IconX } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import {
-  useCreateAiMcpServerMutation,
-  useUpdateAiMcpServerMutation,
-  useTestAiMcpServerMutation,
-} from "@/features/workspace/queries/ai-mcp-server-query.ts";
-import {
   IAiMcpServer,
   IAiMcpServerCreate,
   IAiMcpServerUpdate,
-} from "@/features/workspace/services/ai-mcp-server-service.ts";
-import { resolveToolAllowlist } from "./ai-mcp-server-form.utils.ts";
+} from "./mcp-server-types.ts";
+import {
+  UseCreateMcpServerMutation,
+  UseUpdateMcpServerMutation,
+  UseTestMcpServerMutation,
+} from "./mcp-mutation-hooks.ts";
+import { resolveToolAllowlist } from "./mcp-form-utils.ts";
 
 const formSchema = z.object({
   name: z.string().min(1),
@@ -37,17 +37,22 @@ const formSchema = z.object({
   // Write-only secret buffer. Empty string means "do not change" (unless cleared).
   authHeader: z.string(),
   toolAllowlist: z.array(z.string()),
-  // Admin-authored prompt guidance (#180). Capped to mirror the DTO MaxLength.
+  // Author-supplied prompt guidance (#180). Capped to mirror the DTO MaxLength.
   instructions: z.string().max(4000),
   enabled: z.boolean(),
 });
 
 type FormValues = z.infer<typeof formSchema>;
 
-interface AiMcpServerFormProps {
+interface McpServerFormProps {
   // When provided, the form edits an existing server; otherwise it creates one.
   server?: IAiMcpServer;
   onClose: () => void;
+  // Scope-specific mutation hooks (admin `/workspace/ai-mcp-servers*` or
+  // personal `/account/mcp-servers*`), so the identical form wiring drives both.
+  useCreateMutation: UseCreateMcpServerMutation;
+  useUpdateMutation: UseUpdateMcpServerMutation;
+  useTestMutation: UseTestMcpServerMutation;
 }
 
 // Build the form's field values from a (possibly undefined) server. Used both
@@ -72,16 +77,26 @@ function buildInitialValues(server?: IAiMcpServer): FormValues {
   };
 }
 
-export default function AiMcpServerForm({
+/**
+ * Add/edit form for an external MCP server, shared (#686) by the admin and the
+ * personal (account) pages. The create/update/test mutations are injected as
+ * hooks so the SAME form drives both the `/workspace/ai-mcp-servers*` and the
+ * `/account/mcp-servers*` endpoints — the write-only header semantics and the
+ * per-server Test all live here exactly once.
+ */
+export default function McpServerForm({
   server,
   onClose,
-}: AiMcpServerFormProps) {
+  useCreateMutation,
+  useUpdateMutation,
+  useTestMutation,
+}: McpServerFormProps) {
   const { t } = useTranslation();
   const isEdit = Boolean(server);
 
-  const createMutation = useCreateAiMcpServerMutation();
-  const updateMutation = useUpdateAiMcpServerMutation();
-  const testMutation = useTestAiMcpServerMutation();
+  const createMutation = useCreateMutation();
+  const updateMutation = useUpdateMutation();
+  const testMutation = useTestMutation();
 
   // Whether auth headers are currently stored server-side (drives the placeholder).
   const [hasHeaders, setHasHeaders] = useState(server?.hasHeaders ?? false);

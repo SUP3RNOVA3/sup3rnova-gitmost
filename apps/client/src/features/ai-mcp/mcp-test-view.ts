@@ -1,4 +1,4 @@
-import type { IAiMcpServerTestResult } from "@/features/workspace/services/ai-mcp-server-service.ts";
+import type { IAiMcpServerTestResult } from "./mcp-server-types.ts";
 
 /** Minimal translator shape (i18next `t`): key + optional interpolation. */
 type Translate = (key: string, options?: Record<string, unknown>) => string;
