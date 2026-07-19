@@ -4,6 +4,7 @@ import { compression } from "vite-plugin-compression2";
 import * as path from "path";
 import * as fs from "node:fs";
 import { execSync } from "node:child_process";
+import { buildDefineEnv } from "./src/lib/client-config-keys";
 
 const envPath = path.resolve(process.cwd(), "..", "..");
 
@@ -51,50 +52,21 @@ function versionJsonPlugin(version: string): Plugin {
 
 export default defineConfig(({ mode }) => {
   const appVersion = resolveAppVersion(envPath);
-  const {
-    APP_URL,
-    FILE_UPLOAD_SIZE_LIMIT,
-    FILE_IMPORT_SIZE_LIMIT,
-    DRAWIO_URL,
-    CLOUD,
-    SUBDOMAIN_HOST,
-    COLLAB_URL,
-    BILLING_TRIAL_DAYS,
-    POSTHOG_HOST,
-    POSTHOG_KEY,
-    // #639 — these three flags reach the client ONLY through `window.CONFIG` in
-    // prod (static.module.ts), but in DEV the client reads `process.env` baked
-    // in here. They were absent from this allowlist, so `getConfigValue` read
-    // `undefined` in dev and e.g. `isLocalFirstEnabled()` was ALWAYS false —
-    // making the flag unreachable for any dev measurement. Prod is untouched.
-    LOCAL_FIRST_ENABLED,
-    CLIENT_TELEMETRY_ENABLED,
-    COMPACT_PAGE_TREE,
-    // #639 §4 — dev override of the telemetry sampling rate, so a dev taking a
-    // baseline by reloading does not silently collect nothing 3/4 of the time.
-    CLIENT_TELEMETRY_SAMPLE_RATE,
-  } = loadEnv(mode, envPath, "");
+  const env = loadEnv(mode, envPath, "");
+  const { APP_URL } = env;
 
   return {
     define: {
-      "process.env": {
-        APP_URL,
-        FILE_UPLOAD_SIZE_LIMIT,
-        FILE_IMPORT_SIZE_LIMIT,
-        DRAWIO_URL,
-        CLOUD,
-        SUBDOMAIN_HOST,
-        COLLAB_URL,
-        BILLING_TRIAL_DAYS,
-        POSTHOG_HOST,
-        POSTHOG_KEY,
-        // #639 — see the loadEnv note above: without these keys the dev bundle
-        // reads `undefined` for the flags and always behaves as flag-OFF.
-        LOCAL_FIRST_ENABLED,
-        CLIENT_TELEMETRY_ENABLED,
-        COMPACT_PAGE_TREE,
-        CLIENT_TELEMETRY_SAMPLE_RATE,
-      },
+      // #638 finding 1 — GENERATED from `CLIENT_CONFIG_KEYS`, never hand-listed.
+      // In dev `getConfigValue` reads `process.env`, which vite replaces with
+      // this static object, so a key missing here is unreachable in dev whatever
+      // `.env` says — that is how `isLocalFirstEnabled()` stayed false through
+      // every phase 1-2 dev verification. Deriving the object from the same list
+      // the drift test checks against `config.ts` keeps a new flag from ever
+      // being silently dev-dead again. See client-config-keys.ts for why the
+      // allowlist must stay an allowlist (loadEnv with an empty prefix returns
+      // the full server env, secrets included).
+      "process.env": buildDefineEnv(env),
       APP_VERSION: JSON.stringify(appVersion),
     },
     plugins: [
