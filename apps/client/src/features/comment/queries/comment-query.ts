@@ -26,6 +26,10 @@ import { useTranslation } from "react-i18next";
 import React, { useEffect, useMemo, useRef } from "react";
 import { useAtomValue } from "jotai";
 import { pageEditorAtom } from "@/features/editor/atoms/editor-atoms";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 
 export const RQ_KEY = (pageId: string) => ["comments", pageId];
 
@@ -249,6 +253,12 @@ export function useApplySuggestionMutation() {
     // No optimistic update: apply can fail with 409 (the commented text drifted),
     // so we only mutate the cache once the server confirms.
     mutationFn: ({ commentId }) => applySuggestion(commentId),
+    // #683 `comment_apply` — mark at the user action; measured in onSettled on
+    // success only. There is no optimistic update here, so onMutate is used
+    // purely for the telemetry start mark.
+    onMutate: () => {
+      markOperationStart("comment_apply");
+    },
     onSuccess: (data, variables) => {
       // Ephemeral (#329): the server hard-deletes the applied suggestion when the
       // thread has no replies ('deleted') or resolves it when it does ('resolved').
@@ -323,6 +333,13 @@ export function useApplySuggestionMutation() {
         message: t("Failed to apply suggestion"),
         color: "red",
       });
+    },
+    // #683 `comment_apply` measure — success only. The 404 idempotent-race branch
+    // lives in onError (RQ treats it as an error), so it is intentionally NOT
+    // measured; only a clean apply reports, and a real failure lets the mark
+    // expire.
+    onSettled: (_data, error) => {
+      if (!error) measureOperation("comment_apply");
     },
   });
 }
@@ -404,6 +421,10 @@ export function useResolveCommentMutation() {
   const mutation = useMutation({
     mutationFn: (data: IResolveComment) => resolveComment(data),
     onMutate: async (variables) => {
+      // #683 `comment_resolve` — mark at the optimistic start; measured in
+      // onSettled on success only (the "до/после" #399 round-trip incl. the
+      // thread re-render). A failed resolve leaves the mark to expire.
+      markOperationStart("comment_resolve");
       await queryClient.cancelQueries({ queryKey: RQ_KEY(variables.pageId) });
       const previousCache = queryClient.getQueryData(RQ_KEY(variables.pageId));
 
@@ -552,6 +573,12 @@ export function useResolveCommentMutation() {
           ),
         ),
       });
+    },
+    // #683 `comment_resolve` measure — success only (skip errors, incl. the
+    // rollback and the 404-drop paths, so a failed resolve reports nothing and
+    // its start mark expires).
+    onSettled: (_data, error) => {
+      if (!error) measureOperation("comment_resolve");
     },
   });
 

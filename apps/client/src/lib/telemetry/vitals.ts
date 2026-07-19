@@ -34,6 +34,10 @@ const FLUSH_INTERVAL_MS = 15_000;
 const MAX_BUFFER = 40; // flush early if the buffer fills between timers
 const MAX_ATTR_LENGTH = 120;
 const EDITOR_TX_MIN_MS = 8; // only report editor transactions slower than this
+// #683 — same >8ms report threshold as editor_tx: fast ops (cache-hit tree
+// expand, trivial re-highlight) must not flood the metric, and they carry no
+// user-perceived wait worth measuring.
+const OPERATION_MIN_MS = 8;
 
 // #639 — hard cap on a mark-less (timeOrigin) page_open_body_ms measurement.
 // The mark-less start counts from `performance.timeOrigin`, i.e. document boot.
@@ -82,6 +86,11 @@ const ALLOWED_NAMES = new Set([
   // ALLOWED_METRIC_NAMES; a name missing from EITHER side is silently dropped.
   "page_open_body_ms",
   "body_paint_timeout",
+  // #683 — single client-perceived / compute operation metric. The specific
+  // operation rides in `attr` (op name), NOT the metric name, so this one entry
+  // covers every op. Must ALSO be in reportClientMetric's union type below AND
+  // the server ALLOWED_METRIC_NAMES; a name missing from EITHER side is dropped.
+  "operation_ms",
 ]);
 
 interface VitalEvent {
@@ -227,9 +236,12 @@ export function reportClientMetric(
     // #639 — must stay in lockstep with ALLOWED_NAMES above and the server
     // ALLOWED_METRIC_NAMES; a name missing from any of the three is dropped.
     | "page_open_body_ms"
-    | "body_paint_timeout",
+    | "body_paint_timeout"
+    // #683 — one metric for all client-perceived / compute operations; the op
+    // name is carried in `extra.attr` (see reportOperation).
+    | "operation_ms",
   value: number,
-  extra?: { docSize?: number },
+  extra?: { docSize?: number; attr?: string },
 ): void {
   if (!isVitalsActive()) return;
   if (!Number.isFinite(value)) return;
@@ -238,6 +250,7 @@ export function reportClientMetric(
     value,
     route: currentRouteTemplate(),
     docSize: extra?.docSize,
+    attr: extra?.attr,
   });
 }
 
@@ -245,6 +258,88 @@ export function reportClientMetric(
 export function reportEditorTx(ms: number, docSize: number): void {
   if (ms <= EDITOR_TX_MIN_MS) return;
   reportClientMetric("editor_tx_ms", ms, { docSize });
+}
+
+/**
+ * #683 — the operations measured by `operation_ms{op}`. ONE metric; the op is the
+ * `attr`. Pattern A (surface opens / client-perceived round-trips) uses
+ * markOperationStart(op) on the user action + measureOperation(op) at the settled
+ * point; Pattern B (pure client compute/render) times the work with
+ * performance.now() and calls reportOperation(op, ms) directly. All op values are
+ * short lowercase-and-underscore identifiers, so they pass the server's
+ * CSS-selector-shaped `attr` charset validation.
+ */
+export type OperationName =
+  // Pattern A — surface opens & client-perceived round-trips.
+  | "comments_open"
+  | "ai_chat_open"
+  | "spotlight_open"
+  | "comment_resolve"
+  | "comment_apply"
+  | "history_restore"
+  | "search_full"
+  | "tree_dragdrop"
+  | "tree_expand"
+  // Pattern B — pure client compute / render.
+  | "history_diff"
+  | "code_highlight"
+  | "diagram_mermaid"
+  | "diagram_excalidraw"
+  | "diagram_drawio";
+
+// #683 — per-op start marks. Keyed by op so overlapping different ops each keep
+// their own start; a repeated start for the SAME op overwrites the prior mark
+// (last-start-wins), matching the "cancelled/replayed interaction" edge case.
+const OPERATION_MARK_PREFIX = "gm_op_start:";
+
+/**
+ * Report one operation_ms sample (Pattern B callers, and the shared sink for
+ * Pattern A's measureOperation). Threshold-gated like editor_tx so cache hits and
+ * trivial recomputes don't flood; the op rides in `attr`. Gated by
+ * isVitalsActive() inside reportClientMetric — flag off / not sampled ⇒ no-op.
+ */
+export function reportOperation(op: OperationName, ms: number): void {
+  if (!Number.isFinite(ms) || ms <= OPERATION_MIN_MS) return;
+  reportClientMetric("operation_ms", ms, { attr: op });
+}
+
+/**
+ * Mark the start of a Pattern-A operation at the user-action point. Overwrites
+ * any prior unconsumed mark for the same op (replayed/cancelled interaction).
+ * Cheap enough to call unconditionally, but skipped when telemetry is inactive
+ * so a disabled/non-sampled session pays zero cost.
+ */
+export function markOperationStart(op: OperationName): void {
+  if (!isVitalsActive()) return;
+  try {
+    const mark = OPERATION_MARK_PREFIX + op;
+    performance.clearMarks(mark);
+    performance.mark(mark);
+  } catch {
+    // performance marks are best-effort; never throw into the user path.
+  }
+}
+
+/**
+ * Measure a Pattern-A operation at its settled point, if a start mark exists, and
+ * report it (threshold-gated). Consumes the mark so a later settle for the same
+ * op doesn't double-count; an unconsumed mark (interaction cancelled before it
+ * settled) simply expires — it is only ever read here or overwritten by the next
+ * markOperationStart. Call this ONLY on the SUCCESS path (never in onError), so a
+ * failed operation reports nothing and leaves its mark to expire.
+ */
+export function measureOperation(op: OperationName): void {
+  if (!isVitalsActive()) return;
+  try {
+    const mark = OPERATION_MARK_PREFIX + op;
+    const marks = performance.getEntriesByName(mark, "mark");
+    if (marks.length === 0) return;
+    const elapsed = performance.now() - marks[0].startTime;
+    performance.clearMarks(mark);
+    reportOperation(op, elapsed);
+  } catch {
+    // best-effort; never throw into the user path.
+  }
 }
 
 const PAGE_OPEN_MARK = "gm_page_open_start";

@@ -1,8 +1,12 @@
 import { Spotlight } from "@mantine/spotlight";
 import { IconSearch } from "@tabler/icons-react";
 import { Group, Text, VisuallyHidden } from "@mantine/core";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { useDebouncedValue } from "@mantine/hooks";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 import { useTranslation } from "react-i18next";
 import { searchSpotlightStore } from "../constants.ts";
 import { SearchSpotlightFilters } from "./search-spotlight-filters.tsx";
@@ -39,6 +43,23 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
   }, [debouncedSearchQuery, filters]);
 
   const { data: searchResults, isLoading } = useUnifiedSearch(searchParams);
+
+  // #683 `search_full` — the user's search round-trip: a new non-empty debounced
+  // query is the "submit" (mark), and the metric is settled when its results
+  // render (isLoading → false). A brand-new query key starts as isLoading=true,
+  // so the mark is set before the settle; a superseding query overwrites the mark
+  // (replayed search) and an empty query never marks. measureOperation consumes
+  // the mark, so each query reports at most once; the surface-open cost is the
+  // separate `spotlight_open` metric, so this is not double-counted.
+  useEffect(() => {
+    if (debouncedSearchQuery.length > 0) markOperationStart("search_full");
+  }, [debouncedSearchQuery]);
+
+  useEffect(() => {
+    if (debouncedSearchQuery.length > 0 && !isLoading) {
+      measureOperation("search_full");
+    }
+  }, [debouncedSearchQuery, isLoading]);
 
   const resultItems = (searchResults || []).map((result) => (
     <SearchResultItem

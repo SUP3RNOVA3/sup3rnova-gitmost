@@ -26,7 +26,7 @@ import {
   SearchMobileControl,
 } from "@/features/search/components/search-control.tsx";
 import {
-  searchSpotlight,
+  openSearchSpotlight,
 } from "@/features/search/constants.ts";
 import { NotificationPopover } from "@/features/notification/components/notification-popover.tsx";
 
@@ -99,10 +99,10 @@ export function AppHeader() {
 
         <div>
           <Group visibleFrom="sm">
-            <SearchControl onClick={searchSpotlight.open} />
+            <SearchControl onClick={openSearchSpotlight} />
           </Group>
           <Group hiddenFrom="sm">
-            <SearchMobileControl onSearch={searchSpotlight.open} />
+            <SearchMobileControl onSearch={openSearchSpotlight} />
           </Group>
         </div>
 

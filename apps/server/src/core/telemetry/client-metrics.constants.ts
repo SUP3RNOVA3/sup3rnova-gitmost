@@ -27,6 +27,12 @@ export const ALLOWED_METRIC_NAMES = new Set<string>([
   // text (no CHECK/enum), so no migration is needed.
   'page_open_body_ms',
   'body_paint_timeout',
+  // #683 — single client-perceived / compute operation metric. The specific
+  // operation is carried in `attr` (a short op name like `comments_open`,
+  // `diagram_mermaid`), which passes the CSS-selector-shaped `attr` charset
+  // check below (lowercase letters + `_`). MUST also be in the client allowlist
+  // + union type (vitals.ts) — a name missing from EITHER side is dropped.
+  'operation_ms',
 ]);
 
 // The only rating values accepted (web-vitals). Anything else -> null.

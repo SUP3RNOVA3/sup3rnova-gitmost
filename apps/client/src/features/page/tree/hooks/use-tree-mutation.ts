@@ -20,6 +20,10 @@ import {
 } from "@/features/page/queries/page-query.ts";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import { getSpaceUrl } from "@/lib/config.ts";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 
 export type UseTreeMutation = {
@@ -116,6 +120,13 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
         }
       }
 
+      // #683 `tree_dragdrop` — mark at the committed drop (this centralizes the
+      // start for every drag-drop source, since all rows route their onDrop
+      // through handleMove). Measured on success only, after the server move
+      // settles and the cache is reconciled; the failure path below rolls back
+      // and returns without measuring, so its mark expires.
+      markOperationStart("tree_dragdrop");
+
       setData(optimistic);
 
       try {
@@ -147,6 +158,11 @@ export function useTreeMutation(spaceId: string): UseTreeMutation {
         payload.parentPageId,
         pageData,
       );
+
+      // #683 `tree_dragdrop` measure — the move persisted and the tree cache is
+      // reconciled (the optimistic re-render already happened above). Success
+      // path only.
+      measureOperation("tree_dragdrop");
 
       // Realtime broadcast is now server-authoritative: the server emits
       // `moveTreeNode` to the space room on PAGE_MOVED. The old client relay

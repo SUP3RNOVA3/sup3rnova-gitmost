@@ -66,6 +66,40 @@ describe('VitalsService.buildRows', () => {
     ]);
   });
 
+  // #683 criterion 6 — the single operation_ms metric is accepted and its op name
+  // (carried in `attr`) survives the CSS-selector-shaped charset check, since op
+  // values are short lowercase-and-underscore identifiers. An unknown name is
+  // still dropped. Guards the server half of the client<->server name lockstep.
+  it('accepts operation_ms with an op attr and still drops unknown names (#683)', () => {
+    const rows = svc.buildRows(
+      {
+        events: [
+          {
+            name: 'operation_ms',
+            value: 123,
+            attr: 'comments_open',
+            route: '/s/:space/p/:slug',
+          },
+          { name: 'operation_ms', value: 45, attr: 'diagram_mermaid' },
+          { name: 'operation_ms', value: 12, attr: 'tree_expand' },
+          { name: 'not_a_real_metric', value: 1 }, // still dropped
+        ],
+      },
+      WS,
+    );
+    expect(rows.map((r) => r.name)).toEqual([
+      'operation_ms',
+      'operation_ms',
+      'operation_ms',
+    ]);
+    // The op name is preserved in `attr` (not stripped by the charset guard).
+    expect(rows.map((r) => r.attr)).toEqual([
+      'comments_open',
+      'diagram_mermaid',
+      'tree_expand',
+    ]);
+  });
+
   it('drops events with a non-numeric or missing value', () => {
     const rows = svc.buildRows(
       {

@@ -58,6 +58,10 @@ import {
   useAiRolesQuery,
 } from "@/features/ai-chat/queries/ai-chat-query.ts";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 import ConversationList from "@/features/ai-chat/components/conversation-list.tsx";
 import ChatThread from "@/features/ai-chat/components/chat-thread.tsx";
 import {
@@ -484,6 +488,21 @@ export default function AiChatWindow() {
     [chats, activeChatId],
   );
   const canExport = !!activeChatId;
+
+  // #683 `ai_chat_open` — mark when the chat window opens (the user toggled it
+  // open; this component is always mounted and only null-renders while closed, so
+  // the windowOpen→true edge is the open action). The matching measure fires at
+  // the first render of the message list — i.e. when the history loader clears
+  // and <ChatThread> mounts (waitingForHistory → false). measureOperation
+  // consumes the mark, so it reports once per open; a window closed before the
+  // thread rendered leaves the mark to expire.
+  useEffect(() => {
+    if (windowOpen) markOperationStart("ai_chat_open");
+  }, [windowOpen]);
+
+  useEffect(() => {
+    if (windowOpen && !waitingForHistory) measureOperation("ai_chat_open");
+  }, [windowOpen, waitingForHistory]);
 
   // The role to display in the header and as the assistant's name. Prefer the
   // persisted role of an existing chat (chat-list JOIN); fall back to the role

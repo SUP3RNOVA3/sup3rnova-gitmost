@@ -15,6 +15,10 @@ import {
   titleEditorAtom,
 } from "@/features/editor/atoms/editor-atoms";
 import { useBodyWriteBlocked } from "@/features/editor/hooks/use-body-write-blocked";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 import { useSpaceAbility } from "@/features/space/permissions/use-space-ability";
 import { useSpaceQuery } from "@/features/space/queries/space-query";
 import {
@@ -53,6 +57,11 @@ export function useHistoryRestore() {
     // user can open it before the socket drops and confirm after — is covered.
     if (refuseIfBlocked()) return;
 
+    // #683 `history_restore` — mark at the confirmed restore; measured once the
+    // main editor has been rebuilt AND repainted (double-rAF), which is what the
+    // user actually waits for. Only runs on the success path (past refuseIfBlocked).
+    markOperationStart("history_restore");
+
     mainEditorTitle
       .chain()
       .clearContent()
@@ -64,6 +73,16 @@ export function useHistoryRestore() {
       .clearContent()
       .setContent(activeHistoryData.content)
       .run();
+
+    // Measure after the rebuilt document paints (render → paint), not just after
+    // setContent returns. best-effort: skip if rAF is unavailable.
+    try {
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => measureOperation("history_restore")),
+      );
+    } catch {
+      measureOperation("history_restore");
+    }
 
     setHistoryModalOpen(false);
     notifications.show({ message: t("Successfully restored") });
