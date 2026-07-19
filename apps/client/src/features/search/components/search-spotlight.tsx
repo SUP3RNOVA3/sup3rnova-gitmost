@@ -42,7 +42,7 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
     return params;
   }, [debouncedSearchQuery, filters]);
 
-  const { data: searchResults, isLoading } = useUnifiedSearch(searchParams);
+  const { data: searchResults, isLoading, isError } = useUnifiedSearch(searchParams);
 
   // #683 `search_full` — the user's search round-trip: a new non-empty debounced
   // query is the "submit" (mark), and the metric is settled when its results
@@ -51,15 +51,18 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
   // (replayed search) and an empty query never marks. measureOperation consumes
   // the mark, so each query reports at most once; the surface-open cost is the
   // separate `spotlight_open` metric, so this is not double-counted.
+  // Success-only: a failed search (isError) does NOT measure — its mark is left
+  // to be overwritten by the next query or to expire silently, so retry-inflated
+  // failures never pollute the p95/p99 the metric exists for.
   useEffect(() => {
     if (debouncedSearchQuery.length > 0) markOperationStart("search_full");
   }, [debouncedSearchQuery]);
 
   useEffect(() => {
-    if (debouncedSearchQuery.length > 0 && !isLoading) {
+    if (debouncedSearchQuery.length > 0 && !isLoading && !isError) {
       measureOperation("search_full");
     }
-  }, [debouncedSearchQuery, isLoading]);
+  }, [debouncedSearchQuery, isLoading, isError]);
 
   const resultItems = (searchResults || []).map((result) => (
     <SearchResultItem
