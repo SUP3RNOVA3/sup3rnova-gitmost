@@ -384,6 +384,37 @@ export class EnvironmentService {
   }
 
   /**
+   * Kill-switch for personal external MCP servers (#686). When enabled (the
+   * default), members may attach their OWN external MCP servers via
+   * `account/mcp-servers`, and the agent's toolset unions the workspace-admin
+   * servers with the calling user's personal ones. Defaults to ENABLED — the
+   * feature ships on. This is a SANCTIONED kill-switch, NOT a rollout fork:
+   * flip MCP_PERSONAL_SERVERS_ENABLED=false to disable the personal CRUD API
+   * (the account endpoints answer 403) and drop personal rows from the agent
+   * union, without a code revert. Kept as an explicit ENABLED flag rather than
+   * a MAX=0 because getMcpPersonalServersMax discards <=0 (so a 0 cap cannot
+   * disable the feature).
+   */
+  isMcpPersonalServersEnabled(): boolean {
+    const enabled = this.configService
+      .get<string>('MCP_PERSONAL_SERVERS_ENABLED', 'true')
+      .toLowerCase();
+    return enabled === 'true';
+  }
+
+  /**
+   * Per-user cap on personal external MCP servers (#686). A member may create
+   * at most this many personal servers in a workspace; the personal-create path
+   * takes a row lock, counts the user's existing rows, and rejects at the cap.
+   * Defaults to 10. A non-integer or <= 0 value falls back to the default (see
+   * getPositiveIntEnv), so the cap can never be disabled to 0 here — use
+   * MCP_PERSONAL_SERVERS_ENABLED=false to turn the feature off entirely.
+   */
+  getMcpPersonalServersMax(): number {
+    return this.getPositiveIntEnv('MCP_PERSONAL_SERVERS_MAX', 10);
+  }
+
+  /**
    * Resumable SSE transport for durable agent runs (#184 phase 1.5). When
    * enabled, a run tees its SSE frames into the in-memory run-stream registry so
    * a late/reloaded tab can attach (replay + live tail) via
