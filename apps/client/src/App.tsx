@@ -50,6 +50,12 @@ const AccountPreferences = lazy(
 const AccountApiKeys = lazy(
   () => import("@/pages/settings/account/account-api-keys.tsx"),
 );
+// #686 — lazy leaf (own chunk): the personal MCP-servers page carries the shared
+// Mantine form/modal + create/test flow, so it is route-split out of the entry
+// bundle like the API-keys page.
+const AccountMcpServers = lazy(
+  () => import("@/pages/settings/account/account-mcp-servers.tsx"),
+);
 const WorkspaceSettings = lazy(
   () => import("@/pages/settings/workspace/workspace-settings"),
 );
@@ -112,6 +118,10 @@ export default function App() {
               element={<AccountPreferences />}
             />
             <Route path={"account/api-keys"} element={<AccountApiKeys />} />
+            <Route
+              path={"account/mcp-servers"}
+              element={<AccountMcpServers />}
+            />
             <Route path={"workspace"} element={<WorkspaceSettings />} />
             <Route path={"ai"} element={<AiSettings />} />
             <Route path={"members"} element={<WorkspaceMembers />} />
