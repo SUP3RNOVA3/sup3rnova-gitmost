@@ -19,7 +19,8 @@ import { getTestDb, destroyTestDb, createWorkspace, createUser } from './db';
  *  - SecretBoxService: a visible reversible marker so we can assert the raw
  *    header value NEVER reaches the view (only `hasHeaders`);
  *  - McpClientsService: a fixed testServer() result (the transport itself is
- *    the admin path's concern, already covered);
+ *    the admin path's concern, already covered) + invalidateUser (#686 phase 3:
+ *    every personal mutation evicts the owner's per-user toolset cache);
  *  - EnvironmentService: only `getMcpPersonalServersMax()` is consumed.
  */
 const secretBoxStub = {
@@ -28,6 +29,8 @@ const secretBoxStub = {
 
 const clientsStub = {
   testServer: jest.fn().mockResolvedValue({ ok: true, tools: ['search'] }),
+  // #686 phase 3: personal CRUD now evicts this user's cache entry.
+  invalidateUser: jest.fn(),
 } as any;
 
 function envStub(max: number) {

@@ -288,6 +288,38 @@ describe('buildMcpToolingBlock', () => {
     // The blank-only entry contributes no section header.
     expect(block).not.toContain('b_*');
   });
+
+  // #686 P4 — aggregate byte budget (MCP_TOOLING_BLOCK_MAX = 16000). A workspace
+  // with many servers (admin + every member's personal) must not blow the model
+  // context window with guidance. Truncation is on a SECTION boundary, admin-first,
+  // with a visible marker.
+  it('truncates on a section boundary with a marker when the aggregate exceeds 16k', () => {
+    // Each guidance is ~2000 chars; 20 servers => ~40k, well over the 16k cap.
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      serverName: `srv${i}`,
+      toolPrefix: `p${i}`,
+      instructions: `${'x'.repeat(2000)}-${i}`,
+    }));
+    const block = buildMcpToolingBlock(many);
+    // Bounded: within the budget (+ a small marker/close-tag slack).
+    expect(block.length).toBeLessThanOrEqual(16000 + 100);
+    // The truncation is VISIBLE.
+    expect(block).toContain('[guidance truncated]');
+    // Admin-first order preserved: the EARLY sections are kept, LATE ones dropped.
+    expect(block).toContain('-0'); // first section's guidance survived
+    expect(block).not.toContain('-19'); // last section was truncated away
+    // A full section boundary — the marker sits before the closing tag.
+    expect(block.indexOf('[guidance truncated]')).toBeLessThan(
+      block.indexOf('</mcp_tooling>'),
+    );
+  });
+
+  it('does NOT truncate (no marker) when the aggregate fits under 16k', () => {
+    const block = buildMcpToolingBlock([
+      { serverName: 'A', toolPrefix: 'a', instructions: 'short guide' },
+    ]);
+    expect(block).not.toContain('[guidance truncated]');
+  });
 });
 
 /**

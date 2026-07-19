@@ -14,7 +14,9 @@ import {
   mcpSseBodyTimeoutMs,
 } from '../../../integrations/ai/ai-streaming-fetch';
 import { SecretBoxService } from '../../../integrations/crypto/secret-box';
+import { incExternalMcpConnectFailure } from '../../../integrations/metrics/metrics.registry';
 import { isUrlAllowed, isIpAllowed } from './ssrf-guard';
+import { CACHE_KEY_SEP } from './mcp.constants';
 // TYPE-ONLY (erased at compile): @docmost/mcp is ESM-only and cannot be a runtime
 // `require()` from this commonjs module (same constraint as docmost-client.loader).
 // The write-class MAP is loaded lazily via the dynamic-import trick below.
@@ -40,11 +42,41 @@ export interface Closable {
   close: () => Promise<void>;
 }
 
+/**
+ * Thrown when a server's `headersEnc` blob is PRESENT but cannot be decrypted
+ * (e.g. after an `APP_SECRET` rotation). Distinct from "no auth headers": the
+ * connect path must NOT fall back to an anonymous, header-less connection (that
+ * would silently drop the server's credentials and could reach an unintended
+ * endpoint) — the server is SKIPPED with a clear `auth-unreadable` outcome. The
+ * server id + workspace id ride along for a non-secret operator log line; the
+ * encrypted blob itself is NEVER carried or logged.
+ */
+export class McpAuthUnreadableError extends Error {
+  constructor(
+    readonly serverId?: string,
+    readonly workspaceId?: string,
+  ) {
+    super('external MCP server auth headers are unreadable');
+    this.name = 'McpAuthUnreadableError';
+  }
+}
+
 /** The minimal shape of an @ai-sdk/mcp client we depend on. */
 interface McpClient {
   tools(): Promise<Record<string, Tool>>;
   close(): Promise<void>;
 }
+
+/**
+ * The fields {@link McpClientsService.connect} needs. `id`/`workspaceId` are
+ * OPTIONAL (the admin "test" endpoint connects a not-yet-persisted config) — they
+ * only ride along so an undecryptable-headers skip (#686) can log WHICH server
+ * without ever touching the encrypted blob.
+ */
+type ConnectTarget = Pick<AiMcpServer, 'transport' | 'url' | 'headersEnc'> & {
+  id?: string;
+  workspaceId?: string;
+};
 
 /** A server we connected to (or tried to) for one toolset build. */
 interface ServerOutcome {
@@ -155,7 +187,11 @@ interface CacheEntry {
   evicted: boolean;
   /** Set once the clients have actually been closed (guards double-close). */
   closed: boolean;
-  timer: NodeJS.Timeout;
+  /**
+   * The TTL expiry timer. Undefined for a ONE-SHOT entry (#686): a one-shot is
+   * never cached, so it has no TTL — it is pre-`evicted` and closes on release.
+   */
+  timer?: NodeJS.Timeout;
 }
 
 /**
@@ -174,10 +210,15 @@ interface CacheEntry {
 export class McpClientsService {
   private readonly logger = new Logger(McpClientsService.name);
   /**
-   * In-flight-deduplicated, per-workspace toolset builds. We store the BUILD
-   * PROMISE (not the resolved entry) so two concurrent turns for the same
-   * workspace await the SAME build instead of each connecting to every server
-   * and leaking the loser's live clients (see getOrBuildEntry).
+   * In-flight-deduplicated toolset builds, keyed PER-USER (#686):
+   * `${workspaceId}${CACHE_KEY_SEP}${userId}`. The toolset is ALWAYS per-user
+   * (admin servers ∪ that user's personal servers), so no entry is ever shared
+   * across users — a NUL separator makes `${workspaceId}${CACHE_KEY_SEP}` an
+   * unambiguous prefix for the admin-CRUD fan-out that evicts every user's entry
+   * in one workspace at once (see {@link invalidate}). We store the BUILD PROMISE
+   * (not the resolved entry) so two concurrent turns for the same user await the
+   * SAME build instead of each connecting to every server and leaking the loser's
+   * live clients (see acquireEntry).
    */
   private readonly cache = new Map<string, Promise<CacheEntry>>();
   /**
@@ -266,12 +307,16 @@ export class McpClientsService {
    * remains and the entry has been evicted). The caller MUST close every handle
    * in the streamText onFinish/onError/onAbort lifecycle.
    */
-  async toolsFor(workspaceId: string): Promise<ExternalToolset> {
-    const entry = await this.getOrBuildEntry(workspaceId);
-    // Lease the SHARED awaited entry for this turn. Because concurrent callers
-    // await the same in-flight build, every lease here increments the refCount
-    // of the one entry that actually owns the live clients (no leaked loser).
-    entry.refCount += 1;
+  async toolsFor(
+    workspaceId: string,
+    userId: string,
+  ): Promise<ExternalToolset> {
+    // #686: the toolset is ALWAYS per-user (admin ∪ this user's personal servers)
+    // — `userId` is REQUIRED. acquireEntry returns an ALREADY-LEASED live entry
+    // (refCount already incremented synchronously with its liveness check, so a
+    // TTL timer / invalidation cannot evict-then-close it in the gap between the
+    // check and the lease). We therefore do NOT increment refCount again here.
+    const entry = await this.acquireEntry(workspaceId, userId);
     let released = false;
     const release: Closable = {
       close: async () => {
@@ -321,17 +366,79 @@ export class McpClientsService {
     };
   }
 
-  /** Invalidate the cached toolset for a workspace (call on any CRUD change). */
+  /** The per-user cache key: `${workspaceId}${CACHE_KEY_SEP}${userId}`. */
+  private userKey(workspaceId: string, userId: string): string {
+    return `${workspaceId}${CACHE_KEY_SEP}${userId}`;
+  }
+
+  /**
+   * Admin-CRUD invalidation (#686): an admin server appears in EVERY user's
+   * toolset, so a change to it must evict every per-user entry for the workspace.
+   * PREFIX FAN-OUT over `${workspaceId}${CACHE_KEY_SEP}` — the NUL separator can
+   * never appear in a workspace/user UUID, so the prefix matches exactly this
+   * workspace's per-user keys and nothing else.
+   */
   invalidate(workspaceId: string): void {
-    const pending = this.cache.get(workspaceId);
+    const prefix = `${workspaceId}${CACHE_KEY_SEP}`;
+    // Snapshot the keys first: evictKey mutates the map while we iterate.
+    for (const key of [...this.cache.keys()]) {
+      if (key.startsWith(prefix)) this.evictKey(key);
+    }
+  }
+
+  /**
+   * Single-user invalidation (#686): evict ONLY this user's entry. Called by the
+   * personal-server CRUD path and by the user-delete flow. Critically, this is
+   * also what the TTL timer routes through (via {@link expireEntry}) so ONE
+   * user's 60s expiry does NOT fan-out-evict every other user's toolset (which
+   * would trigger a connect storm across the whole workspace on each expiry).
+   */
+  invalidateUser(workspaceId: string, userId: string): void {
+    this.evictKey(this.userKey(workspaceId, userId));
+  }
+
+  /**
+   * Drop one cache key and evict its resolved entry. Identity-aware: only the
+   * map slot that STILL holds the promise we read is removed, so a concurrent
+   * rebuild that already replaced it is never clobbered. A rejected build owns
+   * no clients, so there is nothing to close on that branch.
+   */
+  private evictKey(key: string): void {
+    const pending = this.cache.get(key);
     if (!pending) return;
-    this.cache.delete(workspaceId);
-    // The map holds a build PROMISE; evict once it resolves (a rejected build
-    // owns no clients, so there is nothing to close).
+    if (this.cache.get(key) === pending) this.cache.delete(key);
     pending.then(
       (entry) => this.evict(entry),
       () => undefined,
     );
+  }
+
+  /**
+   * The TTL timer's expiry handler (#686). It is the per-user single-key eviction
+   * (never the workspace fan-out) AND it is IDENTITY-AWARE: it evicts ONLY when
+   * the map still points at THIS entry's promise. Without the identity check a
+   * stale timer for an old entry (E1) could fire just after a rebuild installed a
+   * fresh entry (E2) at the same key and evict E2 — closing a toolset a live turn
+   * is executing against. The old entry is closed regardless (idempotent) so its
+   * transports never leak.
+   */
+  private expireEntry(key: string, entry: CacheEntry): void {
+    const pending = this.cache.get(key);
+    if (!pending) {
+      // Key already gone (evicted by CRUD / getOrBuild expiry). Close THIS entry.
+      this.evict(entry);
+      return;
+    }
+    pending.then((current) => {
+      // Only remove the map slot when it still resolves to THIS entry (not a
+      // newer rebuild) AND still holds the SAME promise we read.
+      if (current === entry && this.cache.get(key) === pending) {
+        this.cache.delete(key);
+      }
+      // Always close THIS (now-expired) entry; evict() is idempotent and closes
+      // only when nothing is leasing it.
+      this.evict(entry);
+    }, () => this.evict(entry));
   }
 
   /**
@@ -360,43 +467,116 @@ export class McpClientsService {
   // --- internals ---
 
   /**
-   * Return the per-workspace cache entry, building it at most ONCE for any set
-   * of concurrent callers. We store the build PROMISE in the map: the first
-   * caller installs it, concurrent callers await the same one, and refcount/
-   * lease then operate on the single shared entry — so no second build's live
-   * clients leak unclosed.
+   * Return a LEASED, guaranteed-live cache entry for this user, building it at
+   * most ONCE for any set of concurrent callers. The returned entry already has
+   * `refCount` incremented for the caller's lease — the increment happens in the
+   * SAME synchronous block as the liveness check (no await between), so a TTL
+   * timer / invalidation cannot evict-then-close the entry in the gap between
+   * "it's live" and "I hold a lease". The caller (toolsFor) builds the release
+   * around it and must NOT increment again.
    */
-  private async getOrBuildEntry(workspaceId: string): Promise<CacheEntry> {
-    const pending = this.cache.get(workspaceId);
+  private async acquireEntry(
+    workspaceId: string,
+    userId: string,
+  ): Promise<CacheEntry> {
+    const key = this.userKey(workspaceId, userId);
+    const pending = this.cache.get(key);
     if (pending) {
       const entry = await pending;
-      if (entry.expiresAt > Date.now() && !entry.evicted) {
-        return entry;
+      // TOCTOU fix (#686): liveness check + refCount increment in ONE synchronous
+      // block. Nothing runs between them (single-threaded JS, no await), so the
+      // entry cannot be evicted-and-closed underneath us. Once refCount > 0, a
+      // racing evict() sees a non-zero lease count and defers the close to our
+      // release() — so leasing a live entry can never hand back closed clients.
+      if (
+        entry.expiresAt > Date.now() &&
+        !entry.evicted &&
+        !entry.closed
+      ) {
+        entry.refCount += 1;
+        // Defensive re-check: if an eviction had ALREADY closed it before our
+        // increment (it could only have run at the await above, but assert the
+        // invariant anyway), undo the lease and fall through to a fresh build.
+        if (!entry.closed) return entry;
+        entry.refCount -= 1;
       }
-      // Expired (or evicted under us): drop this promise and rebuild fresh.
-      // Only delete if the map still points at THIS promise, so we don't
-      // clobber a fresh build another caller already installed.
-      if (this.cache.get(workspaceId) === pending) {
-        this.cache.delete(workspaceId);
+      // Expired / evicted / closed: drop this promise (identity-aware) + evict the
+      // stale entry, then rebuild fresh.
+      if (this.cache.get(key) === pending) {
+        this.cache.delete(key);
         this.evict(entry);
       }
     }
+    return this.buildAndLease(key, workspaceId, userId);
+  }
 
+  /**
+   * Build a fresh entry, cache it, and return it LEASED. Handles the
+   * evict-pending-build hole (#686): an invalidation (or the user-delete flow)
+   * can fire WHILE we await the build and — because the just-resolved entry has
+   * refCount 0 — evict AND close its clients before we ever lease it. Leasing
+   * that corpse would hand the turn dead clients (ARCH INVARIANT #10). When we
+   * detect the cached entry was evicted/closed during the build, we fall back to
+   * a ONE-SHOT entry: built fresh, NOT put in the Map, NO TTL timer, pre-marked
+   * `evicted` so the shared release path closes it exactly once when the turn
+   * releases its lease (inc → 1, release → 0 ⇒ close). It is never shared, so
+   * refCount only ever goes 0 → 1 → 0.
+   */
+  private async buildAndLease(
+    key: string,
+    workspaceId: string,
+    userId: string,
+  ): Promise<CacheEntry> {
     // Install the in-flight build promise BEFORE awaiting, so concurrent callers
     // reuse it. On rejection, remove it so a later call retries.
-    const build = this.buildEntry(workspaceId).catch((err: unknown) => {
-      if (this.cache.get(workspaceId) === build) {
-        this.cache.delete(workspaceId);
+    const build = this.buildEntry(workspaceId, userId).catch((err: unknown) => {
+      if (this.cache.get(key) === build) {
+        this.cache.delete(key);
       }
       throw err;
     });
-    this.cache.set(workspaceId, build);
-    return build;
+    this.cache.set(key, build);
+    const entry = await build;
+    if (entry.evicted || entry.closed) {
+      // The cached build was invalidated (and, at refCount 0, closed) while we
+      // awaited it. Serve a one-shot uncached toolset for THIS turn instead.
+      return this.buildOneShotLeased(workspaceId, userId);
+    }
+    // Lease synchronously after the await (no gap to an evict-then-close).
+    entry.refCount += 1;
+    if (entry.closed) {
+      // Defensive: closed between resolve and our lease — release + one-shot.
+      entry.refCount -= 1;
+      return this.buildOneShotLeased(workspaceId, userId);
+    }
+    return entry;
+  }
+
+  /**
+   * Build a ONE-SHOT (uncached, pre-evicted, timer-less) entry and lease it. Used
+   * only for the evict-pending-build hole (see {@link buildAndLease}).
+   */
+  private async buildOneShotLeased(
+    workspaceId: string,
+    userId: string,
+  ): Promise<CacheEntry> {
+    const oneShot = await this.buildEntry(workspaceId, userId, {
+      oneShot: true,
+    });
+    // Lease it (inc → 1). release() closes it (refCount → 0, evicted true).
+    oneShot.refCount += 1;
+    return oneShot;
   }
 
   /** Connect to all enabled servers and assemble one cache entry. */
-  private async buildEntry(workspaceId: string): Promise<CacheEntry> {
-    const servers = await this.repo.listEnabled(workspaceId);
+  private async buildEntry(
+    workspaceId: string,
+    userId: string,
+    opts?: { oneShot?: boolean },
+  ): Promise<CacheEntry> {
+    // #686: the agent-union read — admin servers ∪ THIS user's personal servers,
+    // ADMIN-FIRST (so admin keeps the canonical namespace prefix on a name clash).
+    const servers = await this.repo.listEnabledForAgent(workspaceId, userId);
     const tools: Record<string, Tool> = {};
     const clients: McpClient[] = [];
     const outcomes: ServerOutcome[] = [];
@@ -462,6 +642,24 @@ export class McpClientsService {
         // leaks (compounding every 60s cache rebuild during a flaky-server outage).
         if (client) {
           void client.close().catch(() => undefined);
+        }
+        // Observability (#686): every enabled server that fails to connect (or
+        // whose auth is unreadable) increments the connect-failure metric, by the
+        // server's OWNERSHIP LEVEL so an operator sees whether admin or personal
+        // external tools have gone dark. Never a per-server label (unbounded).
+        incExternalMcpConnectFailure(server.userId ? 'personal' : 'admin');
+        // Undecryptable auth headers (#686): the blob is PRESENT but unreadable
+        // (e.g. APP_SECRET rotated). We SKIP the server with a clear
+        // `auth-unreadable` outcome rather than connecting anonymously — a
+        // header-less connect would silently drop the credentials. The WARN
+        // carries the server + workspace ids (never the blob) so an admin can
+        // repair it by re-saving the headers.
+        if (err instanceof McpAuthUnreadableError) {
+          this.logger.warn(
+            `External MCP server "${server.name}" (server ${server.id}, workspace ${server.workspaceId}) ` +
+              `auth headers are unreadable (APP_SECRET rotated?) — skipping; re-save its headers to repair`,
+          );
+          return { ok: false, reason: 'auth-unreadable' };
         }
         // Log a short warning (never the URL/headers) so ops can see degradation,
         // and record the outcome so the UI can show "tool X unavailable".
@@ -532,12 +730,24 @@ export class McpClientsService {
       toolMeta,
       expiresAt: Date.now() + CACHE_TTL_MS,
       refCount: 0,
-      evicted: false,
+      // A one-shot entry is pre-`evicted` so the shared release path closes it
+      // exactly once when the leasing turn releases it (it is never cached).
+      evicted: opts?.oneShot === true,
       closed: false,
-      timer: setTimeout(() => this.invalidate(workspaceId), CACHE_TTL_MS),
     };
-    // Do not keep the process alive just for the cache timer.
-    entry.timer.unref?.();
+    // A one-shot entry has NO TTL timer (it is never cached). A cached entry's
+    // timer routes through invalidateUser via the identity-aware expireEntry, so
+    // ONE user's 60s expiry evicts ONLY that user's key — never the workspace
+    // fan-out, which would connect-storm every other user on each expiry.
+    if (!opts?.oneShot) {
+      const key = this.userKey(workspaceId, userId);
+      entry.timer = setTimeout(
+        () => this.expireEntry(key, entry),
+        CACHE_TTL_MS,
+      );
+      // Do not keep the process alive just for the cache timer.
+      entry.timer.unref?.();
+    }
     return entry;
   }
 
@@ -594,9 +804,7 @@ export class McpClientsService {
    * re-validates the resolved IP on every request AND pins the socket to a
    * validated address (DNS-rebinding defense, no unchecked second resolution).
    */
-  private async connect(
-    server: Pick<AiMcpServer, 'transport' | 'url' | 'headersEnc'>,
-  ): Promise<McpClient> {
+  private async connect(server: ConnectTarget): Promise<McpClient> {
     // Pre-connect SSRF check (re-resolves DNS each time — not just at save).
     const check = await isUrlAllowed(server.url);
     if (!check.ok) {
@@ -610,7 +818,14 @@ export class McpClientsService {
       transport: {
         type: transportType,
         url: server.url,
-        headers: this.decryptHeaders(server.headersEnc),
+        // #686: throws McpAuthUnreadableError when headersEnc is present but
+        // undecryptable — the caller (buildEntry) skips the server rather than
+        // connecting anonymously.
+        headers: this.decryptHeaders(
+          server.headersEnc,
+          server.id,
+          server.workspaceId,
+        ),
         // SSRF: reject any redirect response (no redirect-based bypass).
         redirect: 'error',
         // Defense in depth: re-validate the actual request host on EVERY fetch
@@ -631,7 +846,7 @@ export class McpClientsService {
    * is NOT bounded internally, and — exactly like @ai-sdk/mcp's tool calls
    * (see wrapToolWithCallTimeout) — its promise does NOT settle on abort. So a
    * transient network blip mid-handshake can make connect hang FOREVER. Because
-   * getOrBuildEntry caches the build PROMISE, a never-settling connect would then
+   * buildAndLease caches the build PROMISE, a never-settling connect would then
    * wedge EVERY later turn for the workspace (each awaits the same pending build,
    * step_count stuck at 0, run row leaks 'running', chat 409s forever). Bounding
    * connect here guarantees buildEntry always gets a client OR a rejection within
@@ -641,7 +856,7 @@ export class McpClientsService {
    * the orphaned client so its transport/socket is not leaked.
    */
   private connectWithTimeout(
-    server: Pick<AiMcpServer, 'transport' | 'url' | 'headersEnc'>,
+    server: ConnectTarget,
     ms: number,
   ): Promise<McpClient> {
     return new Promise<McpClient>((resolve, reject) => {
@@ -675,12 +890,21 @@ export class McpClientsService {
   }
 
   /**
-   * Decrypt the stored auth headers. Returns undefined when none are set. The
-   * plaintext headers live only in this returned object and are passed straight
-   * to the transport — never logged.
+   * Decrypt the stored auth headers. Returns undefined when none are set (a
+   * legitimately anonymous server). The plaintext headers live only in this
+   * returned object and are passed straight to the transport — never logged.
+   *
+   * #686: when the blob is PRESENT but undecryptable (e.g. APP_SECRET rotated)
+   * this THROWS {@link McpAuthUnreadableError} rather than returning undefined —
+   * the connect path must NOT fall back to an anonymous, header-less connection
+   * (that would silently drop the server's credentials). buildEntry catches it
+   * and skips the server with a clear `auth-unreadable` outcome. The blob is
+   * never logged; the server/workspace ids ride on the error for a WARN there.
    */
   private decryptHeaders(
     headersEnc: string | null,
+    serverId?: string,
+    workspaceId?: string,
   ): Record<string, string> | undefined {
     if (!headersEnc) return undefined;
     try {
@@ -692,11 +916,10 @@ export class McpClientsService {
       }
       return Object.keys(headers).length > 0 ? headers : undefined;
     } catch {
-      // Decryption/parse failure (e.g. APP_SECRET rotated). Connect WITHOUT the
-      // (now unreadable) auth headers will likely 401 and be skipped — never
-      // crash and never log the blob.
-      this.logger.warn('Failed to decrypt MCP server auth headers');
-      return undefined;
+      // Decryption/parse failure of a PRESENT blob. Do NOT connect anonymously —
+      // surface a distinct error so the caller skips the server. Never log the
+      // blob; the WARN (with ids) is emitted at the skip site in buildEntry.
+      throw new McpAuthUnreadableError(serverId, workspaceId);
     }
   }
 
@@ -842,11 +1065,30 @@ export class McpClientsService {
    * RUN via the returned lease (closed at turn-end), independent of the shared
    * cache entry (whose TTL rebuild heals future turns). On a failure the fresh
    * client is closed so its socket never leaks.
+   *
+   * RECOVERY RE-READ (#686): before reopening a connection we re-read the row via
+   * the scope-agnostic {@link AiMcpServerRepo.findByIdRaw}. If the row is now
+   * MISSING, DISABLED, or was EDITED (its `updatedAt` moved) since this toolset
+   * was cached, we REFUSE to reconnect (no retry) — a run must never reopen a
+   * connection with stale decrypted config, most critically a personal server's
+   * now-changed auth headers. The cache TTL rebuild heals future turns.
    */
   private async reconnectServer(
     server: AiMcpServer,
     capMs: number,
   ): Promise<{ state: RecoveredServerState; lease: Closable }> {
+    const fresh = await this.repo.findByIdRaw(server.id);
+    if (
+      !fresh ||
+      fresh.enabled === false ||
+      new Date(fresh.updatedAt as unknown as string).getTime() !==
+        new Date(server.updatedAt as unknown as string).getTime()
+    ) {
+      throw new Error(
+        `external MCP server "${server.name}" changed (removed, disabled, or edited) ` +
+          `since the toolset was built — not reconnecting with stale config`,
+      );
+    }
     const client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
     let tools: Record<string, Tool>;
     try {

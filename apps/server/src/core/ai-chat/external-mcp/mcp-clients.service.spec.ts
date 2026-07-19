@@ -1,14 +1,18 @@
-import { McpClientsService } from './mcp-clients.service';
+import {
+  McpClientsService,
+  McpAuthUnreadableError,
+} from './mcp-clients.service';
 
 /**
  * Unit tests for the two security-critical surfaces of McpClientsService that the
  * sibling specs (ssrf-guard / validate-resolved-addresses / lease) do NOT cover:
  *
- *  1. `decryptHeaders` (private) — FAIL-OPEN behavior. A decrypt/parse failure
- *     (e.g. APP_SECRET rotated, tampered blob) must NEVER throw and must NEVER
- *     log the blob: it returns `undefined` so the connect proceeds WITHOUT the
- *     now-unreadable auth headers (which then 401s and the server is skipped),
- *     rather than crashing the whole turn.
+ *  1. `decryptHeaders` (private) — FAIL-CLOSED behavior (#686). A decrypt/parse
+ *     failure of a PRESENT blob (e.g. APP_SECRET rotated, tampered blob) must
+ *     NEVER return undefined (which would connect the server ANONYMOUSLY) and
+ *     must NEVER log the blob: it throws McpAuthUnreadableError so buildEntry
+ *     skips the server with a clear `auth-unreadable` outcome. A truly ABSENT
+ *     blob still returns undefined (a legitimately anonymous server).
  *
  *  2. `this.guardedFetch` (private, bound to the SSRF-pinned dispatcher) — the
  *     per-request DNS-rebinding guard. A blocked host (private/loopback/metadata
@@ -69,38 +73,30 @@ describe('McpClientsService.decryptHeaders', () => {
     expect(callDecrypt(service, 'cipher')).toBeUndefined();
   });
 
-  it('FAILS OPEN: a decrypt error returns undefined instead of throwing', () => {
+  // #686: fail-CLOSED. A PRESENT-but-undecryptable blob (e.g. APP_SECRET rotated)
+  // must NOT return undefined (which would connect the server ANONYMOUSLY, silently
+  // dropping its credentials). It throws McpAuthUnreadableError so buildEntry skips
+  // the server with a clear `auth-unreadable` outcome. The blob is never in the
+  // error, and decryptHeaders itself no longer warns (the WARN, carrying the
+  // server/workspace ids, moved to the skip site in buildEntry).
+  it('FAILS CLOSED: a decrypt error throws McpAuthUnreadableError (no anonymous connect)', () => {
     const { service } = buildService(() => {
       throw new Error('Failed to decrypt secret — APP_SECRET may have changed');
     });
-    const warnSpy = jest
-      .spyOn(
-        (service as unknown as { logger: { warn: (...a: unknown[]) => void } })
-          .logger,
-        'warn',
-      )
-      .mockImplementation(() => undefined);
-
-    let result: unknown;
-    expect(() => {
-      result = callDecrypt(service, 'tampered-blob');
-    }).not.toThrow();
-    expect(result).toBeUndefined();
-    // It warns (so ops sees degradation) but never logs the blob itself.
-    expect(warnSpy).toHaveBeenCalledTimes(1);
-    expect(String(warnSpy.mock.calls[0]?.[0])).not.toContain('tampered-blob');
+    let thrown: unknown;
+    try {
+      callDecrypt(service, 'tampered-blob');
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(McpAuthUnreadableError);
+    // The blob is never carried on the error.
+    expect(String((thrown as Error).message)).not.toContain('tampered-blob');
   });
 
-  it('FAILS OPEN: malformed JSON (decrypts to non-JSON) returns undefined', () => {
+  it('FAILS CLOSED: malformed JSON (decrypts to non-JSON) throws McpAuthUnreadableError', () => {
     const { service } = buildService(() => 'not-json{');
-    jest
-      .spyOn(
-        (service as unknown as { logger: { warn: (...a: unknown[]) => void } })
-          .logger,
-        'warn',
-      )
-      .mockImplementation(() => undefined);
-    expect(callDecrypt(service, 'cipher')).toBeUndefined();
+    expect(() => callDecrypt(service, 'cipher')).toThrow(McpAuthUnreadableError);
   });
 });
 
