@@ -6,6 +6,7 @@ import { Title } from "@mantine/core";
 import { DecorationSet } from "@tiptap/pm/view";
 import historyClasses from "./css/history.module.css";
 import { computeHistoryDiff } from "./history-diff.ts";
+import { isVitalsActive, reportOperation } from "@/lib/telemetry/vitals";
 import { useAtom } from "jotai";
 import {
   diffCountsAtom,
@@ -34,6 +35,12 @@ export function HistoryEditor({
   useEffect(() => {
     if (!editor || !content) return;
 
+    // #683 `history_diff` (Pattern B) — time the diff compute + content render.
+    // This is pure client CPU (the ProseMirror change-set diff), the "до/после"
+    // signal for #343/#342. Local performance.now() (not a shared mark) so a
+    // second diff modal can never collide; sub-threshold diffs are dropped.
+    const diffStart = isVitalsActive() ? performance.now() : 0;
+
     // Pure diff computation lives in history-diff.ts; the component keeps the
     // editor side-effects (rendering the new content + wiring decorations).
     const { decorationSet, added, deleted, total, failed } = computeHistoryDiff(
@@ -43,6 +50,8 @@ export function HistoryEditor({
     );
 
     editor.commands.setContent(content);
+
+    if (diffStart) reportOperation("history_diff", performance.now() - diffStart);
 
     // @ts-ignore — jotai setter typing in this build resolves as non-callable
     // (pre-existing); the payload matches DiffCounts.

@@ -88,7 +88,7 @@ import {
 import { FIVE_MINUTES } from "@/lib/constants.ts";
 import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { jwtDecode } from "jwt-decode";
-import { searchSpotlight } from "@/features/search/constants.ts";
+import { openSearchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { usePageContentCache } from "./hooks/use-page-content-cache";
 import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
@@ -130,6 +130,7 @@ import {
   armBodyPaint,
   disarmBodyPaint,
   isVitalsActive,
+  markOperationStart,
   notePageBodyPaint,
   reportEditorTx,
 } from "@/lib/telemetry/vitals";
@@ -565,7 +566,7 @@ export default function PageEditor({
               return true;
             }
             if (platformModifierKey(event) && event.code === "KeyK") {
-              searchSpotlight.open();
+              openSearchSpotlight();
               return true;
             }
             if (["ArrowUp", "ArrowDown", "Enter"].includes(event.key)) {
@@ -712,6 +713,12 @@ export default function PageEditor({
       return;
     }
 
+    // #683 `comments_open` — clicking an inline comment mark also opens the
+    // aside (bypassing use-toggle-aside), so mark the op here too or this heavy
+    // open path (the #340 300+-comment scenario is usually reached this way)
+    // would be systematically under-sampled. Marking is idempotent: the measure
+    // in comment-list-with-tabs consumes it, and a no-op if no mark exists.
+    markOperationStart("comments_open");
     setActiveCommentId(commentId);
     setAsideState({ tab: "comments", isAsideOpen: true });
 

@@ -1,5 +1,9 @@
 import { useRef } from "react";
 import { Link, useParams } from "react-router-dom";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 import { useAtom, useSetAtom } from "jotai";
 import { useTranslation } from "react-i18next";
 import { ActionIcon, rem, Tooltip } from "@mantine/core";
@@ -130,6 +134,12 @@ export function SpaceTreeRow({
 
   const handleLoadChildren = async () => {
     if (!node.hasChildren) return;
+    // #683 `tree_expand` — mark at the expand action; measured once the children
+    // are appended and rendered (double-rAF render → paint). A cache-hit expand
+    // is ~0ms and is dropped by the report threshold; a failed fetch measures
+    // nothing (the mark expires). Includes network on a cold expand — honest, the
+    // user waits for children to appear.
+    markOperationStart("tree_expand");
     try {
       const childrenTree = await fetchAllAncestorChildren({
         pageId: node.id,
@@ -138,6 +148,13 @@ export function SpaceTreeRow({
       setTreeData((prev) =>
         treeModel.appendChildren(prev, node.id, childrenTree),
       );
+      try {
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => measureOperation("tree_expand")),
+        );
+      } catch {
+        measureOperation("tree_expand");
+      }
     } catch (error) {
       console.error("Failed to fetch children:", error);
     }

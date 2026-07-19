@@ -33,6 +33,10 @@ import {
 } from "@/features/editor/components/excalidraw/excalidraw-raster.ts";
 import { isExcalidrawRasterEnabled } from "@/lib/config.ts";
 import { modals } from "@mantine/modals";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 
 /**
  * Read a Blob's bytes as a `data:<mime>;base64,<b64>` data-URI (#632, Part A).
@@ -80,6 +84,12 @@ export default function ExcalidrawView(props: NodeViewProps) {
     if (!editor.isEditable) {
       return;
     }
+    // #683 `diagram_excalidraw` — mark at the double-click that opens the editor;
+    // measured when the lazily-loaded Excalidraw component mounts and hands back
+    // its imperative API (render readiness). The node-view itself is a light
+    // placeholder card until this open, so this captures the heavy chunk load +
+    // editor mount the user actually waits for.
+    markOperationStart("diagram_excalidraw");
     isDirtyRef.current = false;
     isInitialLoadRef.current = true;
     open();
@@ -266,7 +276,12 @@ export default function ExcalidrawView(props: NodeViewProps) {
         <div style={{ height: "90vh" }}>
           <Suspense fallback={null}>
             <ExcalidrawComponent
-              excalidrawAPI={(api) => setExcalidrawAPI(api)}
+              excalidrawAPI={(api) => {
+                setExcalidrawAPI(api);
+                // #683 — the editor is mounted and ready; report the open→ready
+                // latency (success path; measureOperation consumes the mark).
+                measureOperation("diagram_excalidraw");
+              }}
               onChange={(elements, _appState, files) => {
                 const fingerprint = `${elements.length}:${elements.reduce((s, e) => s + (e.version || 0), 0)}:${Object.keys(files).length}`;
                 if (isInitialLoadRef.current) {

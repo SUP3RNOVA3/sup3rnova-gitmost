@@ -219,6 +219,122 @@ describe("page_open_body_ms latch (#639)", () => {
   });
 });
 
+describe("operation_ms helpers (#683)", () => {
+  // A faithful in-memory performance-mark store so the mark→measure→consume flow
+  // is exercised for real (not just the pure reporter). `fakeNow` is the mocked
+  // clock: markOperationStart stamps it; measureOperation reads it back.
+  function stubMarkStore(): { setNow: (n: number) => void } {
+    let store: Record<string, number> = {};
+    let fakeNow = 0;
+    vi.spyOn(performance, "mark").mockImplementation((name: any) => {
+      store[String(name)] = fakeNow;
+      return undefined as any;
+    });
+    vi.spyOn(performance, "clearMarks").mockImplementation((name?: any) => {
+      if (name === undefined) store = {};
+      else delete store[String(name)];
+    });
+    vi.spyOn(performance, "getEntriesByName").mockImplementation((name: any) =>
+      String(name) in store
+        ? ([{ startTime: store[String(name)] }] as any)
+        : ([] as any),
+    );
+    vi.spyOn(performance, "now").mockImplementation(() => fakeNow);
+    return {
+      setNow: (n: number) => {
+        fakeNow = n;
+      },
+    };
+  }
+
+  // AC1/AC6 — reportOperation emits operation_ms with the op as `attr`.
+  it("reports operation_ms with the op in attr (Pattern B direct report)", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    stubMarkStore();
+    v.reportOperation("diagram_mermaid", 123);
+
+    const events = names(v.__vitalsTestHooks.drainBuffer(), "operation_ms");
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toBe(123);
+    expect(events[0].attr).toBe("diagram_mermaid");
+  });
+
+  // Edge case — >8ms report threshold (as editor_tx): fast ops don't flood.
+  it("drops sub-threshold (<=8ms) samples and keeps faster-than-a-frame out", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    stubMarkStore();
+    v.reportOperation("tree_expand", 8); // exactly the threshold — dropped
+    v.reportOperation("tree_expand", 3); // cache-hit ~0ms — dropped
+    v.reportOperation("tree_expand", 9); // just above — kept
+
+    const events = names(v.__vitalsTestHooks.drainBuffer(), "operation_ms");
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toBe(9);
+  });
+
+  // Pattern A — mark then measure reports the elapsed, and CONSUMES the mark so a
+  // second settle for the same op is a no-op (expiry/no double-count).
+  it("mark→measure reports elapsed once and consumes the mark", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    const clock = stubMarkStore();
+    clock.setNow(1000);
+    v.markOperationStart("comment_resolve");
+    clock.setNow(1250);
+    v.measureOperation("comment_resolve"); // 250ms
+    v.measureOperation("comment_resolve"); // mark consumed — no-op
+
+    const events = names(v.__vitalsTestHooks.drainBuffer(), "operation_ms");
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toBe(250);
+    expect(events[0].attr).toBe("comment_resolve");
+  });
+
+  // Edge case — a replayed start overwrites the prior mark (last-start-wins), so
+  // the measure reflects the most recent interaction, not the abandoned one.
+  it("a new markOperationStart overwrites the prior mark", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    const clock = stubMarkStore();
+    clock.setNow(0);
+    v.markOperationStart("spotlight_open"); // abandoned start
+    clock.setNow(500);
+    v.markOperationStart("spotlight_open"); // replay — overwrites
+    clock.setNow(520);
+    v.measureOperation("spotlight_open");
+
+    const events = names(v.__vitalsTestHooks.drainBuffer(), "operation_ms");
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toBe(20); // 520 - 500, not 520 - 0
+  });
+
+  // Success-only / cancelled-interaction — measureOperation with no live mark (the
+  // interaction was cancelled, or measure was skipped on the error path) reports
+  // nothing; the mark simply expires.
+  it("measureOperation with no mark reports nothing (cancelled / error path)", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    stubMarkStore();
+    v.measureOperation("comment_apply");
+    expect(
+      names(v.__vitalsTestHooks.drainBuffer(), "operation_ms"),
+    ).toHaveLength(0);
+  });
+
+  // AC6 (gate half) — telemetry off ⇒ zero collection: neither mark, measure, nor
+  // a direct report buffers anything.
+  it("is a no-op end-to-end when telemetry is disabled", async () => {
+    const v = await loadVitals({
+      pathname: "/s/eng/p/x",
+      telemetryEnabled: false,
+    });
+    const clock = stubMarkStore();
+    clock.setNow(0);
+    v.markOperationStart("history_diff");
+    clock.setNow(9999);
+    v.measureOperation("history_diff");
+    v.reportOperation("history_diff", 500);
+    expect(v.__vitalsTestHooks.drainBuffer()).toHaveLength(0);
+  });
+});
+
 describe("forced sampling override (#639 §4)", () => {
   it("forces sampling ON even if an earlier tab-session decided not-sampled", async () => {
     // A prior session persisted a "not sampled" decision.

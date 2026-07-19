@@ -102,6 +102,8 @@ import FootnoteReferenceView from "@/features/editor/components/footnote/footnot
 import FootnotesListView from "@/features/editor/components/footnote/footnotes-list-view.tsx";
 import FootnoteDefinitionView from "@/features/editor/components/footnote/footnote-definition-view.tsx";
 import PageEmbedView from "@/features/editor/components/page-embed/page-embed-view.tsx";
+import { reportOperation } from "@/lib/telemetry/vitals";
+import { isClientTelemetryEnabled } from "@/lib/config";
 import { common, createLowlight } from "lowlight";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import powershell from "highlight.js/lib/languages/powershell";
@@ -356,6 +358,21 @@ export const mainExtensions = [
     HTMLAttributes: {
       spellcheck: false,
     },
+    // #683 `code_highlight` — report a REAL syntax-highlight recompute (init +
+    // guarded recompute inside the plugin), never a plain keystroke (AC5).
+    // reportOperation is threshold-gated + isVitalsActive()-gated internally; the
+    // callback is wired ONLY when the operator flag is on, so a telemetry-off
+    // build passes no callback and the plugin skips timing entirely (zero cost).
+    //
+    // CADENCE (for the operator reading the metric): this emits ONE sample per
+    // recompute that exceeds the >8ms threshold — NOT one per diagram/open. Every
+    // edit that touches a code block recomputes its decorations, so typing inside
+    // a LARGE code block (where each recompute is >8ms) yields roughly one
+    // `code_highlight` sample per keystroke. Read the distribution as "per-
+    // recompute cost", and expect high sample counts on big code blocks.
+    onHighlight: isClientTelemetryEnabled()
+      ? (ms: number) => reportOperation("code_highlight", ms)
+      : undefined,
   }),
   Selection,
   Attachment.configure({

@@ -42,7 +42,7 @@ import {
   SearchMobileControl,
 } from "@/features/search/components/search-control.tsx";
 import { ShareSearchSpotlight } from "@/features/search/components/share-search-spotlight.tsx";
-import { shareSearchSpotlight } from "@/features/search/constants";
+import { openShareSearchSpotlight } from "@/features/search/constants";
 import ShareBranding from '@/features/share/components/share-branding.tsx';
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
 
@@ -179,7 +179,7 @@ export default function ShareShell({
 
           {shareId && (
             <Group visibleFrom="sm">
-              <SearchControl onClick={shareSearchSpotlight.open} />
+              <SearchControl onClick={openShareSearchSpotlight} />
             </Group>
           )}
 
@@ -187,7 +187,7 @@ export default function ShareShell({
             <>
               {shareId && (
                 <Group hiddenFrom="sm">
-                  <SearchMobileControl onSearch={shareSearchSpotlight.open} />
+                  <SearchMobileControl onSearch={openShareSearchSpotlight} />
                 </Group>
               )}
 

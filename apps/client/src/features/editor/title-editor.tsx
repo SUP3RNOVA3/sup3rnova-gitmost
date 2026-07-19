@@ -26,7 +26,7 @@ import EmojiCommand from "@/features/editor/extensions/emoji-command.ts";
 import { UpdateEvent } from "@/features/websocket/types";
 import localEmitter from "@/lib/local-emitter.ts";
 import { PageEditMode } from "@/features/user/types/user.types.ts";
-import { searchSpotlight } from "@/features/search/constants.ts";
+import { openSearchSpotlight } from "@/features/search/constants.ts";
 import { platformModifierKey } from "@/lib";
 import { useTitleAutofocus } from "@/features/editor/hooks/use-title-autofocus";
 
@@ -113,7 +113,7 @@ export function TitleEditor({
             return true;
           }
           if (platformModifierKey(event) && event.code === "KeyK") {
-            searchSpotlight.open();
+            openSearchSpotlight();
             return true;
           }
         },

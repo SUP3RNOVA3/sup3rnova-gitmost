@@ -1,5 +1,13 @@
-import React, { useState, useRef, useCallback, memo, useMemo } from "react";
+import React, {
+  useState,
+  useRef,
+  useCallback,
+  useEffect,
+  memo,
+  useMemo,
+} from "react";
 import { useParams } from "react-router-dom";
+import { measureOperation } from "@/lib/telemetry/vitals";
 import {
   ActionIcon,
   Center,
@@ -115,6 +123,19 @@ function CommentListWithTabs({ onClose }: CommentListWithTabsProps) {
   // mutateAsync is a stable reference across renders; depend on it (not the
   // mutation object) so the reply/comment callbacks stay stable.
   const createCommentAsync = createCommentMutation.mutateAsync;
+
+  // #683 `comments_open` measure: the panel is "settled" once the comments query
+  // resolves (the filled list or the empty-state renders — not just a frame).
+  // measureOperation consumes the start mark (set in use-toggle-aside on the
+  // open toggle), so it reports once per open; a later render is a no-op, and an
+  // open that errored out (isError) reports nothing. Reflects the whole
+  // click→list round-trip (network included), which is the point on a 300+
+  // comment page (#340).
+  useEffect(() => {
+    if (!isCommentsLoading && !isError) {
+      measureOperation("comments_open");
+    }
+  }, [isCommentsLoading, isError]);
   const { data: space } = useGetSpaceBySlugQuery(page?.space?.slug);
 
   const canEdit = page?.permissions?.canEdit ?? false;

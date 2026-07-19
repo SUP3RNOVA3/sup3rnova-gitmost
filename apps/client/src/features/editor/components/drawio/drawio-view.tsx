@@ -22,6 +22,10 @@ import { IconEdit } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { modals } from "@mantine/modals";
 import { useDrawioRasterSave } from "./use-drawio-raster-save.ts";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 
 export default function DrawioView(props: NodeViewProps) {
   const { t } = useTranslation();
@@ -66,6 +70,11 @@ export default function DrawioView(props: NodeViewProps) {
     if (!editor.isEditable) {
       return;
     }
+    // #683 `diagram_drawio` — mark at the double-click that opens the editor;
+    // measured at the drawio iframe's onLoad (render readiness). The node-view is
+    // a light placeholder card until this open, so this captures the iframe load
+    // the user waits for.
+    markOperationStart("diagram_drawio");
     isDirtyRef.current = false;
     open();
   };
@@ -145,6 +154,10 @@ export default function DrawioView(props: NodeViewProps) {
                 ref={drawioRef}
                 xml={initialXML}
                 baseUrl={getDrawioUrl()}
+                // #683 — the drawio editor iframe finished loading (render
+                // readiness); report the open→ready latency (success path;
+                // measureOperation consumes the mark set in handleOpen).
+                onLoad={() => measureOperation("diagram_drawio")}
                 autosave
                 urlParameters={{
                   ui: computedColorScheme === "light" ? "kennedy" : "dark",
