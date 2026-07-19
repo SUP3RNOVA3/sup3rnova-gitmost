@@ -851,9 +851,15 @@ export class McpClientsService {
     let tools: Record<string, Tool>;
     try {
       const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
+      // Allowlist semantics (#476/#685): null/absent = no restriction (all
+      // tools); ANY array — including `[]` — is authoritative, so an EMPTY
+      // allowlist yields ZERO tools (deny-all). This MUST match buildEntry
+      // above: do NOT add a `.length > 0` escape, which reads `[]` as falsy
+      // and silently widens deny-all to allow-all exactly on recovery-reconnect
+      // (a fail-closed → fail-open flip precisely when the transport degrades;
+      // the repo also fails corrupt allowlist rows closed to `[]`).
       const allow = server.toolAllowlist;
-      const picked =
-        Array.isArray(allow) && allow.length > 0 ? pick(raw, allow) : raw;
+      const picked = Array.isArray(allow) ? pick(raw, allow) : raw;
       tools = wrapToolsWithCallTimeout(picked, capMs);
     } catch (err) {
       void client.close().catch(() => undefined);
