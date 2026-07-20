@@ -71,7 +71,10 @@ describe("recreateTransform #581 highlight semantics", () => {
     // Each block has one edited word -> hundreds of granular changes, not 1/1.
     expect(added).toBeGreaterThan(100);
     expect(deleted).toBeGreaterThan(100);
-  });
+    // 600 blocks under wordDiffs took 5044ms on a loaded CI runner (vitest default
+    // is 5000ms); generous timeout so CI variance never flakes it — same convention
+    // as the property test (correctness, not speed, is the point here).
+  }, 30000);
 
   it("uniform text expansion of every block adds text but deletes nothing", () => {
     const n = 80;
