@@ -20,7 +20,15 @@ export function computePinTop(): number {
     const rect = el.getBoundingClientRect();
     if (rect.height > 0 && rect.bottom > bottom) bottom = rect.bottom;
   }
-  return bottom;
+  // Quantize to whole pixels. getBoundingClientRect().bottom is a float, and the
+  // pinned/transformed header row keeps nudging the anchor rect by sub-pixel
+  // amounts. Without rounding, publish()'s `top === lastValue` dedupe below never
+  // holds, so every ResizeObserver tick rewrites --editor-pin-offset on
+  // documentElement — which in WebKit (no independent-inheritance fast path for
+  // custom properties) is a full-document style recalc, feeding the very layout
+  // jitter that triggered the tick. A whole pixel is below the visible threshold
+  // for the pin offset, so quantizing costs nothing visually.
+  return Math.round(bottom);
 }
 
 // Reference-counted watcher that publishes the editor's top offset to a CSS custom property.
@@ -46,6 +54,11 @@ export const pinOffsetWatcher = {
   },
 
   release() {
+    // Floor at zero. An unbalanced release would otherwise make refs negative,
+    // and the next acquire() would pass its `refs++ > 0` guard while leaving
+    // refs at 0 — so a later acquire() would build a SECOND ResizeObserver,
+    // overwrite the reference, and leak the first one onto document.body.
+    if (this.refs <= 0) return;
     if (--this.refs > 0) return;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
