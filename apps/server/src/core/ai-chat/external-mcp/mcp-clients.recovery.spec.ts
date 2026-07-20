@@ -337,12 +337,12 @@ describe('reconnectServer honours allowlist deny-all on recovery (#476/#685)', (
   }
 
   it('toolAllowlist:[] yields ZERO tools after a recovery-reconnect (deny-all)', async () => {
-    const { service } = buildService([]);
+    // #686 recovery re-read: the row must be FINDABLE by findByIdRaw (same object
+    // => same updatedAt/enabled), or the staleness guard refuses the reconnect.
+    const srv = server({ toolAllowlist: [] });
+    const { service } = buildService([srv]);
     stubConnectRaw(service, RAW());
-    const { keys, close } = await reconnectKeys(
-      service,
-      server({ toolAllowlist: [] }),
-    );
+    const { keys, close } = await reconnectKeys(service, srv);
     expect(keys).toEqual([]);
     await close();
   });
@@ -351,34 +351,28 @@ describe('reconnectServer honours allowlist deny-all on recovery (#476/#685)', (
     // The repo fails a present-but-corrupt tool_allowlist CLOSED to `[]`
     // (ai-mcp-server.repo.ts normalizeRow); recovery must honour that as deny-all.
     const corruptFallback: string[] = [];
-    const { service } = buildService([]);
+    const srv = server({ toolAllowlist: corruptFallback });
+    const { service } = buildService([srv]);
     stubConnectRaw(service, RAW());
-    const { keys, close } = await reconnectKeys(
-      service,
-      server({ toolAllowlist: corruptFallback }),
-    );
+    const { keys, close } = await reconnectKeys(service, srv);
     expect(keys).toEqual([]);
     await close();
   });
 
   it('null (no restriction) still exposes every tool after reconnect', async () => {
-    const { service } = buildService([]);
+    const srv = server({ toolAllowlist: null });
+    const { service } = buildService([srv]);
     stubConnectRaw(service, RAW());
-    const { keys, close } = await reconnectKeys(
-      service,
-      server({ toolAllowlist: null }),
-    );
+    const { keys, close } = await reconnectKeys(service, srv);
     expect(keys.sort()).toEqual(['alpha', 'beta', 'gamma']);
     await close();
   });
 
   it("['alpha'] exposes ONLY alpha after reconnect (parity with buildEntry)", async () => {
-    const { service } = buildService([]);
+    const srv = server({ toolAllowlist: ['alpha'] });
+    const { service } = buildService([srv]);
     stubConnectRaw(service, RAW());
-    const { keys, close } = await reconnectKeys(
-      service,
-      server({ toolAllowlist: ['alpha'] }),
-    );
+    const { keys, close } = await reconnectKeys(service, srv);
     expect(keys).toEqual(['alpha']);
     await close();
   });
