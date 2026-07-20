@@ -31,9 +31,11 @@ import {
  * headers are encrypted on save and NEVER returned; the view carries only
  * `hasHeaders`. SSRF validation (`assertMcpUrlAllowed`) runs on every save.
  *
- * NOTE (phase boundary): nothing CONSUMES personal servers yet — the agent-loop
- * union + per-user cache invalidation is phase 3 (PR B). So this service only
- * PERSISTS; it deliberately does not touch the tool cache.
+ * CACHE (#686 phase 3 / PR B): the agent loop now CONSUMES personal servers via
+ * the per-user toolset cache (`McpClientsService.toolsFor(workspaceId, userId)`).
+ * Every personal mutation therefore evicts THIS user's cache entry only, via
+ * `invalidateUser(workspaceId, userId)` — the single-key eviction, never the
+ * admin fan-out (a personal change affects no other user's toolset).
  */
 @Injectable()
 export class AccountMcpServersService {
@@ -100,6 +102,8 @@ export class AccountMcpServersService {
       );
     });
 
+    // Evict this user's cached toolset so the new server is picked up next turn.
+    this.clients.invalidateUser(workspaceId, userId);
     return toMcpServerView(row);
   }
 
@@ -147,6 +151,8 @@ export class AccountMcpServersService {
       enabled: dto.enabled,
     });
 
+    // Evict this user's cached toolset so the edit takes effect next turn.
+    this.clients.invalidateUser(workspaceId, userId);
     const updated = await this.repo.findByIdForUser(id, workspaceId, userId);
     return toMcpServerView(updated as AiMcpServer);
   }
@@ -162,6 +168,8 @@ export class AccountMcpServersService {
       throw new NotFoundException('MCP server not found');
     }
     await this.repo.deleteForUser(id, workspaceId, userId);
+    // Evict this user's cached toolset so the removed server is gone next turn.
+    this.clients.invalidateUser(workspaceId, userId);
     return { success: true };
   }
 

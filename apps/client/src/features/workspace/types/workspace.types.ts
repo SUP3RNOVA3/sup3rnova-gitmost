@@ -77,6 +77,17 @@ export interface IWorkspaceSharingSettings {
   disabled?: boolean;
 }
 
+// Response of `POST /workspace/entitlements`. Kept loose (extra fields tolerated)
+// since it also carries license tier/feature data the client doesn't model here.
+export interface IWorkspaceEntitlements {
+  cloud: boolean;
+  tier: string;
+  features: string[];
+  // #686 kill-switch (MCP_PERSONAL_SERVERS_ENABLED). When false, the personal
+  // external MCP servers page is hidden/disabled. The server enforces it too.
+  mcpPersonalServersEnabled: boolean;
+}
+
 export interface IWorkspaceTemplateSettings {
   allowMemberTemplates?: boolean;
 }

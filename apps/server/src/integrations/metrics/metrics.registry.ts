@@ -32,6 +32,7 @@ import {
   METRIC_MCP_RYOW_EXPIRED_TOTAL,
   METRIC_API_KEY_AUTH_DENIED_TOTAL,
   METRIC_AI_CHAT_BIND_SKIPPED_TOTAL,
+  METRIC_AI_EXTERNAL_MCP_CONNECT_FAILURES_TOTAL,
   sizeBucket,
 } from './metrics.constants';
 
@@ -82,6 +83,8 @@ let mcpRyowExpiredCounter: Counter | null = null;
 let apiKeyAuthDeniedCounter: Counter<'reason'> | null = null;
 // #665 — page->chat binding skips, by bounded reason label.
 let aiChatBindSkippedCounter: Counter<'reason'> | null = null;
+// #686 — external-MCP connect failures, by bounded ownership level (admin|personal).
+let externalMcpConnectFailuresCounter: Counter<'level'> | null = null;
 
 // #402 — read-on-scrape source for collab_docs_open. The gauge is NEVER
 // inc/dec'd (that drifts under crashes/handoffs); instead its collect() callback
@@ -246,6 +249,13 @@ function init(): void {
     labelNames: ['reason'],
     registers: [registry],
   });
+
+  externalMcpConnectFailuresCounter = new Counter({
+    name: METRIC_AI_EXTERNAL_MCP_CONNECT_FAILURES_TOTAL,
+    help: 'Total external-MCP server connect failures during agent-turn toolset builds (#686), by ownership level (admin|personal)',
+    labelNames: ['level'],
+    registers: [registry],
+  });
 }
 
 // Runs once when this module is first imported. Safe to call again (idempotent).
@@ -352,6 +362,21 @@ export type AiChatBindSkipReason =
 
 export function incAiChatBindSkipped(reason: AiChatBindSkipReason): void {
   aiChatBindSkippedCounter?.inc({ reason });
+}
+
+/**
+ * #686 — record one external-MCP connect failure during an agent-turn toolset
+ * build, labelled by the failing server's OWNERSHIP LEVEL. A no-op when metrics
+ * are disabled (so the paired WARN in mcp-clients.service is the primary channel).
+ * `level` is a fixed 2-value set derived server-side from `user_id IS NULL` —
+ * never free-form input — so the label cardinality stays bounded.
+ */
+export type ExternalMcpFailureLevel = 'admin' | 'personal';
+
+export function incExternalMcpConnectFailure(
+  level: ExternalMcpFailureLevel,
+): void {
+  externalMcpConnectFailuresCounter?.inc({ level });
 }
 
 /**

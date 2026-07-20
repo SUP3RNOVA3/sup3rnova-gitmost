@@ -1,4 +1,4 @@
-import { IAiMcpServer } from "@/features/workspace/services/ai-mcp-server-service.ts";
+import { IAiMcpServer } from "./mcp-server-types.ts";
 
 // Resolve the tool allowlist value to persist from the form field.
 //

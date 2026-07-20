@@ -76,6 +76,18 @@ export const METRIC_API_KEY_AUTH_DENIED_TOTAL = 'api_key_auth_denied_total';
 // contract as the other families.
 export const METRIC_AI_CHAT_BIND_SKIPPED_TOTAL = 'ai_chat_bind_skipped_total';
 
+// #686 — external-MCP connect-failure observability. Every enabled external MCP
+// server that FAILS to connect (or whose auth headers are unreadable) during an
+// agent turn's toolset build increments this counter, labelled by the OWNERSHIP
+// LEVEL of the failing server: `admin` (a workspace-managed row, user_id IS NULL)
+// or `personal` (a member-owned row). The `level` label is a fixed 2-value set —
+// never free-form input — so cardinality stays bounded. This is the operator's
+// signal that a whole class of external tools (e.g. every user's personal Tavily,
+// or the admin web-search server) has silently gone dark. Same "do not rename"
+// contract as the other families.
+export const METRIC_AI_EXTERNAL_MCP_CONNECT_FAILURES_TOTAL =
+  'ai_external_mcp_connect_failures_total';
+
 // Histogram buckets (seconds). Chosen to give useful p50/p95/p99 resolution
 // for typical web/DB latencies without exploding series cardinality.
 export const HTTP_BUCKETS = [

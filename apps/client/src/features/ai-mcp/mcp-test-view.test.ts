@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mcpTestButtonView } from "./ai-mcp-server-test-view";
+import { mcpTestButtonView } from "./mcp-test-view";
 
 /**
  * Pure-helper tests for the inline "Test" button presentation. Covers the four

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveToolAllowlist } from "./ai-mcp-server-form.utils.ts";
+import { resolveToolAllowlist } from "./mcp-form-utils.ts";
 
 describe("resolveToolAllowlist", () => {
   it("sends the typed tools when the field is non-empty", () => {

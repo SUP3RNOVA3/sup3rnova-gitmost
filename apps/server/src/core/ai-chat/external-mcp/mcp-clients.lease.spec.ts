@@ -58,7 +58,7 @@ describe('McpClientsService lease/refcount/eviction', () => {
     const entry = makeEntry([client]);
     stubBuild(entry);
 
-    const lease = await service.toolsFor('ws-1');
+    const lease = await service.toolsFor('ws-1', 'user-1');
     expect(entry.refCount).toBe(1);
 
     await lease.clients[0].close();
@@ -73,7 +73,7 @@ describe('McpClientsService lease/refcount/eviction', () => {
     const entry = makeEntry([client]);
     stubBuild(entry);
 
-    const lease = await service.toolsFor('ws-2');
+    const lease = await service.toolsFor('ws-2', 'user-1');
     (service as any).evict(entry);
 
     // Evicted under an active lease: close is deferred to the last release.
@@ -90,8 +90,8 @@ describe('McpClientsService lease/refcount/eviction', () => {
     const entry = makeEntry([client]);
     stubBuild(entry);
 
-    const lease1 = await service.toolsFor('ws-3');
-    const lease2 = await service.toolsFor('ws-3');
+    const lease1 = await service.toolsFor('ws-3', 'user-1');
+    const lease2 = await service.toolsFor('ws-3', 'user-1');
     expect(entry.refCount).toBe(2);
 
     (service as any).evict(entry);
@@ -111,7 +111,7 @@ describe('McpClientsService lease/refcount/eviction', () => {
     const entry = makeEntry([client]);
     stubBuild(entry);
 
-    const lease = await service.toolsFor('ws-4');
+    const lease = await service.toolsFor('ws-4', 'user-1');
     (service as any).evict(entry);
 
     await lease.clients[0].close();
@@ -126,7 +126,10 @@ describe('McpClientsService lease/refcount/eviction', () => {
     const entry = makeEntry([client]);
     stubBuild(entry);
 
-    const built = await (service as any).getOrBuildEntry('ws-5');
+    // buildEntry is stubbed to return an UNLEASED entry (refCount 0); acquireEntry
+    // would lease it (refCount 1), so call the build directly to model the
+    // unleased-then-evicted path.
+    const built = await (service as any).buildEntry('ws-5', 'user-1');
     expect(built.refCount).toBe(0);
 
     (service as any).evict(entry);
@@ -139,7 +142,7 @@ describe('McpClientsService lease/refcount/eviction', () => {
     const entry = makeEntry([client]);
     stubBuild(entry);
 
-    const lease = await service.toolsFor('ws-6');
+    const lease = await service.toolsFor('ws-6', 'user-1');
     expect(entry.refCount).toBe(1);
 
     service.invalidate('ws-6');

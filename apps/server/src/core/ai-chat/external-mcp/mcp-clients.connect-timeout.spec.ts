@@ -49,7 +49,7 @@ function server(
 }
 
 function buildService(servers: FakeServer[]) {
-  const repoStub = { listEnabled: jest.fn().mockResolvedValue(servers) };
+  const repoStub = { listEnabledForAgent: jest.fn().mockResolvedValue(servers) };
   const service = new McpClientsService(repoStub as never, {} as never);
   // Silence the expected "server unavailable" warning.
   jest
@@ -88,7 +88,7 @@ describe('McpClientsService.connectWithTimeout — hung connect does not poison 
     // connect NEVER settles — models a wedged createMCPClient handshake.
     stubConnect(svc, () => new Promise<never>(() => {}));
 
-    const toolsetPromise = svc.toolsFor('ws-1');
+    const toolsetPromise = svc.toolsFor('ws-1', 'user-1');
     // Drive fake time past the connect bound so connectWithTimeout rejects and
     // buildEntry catches it (records ok:false) — flushing the microtasks.
     await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 1);
@@ -103,7 +103,7 @@ describe('McpClientsService.connectWithTimeout — hung connect does not poison 
 
     // The cache is NOT poisoned: a subsequent turn returns (served from the warm
     // cached entry) instead of awaiting a never-settling build.
-    const again = await svc.toolsFor('ws-1');
+    const again = await svc.toolsFor('ws-1', 'user-1');
     expect(Object.keys(again.tools)).toHaveLength(0);
     await Promise.all(again.clients.map((c) => c.close()));
   });
@@ -123,7 +123,7 @@ describe('McpClientsService.connectWithTimeout — hung connect does not poison 
         : Promise.resolve(okClient),
     );
 
-    const toolsetPromise = svc.toolsFor('ws-2');
+    const toolsetPromise = svc.toolsFor('ws-2', 'user-1');
     await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 1);
 
     const toolset = await toolsetPromise;
@@ -152,7 +152,7 @@ describe('McpClientsService.connectWithTimeout — hung connect does not poison 
         }),
     );
 
-    const toolsetPromise = svc.toolsFor('ws-3');
+    const toolsetPromise = svc.toolsFor('ws-3', 'user-1');
     // Fire the timeout: the build completes with the server skipped.
     await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 1);
     const toolset = await toolsetPromise;
@@ -194,7 +194,7 @@ describe('McpClientsService.buildEntry — closes a connected client whose tools
       s.id === 'id-bad' ? Promise.resolve(badClient) : Promise.resolve(okClient),
     );
 
-    const toolset = await svc.toolsFor('ws-4');
+    const toolset = await svc.toolsFor('ws-4', 'user-1');
 
     // The orphaned (never-registered) client is closed exactly once — no leak.
     expect(badClient.close).toHaveBeenCalledTimes(1);
@@ -224,7 +224,7 @@ describe('McpClientsService.buildEntry — closes a connected client whose tools
     };
     stubConnect(svc, () => Promise.resolve(slowClient));
 
-    const toolsetPromise = svc.toolsFor('ws-5');
+    const toolsetPromise = svc.toolsFor('ws-5', 'user-1');
     // Drive fake time past the tools() bound so withTimeout rejects.
     await jest.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 1);
     const toolset = await toolsetPromise;

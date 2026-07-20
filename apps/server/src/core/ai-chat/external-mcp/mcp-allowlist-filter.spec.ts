@@ -55,7 +55,7 @@ async function mergedKeysFor(
   rawTools: Record<string, Tool>,
 ): Promise<string[]> {
   const repoStub = {
-    listEnabled: jest.fn().mockResolvedValue(servers),
+    listEnabledForAgent: jest.fn().mockResolvedValue(servers),
   };
   const service = new McpClientsService(repoStub as never, {} as never);
 
@@ -71,7 +71,7 @@ async function mergedKeysFor(
       }),
     );
 
-  const toolset = await service.toolsFor('ws-1');
+  const toolset = await service.toolsFor('ws-1', 'user-1');
   // Release the lease so the service does not hold the fake clients open.
   await Promise.all(toolset.clients.map((c) => c.close()));
   return Object.keys(toolset.tools);
@@ -140,7 +140,7 @@ describe('external MCP tool-allowlist filtering (via toolsFor, #476)', () => {
 
   it('a deny-all server contributes no prompt instructions (0 tools merged)', async () => {
     const repoStub = {
-      listEnabled: jest.fn().mockResolvedValue([
+      listEnabledForAgent: jest.fn().mockResolvedValue([
         {
           ...server({ id: 'id-1', name: 'srv', toolAllowlist: [] }),
           instructions: 'use the tools wisely',
@@ -160,7 +160,7 @@ describe('external MCP tool-allowlist filtering (via toolsFor, #476)', () => {
         }),
       );
 
-    const toolset = await service.toolsFor('ws-1');
+    const toolset = await service.toolsFor('ws-1', 'user-1');
     await Promise.all(toolset.clients.map((c) => c.close()));
     expect(Object.keys(toolset.tools)).toEqual([]);
     // mergeNamespaced reported 0 contributed tools, so no guidance is attached.

@@ -41,6 +41,10 @@ import {
   type ViewImageCacheEntry,
 } from './tools/ai-chat-tools.service';
 import { McpClientsService } from './external-mcp/mcp-clients.service';
+import {
+  MCP_FAILURES_CAP,
+  MCP_FAILURE_REASON_MAX,
+} from './external-mcp/mcp.constants';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { AiChatStreamRegistryService } from './ai-chat-stream-registry.service';
 import { buildSystemPrompt } from './ai-chat.prompt';
@@ -1458,6 +1462,11 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         outcomes: [],
         instructions: [],
       };
+      // #686 P4 (observability): the external-MCP connection failures surfaced to
+      // the client (via the chatStreamMetadata seam) AND persisted into the
+      // assistant message metadata. Populated from `external.outcomes` after a
+      // build, or a single synthetic record when the whole build fails below.
+      let mcpFailures: McpFailureRecord[] = [];
       try {
         // Bound the external-MCP toolset build by BOTH the run's abort signal and
         // a generous wall-clock deadline. This is the pre-streamText setup phase,
@@ -1471,7 +1480,9 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
         // clients and closes them on TTL/evict). This just prevents the lease
         // refcount from being pinned >=1 forever by a toolset nobody will consume.
         external = await raceAgainstAbortAndTimeout(
-          this.mcpClients.toolsFor(workspace.id),
+          // #686: the toolset is per-user — admin servers ∪ THIS user's personal
+          // servers. `user.id` is REQUIRED (the cache is always keyed per-user).
+          this.mcpClients.toolsFor(workspace.id, user.id),
           effectiveSignal,
           MCP_TOOLSET_BUILD_DEADLINE_MS,
           (late) => {
@@ -1480,6 +1491,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             );
           },
         );
+        // Surface per-server connect failures (ok:false outcomes), capped.
+        mcpFailures = buildMcpFailures(external.outcomes);
       } catch (err) {
         // An explicit Stop reached the RUN's signal DURING setup: re-throw so the
         // outer catch finalizes the run as aborted — never swallow a Stop. #487: the
@@ -1500,6 +1513,18 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
             err instanceof Error ? err.message : 'unknown error'
           }`,
         );
+        // #686 P4: a TOTAL build failure yields no per-server outcomes, so
+        // synthesize one record — otherwise a whole external toolset silently
+        // vanishing would leave no signal (ARCH INVARIANT #10). The turn still
+        // proceeds on Docmost-only tools.
+        mcpFailures = [
+          {
+            name: '(external toolset)',
+            reason: `build failed: ${truncateMcpReason(
+              err instanceof Error ? err.message : 'unknown error',
+            )}`,
+          },
+        ];
       }
 
       // Close every external client EXACTLY ONCE across the turn's terminal
@@ -2113,6 +2138,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 // configured budget (only when it actually did).
                 replayBelowConfiguredBudget:
                   replayBelowConfiguredBudget || undefined,
+                // #686 P4: persist the external-MCP failures for this turn.
+                mcpFailures,
               }),
             );
             // #184/#487: the RUN is finalized ALWAYS (never gated on the message).
@@ -2201,6 +2228,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 // configured budget (only when it actually was).
                 replayBelowConfiguredBudget:
                   replayBelowConfiguredBudget || undefined,
+                // #686 P4: persist the external-MCP failures for this turn.
+                mcpFailures,
               }),
             );
             // #184: settle the RUN as failed, carrying the provider/transport cause.
@@ -2227,6 +2256,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                   error: OUTPUT_DEGENERATION_ERROR,
                   pageChanged,
                   partsCache,
+                  // #686 P4: persist the external-MCP failures for this turn.
+                  mcpFailures,
                 }),
               );
               if (runId)
@@ -2264,6 +2295,8 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
               flushAssistant(capturedSteps, inProgressText, 'aborted', {
                 pageChanged,
                 partsCache,
+                // #686 P4: persist the external-MCP failures for this turn.
+                mcpFailures,
               }),
             );
             // #184: settle the RUN as aborted (an explicit user stop reached the
@@ -2370,7 +2403,14 @@ export class AiChatService implements OnModuleInit, OnModuleDestroy {
                 normalizeStreamUsage(p.usage),
               );
             }
-            return chatStreamMetadata(p, chatId, cumulativeStepUsage, runId);
+            return chatStreamMetadata(
+              p,
+              chatId,
+              cumulativeStepUsage,
+              runId,
+              // #686 P4: deliver the external-MCP failures on the `start` part.
+              mcpFailures,
+            );
           },
           // Stream reasoning (thinking) parts to the client so the live counter can
           // estimate reasoning tokens from streamed text. v6 default is already
@@ -2566,6 +2606,49 @@ export function accumulateStepUsage(
  *  - `finish`       -> `{ usage }` from the turn's `totalUsage` (final reconcile).
  * Any other part type contributes no metadata. Pure + unit-testable.
  */
+/**
+ * One external-MCP connection failure surfaced to the client + persisted (#686
+ * P4). `name` is the server's display name (or `(external toolset)` for a total
+ * build failure); `reason` is a short, non-sensitive cause (never a URL/header).
+ */
+export interface McpFailureRecord {
+  name: string;
+  reason: string;
+}
+
+/** Truncate a failure reason to the shared per-reason budget (#686). */
+export function truncateMcpReason(reason: string): string {
+  const r = typeof reason === 'string' ? reason : String(reason ?? '');
+  return r.length > MCP_FAILURE_REASON_MAX
+    ? r.slice(0, MCP_FAILURE_REASON_MAX)
+    : r;
+}
+
+/**
+ * Build the capped external-MCP failure list from a turn's per-server outcomes
+ * (#686 P4): ONLY the `ok:false` outcomes, at most {@link MCP_FAILURES_CAP} of
+ * them, each reason truncated to {@link MCP_FAILURE_REASON_MAX} chars (ARCH
+ * INVARIANT #1 — a bounded payload). A hostile/verbose provider error therefore
+ * can never dominate the delivered/persisted metadata.
+ */
+export function buildMcpFailures(
+  outcomes:
+    | ReadonlyArray<{ name?: string; ok?: boolean; reason?: string }>
+    | undefined,
+): McpFailureRecord[] {
+  if (!Array.isArray(outcomes)) return [];
+  const out: McpFailureRecord[] = [];
+  for (const o of outcomes) {
+    if (!o || o.ok !== false) continue;
+    out.push({
+      name: typeof o.name === 'string' ? o.name : '',
+      reason: truncateMcpReason(o.reason ?? 'unavailable'),
+    });
+    if (out.length >= MCP_FAILURES_CAP) break;
+  }
+  return out;
+}
+
 export function chatStreamMetadata(
   part: StreamMetadataPart,
   chatId: string,
@@ -2574,8 +2657,20 @@ export function chatStreamMetadata(
   // the client learns the run it can reconnect to / stop. Omitted when the turn
   // is not run-wrapped (legacy path).
   runId?: string,
-): { chatId: string; runId?: string } | { usage: ChatStreamUsage } | undefined {
-  if (part.type === 'start') return runId ? { chatId, runId } : { chatId };
+  // #686 P4: external-MCP connection failures for this turn, delivered on the
+  // `start` part so the client can show which external tools are unavailable.
+  // Omitted when the list is empty (unchanged wire for the common no-failure case).
+  mcpFailures?: ReadonlyArray<McpFailureRecord>,
+):
+  | { chatId: string; runId?: string; mcpFailures?: McpFailureRecord[] }
+  | { usage: ChatStreamUsage }
+  | undefined {
+  if (part.type === 'start') {
+    const base = runId ? { chatId, runId } : { chatId };
+    return mcpFailures && mcpFailures.length > 0
+      ? { ...base, mcpFailures: [...mcpFailures] }
+      : base;
+  }
   if (part.type === 'finish-step') {
     return cumulativeStepUsage ? { usage: cumulativeStepUsage } : undefined;
   }
@@ -3330,6 +3425,10 @@ export function flushAssistant(
     // anti-brick invariant cut past it). Omitted on a normal in-budget replay so the
     // flag marks ONLY the "config is factually too large" case.
     replayBelowConfiguredBudget?: boolean;
+    // #686 P4: the external-MCP connection failures for this turn (capped by
+    // buildMcpFailures). Persisted so history / the UI can show which external
+    // tools were unavailable. Omitted when there were none.
+    mcpFailures?: ReadonlyArray<McpFailureRecord>;
   },
 ): AssistantFlush {
   const finished = capturedSteps ?? [];
@@ -3386,6 +3485,10 @@ export function flushAssistant(
     metadata.replayOverflowCount = extra.replayOverflowCount;
   if (extra?.replayBelowConfiguredBudget)
     metadata.replayBelowConfiguredBudget = true;
+  // #686 P4: persist the (already-capped) external-MCP failure list. Only when
+  // non-empty so a clean turn's metadata is unchanged.
+  if (extra?.mcpFailures && extra.mcpFailures.length > 0)
+    metadata.mcpFailures = [...extra.mcpFailures];
   if (extra?.error) metadata.error = extra.error;
   // Persist the page-change diff the agent saw this turn (#274 observability),
   // so history / the Markdown export can show what the user changed. Only when

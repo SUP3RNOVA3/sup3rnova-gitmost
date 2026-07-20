@@ -42,6 +42,11 @@ type FakeServer = {
   headersEnc: string | null;
   toolAllowlist: string[] | null;
   instructions: string | null;
+  // #686: the recovery re-read guard (findByIdRaw) validates these.
+  userId: string | null;
+  workspaceId: string;
+  enabled: boolean;
+  updatedAt: Date;
 };
 
 const server = (over: Partial<FakeServer> = {}): FakeServer => ({
@@ -52,11 +57,21 @@ const server = (over: Partial<FakeServer> = {}): FakeServer => ({
   headersEnc: null,
   toolAllowlist: null,
   instructions: null,
+  userId: null,
+  workspaceId: 'ws-1',
+  enabled: true,
+  updatedAt: new Date('2020-01-01T00:00:00.000Z'),
   ...over,
 });
 
 function buildService(servers: FakeServer[], trusted = false) {
-  const repo = { listEnabled: jest.fn().mockResolvedValue(servers) };
+  const repo = {
+    listEnabledForAgent: jest.fn().mockResolvedValue(servers),
+    // #686 recovery re-read: reconnectServer re-reads the row before reopening a
+    // connection. Return the SAME object by id so updatedAt/enabled match and the
+    // guard permits the reconnect (the "changed" refusal is tested separately).
+    findByIdRaw: jest.fn(async (id: string) => servers.find((s) => s.id === id)),
+  };
   const service = new McpClientsService(repo as never, {} as never);
   // Seed a DETERMINISTIC write-class map so the retry gate is controlled here
   // (the production map loads from @docmost/mcp via a dynamic ESM import). getPage
@@ -141,7 +156,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     const second = jest.fn().mockResolvedValue({ ok: true });
     const connectSpy = stubConnect(service, 'getPage', [first, second]);
 
-    const toolset = await service.toolsFor('ws-1');
+    const toolset = await service.toolsFor('ws-1', 'user-1');
     const tool = toolset.tools['srv_getPage'];
     const result = await (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
       { pageId: 'p' },
@@ -165,7 +180,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     const exec = jest.fn().mockRejectedValue(realErr);
     const connectSpy = stubConnect(service, 'patchNode', [exec]);
 
-    const toolset = await service.toolsFor('ws-2');
+    const toolset = await service.toolsFor('ws-2', 'user-1');
     const tool = toolset.tools['srv_patchNode'];
     await expect(
       (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
@@ -193,7 +208,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     const second = jest.fn().mockResolvedValue({ ok: true });
     const connectSpy = stubConnect(service, 'getPage', [first, second]);
 
-    const toolset = await service.toolsFor('ws-3');
+    const toolset = await service.toolsFor('ws-3', 'user-1');
     const tool = toolset.tools['srv_getPage'];
     await expect(
       (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
@@ -214,7 +229,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     const exec = jest.fn().mockRejectedValue(appErr);
     const connectSpy = stubConnect(service, 'getPage', [exec]);
 
-    const toolset = await service.toolsFor('ws-4');
+    const toolset = await service.toolsFor('ws-4', 'user-1');
     const tool = toolset.tools['srv_getPage'];
     await expect(
       (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
@@ -244,7 +259,7 @@ describe('McpClientsService in-run transport recovery (#489)', () => {
     const exec = jest.fn().mockRejectedValue(realErr);
     const connectSpy = stubConnect(service, 'getPage', [exec, exec]);
 
-    const toolset = await service.toolsFor('ws-5');
+    const toolset = await service.toolsFor('ws-5', 'user-1');
     const tool = toolset.tools['srv_getPage'];
     await expect(
       (tool.execute as (a: unknown, o: unknown) => Promise<unknown>)(
