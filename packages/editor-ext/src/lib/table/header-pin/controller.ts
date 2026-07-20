@@ -1,6 +1,7 @@
 // Per-table header-pin controller: native sticky when table fits its wrapper, transform fallback when it doesn't.
 
 import { computePinTop, pinOffsetWatcher } from './offset';
+import { OscillationLatch } from './oscillation-latch';
 
 const WRAPPER_NO_OVERFLOW = 'tableWrapperNoOverflow';
 const HEADER_PINNED = 'tableHeaderPinned';
@@ -36,13 +37,6 @@ const PIN_LATCH_COOLDOWN_MS = 30_000;
 // bistable, so retrying forever would just log forever. After this many latches we
 // stop retrying for the life of this controller and say so once.
 const PIN_LATCH_GIVE_UP_COUNT = 3;
-
-function monotonicNow(): number {
-  return typeof performance !== 'undefined' &&
-    typeof performance.now === 'function'
-    ? performance.now()
-    : Date.now();
-}
 
 type PinMode = 'off' | 'native' | 'fallback';
 
@@ -98,21 +92,27 @@ export class TablePinController {
   private pendingEntry: IntersectionObserverEntry | null = null;
   private evaluateRafPending = false;
   private evaluateRaf: number | null = null;
-  private latched = false;
-  private flipCount = 0;
-  // null (not 0) is the "no window open" sentinel: monotonicNow() can legitimately
-  // return 0, and a 0 sentinel would reopen the window on every flip and disable
-  // the latch entirely.
-  private flipWindowStart: number | null = null;
-  private latchedAt = 0;
-  private latchCount = 0;
-  private gaveUp = false;
+  // Fit-detection oscillation fail-safe. Shares its implementation with the
+  // pin-offset republish latch (see oscillation-latch.ts) so the two read the
+  // same; only the constants and the latch's effect differ.
+  private latch = new OscillationLatch({
+    limit: PIN_MODE_FLIP_LIMIT,
+    windowMs: PIN_MODE_FLIP_WINDOW_MS,
+    cooldownMs: PIN_LATCH_COOLDOWN_MS,
+    giveUpCount: PIN_LATCH_GIVE_UP_COUNT,
+  });
+  // True while this controller holds a pinOffsetWatcher reference. The reference
+  // is tied to being in a PINNING MODE, not to the controller's lifetime: nothing
+  // consumes --editor-pin-offset unless some table is actually pinned (its only
+  // consumer is the `top:` of `.tableWrapperNoOverflow.tableHeaderPinned` rows in
+  // table.css, which has a `var(..., 90px)` fallback), so an unpinned page must
+  // not be paying for a watcher at all.
+  private pinOffsetHeld = false;
   private destroyed = false;
 
   constructor(wrapper: HTMLElement, table: HTMLTableElement) {
     this.wrapper = wrapper;
     this.table = table;
-    pinOffsetWatcher.acquire();
     this.fitsObserver = new IntersectionObserver(
       (entries) => {
         // Never write style synchronously from inside this callback: `apply()`
@@ -151,7 +151,7 @@ export class TablePinController {
   }
 
   private evaluateFit(entry: IntersectionObserverEntry) {
-    if (this.latched) return;
+    if (this.latch.latched) return;
     if (!this.isEligible()) {
       this.apply('off');
       return;
@@ -166,22 +166,8 @@ export class TablePinController {
     );
   }
 
-  // Returns true when this flip crosses the oscillation limit for the window.
-  private noteFlip(): boolean {
-    const now = monotonicNow();
-    if (
-      this.flipWindowStart === null ||
-      now - this.flipWindowStart > PIN_MODE_FLIP_WINDOW_MS
-    ) {
-      this.flipWindowStart = now;
-      this.flipCount = 0;
-    }
-    this.flipCount += 1;
-    return this.flipCount > PIN_MODE_FLIP_LIMIT;
-  }
-
   private apply(next: PinMode) {
-    if (this.latched) return;
+    if (this.latch.latched) return;
     if (next === this.mode) return;
 
     // Only the overflow-driven pair can oscillate; eligibility-driven `off`
@@ -191,16 +177,14 @@ export class TablePinController {
       return;
     }
 
-    if (this.noteFlip()) {
+    if (this.latch.note()) {
       // Fit detection is oscillating. Latch into 'fallback' — the only pinned
       // mode that leaves the wrapper's overflow alone, so it cannot re-drive
       // the cycle — and stop listening. Per-controller (per table), not global.
       // `next` is statically narrowed to 'native' | 'fallback' here because every
       // 'off' transition returned above — so the latch structurally cannot
       // override a requested 'off' and force-pin a table that must not be pinned.
-      this.latched = true;
-      this.latchedAt = monotonicNow();
-      this.latchCount += 1;
+      const { latchCount, gaveUpNow } = this.latch.latch();
       this.fitsObserver?.disconnect();
       this.pendingEntry = null;
       const preamble =
@@ -210,18 +194,16 @@ export class TablePinController {
         PIN_MODE_FLIP_WINDOW_MS +
         'ms) — using the transform fallback for this table; header pinning stays ' +
         'functional but the native sticky path is off. ';
-      if (this.latchCount >= PIN_LATCH_GIVE_UP_COUNT) {
-        const alreadyGaveUp = this.gaveUp;
-        this.gaveUp = true;
+      if (this.latch.gaveUp) {
         // Log only the FIRST transition into the give-up state. unlatch() (the
         // ineligible path) restores retry rights without clearing latchCount, so
         // a table whose eligibility churns can latch again while gaveUp is
         // already set — repeating the announcement would just be noise.
-        if (!alreadyGaveUp) {
+        if (gaveUpNow) {
           console.warn(
             preamble +
               'This is latch #' +
-              this.latchCount +
+              latchCount +
               ' for this table, so native sticky will not be retried again ' +
               'while this table keeps qualifying for pinning; the transform ' +
               'fallback stays in place.',
@@ -254,10 +236,18 @@ export class TablePinController {
     this.mode = next;
     const cls = this.wrapper.classList;
 
+    // Acquire BEFORE the class writes so :root already carries the offset when
+    // the row first paints as pinned; release AFTER them, when nothing is left
+    // to consume it. Every path out of a pinning mode funnels through here —
+    // the latch (which sets 'fallback'), the ineligible->'off' path in refresh(),
+    // and destroy() — so the refcount stays balanced by construction.
+    if (next !== 'off') this.holdPinOffset(true);
+
     if (next === 'off') {
       cls.remove(HEADER_PINNED);
       cls.remove(WRAPPER_NO_OVERFLOW);
       this.wrapper.style.removeProperty(PIN_OFFSET_VAR);
+      this.holdPinOffset(false);
     } else if (next === 'native') {
       cls.add(HEADER_PINNED);
       cls.add(WRAPPER_NO_OVERFLOW);
@@ -273,13 +263,22 @@ export class TablePinController {
     }
   }
 
+  // Idempotent by the boolean: acquiring twice or releasing an unheld reference
+  // would unbalance the module-level refcount.
+  private holdPinOffset(hold: boolean) {
+    if (hold === this.pinOffsetHeld) return;
+    this.pinOffsetHeld = hold;
+    if (hold) pinOffsetWatcher.acquire();
+    else pinOffsetWatcher.release();
+  }
+
   updateFallbackOffset() {
     // A latched controller is by definition in fallback mode, so it is in
     // fallbackControllers and this runs on every scroll frame — the only tick
     // that still exists on a read-only page, where the doc never changes and
     // refresh() is therefore never called. Costs one boolean per frame when not
     // latched, one timestamp comparison when it is.
-    if (this.latched) this.rearmLatchAfterCooldown();
+    if (this.latch.latched) this.rearmLatchAfterCooldown();
 
     const pinTop = computePinTop();
     const tableRect = this.table.getBoundingClientRect();
@@ -297,22 +296,11 @@ export class TablePinController {
     }
   }
 
-  // Clears the latched state without touching latchCount/gaveUp, so the give-up
-  // budget stays spent for the life of the controller.
-  private unlatch() {
-    this.latched = false;
-    this.flipCount = 0;
-    this.flipWindowStart = null;
-  }
-
   // Latching is not terminal: PIN_LATCH_COOLDOWN_MS after latching we re-observe
   // and give native sticky another chance — unless this table has already spent
   // its retry budget. Driven from refresh() and from the fallback scroll frame.
   private rearmLatchAfterCooldown() {
-    if (this.gaveUp) return;
-    if (monotonicNow() - this.latchedAt < PIN_LATCH_COOLDOWN_MS) return;
-    this.unlatch();
-    this.fitsObserver?.observe(this.table);
+    if (this.latch.maybeRelease()) this.fitsObserver?.observe(this.table);
   }
 
   refresh() {
@@ -331,10 +319,10 @@ export class TablePinController {
       // eligible again (an undone header-row deletion) before the cooldown
       // expires would be stranded with no pinning at all: refresh() would see
       // `latched` and return without ever taking the re-observe path below.
-      this.unlatch();
+      this.latch.unlatch();
       return;
     }
-    if (this.latched) {
+    if (this.latch.latched) {
       this.rearmLatchAfterCooldown();
       return;
     }
@@ -361,8 +349,11 @@ export class TablePinController {
     this.fitsObserver?.disconnect();
     this.fitsObserver = undefined;
     // Bypass apply()'s latch/flip bookkeeping — teardown must always clean up.
+    // setMode('off') releases the pin-offset reference; the extra call covers
+    // the case where the mode was already 'off' (setMode early-returns then) and
+    // is a no-op when the reference was already released.
     this.setMode('off');
-    pinOffsetWatcher.release();
+    this.holdPinOffset(false);
   }
 }
 

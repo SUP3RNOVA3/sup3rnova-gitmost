@@ -59,19 +59,31 @@ describe('pinOffsetWatcher.publish', () => {
   let setPropertySpy: ReturnType<typeof vi.spyOn>;
   let anchorBottom = 0;
   let originalResizeObserver: unknown;
+  let observed: unknown[];
+  // ONE stable stub for the whole test, reading `anchorBottom` live. A fresh
+  // object per querySelector call would make `sameAnchors` false every time and
+  // silently disable the anti-churn branch under test.
+  const stableAnchor = {
+    getBoundingClientRect: () => ({ bottom: anchorBottom, height: 40 }) as DOMRect,
+  } as unknown as HTMLElement;
 
   beforeEach(() => {
     anchorBottom = 140.2;
     querySelectorSpy = vi
       .spyOn(document, 'querySelector')
-      .mockImplementation(
-        () => anchorStub(anchorBottom) as unknown as Element,
+      .mockImplementation((sel: string) =>
+        sel === '[data-page-header]'
+          ? (stableAnchor as unknown as Element)
+          : null,
       );
     setPropertySpy = vi.spyOn(document.documentElement.style, 'setProperty');
 
+    observed = [];
     originalResizeObserver = (globalThis as any).ResizeObserver;
     (globalThis as any).ResizeObserver = class {
-      observe() {}
+      observe(target: unknown) {
+        observed.push(target);
+      }
       unobserve() {}
       disconnect() {}
     };
@@ -110,6 +122,174 @@ describe('pinOffsetWatcher.publish', () => {
     );
   });
 
+  it('does not re-subscribe the observer when the anchor set is unchanged', () => {
+    pinOffsetWatcher.acquire();
+    expect(observed).toEqual([stableAnchor]);
+
+    anchorBottom = 160;
+    pinOffsetWatcher.publish();
+    anchorBottom = 180;
+    pinOffsetWatcher.publish();
+
+    // Same anchor element throughout: syncAnchors() must leave the subscription
+    // alone rather than disconnect/observe on every publish.
+    expect(observed).toEqual([stableAnchor]);
+  });
+
+  // A geometry that alternates between two whole pixels: Math.round() cannot
+  // defeat this, so the dedupe lets every tick through and the loop is
+  // self-sustaining. The latch is the only thing that can stop it.
+  const flip = () => {
+    anchorBottom = anchorBottom === 140 ? 141 : 140;
+    pinOffsetWatcher.publish();
+  };
+
+  it('latches on a whole-pixel oscillation, warns once, freezes the NEW value', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    anchorBottom = 140;
+    pinOffsetWatcher.acquire(); // publish #1 -> 140px
+
+    // flip 1 publishes a brand-new value (141): not a return, not evidence.
+    // flips 2..8 each return to a value published a moment ago; the 7th return
+    // crosses the budget of 6 and latches — AFTER writing its own value.
+    for (let i = 0; i < 8; i++) flip();
+
+    expect(setPropertySpy).toHaveBeenCalledTimes(9);
+    // The value that tripped the latch is the one left on :root — not the stale
+    // previous one.
+    expect(setPropertySpy).toHaveBeenLastCalledWith(
+      EDITOR_PIN_OFFSET_VAR,
+      '140px',
+    );
+    expect(pinOffsetWatcher.latch.latched).toBe(true);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(String(warnSpy.mock.calls[0][0])).toContain('[table-header-pin]');
+
+    // Everything after the latch is inert: no more writes, no more logging.
+    for (let i = 0; i < 20; i++) flip();
+    expect(setPropertySpy).toHaveBeenCalledTimes(9);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    warnSpy.mockRestore();
+  });
+
+  it('does NOT latch on a monotonic settling sequence', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    // A perfectly healthy page load: no anchors yet, then the header mounts,
+    // then the toolbar, then web fonts land, then the navbar transition nudges
+    // the toolbar. Nine distinct values inside one window, zero bistability —
+    // counting bare changes (rather than returns) would freeze the offset at
+    // 45px here and push every sticky header row 90px too high.
+    anchorBottom = 0; // no visible anchor -> APP_BAR_FALLBACK_HEIGHT
+    pinOffsetWatcher.acquire();
+    for (const bottom of [90, 135, 137, 138, 139, 140, 141, 142, 143]) {
+      anchorBottom = bottom;
+      pinOffsetWatcher.publish();
+    }
+
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(pinOffsetWatcher.latch.latched).toBe(false);
+    expect(setPropertySpy).toHaveBeenLastCalledWith(
+      EDITOR_PIN_OFFSET_VAR,
+      '143px',
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it('releases the republish latch after the cooldown', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let now = 5_000;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => now);
+
+    anchorBottom = 140;
+    pinOffsetWatcher.acquire();
+    for (let i = 0; i < 8; i++) flip();
+    expect(pinOffsetWatcher.latch.latched).toBe(true);
+    const writesWhenLatched = setPropertySpy.mock.calls.length;
+
+    // Inside the cooldown: still frozen.
+    now += 29_000;
+    anchorBottom = 200;
+    pinOffsetWatcher.publish();
+    expect(setPropertySpy).toHaveBeenCalledTimes(writesWhenLatched);
+
+    // Past it: the next differing value releases the latch and publishes.
+    now += 2_000;
+    anchorBottom = 210;
+    pinOffsetWatcher.publish();
+    expect(setPropertySpy).toHaveBeenLastCalledWith(
+      EDITOR_PIN_OFFSET_VAR,
+      '210px',
+    );
+    expect(pinOffsetWatcher.latch.latched).toBe(false);
+
+    nowSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('gives up after the third latch, announcing it exactly once', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let now = 5_000;
+    const nowSpy = vi.spyOn(performance, 'now').mockImplementation(() => now);
+
+    const latchOnce = () => {
+      for (let i = 0; i < 40 && !pinOffsetWatcher.latch.latched; i++) flip();
+      expect(pinOffsetWatcher.latch.latched).toBe(true);
+    };
+    // Past the cooldown, one differing value releases the latch.
+    const cooldownOut = () => {
+      now += 31_000;
+      anchorBottom = 300;
+      pinOffsetWatcher.publish();
+      expect(pinOffsetWatcher.latch.latched).toBe(false);
+    };
+
+    anchorBottom = 140;
+    pinOffsetWatcher.acquire();
+
+    latchOnce();
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    cooldownOut();
+    latchOnce();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    cooldownOut();
+    latchOnce(); // third latch: retry budget spent
+    expect(warnSpy).toHaveBeenCalledTimes(3);
+    expect(String(warnSpy.mock.calls[2][0])).toContain('will not be retried');
+
+    // The cooldown no longer releases it, and nothing more is logged.
+    const writes = setPropertySpy.mock.calls.length;
+    now += 31_000;
+    anchorBottom = 300;
+    pinOffsetWatcher.publish();
+    expect(pinOffsetWatcher.latch.latched).toBe(true);
+    expect(setPropertySpy).toHaveBeenCalledTimes(writes);
+    expect(warnSpy).toHaveBeenCalledTimes(3);
+
+    // A fresh pinning session starts clean.
+    pinOffsetWatcher.release();
+    pinOffsetWatcher.acquire();
+    expect(pinOffsetWatcher.latch.latched).toBe(false);
+    expect(pinOffsetWatcher.latch.gaveUp).toBe(false);
+
+    nowSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('is inert when nothing holds a reference', () => {
+    // publish() is reachable on the exported object; called with refs at 0 it
+    // would otherwise write a property nothing will ever remove.
+    anchorBottom = 300;
+    pinOffsetWatcher.publish();
+    expect(setPropertySpy).not.toHaveBeenCalled();
+
+    pinOffsetWatcher.sync();
+    expect(setPropertySpy).not.toHaveBeenCalled();
+  });
+
   it('floors the refcount so an unbalanced release cannot leak an observer', () => {
     pinOffsetWatcher.acquire();
     pinOffsetWatcher.release();
@@ -124,6 +304,201 @@ describe('pinOffsetWatcher.publish', () => {
     pinOffsetWatcher.acquire();
     expect(pinOffsetWatcher.refs).toBe(1);
     expect(pinOffsetWatcher.resizeObserver).not.toBeNull();
+  });
+});
+
+describe('pinOffsetWatcher observation scope', () => {
+  let originalResizeObserver: unknown;
+  let observed: unknown[];
+  let fireResize: () => void;
+
+  // Records EVERY target ever handed to observe(), so a reintroduced
+  // `observe(document.body)` shows up here no matter when it happened.
+  function installRecordingResizeObserver() {
+    observed = [];
+    let captured: (() => void) | null = null;
+    (globalThis as any).ResizeObserver = class {
+      constructor(cb: () => void) {
+        captured = cb;
+      }
+      observe(target: unknown) {
+        observed.push(target);
+      }
+      unobserve() {}
+      disconnect() {}
+    };
+    fireResize = () => captured?.();
+  }
+
+  function mountAnchor(attr: string, bottom: number, height = 40) {
+    const el = document.createElement('div');
+    el.setAttribute(attr, 'true');
+    el.getBoundingClientRect = () => ({ bottom, height }) as DOMRect;
+    document.body.appendChild(el);
+    return el;
+  }
+
+  // Queued rAF for the whole describe: sync() only SCHEDULES, so every test here
+  // has to flush a frame to see the effect.
+  let rafQueue: Map<number, FrameRequestCallback>;
+  let rafSeq: number;
+  let originalRaf: unknown;
+  let originalCaf: unknown;
+  const flush = () => {
+    const pending = [...rafQueue.values()];
+    rafQueue.clear();
+    for (const cb of pending) cb(0);
+  };
+
+  beforeEach(() => {
+    originalResizeObserver = (globalThis as any).ResizeObserver;
+    installRecordingResizeObserver();
+
+    rafQueue = new Map();
+    rafSeq = 0;
+    originalRaf = (globalThis as any).requestAnimationFrame;
+    originalCaf = (globalThis as any).cancelAnimationFrame;
+    (globalThis as any).requestAnimationFrame = (cb: FrameRequestCallback) => {
+      const handle = ++rafSeq;
+      rafQueue.set(handle, cb);
+      return handle;
+    };
+    (globalThis as any).cancelAnimationFrame = (handle: number) => {
+      rafQueue.delete(handle);
+    };
+  });
+
+  afterEach(() => {
+    while (pinOffsetWatcher.refs > 0) pinOffsetWatcher.release();
+    document.body.innerHTML = '';
+    (globalThis as any).ResizeObserver = originalResizeObserver;
+    (globalThis as any).requestAnimationFrame = originalRaf;
+    (globalThis as any).cancelAnimationFrame = originalCaf;
+  });
+
+  it('observes only the pin anchors, never document.body or documentElement', () => {
+    const header = mountAnchor('data-page-header', 120);
+    pinOffsetWatcher.acquire();
+
+    const toolbar = mountAnchor('data-fixed-toolbar', 170);
+    pinOffsetWatcher.sync();
+    flush();
+
+    // This is THE regression guard: observing the body closed the write ->
+    // relayout -> re-measure -> write feedback loop that pegged Safari at 100%.
+    expect(observed).not.toContain(document.body);
+    expect(observed).not.toContain(document.documentElement);
+    expect(observed).toEqual([header, header, toolbar]);
+  });
+
+  it('picks up an anchor that mounts after acquire()', () => {
+    // No anchors at all at acquire time: the fallback app-bar height is used.
+    pinOffsetWatcher.acquire();
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('45px');
+    expect(observed).toEqual([]);
+
+    // The page header mounts later (it is React-rendered, not guaranteed to
+    // exist when the first table starts pinning).
+    const header = mountAnchor('data-page-header', 132.6);
+    pinOffsetWatcher.sync();
+    flush();
+
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('133px');
+    expect(observed).toEqual([header]);
+  });
+
+  it('republishes from a window resize event, not from a document observer', () => {
+    let bottom = 100;
+    const el = document.createElement('div');
+    el.setAttribute('data-page-header', 'true');
+    el.getBoundingClientRect = () => ({ bottom, height: 40 }) as DOMRect;
+    document.body.appendChild(el);
+
+    pinOffsetWatcher.acquire();
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('100px');
+
+    bottom = 150;
+    window.dispatchEvent(new Event('resize'));
+    flush();
+
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('150px');
+
+    // The anchor ResizeObserver still exists and still drives a republish.
+    bottom = 160;
+    fireResize();
+    flush();
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('160px');
+  });
+
+  it('coalesces a burst of sync() calls into one frame and reads no geometry synchronously', () => {
+    let rectReads = 0;
+    let bottom = 100;
+    const el = document.createElement('div');
+    el.setAttribute('data-page-header', 'true');
+    el.getBoundingClientRect = () => {
+      rectReads += 1;
+      return { bottom, height: 40 } as DOMRect;
+    };
+    document.body.appendChild(el);
+
+    pinOffsetWatcher.acquire();
+    rafQueue.clear();
+    const readsAfterAcquire = rectReads;
+
+    // sync() stands in for the editor plugin's view.update(), which fires on
+    // EVERY transaction — a cursor move, a co-editor's awareness update. It must
+    // not measure inside that call (layout is dirty there), and 50 of them must
+    // cost one frame, not 50.
+    bottom = 150;
+    for (let i = 0; i < 50; i++) pinOffsetWatcher.sync();
+    expect(rectReads).toBe(readsAfterAcquire);
+    expect(rafQueue.size).toBe(1);
+
+    flush();
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('150px');
+  });
+
+  it('release() removes the window resize listener and cancels a queued frame', () => {
+    const addSpy = vi.spyOn(window, 'addEventListener');
+    const removeSpy = vi.spyOn(window, 'removeEventListener');
+
+    mountAnchor('data-page-header', 120);
+    pinOffsetWatcher.acquire();
+    const added = addSpy.mock.calls.find((c) => c[0] === 'resize');
+    expect(added).toBeDefined();
+
+    // A frame is queued and then the last table unpins.
+    pinOffsetWatcher.sync();
+    expect(rafQueue.size).toBe(1);
+    pinOffsetWatcher.release();
+
+    // The listener is gone (same reference — a leaked listener would keep the
+    // whole watcher alive), the frame is cancelled, and the property is cleared.
+    const removed = removeSpy.mock.calls.find((c) => c[0] === 'resize');
+    expect(removed?.[1]).toBe(added?.[1]);
+    expect(rafQueue.size).toBe(0);
+    expect(document.documentElement.style.getPropertyValue(
+      EDITOR_PIN_OFFSET_VAR,
+    )).toBe('');
+
+    // Nothing is left that could fire.
+    window.dispatchEvent(new Event('resize'));
+    expect(rafQueue.size).toBe(0);
+
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
   });
 });
 
@@ -572,6 +947,77 @@ describe('TablePinController oscillation latch', () => {
     expect(wrapper.classList.contains(PINNED)).toBe(true);
     expect(wrapper.classList.contains(NO_OVERFLOW)).toBe(false);
     expect(warnSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('holds a pin-offset reference only while actually pinning', () => {
+    const { wrapper, table } = buildFixture();
+    const ctrl = track(new TablePinController(wrapper, table));
+
+    // Constructing a controller must NOT start the watcher: nothing consumes
+    // --editor-pin-offset until a header row is pinned (an idle page with four
+    // unpinned tables used to run the watcher anyway — the CPU burn).
+    expect(pinOffsetWatcher.refs).toBe(0);
+
+    io.emit(true); // -> native
+    expect(pinOffsetWatcher.refs).toBe(1);
+    io.emit(false); // -> fallback
+    expect(pinOffsetWatcher.refs).toBe(1);
+
+    // Latched (still pinned, in the transform fallback).
+    driveOscillation();
+    expect(pinOffsetWatcher.refs).toBe(1);
+
+    // Cooldown re-arm back into native.
+    now += 31_000;
+    ctrl.refresh();
+    io.emit(true);
+    expect(pinOffsetWatcher.refs).toBe(1);
+
+    // Spend the retry budget: give-up state, still pinned.
+    for (let latch = 0; latch < 3; latch++) {
+      driveOscillation();
+      now += 31_000;
+      ctrl.refresh();
+    }
+    expect(pinOffsetWatcher.refs).toBe(1);
+
+    // Ineligible -> 'off' must release, latched or not.
+    setFirstRowCells(table, 'td');
+    ctrl.refresh();
+    expect(wrapper.classList.contains(PINNED)).toBe(false);
+    expect(pinOffsetWatcher.refs).toBe(0);
+
+    // Eligible again -> pinned again -> held again.
+    setFirstRowCells(table, 'th');
+    ctrl.refresh();
+    io.emit(true);
+    expect(pinOffsetWatcher.refs).toBe(1);
+
+    ctrl.destroy();
+    ctrl.destroy();
+    expect(pinOffsetWatcher.refs).toBe(0);
+  });
+
+  it('keeps the refcount at least one while any controller is pinned', () => {
+    const a = buildFixture();
+    const b = buildFixture();
+    // The stub keeps only the most recently constructed observer callback, so
+    // pin each controller right after constructing it.
+    const ctrlA = track(new TablePinController(a.wrapper, a.table));
+    io.emit(true);
+    const ctrlB = track(new TablePinController(b.wrapper, b.table));
+    io.emit(true);
+
+    expect(pinOffsetWatcher.refs).toBe(2);
+
+    ctrlA.destroy();
+    // B is still pinned: the watcher must stay alive, or its sticky header row
+    // would fall back to the CSS default offset mid-scroll.
+    expect(pinOffsetWatcher.refs).toBe(1);
+    expect(b.wrapper.classList.contains(PINNED)).toBe(true);
+
+    ctrlB.destroy();
+    expect(pinOffsetWatcher.refs).toBe(0);
   });
 
   it('has an idempotent destroy that does not double-release the watcher', () => {
