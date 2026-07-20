@@ -93,6 +93,7 @@ import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { usePageContentCache } from "./hooks/use-page-content-cache";
 import { useScrollRestoreOnSwap } from "./hooks/use-scroll-position";
 import { useSwapHeightReservation } from "./hooks/use-swap-height-reservation";
+import { decideSocketIdleAction } from "./hooks/socket-idle-reconnect";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
 import ColumnsMenu from "@/features/editor/components/columns/columns-menu.tsx";
 import { TransclusionLookupProvider } from "@/features/editor/components/transclusion/transclusion-lookup-context";
@@ -473,27 +474,41 @@ export default function PageEditor({
     };
   }, [pageId]);
 
+  // Marks the socket as "disconnected BY US for being idle+hidden". Only such
+  // a disconnect is ours to undo, and only once per transition — see
+  // `decideSocketIdleAction` for why a level-triggered `socket.connect()`
+  // destroys Hocuspocus's reconnect backoff.
+  const idleDisconnectedRef = useRef(false);
+
   // Only connect/disconnect on tab/idle, not destroy
   useEffect(() => {
     if (!providersReady || !providersRef.current) return;
     const socket = providersRef.current.socket;
 
-    if (
-      isIdle &&
-      documentState === "hidden" &&
-      yjsConnectionStatus === WebSocketStatus.Connected
-    ) {
+    const action = decideSocketIdleAction({
+      isIdle,
+      documentState,
+      status: yjsConnectionStatus,
+      idleDisconnected: idleDisconnectedRef.current,
+    });
+
+    if (action === "disconnect") {
+      idleDisconnectedRef.current = true;
       socket.disconnect();
       return;
     }
-    if (
-      documentState === "visible" &&
-      yjsConnectionStatus === WebSocketStatus.Disconnected
-    ) {
+    if (action === "connect") {
+      idleDisconnectedRef.current = false;
       resetIdle();
       socket.connect();
     }
-  }, [isIdle, documentState, providersReady, resetIdle]);
+  }, [
+    isIdle,
+    documentState,
+    yjsConnectionStatus,
+    providersReady,
+    resetIdle,
+  ]);
 
   // Attach the remote provider once it's ready (and again after a pageId swap
   // recreates it) to make sure the connection gets properly established. This

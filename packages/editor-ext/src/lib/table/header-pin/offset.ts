@@ -24,10 +24,14 @@ export function computePinTop(): number {
   // pinned/transformed header row keeps nudging the anchor rect by sub-pixel
   // amounts. Without rounding, publish()'s `top === lastValue` dedupe below never
   // holds, so every ResizeObserver tick rewrites --editor-pin-offset on
-  // documentElement — which in WebKit (no independent-inheritance fast path for
-  // custom properties) is a full-document style recalc, feeding the very layout
-  // jitter that triggered the tick. A whole pixel is below the visible threshold
-  // for the pin offset, so quantizing costs nothing visually.
+  // documentElement. That write is expensive in EVERY engine: an inherited custom
+  // property set on the root invalidates the computed style of the whole
+  // document. Here it costs more still, because the property is the `top`
+  // constraint of every `position: sticky` header row on the page, so each write
+  // also forces every sticky constraint to be re-evaluated — feeding the very
+  // layout jitter that triggered the tick. (No WebKit-vs-Blink asymmetry is
+  // claimed: we have not measured one.) A whole pixel is below the visible
+  // threshold for the pin offset, so quantizing costs nothing visually.
   return Math.round(bottom);
 }
 

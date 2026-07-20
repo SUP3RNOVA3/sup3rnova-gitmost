@@ -47,25 +47,42 @@
     line-height: var(--mantine-line-height-md);
   }
 
+  /* The placeholder shimmer used to animate `background-position` on a
+     `background-size: 400% 400%` gradient. That is not a compositable
+     property: every frame re-rasterizes the whole gradient over the element's
+     box on the main thread, for as long as the media is loading (and, before
+     the error path existed, forever on a broken attachment).
+
+     `opacity` is compositable, so the animation now runs off the main thread.
+     The class sits on the replaced element itself (`<img>` / `<video>`), which
+     cannot carry a `::before`, so a translated pseudo-element is not an option
+     here — we keep the same gradient, frozen at its light-band position, and
+     breathe it instead. Same duration and easing. */
   .media-pulse {
     animation: media-pulse 1.2s ease-in-out infinite;
+    will-change: opacity;
 
     @mixin light {
       background: linear-gradient(-90deg, var(--mantine-color-gray-3) 0%, var(--mantine-color-gray-1) 50%, var(--mantine-color-gray-3) 100%);
       background-size: 400% 400%;
+      background-position: -60% 0%;
     }
 
     @mixin dark {
       background: linear-gradient(-90deg, var(--mantine-color-dark-6) 0%, var(--mantine-color-dark-5) 50%, var(--mantine-color-dark-6) 100%);
       background-size: 400% 400%;
+      background-position: -60% 0%;
     }
 
     @keyframes media-pulse {
       0% {
-        background-position: 0% 0%;
+        opacity: 1;
+      }
+      50% {
+        opacity: 0.55;
       }
       100% {
-        background-position: -135% 0%;
+        opacity: 1;
       }
     }
   }

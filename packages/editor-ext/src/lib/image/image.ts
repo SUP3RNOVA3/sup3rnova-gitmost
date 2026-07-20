@@ -7,7 +7,7 @@ import {
 } from "@tiptap/core";
 import { ResizableNodeView } from "../resizable-nodeview";
 import type { ResizableNodeViewDirection } from "../resizable-nodeview";
-import { normalizeFileUrl } from "../media-utils";
+import { attachMediaPlaceholder, normalizeFileUrl } from "../media-utils";
 
 export type ImageResizeOptions = {
   enabled: boolean;
@@ -402,14 +402,13 @@ export const TiptapImage = Image.extend<ImageOptions>({
         });
       }
 
-      // Show skeleton background while image loads from server
-      dom.style.pointerEvents = "none";
-      el.classList.add("media-pulse");
-
-      el.onload = () => {
-        dom.style.pointerEvents = "";
-        el.classList.remove("media-pulse");
-      };
+      // Show the skeleton placeholder while the image loads from the server.
+      // Settles on success AND on error — see attachMediaPlaceholder.
+      attachMediaPlaceholder(el, dom, {
+        nodeType: "image",
+        src: el.src,
+        readyEvent: "load",
+      });
 
       return nodeView;
     };
