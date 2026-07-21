@@ -62,7 +62,6 @@ import {
   TransclusionSource,
   TransclusionReference,
   PageEmbed,
-  TableView,
   FootnoteReference,
   FootnotesList,
   FootnoteDefinition,
@@ -293,7 +292,11 @@ export const mainExtensions = [
     lastColumnResizable: true,
     allowTableNodeSelection: true,
     cellMinWidth: 49,
-    View: TableView,
+    // No `View:` here on purpose. That option only reaches prosemirror-tables'
+    // columnResizing plugin, whose nodeViews are plugin props — the node view
+    // CustomTable registers via addNodeView() is a DIRECT EditorView prop and
+    // always wins in someProp('nodeViews'). Passing TableView here therefore
+    // configured an owner that never ran; the real one lives in CustomTable.
   }),
   TableRow,
   TableCell,
