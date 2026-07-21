@@ -7,7 +7,11 @@ import {
 } from "@tiptap/core";
 import { DOMOutputSpec, Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { TextSelection } from "@tiptap/pm/state";
-import { cellAround } from "@tiptap/pm/tables";
+import {
+  cellAround,
+  columnResizing,
+  columnResizingPluginKey,
+} from "@tiptap/pm/tables";
 import { TableView } from "./table-view";
 
 const LIST_TYPES = ["bulletList", "orderedList", "taskList"];
@@ -40,6 +44,69 @@ function handleListOutdent(editor: Editor): boolean {
 }
 
 export const CustomTable = Table.extend({
+
+  // Upstream (@tiptap/extension-table) gates the column-resizing plugin on
+  // `this.options.resizable && this.editor.isEditable`. `addProseMirrorPlugins`
+  // runs exactly ONCE, at editor construction, and the body editor in
+  // page-editor.tsx is deliberately constructed with a constant
+  // `editable: false` (local-first Ф7 — it stops the editor being destroyed and
+  // recreated when /pages/info lands). Editability is flipped afterwards via
+  // `setEditable`, which does NOT rebuild the plugin set, so `isResizable` was
+  // permanently false and columnResizing was never installed: no resize
+  // handles, no draggable column borders, ever.
+  //
+  // The fix is to gate on `this.options.resizable` ALONE. That is safe because
+  // prosemirror-tables guards columnResizing at RUNTIME instead: handleMouseMove,
+  // handleMouseLeave and handleMouseDown all early-return on `!view.editable`,
+  // and the resize handle is a decoration that is only produced once a handle is
+  // active. In a read-only editor the plugin is therefore inert.
+  addProseMirrorPlugins() {
+    // Everything except columnResizing comes from the parent verbatim, so
+    // tableEditing keeps exactly upstream's configuration and any plugin
+    // upstream adds later is inherited for free. The parent DOES include a
+    // columnResizing of its own whenever the editor happens to be editable at
+    // construction time, so it is filtered out here — otherwise the plugin
+    // would be registered twice (ProseMirror rejects duplicate plugin keys).
+    const inherited = (this.parent?.() ?? []).filter(
+      (plugin) => plugin.spec?.key !== columnResizingPluginKey,
+    );
+
+    if (!this.options.resizable) {
+      return inherited;
+    }
+
+    // Upstream's order: columnResizing before tableEditing.
+    return [
+      columnResizing({
+        handleWidth: this.options.handleWidth,
+        cellMinWidth: this.options.cellMinWidth,
+        // Mirrors upstream, which passes cellMinWidth for both knobs.
+        defaultCellMinWidth: this.options.cellMinWidth,
+        lastColumnResizable: this.options.lastColumnResizable,
+        // DELIBERATE: `null` tells prosemirror-tables to install NO table node
+        // view of its own (`if (View && nodeViews)` in the plugin's state.init
+        // — `null` is the documented opt-out). The table node view is owned by
+        // `addNodeView()` below, which is what stops the 150 Hz DOM-repair loop
+        // (af06bab6); leaving the default `View` here would create a second
+        // owner for the same node. Ours would still win — tiptap passes
+        // extension node views as a direct `EditorView._props.nodeViews` entry
+        // and `someProp` consults `_props` before plugin props — but "wins by
+        // lookup order" is a latent trap, so the competing owner is removed
+        // outright rather than merely out-ranked. Nothing is lost: the live
+        // drag preview (`displayColumnWidth`) walks up to the <table> element
+        // from `view.domAtPos` and rewrites the colgroup directly, without
+        // going through any node view, and the committed colwidth attrs are
+        // re-rendered by TableView.update().
+        //
+        // Consequence worth knowing: upstream's `TableOptions.View` is now
+        // deliberately NOT forwarded, so `CustomTable.configure({ View })` is a
+        // no-op. The table node view is not configurable from the outside any
+        // more — it is `addNodeView()` below, always.
+        View: null,
+      }),
+      ...inherited,
+    ];
+  },
 
   addKeyboardShortcuts() {
     return {

@@ -3,8 +3,10 @@ import { Editor } from '@tiptap/core';
 import { Document } from '@tiptap/extension-document';
 import { Paragraph } from '@tiptap/extension-paragraph';
 import { Text } from '@tiptap/extension-text';
+import { History } from '@tiptap/extension-history';
 import { Schema } from '@tiptap/pm/model';
 import type { Node as PMNode } from '@tiptap/pm/model';
+import { columnResizingPluginKey, tableEditingKey } from '@tiptap/pm/tables';
 
 import { TableView } from './table-view';
 import { CustomTable } from './table';
@@ -260,28 +262,39 @@ describe('table node view in a real editor', () => {
   });
 
   /**
-   * `resizable` defaults to FALSE here on purpose, and that models production:
-   * the body editor is constructed with `editable: false` (page-editor.tsx) and
-   * only flipped later via setEditable, which does not rebuild plugins — so
-   * tiptap's `isResizable = resizable && editor.isEditable` is false and
-   * prosemirror-tables' columnResizing (which would install ITS OWN table node
-   * view as a fallback) is never in the plugin set. With `resizable: true` that
-   * fallback view masks the regression: removing our `addNodeView` still yields
-   * 0 updateState calls, because pm-tables' view also ignores wrapper
-   * attribute mutations. Measured, not assumed — see the ownership test below.
+   * `resizable` defaults to FALSE here on purpose: it is the configuration in
+   * which columnResizing is definitely absent from the plugin set, so the
+   * CPU-burn tests below observe OUR node view and nothing else. (Historically
+   * pm-tables' columnResizing installed its own fallback table node view, which
+   * also ignores wrapper attribute mutations and would therefore mask the
+   * regression — removing our `addNodeView` still yielded 0 updateState calls.
+   * CustomTable now passes `View: null`, so that fallback no longer exists, but
+   * keeping these tests on the resizing-free path keeps them independent of
+   * that decision.)
    */
   function makeEditor({
     resizable = false,
+    editable = true,
+    history = false,
     HTMLAttributes,
-  }: { resizable?: boolean; HTMLAttributes?: Record<string, any> } = {}) {
+  }: {
+    resizable?: boolean;
+    editable?: boolean;
+    history?: boolean;
+    HTMLAttributes?: Record<string, any>;
+  } = {}) {
     const element = document.createElement('div');
     document.body.appendChild(element);
     const editor = new Editor({
       element,
+      editable,
       extensions: [
         Document,
         Paragraph,
         Text,
+        // Only loaded where a test needs REAL undo, so the other tests keep the
+        // minimal plugin set their assertions count.
+        ...(history ? [History] : []),
         CustomTable.configure({
           resizable,
           cellMinWidth: 49,
@@ -325,15 +338,11 @@ describe('table node view in a real editor', () => {
     expect(wrapper.classList.contains('tableHeaderPinned')).toBe(true);
   });
 
-  it('owns the table DOM even when columnResizing contributes its own view', () => {
-    // Guards the historical failure mode directly: the configured owner was
-    // never the one ProseMirror actually used. Our node view is a direct
-    // EditorView prop, so it must win someProp('nodeViews') over the plugin's.
-    const { element } = makeEditor({ resizable: true });
-    const wrapper: any = element.querySelector('.tableWrapper')!;
-
-    expect(wrapper.pmViewDesc.spec).toBeInstanceOf(TableView);
-  });
+  // NOTE — the former 'owns the table DOM even when columnResizing contributes
+  // its own view' test lived here. It rested on a premise that is no longer
+  // true (CustomTable passes `View: null`, so columnResizing never offers a
+  // node view at all) and duplicated the `editable=true` case of the
+  // parametrised ownership test in the 'column resizing' block below.
 
   it('still lets real content edits inside the table reach the document', () => {
     const { editor, element } = makeEditor();
@@ -392,5 +401,320 @@ describe('table node view in a real editor', () => {
       );
 
     expect(normalise(live)).toBe(normalise(exported));
+  });
+
+  /**
+   * Regression guard for "table column resizing stopped working".
+   *
+   * Upstream gates columnResizing on `resizable && editor.isEditable` inside
+   * `addProseMirrorPlugins()`, which runs ONCE at construction. The body editor
+   * is constructed with a constant `editable: false` (page-editor.tsx, Ф7) and
+   * only becomes editable later via `setEditable`, which does not rebuild
+   * plugins — so the plugin was never installed and no column could ever be
+   * dragged. A unit test of the option cannot catch this: the whole bug is
+   * "the plugin is not in the plugin set", which only a real Editor shows.
+   */
+  describe('column resizing', () => {
+    const hasColumnResizing = (editor: Editor) =>
+      editor.view.state.plugins.some(
+        (plugin) => plugin.spec?.key === columnResizingPluginKey,
+      );
+
+    it('installs columnResizing even when the editor is constructed read-only', () => {
+      const { editor } = makeEditor({ resizable: true, editable: false });
+
+      expect(editor.isEditable).toBe(false);
+      expect(hasColumnResizing(editor)).toBe(true);
+    });
+
+    it('installs columnResizing exactly once when constructed editable', () => {
+      const { editor } = makeEditor({ resizable: true, editable: true });
+
+      const matches = editor.view.state.plugins.filter(
+        (plugin) => plugin.spec?.key === columnResizingPluginKey,
+      );
+      expect(matches).toHaveLength(1);
+    });
+
+    it('does not install columnResizing when resizable is off', () => {
+      const { editor } = makeEditor({ resizable: false });
+
+      expect(hasColumnResizing(editor)).toBe(false);
+    });
+
+    it('keeps tableEditing (and only one copy of it) alongside columnResizing', () => {
+      const { editor } = makeEditor({ resizable: true, editable: false });
+
+      const tableEditingPlugins = editor.view.state.plugins.filter(
+        (plugin) => plugin.spec?.key === tableEditingKey,
+      );
+      expect(tableEditingPlugins).toHaveLength(1);
+    });
+
+    /**
+     * The ownership invariant behind the 150 Hz DOM-repair fix (af06bab6):
+     * columnResizing may not take over the table DOM. CustomTable passes
+     * `View: null`, so pm-tables installs no node view at all and ours is the
+     * only owner — asserted here with the resize plugin actually present, in
+     * BOTH construction-time editability states.
+     */
+    it.each([true, false])(
+      'keeps TableView as the table DOM owner with columnResizing present (editable=%s)',
+      (editable) => {
+        const { editor, element } = makeEditor({ resizable: true, editable });
+
+        expect(hasColumnResizing(editor)).toBe(true);
+
+        const wrapper: any = element.querySelector('.tableWrapper')!;
+        expect(wrapper.pmViewDesc.spec).toBeInstanceOf(TableView);
+
+        // And the plugin really did decline to register a competing one.
+        const resizingPlugin = editor.view.state.plugins.find(
+          (plugin) => plugin.spec?.key === columnResizingPluginKey,
+        )!;
+        expect((resizingPlugin.spec as any).props.nodeViews).toEqual({});
+      },
+    );
+
+    /**
+     * jsdom has no layout: `getBoundingClientRect()` is all zeros and
+     * `document.elementFromPoint` does not exist, so `view.posAtCoords` cannot
+     * resolve anything. Left alone, EVERY "no resize handle appears" assertion
+     * passes for that reason instead of the one it claims — flipping
+     * `editable: false` to `true` would not turn such a test red. These helpers
+     * supply the missing layout primitives so the POSITIVE arm genuinely fires,
+     * which is what gives the negative arm its meaning.
+     */
+    const CELL_LEFT = 0;
+    const CELL_RIGHT = 100;
+
+    function firstCellPos(editor: Editor) {
+      let found = -1;
+      editor.state.doc.descendants((node, pos) => {
+        if (found > -1) return false;
+        if (node.type.name === 'tableHeader' || node.type.name === 'tableCell') {
+          found = pos;
+          return false;
+        }
+        return true;
+      });
+      return found;
+    }
+
+    // Gives the first cell a real box and makes posAtCoords resolve into it.
+    function armLayout(editor: Editor, cell: HTMLElement) {
+      const cellPos = firstCellPos(editor);
+      cell.getBoundingClientRect = () =>
+        ({
+          left: CELL_LEFT,
+          right: CELL_RIGHT,
+          top: 0,
+          bottom: 20,
+          width: CELL_RIGHT - CELL_LEFT,
+          height: 20,
+          x: CELL_LEFT,
+          y: 0,
+          toJSON: () => ({}),
+        }) as DOMRect;
+      // `+2` lands inside the paragraph inside the cell, which is what a real
+      // hit-test returns and what `cellAround` needs to walk back up from.
+      (editor.view as any).posAtCoords = () => ({
+        pos: cellPos + 2,
+        inside: cellPos,
+      });
+      return cellPos;
+    }
+
+    /**
+     * Drives a REAL prosemirror-tables drag of the first column to `toX`: arm
+     * the handle, mousedown on the cell, mousemove on the window, mouseup. The
+     * handle is armed directly rather than by hovering because the drag itself
+     * is what is under test here; the hover path has its own test above.
+     */
+    function dragFirstColumnTo(editor: Editor, cell: HTMLElement, toX: number) {
+      // jsdom has no elementFromPoint at all, and ProseMirror's own mousedown
+      // handling hit-tests.
+      (document as any).elementFromPoint = () => null;
+      const cellPos = firstCellPos(editor);
+
+      editor.view.dispatch(
+        editor.state.tr.setMeta(columnResizingPluginKey, { setHandle: cellPos }),
+      );
+      cell.dispatchEvent(
+        new MouseEvent('mousedown', { bubbles: true, clientX: 100 }),
+      );
+
+      // `move()` bails unless the primary button is still held; jsdom does not
+      // derive `which` from the constructor, so it is set explicitly.
+      const drag = new MouseEvent('mousemove', { clientX: toX });
+      Object.defineProperty(drag, 'which', { value: 1 });
+      window.dispatchEvent(drag);
+
+      return { cellPos, release: () => window.dispatchEvent(new MouseEvent('mouseup', { clientX: toX })) };
+    }
+
+    function columnWidths(editor: Editor) {
+      const widths: (number[] | null)[] = [];
+      editor.state.doc.descendants((node) => {
+        if (node.type.name === 'tableHeader' || node.type.name === 'tableCell') {
+          widths.push(node.attrs.colwidth);
+        }
+        return true;
+      });
+      return widths;
+    }
+
+    function hoverRightEdge(cell: HTMLElement) {
+      cell.dispatchEvent(
+        new MouseEvent('mousemove', {
+          bubbles: true,
+          clientX: CELL_RIGHT,
+          clientY: 10,
+        }),
+      );
+    }
+
+    /**
+     * The differential pair for the runtime guard. prosemirror-tables early-
+     * returns on `!view.editable` in handleMouseMove/handleMouseLeave/
+     * handleMouseDown, and the handle is a decoration that only exists once a
+     * handle is active. With identical layout stubs and an identical mousemove,
+     * the editable editor MUST arm a handle and the read-only one MUST NOT —
+     * so the read-only assertion cannot pass by accident.
+     */
+    it.each([
+      ['editable', true],
+      ['read-only', false],
+    ])(
+      'arms a resize handle on a cell-edge hover only when editable (%s)',
+      (_label, editable) => {
+        const { editor, element } = makeEditor({ resizable: true, editable });
+        const cell = element.querySelector('th')!;
+        const cellPos = armLayout(editor, cell);
+        expect(cellPos).toBeGreaterThan(-1);
+
+        hoverRightEdge(cell);
+
+        const activeHandle = columnResizingPluginKey.getState(
+          editor.state,
+        ).activeHandle;
+
+        if (editable) {
+          expect(activeHandle).toBe(cellPos);
+          expect(
+            element.querySelectorAll('.column-resize-handle').length,
+          ).toBeGreaterThan(0);
+        } else {
+          expect(activeHandle).toBe(-1);
+          expect(element.querySelectorAll('.column-resize-handle')).toHaveLength(
+            0,
+          );
+        }
+      },
+    );
+
+    it('renders the table normally in a read-only editor despite the plugin', () => {
+      const { editor, element } = makeEditor({
+        resizable: true,
+        editable: false,
+      });
+
+      const wrapper: any = element.querySelector('.tableWrapper')!;
+      expect(wrapper).toBeTruthy();
+      expect(wrapper.pmViewDesc.spec).toBeInstanceOf(TableView);
+      expect(wrapper.querySelectorAll('td, th').length).toBe(4);
+      expect(editor.state.doc.textContent).toBe('abcd');
+    });
+
+    /**
+     * The main user scenario, and the only place the two style models meet:
+     * prosemirror-tables' live preview writes `style.width` straight into the
+     * colgroup owned by OUR TableView (which otherwise writes `min-width`), and
+     * the commit re-renders that colgroup through `TableView.update()`. Pins
+     * both the user-facing result and the af06bab6 ownership invariant UNDER
+     * drag load, which is the only runtime force that perturbs table geometry.
+     */
+    it('commits a column width on a real drag and keeps TableView owning the DOM', () => {
+      const { editor, element } = makeEditor({
+        resizable: true,
+        editable: true,
+      });
+      const cell = element.querySelector('th')!;
+      const wrapperBefore = element.querySelector('.tableWrapper')!;
+
+      const { release } = dragFirstColumnTo(editor, cell, 300);
+      expect(
+        columnResizingPluginKey.getState(editor.state).dragging,
+      ).toBeTruthy();
+
+      // The live preview reached OUR colgroup rather than one of its own.
+      const colsDuringDrag = Array.from(
+        element.querySelectorAll('col'),
+      ) as HTMLTableColElement[];
+      expect(colsDuringDrag[0].style.width).toBe('200px');
+
+      release();
+
+      // Committed to the document on EVERY cell of the dragged column: cells 0
+      // and 2 are column one of a 2x2 table.
+      const widths = columnWidths(editor);
+      expect(widths[0]).toEqual([200]);
+      expect(widths[2]).toEqual([200]);
+      expect(widths[1]).toBeNull();
+      expect(widths[3]).toBeNull();
+
+      // Re-rendered through TableView.update(), and the wrapper is the SAME
+      // element — so the header-pin controller bound to it survived the drag
+      // and the af06bab6 destroy/recreate loop did not come back.
+      expect(
+        (element.querySelector('col') as HTMLTableColElement).style.width,
+      ).toBe('200px');
+      const wrapperAfter: any = element.querySelector('.tableWrapper')!;
+      expect(wrapperAfter).toBe(wrapperBefore);
+      expect(wrapperAfter.pmViewDesc.spec).toBeInstanceOf(TableView);
+    });
+
+    /**
+     * Z1: a column going from "has width" back to "no width" must actually lose
+     * its `width`. `getColStyleDeclaration` writes EITHER `width` or
+     * `min-width`, so without clearing the opposite property the stale `width`
+     * survives undo while the <table> recomputes — a visibly inconsistent
+     * table. Unreachable before this branch (colwidth never changed at runtime
+     * without columnResizing); reachable now via undo, version restore, or a
+     * remote collab edit.
+     */
+    it('clears a committed column width again on a real undo', () => {
+      const { editor, element } = makeEditor({
+        resizable: true,
+        editable: true,
+        history: true,
+      });
+      const firstCol = () =>
+        element.querySelector('col') as HTMLTableColElement;
+      const table = () => element.querySelector('table') as HTMLTableElement;
+      const styleBefore = firstCol().style.cssText;
+      const tableStyleBefore = table().style.cssText;
+
+      const { release } = dragFirstColumnTo(
+        editor,
+        element.querySelector('th')!,
+        300,
+      );
+      release();
+      expect(columnWidths(editor)[0]).toEqual([200]);
+      expect(firstCol().style.width).toBe('200px');
+
+      editor.commands.undo();
+
+      // The document really did drop the width...
+      expect(columnWidths(editor)[0]).toBeNull();
+      // ...and so did the DOM. Before the fix the stale `width` survived here
+      // while the <table> recomputed its own min-width, leaving a table that
+      // was visibly wider than the document said it was.
+      expect(firstCol().style.width).toBe('');
+      expect(firstCol().style.minWidth).toBe('49px');
+      expect(firstCol().style.cssText).toBe(styleBefore);
+      expect(table().style.cssText).toBe(tableStyleBefore);
+    });
   });
 });

@@ -24,7 +24,6 @@ export function updateColumns(
           overrideCol === col
             ? overrideValue
             : ((colwidth && colwidth[j]) as number | undefined);
-        const cssWidth = hasWidth ? `${hasWidth}px` : '';
 
         totalWidth += hasWidth || cellMinWidth;
 
@@ -44,16 +43,29 @@ export function updateColumns(
 
           colgroup.appendChild(colElement);
         } else {
-          if ((nextDOM as HTMLTableColElement).style.width !== cssWidth) {
-            const [propertyKey, propertyValue] = getColStyleDeclaration(
-              cellMinWidth,
-              hasWidth,
-            );
-
-            (nextDOM as HTMLTableColElement).style.setProperty(
-              propertyKey,
-              propertyValue,
-            );
+          const existingCol = nextDOM as HTMLTableColElement;
+          const [propertyKey, propertyValue] = getColStyleDeclaration(
+            cellMinWidth,
+            hasWidth,
+          );
+          // `getColStyleDeclaration` writes EITHER `width` (sized column) or
+          // `min-width` (unsized one), so a column losing its width leaves the
+          // old `width` behind and the browser keeps honouring it. Upstream
+          // tiptap has the same bug — plus it compares `style.width` against a
+          // value it may write to `min-width`, so the compared and written
+          // properties diverge — but it was UNREACHABLE here until this branch
+          // installed columnResizing: without it `colwidth` never changed at
+          // runtime. Now undo-after-resize, restoring an older page version and
+          // remote collab edits all hit it, so the opposite property is cleared
+          // explicitly. (prosemirror-tables' own TableView does not suffer from
+          // this: it always assigns `style.width`, and the empty string clears.)
+          const otherKey = propertyKey === 'width' ? 'min-width' : 'width';
+          if (
+            existingCol.style.getPropertyValue(propertyKey) !== propertyValue ||
+            existingCol.style.getPropertyValue(otherKey)
+          ) {
+            existingCol.style.removeProperty(otherKey);
+            existingCol.style.setProperty(propertyKey, propertyValue);
           }
 
           nextDOM = nextDOM.nextSibling;
