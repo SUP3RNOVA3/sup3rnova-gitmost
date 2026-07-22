@@ -182,9 +182,11 @@ export function useDrawioRasterSave<TTarget>(
   );
 
   // ---- png raster generation with match/budget checks (A3/A6) ---------------
-  // Returns a data-URI on success, or null WITH a reason for a graceful skip.
-  // THROWS only on export failure/timeout (the caller counts those toward the
-  // circuit-breaker); a budget/mismatch skip is not a server failure.
+  // Returns a data-URI on success, or null WITH a reason when the raster is
+  // dropped for being over the byte budget (a persistent state-mismatch now
+  // embeds best-effort, it no longer drops the raster). THROWS only on export
+  // failure/timeout (the caller counts those toward the circuit-breaker); an
+  // over-budget skip is not a server failure.
   const generateRaster = useCallback(
     async (
       sourceXml: string | null,
@@ -209,10 +211,16 @@ export function useDrawioRasterSave<TTarget>(
         if (token !== saveTokenRef.current)
           return { dataUri: null, reason: null };
         if (!xmlStatesMatch(sourceXml, resp.xml)) {
-          return {
-            dataUri: null,
-            reason: t("the diagram changed while the preview was rendering"),
-          };
+          // Embed the preview best-effort: the png/svg state could not be
+          // confirmed equal even after a retry, so this png may render a
+          // slightly-different state than the svg source. We accept that as the
+          // lesser evil vs. dropping the raster entirely (no data-raster ->
+          // the diagram is lost on downstream publish). Do NOT return early:
+          // fall through to the shared budget/downscale tail below so this png
+          // is still capped by the byte budget like the matched path.
+          console.warn(
+            "drawio raster: png/svg state check could not be confirmed after a retry; embedding the preview best-effort",
+          );
         }
       }
 
@@ -286,8 +294,8 @@ export function useDrawioRasterSave<TTarget>(
             const r = await generateRaster(sourceXml, token);
             if (token !== saveTokenRef.current) return;
             rasterDataUri = r.dataUri;
-            // A completed export (raster used, OR skipped over-budget/mismatch)
-            // proves the server works, so it resets the failure streak (A6).
+            // A completed export (raster used, OR skipped over-budget) proves
+            // the server works, so it resets the failure streak (A6).
             applyCircuitBreaker(rasterDataUri ? "raster" : "skip");
             if (!rasterDataUri && r.reason) {
               notify(

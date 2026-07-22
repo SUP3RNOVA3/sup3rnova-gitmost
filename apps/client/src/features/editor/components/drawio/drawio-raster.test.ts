@@ -199,12 +199,39 @@ describe("xmlStatesMatch (volatile-attr-insensitive compare, A3)", () => {
     expect(xmlStatesMatch(base, changed)).toBe(false);
   });
 
-  it("only strips volatile attrs on the mxfile tag, keeping host", () => {
+  it("strips all mxfile wrapper attrs, keeping the inner content", () => {
     const stripped = stripVolatileMxfileAttrs(base);
-    expect(stripped).toContain('host="drawio"');
+    // Every attribute on the <mxfile> wrapper is gone — it is now bare.
+    expect(stripped).toContain("<mxfile>");
+    expect(stripped).not.toContain('host="drawio"');
     expect(stripped).not.toContain("modified=");
     expect(stripped).not.toContain("etag=");
     expect(stripped).not.toContain("agent=");
+    // The children (the actual diagram content) are preserved untouched.
+    expect(stripped).toContain(
+      "<diagram><mxGraphModel><root>" +
+        '<mxCell id="2" value="A"/></root></mxGraphModel></diagram></mxfile>',
+    );
+  });
+
+  it("preserves a self-closing <mxfile/> when stripping attrs", () => {
+    expect(stripVolatileMxfileAttrs('<mxfile host="drawio"/>')).toBe(
+      "<mxfile/>",
+    );
+    expect(stripVolatileMxfileAttrs("<mxfile/>")).toBe("<mxfile/>");
+  });
+
+  it("treats empty/absent png xml as a match (png export returns no xml)", () => {
+    expect(xmlStatesMatch(base, "")).toBe(true);
+    expect(xmlStatesMatch("", base)).toBe(true);
+    expect(xmlStatesMatch(base, undefined as any)).toBe(true);
+  });
+
+  it("treats two exports differing only in a non-content mxfile attr (host/type/pages) as equal", () => {
+    const variant = base
+      .replace('host="drawio"', 'host="embed.diagrams.net"')
+      .replace('<mxfile ', '<mxfile pages="1" ');
+    expect(xmlStatesMatch(base, variant)).toBe(true);
   });
 });
 

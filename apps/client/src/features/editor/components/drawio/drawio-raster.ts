@@ -144,24 +144,44 @@ export function isValidDrawioSvg(svgString: string): boolean {
 }
 
 /**
- * Strip the volatile `<mxfile …>` attributes that change on every export even
- * when the diagram content is identical, so two exports of the SAME state
- * compare equal (A3). We only touch attributes on the root `<mxfile>` tag.
+ * Strip EVERY attribute from the root `<mxfile …>` opening tag (A3). Every
+ * attribute on the `<mxfile>` wrapper — `host`, `modified`, `agent`, `etag`,
+ * `version`, `type`, `pages`, `scale`, `border`, … — is environment metadata
+ * recorded by whichever draw.io instance produced the export; none of it
+ * affects the actual diagram content, which lives entirely in the `<mxfile>`
+ * children (`<diagram>`/`<mxGraphModel>`/`<mxCell>`). Reducing the wrapper to a
+ * bare `<mxfile>` lets two exports of the SAME state — an `xmlsvg` and a plain
+ * `png` export made milliseconds apart, which routinely differ in these
+ * metadata attrs — compare equal. We only touch the `<mxfile>` opening tag,
+ * never its children. Null/empty-safe: returns the input unchanged when falsy.
  */
 export function stripVolatileMxfileAttrs(xml: string): string {
   if (!xml) return xml;
-  return xml.replace(/<mxfile\b[^>]*>/, (tag) =>
-    tag.replace(/\s+(?:modified|etag|agent|version)="[^"]*"/g, ""),
-  );
+  // Preserve an optional self-close so `<mxfile/>` stays `<mxfile/>` (never
+  // dropping the `/`); only the root tag's attributes are removed.
+  return xml.replace(/<mxfile\b[^>]*?(\/?)>/, "<mxfile$1>");
 }
 
 /**
- * Compare two mxgraph sources for the SAME diagram state, ignoring volatile
- * `mxfile` attributes (A3). Used to confirm the svg export and the png export
- * captured the same state before embedding the raster.
+ * Compare two mxgraph sources for the SAME diagram state, ignoring the volatile
+ * `<mxfile>` wrapper attributes (A3). Used to confirm the svg export and the png
+ * export captured the same state before embedding the raster.
+ *
+ * Robust by construction: null/undefined coerce to "", and if EITHER side is
+ * blank after trimming we return `true` — the plain `png` export legitimately
+ * returns no `xml`, and it was captured milliseconds after the svg export from
+ * the same idle embed, so we trust it rather than dropping the raster. Two
+ * non-empty sources are compared after stripping the wrapper attrs and
+ * normalizing inter-tag whitespace, so a genuine content change still returns
+ * `false`.
  */
 export function xmlStatesMatch(a: string, b: string): boolean {
-  return stripVolatileMxfileAttrs(a).trim() === stripVolatileMxfileAttrs(b).trim();
+  const aStr = (a ?? "").trim();
+  const bStr = (b ?? "").trim();
+  if (aStr === "" || bStr === "") return true;
+  const norm = (s: string) =>
+    stripVolatileMxfileAttrs(s).replace(/>\s+</g, "><").trim();
+  return norm(aStr) === norm(bStr);
 }
 
 /**
