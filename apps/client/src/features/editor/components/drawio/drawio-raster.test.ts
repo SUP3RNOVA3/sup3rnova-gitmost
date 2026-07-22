@@ -12,6 +12,8 @@ import {
   normalizeRasterDataUri,
   RASTER_CIRCUIT_BREAKER_THRESHOLD,
   RASTER_DATA_URI_PREFIX,
+  RASTER_DOWNSCALE_STEPS,
+  RASTER_PRIMARY_SCALE,
   resolveEffectiveUpdateSrc,
   resolveExportFamily,
   stripVolatileMxfileAttrs,
@@ -355,5 +357,24 @@ describe("resolveEffectiveUpdateSrc (coalesced-save updateSrc, A7/M2)", () => {
   it("preserves the trivial cases", () => {
     expect(resolveEffectiveUpdateSrc(false, false)).toBe(false);
     expect(resolveEffectiveUpdateSrc(true, true)).toBe(true);
+  });
+});
+
+describe("raster scale ladder (retina quality)", () => {
+  it("exports at 2x primary for crisp hi-DPI output", () => {
+    expect(RASTER_PRIMARY_SCALE).toBe(2);
+  });
+
+  it("downscale steps are strictly descending and below the primary scale", () => {
+    // The budget fallback walks these in order, so they MUST be sorted
+    // high->low and all be smaller than the primary scale (else a downscale
+    // would keep or raise the byte size, defeating the budget).
+    expect(RASTER_DOWNSCALE_STEPS.length).toBeGreaterThan(0);
+    let prev = RASTER_PRIMARY_SCALE;
+    for (const s of RASTER_DOWNSCALE_STEPS) {
+      expect(s).toBeGreaterThan(0);
+      expect(s).toBeLessThan(prev);
+      prev = s;
+    }
   });
 });

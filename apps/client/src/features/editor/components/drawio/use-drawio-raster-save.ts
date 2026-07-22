@@ -13,6 +13,8 @@ import {
   isWithinRasterBudget,
   nextCircuitBreakerState,
   RASTER_CIRCUIT_BREAKER_THRESHOLD,
+  RASTER_DOWNSCALE_STEPS,
+  RASTER_PRIMARY_SCALE,
   resolveEffectiveUpdateSrc,
   resolveExportFamily,
   xmlStatesMatch,
@@ -193,19 +195,21 @@ export function useDrawioRasterSave<TTarget>(
       token: number,
     ): Promise<{ dataUri: string | null; reason: string | null }> => {
       const t = paramsRef.current.t;
+      // Export at the primary (retina) scale; the budget ladder below steps it
+      // down only if the result is over MAX_RASTER_BYTES.
       let resp = await requestExport(
         "png",
-        { format: "png" },
+        { format: "png", scale: RASTER_PRIMARY_SCALE },
         PNG_EXPORT_TIMEOUT_MS,
       );
       if (token !== saveTokenRef.current) return { dataUri: null, reason: null };
 
       // Confirm the png captured the same diagram state as the svg (A3). One
-      // redo on mismatch, then give up on the raster.
+      // redo on mismatch (at the same primary scale), then give up on the raster.
       if (sourceXml != null && !xmlStatesMatch(sourceXml, resp.xml)) {
         resp = await requestExport(
           "png",
-          { format: "png" },
+          { format: "png", scale: RASTER_PRIMARY_SCALE },
           PNG_EXPORT_TIMEOUT_MS,
         );
         if (token !== saveTokenRef.current)
@@ -224,24 +228,26 @@ export function useDrawioRasterSave<TTarget>(
         }
       }
 
-      // Budget: cap by DECODED bytes; over -> re-export at half scale; still
-      // over -> no raster (A6).
+      // Budget: cap by DECODED bytes. Over budget -> step DOWN the scale ladder
+      // (RASTER_DOWNSCALE_STEPS), re-exporting at each lower scale until one fits;
+      // if even the smallest scale is still over, give up on the raster (A6).
       let size = decodedBase64ByteLength(resp.data);
-      if (!isWithinRasterBudget(size)) {
+      for (const scale of RASTER_DOWNSCALE_STEPS) {
+        if (isWithinRasterBudget(size)) break;
         resp = await requestExport(
           "png",
-          { format: "png", scale: 0.5 },
+          { format: "png", scale },
           PNG_EXPORT_TIMEOUT_MS,
         );
         if (token !== saveTokenRef.current)
           return { dataUri: null, reason: null };
         size = decodedBase64ByteLength(resp.data);
-        if (!isWithinRasterBudget(size)) {
-          return {
-            dataUri: null,
-            reason: t("the preview image is too large"),
-          };
-        }
+      }
+      if (!isWithinRasterBudget(size)) {
+        return {
+          dataUri: null,
+          reason: t("the preview image is too large"),
+        };
       }
 
       return { dataUri: resp.data, reason: null };

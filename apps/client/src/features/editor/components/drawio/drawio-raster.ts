@@ -16,8 +16,18 @@ export const DRAWIO_RASTER_ATTR = "data-raster";
 export const RASTER_DATA_URI_PREFIX = "data:image/png;base64,";
 
 // Size cap for the embedded raster, measured by DECODED bytes (A6). Over budget
-// we downscale once, then give up and save without a raster.
+// we step DOWN the scale ladder (see RASTER_*_SCALE below); if even the smallest
+// scale is still over, we give up and save without a raster.
 export const MAX_RASTER_BYTES = 2 * 1024 * 1024; // 2 MiB
+
+// PNG export scale ladder (issue #629 follow-up: retina quality). draw.io's
+// default png export is 1x, which looks soft on hi-DPI screens and whenever the
+// diagram is shown wider than its native px size. We export at 2x for crisp
+// text/lines and, on over-budget, step DOWN this ladder (2 -> 1 -> 0.5) instead
+// of jumping straight to the smallest — so a big/dense diagram keeps the best
+// scale that still fits MAX_RASTER_BYTES rather than collapsing to half-res.
+export const RASTER_PRIMARY_SCALE = 2;
+export const RASTER_DOWNSCALE_STEPS: readonly number[] = [1, 0.5];
 
 // After this many consecutive failed/timed-out png exports in one editing
 // session we stop attempting png so a broken export server does not add the
