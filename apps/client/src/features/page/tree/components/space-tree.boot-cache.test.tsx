@@ -65,14 +65,15 @@ vi.mock("@/lib/config.ts", () => ({
 }));
 
 // Capture the props DocTree is rendered with instead of rendering anything.
-vi.mock("./doc-tree", () => ({
+// The real module is spread in so the exported layout constants (row heights,
+// icon sizes) are never hand-mirrored here and cannot drift.
+vi.mock("./doc-tree", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./doc-tree")>()),
   DocTree: (props: { onToggle: (id: string, isOpen: boolean) => void; data: unknown[] }) => {
     docTree.onToggle = props.onToggle;
     docTree.data = props.data;
     return null;
   },
-  ROW_HEIGHT_COMPACT: 28,
-  ROW_HEIGHT_STANDARD: 32,
 }));
 vi.mock("./space-tree-row", () => ({
   SpaceTreeRow: () => null,

@@ -26,6 +26,8 @@ import {
   type RenderRowProps,
   ROW_HEIGHT_COMPACT,
   ROW_HEIGHT_STANDARD,
+  TREE_ICON_SIZE_COMPACT,
+  TREE_ICON_SIZE_STANDARD,
 } from "@/features/page/tree/components/doc-tree";
 import { isCompactPageTreeEnabled } from "@/lib/config.ts";
 import { openSharedTreeNodesAtom } from "@/features/share/atoms/open-shared-tree-nodes-atom";
@@ -127,6 +129,10 @@ function SharedTreeRow({
   const { shareId } = useParams();
   const { t } = useTranslation();
   const [, setMobileSidebarState] = useAtom(mobileSidebarAtom);
+  // Read the density here rather than threading a prop: `renderRow` is this
+  // component itself (a stable module-scope reference), and the flag is a cheap
+  // `window.CONFIG` lookup.
+  const compactTree = isCompactPageTreeEnabled();
 
   const pageUrl = buildSharedPageUrl({
     shareId: shareId,
@@ -153,7 +159,10 @@ function SharedTreeRow({
         onToggle={toggleOpen}
       />
       <div style={{ marginRight: "4px" }}>
-        <PageIcon value={node.icon} size={18} />
+        <PageIcon
+          value={node.icon}
+          size={compactTree ? TREE_ICON_SIZE_COMPACT : TREE_ICON_SIZE_STANDARD}
+        />
       </div>
       <span className={classes.text}>{node.name || t("untitled")}</span>
     </Box>

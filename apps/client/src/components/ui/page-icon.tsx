@@ -16,16 +16,24 @@ import {
   serializeIconRef,
   resolvePageIconColor,
   pageIconBg,
-  pageIconFg,
+  pageIconFgDark,
+  pageIconFgLight,
   PAGE_ICON_PALETTE,
   type PageIconColor,
 } from "@/lib/icon-ref";
 import { LucideGlyph, isValidIconName } from "./lucide/lucide-glyph";
 import { LucideIconGrid } from "./lucide/lucide-icon-grid";
+import classes from "./page-icon.module.css";
 
-// The rounded color box must not exceed the sidebar row height (~18-20px) so the
-// tree rows never grow.
-const MAX_BOX = 20;
+// Sanity ceiling on a caller-supplied size — nothing more. Fitting the box into
+// a sidebar row is guaranteed by TREE_ICON_SIZE_COMPACT / TREE_ICON_SIZE_STANDARD
+// in `features/page/tree/components/doc-tree.tsx` (20 and 24 — 22 and 26 once the
+// picker's ActionIcon adds its +2 border box). The limiting container is NOT the
+// row slot (26 / 32px) but the `.node` highlight pill inside it, which
+// `tree.module.css` insets to `height: calc(100% - 4px)` → 22px compact / 28px
+// standard. In compact density the 20px tile plus the trigger's 2px border box
+// therefore lands at exactly 22px: zero slack, by design.
+const MAX_BOX = 24;
 
 export interface PageIconProps {
   /** The stored `pages.icon` value (IconRef JSON, a legacy emoji, or null). */
@@ -43,6 +51,9 @@ export function PageIcon({ value, size = 18 }: PageIconProps) {
   const ref = parseIconRef(value);
 
   if (!ref || !isValidIconName(ref.name)) {
+    // Intentionally the FULL box size (not the tile's inner glyph size): most
+    // rows have no custom icon, and an equal footprint keeps every row's title
+    // left-aligned with the icon-bearing ones.
     return (
       <IconFileDescription
         size={size}
@@ -56,23 +67,26 @@ export function PageIcon({ value, size = 18 }: PageIconProps) {
   const box = Math.min(size, MAX_BOX);
 
   return (
+    // Layout + the scheme-forked glyph tone live in the CSS module; only the
+    // runtime-dependent values stay inline. The glyph inherits the tone through
+    // `currentColor`, so the fork is resolved once, on this element.
     <span
       aria-hidden="true"
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        justifyContent: "center",
-        width: box,
-        height: box,
-        borderRadius: 4,
-        flexShrink: 0,
-        backgroundColor: pageIconBg(color),
-      }}
+      className={classes.tile}
+      style={
+        {
+          width: box,
+          height: box,
+          backgroundColor: pageIconBg(color),
+          "--page-icon-fg-light": pageIconFgLight(color),
+          "--page-icon-fg-dark": pageIconFgDark(color),
+        } as React.CSSProperties
+      }
     >
       <LucideGlyph
         name={ref.name}
         size={Math.round(box * 0.7)}
-        color={pageIconFg(color)}
+        color="currentColor"
       />
     </span>
   );
@@ -84,6 +98,8 @@ export interface PageIconPickerProps {
   onChange: (json: string) => void;
   onRemove: () => void;
   readOnly?: boolean;
+  /** Size of the trigger icon; falls back to {@link PageIcon}'s own default. */
+  size?: number;
   actionIconProps?: {
     size?: string | number;
     variant?: string;
@@ -103,6 +119,7 @@ export function PageIconPicker({
   onChange,
   onRemove,
   readOnly = false,
+  size,
   actionIconProps,
 }: PageIconPickerProps) {
   const { t } = useTranslation();
@@ -125,6 +142,14 @@ export function PageIconPicker({
     ["mousedown", "touchstart"],
     [dropdown, target],
   );
+
+  // The trigger must be 2px larger than the tile it wraps: the ActionIcon root
+  // has `overflow: hidden` plus a 1px transparent border under the global
+  // `box-sizing: border-box`, so a button of exactly `size` would clip the tile
+  // by 1px on every side and round off its corners. An explicit
+  // actionIconProps.size still wins.
+  const triggerSize =
+    actionIconProps?.size ?? (size !== undefined ? size + 2 : undefined);
 
   // Mantine's popover closeOnEscape is unreliable here; attach a window keydown
   // only while open (same pattern as the emoji picker).
@@ -171,14 +196,14 @@ export function PageIconPicker({
       <Popover.Target ref={setTarget}>
         <ActionIcon
           variant={(actionIconProps?.variant as never) || "transparent"}
-          size={actionIconProps?.size as never}
+          size={triggerSize as never}
           tabIndex={actionIconProps?.tabIndex}
           onClick={handlers.toggle}
           aria-label={t("Pick icon")}
           aria-haspopup="dialog"
           aria-expanded={opened}
         >
-          <PageIcon value={value} />
+          <PageIcon value={value} size={size} />
         </ActionIcon>
       </Popover.Target>
       <Popover.Dropdown ref={setDropdown} p="sm">

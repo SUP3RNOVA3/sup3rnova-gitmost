@@ -42,7 +42,13 @@ import {
 import { IPage } from "@/features/page/types/page.types.ts";
 import { extractPageSlugId } from "@/lib";
 import { isCompactPageTreeEnabled } from "@/lib/config.ts";
-import { DocTree, ROW_HEIGHT_COMPACT, ROW_HEIGHT_STANDARD } from "./doc-tree";
+import {
+  DocTree,
+  ROW_HEIGHT_COMPACT,
+  ROW_HEIGHT_STANDARD,
+  TREE_ICON_SIZE_COMPACT,
+  TREE_ICON_SIZE_STANDARD,
+} from "./doc-tree";
 import { SpaceTreeRow } from "./space-tree-row";
 
 interface SpaceTreeProps {
@@ -357,9 +363,13 @@ const SpaceTree = forwardRef<SpaceTreeApi, SpaceTreeProps>(function SpaceTree(
   // defeating memo(DocTreeRow).
   const renderRow = useCallback(
     (rowProps: Parameters<typeof SpaceTreeRow>[0]) => (
-      <SpaceTreeRow {...rowProps} readOnly={readOnly} />
+      <SpaceTreeRow
+        {...rowProps}
+        readOnly={readOnly}
+        iconSize={compactTree ? TREE_ICON_SIZE_COMPACT : TREE_ICON_SIZE_STANDARD}
+      />
     ),
-    [readOnly],
+    [readOnly, compactTree],
   );
   const disableDragDrop = useCallback(
     (n: SpaceTreeNode) => n.canEdit === false,

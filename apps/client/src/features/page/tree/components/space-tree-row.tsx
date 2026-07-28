@@ -39,6 +39,8 @@ import { updateTreeNodeIcon } from "@/features/page/tree/utils/utils.ts";
 
 type SpaceTreeRowProps = RenderRowProps<SpaceTreeNode> & {
   readOnly: boolean;
+  /** Page-icon tile size for the current tree density (see TREE_ICON_SIZE_*). */
+  iconSize: number;
 };
 
 export function SpaceTreeRow({
@@ -50,6 +52,7 @@ export function SpaceTreeRow({
   tabIndex,
   treeItemProps,
   readOnly,
+  iconSize,
 }: SpaceTreeRowProps) {
   const { t } = useTranslation();
   const { spaceSlug } = useParams();
@@ -182,11 +185,17 @@ export function SpaceTreeRow({
       />
 
       <div onClick={handleEmojiIconClick} style={{ marginRight: "4px" }}>
+        {/* The trigger ActionIcon is sized to the glyph on purpose: its default
+            (Mantine `md`, 28px) is taller than a 26px compact row, leaves a wide
+            dead gap between the icon and the title, and overlaps the
+            neighbouring rows' hit areas. PageIconPicker derives the button's own
+            border box from `size`. */}
         <PageIconPicker
           value={node.icon}
           onChange={handleIconSelect}
           onRemove={handleRemoveEmoji}
           readOnly={!canEdit}
+          size={iconSize}
           actionIconProps={{ tabIndex: -1 }}
         />
       </div>

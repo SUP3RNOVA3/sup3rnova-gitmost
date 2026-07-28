@@ -54,11 +54,15 @@ vi.mock("@/lib/config.ts", () => ({
   isCompactPageTreeEnabled: () => false,
 }));
 
-// Stub the visual children so we don't drag in the full DnD / Mantine stack.
-vi.mock("./doc-tree", () => ({
+// Stub the visual children so the full DnD / Mantine stack is never RENDERED
+// (it is still imported: `importOriginal()` really evaluates ./doc-tree and its
+// transitive imports — that is the price of reading the real layout constants
+// below, and it is cheap because nothing mounts).
+// The real module is spread in so the exported layout constants (row heights,
+// icon sizes) are never hand-mirrored here and cannot drift.
+vi.mock("./doc-tree", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./doc-tree")>()),
   DocTree: () => null,
-  ROW_HEIGHT_COMPACT: 28,
-  ROW_HEIGHT_STANDARD: 32,
 }));
 vi.mock("./space-tree-row", () => ({
   SpaceTreeRow: () => null,
