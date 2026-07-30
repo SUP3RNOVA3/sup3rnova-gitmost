@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Badge,
@@ -11,9 +11,11 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { modals } from "@mantine/modals";
+import { notifications } from "@mantine/notifications";
 import { IconInfoCircle, IconPlus } from "@tabler/icons-react";
 import { Helmet } from "react-helmet-async";
 import { useTranslation } from "react-i18next";
+import { useSearchParams } from "react-router-dom";
 import { getAppName } from "@/lib/config.ts";
 import SettingsTitle from "@/components/settings/settings-title.tsx";
 import { useWorkspaceEntitlementsQuery } from "@/features/workspace/queries/workspace-query.ts";
@@ -23,6 +25,8 @@ import {
   useDeleteAccountMcpServerMutation,
   useTestAccountMcpServerMutation,
   useUpdateAccountMcpServerMutation,
+  useStartAccountMcpOauthMutation,
+  useDisconnectAccountMcpOauthMutation,
 } from "@/features/account-mcp/queries/account-mcp-server-query.ts";
 import type { IAiMcpServer } from "@/features/ai-mcp/mcp-server-types.ts";
 import AiMcpServerRow from "@/features/ai-mcp/mcp-server-row.tsx";
@@ -44,9 +48,32 @@ export default function AccountMcpServers() {
   const enabled = entitlements?.mcpPersonalServersEnabled ?? false;
 
   // Only fetch the list when the feature is on (avoids a guaranteed 403).
-  const { data: servers, isLoading } = useAccountMcpServersQuery(enabled);
+  const { data: servers, isLoading, refetch } =
+    useAccountMcpServersQuery(enabled);
   const updateMutation = useUpdateAccountMcpServerMutation();
   const deleteMutation = useDeleteAccountMcpServerMutation();
+
+  // #687: handle the OAuth callback return (`?oauth=connected|error`): show a
+  // notification, refresh the grant statuses, and strip the param so a reload
+  // does not re-notify.
+  const [searchParams, setSearchParams] = useSearchParams();
+  useEffect(() => {
+    const oauth = searchParams.get("oauth");
+    if (oauth !== "connected" && oauth !== "error") return;
+    if (oauth === "connected") {
+      notifications.show({ message: t("MCP server authorized") });
+    } else {
+      notifications.show({
+        message: t("Authorization failed. Please try again."),
+        color: "red",
+      });
+    }
+    refetch();
+    const next = new URLSearchParams(searchParams);
+    next.delete("oauth");
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   const [opened, { open, close }] = useDisclosure(false);
   // The server being edited; undefined means the modal is in "create" mode.
@@ -144,6 +171,8 @@ export default function AccountMcpServers() {
                 key={server.id}
                 server={server}
                 useTestMutation={useTestAccountMcpServerMutation}
+                useAuthorizeMutation={useStartAccountMcpOauthMutation}
+                useDisconnectMutation={useDisconnectAccountMcpOauthMutation}
                 onEdit={openEdit}
                 onDelete={confirmDelete}
                 onToggleEnabled={(isEnabled) =>
@@ -160,6 +189,7 @@ export default function AccountMcpServers() {
             useCreateMutation={useCreateAccountMcpServerMutation}
             useUpdateMutation={useUpdateAccountMcpServerMutation}
             useTestMutation={useTestAccountMcpServerMutation}
+            allowOauth
           />
         </Paper>
       )}

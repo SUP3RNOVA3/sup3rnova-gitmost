@@ -35,3 +35,19 @@ export type UseTestMcpServerMutation = () => UseMutationResult<
   Error,
   string
 >;
+
+// #687: OAuth control hooks for a personal oauth2 server. `authorize` returns the
+// browser authorize URL (the hook navigates to it); `disconnect` deletes the
+// grant. Optional on the shared row (only the personal page passes them, since
+// oauth2 servers are personal-only).
+export type UseAuthorizeMcpOauthMutation = () => UseMutationResult<
+  { authorizeUrl: string },
+  Error,
+  string
+>;
+
+export type UseDisconnectMcpOauthMutation = () => UseMutationResult<
+  { success: true },
+  Error,
+  string
+>;

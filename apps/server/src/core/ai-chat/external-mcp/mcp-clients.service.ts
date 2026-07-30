@@ -1,22 +1,33 @@
-import { isIP } from 'node:net';
-import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { pathToFileURL } from 'node:url';
 import { Injectable, Logger } from '@nestjs/common';
 import { type Tool, type ToolCallOptions } from 'ai';
 import { createMCPClient } from '@ai-sdk/mcp';
-import { Agent, type Dispatcher } from 'undici';
+import { type Dispatcher } from 'undici';
 import { AiMcpServerRepo } from '@docmost/db/repos/ai-chat/ai-mcp-server.repo';
 import { AiMcpServer } from '@docmost/db/types/entity.types';
 import {
-  streamingDispatcherOptions,
   mcpStreamTimeoutMs,
   mcpCallTimeoutMs,
   mcpSseBodyTimeoutMs,
 } from '../../../integrations/ai/ai-streaming-fetch';
 import { SecretBoxService } from '../../../integrations/crypto/secret-box';
+import { EnvironmentService } from '../../../integrations/environment/environment.service';
 import { incExternalMcpConnectFailure } from '../../../integrations/metrics/metrics.registry';
-import { isUrlAllowed, isIpAllowed } from './ssrf-guard';
+import { isUrlAllowed } from './ssrf-guard';
+import {
+  buildPinnedDispatcher,
+  guardedFetch,
+  validateResolvedAddresses,
+} from './guarded-fetch';
 import { CACHE_KEY_SEP } from './mcp.constants';
+import { McpOauthService } from './mcp-oauth.service';
+import { UnauthorizedError, type OAuthClientProvider } from '@ai-sdk/mcp';
+import { classifyGrantError } from './mcp-oauth.errors';
+
+// Re-exported for backwards compatibility: existing specs import
+// `validateResolvedAddresses` from this module. Its single definition lives in
+// guarded-fetch.ts (AGENTS #7 — one SSRF source shared by the client + OAuth).
+export { validateResolvedAddresses };
 // TYPE-ONLY (erased at compile): @docmost/mcp is ESM-only and cannot be a runtime
 // `require()` from this commonjs module (same constraint as docmost-client.loader).
 // The write-class MAP is loaded lazily via the dynamic-import trick below.
@@ -256,6 +267,16 @@ export class McpClientsService {
   constructor(
     private readonly repo: AiMcpServerRepo,
     private readonly secretBox: SecretBoxService,
+    // #687: OPTIONAL so the existing 2-arg unit constructions (all static
+    // servers) keep compiling. NestJS injects the real singleton at runtime; the
+    // oauth branch in buildEntry is only reached for an `auth_type='oauth2'`
+    // server, which those unit tests never build.
+    private readonly oauth?: McpOauthService,
+    // #687 KILL-SWITCH: gates the RUNTIME personal-server union. OPTIONAL for the
+    // same 2-arg-construction reason; when absent the feature defaults to ENABLED
+    // (matching EnvironmentService's default), so static-only unit tests are
+    // unaffected. NestJS injects the real global singleton.
+    private readonly env?: EnvironmentService,
   ) {}
 
   /**
@@ -576,7 +597,16 @@ export class McpClientsService {
   ): Promise<CacheEntry> {
     // #686: the agent-union read — admin servers ∪ THIS user's personal servers,
     // ADMIN-FIRST (so admin keeps the canonical namespace prefix on a name clash).
-    const servers = await this.repo.listEnabledForAgent(workspaceId, userId);
+    // #687 KILL-SWITCH: when MCP_PERSONAL_SERVERS_ENABLED=false the union drops
+    // personal rows entirely — so a disabled feature never connects/refreshes a
+    // personal oauth2 (or static) server at runtime, not just blocks its CRUD.
+    // Defaults to ENABLED when env is unavailable (matches EnvironmentService).
+    const includePersonal = this.env?.isMcpPersonalServersEnabled() ?? true;
+    const servers = await this.repo.listEnabledForAgent(
+      workspaceId,
+      userId,
+      includePersonal,
+    );
     const tools: Record<string, Tool> = {};
     const clients: McpClient[] = [];
     const outcomes: ServerOutcome[] = [];
@@ -621,8 +651,33 @@ export class McpClientsService {
       // the client is handed back and registered by the merge below (owned by the
       // entry, closed at teardown) — so it is never double-closed.
       let client: McpClient | undefined;
+      // #687 CONNECT GATE: an OAuth (auth_type='oauth2') server connects ONLY
+      // when its grant is `connected`; any other status is a read-only skip with
+      // the precise outcome and NO DB write. The runtime provider (token bearer)
+      // is attached to the transport instead of static headers.
+      let authProvider: OAuthClientProvider | undefined;
+      if (server.authType === 'oauth2') {
+        if (!this.oauth) {
+          // Misconfiguration (feature wired without the OAuth service) — never
+          // connect an OAuth server anonymously.
+          return { ok: false, reason: 'auth-unavailable' };
+        }
+        const status = await this.oauth.getGrantStatus(server.id);
+        if (status !== 'connected') {
+          // none/pending/error -> auth-required; expired -> auth-expired.
+          return {
+            ok: false,
+            reason: status === 'expired' ? 'auth-expired' : 'auth-required',
+          };
+        }
+        authProvider = this.oauth.createRuntimeProvider(server);
+      }
       try {
-        client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
+        client = await this.connectWithTimeout(
+          server,
+          CONNECT_TIMEOUT_MS,
+          authProvider,
+        );
         const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
         // Allowlist semantics (#476): null/absent = no restriction (all tools);
         // ANY array — including `[]` — is authoritative, so an EMPTY allowlist
@@ -660,6 +715,26 @@ export class McpClientsService {
               `auth headers are unreadable (APP_SECRET rotated?) — skipping; re-save its headers to repair`,
           );
           return { ok: false, reason: 'auth-unreadable' };
+        }
+        // #687: our runtime token path threw a classified grant error (possibly
+        // wrapped by @ai-sdk). invalid_grant/invalid_client -> `auth-expired`
+        // (grant already moved to expired); transient -> `auth-unavailable`
+        // (grant stays connected, next turn retries). A runtime REDIRECT (the
+        // SDK could not authorize non-interactively) surfaces as an
+        // UnauthorizedError and is a transient `auth-unavailable` (status NOT
+        // changed) per R1.
+        if (server.authType === 'oauth2') {
+          const grantClass = classifyGrantError(err);
+          if (grantClass === 'expired') {
+            return { ok: false, reason: 'auth-expired' };
+          }
+          if (grantClass === 'unavailable' || err instanceof UnauthorizedError) {
+            this.logger.warn(
+              `External MCP OAuth server "${server.name}" (server ${server.id}, ` +
+                `workspace ${server.workspaceId}) skipped this turn: token unavailable`,
+            );
+            return { ok: false, reason: 'auth-unavailable' };
+          }
         }
         // Log a short warning (never the URL/headers) so ops can see degradation,
         // and record the outcome so the UI can show "tool X unavailable".
@@ -804,7 +879,10 @@ export class McpClientsService {
    * re-validates the resolved IP on every request AND pins the socket to a
    * validated address (DNS-rebinding defense, no unchecked second resolution).
    */
-  private async connect(server: ConnectTarget): Promise<McpClient> {
+  private async connect(
+    server: ConnectTarget,
+    authProvider?: OAuthClientProvider,
+  ): Promise<McpClient> {
     // Pre-connect SSRF check (re-resolves DNS each time — not just at save).
     const check = await isUrlAllowed(server.url);
     if (!check.ok) {
@@ -818,14 +896,20 @@ export class McpClientsService {
       transport: {
         type: transportType,
         url: server.url,
-        // #686: throws McpAuthUnreadableError when headersEnc is present but
-        // undecryptable — the caller (buildEntry) skips the server rather than
-        // connecting anonymously.
-        headers: this.decryptHeaders(
-          server.headersEnc,
-          server.id,
-          server.workspaceId,
-        ),
+        // #687: an OAuth server connects WITHOUT static headers — the bearer is
+        // injected per-request by the authProvider (which reads tokens() on
+        // every call). A static server keeps its decrypted headers. #686:
+        // decryptHeaders throws McpAuthUnreadableError when a PRESENT blob is
+        // undecryptable so the caller skips rather than connecting anonymously.
+        headers: authProvider
+          ? undefined
+          : this.decryptHeaders(
+              server.headersEnc,
+              server.id,
+              server.workspaceId,
+            ),
+        // #687: the OAuth client provider (runtime bearer / SDK 401-retry).
+        authProvider,
         // SSRF: reject any redirect response (no redirect-based bypass).
         redirect: 'error',
         // Defense in depth: re-validate the actual request host on EVERY fetch
@@ -858,6 +942,7 @@ export class McpClientsService {
   private connectWithTimeout(
     server: ConnectTarget,
     ms: number,
+    authProvider?: OAuthClientProvider,
   ): Promise<McpClient> {
     return new Promise<McpClient>((resolve, reject) => {
       let settled = false;
@@ -867,7 +952,7 @@ export class McpClientsService {
       }, ms);
       // Do not keep the process alive just for this connect-timeout timer.
       timer.unref?.();
-      this.connect(server).then(
+      this.connect(server, authProvider).then(
         (client) => {
           if (settled) {
             // The race was already lost to the timeout: close the orphaned client
@@ -1089,7 +1174,19 @@ export class McpClientsService {
           `since the toolset was built — not reconnecting with stale config`,
       );
     }
-    const client = await this.connectWithTimeout(server, CONNECT_TIMEOUT_MS);
+    // #687: an OAuth server reconnects WITH its runtime provider (never
+    // anonymously). In practice recovery only fires for a declared readOnly
+    // internal-Docmost tool, so an external OAuth server never reaches here — but
+    // attach the provider anyway so a future trusted OAuth server is correct.
+    const reconnectProvider =
+      server.authType === 'oauth2' && this.oauth
+        ? this.oauth.createRuntimeProvider(server)
+        : undefined;
+    const client = await this.connectWithTimeout(
+      server,
+      CONNECT_TIMEOUT_MS,
+      reconnectProvider,
+    );
     let tools: Record<string, Tool>;
     try {
       const raw = await withTimeout(client.tools(), CONNECT_TIMEOUT_MS);
@@ -1135,130 +1232,6 @@ export class McpClientsService {
   }
 }
 
-/**
- * Apply the SSRF connect-time rule to a set of DNS-resolved addresses: block if
- * ANY resolved address is disallowed by `isIpAllowed`, and block an EMPTY set
- * (nothing safe to connect to). Only an all-public, non-empty set is allowed.
- *
- * This is the connect-time half of the DNS-rebinding defense: the dispatcher's
- * lookup hands net/tls.connect ONLY a set that passed this check, so the kernel
- * can never connect to an address that did not pass the guard. Pure — no I/O.
- */
-export function validateResolvedAddresses(addrs: readonly LookupAddress[]): {
-  ok: boolean;
-  blockedHost?: string;
-} {
-  if (addrs.length === 0) {
-    return { ok: false };
-  }
-  const blocked = addrs.find((a) => !isIpAllowed(a.address).ok);
-  if (blocked) {
-    return { ok: false, blockedHost: blocked.address };
-  }
-  return { ok: true };
-}
-
-/**
- * Build the SSRF-pinned undici dispatcher. Its custom connect.lookup resolves
- * the host, validates EVERY resolved address with the same ssrf-guard, and
- * returns ONLY a validated address to net/tls.connect — so there is no second,
- * unchecked DNS resolution: the kernel can only connect to an address that
- * passed the guard. The hostname (SNI / Host header) is left untouched, so TLS
- * certificate validation still uses the real hostname (we never rewrite the URL
- * to an IP literal).
- */
-function buildPinnedDispatcher(bodyTimeoutMs: number): Agent {
-  // External-MCP traffic uses a DEDICATED, shorter HEADERS silence timeout
-  // (`AI_MCP_STREAM_TIMEOUT_MS`, default 1 min) — deliberately tighter than the
-  // chat provider's 15-min `streamTimeoutMs()` — so a byte-silent/hung MCP
-  // upstream is broken in ~1 min instead of 15. We keep the keep-alive options
-  // from `streamingDispatcherOptions()` but OVERRIDE the timeouts. `bodyTimeout`
-  // is passed in per-transport (#489): tight for HTTP (fresh request per call),
-  // raised for SSE (one long-lived body across calls — idle BETWEEN calls is
-  // legit). The per-call total cap (`AI_MCP_CALL_TIMEOUT_MS`) is the complementary
-  // guard for chatty-but-stuck calls that keep the socket warm yet never return.
-  const headersMs = mcpStreamTimeoutMs();
-  return new Agent({
-    ...streamingDispatcherOptions(),
-    headersTimeout: headersMs,
-    bodyTimeout: bodyTimeoutMs,
-    connect: {
-      lookup: (hostname, _options, callback) => {
-        // Always resolve ALL addresses ourselves; do not trust the caller's
-        // `all` flag. Validate each, then hand back the validated set.
-        dnsLookup(hostname, { all: true }, (err, addresses) => {
-          if (err) {
-            callback(err, '', 0);
-            return;
-          }
-          const addrs = addresses as LookupAddress[];
-          const verdict = validateResolvedAddresses(addrs);
-          if (!verdict.ok) {
-            // Refuse the connection: net/tls.connect never sees this address.
-            // An empty set is treated as blocked (nothing safe to connect to).
-            const reason =
-              addrs.length === 0
-                ? `No address resolved for ${hostname}`
-                : `Blocked address for ${hostname}`;
-            callback(new Error(reason), '', 0);
-            return;
-          }
-          // undici/net invoke this lookup with `all: true`, so the callback
-          // must receive an ARRAY of validated {address, family} entries (the
-          // single-address form throws ERR_INVALID_IP_ADDRESS at connect). Every
-          // entry has already passed isIpAllowed, so the socket can only connect
-          // to a validated address — no second, unchecked DNS resolution.
-          const validated: LookupAddress[] = addrs.map((a) => ({
-            address: a.address,
-            family: a.family,
-          }));
-          (
-            callback as unknown as (
-              err: NodeJS.ErrnoException | null,
-              addresses: LookupAddress[],
-            ) => void
-          )(null, validated);
-        });
-      },
-    },
-  });
-}
-
-/**
- * A fetch wrapper that re-validates the request URL's host against the SSRF
- * policy before each request AND routes the request through the SSRF-pinned
- * dispatcher, so the socket can only connect to an address that passed the
- * guard. This closes the DNS-rebinding TOCTOU between the pre-flight check and
- * the actual HTTP call, and covers every follow-up request the streamable-HTTP
- * transport makes.
- */
-const guardedFetch = async (
-  dispatcher: Dispatcher,
-  input: Parameters<typeof fetch>[0],
-  init?: Parameters<typeof fetch>[1],
-): Promise<Response> => {
-  const rawUrl =
-    typeof input === 'string'
-      ? input
-      : input instanceof URL
-        ? input.href
-        : input.url;
-  let host: string;
-  try {
-    host = new URL(rawUrl).hostname.replace(/^\[|\]$/g, '');
-  } catch {
-    throw new Error('blocked request: invalid URL');
-  }
-  // If the host is an IP literal, check it directly; otherwise the full URL
-  // check (which re-resolves DNS) runs. Either way a blocked host throws.
-  const check = isIP(host) ? isIpAllowed(host) : await isUrlAllowed(rawUrl);
-  if (!check.ok) {
-    throw new Error(`blocked request: ${check.reason ?? 'SSRF policy'}`);
-  }
-  // The dispatcher's connect.lookup re-validates and pins the actual socket IP,
-  // eliminating the unchecked second resolution undici would otherwise perform.
-  return fetch(input, { ...init, dispatcher } as RequestInit);
-};
 
 /** Keep only the named tools from a raw toolset. Unknown names are ignored. */
 function pick(

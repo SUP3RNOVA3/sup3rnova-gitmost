@@ -12,6 +12,10 @@ import {
 export const MCP_TRANSPORTS = ['http', 'sse'] as const;
 export type McpTransport = (typeof MCP_TRANSPORTS)[number];
 
+/** Authentication kinds (#687). 'oauth2' is personal-only (account path). */
+export const MCP_AUTH_TYPES = ['static', 'oauth2'] as const;
+export type McpAuthType = (typeof MCP_AUTH_TYPES)[number];
+
 /**
  * Admin create payload for an external MCP server (§7.3).
  *
@@ -23,6 +27,14 @@ export class CreateMcpServerDto {
   @IsString()
   @MaxLength(200)
   name: string;
+
+  // #687: authentication kind. Create-only and immutable after creation.
+  // Defaults to 'static' when omitted. 'oauth2' is valid ONLY on the personal
+  // (account) path — the admin service rejects it with 400 — and cannot be
+  // combined with static `headers` (also 400). The service enforces both.
+  @IsOptional()
+  @IsIn(MCP_AUTH_TYPES)
+  authType?: McpAuthType;
 
   @IsIn(MCP_TRANSPORTS)
   transport: McpTransport;

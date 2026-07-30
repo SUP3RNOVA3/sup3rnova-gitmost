@@ -48,6 +48,7 @@ import {
 import { PageEmbeddings } from '@docmost/db/types/embeddings.types';
 import { AiProviderCredentials as AiProviderCredentialsTable } from '@docmost/db/types/ai-provider-credentials.types';
 import { AiMcpServers as AiMcpServersTable } from '@docmost/db/types/ai-mcp-servers.types';
+import { AiMcpOauthGrants as AiMcpOauthGrantsTable } from '@docmost/db/types/ai-mcp-oauth-grants.types';
 
 // AI Chat
 export type AiChat = Selectable<AiChats>;
@@ -102,6 +103,15 @@ export type UpdatableAiProviderCredentials = Updateable<
 export type AiMcpServer = Selectable<AiMcpServersTable>;
 export type InsertableAiMcpServer = Insertable<AiMcpServersTable>;
 export type UpdatableAiMcpServer = Updateable<Omit<AiMcpServersTable, 'id'>>;
+
+// AI MCP OAuth grants (#687) — one row per OAuth 2.1 personal MCP server.
+// SECURITY (§8.10): the *_enc columns hold encrypted tokens / client secret;
+// never expose them — only `status` is projected outward.
+export type AiMcpOauthGrant = Selectable<AiMcpOauthGrantsTable>;
+export type InsertableAiMcpOauthGrant = Insertable<AiMcpOauthGrantsTable>;
+export type UpdatableAiMcpOauthGrant = Updateable<
+  Omit<AiMcpOauthGrantsTable, 'serverId'>
+>;
 
 // AI Agent Roles (reusable, workspace-scoped, admin-owned agent presets).
 // A role replaces the persona layer of the system prompt (instructions) and may

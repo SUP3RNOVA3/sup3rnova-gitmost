@@ -49,3 +49,26 @@ export async function testAccountMcpServer(
   );
   return req.data;
 }
+
+// #687: begin OAuth authorization for the user's own oauth2 server. Returns the
+// browser authorize URL to redirect to (Google consent). The redirect_uri is
+// gitmost's own `/api/mcp-oauth/callback`, which finishes the flow.
+export async function startAccountMcpOauth(
+  id: string,
+): Promise<{ authorizeUrl: string }> {
+  const req = await api.post<{ authorizeUrl: string }>(
+    `/account/mcp-servers/${id}/oauth/start`,
+  );
+  return req.data;
+}
+
+// #687: disconnect (delete the grant) for the user's own oauth2 server. The
+// server row itself is preserved.
+export async function disconnectAccountMcpOauth(
+  id: string,
+): Promise<{ success: true }> {
+  const req = await api.post<{ success: true }>(
+    `/account/mcp-servers/${id}/oauth/disconnect`,
+  );
+  return req.data;
+}

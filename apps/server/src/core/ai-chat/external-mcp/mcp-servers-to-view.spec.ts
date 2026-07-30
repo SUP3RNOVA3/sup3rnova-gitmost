@@ -12,6 +12,7 @@ function row(overrides: Partial<AiMcpServer>): AiMcpServer {
   return {
     id: 'srv-1',
     name: 'Tavily',
+    authType: 'static',
     transport: 'http',
     url: 'https://example.com/mcp',
     enabled: true,
@@ -79,6 +80,10 @@ describe('McpServersService.toView (via list) — encrypted-header leak guard', 
       toolAllowlist: ['search'],
       hasHeaders: true,
       instructions: 'Use search for fresh web facts.',
+      // #687: additive public fields — a static server carries authType 'static'
+      // and a null grantStatus (no OAuth grant). The encrypted blob is still gone.
+      authType: 'static',
+      grantStatus: null,
     });
   });
 

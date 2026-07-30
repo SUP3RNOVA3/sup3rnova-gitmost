@@ -22,10 +22,23 @@ export interface McpServerView {
   // Author-supplied prompt guidance (#180). NON-secret, so returned in the
   // view. Null when no guidance is configured.
   instructions: string | null;
+  // #687: 'static' | 'oauth2'. Static servers use auth headers; oauth2 servers
+  // use the OAuth grant + Authorize/Disconnect controls.
+  authType: string;
+  // #687: OAuth grant status for an oauth2 server ('none' | 'pending' |
+  // 'connected' | 'expired' | 'error'). null for a static server. NEVER a token.
+  grantStatus: string | null;
 }
 
-/** Project a row to the public view (NEVER includes headersEnc). */
-export function toMcpServerView(row: AiMcpServer): McpServerView {
+/**
+ * Project a row to the public view (NEVER includes headersEnc). `grantStatus`
+ * (#687) is supplied by the caller for an oauth2 server (looked up from
+ * `ai_mcp_oauth_grants`); null for a static server.
+ */
+export function toMcpServerView(
+  row: AiMcpServer,
+  grantStatus: string | null = null,
+): McpServerView {
   return {
     id: row.id,
     name: row.name,
@@ -35,6 +48,8 @@ export function toMcpServerView(row: AiMcpServer): McpServerView {
     toolAllowlist: row.toolAllowlist ?? null,
     hasHeaders: Boolean(row.headersEnc),
     instructions: row.instructions ?? null,
+    authType: row.authType,
+    grantStatus: row.authType === 'oauth2' ? (grantStatus ?? 'none') : null,
   };
 }
 

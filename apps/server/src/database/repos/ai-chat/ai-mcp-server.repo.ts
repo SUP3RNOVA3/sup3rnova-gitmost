@@ -84,10 +84,21 @@ export class AiMcpServerRepo {
    * places admin rows (false) ahead of personal rows (true); within each scope,
    * `created_at ASC` then `id ASC` (a stable tiebreaker for equal timestamps)
    * so tool-name disambiguation is reproducible across calls.
+   *
+   * KILL-SWITCH (#687): `includePersonal=false` drops the user's personal rows
+   * from the union entirely (admin-only). The personal-servers feature is gated
+   * by `MCP_PERSONAL_SERVERS_ENABLED` (#686); until now the flag only blocked the
+   * personal CRUD + OAuth controllers, but the RUNTIME union here always added
+   * personal rows — so with the flag OFF an agent tour would still connect a
+   * `connected` oauth2 server and rotate/use its tokens. Filtering them out here
+   * (personal rows are never even fetched, so their decrypted config/tokens never
+   * load) is what makes the documented "drops personal rows from the agent union"
+   * contract real. The caller (`McpClientsService.buildEntry`) passes the flag.
    */
   async listEnabledForAgent(
     workspaceId: string,
     userId: string,
+    includePersonal = true,
   ): Promise<AiMcpServer[]> {
     const rows = await this.db
       .selectFrom('aiMcpServers')
@@ -95,7 +106,10 @@ export class AiMcpServerRepo {
       .where('workspaceId', '=', workspaceId)
       .where('enabled', '=', true)
       .where((eb) =>
-        eb.or([eb('userId', 'is', null), eb('userId', '=', userId)]),
+        includePersonal
+          ? eb.or([eb('userId', 'is', null), eb('userId', '=', userId)])
+          : // Kill-switch OFF: admin-managed servers only.
+            eb('userId', 'is', null),
       )
       // Admin-first: NULL owner (false) sorts before a personal owner (true).
       .orderBy(sql`("user_id" is not null)`, 'asc')
@@ -126,6 +140,8 @@ export class AiMcpServerRepo {
       // #686: owner of a personal server; omit / null for an admin server.
       userId?: string | null;
       name: string;
+      // #687: 'static' | 'oauth2'. Omit => DB default 'static'.
+      authType?: string;
       transport: string;
       url: string;
       headersEnc?: string | null;
@@ -143,6 +159,10 @@ export class AiMcpServerRepo {
         workspaceId: values.workspaceId,
         userId: values.userId ?? null,
         name: values.name,
+        // #687: omit => let the column default ('static') apply.
+        ...(values.authType !== undefined
+          ? { authType: values.authType }
+          : {}),
         transport: values.transport,
         url: values.url,
         headersEnc: values.headersEnc ?? null,

@@ -38,6 +38,14 @@ export class McpServersService {
     workspaceId: string,
     dto: CreateMcpServerDto,
   ): Promise<McpServerView> {
+    // #687: OAuth servers are PERSONAL-only (the OAuth grant is per-user and its
+    // tokens live under the user's control). An admin-managed OAuth server is
+    // rejected.
+    if (dto.authType === 'oauth2') {
+      throw new BadRequestException(
+        'OAuth (oauth2) MCP servers can only be created as personal servers.',
+      );
+    }
     await this.assertUrlAllowed(dto.url);
 
     // Encrypt the auth headers if any non-empty set was provided.

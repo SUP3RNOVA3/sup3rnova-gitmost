@@ -134,9 +134,19 @@ describe('per-user cache key + admin∪personal union (#686)', () => {
     // Two DISTINCT per-user entries — no cross-user sharing.
     expect(cacheMap(service).has(keyOf('ws', 'userA'))).toBe(true);
     expect(cacheMap(service).has(keyOf('ws', 'userB'))).toBe(true);
-    // The agent-union read was called with each user's id (NOT the admin-only read).
-    expect(repo.listEnabledForAgent).toHaveBeenCalledWith('ws', 'userA');
-    expect(repo.listEnabledForAgent).toHaveBeenCalledWith('ws', 'userB');
+    // The agent-union read was called with each user's id (NOT the admin-only
+    // read). #687: a 3rd `includePersonal` arg (true here — feature enabled by
+    // default) now rides along, so match the id args and ignore the flag.
+    expect(repo.listEnabledForAgent).toHaveBeenCalledWith(
+      'ws',
+      'userA',
+      expect.anything(),
+    );
+    expect(repo.listEnabledForAgent).toHaveBeenCalledWith(
+      'ws',
+      'userB',
+      expect.anything(),
+    );
   });
 
   it('admin server keeps the canonical namespace prefix on a name collision (admin-first)', async () => {

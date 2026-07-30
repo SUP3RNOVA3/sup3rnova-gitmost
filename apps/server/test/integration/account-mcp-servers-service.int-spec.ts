@@ -33,6 +33,16 @@ const clientsStub = {
   invalidateUser: jest.fn(),
 } as any;
 
+// #687: the OAuth service collaborator. These static-server tests never create an
+// oauth2 server, so getGrantStatus/resetGrant are never invoked on a real path;
+// the stub keeps the constructor satisfied and the spec offline.
+const oauthStub = {
+  getGrantStatus: jest.fn().mockResolvedValue('none'),
+  resetGrant: jest.fn(),
+  disconnect: jest.fn(),
+  startAuthorization: jest.fn(),
+} as any;
+
 function envStub(max: number) {
   return { getMcpPersonalServersMax: () => max } as any;
 }
@@ -45,6 +55,7 @@ function buildService(db: Kysely<any>, max: number): AccountMcpServersService {
     secretBoxStub,
     clientsStub,
     envStub(max),
+    oauthStub,
   );
 }
 

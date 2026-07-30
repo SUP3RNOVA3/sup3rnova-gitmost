@@ -12,6 +12,17 @@
 // External MCP server transports (mirrors the server's MCP_TRANSPORTS).
 export type McpTransport = "http" | "sse";
 
+// Authentication kind (#687). 'oauth2' is personal-only (account path).
+export type McpAuthType = "static" | "oauth2";
+
+// OAuth grant status for an oauth2 server (#687). 'none' = never authorized.
+export type McpGrantStatus =
+  | "none"
+  | "pending"
+  | "connected"
+  | "expired"
+  | "error";
+
 // View of a configured external MCP server.
 // SECURITY (§8.10): the auth headers are NEVER returned — only `hasHeaders`
 // signals whether any are stored. `toolAllowlist` is null when unrestricted.
@@ -26,11 +37,19 @@ export interface IAiMcpServer {
   // Author-supplied guidance injected into the agent system prompt (#180).
   // NON-secret, so it IS returned. Null when no guidance is configured.
   instructions: string | null;
+  // #687: 'static' (auth headers) | 'oauth2' (OAuth grant + Authorize flow).
+  authType: McpAuthType;
+  // #687: OAuth grant status for an oauth2 server; null for a static server.
+  // NEVER a token — only the status.
+  grantStatus: McpGrantStatus | null;
 }
 
 // Create payload. `headers` is write-only: omit => no auth headers.
 export interface IAiMcpServerCreate {
   name: string;
+  // #687: create-only, immutable after creation. Omit => 'static'. 'oauth2'
+  // is valid only on the personal path and cannot carry static `headers`.
+  authType?: McpAuthType;
   transport: McpTransport;
   url: string;
   // Auth headers map (e.g. { Authorization: 'Bearer ...' }). Encrypted on save;

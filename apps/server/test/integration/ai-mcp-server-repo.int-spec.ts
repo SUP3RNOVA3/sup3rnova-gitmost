@@ -384,6 +384,16 @@ describe('AiMcpServerRepo personal servers + admin isolation [integration]', () 
     expect(lastAdminIdx).toBeLessThan(firstPersonalIdx);
     // Both admin rows are present, created_at ASC (admin1 before admin2).
     expect(ids.indexOf(admin1.id)).toBeLessThan(ids.indexOf(admin2.id));
+
+    // #687 KILL-SWITCH: includePersonal=false drops the personal rows from the
+    // union at the SQL level (admin-only), so a disabled feature never even
+    // fetches a personal server for the agent tour.
+    const forAOff = await repo.listEnabledForAgent(w, uA, false);
+    const idsOff = forAOff.map((r) => r.id);
+    expect(idsOff).toContain(admin1.id);
+    expect(idsOff).toContain(admin2.id);
+    expect(idsOff).not.toContain(aPersonal.id);
+    expect(forAOff.every((r) => r.userId === null)).toBe(true);
   });
 
   it('countByUser counts only that user, across enabled + disabled', async () => {

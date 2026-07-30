@@ -20,6 +20,14 @@ export interface AiMcpServers {
   userId: string | null;
   // Display name, e.g. 'Tavily'. Also drives the tool-name namespace prefix.
   name: string;
+  // Authentication kind (#687). 'static' = today's model (optional static auth
+  // headers). 'oauth2' = an OAuth 2.1 personal server whose bearer token is
+  // minted/refreshed by gitmost through the `ai_mcp_oauth_grants` grant and
+  // injected via an OAuthClientProvider (never via static headers). Create-only
+  // and immutable after creation (change it by recreating the server). Mirrors
+  // migration 20260730T120000-ai-mcp-oauth-grants.ts. Defaults to 'static' so
+  // every existing row stays a static server.
+  authType: Generated<string>;
   // '@ai-sdk/mcp' transport type: 'http' | 'sse'.
   transport: string;
   // Remote MCP endpoint URL.

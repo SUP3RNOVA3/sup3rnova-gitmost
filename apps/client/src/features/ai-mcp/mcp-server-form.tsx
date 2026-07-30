@@ -16,7 +16,7 @@ import {
 } from "@mantine/core";
 import { useForm } from "@mantine/form";
 import { zod4Resolver } from "mantine-form-zod-resolver";
-import { IconCheck, IconX } from "@tabler/icons-react";
+import { IconCheck, IconInfoCircle, IconX } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import {
   IAiMcpServer,
@@ -32,6 +32,8 @@ import { resolveToolAllowlist } from "./mcp-form-utils.ts";
 
 const formSchema = z.object({
   name: z.string().min(1),
+  // #687: 'static' | 'oauth2'. Create-only; immutable after creation.
+  authType: z.enum(["static", "oauth2"]),
   transport: z.enum(["http", "sse"]),
   url: z.string().min(1),
   // Write-only secret buffer. Empty string means "do not change" (unless cleared).
@@ -53,6 +55,8 @@ interface McpServerFormProps {
   useCreateMutation: UseCreateMcpServerMutation;
   useUpdateMutation: UseUpdateMcpServerMutation;
   useTestMutation: UseTestMcpServerMutation;
+  // #687: offer the OAuth auth-type on create (personal path only).
+  allowOauth?: boolean;
 }
 
 // Build the form's field values from a (possibly undefined) server. Used both
@@ -62,6 +66,7 @@ interface McpServerFormProps {
 function buildInitialValues(server?: IAiMcpServer): FormValues {
   return {
     name: server?.name ?? "",
+    authType: server?.authType ?? "static",
     transport: server?.transport ?? "http",
     url: server?.url ?? "",
     authHeader: "",
@@ -90,6 +95,7 @@ export default function McpServerForm({
   useCreateMutation,
   useUpdateMutation,
   useTestMutation,
+  allowOauth,
 }: McpServerFormProps) {
   const { t } = useTranslation();
   const isEdit = Boolean(server);
@@ -116,6 +122,12 @@ export default function McpServerForm({
     setHeadersCleared(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [server?.id]);
+
+  // #687: an oauth2 server authenticates via the OAuth grant (Authorize flow),
+  // so the static Authorization-header field and Test are hidden for it.
+  const isOauth = form.values.authType === "oauth2";
+  // The auth-type is create-only and immutable, and oauth2 is personal-only.
+  const showAuthTypeSelect = !isEdit && Boolean(allowOauth);
 
   const transportOptions = [
     { value: "http", label: "HTTP" },
@@ -161,6 +173,8 @@ export default function McpServerForm({
     } else {
       const payload: IAiMcpServerCreate = {
         name: values.name,
+        // #687: create-only auth type.
+        authType: values.authType,
         transport: values.transport,
         url: values.url,
         toolAllowlist,
@@ -168,8 +182,13 @@ export default function McpServerForm({
         instructions: values.instructions,
         enabled: values.enabled,
       };
-      // On create, only a typed value matters (no prior stored headers).
-      if (headers !== undefined && Object.keys(headers).length > 0) {
+      // On create, only a typed value matters (no prior stored headers). An
+      // oauth2 server NEVER carries static headers (the server rejects it).
+      if (
+        values.authType !== "oauth2" &&
+        headers !== undefined &&
+        Object.keys(headers).length > 0
+      ) {
         payload.headers = headers;
       }
       await createMutation.mutateAsync(payload);
@@ -191,6 +210,21 @@ export default function McpServerForm({
     <Stack>
       <TextInput label={t("Server name")} {...form.getInputProps("name")} />
 
+      {showAuthTypeSelect && (
+        <Select
+          label={t("Authentication")}
+          description={t(
+            "Static: send an Authorization header. OAuth: authorize the server (e.g. Google) after creating it.",
+          )}
+          data={[
+            { value: "static", label: t("Static header") },
+            { value: "oauth2", label: t("OAuth 2.1") },
+          ]}
+          allowDeselect={false}
+          {...form.getInputProps("authType")}
+        />
+      )}
+
       <Select
         label={t("Transport")}
         data={transportOptions}
@@ -200,30 +234,42 @@ export default function McpServerForm({
 
       <TextInput label={t("URL")} {...form.getInputProps("url")} />
 
-      <PasswordInput
-        label={t("Authorization header")}
-        // Clarify that the value is sent verbatim as the Authorization header,
-        // so the user supplies the full scheme (no implicit Bearer prefix).
-        description={t(
-          'Sent verbatim as the value of the Authorization header (e.g. "Bearer <token>" or "Basic <base64>").',
-        )}
-        // Placeholder hints whether headers are stored; the value is never shown.
-        placeholder={hasHeaders ? t("•••• set") : ""}
-        autoComplete="off"
-        {...form.getInputProps("authHeader")}
-      />
+      {/* #687: an oauth2 server has no static header — it uses the Authorize flow
+          (available on the row once the server is created). */}
+      {isOauth ? (
+        <Alert color="blue" variant="light" icon={<IconInfoCircle size={16} />}>
+          {t(
+            "This server uses OAuth. After saving, click Authorize on its row to connect (you'll be redirected to the provider to grant access).",
+          )}
+        </Alert>
+      ) : (
+        <>
+          <PasswordInput
+            label={t("Authorization header")}
+            // Clarify that the value is sent verbatim as the Authorization header,
+            // so the user supplies the full scheme (no implicit Bearer prefix).
+            description={t(
+              'Sent verbatim as the value of the Authorization header (e.g. "Bearer <token>" or "Basic <base64>").',
+            )}
+            // Placeholder hints whether headers are stored; the value is never shown.
+            placeholder={hasHeaders ? t("•••• set") : ""}
+            autoComplete="off"
+            {...form.getInputProps("authHeader")}
+          />
 
-      {hasHeaders && (
-        <Group justify="flex-start" mt={-8}>
-          <Button
-            variant="subtle"
-            size="compact-sm"
-            color="red"
-            onClick={handleClearHeaders}
-          >
-            {t("Clear")}
-          </Button>
-        </Group>
+          {hasHeaders && (
+            <Group justify="flex-start" mt={-8}>
+              <Button
+                variant="subtle"
+                size="compact-sm"
+                color="red"
+                onClick={handleClearHeaders}
+              >
+                {t("Clear")}
+              </Button>
+            </Group>
+          )}
+        </>
       )}
 
       <TagsInput
@@ -287,8 +333,9 @@ export default function McpServerForm({
       )}
 
       <Group justify="space-between" mt="sm">
-        {/* Test runs against the SAVED server, so it's only available in edit mode. */}
-        {isEdit && server ? (
+        {/* Test runs against the SAVED server (static auth only), so it's only
+            available in edit mode and not for an oauth2 server. */}
+        {isEdit && server && !isOauth ? (
           <Button
             type="button"
             variant="default"

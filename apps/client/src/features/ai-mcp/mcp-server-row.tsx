@@ -18,8 +18,13 @@ import {
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { IAiMcpServer } from "./mcp-server-types.ts";
-import { UseTestMcpServerMutation } from "./mcp-mutation-hooks.ts";
+import {
+  UseTestMcpServerMutation,
+  UseAuthorizeMcpOauthMutation,
+  UseDisconnectMcpOauthMutation,
+} from "./mcp-mutation-hooks.ts";
 import { mcpTestButtonView } from "./mcp-test-view.ts";
+import McpOauthControls from "./mcp-oauth-controls.tsx";
 
 interface AiMcpServerRowProps {
   server: IAiMcpServer;
@@ -27,6 +32,11 @@ interface AiMcpServerRowProps {
   // or personal `/account/mcp-servers/test`). Instantiated PER ROW inside the
   // component so each row's inline result/loading is independent.
   useTestMutation: UseTestMcpServerMutation;
+  // #687: OAuth control hooks (personal path only). When the server is oauth2
+  // and these are provided, the row shows the grant status + Authorize/Disconnect
+  // INSTEAD of the static-header Test button.
+  useAuthorizeMutation?: UseAuthorizeMcpOauthMutation;
+  useDisconnectMutation?: UseDisconnectMcpOauthMutation;
   onEdit: (server: IAiMcpServer) => void;
   onDelete: (server: IAiMcpServer) => void;
   onToggleEnabled: (enabled: boolean) => void;
@@ -44,6 +54,8 @@ interface AiMcpServerRowProps {
 export default function AiMcpServerRow({
   server,
   useTestMutation,
+  useAuthorizeMutation,
+  useDisconnectMutation,
   onEdit,
   onDelete,
   onToggleEnabled,
@@ -51,6 +63,11 @@ export default function AiMcpServerRow({
   const { t } = useTranslation();
   const testMutation = useTestMutation();
   const result = testMutation.data;
+  // #687: an oauth2 server uses the OAuth grant flow, not static-header Test.
+  const isOauth =
+    server.authType === "oauth2" &&
+    Boolean(useAuthorizeMutation) &&
+    Boolean(useDisconnectMutation);
 
   // The row is keyed by `server.id`, so editing the connection-relevant fields
   // (url/transport/headers) does NOT remount it — an old success/failure result
@@ -106,26 +123,35 @@ export default function AiMcpServerRow({
       </Stack>
 
       <Group gap="xs" wrap="nowrap">
-        {/* Always clickable: testing a disabled server before enabling it is useful. */}
-        <Tooltip
-          label={tooltipLabel}
-          disabled={view.state === "idle"}
-          multiline
-          maw={320}
-          withinPortal
-        >
-          <Button
-            size="xs"
-            miw={88}
-            color={buttonColor}
-            variant={buttonVariant}
-            leftSection={testMutation.isPending ? undefined : buttonIcon}
-            loading={testMutation.isPending}
-            onClick={() => testMutation.mutate(server.id)}
+        {isOauth ? (
+          // #687: OAuth grant status + Authorize/Reauthorize/Disconnect.
+          <McpOauthControls
+            server={server}
+            useAuthorizeMutation={useAuthorizeMutation!}
+            useDisconnectMutation={useDisconnectMutation!}
+          />
+        ) : (
+          // Always clickable: testing a disabled server before enabling it is useful.
+          <Tooltip
+            label={tooltipLabel}
+            disabled={view.state === "idle"}
+            multiline
+            maw={320}
+            withinPortal
           >
-            {buttonLabel}
-          </Button>
-        </Tooltip>
+            <Button
+              size="xs"
+              miw={88}
+              color={buttonColor}
+              variant={buttonVariant}
+              leftSection={testMutation.isPending ? undefined : buttonIcon}
+              loading={testMutation.isPending}
+              onClick={() => testMutation.mutate(server.id)}
+            >
+              {buttonLabel}
+            </Button>
+          </Tooltip>
+        )}
         <Switch
           size="sm"
           checked={server.enabled}

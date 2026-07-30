@@ -4,6 +4,8 @@ import {
   ForbiddenException,
   HttpCode,
   HttpStatus,
+  Param,
+  ParseUUIDPipe,
   Post,
   UseGuards,
 } from '@nestjs/common';
@@ -99,5 +101,33 @@ export class AccountMcpServersController {
   ) {
     this.assertEnabled();
     return this.service.test(workspace.id, user.id, idDto.id);
+  }
+
+  /**
+   * #687: begin OAuth authorization for the user's own oauth2 server. Returns
+   * the browser authorize URL. `:id` is UUID-validated up front (a non-UUID
+   * would 500 in the query otherwise). Kill-switch gated.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post(':id/oauth/start')
+  async oauthStart(
+    @Param('id', ParseUUIDPipe) id: string,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
+    this.assertEnabled();
+    return this.service.startOauth(workspace.id, user.id, id);
+  }
+
+  /** #687: disconnect (delete the grant) for the user's own oauth2 server. */
+  @HttpCode(HttpStatus.OK)
+  @Post(':id/oauth/disconnect')
+  async oauthDisconnect(
+    @Param('id', ParseUUIDPipe) id: string,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
+    this.assertEnabled();
+    return this.service.disconnectOauth(workspace.id, user.id, id);
   }
 }

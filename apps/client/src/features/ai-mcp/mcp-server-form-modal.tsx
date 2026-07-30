@@ -16,6 +16,9 @@ interface McpServerFormModalProps {
   useCreateMutation: UseCreateMcpServerMutation;
   useUpdateMutation: UseUpdateMcpServerMutation;
   useTestMutation: UseTestMcpServerMutation;
+  // #687: offer the OAuth auth-type on create (personal path only; oauth2 is
+  // rejected on the admin path).
+  allowOauth?: boolean;
 }
 
 /**
@@ -31,6 +34,7 @@ export default function McpServerFormModal({
   useCreateMutation,
   useUpdateMutation,
   useTestMutation,
+  allowOauth,
 }: McpServerFormModalProps) {
   const { t } = useTranslation();
 
@@ -49,6 +53,7 @@ export default function McpServerFormModal({
         useCreateMutation={useCreateMutation}
         useUpdateMutation={useUpdateMutation}
         useTestMutation={useTestMutation}
+        allowOauth={allowOauth}
       />
     </Modal>
   );

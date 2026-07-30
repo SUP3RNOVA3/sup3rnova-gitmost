@@ -11,6 +11,7 @@ import { executeTx } from '@docmost/db/utils';
 import { SecretBoxService } from '../../../integrations/crypto/secret-box';
 import { EnvironmentService } from '../../../integrations/environment/environment.service';
 import { McpClientsService } from './mcp-clients.service';
+import { McpOauthService } from './mcp-oauth.service';
 import { CreateMcpServerDto } from './dto/create-mcp-server.dto';
 import { UpdateMcpServerDto } from './dto/update-mcp-server.dto';
 import {
@@ -45,11 +46,22 @@ export class AccountMcpServersService {
     private readonly secretBox: SecretBoxService,
     private readonly clients: McpClientsService,
     private readonly env: EnvironmentService,
+    private readonly oauth: McpOauthService,
   ) {}
 
   async list(workspaceId: string, userId: string): Promise<McpServerView[]> {
     const rows = await this.repo.listByUser(workspaceId, userId);
-    return rows.map((r) => toMcpServerView(r));
+    // #687: enrich oauth2 rows with their live grant status so the UI can show
+    // Authorize/Reauthorize/Disconnect. Static rows carry a null grantStatus.
+    return Promise.all(
+      rows.map(async (r) => {
+        const grantStatus =
+          r.authType === 'oauth2'
+            ? await this.oauth.getGrantStatus(r.id)
+            : null;
+        return toMcpServerView(r, grantStatus);
+      }),
+    );
   }
 
   /**
@@ -67,10 +79,24 @@ export class AccountMcpServersService {
     userId: string,
     dto: CreateMcpServerDto,
   ): Promise<McpServerView> {
+    const authType = dto.authType ?? 'static';
+    // #687: an OAuth server authenticates via the OAuth grant (Authorize flow),
+    // NOT static headers — the two are mutually exclusive.
+    const hasHeaders =
+      dto.headers != null && Object.keys(dto.headers).length > 0;
+    if (authType === 'oauth2' && hasHeaders) {
+      throw new BadRequestException(
+        'An OAuth (oauth2) MCP server cannot also carry static auth headers.',
+      );
+    }
+
     await assertMcpUrlAllowed(dto.url);
 
-    // Encrypt the auth headers if any non-empty set was provided.
-    const headersEnc = encryptMcpHeaders(this.secretBox, dto.headers);
+    // Encrypt the auth headers if any non-empty set was provided (static only).
+    const headersEnc =
+      authType === 'oauth2'
+        ? undefined
+        : encryptMcpHeaders(this.secretBox, dto.headers);
 
     const max = this.env.getMcpPersonalServersMax();
 
@@ -90,6 +116,7 @@ export class AccountMcpServersService {
           workspaceId,
           userId,
           name: dto.name,
+          authType,
           transport: dto.transport,
           url: dto.url,
           headersEnc,
@@ -120,8 +147,26 @@ export class AccountMcpServersService {
       throw new NotFoundException('MCP server not found');
     }
 
-    // Re-validate the URL whenever it changes (user-supplied -> SSRF risk).
-    if (dto.url !== undefined && dto.url !== existing.url) {
+    // #687: an OAuth server authenticates via its grant, NOT static headers.
+    // create rejects oauth2+headers; update must too, or a user could stash a
+    // useless encrypted header blob on an oauth2 row (and flip hasHeaders:true).
+    if (
+      existing.authType === 'oauth2' &&
+      dto.headers != null &&
+      Object.keys(dto.headers).length > 0
+    ) {
+      throw new BadRequestException(
+        'An OAuth (oauth2) MCP server cannot carry static auth headers.',
+      );
+    }
+
+    // Re-validate the URL whenever it changes (user-supplied -> SSRF risk). MUST
+    // run BEFORE any mutation below (a validation failure must not touch the
+    // grant or the row).
+    const urlChanged = dto.url !== undefined && dto.url !== existing.url;
+    const transportChanged =
+      dto.transport !== undefined && dto.transport !== existing.transport;
+    if (urlChanged) {
       await assertMcpUrlAllowed(dto.url);
     }
 
@@ -136,6 +181,19 @@ export class AccountMcpServersService {
       headersEnc = null; // clear
     } else {
       headersEnc = encryptMcpHeaders(this.secretBox, dto.headers) ?? null;
+    }
+
+    // #687 (R1): a url/transport change on an OAuth server RESETS the grant to
+    // `none` — a bearer minted for the old resource must not travel to a new
+    // address, and refresh must stop hitting the old AS. Deleting the grant
+    // (== status 'none') runs BEFORE the row write: otherwise a concurrent agent
+    // tour could interleave on an await and read the row with the NEW url while
+    // the grant is still `connected`, and connect to the new address with the
+    // old-resource Bearer — exactly what R1 forbids. Resetting first means any
+    // interleaving reads `none` (connect gate skips) until the row is rewritten.
+    if (existing.authType === 'oauth2' && (urlChanged || transportChanged)) {
+      await this.oauth.resetGrant(id);
+      this.clients.invalidateUser(workspaceId, userId);
     }
 
     await this.repo.updateForUser(id, workspaceId, userId, {
@@ -154,7 +212,11 @@ export class AccountMcpServersService {
     // Evict this user's cached toolset so the edit takes effect next turn.
     this.clients.invalidateUser(workspaceId, userId);
     const updated = await this.repo.findByIdForUser(id, workspaceId, userId);
-    return toMcpServerView(updated as AiMcpServer);
+    const grantStatus =
+      updated?.authType === 'oauth2'
+        ? await this.oauth.getGrantStatus(id)
+        : null;
+    return toMcpServerView(updated as AiMcpServer, grantStatus);
   }
 
   async remove(
@@ -192,5 +254,54 @@ export class AccountMcpServersService {
       url: row.url,
       headersEnc: row.headersEnc,
     });
+  }
+
+  /**
+   * Begin OAuth authorization for the user's own oauth2 server (#687): discovery
+   * + DCR, persist a pending grant + the one-time state, and return the browser
+   * authorize URL. Ownership-scoped (a non-owner id is "not found"); the server
+   * MUST be oauth2.
+   */
+  async startOauth(
+    workspaceId: string,
+    userId: string,
+    id: string,
+  ): Promise<{ authorizeUrl: string }> {
+    const row = await this.repo.findByIdForUser(id, workspaceId, userId);
+    if (!row) {
+      throw new NotFoundException('MCP server not found');
+    }
+    if (row.authType !== 'oauth2') {
+      throw new BadRequestException('This MCP server does not use OAuth.');
+    }
+    const { authorizeUrl } = await this.oauth.startAuthorization(userId, {
+      id: row.id,
+      workspaceId: row.workspaceId,
+      url: row.url,
+    });
+    // The grant just moved to `pending`; refresh this user's toolset cache.
+    this.clients.invalidateUser(workspaceId, userId);
+    return { authorizeUrl };
+  }
+
+  /**
+   * Disconnect the user's own oauth2 server (#687): delete the grant (status ->
+   * `none`). The server row itself is preserved.
+   */
+  async disconnectOauth(
+    workspaceId: string,
+    userId: string,
+    id: string,
+  ): Promise<{ success: true }> {
+    const row = await this.repo.findByIdForUser(id, workspaceId, userId);
+    if (!row) {
+      throw new NotFoundException('MCP server not found');
+    }
+    if (row.authType !== 'oauth2') {
+      throw new BadRequestException('This MCP server does not use OAuth.');
+    }
+    await this.oauth.disconnect(row.id);
+    this.clients.invalidateUser(workspaceId, userId);
+    return { success: true };
   }
 }

@@ -5,6 +5,8 @@ import { McpServersService } from './mcp-servers.service';
 import { McpServersController } from './mcp-servers.controller';
 import { AccountMcpServersService } from './account-mcp-servers.service';
 import { AccountMcpServersController } from './account-mcp-servers.controller';
+import { McpOauthService } from './mcp-oauth.service';
+import { McpOauthCallbackController } from './mcp-oauth-callback.controller';
 
 /**
  * External MCP servers unit (§6.8 / E1-E3). Lets the agent use admin-configured
@@ -21,8 +23,20 @@ import { AccountMcpServersController } from './account-mcp-servers.controller';
  */
 @Module({
   imports: [CryptoModule],
-  controllers: [McpServersController, AccountMcpServersController],
-  providers: [McpClientsService, McpServersService, AccountMcpServersService],
+  controllers: [
+    McpServersController,
+    AccountMcpServersController,
+    // #687: the OAuth callback lives in its own controller so the kill-switch
+    // gates it too (a flow begun before the flip must not write tokens).
+    McpOauthCallbackController,
+  ],
+  providers: [
+    McpClientsService,
+    McpServersService,
+    AccountMcpServersService,
+    // #687: OAuth 2.1 flow + runtime token service (single-flight refresh).
+    McpOauthService,
+  ],
   exports: [McpClientsService],
 })
 export class ExternalMcpModule {}

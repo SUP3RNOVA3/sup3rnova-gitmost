@@ -10,6 +10,8 @@ import {
   updateAccountMcpServer,
   deleteAccountMcpServer,
   testAccountMcpServer,
+  startAccountMcpOauth,
+  disconnectAccountMcpOauth,
 } from "@/features/account-mcp/services/account-mcp-server-service.ts";
 import type {
   IAiMcpServer,
@@ -99,5 +101,47 @@ export function useDeleteAccountMcpServerMutation() {
 export function useTestAccountMcpServerMutation() {
   return useMutation<IAiMcpServerTestResult, Error, string>({
     mutationFn: (id) => testAccountMcpServer(id),
+  });
+}
+
+// #687: begin the OAuth flow for an oauth2 server, then navigate the WHOLE tab to
+// the returned authorize URL (Google consent). A full-page navigation (not a
+// popup) keeps the `authToken` cookie on the top-level callback GET.
+export function useStartAccountMcpOauthMutation() {
+  const { t } = useTranslation();
+
+  return useMutation<{ authorizeUrl: string }, Error, string>({
+    mutationFn: (id) => startAccountMcpOauth(id),
+    onSuccess: (data) => {
+      window.location.assign(data.authorizeUrl);
+    },
+    onError: (error) => {
+      const errorMessage = error["response"]?.data?.message;
+      notifications.show({
+        message: errorMessage ?? t("Could not start authorization"),
+        color: "red",
+      });
+    },
+  });
+}
+
+// #687: disconnect (delete the grant) for an oauth2 server.
+export function useDisconnectAccountMcpOauthMutation() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+
+  return useMutation<{ success: true }, Error, string>({
+    mutationFn: (id) => disconnectAccountMcpOauth(id),
+    onSuccess: () => {
+      notifications.show({ message: t("Disconnected successfully") });
+      queryClient.invalidateQueries({ queryKey: accountMcpServersKey });
+    },
+    onError: (error) => {
+      const errorMessage = error["response"]?.data?.message;
+      notifications.show({
+        message: errorMessage ?? t("Failed to update data"),
+        color: "red",
+      });
+    },
   });
 }
