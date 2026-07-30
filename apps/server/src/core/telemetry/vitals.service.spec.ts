@@ -100,6 +100,28 @@ describe('VitalsService.buildRows', () => {
     ]);
   });
 
+  // #681 criterion 3 — the new editor_key_latency_ms name is registered in the
+  // server ALLOWED_METRIC_NAMES (accepted, not dropped as unknown), guarding the
+  // server half of the client<->server name lockstep (#639). A name missing here
+  // is silently dropped even when the client sends it.
+  it('accepts editor_key_latency_ms and still drops unknown names (#681)', () => {
+    const rows = svc.buildRows(
+      {
+        events: [
+          {
+            name: 'editor_key_latency_ms',
+            value: 48,
+            route: '/s/:space/p/:slug',
+          },
+          { name: 'not_a_real_metric', value: 1 }, // still dropped
+        ],
+      },
+      WS,
+    );
+    expect(rows.map((r) => r.name)).toEqual(['editor_key_latency_ms']);
+    expect(rows[0].value).toBe(48);
+  });
+
   it('drops events with a non-numeric or missing value', () => {
     const rows = svc.buildRows(
       {

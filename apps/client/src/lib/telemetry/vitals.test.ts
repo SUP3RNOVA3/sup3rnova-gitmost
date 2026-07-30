@@ -15,6 +15,7 @@ async function loadVitals(opts: {
   pathname: string;
   telemetryEnabled?: boolean;
   sampleRate?: string;
+  mockWebVitals?: boolean;
 }): Promise<VitalsModule> {
   vi.resetModules();
   // Control the module-init pathname capture (the doc's boot route).
@@ -23,6 +24,18 @@ async function loadVitals(opts: {
     isClientTelemetryEnabled: () => opts.telemetryEnabled ?? true,
     getClientTelemetrySampleRate: () => opts.sampleRate ?? "1",
   }));
+  if (opts.mockWebVitals) {
+    // The #681 observer-wiring test stubs a global PerformanceObserver; web-vitals'
+    // onINP would otherwise ALSO register an `{type:"event"}` observer through it,
+    // muddying which observer is ours. No-op the web-vitals subscribers so only
+    // initVitals' own observers are installed on the stub.
+    vi.doMock("web-vitals/attribution", () => ({
+      onINP: () => undefined,
+      onLCP: () => undefined,
+      onCLS: () => undefined,
+      onTTFB: () => undefined,
+    }));
+  }
   return import("./vitals");
 }
 
@@ -50,8 +63,11 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   vi.doUnmock("@/lib/config");
+  vi.doUnmock("web-vitals/attribution");
   vi.useRealTimers();
+  document.body.innerHTML = "";
 });
 
 describe("page_open_body_ms latch (#639)", () => {
@@ -332,6 +348,166 @@ describe("operation_ms helpers (#683)", () => {
     v.measureOperation("history_diff");
     v.reportOperation("history_diff", 500);
     expect(v.__vitalsTestHooks.drainBuffer()).toHaveLength(0);
+  });
+});
+
+describe("editor_key_latency_ms Event Timing observer (#681)", () => {
+  // A real-ish PerformanceEventTiming: the fields the browser hands the observer,
+  // including `target: null` (Event Timing does NOT expose the target element —
+  // the whole reason the filter uses a live focus check instead).
+  function eventEntry(
+    over: Partial<PerformanceEventTiming> = {},
+  ): PerformanceEventTiming {
+    return {
+      name: "keydown",
+      entryType: "event",
+      startTime: 1000,
+      duration: 48,
+      processingStart: 1008,
+      processingEnd: 1016,
+      cancelable: true,
+      target: null,
+      interactionId: 0,
+      toJSON: () => ({}),
+      ...over,
+    } as unknown as PerformanceEventTiming;
+  }
+
+  // Put real focus inside a real `.ProseMirror` element so isEditorFocused()
+  // exercises the actual DOM focus path (#8: the observable property under a
+  // real-ish entry + real focus, not a stubbed helper). Returns a cleanup fn.
+  function focusInsideEditor(): void {
+    const editor = document.createElement("div");
+    editor.className = "ProseMirror";
+    editor.contentEditable = "true";
+    editor.tabIndex = -1;
+    document.body.appendChild(editor);
+    editor.focus();
+  }
+
+  function focusOutsideEditor(): void {
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+  }
+
+  // AC1/AC2 — an editor-focused keydown reports editor_key_latency_ms with the
+  // entry's FULL duration (keydown→paint) and the current route template.
+  it("reports the full keydown duration when focus is inside the editor", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/design-abc" });
+    focusInsideEditor();
+    v.reportEditorKeyLatency([eventEntry({ duration: 64 })]);
+
+    const events = names(
+      v.__vitalsTestHooks.drainBuffer(),
+      "editor_key_latency_ms",
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toBe(64);
+    expect(events[0].route).toBe("/s/:space/p/:slug");
+  });
+
+  // Filter half 1 — non-keydown interactions (click/pointerdown) are ignored even
+  // when the editor is focused: this metric is typing latency only.
+  it("ignores non-keydown interaction entries", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    focusInsideEditor();
+    v.reportEditorKeyLatency([
+      eventEntry({ name: "click", duration: 90 }),
+      eventEntry({ name: "pointerdown", duration: 90 }),
+    ]);
+    expect(
+      names(v.__vitalsTestHooks.drainBuffer(), "editor_key_latency_ms"),
+    ).toHaveLength(0);
+  });
+
+  // Filter half 2 — a keydown while focus is OUTSIDE any .ProseMirror (a comment
+  // input, the spotlight, page chrome) is not an editor interaction: ignored.
+  it("ignores a keydown when focus is outside the editor", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    focusOutsideEditor();
+    v.reportEditorKeyLatency([eventEntry({ duration: 80 })]);
+    expect(
+      names(v.__vitalsTestHooks.drainBuffer(), "editor_key_latency_ms"),
+    ).toHaveLength(0);
+  });
+
+  // Always-on, per-interaction (NOT sampled to one p98): every qualifying entry in
+  // a batch reports its own sample.
+  it("reports every qualifying entry in a batch", async () => {
+    const v = await loadVitals({ pathname: "/s/eng/p/x" });
+    focusInsideEditor();
+    v.reportEditorKeyLatency([
+      eventEntry({ duration: 24 }),
+      eventEntry({ name: "click", duration: 200 }), // filtered out
+      eventEntry({ duration: 112 }),
+    ]);
+    const events = names(
+      v.__vitalsTestHooks.drainBuffer(),
+      "editor_key_latency_ms",
+    );
+    expect(events.map((e) => e.value)).toEqual([24, 112]);
+  });
+
+  // AC4 gate half — telemetry off ⇒ nothing collected even for an editor keydown.
+  it("is a no-op when telemetry is disabled", async () => {
+    const v = await loadVitals({
+      pathname: "/s/eng/p/x",
+      telemetryEnabled: false,
+    });
+    focusInsideEditor();
+    v.reportEditorKeyLatency([eventEntry({ duration: 100 })]);
+    expect(v.__vitalsTestHooks.drainBuffer()).toHaveLength(0);
+  });
+
+  // Wiring (#8) — initVitals installs a real `{type:"event", durationThreshold:16,
+  // buffered:false}` observer whose callback routes list.getEntries() through the
+  // SAME reportEditorKeyLatency filter (#7: one source of the detection). Driving
+  // the captured callback with a real-ish list + real focus proves the observer is
+  // wired to the filter and reports the correct shape.
+  it("initVitals installs an event observer wired to the editor-keydown filter", async () => {
+    const observed: Array<{
+      cb: (list: { getEntries: () => PerformanceEntry[] }) => void;
+      options: PerformanceObserverInit;
+    }> = [];
+    class FakePerformanceObserver {
+      constructor(
+        private cb: (list: { getEntries: () => PerformanceEntry[] }) => void,
+      ) {}
+      observe(options: PerformanceObserverInit) {
+        observed.push({ cb: this.cb, options });
+      }
+      disconnect() {}
+      takeRecords() {
+        return [];
+      }
+    }
+    vi.stubGlobal("PerformanceObserver", FakePerformanceObserver);
+    vi.useFakeTimers(); // swallow initVitals' setInterval(flush)
+
+    const v = await loadVitals({
+      pathname: "/s/eng/p/x",
+      mockWebVitals: true,
+    });
+    v.initVitals();
+
+    const eventObs = observed.find((o) => o.options.type === "event");
+    expect(eventObs).toBeDefined();
+    expect(eventObs!.options.durationThreshold).toBe(16);
+    expect(eventObs!.options.buffered).toBe(false);
+
+    // Drive the live observer callback with a real-ish entry + real editor focus.
+    focusInsideEditor();
+    eventObs!.cb({
+      getEntries: () => [eventEntry({ duration: 72 })],
+    });
+
+    const events = names(
+      v.__vitalsTestHooks.drainBuffer(),
+      "editor_key_latency_ms",
+    );
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toBe(72);
   });
 });
 
