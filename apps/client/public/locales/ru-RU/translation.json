@@ -1556,8 +1556,10 @@
   "Weather": "Погода",
   "{{count}} icons (limited mode)_few": "{{count}} иконки (ограниченный режим)",
   "{{count}} icons (limited mode)_one": "{{count}} иконка (ограниченный режим)",
+  "{{count}} icons (limited mode)_many": "{{count}} иконок (ограниченный режим)",
   "{{count}} icons (limited mode)_other": "{{count}} иконок (ограниченный режим)",
   "{{count}} icons_few": "{{count}} иконки",
   "{{count}} icons_one": "{{count}} иконка",
+  "{{count}} icons_many": "{{count}} иконок",
   "{{count}} icons_other": "{{count}} иконок"
 }
