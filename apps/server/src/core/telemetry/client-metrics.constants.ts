@@ -33,6 +33,13 @@ export const ALLOWED_METRIC_NAMES = new Set<string>([
   // check below (lowercase letters + `_`). MUST also be in the client allowlist
   // + union type (vitals.ts) — a name missing from EITHER side is dropped.
   'operation_ms',
+  // #681 — full keydown→paint editor latency via the Event Timing API (the same
+  // source INP uses, but always-on and filtered to editor keydowns). It measures
+  // what `editor_tx_ms` is structurally blind to: the React re-render / menu-
+  // subscription / floating-ui work that runs AFTER the ProseMirror dispatch.
+  // MUST also be in the client allowlist + reportClientMetric union type
+  // (vitals.ts) — a name missing from EITHER side is silently dropped (#639).
+  'editor_key_latency_ms',
 ]);
 
 // The only rating values accepted (web-vitals). Anything else -> null.

@@ -39,6 +39,14 @@ const EDITOR_TX_MIN_MS = 8; // only report editor transactions slower than this
 // user-perceived wait worth measuring.
 const OPERATION_MIN_MS = 8;
 
+// #681 — Event Timing durationThreshold for editor_key_latency_ms. Per the
+// Event Timing spec the minimum reportable interaction duration is 16ms (finer
+// ones are dropped by the browser and durations are rounded to 8ms), so 16 is
+// the floor. Fast keystrokes (<16ms) never surface, by design: this metric is a
+// distribution over PERCEPTIBLE keydown→paint latencies (we want the lags, not
+// background noise), not a per-keystroke trace.
+const EDITOR_KEY_LATENCY_MIN_MS = 16;
+
 // #639 — hard cap on a mark-less (timeOrigin) page_open_body_ms measurement.
 // The mark-less start counts from `performance.timeOrigin`, i.e. document boot.
 // A programmatic (non-<a>) navigation after minutes of idle carries NO click
@@ -91,6 +99,13 @@ const ALLOWED_NAMES = new Set([
   // covers every op. Must ALSO be in reportClientMetric's union type below AND
   // the server ALLOWED_METRIC_NAMES; a name missing from EITHER side is dropped.
   "operation_ms",
+  // #681 — full keydown→paint editor latency via the Event Timing API. Unlike
+  // editor_tx_ms (the SYNCHRONOUS PM transaction only), this captures the React
+  // re-render / menu-subscription / floating-ui work that runs AFTER dispatch —
+  // the layer #343 optimised, which editor_tx is structurally blind to. Must
+  // ALSO be in reportClientMetric's union type below AND the server
+  // ALLOWED_METRIC_NAMES; a name missing from EITHER side is silently dropped.
+  "editor_key_latency_ms",
 ]);
 
 interface VitalEvent {
@@ -239,7 +254,11 @@ export function reportClientMetric(
     | "body_paint_timeout"
     // #683 — one metric for all client-perceived / compute operations; the op
     // name is carried in `extra.attr` (see reportOperation).
-    | "operation_ms",
+    | "operation_ms"
+    // #681 — full keydown→paint editor latency (see reportEditorKeyLatency).
+    // Must stay in lockstep with ALLOWED_NAMES above and the server
+    // ALLOWED_METRIC_NAMES; a name missing from any of the three is dropped.
+    | "editor_key_latency_ms",
   value: number,
   extra?: { docSize?: number; attr?: string },
 ): void {
@@ -467,6 +486,51 @@ export function notePageBodyPaint(docKey: string): void {
   }
 }
 
+/**
+ * #681 — is the current focus inside a ProseMirror editor? A PerformanceEventTiming
+ * entry exposes a `target`, but it returns `null` once the node is detached by
+ * callback time (and it is not reliably retained across the paint), so we cannot
+ * depend on it to filter editor keydowns. Instead we check the LIVE focus at callback time:
+ * a keydown lag matters to this metric only when the editor has focus. The
+ * heuristic is intentionally broad — a focused input nested inside a `.ProseMirror`
+ * container (e.g. an inline widget) counts as an editor interaction too, which is
+ * acceptable per the issue's edge-case call.
+ */
+function isEditorFocused(): boolean {
+  try {
+    return document.activeElement?.closest(".ProseMirror") != null;
+  } catch {
+    // No DOM (SSR) or a hostile activeElement: treat as not-in-editor.
+    return false;
+  }
+}
+
+/**
+ * #681 — the editor-keydown filter + report for a batch of Event Timing entries.
+ * This is the SINGLE source of the editor-keydown detection: the live
+ * PerformanceObserver callback (initVitals) and the tests both drive THIS
+ * function, so there is no hand-synced mirror of the filter (#7).
+ *
+ * For each entry it reports `editor_key_latency_ms` = the entry's `duration`,
+ * i.e. the FULL keydown→next-paint time (input delay + event handling + React
+ * commit + presentation), for keydowns whose focus is in the editor. The
+ * browser has already dropped sub-threshold (<16ms) interactions via
+ * `durationThreshold`, so every entry here is a perceptible interaction.
+ * Reporting is gated by isVitalsActive() inside reportClientMetric — flag off or
+ * not-sampled ⇒ no-op.
+ */
+export function reportEditorKeyLatency(entries: PerformanceEventTiming[]): void {
+  for (const entry of entries) {
+    // The observer also delivers pointerdown/click/etc.; we want editor keydowns
+    // only. The entry's `target` is unreliable (null once detached), so filter by
+    // name + live focus. This covers all keydowns in the editor (arrows/shortcuts
+    // too, not just text insertion), which is what the issue's keydown→paint asks.
+    if (entry.name !== "keydown") continue;
+    if (!isEditorFocused()) continue;
+    reportClientMetric("editor_key_latency_ms", entry.duration, {});
+  }
+}
+
 function attrTarget(
   metric:
     | INPMetricWithAttribution
@@ -556,6 +620,40 @@ export function initVitals(): void {
     }
   } catch {
     // longtask entry type unsupported: skip silently.
+  }
+
+  // #681 — editor_key_latency_ms: full keydown→paint latency via the Event
+  // Timing API (the same browser-native source INP is built on), but ALWAYS-ON
+  // (every qualifying interaction, not INP's single p98 sample) and filtered to
+  // editor keydowns. This is the ONLY vitals signal that sees the React re-render
+  // / menu-subscription / floating-ui work that runs AFTER the ProseMirror
+  // dispatch — the #343-class overhead that editor_tx_ms is structurally blind
+  // to. A passive browser-collected observer: nothing is added to the keystroke
+  // hot path (Event Timing is gathered natively; the callback fires only on
+  // interactions ≥ threshold).
+  try {
+    if (typeof PerformanceObserver !== "undefined") {
+      const keyObserver = new PerformanceObserver((list) => {
+        reportEditorKeyLatency(
+          list.getEntries() as unknown as PerformanceEventTiming[],
+        );
+      });
+      // buffered:false — only live interactions, not a replay of pre-init events
+      // (those predate any editor focus / this session's sampling decision).
+      keyObserver.observe({
+        type: "event",
+        durationThreshold: EDITOR_KEY_LATENCY_MIN_MS,
+        buffered: false,
+      });
+    }
+  } catch {
+    // #10/#681 — Event Timing unsupported (older browser): observe({type:"event"})
+    // throws. The metric is then INTENTIONALLY inert — no editor_key_latency_ms is
+    // ever collected on this session, exactly like the longtask observer above.
+    // This is a deliberate, commented graceful-degrade (the browser lacks the
+    // native source), NOT a swallowed error hiding a bug: there is nothing to
+    // surface to the operator because telemetry itself is best-effort and the
+    // rest of vitals keeps working. Newer browsers (all evergreen) support it.
   }
 
   // page_open_body_ms start: mark when the user clicks a page link/tree-row (any
