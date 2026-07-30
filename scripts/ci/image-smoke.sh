@@ -73,6 +73,24 @@ echo "OK S4: hashed asset served with immutable cache-control"
 grep -qi '^content-encoding:.*br' <<<"$HDRS" || fail "S4: $ASSET not served brotli-precompressed (content-encoding: br missing)"
 echo "OK S4: hashed asset served with the precompressed brotli copy"
 
+# S5: the ~700KB Lucide icon catalog (#696) must stay in its OWN lazy chunk and
+# NEVER be pulled into an eager bundle referenced by index.html — a single static
+# import anywhere in the eager graph would drag it into the entry bundle. We
+# assert a sentinel string that exists ONLY in the catalog data ("firefighter",
+# a lucide tag of the `flame` icon) is absent from every eager /assets/*.js the
+# served HTML references. Fetched without `Accept-Encoding: br` so the body is
+# plain text to grep.
+SENTINEL="firefighter"
+mapfile -t EAGER_JS < <(grep -oE '/assets/[A-Za-z0-9._@/-]+\.js' <<<"$HTML" | sort -u)
+[ "${#EAGER_JS[@]}" -gt 0 ] || fail "S5: no eager /assets/*.js found in the served HTML"
+for JS in "${EAGER_JS[@]}"; do
+  BODY=$(curl -fsS "http://localhost:3000$JS") || fail "S5: GET $JS failed"
+  if grep -q "$SENTINEL" <<<"$BODY"; then
+    fail "S5: eager bundle $JS contains the catalog sentinel '$SENTINEL' — the Lucide catalog leaked into an eager chunk (must be a lazy import only)"
+  fi
+done
+echo "OK S5: Lucide catalog is not present in any eager bundle (#696)"
+
 # Remove the container ONLY on success, so the failure path keeps it around for
 # the workflow's "Dump smoke container log on failure" step.
 docker rm -f gitmost-smoke > /dev/null

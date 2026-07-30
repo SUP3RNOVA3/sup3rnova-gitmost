@@ -90,6 +90,12 @@ export default defineConfig(({ mode }) => {
       }),
     ],
     build: {
+      // The Lucide icon catalog (issue #696) is a single ~700 KB (raw)
+      // dynamically-imported chunk (lucide-catalog.generated-*.js), well over
+      // Vite's default 500 KB warning threshold — but it is lazy (loaded only
+      // when the icon picker first opens) and compresses to ~128 KB brotli. Raise
+      // the limit so that intentional chunk stops spamming a warning every build.
+      chunkSizeWarningLimit: 1000,
       rolldownOptions: {
         output: {
           advancedChunks: {

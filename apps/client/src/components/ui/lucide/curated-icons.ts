@@ -1,8 +1,9 @@
 /**
- * A curated set of common Lucide icons shown in the picker BEFORE the user
- * types a search query. Every name here MUST be a key of `dynamicIconImports`
- * (enforced by curated-icons.test.ts). Kept well under the 120-icon render
- * window so the default view renders in one page.
+ * A curated set of common Lucide icons shown as the "Popular" section of the
+ * picker BEFORE the user types a search query. Every name here MUST be a
+ * CANONICAL icon — a key of the generated catalog's `icons`, not an alias
+ * (enforced by lucide-catalog.generated.test.ts check #5). Canonicalized in
+ * #696: `filter`→`funnel`, `circle-help`→`circle-question-mark`.
  */
 export const CURATED_ICON_NAMES: string[] = [
   "file",
@@ -91,7 +92,7 @@ export const CURATED_ICON_NAMES: string[] = [
   "key",
   "eye",
   "search",
-  "filter",
+  "funnel",
   "pencil",
   "trash-2",
   "archive",
@@ -103,7 +104,7 @@ export const CURATED_ICON_NAMES: string[] = [
   "save",
   "triangle-alert",
   "info",
-  "circle-help",
+  "circle-question-mark",
   "quote",
   "hash",
   "at-sign",
