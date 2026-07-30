@@ -29,6 +29,13 @@ packages/mcp/build/
 # is a build artifact like build/ — never committed, always fresh.
 packages/mcp/src/registry-stamp.generated.ts
 
+# EXCEPTION to the "*.generated.* is never committed" convention above:
+# apps/client/src/components/ui/lucide/lucide-catalog.generated.ts IS committed.
+# Its generator (scripts/gen-lucide-catalog.mjs, issue #696) is hand-run and
+# reaches the network (a lucide repo-tag tarball), so it cannot run in the Docker
+# build; the committed artifact is what ships. A guard test protects it from
+# drift. Deliberately NOT ignored — do not add it here.
+
 # token-estimate compiled output (#490; built in CI/Docker via `pnpm build` /
 # the server `pretest`, never committed, so src/ and prod can never diverge).
 packages/token-estimate/dist/
