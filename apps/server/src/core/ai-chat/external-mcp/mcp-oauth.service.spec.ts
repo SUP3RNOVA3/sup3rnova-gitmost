@@ -135,6 +135,30 @@ describe('ensureAccessToken — proactive refresh + classification', () => {
     expect(grantRepo.markStatus).not.toHaveBeenCalled();
   });
 
+  it('LOW: a hostile empty refresh_token does NOT overwrite the live one', async () => {
+    const { svc, grantRepo } = build();
+    // AS returns a new access token but an EMPTY refresh_token (a string, but not
+    // a usable token). We must persist the new access yet KEEP the old refresh.
+    (svc as any).fetchFn = jest.fn(async () =>
+      tokenResponse(200, {
+        access_token: 'AT2',
+        refresh_token: '',
+        expires_in: 3600,
+      }),
+    );
+
+    await expect(svc.ensureAccessToken(server)).resolves.toBe('AT2');
+    // 'RT' is the pre-existing refresh (grant.refreshTokenEnc = 'enc:RT'); it is
+    // re-encrypted unchanged, NOT replaced by enc:'' (which would break the next
+    // refresh with invalid_grant -> spurious re-consent).
+    expect(grantRepo.updateTokens).toHaveBeenCalledWith('srv-1', {
+      accessTokenEnc: 'enc:AT2',
+      refreshTokenEnc: 'enc:RT',
+      expiresAt: expect.any(Date),
+    });
+    expect(grantRepo.markStatus).not.toHaveBeenCalled();
+  });
+
   it('criterion 5: AS 503 -> grant STAYS connected, throws unavailable', async () => {
     const { svc, grantRepo } = build();
     const fetchFn = jest.fn(async () => tokenResponse(503, {}));

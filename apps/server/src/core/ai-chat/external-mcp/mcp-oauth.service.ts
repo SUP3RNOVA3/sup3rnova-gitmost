@@ -579,11 +579,13 @@ export class McpOauthService {
       throw new McpGrantUnavailableError(server.id, server.workspaceId);
     }
     // fastmcp rotates the refresh token (one-time use); keep the old one only if
-    // the response omitted a new one.
+    // the response omitted a new one. #699 LOW: an EMPTY string is a string but
+    // NOT a usable token — persisting `''` would make the next turn's refresh
+    // fail with invalid_grant and force a spurious re-consent. Treat empty like
+    // absent and keep the live refresh token (mirrors the access_token guard).
+    const rotated = json?.refresh_token;
     const newRefresh =
-      typeof json?.refresh_token === 'string'
-        ? json.refresh_token
-        : refreshToken;
+      typeof rotated === 'string' && rotated.length > 0 ? rotated : refreshToken;
     const expiresAt =
       typeof json?.expires_in === 'number'
         ? expiryFromExpiresIn(json.expires_in)

@@ -113,5 +113,15 @@ export const guardedFetch = async (
   if (!check.ok) {
     throw new Error(`blocked request: ${check.reason ?? 'SSRF policy'}`);
   }
-  return fetch(input, { ...init, dispatcher } as RequestInit);
+  // SSRF: FORCE redirect:'error' — placed AFTER the spread so no caller can
+  // override it. This closes the redirect-to-internal vector uniformly for BOTH
+  // the MCP transport AND the OAuth discovery/DCR/exchange/refresh calls (the
+  // single SSRF source, AGENTS #7): only the INITIAL URL is pre-flighted above,
+  // and undici SKIPS the pinning connect.lookup for an IP-literal host — so a
+  // `302 Location: http://169.254.169.254/…` (or a private 10.x) would otherwise
+  // let fetch open a fresh, UNPINNED socket to an internal address and leak the
+  // client_secret/refresh_token in the refresh POST body. OAuth discovery/token
+  // endpoints are direct calls that legitimately never server-side-redirect; the
+  // browser consent redirect happens in the USER's browser, not this fetch.
+  return fetch(input, { ...init, dispatcher, redirect: 'error' } as RequestInit);
 };
