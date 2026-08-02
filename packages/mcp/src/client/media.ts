@@ -1010,11 +1010,6 @@ export function MediaMixin<TBase extends GConstructor<DocmostClientContext>>(Bas
     return this.fetchInternalFile(src);
   }
 
-  /**
-   * Resolve a drawio node on a page by `attrs.id` or `#<index>` and return the
-   * node plus its ref. Throws a clear error if the ref does not resolve to a
-   * drawio node.
-   */
   }
   return MediaMixin;
 }

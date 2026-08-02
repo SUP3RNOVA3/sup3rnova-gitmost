@@ -128,12 +128,12 @@ All 41 tools, grouped by what you'd reach for them.
 - **`getOutline`** — A compact outline of a page's top-level blocks (`{index, type, id,
   level, firstText}`; tables add row/column counts and their header-cell texts, lists add
   item counts) **without** the document body. The cheap way to locate a section or table
-  and grab its block id before
+  and grab its block id — or, for an id-less block such as a table, its `index` — before
   `getNode` / `patchNode` / `insertNode`.
 - **`getNode`** — Fetch a single block's full ProseMirror subtree (lossless) without
   pulling the whole page. Address it by a block id (from `getOutline` / `getPageJson`),
-  or by `#<index>` for a top-level block — use the `#<index>` form for tables/rows/cells,
-  which carry no id.
+  or by `#<index>` for a top-level block — the way to reach a block with no id (tables,
+  lists, quotes, dividers, callouts, images).
 
 ### Page lifecycle
 
@@ -267,8 +267,15 @@ This same guidance is also delivered at runtime via the MCP server `instructions
 so capable clients steer the model automatically.
 
 - **Text fixes** (wording, typos, numbers): `editPageText`.
-- **One block** (paragraph/heading/callout/table cell): `patchNode` / `insertNode` /
-  `deleteNode`, addressing the node by its `attrs.id` from `getPageJson`.
+- **One block**: `patchNode` / `insertNode` / `deleteNode`, addressing the node by its
+  `attrs.id` from `getPageJson`. Block ids sit on paragraphs and headings (a few
+  container nodes carry one too) and are matched anywhere in the tree, so a paragraph
+  inside a list item, quote, table cell or callout is addressable **if it has an id** —
+  blocks imported from Markdown often have none, and `getOutline` shows top-level ids
+  only (nested ones surface in `getPageJson`, `tableGet`'s `cellIds`, `searchInPage`'s
+  `nodeId`). Without an id: `editPageText` (needs none), the table tools, or
+  `docmostTransform`. The `#<index>` form works with `getNode` but not with
+  `patchNode` / `deleteNode` / `insertNode`'s `anchorNodeId`.
 - **Images**: `insertImage` / `replaceImage`.
 - **A new page**: `createPage`.
 - **Bulk rewrite, or nodes without ids**: `updatePageJson` (ProseMirror) or
@@ -281,8 +288,8 @@ so capable clients steer the model automatically.
 - **Review changes**: `listPageHistory` → `diffPageVersions` → `restorePageVersion`.
 - **Comments**: `createComment` (with optional inline anchoring) / `listComments` /
   `updateComment` / `resolveComment` / `deleteComment` / `checkNewComments`.
-- **Navigate a page cheaply** (find a section/table, grab a block id): `getOutline` →
-  `getNode`.
+- **Navigate a page cheaply** (find a section/table, grab a block id or index):
+  `getOutline` → `getNode`.
 - **Tables** (add/remove a row, set a cell): `tableGet` / `tableInsertRow` /
   `tableDeleteRow` / `tableUpdateCell`.
 - **Export a page as self-contained Markdown** (with comment anchors): `exportPageMarkdown`.

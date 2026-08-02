@@ -1039,7 +1039,9 @@ export class AiChatToolsService {
           'Run a sandboxed JS transform of the form `(doc, ctx) => doc` over a ' +
           "page's ProseMirror document for complex/scripted rewrites. dryRun " +
           '(default true) previews a diff WITHOUT writing; set dryRun:false to ' +
-          'apply. Reversible: applying creates a new page-history snapshot.',
+          'apply. Helpers live on `ctx.helpers`, not on `ctx` (e.g. ' +
+          '`ctx.helpers.getList` finds an id-less node). ' +
+          'Reversible: applying creates a new page-history snapshot.',
         inputSchema: modelFriendlyInput({
           pageId: z.string().describe('The id of the page to transform.'),
           transformJs: z
@@ -1120,8 +1122,8 @@ export class AiChatToolsService {
       tools.viewImage = tool({
         description:
           'View an image node from a page so you can SEE it (vision). Given a ' +
-          'pageId and a node reference (the image/drawio node\'s attrs.id, or ' +
-          '"#<index>" for a top-level block), the image is shown to you as a ' +
+          'pageId and a node reference ("#<index>" from the page outline — image ' +
+          'and drawio nodes carry no id in the schema), the image is shown to you as a ' +
           'separate message on THIS step only. Raster images (png/jpeg/webp/gif) ' +
           'are shown as-is; a plain SVG is rendered to PNG. A draw.io diagram is ' +
           'shown from its embedded PNG preview when it has one; otherwise, ' +
@@ -1136,8 +1138,8 @@ export class AiChatToolsService {
             .string()
             .min(1)
             .describe(
-              'The image/drawio node reference: its attrs.id, or "#<index>" for ' +
-                'a top-level block from the page outline.',
+              'The image/drawio node reference: "#<index>" for a top-level block ' +
+                'from the page outline (these nodes carry no id in the schema).',
             ),
         }),
         execute: async ({ pageId, node }, { toolCallId }) =>

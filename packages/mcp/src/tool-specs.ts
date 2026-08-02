@@ -247,6 +247,23 @@ export const DRAWIO_HARD_RULES =
   "wider than its shape, negative coords) — they do NOT block the write; fix them " +
   "and retry, max 2 iterations.";
 
+/**
+ * Where block ids live and what to do when a block has none — spliced into the
+ * patchNode / deleteNode descriptions (same pattern as DRAWIO_HARD_RULES above:
+ * ONE copy, concatenated, never two hand-synced paragraphs). Kept deliberately
+ * terse: every spec ships on every tools/list. Transport-neutral by convention,
+ * so it reads correctly on both the MCP and the in-app layer. ROUTING_PROSE and
+ * the READMEs carry the same facts in their own register and stay hand-written.
+ */
+export const BLOCK_ID_NOTE =
+  'Ids sit on paragraphs/headings (a few containers too), matched anywhere in ' +
+  'the tree: a nested paragraph (list, quote, cell, callout) works IF it has ' +
+  'one — markdown-imported ones often lack it, and getOutline shows top-level ' +
+  'ids only (nested: getPageJson, a table read, searchInPage). No id ' +
+  '("#<index>" is NOT accepted here) -> a scripted page transform, the way to ' +
+  'REMOVE an id-less container; editPageText needs no id for text fixes, and ' +
+  'the table tools take "#<index>" (incl. add/delete row). ';
+
 export const SHARED_TOOL_SPECS = {
   // --- no-argument read tools ---
 
@@ -334,15 +351,16 @@ export const SHARED_TOOL_SPECS = {
     writeClass: 'readOnly',
     description:
       "Fetch a single block for editing. `nodeId` is a block id from the page " +
-      'outline or page-JSON view (works for headings/paragraphs/callouts/images), OR ' +
-      '`#<index>` to fetch a top-level block by its outline index — use the ' +
-      '`#<index>` form for tables/rows/cells, which carry no id. ' +
+      'outline or page-JSON view — block ids live on PARAGRAPHS and HEADINGS (a ' +
+      'few containers too). OR `#<index>` to fetch a top-level block by its ' +
+      'outline index — the way to reach any top-level block without an id: ' +
+      'tables, lists, quotes, dividers, callouts, images. ' +
       "`format` defaults to \"markdown\": the block is returned as a canonical " +
       'markdown fragment (comment anchors are KEPT so a patchNode write-back does ' +
       'not orphan a thread) — edit it and write it back with patchNode({markdown}). ' +
       'Pass format:"json" for the raw lossless ProseMirror subtree (for precise ' +
       'attr/mark work). A node that cannot be a document top-level block ' +
-      '(tableRow/tableCell/tableHeader via "#<index>") auto-falls back to JSON with ' +
+      'auto-falls back to JSON with ' +
       'format:"json" in the response. Reflects your own just-made edit immediately ' +
       '(read-after-write); a rare freshness:"stale-fallback" in the response means ' +
       're-read shortly for the settled version.',
@@ -385,7 +403,8 @@ export const SHARED_TOOL_SPECS = {
       'match, after }] }: `nodeId` is the block id (or "#<index>" for ' +
       'table/cell content) — pass it to getNode/patchNode (the "#<index>" ' +
       'form resolves with getNode but NOT patchNode, which only accepts a real ' +
-      'block id). To anchor a comment, do NOT pass nodeId to createComment (it ' +
+      'block id; to WRITE such a hit use editPageText, which needs no id). ' +
+      'To anchor a comment, do NOT pass nodeId to createComment (it ' +
       'has no nodeId param); build a UNIQUE text selection from before+match+' +
       'after and pass it as createComment\'s `selection`. `blockIndex` is the ' +
       'getOutline index; `before`/`after` give ~40 chars of context to build ' +
@@ -450,7 +469,8 @@ export const SHARED_TOOL_SPECS = {
     writeClass: 'write',
     description:
       'Remove a single block by its attrs.id (from the page outline or ' +
-      'page-JSON view) WITHOUT resending the whole document.',
+      'page-JSON view) WITHOUT resending the whole document. ' +
+      BLOCK_ID_NOTE,
     tier: 'deferred',
     catalogLine: 'deleteNode — remove a single content block by its block id.',
     buildShape: (z) => ({
@@ -478,6 +498,7 @@ export const SHARED_TOOL_SPECS = {
       'Replace a single content block identified by its attrs.id, WITHOUT ' +
       'resending the whole document; the replacement keeps the same block id. ' +
       'Get the block id from the page outline (cheap) or the page-JSON view. ' +
+      BLOCK_ID_NOTE +
       'Provide EXACTLY ONE of `markdown` or `node`. ' +
       '`markdown` (RECOMMENDED for prose): a canonical markdown fragment — the ' +
       'usual round trip is getNode (markdown) → edit the markdown → patchNode ' +
@@ -488,9 +509,10 @@ export const SHARED_TOOL_SPECS = {
       '`$...$`/`$$...$$` are NOT parsed as math and schemeless `www.host` / bare ' +
       'emails are NOT auto-linked (an explicit `https://` URL still links); for a ' +
       'real formula pass a `mathInline`/`mathBlock` ProseMirror node via `node` ' +
-      '(or updatePageJson). REJECTED when the target is a table ' +
-      'cell with attributes markdown cannot represent (merged/colored/fixed-width) ' +
-      '— use the table tools or `node`. ' +
+      '(or updatePageJson). REJECTED when the target block or its subtree ' +
+      'carries table-cell attrs markdown cannot represent ' +
+      '(merged/colored/fixed-width) — use the table tools or `node`; a paragraph ' +
+      'INSIDE such a cell is fine. ' +
       '`node` (for precise attr/mark work): a raw ProseMirror node, e.g. a ' +
       'paragraph {"type":"paragraph","content":[{"type":"text","text":"Hello"}]} ' +
       'or a heading {"type":"heading","attrs":{"level":2},"content":' +
@@ -561,7 +583,8 @@ export const SHARED_TOOL_SPECS = {
       '`node` (for precise attr/mark work OR table structure): a raw ProseMirror ' +
       'node. Table structure is JSON-only (not expressible in markdown): to add a ' +
       'tableRow, pass a tableRow node with position before/after and anchor INSIDE ' +
-      'the target table — anchorNodeId of any block/cell in it, or anchorText ' +
+      'the target table — anchorNodeId of any block inside it (a cell itself ' +
+      'carries no id), or anchorText ' +
       'matching the table; to add a tableCell/tableHeader, use anchorNodeId of a ' +
       'block inside the target row (anchorText only resolves top-level blocks). ' +
       "`anchorText` is matched against the block's literal rendered plain text " +
@@ -2054,8 +2077,9 @@ export const SHARED_TOOL_SPECS = {
     writeClass: 'readOnly',
     description:
       'Read a draw.io diagram on a page as mxGraph XML (default) or as its raw ' +
-      '`.drawio.svg`. `node` is the drawio node\'s attrs.id (from getOutline / ' +
-      'getPageJson) or "#<index>" for a top-level block. Returns the decoded ' +
+      '`.drawio.svg`. `node` is the diagram block\'s "#<index>" from getOutline — ' +
+      'the reliable ref, since drawio nodes carry no id in the schema (a rare ' +
+      'legacy node may still carry an attrs.id). Returns the decoded ' +
       'mxGraphModel XML plus meta { attachmentId, title, width, height, ' +
       'cellCount, hash }. `hash` is the optimistic-lock key you MUST pass back ' +
       'as baseHash to drawioUpdate. Diagrams a human saved from the editor ' +
@@ -2068,7 +2092,10 @@ export const SHARED_TOOL_SPECS = {
       node: z
         .string()
         .min(1)
-        .describe('The drawio node attrs.id, or "#<index>" for a top-level block.'),
+        .describe(
+          'The diagram block\'s "#<index>" from getOutline (drawio nodes have ' +
+            'no schema id).',
+        ),
       format: z
         .enum(['xml', 'svg'])
         .optional()
@@ -2168,7 +2195,8 @@ export const SHARED_TOOL_SPECS = {
       '(a human or another agent edited it) the hash mismatches and the update ' +
       'is refused with a conflict error — re-read with drawioGet and retry. On ' +
       'success it overwrites the diagram attachment and updates the node ' +
-      'width/height. `node` is the drawio node attrs.id or "#<index>".' +
+      'width/height. `node` is the diagram block\'s "#<index>" (drawio nodes ' +
+      'carry no id in the schema).' +
       DRAWIO_HARD_RULES,
     tier: 'deferred',
     catalogLine:
@@ -2178,7 +2206,10 @@ export const SHARED_TOOL_SPECS = {
       node: z
         .string()
         .min(1)
-        .describe('The drawio node attrs.id, or "#<index>" for a top-level block.'),
+        .describe(
+          'The diagram block\'s "#<index>" from getOutline (drawio nodes have ' +
+            'no schema id).',
+        ),
       xml: z
         .string()
         .min(1)
@@ -2226,7 +2257,8 @@ export const SHARED_TOOL_SPECS = {
       'based the edit on; if the diagram changed since, the edit is refused with ' +
       'a conflict error — re-read with drawioGet and retry. The edited model goes ' +
       'through the same lint + quality-warning pipeline as drawioUpdate. `node` is ' +
-      'the drawio node attrs.id or "#<index>". Use this to tweak a diagram (move ' +
+      'the diagram block\'s "#<index>" (drawio nodes carry no id in the schema). ' +
+      'Use this to tweak a diagram (move ' +
       'or restyle a few cells, add/remove nodes); to (re)generate a whole diagram ' +
       'from a description use drawioFromGraph.' +
       DRAWIO_HARD_RULES,
@@ -2238,7 +2270,10 @@ export const SHARED_TOOL_SPECS = {
       node: z
         .string()
         .min(1)
-        .describe('The drawio node attrs.id, or "#<index>" for a top-level block.'),
+        .describe(
+          'The diagram block\'s "#<index>" from getOutline (drawio nodes have ' +
+            'no schema id).',
+        ),
       operations: z
         .array(
           z.object({

@@ -69,8 +69,10 @@ export interface IDrawioMixin {
 export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Base: TBase): GConstructor<DocmostClientContext & IDrawioMixin> & TBase {
   abstract class DrawioMixin extends Base implements IDrawioMixin {
   /**
-   * Resolve a drawio node on a page by `attrs.id` or `#<index>` and return the
-   * node plus its ref. Throws a clear error if the ref does not resolve to a
+   * Resolve a drawio node on a page by its `#<index>` and return the node plus
+   * its ref. Drawio nodes carry no id in the schema, so `#<index>` is the
+   * reliable ref (the resolver also accepts an attrs.id, which only a rare
+   * legacy node carries). Throws a clear error if the ref does not resolve to a
    * drawio node.
    */
   protected async resolveDrawioNode(
@@ -84,7 +86,7 @@ export function DrawioMixin<TBase extends GConstructor<DocmostClientContext>>(Ba
     );
     if (!hit) {
       throw new Error(
-        `drawio: no node found for "${node}" on page ${pageId} (use the drawio node's attrs.id or "#<index>" from getOutline)`,
+        `drawio: no node found for "${node}" on page ${pageId} (use the diagram block's "#<index>" from getOutline — drawio nodes carry no id in the schema)`,
       );
     }
     if (hit.type !== "drawio") {

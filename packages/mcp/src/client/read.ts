@@ -638,9 +638,11 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
   }
 
   /**
-   * Fetch a single block for editing by reference: a block id (headings/
-   * paragraphs/callouts/images), or `#<index>` to select a top-level block by its
-   * outline index (the only way to reach tables/rows/cells, which carry no id).
+   * Fetch a single block for editing by reference: a block id (block ids live on
+   * paragraphs and headings; a few container nodes carry one too), or `#<index>`
+   * to select a top-level block by its outline index (the only way to reach an
+   * id-less block: tables, lists, quotes, dividers, callouts, images, code
+   * blocks).
    *
    * `format` (#413):
    *  - `"markdown"` (DEFAULT): serialize the block via the canonical converter
@@ -652,10 +654,9 @@ export function ReadMixin<TBase extends GConstructor<DocmostClientContext>>(Base
    *  - `"json"`: return the raw ProseMirror subtree as-is (lossless; the previous
    *    default). Returns `{ ..., format:"json", node }`.
    *
-   * AUTO fallback: a type that cannot be a document top-level child
-   * (tableRow/tableCell/tableHeader, addressed by `#<index>`) is NOT expressible
-   * as a standalone markdown document, so a `"markdown"` request for such a node
-   * transparently falls back to JSON with an explicit `format:"json"` field. The
+   * AUTO fallback: a type that cannot be a document top-level child is NOT
+   * expressible as a standalone markdown document, so a `"markdown"` request for
+   * such a node transparently falls back to JSON with a `format:"json"` field. The
    * check derives from the schema's `doc` contentMatch, so it tracks the schema.
    */
   async getNode(

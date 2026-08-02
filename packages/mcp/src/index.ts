@@ -533,7 +533,7 @@ server.registerTool(
       "`ctx` gives you: comments (the page's comments, each {id, content " +
       "(markdown), selection, type}); log (array; console.log pushes to it); " +
       "consume(id) (mark a comment id as consumed — those are deleted when " +
-      "deleteComments=true after a successful apply); and helpers: " +
+      "deleteComments=true after a successful apply); and `ctx.helpers`: " +
       "blockText(node) (plain text), walk(node, fn) (depth-first over all " +
       "nodes incl. callouts/tables/lists), getList(doc, predicate) (find a " +
       "node even without attrs.id), insertMarkerAfter(doc, anchor, marker, " +
@@ -564,9 +564,11 @@ server.registerTool(
         .describe(
           "A JS function `(doc, ctx) => doc` (expression-arrow or " +
             "parenthesized function). It receives a clone of the live doc and " +
-            "ctx (comments, log, consume(id), helpers: blockText/walk/getList/" +
-            "insertMarkerAfter/setCalloutRange/noteItem/mdToInlineNodes/" +
-            "commentsToFootnotes/canonicalizeFootnotes/insertInlineFootnote) " +
+            "ctx (comments, log, consume(id) on `ctx`; helpers under " +
+            "`ctx.helpers`, e.g. `ctx.helpers.blockText(node)` NOT " +
+            "`ctx.blockText`: blockText/walk/getList/insertMarkerAfter/" +
+            "setCalloutRange/noteItem/mdToInlineNodes/commentsToFootnotes/" +
+            "canonicalizeFootnotes/insertInlineFootnote) " +
             "and must return a {type:'doc'} node.",
         ),
       dryRun: z
