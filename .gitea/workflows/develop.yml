@@ -1,71 +1,65 @@
-name: Publish image to the Gitea registry
+name: Mirror the gated image into the Gitea registry
 
-# Deliberately NOT a copy of .github/workflows/develop.yml.
+# This is NOT a build, on purpose.
 #
-# The full gate — unit tests, both e2e suites and the image boot-smoke — runs on
-# GitHub Actions for the same commit and is not duplicated here. Porting it would
-# mean changing project code for a second copy of the same checks: the e2e jobs
-# reach their service containers on localhost (GitHub publishes service ports on
-# the runner host; Gitea puts services on the job network), and
-# scripts/ci/image-smoke.sh runs the image with --network host expecting the same
-# topology. On top of that several suites use short per-test timeouts that this
-# runner does not reliably meet — two different tests timed out on two
-# consecutive runs, so chasing them would be endless.
+# ghcr.io/vvzvlad/gitmost:develop is published by .github/workflows/develop.yml
+# only after the full gate passes: unit tests, both e2e suites and a boot-smoke
+# of the exact image. Rebuilding here would produce a DIFFERENT, ungated image —
+# and it would not sit in the registry harmlessly: four containers across four
+# stacks run this tag (gitmost, docmost-asakusa, docmost-wb, docmost-ukuetis),
+# all labelled for watchtower, which polls every two minutes. An ungated image
+# would be live on four wikis within minutes.
 #
-# What is left here is the one thing GitHub cannot do for us: publish the image
-# to our own registry.
+# So we copy the exact artifact that passed the gate. skopeo copies by digest and
+# skips layers already present, so a run with nothing new is cheap.
+#
+# Why polling and not `on: push`: at push time GitHub has not finished building
+# that commit yet, so a push-triggered copy would fetch the previous image. The
+# schedule picks the new one up once the gate is green.
 
 on:
-  push:
-    branches:
-      - develop
   workflow_dispatch:
+  schedule:
+    # Every 20 minutes. Off the hour to avoid the crowded :00 slot.
+    - cron: '7,27,47 * * * *'
 
 concurrency:
-  group: gitea-publish-${{ github.ref }}
-  cancel-in-progress: true
+  group: gitea-mirror-image
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
-  IMAGE: gitea.vvzvlad.xyz/projects/gitmost
+  SRC: ghcr.io/vvzvlad/gitmost:develop
+  DST: gitea.vvzvlad.xyz/projects/gitmost:develop
 
 jobs:
-  publish:
+  mirror:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          # Full history: the version is derived from git describe.
-          fetch-depth: 0
+      - name: Copy the gated image as-is
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          docker run --rm quay.io/skopeo/stable:latest copy \
+            --src-creds "vvzvlad:${GHCR_PAT}" \
+            --dest-creds "vvzvlad:${REGISTRY_TOKEN}" \
+            "docker://${SRC}" "docker://${DST}"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to the Gitea container registry
-        uses: docker/login-action@v3
-        with:
-          registry: gitea.vvzvlad.xyz
-          username: ${{ github.repository_owner }}
-          # Org-level secret on `projects`; GITEA_TOKEN has no package scope.
-          password: ${{ secrets.REGISTRY_TOKEN }}
-
-      - name: Resolve version
-        id: version
-        run: echo "value=$(git describe --tags --always)" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          tags: ${{ env.IMAGE }}:develop
-          build-args: |
-            APP_VERSION=${{ steps.version.outputs.value }}
-            AI_AGENT_ROLES_CATALOG_URL=https://raw.githubusercontent.com/vvzvlad/gitmost/develop/agent-roles-catalog
-          cache-from: type=gha,scope=gitea-develop-amd64
-          cache-to: type=gha,scope=gitea-develop-amd64,mode=max,ignore-error=true
+      - name: Verify both sides point at the same digest
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          src=$(docker run --rm quay.io/skopeo/stable:latest inspect \
+                  --creds "vvzvlad:${GHCR_PAT}" "docker://${SRC}" | grep -o '"Digest": "[^"]*"' | head -1)
+          dst=$(docker run --rm quay.io/skopeo/stable:latest inspect \
+                  --creds "vvzvlad:${REGISTRY_TOKEN}" "docker://${DST}" | grep -o '"Digest": "[^"]*"' | head -1)
+          echo "source:      $src"
+          echo "destination: $dst"
+          # A mismatch means the copy silently produced a different artifact —
+          # exactly what this workflow exists to prevent.
+          [ "$src" = "$dst" ] || { echo "::error::digests differ"; exit 1; }
