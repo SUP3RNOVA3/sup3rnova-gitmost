@@ -44,7 +44,12 @@ jobs:
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
           REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
         run: |
-          docker run --rm quay.io/skopeo/stable:latest copy \
+          # --all: the tag points at an INDEX, not a single manifest — buildx
+          # attaches provenance/SBOM attestations. Copying without it takes only
+          # the platform manifest out of the index and lands a different digest.
+          # --preserve-digests makes skopeo fail here rather than silently
+          # re-encode, so a mismatch never reaches the registry at all.
+          docker run --rm quay.io/skopeo/stable:latest copy --all --preserve-digests \
             --src-creds "vvzvlad:${GHCR_PAT}" \
             --dest-creds "vvzvlad:${REGISTRY_TOKEN}" \
             "docker://${SRC}" "docker://${DST}"
