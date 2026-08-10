@@ -873,7 +873,12 @@ export const SHARED_TOOL_SPECS = {
   // CANONICAL description is the CORRECTED in-app wording: a formatting-only
   // change is REFUSED into failed[] (not silently stripped-and-retried). The
   // stale MCP claim that "Markdown wrappers are tolerated via a strip-and-retry
-  // fallback" is intentionally absent here.
+  // fallback" is intentionally absent here. NOT the same thing as the markdown
+  // LOCATOR tier (#658), which is real and now stated up front: stripping finds
+  // the text, it never turns a formatting change into an applied edit. The old
+  // wording claimed find AND replace were "literal text, not markdown", which
+  // contradicted the tail sentence and taught agents that a `find` carrying
+  // backticks can never match — measured false (matchedVia: "markdown").
   editPageText: {
     mcpName: 'editPageText',
     inAppKey: 'editPageText',
@@ -888,8 +893,14 @@ export const SHARED_TOOL_SPECS = {
       'it can and returns applied[] + failed[] plus a verify change-report ' +
       '(the text/marks/structure that ACTUALLY changed — read it to confirm ' +
       'your edit landed; do not assume success); a fully-unmatched batch ' +
-      'writes nothing and errors. find and replace are LITERAL text, not ' +
-      'markdown. This tool edits plain text ONLY and CANNOT add or remove ' +
+      'writes nothing and errors. Markdown is ASYMMETRIC here, and getting it ' +
+      'backwards is the single most common mistake: NEVER put markdown in ' +
+      '`replace` — it is written LITERALLY, so `**x**` lands as visible ' +
+      'asterisks (which is why such an edit is REFUSED, below); write the bare ' +
+      'text and the surrounding marks are kept for you. In `find` markdown is ' +
+      'TOLERATED — wrappers are stripped to LOCATE the text (find:"a `x` b" ' +
+      'finds a code-marked x), never to apply a formatting change. ' +
+      'This tool edits plain text ONLY and CANNOT add or remove ' +
       'formatting marks: a formatting change — find/replace that differ only ' +
       'in markdown markers (e.g. find:"~~x~~", replace:"x"), or a replace ' +
       'containing **bold**/~~strike~~/`code` wrappers — is REFUSED into ' +
@@ -898,9 +909,9 @@ export const SHARED_TOOL_SPECS = {
       'Examples: edits:[{find:"teh",replace:"the"}]; edits:[{find:"Hello ' +
       'world",replace:"Hello there"}] (crosses a bold boundary). Exception: ' +
       'literal markers found verbatim in the document are allowed (e.g. ' +
-      'cleaning up a stray find:"**bold**", replace:"bold"). Matching is ' +
-      'tolerant of invisible characters (soft hyphen/NBSP/zero-width) and ' +
-      'markdown in find; on a miss, failed[] carries a precise self-diagnosis.',
+      'cleaning up a stray find:"**bold**", replace:"bold"). Matching is also ' +
+      'tolerant of invisible characters (soft hyphen/NBSP/zero-width); on a ' +
+      'miss, failed[] carries a precise self-diagnosis.',
     tier: 'core',
     catalogLine:
       "editPageText — surgical find/replace of plain text in a page, preserving ids/marks.",
