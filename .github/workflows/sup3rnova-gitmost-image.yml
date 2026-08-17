@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - main
+      - sup3rnova-v0.94.1-brand.1
 
 permissions:
   contents: read
