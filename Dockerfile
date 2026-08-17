@@ -1,5 +1,5 @@
 FROM node:22-slim AS base
-LABEL org.opencontainers.image.source="https://github.com/vvzvlad/gitmost"
+LABEL org.opencontainers.image.source="https://github.com/SUP3RNOVA3/sup3rnova-gitmost"
 
 RUN npm install -g pnpm@10.4.0
 

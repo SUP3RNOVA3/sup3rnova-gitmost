@@ -25,7 +25,7 @@ export function BrandLogo({
   return (
     <img
       src={src}
-      alt="Gitmost"
+      alt="SUP3RNOVA"
       className={className}
       draggable={false}
       style={{ height, width: "auto", display: "block", userSelect: "none" }}
