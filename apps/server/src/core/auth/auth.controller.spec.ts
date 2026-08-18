@@ -5,19 +5,42 @@ import { AuthController } from './auth.controller';
 // and this smoke test only needs the controller to construct.
 describe('AuthController', () => {
   let controller: AuthController;
+  let workosAuthService: any;
 
   beforeEach(() => {
+    workosAuthService = {
+      getAuthorizationUrl: jest.fn(),
+    };
     controller = new AuthController(
       {} as any, // authService
       {} as any, // sessionService
-      {} as any, // environmentService
+      { getAppUrl: jest.fn().mockReturnValue('https://wiki.sup3rnova.com') } as any,
       {} as any, // moduleRef
-      {} as any, // workosAuthService
+      workosAuthService,
       {} as any, // auditService
     );
   });
 
   it('should be defined', () => {
     expect(controller).toBeDefined();
+  });
+
+  it('returns an explicit 302 for WorkOS authorization', async () => {
+    workosAuthService.getAuthorizationUrl.mockResolvedValue(
+      'https://auth.sup3rnova.com/user_management/authorize',
+    );
+    const redirect = jest.fn();
+    const status = jest.fn().mockReturnValue({ redirect });
+
+    await controller.workosLogin(
+      { id: 'workspace-id' } as any,
+      {} as any,
+      { status } as any,
+    );
+
+    expect(status).toHaveBeenCalledWith(302);
+    expect(redirect).toHaveBeenCalledWith(
+      'https://auth.sup3rnova.com/user_management/authorize',
+    );
   });
 });

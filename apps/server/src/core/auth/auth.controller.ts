@@ -71,7 +71,7 @@ export class AuthController {
       callbackUrl,
       returnTo,
     );
-    return res.redirect(authorizationUrl);
+    return res.status(HttpStatus.FOUND).redirect(authorizationUrl);
   }
 
   @Get('workos/callback')
@@ -90,7 +90,7 @@ export class AuthController {
       userAgent: req.headers['user-agent'],
     });
     this.setAuthCookie(res, result.authToken);
-    return res.redirect(result.returnPath);
+    return res.status(HttpStatus.FOUND).redirect(result.returnPath);
   }
 
   @HttpCode(HttpStatus.OK)
