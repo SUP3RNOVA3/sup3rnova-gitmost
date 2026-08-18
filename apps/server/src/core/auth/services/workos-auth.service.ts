@@ -145,6 +145,7 @@ export class WorkosAuthService {
       throw new ForbiddenException('This Gitmost account is not active.');
     }
 
+    await this.ensureDefaultGroupMembership(user.id, input.workspaceId);
     await this.userRepo.updateLastLogin(user.id, input.workspaceId);
     this.auditService.setActorId(user.id);
     this.auditService.log({
@@ -229,6 +230,25 @@ export class WorkosAuthService {
       .returning('id')
       .executeTakeFirstOrThrow();
     return created.id;
+  }
+
+  private async ensureDefaultGroupMembership(
+    userId: string,
+    workspaceId: string,
+  ): Promise<void> {
+    const defaultGroup = await this.db
+      .selectFrom('groups')
+      .select('id')
+      .where('workspaceId', '=', workspaceId)
+      .where('isDefault', '=', true)
+      .where('deletedAt', 'is', null)
+      .executeTakeFirstOrThrow();
+
+    await this.db
+      .insertInto('groupUsers')
+      .values({ userId, groupId: defaultGroup.id })
+      .onConflict((oc) => oc.columns(['groupId', 'userId']).doNothing())
+      .execute();
   }
 
   private getClient(): WorkOS {

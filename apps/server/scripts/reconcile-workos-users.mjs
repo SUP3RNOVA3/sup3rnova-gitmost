@@ -70,6 +70,15 @@ try {
   if (duplicateEmails.length) throw new Error('Duplicate WorkOS emails found');
 
   const workspaceId = workspaces[0].id;
+  const [defaultGroup] = await sql`
+    select id
+    from groups
+    where workspace_id = ${workspaceId}
+      and is_default = true
+      and deleted_at is null
+    limit 1
+  `;
+  if (!defaultGroup) throw new Error('Default Gitmost group not found');
   const existing = await sql`
     select lower(email) as email
     from users
@@ -84,6 +93,11 @@ try {
     createUsers: roster.filter(
       (user) => !existingEmails.has(user.email.toLowerCase()),
     ).length,
+    defaultGroupMembers: await sql`
+      select count(*)::int as count
+      from group_users
+      where group_id = ${defaultGroup.id}
+    `.then((rows) => rows[0].count),
     excludedServiceIdentities: excludedEmails.size,
     notifications: 0,
   };
@@ -140,6 +154,11 @@ try {
           deleted_at = null,
           updated_at = now()
       `;
+      await tx`
+        insert into group_users (user_id, group_id)
+        values (${gitmostUser.id}, ${defaultGroup.id})
+        on conflict (group_id, user_id) do nothing
+      `;
     }
   });
 
@@ -149,7 +168,8 @@ try {
       count(*) filter (
         where aa.deleted_at is null and ap.name = 'WorkOS AuthKit'
       ) as linked_accounts,
-      (select count(*) from workspace_invitations) as invitations
+      (select count(*) from workspace_invitations) as invitations,
+      (select count(*) from group_users where group_id = ${defaultGroup.id}) as default_group_members
     from users u
     left join auth_accounts aa on aa.user_id = u.id
     left join auth_providers ap on ap.id = aa.auth_provider_id
@@ -161,6 +181,7 @@ try {
       users: Number(verification.users),
       linkedAccounts: Number(verification.linked_accounts),
       invitations: Number(verification.invitations),
+      defaultGroupMembers: Number(verification.default_group_members),
       notifications: 0,
     }),
   );
