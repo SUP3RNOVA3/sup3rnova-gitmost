@@ -36,6 +36,26 @@ export class EnvironmentVariables {
   REDIS_URL: string;
 
   @IsOptional()
+  @IsIn(['true', 'false'])
+  WORKOS_ENABLED: string;
+
+  @IsOptional()
+  @IsString()
+  WORKOS_API_KEY: string;
+
+  @IsOptional()
+  @IsString()
+  WORKOS_CLIENT_ID: string;
+
+  @IsOptional()
+  @IsString()
+  WORKOS_ORGANIZATION_ID: string;
+
+  @IsOptional()
+  @IsString()
+  WORKOS_API_HOSTNAME: string;
+
+  @IsOptional()
   @IsUrl({ protocols: ['http', 'https'], require_tld: false })
   APP_URL: string;
 

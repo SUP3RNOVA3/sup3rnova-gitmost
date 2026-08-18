@@ -12,6 +12,7 @@ describe('AuthController', () => {
       {} as any, // sessionService
       {} as any, // environmentService
       {} as any, // moduleRef
+      {} as any, // workosAuthService
       {} as any, // auditService
     );
   });

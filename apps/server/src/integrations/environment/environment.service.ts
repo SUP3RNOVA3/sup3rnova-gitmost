@@ -60,6 +60,33 @@ export class EnvironmentService {
     );
   }
 
+  isWorkosEnabled(): boolean {
+    return (
+      this.configService
+        .get<string>('WORKOS_ENABLED', 'false')
+        .toLowerCase() === 'true'
+    );
+  }
+
+  getWorkosApiKey(): string | undefined {
+    return this.configService.get<string>('WORKOS_API_KEY');
+  }
+
+  getWorkosClientId(): string | undefined {
+    return this.configService.get<string>('WORKOS_CLIENT_ID');
+  }
+
+  getWorkosOrganizationId(): string | undefined {
+    return this.configService.get<string>('WORKOS_ORGANIZATION_ID');
+  }
+
+  getWorkosApiHostname(): string {
+    return this.configService.get<string>(
+      'WORKOS_API_HOSTNAME',
+      'api.workos.com',
+    );
+  }
+
   getJwtTokenExpiresIn(): string {
     return this.configService.get<string>('JWT_TOKEN_EXPIRES_IN', '90d');
   }

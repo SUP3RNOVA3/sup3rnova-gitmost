@@ -1,10 +1,12 @@
 import {
   Body,
   Controller,
+  Get,
   HttpCode,
   HttpStatus,
   Inject,
   Post,
+  Query,
   Req,
   Res,
   UseGuards,
@@ -35,6 +37,7 @@ import { FastifyReply, FastifyRequest } from 'fastify';
 import { validateSsoEnforcement } from './auth.util';
 import { ModuleRef } from '@nestjs/core';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
+import { WorkosAuthService } from './services/workos-auth.service';
 import {
   AUDIT_SERVICE,
   IAuditService,
@@ -51,8 +54,44 @@ export class AuthController {
     private sessionService: SessionService,
     private environmentService: EnvironmentService,
     private moduleRef: ModuleRef,
+    private readonly workosAuthService: WorkosAuthService,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
   ) {}
+
+  @Get('workos/login')
+  async workosLogin(
+    @AuthWorkspace() workspace: Workspace,
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply,
+    @Query('return_to') returnTo?: string,
+  ) {
+    const callbackUrl = `${this.environmentService.getAppUrl()}/api/auth/workos/callback`;
+    const authorizationUrl = await this.workosAuthService.getAuthorizationUrl(
+      workspace.id,
+      callbackUrl,
+      returnTo,
+    );
+    return res.redirect(authorizationUrl);
+  }
+
+  @Get('workos/callback')
+  async workosCallback(
+    @AuthWorkspace() workspace: Workspace,
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply,
+    @Query('code') code?: string,
+    @Query('state') state?: string,
+  ) {
+    const result = await this.workosAuthService.authenticateCallback({
+      code,
+      state,
+      workspaceId: workspace.id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
+    });
+    this.setAuthCookie(res, result.authToken);
+    return res.redirect(result.returnPath);
+  }
 
   @HttpCode(HttpStatus.OK)
   @Post('login')

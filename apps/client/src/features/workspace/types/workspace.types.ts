@@ -108,6 +108,7 @@ export interface IPublicWorkspace {
   logo: string;
   hostname: string;
   enforceSso: boolean;
+  workosEnabled?: boolean;
 }
 
 export interface IVersion {

@@ -35,6 +35,7 @@ export function LoginForm() {
   const { signIn, isLoading } = useAuth();
   useRedirectIfAuthenticated();
   const {
+    data: workspace,
     isLoading: isDataLoading,
     isError,
     error,
@@ -74,6 +75,17 @@ export function LoginForm() {
           <Title order={1} size="h2" ta="center" fw={500} mb="md">
             {t("Login")}
           </Title>
+
+          {workspace?.workosEnabled && (
+            <Button
+              component="a"
+              href="/api/auth/workos/login"
+              fullWidth
+              mb="lg"
+            >
+              Continue with SUP3RNOVA
+            </Button>
+          )}
 
           <form onSubmit={form.onSubmit(onSubmit, handleValidationFailure)}>
             <TextInput

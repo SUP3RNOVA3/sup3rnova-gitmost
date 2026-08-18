@@ -15,7 +15,11 @@ env:
   TAG: v0.94.1-brand.1
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -40,6 +44,28 @@ jobs:
           build-args: APP_VERSION=${{ env.TAG }}
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
             ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Export immutable amd64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          build-args: APP_VERSION=${{ env.TAG }}
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          outputs: type=docker,dest=gitmost-amd64-${{ github.sha }}.docker.tar
+          cache-from: type=gha
+
+      - name: Compress immutable image
+        run: gzip gitmost-amd64-${{ github.sha }}.docker.tar
+
+      - name: Upload immutable image
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitmost-amd64-${{ github.sha }}
+          path: gitmost-amd64-${{ github.sha }}.docker.tar.gz
+          if-no-files-found: error

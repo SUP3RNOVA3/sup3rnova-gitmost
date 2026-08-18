@@ -114,7 +114,10 @@ export class WorkspaceService {
 
     const { licenseKey, plan, ...rest } = workspace;
 
-    return rest;
+    return {
+      ...rest,
+      workosEnabled: this.environmentService.isWorkosEnabled(),
+    };
   }
 
   async create(
