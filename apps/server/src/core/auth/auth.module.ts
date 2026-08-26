@@ -11,6 +11,6 @@ import { WorkosAuthService } from './services/workos-auth.service';
   imports: [TokenModule, WorkspaceModule],
   controllers: [AuthController],
   providers: [AuthService, SignupService, WorkosAuthService, JwtStrategy],
-  exports: [SignupService, AuthService],
+  exports: [SignupService, AuthService, WorkosAuthService],
 })
 export class AuthModule {}

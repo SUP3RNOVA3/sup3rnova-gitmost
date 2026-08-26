@@ -16,6 +16,13 @@ import { AuthService } from '../../core/auth/services/auth.service';
 import { TokenService } from '../../core/auth/services/token.service';
 import { validateSsoEnforcement } from '../../core/auth/auth.util';
 import { JwtPayload } from '../../core/auth/dto/jwt-payload';
+import { WorkosAuthService } from '../../core/auth/services/workos-auth.service';
+import { RedisService } from '@nestjs-labs/nestjs-ioredis';
+import type { Redis } from 'ioredis';
+import {
+  NovaDelegationRequest,
+  verifyNovaDelegationRequest,
+} from './nova-delegation.helpers';
 import { Workspace } from '@docmost/db/types/entity.types';
 import {
   FailedLoginLimiter,
@@ -78,6 +85,7 @@ export class McpService implements OnModuleDestroy {
   private handler: McpHttpHandler | null = null;
   private handlerPromise: Promise<McpHttpHandler> | null = null;
   private warnedMissingCreds = false;
+  private readonly redis: Redis;
 
   // In-memory per-IP/email throttle for FAILED /mcp Basic logins. Calling
   // AuthService.login directly bypasses the controller's ThrottlerGuard, so
@@ -96,10 +104,13 @@ export class McpService implements OnModuleDestroy {
     private readonly workspaceRepo: WorkspaceRepo,
     private readonly authService: AuthService,
     private readonly tokenService: TokenService,
+    private readonly workosAuthService: WorkosAuthService,
+    private readonly redisService: RedisService,
     private readonly userRepo: UserRepo,
     private readonly userSessionRepo: UserSessionRepo,
     private readonly moduleRef: ModuleRef,
   ) {
+    this.redis = this.redisService.getOrThrow();
     this.sweepTimer = setInterval(() => {
       try {
         this.failedLogins.sweep();
@@ -109,6 +120,41 @@ export class McpService implements OnModuleDestroy {
     }, this.sweepIntervalMs);
     // Do not let this interval hold the event loop open.
     this.sweepTimer.unref?.();
+  }
+
+  async issueNovaDelegatedToken(
+    req: FastifyRequest,
+    body: NovaDelegationRequest,
+  ): Promise<{ accessToken: string; expiresIn: number }> {
+    const secret = process.env.NOVA_MCP_BRIDGE_SECRET ?? '';
+    const signatureHeader = req.headers['x-nova-signature'];
+    const signature = Array.isArray(signatureHeader)
+      ? signatureHeader[0]
+      : signatureHeader;
+    const assertion = verifyNovaDelegationRequest({
+      body,
+      signature,
+      secret,
+    });
+    const replayKey = `gitmost:nova-delegation:${assertion.nonce}`;
+    const accepted = await this.redis.set(replayKey, '1', 'EX', 120, 'NX');
+    if (accepted !== 'OK') {
+      throw new UnauthorizedException('Delegated identity assertion replayed.');
+    }
+
+    const workspace = await this.workspaceRepo.findFirst();
+    if (!workspace) {
+      throw new UnauthorizedException('No workspace is configured.');
+    }
+    const user = await this.workosAuthService.resolveDelegatedUser({
+      providerUserId: assertion.workosUserId,
+      email: assertion.email,
+      workspaceId: workspace.id,
+    });
+    return {
+      accessToken: await this.tokenService.generateDelegatedMcpAccessToken(user),
+      expiresIn: 300,
+    };
   }
 
   onModuleDestroy(): void {

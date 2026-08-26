@@ -1,7 +1,8 @@
-import { Controller, Delete, Get, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Post, Req, Res } from '@nestjs/common';
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { McpService } from './mcp.service';
 import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
+import { NovaDelegationRequest } from './nova-delegation.helpers';
 
 // The global prefix in main.ts excludes 'mcp', so these handlers map to /mcp
 // (not /api/mcp). The MCP Streamable-HTTP transport uses POST for JSON-RPC
@@ -9,6 +10,15 @@ import { SkipTransform } from '../../common/decorators/skip-transform.decorator'
 @Controller()
 export class McpController {
   constructor(private readonly mcpService: McpService) {}
+
+  @SkipTransform()
+  @Post('internal/nova/mcp-token')
+  async delegatedToken(
+    @Req() req: FastifyRequest,
+    @Body() body: NovaDelegationRequest,
+  ) {
+    return this.mcpService.issueNovaDelegatedToken(req, body);
+  }
 
   @SkipTransform()
   @Post('mcp')

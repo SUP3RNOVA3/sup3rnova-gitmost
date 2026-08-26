@@ -55,6 +55,22 @@ export class TokenService {
     return this.jwtService.sign(payload);
   }
 
+  async generateDelegatedMcpAccessToken(user: User): Promise<string> {
+    if (isUserDisabled(user)) {
+      throw new ForbiddenException();
+    }
+
+    const payload: JwtPayload = {
+      sub: user.id,
+      email: user.email,
+      workspaceId: user.workspaceId,
+      type: JwtType.ACCESS,
+      actor: 'agent',
+      aiChatId: null,
+    };
+    return this.jwtService.sign(payload, { expiresIn: '5m' });
+  }
+
   async generateCollabToken(
     user: User,
     workspaceId: string,

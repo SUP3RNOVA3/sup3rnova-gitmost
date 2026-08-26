@@ -56,6 +56,11 @@ export class EnvironmentVariables {
   WORKOS_API_HOSTNAME: string;
 
   @IsOptional()
+  @IsString()
+  @MinLength(32)
+  NOVA_MCP_BRIDGE_SECRET: string;
+
+  @IsOptional()
   @IsUrl({ protocols: ['http', 'https'], require_tld: false })
   APP_URL: string;
 
