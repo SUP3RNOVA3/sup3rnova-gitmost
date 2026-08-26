@@ -16,6 +16,8 @@ import { EnvironmentService } from '../../../integrations/environment/environmen
 import { isUserDisabled } from '../../../common/helpers';
 import { User } from '@docmost/db/types/entity.types';
 import { AuditEvent, AuditResource } from '../../../common/events/audit-events';
+import { SignupService } from './signup.service';
+import { randomBytes } from 'node:crypto';
 import {
   AUDIT_SERVICE,
   IAuditService,
@@ -52,6 +54,7 @@ export class WorkosAuthService {
     private readonly redisService: RedisService,
     private readonly userRepo: UserRepo,
     private readonly sessionService: SessionService,
+    private readonly signupService: SignupService,
     @InjectKysely() private readonly db: KyselyDB,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
   ) {
@@ -158,6 +161,82 @@ export class WorkosAuthService {
       authToken: await this.sessionService.createSessionAndToken(user),
       returnPath: pending.returnPath,
     };
+  }
+
+  async resolveDelegatedUser(input: {
+    providerUserId: string;
+    email: string;
+    workspaceId: string;
+  }): Promise<User> {
+    if (!this.isEnabled()) {
+      throw new ServiceUnavailableException('WorkOS login is not enabled.');
+    }
+
+    const normalizedEmail = input.email.trim().toLowerCase();
+    const workos = this.getClient();
+    const organizationId = this.requiredConfig(
+      this.environmentService.getWorkosOrganizationId(),
+    );
+    const providerUser = await workos.userManagement.getUser(
+      input.providerUserId,
+    );
+    if (providerUser.email.trim().toLowerCase() !== normalizedEmail) {
+      throw new ForbiddenException('Corporate identity mismatch.');
+    }
+
+    const memberships = await workos.userManagement.listOrganizationMemberships({
+      organizationId,
+      userId: input.providerUserId,
+      statuses: ['active'],
+      limit: 10,
+    });
+    if (!memberships.data.some((item) => item.organizationId === organizationId && item.status === 'active')) {
+      throw new ForbiddenException('Active SUP3RNOVA membership is required.');
+    }
+
+    let user = await this.resolveProvisionedUser({
+      providerUserId: input.providerUserId,
+      email: normalizedEmail,
+      workspaceId: input.workspaceId,
+    });
+    if (!user) {
+      const name = [providerUser.firstName, providerUser.lastName]
+        .filter(Boolean)
+        .join(' ')
+        .trim() || normalizedEmail.split('@')[0];
+      try {
+        user = await this.signupService.signup(
+          {
+            name,
+            email: normalizedEmail,
+            password: randomBytes(32).toString('base64url'),
+          },
+          input.workspaceId,
+        );
+        await this.userRepo.updateUser(
+          { emailVerifiedAt: new Date(), hasGeneratedPassword: true },
+          user.id,
+          input.workspaceId,
+        );
+      } catch (error) {
+        user = await this.userRepo.findByEmail(
+          normalizedEmail,
+          input.workspaceId,
+        );
+        if (!user) throw error;
+      }
+      user = await this.resolveProvisionedUser({
+        providerUserId: input.providerUserId,
+        email: normalizedEmail,
+        workspaceId: input.workspaceId,
+      });
+    }
+
+    if (!user || isUserDisabled(user)) {
+      throw new ForbiddenException('This Gitmost account is not active.');
+    }
+    await this.ensureDefaultGroupMembership(user.id, input.workspaceId);
+    return user;
   }
 
   private async resolveProvisionedUser(input: {

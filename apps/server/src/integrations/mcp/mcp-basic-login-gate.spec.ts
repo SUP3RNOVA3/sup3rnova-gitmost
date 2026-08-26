@@ -113,6 +113,8 @@ function makeService(opts: {
     undefined as never, // workspaceRepo
     undefined as never, // authService
     undefined as never, // tokenService
+    undefined as never, // workosAuthService
+    { getOrThrow: () => ({ set: jest.fn() }) } as never, // redisService
     undefined as never, // userRepo
     undefined as never, // userSessionRepo
     moduleRef as never, // moduleRef (read by the MFA branch)
