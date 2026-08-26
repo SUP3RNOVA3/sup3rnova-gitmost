@@ -119,6 +119,7 @@ async function bootstrap() {
         '/api/workspace/create',
         '/api/workspace/joined',
         '/api/workspace/find-by-email',
+        '/api/internal/nova/mcp-token',
       ];
 
       if (
