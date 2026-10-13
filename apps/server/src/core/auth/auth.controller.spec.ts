@@ -67,6 +67,7 @@ describe('AuthController.collabToken arms the api-key origin (#501)', () => {
       {} as any, // sessionService
       {} as any, // environmentService
       {} as any, // moduleRef
+      {} as any, // workosAuthService
       {} as any, // auditService
     );
   });
