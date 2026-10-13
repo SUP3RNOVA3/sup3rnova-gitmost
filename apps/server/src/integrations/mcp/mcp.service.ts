@@ -1,3 +1,4 @@
+import { normalizeNovaReadTool } from './nova-tool-compat';
 import {
   Injectable,
   Logger,
@@ -461,7 +462,7 @@ export class McpService implements OnModuleDestroy {
       await handler.handleRequest(
         req.raw as unknown,
         res.raw as unknown,
-        (req as unknown as { body?: unknown }).body,
+        normalizeNovaReadTool((req as unknown as { body?: unknown }).body),
       );
     } catch (err) {
       this.logger.error('MCP request handling failed', err as Error);
