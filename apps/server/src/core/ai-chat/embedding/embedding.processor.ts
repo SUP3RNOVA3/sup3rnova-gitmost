@@ -79,12 +79,25 @@ export class EmbeddingProcessor extends WorkerHost implements OnModuleDestroy {
       }
 
       case QueueJob.WORKSPACE_CREATE_EMBEDDINGS: {
+        // Not swallowed: a bulk reindex that ends with failed pages (or whose
+        // config changed mid-run, StaleReindexTargetError) does not flip the active
+        // generation, so the workspace stays in the swap window (~2x pgvector rows,
+        // `semantic.state: 'stale'`, lexical-only search after a model change).
+        // Rethrow so BullMQ fails the job and RETRIES it with backoff (attempts: 3,
+        // see AiSettingsService.reindex / WorkspaceService); the run is idempotent.
+        // A stale-target retry is the only thing that builds the new target: the
+        // config change's enqueue was de-duplicated against this job (stable
+        // per-workspace jobId). When attempts are exhausted the job stays failed and
+        // the old generation keeps serving. Per-page jobs above keep isolation.
         try {
           await this.indexer.reindexWorkspace(workspaceId);
         } catch (err) {
           this.logger.error(
-            `Failed to reindex workspace ${workspaceId}: ${this.errMessage(err)}`,
+            `Failed to reindex workspace ${workspaceId}: ${this.errMessage(err)} ` +
+              `(attempt ${job.attemptsMade + 1}/${job.opts?.attempts ?? 1}; the job is ` +
+              `retried while attempts remain — the reindex run is idempotent)`,
           );
+          throw err;
         }
         break;
       }

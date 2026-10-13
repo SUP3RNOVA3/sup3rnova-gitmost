@@ -6,10 +6,9 @@
  * A tool part's `type` is `tool-${toolName}` (AI SDK v6 static tool parts) and
  * its `state` is one of input-streaming / input-available / output-available /
  * output-error (we only surface running / done / error). The full toolset the
- * server exposes lives in `ai-chat-tools.service.ts` (the agent now exposes the
- * complete Docmost toolset); friendly action-log labels exist ONLY for the
- * tools listed in `toolLabelKey` below — every other tool falls through to the
- * generic "Ran tool {{name}}" label.
+ * server exposes lives in `ai-chat-tools.service.ts`; friendly action-log labels
+ * exist ONLY for the tools listed in `toolLabelKey` below — every other tool
+ * falls through to the generic "Ran tool {{name}}" label.
  */
 
 /** A tool UI part as it arrives from `useChat` / persisted history. */
@@ -97,10 +96,73 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+/** Collapse runs of whitespace/newlines to a single space and trim. */
+function collapse(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+/** Truncate to ~140 chars, appending an ellipsis when it overflows. */
+function clamp(s: string): string {
+  const MAX = 140;
+  return s.length > MAX ? s.slice(0, MAX).trimEnd() + "…" : s;
+}
+
+/**
+ * Priority "primary" argument fields, in order. The first present one supplies
+ * the summary. `urls` is included (external MCP `read_pages`-style tools take a
+ * list of URLs) and is handled as an array; `url` covers the single-URL form.
+ */
+const PRIMARY_INPUT_FIELDS = [
+  "query",
+  "q",
+  "searchQuery",
+  "url",
+  "urls",
+  "title",
+  "name",
+  "text",
+  "prompt",
+] as const;
+
+/**
+ * A short, PLAIN-TEXT one-line summary of a tool call's arguments (e.g. the
+ * search query), or undefined when no recognizable primary field is present.
+ * Rendered under the tool label so tools without a friendly name (external MCP
+ * tools like `Search_web_search`) still show WHAT was requested, not just a
+ * generic "Ran tool {{name}}". The returned string is plain text and MUST be
+ * rendered React-escaped (Mantine `<Text>`), never as markdown/HTML.
+ *
+ * Streaming gate: while `state === "input-streaming"` the `input` object grows
+ * chunk by chunk but `messageSignature` deliberately does NOT track `input`, so
+ * a live summary computed here would freeze at its first captured value and go
+ * stale. We therefore return undefined until the state flips to
+ * `input-available` (input finalized) — that state change IS tracked by the
+ * signature, so the row re-renders and shows the complete summary. Do NOT add
+ * `input` to `message-signature.ts` to work around this.
+ */
+export function toolInputSummary(part: ToolUiPart): string | undefined {
+  if (part.state === "input-streaming") return undefined;
+  if (!part.input || typeof part.input !== "object") return undefined;
+  const input = part.input as Record<string, unknown>;
+
+  for (const field of PRIMARY_INPUT_FIELDS) {
+    const value = input[field];
+    if (typeof value === "string" && value.length > 0) {
+      return clamp(collapse(value));
+    }
+    if (Array.isArray(value) && value.length > 0) {
+      const first = collapse(String(value[0]));
+      if (first.length === 0) continue;
+      return clamp(first + (value.length > 1 ? ` (+${value.length - 1})` : ""));
+    }
+  }
+  return undefined;
+}
+
 /**
  * Resolve the page citation(s) a tool part references, from its input/output.
  * Only output-available parts (the tool returned) yield citations. Search
- * returns an array of pages; the page-ops return a single page id. We link to
+ * returns its matching pages in `results`; the page-ops return a single page id. We link to
  * `/p/{id}` with the raw page UUID — `PageRedirect` resolves it via
  * `extractPageSlugId` (which returns a bare UUID unchanged), so the space slug
  * and a title slug are not needed here.
@@ -118,12 +180,20 @@ export function toolCitations(part: ToolUiPart): ToolCitation[] {
 
   const toolName = getToolName(part);
 
-  if (toolName === "searchPages" && Array.isArray(out)) {
-    for (const raw of out) {
-      const item = (raw ?? {}) as Record<string, unknown>;
-      push(asString(item.id), asString(item.title));
+  if (toolName === "searchPages") {
+    // Current output is { results, related, total }: cite the real matches
+    // only — `related` are non-matching semantic neighbours, never citations.
+    // Messages persisted before that shape carry a bare array of pages.
+    const results = Array.isArray(out)
+      ? out
+      : (out as { results?: unknown } | undefined)?.results;
+    if (Array.isArray(results)) {
+      for (const raw of results) {
+        const item = (raw ?? {}) as Record<string, unknown>;
+        push(asString(item.id), asString(item.title));
+      }
+      return citations;
     }
-    return citations;
   }
 
   const o = (out ?? {}) as Record<string, unknown>;

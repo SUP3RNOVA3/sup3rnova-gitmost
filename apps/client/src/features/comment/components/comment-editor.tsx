@@ -1,7 +1,7 @@
 import { EditorContent, ReactNodeViewRenderer, useEditor } from "@tiptap/react";
 import { Placeholder } from "@tiptap/extension-placeholder";
 import { StarterKit } from "@tiptap/starter-kit";
-import { Mention, LinkExtension } from "@docmost/editor-ext";
+import { Mention, LinkExtension, Code } from "@docmost/editor-ext";
 import classes from "./comment.module.css";
 import { useFocusWithin } from "@mantine/hooks";
 import clsx from "clsx";
@@ -11,6 +11,7 @@ import EmojiCommand from "@/features/editor/extensions/emoji-command";
 import mentionRenderItems from "@/features/editor/components/mention/mention-suggestion";
 import MentionView from "@/features/editor/components/mention/mention-view";
 import { platformModifierKey } from "@/lib";
+import { linkDomAttributes } from "@/features/editor/components/link/link-href.ts";
 
 interface CommentEditorProps {
   defaultContent?: any;
@@ -44,11 +45,27 @@ const CommentEditor = forwardRef(
           gapcursor: false,
           dropcursor: false,
           link: false,
+          // #515: replace StarterKit's stock `code` mark (which ships
+          // `excludes: "_"` and therefore strips every co-occurring inline mark)
+          // with the shared Docmost `Code` mark (`excludes: "code"`), so a comment
+          // body imported with e.g. **`code`** keeps both marks when edited here.
+          code: false,
         }),
+        Code,
         Placeholder.configure({
           placeholder: placeholder || t("Reply..."),
         }),
-        LinkExtension,
+        LinkExtension.extend({
+          // Same plain <a> as the page editor: a comment's own class/rel/target
+          // link attributes never reach the DOM (see linkDomAttributes).
+          renderHTML({ mark }) {
+            return [
+              "a",
+              linkDomAttributes(mark.attrs, window.location.pathname),
+              0,
+            ];
+          },
+        }),
         EmojiCommand,
         Mention.configure({
           suggestion: {

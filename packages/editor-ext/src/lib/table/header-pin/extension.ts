@@ -1,7 +1,9 @@
 import { Extension } from '@tiptap/core';
 import { Plugin, PluginKey } from '@tiptap/pm/state';
+import type { EditorView } from '@tiptap/pm/view';
 
 import { attach, detach, getController } from './controller';
+import { pinOffsetWatcher } from './offset';
 
 const tableHeaderPinKey = new PluginKey('tableHeaderPin');
 
@@ -9,6 +11,7 @@ export const TableHeaderPin = Extension.create({
   name: 'tableHeaderPin',
 
   addProseMirrorPlugins() {
+    let editorView: EditorView | null = null;
     let editorRoot: HTMLElement | null = null;
     let domObserver: MutationObserver | null = null;
     const tracked = new Set<HTMLElement>();
@@ -28,7 +31,7 @@ export const TableHeaderPin = Extension.create({
       }
       for (const w of current) {
         if (!tracked.has(w)) {
-          attach(w);
+          attach(w, editorView);
           tracked.add(w);
         }
       }
@@ -43,8 +46,9 @@ export const TableHeaderPin = Extension.create({
       new Plugin({
         key: tableHeaderPinKey,
 
-        view(editorView) {
-          editorRoot = editorView.dom as HTMLElement;
+        view(view) {
+          editorView = view;
+          editorRoot = view.dom as HTMLElement;
 
           schedule();
 
@@ -54,6 +58,14 @@ export const TableHeaderPin = Extension.create({
           return {
             update(view, prevState) {
               if (!editorRoot) return;
+              // The pin anchors mount/unmount with the editor's mode (the fixed
+              // toolbar only exists while editing), and the watcher deliberately
+              // observes only the anchors themselves — so give it a chance to
+              // re-resolve them on every view update. sync() only SCHEDULES a
+              // frame (and is a no-op unless some table is pinned), so this adds
+              // no geometry read inside PM's updateStateInner, where the DOM has
+              // just been written and layout is dirty.
+              pinOffsetWatcher.sync();
               if (view.state.doc === prevState.doc) return;
               editorRoot
                 .querySelectorAll<HTMLElement>('.tableWrapper')
@@ -69,6 +81,7 @@ export const TableHeaderPin = Extension.create({
               for (const w of tracked) detach(w);
               tracked.clear();
               editorRoot = null;
+              editorView = null;
             },
           };
         },

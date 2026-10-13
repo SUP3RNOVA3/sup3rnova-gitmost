@@ -24,7 +24,6 @@ export function useFavoritesQuery(type?: FavoriteType, spaceId?: string) {
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.meta.hasNextPage ? lastPage.meta.nextCursor : undefined,
-    refetchOnMount: true,
   });
 }
 
@@ -32,7 +31,6 @@ export function useFavoriteIds(type: FavoriteType, spaceId?: string): Set<string
   const { data } = useQuery({
     queryKey: ["favorite-ids", type, spaceId],
     queryFn: () => getFavoriteIds(type, spaceId),
-    refetchOnMount: true,
   });
 
   const items = data?.items;
@@ -67,7 +65,7 @@ export function useAddFavoriteMutation() {
       queryClient.invalidateQueries({
         queryKey: ["favorites", variables.type],
       });
-      // Notify on success so the action gives visible feedback (issue #128)
+      // Notify on success so the action gives visible feedback
       notifications.show({ message: t("Added to favorites") });
     },
   });
@@ -93,7 +91,7 @@ export function useRemoveFavoriteMutation() {
       queryClient.invalidateQueries({
         queryKey: ["favorites", variables.type],
       });
-      // Notify on success so the action gives visible feedback (issue #128)
+      // Notify on success so the action gives visible feedback
       notifications.show({ message: t("Removed from favorites") });
     },
   });

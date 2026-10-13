@@ -6,6 +6,7 @@ import MessageItem from "@/features/ai-chat/components/message-item.tsx";
 import TypingIndicator from "@/features/ai-chat/components/typing-indicator.tsx";
 import { isToolPart, toolRunState, ToolUiPart } from "@/features/ai-chat/utils/tool-parts.tsx";
 import { assistantMessageHasVisibleContent } from "@/features/ai-chat/utils/message-content.ts";
+import { messageSignature } from "@/features/ai-chat/utils/message-signature.ts";
 import classes from "@/features/ai-chat/components/ai-chat.module.css";
 
 interface MessageListProps {
@@ -24,6 +25,19 @@ interface MessageListProps {
    * false because an anonymous reader cannot open the linked internal pages.
    */
   showCitations?: boolean;
+  /**
+   * Forwarded to MessageItem -> ToolCallCard: whether tool cards render the
+   * one-line summary of a call's arguments (e.g. the search query). Defaults to
+   * true (internal chat). The public share passes false so an anonymous reader
+   * doesn't see the agent's raw query/argument text.
+   */
+  showInput?: boolean;
+  /**
+   * Forwarded to MessageItem -> ToolCallCard: whether a failed tool card renders
+   * its raw errorText. Defaults to true (internal chat). The public share passes
+   * false so internal detail in a tool error is never painted.
+   */
+  showErrors?: boolean;
   /**
    * Forwarded to MessageItem: neutralize internal/relative markdown links in
    * the rendered answers (drop their href so they render as inert text).
@@ -99,8 +113,8 @@ export function showTypingIndicator(messages: UIMessage[], isStreaming: boolean)
  * model is still thinking): in that gap the assistant MessageItem renders nothing,
  * so the indicator stands in for the nascent bubble (name + dots) at a constant
  * gap. It hides the name only once that row shows visible content, because then
- * MessageItem draws the same name — avoids a duplicate stacked label and the
- * layout jump that switching owners mid-stream used to cause.
+ * MessageItem draws the same name — avoiding a duplicate stacked label and a
+ * layout jump from switching owners mid-stream.
  */
 export function typingIndicatorShowsName(messages: UIMessage[]): boolean {
   const last = messages[messages.length - 1];
@@ -111,13 +125,15 @@ export function typingIndicatorShowsName(messages: UIMessage[]): boolean {
 /**
  * Scrollable transcript. Auto-scrolls to the newest message as it streams in,
  * but only while the user is pinned to the bottom — if they scrolled up to read
- * earlier messages, streamed deltas no longer yank them back down.
+ * earlier messages, streamed deltas do not yank them back down.
  */
 export default function MessageList({
   messages,
   isStreaming,
   emptyState,
   showCitations = true,
+  showInput = true,
+  showErrors = true,
   neutralizeInternalLinks = false,
   assistantName,
 }: MessageListProps) {
@@ -195,13 +211,29 @@ export default function MessageList({
   return (
     <ScrollArea className={classes.messages} viewportRef={viewportRef} scrollbarSize={6} type="scroll">
       <Stack gap={0} pr="xs">
-        {messages.map((message) => (
+        {messages.map((message, index) => (
+          // `signature` is snapshotted HERE (parent render) into an immutable
+          // string and handed to MessageItem as its memo key. It must NOT be
+          // recomputed inside MessageItem's arePropsEqual: the AI SDK mutates the
+          // shared `parts` in place, so prev/next message objects both read the
+          // latest content there and the memo would skip every streamed update
+          // (freezing the row at its empty render). See message-item.tsx.
           <MessageItem
             key={message.id}
             message={message}
+            signature={messageSignature(message)}
             showCitations={showCitations}
+            showInput={showInput}
+            showErrors={showErrors}
             neutralizeInternalLinks={neutralizeInternalLinks}
             assistantName={assistantName}
+            // Turn-level liveness, gated to the TAIL row: only the tail message
+            // can belong to the in-flight turn, so a reasoning part stranded at
+            // `state:"streaming"` in an EARLIER message (its turn ended without
+            // `reasoning-end`) stays finalized and doesn't flip back to plain
+            // text (and re-parse) whenever a later turn streams — see
+            // message-item.tsx.
+            turnStreaming={isStreaming && index === messages.length - 1}
           />
         ))}
         {typing && (

@@ -72,6 +72,19 @@ export type RSAMessageCustomEventComplete = {
   type: 'customEventComplete';
   replyId: number;
   payload: unknown;
+  // When the remote handler THREW, the owner sends back the error message here
+  // instead of a payload, so the origin can reject its awaiting promise promptly
+  // (with the real error) rather than waiting out the customEventTTL timeout.
+  error?: string;
+};
+
+// The origin's caller aborted a custom event it started: the owner aborts the
+// handler's signal (a handler stops at its next step; one already done is not
+// undone). `replyTo` + `replyId` name the event like its start message does.
+export type RSAMessageCustomEventAbort = {
+  type: 'customEventAbort';
+  replyTo: string;
+  replyId: number;
 };
 
 export type RSAMessage =
@@ -83,7 +96,8 @@ export type RSAMessage =
   | RSAMessagePong
   | RSAMessageSend
   | RSAMessageCustomEventStart
-  | RSAMessageCustomEventComplete;
+  | RSAMessageCustomEventComplete
+  | RSAMessageCustomEventAbort;
 
 // @ts-ignore
 export type Pack = (msg: RSAMessage) => string | Buffer<ArrayBufferLike>;
@@ -99,7 +113,11 @@ type CustomEventName = string;
 
 export type CustomEvents = Record<
   CustomEventName,
-  (documentName: string, payload: unknown) => Promise<unknown>
+  (
+    documentName: string,
+    payload: unknown,
+    signal?: AbortSignal,
+  ) => Promise<unknown>
 >;
 
 export interface Configuration<TCE> {
@@ -109,9 +127,24 @@ export interface Configuration<TCE> {
   serverId: ServerId;
   lockTTL?: number;
   customEventTTL?: number;
+  // #647 refinement C — default per-call timeout for the NON-CLAIMING read probe
+  // (`readLiveIfLoaded`). SEPARATE from the 30s write `customEventTTL`, so the hot
+  // read path never inherits a 30s stall on a hung owner. Overridable per call.
+  readProbeTTL?: number;
   prefix?: string;
   customEvents?: TCE;
 }
+
+/**
+ * #647 refinement B — bridge-level result of `readLiveIfLoaded`. Distinguishes
+ * (contract point 4) a document that is simply NOT LOADED (no owner, or the owner
+ * hasn't hydrated it) from an owner that is UNREACHABLE (exists but the short
+ * probe timed out / errored) — #654 maps these to different metrics.
+ */
+export type ReadLiveResult =
+  | { loaded: true; content: any; hash: string }
+  | { loaded: false }
+  | { loaded: false; unreachable: true };
 
 export type BaseWebSocket = EventEmitter & {
   readyState: number;

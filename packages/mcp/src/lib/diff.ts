@@ -7,19 +7,31 @@
  * result to text + integrity counts instead of decorations, so a diff can be
  * previewed without a browser.
  *
- * recreateTransform here comes from @fellow/prosemirror-recreate-transform, the
- * maintained published fork of the MIT prosemirror-recreate-steps source that
- * Docmost vendors in @docmost/editor-ext; it exposes the identical
+ * recreateTransform here comes from @docmost/editor-ext — the SAME
+ * implementation the in-app history diff renders with, so the MCP verify report
+ * and the UI can never disagree about what changed. It exposes the usual
  * recreateTransform(fromDoc, toDoc, { complexSteps, wordDiffs, simplifyDiff })
  * signature.
  *
  * If recreateTransform / the changeset throws on a pathological document pair,
- * we fall back to a coarse block-level text diff so the tool never hard-fails.
+ * OR the pair is too large to diff cheaply (see the size guard below), we fall
+ * back to a coarse block-level text diff so the tool never hard-fails and never
+ * pins the event loop.
+ *
+ * SIZE GUARD (CPU-DoS). The diff pipeline is synchronous and super-linear in
+ * the size of the pair; a large/heavily-changed doc can run for seconds or more
+ * and starve the whole process (BullMQ, Redis lock renewals, embeddings). It
+ * never THROWS — it just never finishes — so the try/catch below cannot save
+ * us. Because diffDocs runs on EVERY in-app/MCP content edit's verify report, we
+ * PRE-FLIGHT the doc size and route anything above a measured cap straight to
+ * the coarse fallback (the same shape the catch produces). Same cap+fallback
+ * pattern as the ELK-layout guard. Both caps are measured against inputs the
+ * guard actually ADMITS — see below.
  */
 
 import { Node } from "@tiptap/pm/model";
 import { ChangeSet, simplifyChanges } from "@tiptap/pm/changeset";
-import { recreateTransform } from "@fellow/prosemirror-recreate-transform";
+import { recreateTransform } from "@docmost/editor-ext";
 import { docmostSchema } from "./docmost-schema.js";
 
 /** A single inserted/deleted change with its containing-block context. */
@@ -37,6 +49,50 @@ export interface DiffIntegrity {
   links: [number, number];
   tables: [number, number];
   callouts: [number, number];
+  codeBlocks: [number, number];
+  /**
+   * Diagram block atoms. Both are atoms whose ENTIRE payload lives in
+   * attrs (src/attachmentId), so deleting one moves no prose and no marks — the
+   * only trace in the text delta is the single leaf placeholder `textBetween`
+   * emits for an atom, i.e. a 1-char delta indistinguishable from fixing a typo.
+   * The count is what NAMES the loss (attribution), as the codeBlocks count
+   * does for code.
+   *
+   * Counted as TWO keys, not one "diagrams" bucket: a bucket would report a
+   * drawio replaced by an excalidraw as `1 -> 1` (clean) and omit it from
+   * `VerifyReport.structure` entirely — recreating the very blind spot this
+   * guard exists to close.
+   */
+  drawio: [number, number];
+  excalidraw: [number, number];
+  /**
+   * Block-atom DATA CARRIERS. Same blind zone as the diagram atoms above:
+   * each is a top-level block whose ENTIRE payload lives in `attrs`
+   * (src/attachmentId/sourcePageId/…), so deleting one moves no prose and no
+   * marks — the only trace in the text delta is the single leaf placeholder
+   * `textBetween` emits for an atom, a 1-char change indistinguishable from a
+   * typo fix. The count is what NAMES the loss (attribution), as the
+   * codeBlocks/drawio counts do for their kinds.
+   *
+   * Counted as SEPARATE keys, never one "media"/"embeds" bucket: a bucket would
+   * report e.g. a video replaced by an audio as `1 -> 1` (clean) and omit it
+   * from `VerifyReport.structure` entirely — recreating the very blind spot this
+   * guard exists to close. `youtube` is a distinct node type from `embed` in the
+   * runtime schema, so both are counted. (Inline atoms mathInline/mention are
+   * out of scope — this guard is for block-atom data carriers.)
+   */
+  attachment: [number, number];
+  video: [number, number];
+  audio: [number, number];
+  pdf: [number, number];
+  embed: [number, number];
+  youtube: [number, number];
+  htmlEmbed: [number, number];
+  mathBlock: [number, number];
+  pageEmbed: [number, number];
+  subpages: [number, number];
+  transclusionSource: [number, number];
+  transclusionReference: [number, number];
   footnoteMarkers: [number[], number[]];
 }
 
@@ -70,6 +126,95 @@ function countNodes(doc: any, pred: (node: any) => boolean): number {
   };
   visit(doc);
   return n;
+}
+
+// --- Pre-flight size guard for the precise diff -----------------------------
+// Defaults are BENCHMARK-derived (scripts/diff-size-guard-bench.mjs) on the
+// current pipeline — editor-ext's recreateTransform (complexSteps:false,
+// wordDiffs:true, simplifyDiff:true) + ChangeSet.addSteps + simplifyChanges —
+// with the goal of keeping the WORST ADMITTED case's synchronous block inside
+// the ~200ms budget. "Admitted" is the load-bearing word: a cap may only be
+// justified by inputs the guard actually LETS THROUGH, so the bench
+// binary-searches the text length so a corner doc lands JUST UNDER the byte cap.
+//
+//   BYTE AXIS — 4 KiB. This is the axis that actually binds. The byte-heavy
+//   worst case is a large text node REWRITTEN wholesale. Its cost is NOT in the
+//   diff — editor-ext's word-diff caps bound that (recreateTransform is a few ms
+//   here) — but in ChangeSet.addSteps, which re-diffs the replaced range
+//   internally. Splitting the two stages on one rewritten text node: at 6 KB
+//   recreateTransform is 17ms vs addSteps 194ms; at 12 KB it is 0.7ms vs
+//   addSteps 362ms.
+//
+//   The adversary picks the TOKEN DENSITY, not just the byte count: addSteps works
+//   token-by-token, so the same bytes made of short unique tokens (base36 counters)
+//   cost ~40-60% more than prose-length words. The cap must survive that shape,
+//   because the document is agent/user-authored. Worst ADMITTED-vs-refused times,
+//   all text rewritten (best-of-3, dev box; "dense" = shortest unique tokens):
+//     bytes  | 1 text node | dense 1n | dense 2n | dense 3n | verdict
+//      4 KiB |   156 ms    |  136 ms  |  110 ms  |   72 ms  | ADMIT — budget holds
+//      5 KiB |     —       |  170 ms  |  163 ms  |  136 ms  | refuse
+//      6 KiB |   234 ms    |  202 ms  |  195 ms  |  174 ms  | refuse (over budget)
+//      8 KiB |   345 ms    |  264 ms  |  268 ms  |  250 ms  | refuse
+//     12 KiB |   449 ms    |  435 ms  |  437 ms  |  402 ms  | refuse
+//   4 KiB is therefore the largest cap under which EVERY admitted shape stays inside
+//   ~200ms. Operators who want precise diffs on byte-heavy docs and accept the block
+//   can opt in: MCP_DIFF_MAX_BYTES=6144 (~200-235ms) or =12288 (~400-660ms). The
+//   aggregate word-diff shape (many ~2 KB nodes, half edited) is cheap by
+//   comparison (125 KB / 129 nodes -> 96 ms) and is NOT what binds here.
+//
+//   NODE AXIS — 200, and under the default byte cap it is SUBSUMED: it can
+//   never trip. Even the cheapest possible node (an empty paragraph, ~21 B of JSON)
+//   only gets ~190 nodes into 4 KiB, and a doc of TEXT blocks (~55 B each) tops out
+//   at ~68 blocks / ~137 nodes — so the byte cap always refuses first. Corner docs
+//   sized to land just under the byte cap, every block rewritten:
+//     nodes | bytes | time
+//        61 |  4076 |  26 ms
+//       101 |  4076 |  43 ms
+//       121 |  4046 |  50 ms
+//       137+|   —   | unreachable (cannot fit under the byte cap)
+//   The node cap is kept as defence-in-depth and stays MEANINGFUL for operators who
+//   RAISE MCP_DIFF_MAX_BYTES: in that regime the corner docs become reachable again
+//   and 200 is where the budget lands (at a 6 KiB byte budget: 151 nodes -> 78 ms,
+//   201 nodes -> 116 ms; at 12 KiB: 227 nodes -> 185 ms, 251 -> 227 ms). It also
+//   still bounds byte-cheap/node-heavy shapes (deep nesting) if the byte cap is
+//   raised.
+//
+// Either metric over its cap routes to the coarse fallback. Both are env-tunable
+// for operators who accept more CPU in exchange for exact diffs on larger docs.
+const DEFAULT_MAX_NODES = 200;
+const DEFAULT_MAX_BYTES = 4 * 1024;
+
+/**
+ * Read a positive-integer env override, falling back to `dflt`. Garbage / unset /
+ * non-finite / non-positive all fall back (so the guard can never be accidentally
+ * disabled by a malformed value). Read fresh on every call so a test / operator
+ * can flip the knob without a restart.
+ */
+function readPositiveIntEnv(name: string, dflt: number): number {
+  const raw = parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : dflt;
+}
+
+/**
+ * True when the pair is too large for the precise (recreateTransform) diff and
+ * must degrade to the coarse fallback. Takes the MAX of the two docs on each
+ * metric so an ASYMMETRIC pair (a small new doc vs a huge old doc, or vice
+ * versa) — whose diff cost is driven by the BIG side — is caught. Cheap: one
+ * node walk + one JSON.stringify per doc, both O(size).
+ */
+function exceedsDiffSizeGuard(oldDoc: any, newDoc: any): boolean {
+  const maxNodes = readPositiveIntEnv("MCP_DIFF_MAX_NODES", DEFAULT_MAX_NODES);
+  const maxBytes = readPositiveIntEnv("MCP_DIFF_MAX_BYTES", DEFAULT_MAX_BYTES);
+  const nodes = Math.max(
+    countNodes(oldDoc, () => true),
+    countNodes(newDoc, () => true),
+  );
+  if (nodes > maxNodes) return true;
+  const bytes = Math.max(
+    JSON.stringify(oldDoc)?.length ?? 0,
+    JSON.stringify(newDoc)?.length ?? 0,
+  );
+  return bytes > maxBytes;
 }
 
 /**
@@ -172,11 +317,92 @@ function computeIntegrity(
     countNodes(oldDoc, (n) => n.type === "callout"),
     countNodes(newDoc, (n) => n.type === "callout"),
   ];
+  const codeBlocks: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "codeBlock"),
+    countNodes(newDoc, (n) => n.type === "codeBlock"),
+  ];
+  const drawio: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "drawio"),
+    countNodes(newDoc, (n) => n.type === "drawio"),
+  ];
+  const excalidraw: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "excalidraw"),
+    countNodes(newDoc, (n) => n.type === "excalidraw"),
+  ];
+  const attachment: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "attachment"),
+    countNodes(newDoc, (n) => n.type === "attachment"),
+  ];
+  const video: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "video"),
+    countNodes(newDoc, (n) => n.type === "video"),
+  ];
+  const audio: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "audio"),
+    countNodes(newDoc, (n) => n.type === "audio"),
+  ];
+  const pdf: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "pdf"),
+    countNodes(newDoc, (n) => n.type === "pdf"),
+  ];
+  const embed: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "embed"),
+    countNodes(newDoc, (n) => n.type === "embed"),
+  ];
+  const youtube: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "youtube"),
+    countNodes(newDoc, (n) => n.type === "youtube"),
+  ];
+  const htmlEmbed: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "htmlEmbed"),
+    countNodes(newDoc, (n) => n.type === "htmlEmbed"),
+  ];
+  const mathBlock: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "mathBlock"),
+    countNodes(newDoc, (n) => n.type === "mathBlock"),
+  ];
+  const pageEmbed: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "pageEmbed"),
+    countNodes(newDoc, (n) => n.type === "pageEmbed"),
+  ];
+  const subpages: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "subpages"),
+    countNodes(newDoc, (n) => n.type === "subpages"),
+  ];
+  const transclusionSource: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "transclusionSource"),
+    countNodes(newDoc, (n) => n.type === "transclusionSource"),
+  ];
+  const transclusionReference: [number, number] = [
+    countNodes(oldDoc, (n) => n.type === "transclusionReference"),
+    countNodes(newDoc, (n) => n.type === "transclusionReference"),
+  ];
   const fns: [number[], number[]] = [
     footnoteMarkers(oldDoc, notesHeading),
     footnoteMarkers(newDoc, notesHeading),
   ];
-  return { images, links, tables, callouts, footnoteMarkers: fns };
+  return {
+    images,
+    links,
+    tables,
+    callouts,
+    codeBlocks,
+    drawio,
+    excalidraw,
+    attachment,
+    video,
+    audio,
+    pdf,
+    embed,
+    youtube,
+    htmlEmbed,
+    mathBlock,
+    pageEmbed,
+    subpages,
+    transclusionSource,
+    transclusionReference,
+    footnoteMarkers: fns,
+  };
 }
 
 /**
@@ -226,6 +452,81 @@ function coarseDiff(oldDoc: any, newDoc: any): DiffChange[] {
   return changes;
 }
 
+/** Accumulated textual changes plus their derived char/block tallies. */
+interface DiffTally {
+  changes: DiffChange[];
+  inserted: number;
+  deleted: number;
+  changedBlocks: Set<string>;
+}
+
+/**
+ * Produce the coarse-fallback tally for a pair. This is the SINGLE source of the
+ * `fellBack:true` result shape, shared by BOTH degrade paths in diffDocs (the
+ * pre-flight size guard and the recreateTransform catch) so they behave and
+ * report identically.
+ */
+function coarseDiffTally(oldDoc: any, newDoc: any): DiffTally {
+  const changes = coarseDiff(oldDoc, newDoc);
+  let inserted = 0;
+  let deleted = 0;
+  const changedBlocks = new Set<string>();
+  for (const c of changes) {
+    if (c.op === "insert") inserted += c.text.length;
+    else deleted += c.text.length;
+    if (c.block) changedBlocks.add(c.op[0] + ":" + c.block);
+  }
+  return { changes, inserted, deleted, changedBlocks };
+}
+
+/**
+ * Compute the PRECISE tally via the recreateTransform pipeline. Callers MUST
+ * gate this behind the size guard (it can block the event loop for a large pair)
+ * and wrap it in try/catch (a pathological pair can throw); on either the guard
+ * or a throw, use `coarseDiffTally` instead. Kept as a sibling of
+ * `coarseDiffTally` so both produce the same `DiffTally` shape.
+ */
+function preciseDiffTally(oldDocJson: any, newDocJson: any): DiffTally {
+  const oldNode = Node.fromJSON(docmostSchema, oldDocJson);
+  const newNode = Node.fromJSON(docmostSchema, newDocJson);
+  const tr = recreateTransform(oldNode, newNode, {
+    complexSteps: false,
+    wordDiffs: true,
+    simplifyDiff: true,
+  });
+  const changeSet = ChangeSet.create(oldNode).addSteps(tr.doc, tr.mapping.maps, []);
+  const simplified = simplifyChanges(changeSet.changes, newNode);
+
+  const changes: DiffChange[] = [];
+  let inserted = 0;
+  let deleted = 0;
+  const changedBlocks = new Set<string>();
+
+  for (const change of simplified) {
+    // Deleted text lives in the OLD doc coordinate range [fromA, toA).
+    if (change.toA > change.fromA) {
+      const text = oldNode.textBetween(change.fromA, change.toA, "\n", " ");
+      if (text.length > 0) {
+        deleted += text.length;
+        const block = blockContextAt(oldNode, change.fromA);
+        changes.push({ op: "delete", block, text });
+        if (block) changedBlocks.add("d:" + block);
+      }
+    }
+    // Inserted text lives in the NEW doc coordinate range [fromB, toB).
+    if (change.toB > change.fromB) {
+      const text = newNode.textBetween(change.fromB, change.toB, "\n", " ");
+      if (text.length > 0) {
+        inserted += text.length;
+        const block = blockContextAt(newNode, change.fromB);
+        changes.push({ op: "insert", block, text });
+        if (block) changedBlocks.add("i:" + block);
+      }
+    }
+  }
+  return { changes, inserted, deleted, changedBlocks };
+}
+
 /** Build the human-readable unified-ish markdown summary. */
 function renderMarkdown(
   result: Omit<DiffResult, "markdown">,
@@ -246,6 +547,41 @@ function renderMarkdown(
   lines.push(`- links: ${integrity.links[0]} -> ${integrity.links[1]}`);
   lines.push(`- tables: ${integrity.tables[0]} -> ${integrity.tables[1]}`);
   lines.push(`- callouts: ${integrity.callouts[0]} -> ${integrity.callouts[1]}`);
+  lines.push(
+    `- codeBlocks: ${integrity.codeBlocks[0]} -> ${integrity.codeBlocks[1]}`,
+  );
+  lines.push(
+    `- drawio: ${integrity.drawio[0]} -> ${integrity.drawio[1]}`,
+  );
+  lines.push(
+    `- excalidraw: ${integrity.excalidraw[0]} -> ${integrity.excalidraw[1]}`,
+  );
+  lines.push(
+    `- attachment: ${integrity.attachment[0]} -> ${integrity.attachment[1]}`,
+  );
+  lines.push(`- video: ${integrity.video[0]} -> ${integrity.video[1]}`);
+  lines.push(`- audio: ${integrity.audio[0]} -> ${integrity.audio[1]}`);
+  lines.push(`- pdf: ${integrity.pdf[0]} -> ${integrity.pdf[1]}`);
+  lines.push(`- embed: ${integrity.embed[0]} -> ${integrity.embed[1]}`);
+  lines.push(`- youtube: ${integrity.youtube[0]} -> ${integrity.youtube[1]}`);
+  lines.push(
+    `- htmlEmbed: ${integrity.htmlEmbed[0]} -> ${integrity.htmlEmbed[1]}`,
+  );
+  lines.push(
+    `- mathBlock: ${integrity.mathBlock[0]} -> ${integrity.mathBlock[1]}`,
+  );
+  lines.push(
+    `- pageEmbed: ${integrity.pageEmbed[0]} -> ${integrity.pageEmbed[1]}`,
+  );
+  lines.push(
+    `- subpages: ${integrity.subpages[0]} -> ${integrity.subpages[1]}`,
+  );
+  lines.push(
+    `- transclusionSource: ${integrity.transclusionSource[0]} -> ${integrity.transclusionSource[1]}`,
+  );
+  lines.push(
+    `- transclusionReference: ${integrity.transclusionReference[0]} -> ${integrity.transclusionReference[1]}`,
+  );
   lines.push(
     `- footnoteMarkers: [${integrity.footnoteMarkers[0].join(", ")}] -> [${integrity.footnoteMarkers[1].join(", ")}]`,
   );
@@ -276,66 +612,39 @@ export function diffDocs(
   newDocJson: any,
   notesHeading: string = "Примечания переводчика",
 ): DiffResult {
+  // computeIntegrity is cheap (linear node walks) and its counts are needed in
+  // BOTH the precise and coarse paths, so it always runs first.
   const integrity = computeIntegrity(oldDocJson, newDocJson, notesHeading);
 
-  let changes: DiffChange[] = [];
-  let inserted = 0;
-  let deleted = 0;
   let fellBack = false;
-  const changedBlocks = new Set<string>();
+  let tally: DiffTally;
 
-  try {
-    const oldNode = Node.fromJSON(docmostSchema, oldDocJson);
-    const newNode = Node.fromJSON(docmostSchema, newDocJson);
-    const tr = recreateTransform(oldNode, newNode, {
-      complexSteps: false,
-      wordDiffs: true,
-      simplifyDiff: true,
-    });
-    const changeSet = ChangeSet.create(oldNode).addSteps(
-      tr.doc,
-      tr.mapping.maps,
-      [],
-    );
-    const simplified = simplifyChanges(changeSet.changes, newNode);
-
-    for (const change of simplified) {
-      // Deleted text lives in the OLD doc coordinate range [fromA, toA).
-      if (change.toA > change.fromA) {
-        const text = oldNode.textBetween(change.fromA, change.toA, "\n", " ");
-        if (text.length > 0) {
-          deleted += text.length;
-          const block = blockContextAt(oldNode, change.fromA);
-          changes.push({ op: "delete", block, text });
-          if (block) changedBlocks.add("d:" + block);
-        }
-      }
-      // Inserted text lives in the NEW doc coordinate range [fromB, toB).
-      if (change.toB > change.fromB) {
-        const text = newNode.textBetween(change.fromB, change.toB, "\n", " ");
-        if (text.length > 0) {
-          inserted += text.length;
-          const block = blockContextAt(newNode, change.fromB);
-          changes.push({ op: "insert", block, text });
-          if (block) changedBlocks.add("i:" + block);
-        }
-      }
-    }
-  } catch {
-    // Pathological pair: degrade to a coarse block-level diff so we never throw.
+  // Pre-flight size guard (#464): a too-large pair would make recreateTransform
+  // block the event loop for seconds-to-hours WITHOUT throwing, so route it to
+  // the coarse fallback BEFORE calling recreateTransform at all. Both this path
+  // and the catch below go through coarseDiffTally for an identical `fellBack`
+  // result shape.
+  if (exceedsDiffSizeGuard(oldDocJson, newDocJson)) {
     fellBack = true;
-    changes = coarseDiff(oldDocJson, newDocJson);
-    for (const c of changes) {
-      if (c.op === "insert") inserted += c.text.length;
-      else deleted += c.text.length;
-      if (c.block) changedBlocks.add(c.op[0] + ":" + c.block);
+    tally = coarseDiffTally(oldDocJson, newDocJson);
+  } else {
+    try {
+      tally = preciseDiffTally(oldDocJson, newDocJson);
+    } catch {
+      // Pathological pair: degrade to a coarse block-level diff so we never throw.
+      fellBack = true;
+      tally = coarseDiffTally(oldDocJson, newDocJson);
     }
   }
 
   const partial: Omit<DiffResult, "markdown"> = {
-    summary: { inserted, deleted, blocksChanged: changedBlocks.size },
+    summary: {
+      inserted: tally.inserted,
+      deleted: tally.deleted,
+      blocksChanged: tally.changedBlocks.size,
+    },
     integrity,
-    changes,
+    changes: tally.changes,
   };
   return { ...partial, markdown: renderMarkdown(partial, fellBack) };
 }
@@ -379,9 +688,10 @@ export interface VerifyReport {
   marks: Record<string, [number, number]>;
   /**
    * ONLY structural integrity types whose count changed, as [before, after]
-   * (images/links/tables/callouts). Surfaces structural mutations that touch
-   * neither text nor marks (e.g. insert_image, deleting a table) which diffDocs
-   * — being TEXT-only — would otherwise report as "no content change".
+   * (images/links/tables/callouts/codeBlocks/drawio/excalidraw). Surfaces structural
+   * mutations that touch neither text nor marks (e.g. insertImage, deleting a
+   * table, a vanished code block or draw.io diagram) which diffDocs — being
+   * TEXT-only — would otherwise report as "no content change".
    */
   structure?: Record<string, [number, number]>;
   /** One-line human/agent-readable summary. */
@@ -399,9 +709,9 @@ export interface VerifyReport {
  * `changed:false` / "no content change" rather than a misleading +0/-0 change.
  *
  * The structural integrity delta (from diffDocs's `integrity` tuples) is what
- * makes `changed` true for an image/table/callout/link count change that diffs
- * to zero text — closing a verify blind spot for insert_image, delete_node on a
- * table, etc.
+ * makes `changed` true for an image/table/callout/codeBlock/diagram/link count
+ * change that diffs to zero text — closing a verify blind spot for insertImage,
+ * deleteNode on a table, a vanished codeBlock or drawio/excalidraw diagram, etc.
  */
 export function summarizeChange(before: any, after: any): VerifyReport {
   try {
@@ -421,14 +731,52 @@ export function summarizeChange(before: any, after: any): VerifyReport {
     }
 
     // Structural integrity delta from diffDocs: count-based [old,new] tuples for
-    // images/links/tables/callouts. Include a type only when old != new.
+    // images/links/tables/callouts/codeBlocks/drawio/excalidraw plus the #619
+    // block-atom data carriers (attachment/video/audio/pdf/embed/youtube/
+    // htmlEmbed/mathBlock/pageEmbed/subpages/transclusionSource/
+    // transclusionReference). Include a type only when old != new.
     const integrity = diff.integrity;
     const structure: Record<string, [number, number]> = {};
-    const countTypes: ["images", "links", "tables", "callouts"] = [
+    const countTypes: [
       "images",
       "links",
       "tables",
       "callouts",
+      "codeBlocks",
+      "drawio",
+      "excalidraw",
+      "attachment",
+      "video",
+      "audio",
+      "pdf",
+      "embed",
+      "youtube",
+      "htmlEmbed",
+      "mathBlock",
+      "pageEmbed",
+      "subpages",
+      "transclusionSource",
+      "transclusionReference",
+    ] = [
+      "images",
+      "links",
+      "tables",
+      "callouts",
+      "codeBlocks",
+      "drawio",
+      "excalidraw",
+      "attachment",
+      "video",
+      "audio",
+      "pdf",
+      "embed",
+      "youtube",
+      "htmlEmbed",
+      "mathBlock",
+      "pageEmbed",
+      "subpages",
+      "transclusionSource",
+      "transclusionReference",
     ];
     for (const type of countTypes) {
       const [b, a] = integrity[type];

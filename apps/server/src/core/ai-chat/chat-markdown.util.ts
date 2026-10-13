@@ -1,13 +1,10 @@
 /**
- * Server-side Markdown export for an AI agent chat (#183). The DB is the single
- * source of truth: this renders a chat purely from its persisted message rows
- * (`AiChatMessage[]` — role / content / metadata.parts / toolCalls / usage).
- * Because the assistant row is now persisted UPFRONT and updated per step, an
- * interrupted turn is included up to its last finished step.
+ * Server-side Markdown export for an AI agent chat. It renders a chat purely from
+ * its persisted message rows (`AiChatMessage[]` — role / content / metadata.parts /
+ * toolCalls / usage). The assistant row is persisted upfront and updated per step,
+ * so an interrupted turn is included up to its last finished step.
  *
- * Ported from the client `utils/chat-markdown.ts`. It is a PURE function (apart
- * from `new Date()` for the export timestamp), so it is straightforward to
- * unit-test and a future background worker can reuse it.
+ * Pure apart from `new Date()` for the export timestamp.
  *
  * Only a few fixed role/tool labels are localized via the `lang` param; the
  * structural document words (Input/Output/Error/Tokens/...) stay English because
@@ -15,6 +12,7 @@
  */
 
 import type { AiChatMessage } from '@docmost/db/types/entity.types';
+import { escapeAttr } from './ai-chat.prompt';
 
 /** Supported export label languages. Defaults to English. */
 export type ExportLang = 'en' | 'ru';
@@ -48,9 +46,7 @@ interface UsageLike {
   reasoningTokens?: number;
 }
 
-/** Localized label table. The client-side Markdown builder was removed by #183
- *  (the export is now server-side only), so this no longer mirrors a second
- *  exporter — instead the tool-action labels are kept in parity with the
+/** Localized label table. The tool-action labels are kept in parity with the
  *  on-screen action-log labels in the client's `tool-parts.tsx` (`toolLabelKey`)
  *  so the export reads the same as the UI. Only role + tool-action labels are
  *  localized; everything structural is an English constant in the renderer. */
@@ -63,6 +59,7 @@ const LABELS: Record<
     tools: Record<string, string>;
     ranTool: (name: string) => string;
     stillGenerating: string;
+    pageEditedByUser: string;
   }
 > = {
   en: {
@@ -73,7 +70,7 @@ const LABELS: Record<
       searchPages: 'Searched pages',
       getPage: 'Read page',
       createPage: 'Created page',
-      updatePageContent: 'Updated page',
+      updatePageMarkdown: 'Updated page',
       renamePage: 'Renamed page',
       movePage: 'Moved page',
       deletePage: 'Deleted page (to trash)',
@@ -83,6 +80,8 @@ const LABELS: Record<
     ranTool: (name) => `Ran tool ${name}`,
     stillGenerating:
       'This message is still being generated — the export captured a partial, in-progress response.',
+    pageEditedByUser:
+      'The user edited this page before this turn; the diff the agent saw:',
   },
   ru: {
     untitled: 'Без названия',
@@ -92,7 +91,7 @@ const LABELS: Record<
       searchPages: 'Искал по страницам',
       getPage: 'Прочитал страницу',
       createPage: 'Создал страницу',
-      updatePageContent: 'Обновил страницу',
+      updatePageMarkdown: 'Обновил страницу',
       renamePage: 'Переименовал страницу',
       movePage: 'Переместил страницу',
       deletePage: 'Удалил страницу (в корзину)',
@@ -102,8 +101,23 @@ const LABELS: Record<
     ranTool: (name) => `Выполнил инструмент ${name}`,
     stillGenerating:
       'Это сообщение всё ещё генерируется — экспорт захватил частичный, незавершённый ответ.',
+    pageEditedByUser:
+      'Пользователь изменил страницу перед этим ходом; дифф, который видел агент:',
   },
 };
+
+/**
+ * Make an untrusted title safe to interpolate into a Markdown blockquote
+ * HEADING. escapeAttr() neutralizes `<` `>` `"` and collapses whitespace, but
+ * link/image syntax survives it. So `[` and `]` are also backslash-escaped: that
+ * disables both `[text](url)` links and `![text](url)` images, so a cross-user
+ * title cannot inject a remote image or a clickable link into the downloaded .md.
+ * A bare `(url)` with no preceding `[]` is inert Markdown, so brackets are the
+ * only security-critical characters here.
+ */
+function markdownHeadingSafe(title: string): string {
+  return escapeAttr(title).replace(/[[\]]/g, (m) => `\\${m}`);
+}
 
 /** True for AI SDK tool parts (static `tool-*` or `dynamic-tool`). */
 function isToolPart(type: string): boolean {
@@ -128,6 +142,17 @@ function toolRunState(state: string | undefined): 'running' | 'done' | 'error' {
 /** Resolve a tool's friendly action-log label (localized) from its name. */
 function toolLabel(name: string, lang: ExportLang): string {
   return LABELS[lang].tools[name] ?? LABELS[lang].ranTool(name);
+}
+
+/**
+ * The tool names that carry a hand-written friendly export label, per language.
+ * Exported for the drift-guard (#494): a label keyed by a tool name that no
+ * longer exists is a DEAD entry (the tool was renamed and now silently falls back
+ * to the generic `ranTool(name)` line). The guard asserts every key here is a
+ * real in-app tool AND that the two languages label the SAME set of tools.
+ */
+export function labelledToolNames(lang: ExportLang): string[] {
+  return Object.keys(LABELS[lang].tools);
 }
 
 /**
@@ -208,6 +233,23 @@ function rowParts(row: AiChatMessage): ExportPart[] {
     : [{ type: 'text', text: row.content ?? '' }];
 }
 
+/** The persisted page-change diff the agent saw this turn (#274), when any. */
+function pageChangedOf(
+  row: AiChatMessage,
+): { title: string; diff: string } | undefined {
+  const meta = (row.metadata ?? {}) as {
+    pageChanged?: { title?: string; diff?: string };
+  };
+  const pc = meta.pageChanged;
+  if (pc && typeof pc.diff === 'string' && pc.diff.trim().length > 0) {
+    return {
+      title: typeof pc.title === 'string' ? pc.title : '',
+      diff: pc.diff,
+    };
+  }
+  return undefined;
+}
+
 /**
  * Serialize a chat to a Markdown string from its persisted rows. Source = DB
  * ONLY (no live client state). A row whose `status` is still 'streaming' is an
@@ -264,6 +306,22 @@ export function buildChatMarkdown(args: {
           ? row.createdAt.toISOString()
           : String(row.createdAt);
       blocks.push(`<!-- ${iso} -->`);
+    }
+
+    // Page-change observability (#274): show the diff the agent saw at the start
+    // of this turn, before its response, so the export reflects the stale-page
+    // warning the model received.
+    const pc = pageChangedOf(row);
+    if (pc) {
+      // The page title is UNTRUSTED cross-user data; markdownHeadingSafe() also
+      // neutralizes link/image syntax before it goes into this `> **…**` heading.
+      // An all-`<>"` title escapes to empty and falls to the bare heading. The
+      // diff body is already safe via fence().
+      const safeTitle = markdownHeadingSafe(pc.title);
+      const heading = safeTitle
+        ? `${L.pageEditedByUser} ("${safeTitle}")`
+        : L.pageEditedByUser;
+      blocks.push(`> **📝 ${heading}**\n\n${fence(pc.diff, 'diff')}`);
     }
 
     blocks.push(...renderMessageParts(rowParts(row), lang));

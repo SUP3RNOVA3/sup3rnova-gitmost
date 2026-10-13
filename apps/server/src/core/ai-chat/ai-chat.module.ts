@@ -3,6 +3,8 @@ import { AiModule } from '../../integrations/ai/ai.module';
 import { TokenModule } from '../auth/token.module';
 import { AiChatController } from './ai-chat.controller';
 import { AiChatService } from './ai-chat.service';
+import { AiChatRunService } from './ai-chat-run.service';
+import { AiChatStreamRegistryService } from './ai-chat-stream-registry.service';
 import { AiTranscriptionService } from './ai-transcription.service';
 import { AiChatToolsService } from './tools/ai-chat-tools.service';
 import { EmbeddingModule } from './embedding/embedding.module';
@@ -15,19 +17,19 @@ import { PublicShareChatService } from './public-share-chat.service';
 import { PublicShareChatToolsService } from './tools/public-share-chat-tools.service';
 
 /**
- * Per-user AI chat module (§6.1).
+ * Per-user AI chat module.
  *
  * AiModule supplies AiService + AiSettingsService. TokenModule supplies
- * TokenService for minting the per-user loopback access token (§15[C1]). The
- * AiChatRepo / AiChatMessageRepo / PageEmbeddingRepo / SpaceMemberRepo /
- * PagePermissionRepo come from the global DatabaseModule; the UserThrottlerGuard
- * + AI_CHAT throttler come from the global ThrottleModule registered in
- * AppModule. EmbeddingModule hosts the vector-RAG indexer + AI_QUEUE consumer
- * (§6.7 stage D); importing it here boots the processor with the app.
+ * TokenService for minting the per-user loopback access token. The
+ * AiChatRepo / AiChatMessageRepo come from the global DatabaseModule; the
+ * UserThrottlerGuard + AI_CHAT throttler come from the global ThrottleModule
+ * registered in AppModule. EmbeddingModule hosts the vector-RAG indexer +
+ * AI_QUEUE consumer; importing it here boots the processor with the app.
  *
- * ShareModule (ShareService) + SearchModule (SearchService) are imported for the
- * ANONYMOUS public-share assistant (PublicShareChatController), whose read-only
- * tools scope every lookup to a single share tree.
+ * SearchModule (SearchService) backs the agent's searchPages tool and, with
+ * ShareModule (ShareService), the ANONYMOUS public-share assistant
+ * (PublicShareChatController), whose read-only tools scope every lookup to a
+ * single share tree.
  */
 @Module({
   imports: [
@@ -42,6 +44,8 @@ import { PublicShareChatToolsService } from './tools/public-share-chat-tools.ser
   controllers: [AiChatController, PublicShareChatController],
   providers: [
     AiChatService,
+    AiChatRunService,
+    AiChatStreamRegistryService,
     AiTranscriptionService,
     AiChatToolsService,
     PublicShareChatService,

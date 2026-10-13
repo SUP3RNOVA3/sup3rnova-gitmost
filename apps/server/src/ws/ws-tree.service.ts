@@ -5,6 +5,7 @@ import {
   PageMovedEvent,
   TreeNodeSnapshot,
   TreeUpdateSnapshot,
+  toTreeNodeSnapshot,
 } from '../database/listeners/page.listener';
 
 @Injectable()
@@ -28,15 +29,16 @@ export class WsTreeService {
         // Receivers place by `position` among already-loaded siblings, not by
         // this absolute index (sender's loaded set differs from receivers').
         index: 0,
+        // Built via the shared snapshot helper (same one page.repo uses to fill
+        // the event), then extended with the tree-only fields the client
+        // receiver consumes. The helper carries the death-timer deadline
+        // (normalised to null => permanent) so receivers — and the author, if
+        // this broadcast wins the race against the optimistic insert — render
+        // the temporary-note clock marker immediately, without it drifting from
+        // the event literal.
         data: {
-          id: page.id,
-          slugId: page.slugId,
+          ...toTreeNodeSnapshot(page),
           name: page.title ?? '',
-          title: page.title,
-          icon: page.icon,
-          position: page.position,
-          spaceId: page.spaceId,
-          parentPageId: page.parentPageId,
           hasChildren: false,
           children: [],
         },
@@ -110,15 +112,10 @@ export class WsTreeService {
     // Decide the node's restricted state ONCE, fresh (uncached), and drive BOTH
     // the move broadcast and the compensating delete from this single decision.
     //
-    // Why not just emitTreeEvent for the move? emitTreeEvent gates the move on
-    // the CACHED spaceHasRestrictions (30s TTL, never invalidated). In the window
-    // right after a space gets its FIRST restriction, that cache still says
-    // "no restrictions" → emitTreeEvent would fan the move out to the WHOLE room
-    // (including unauthorized users) while the delete below (computed from the
-    // UNCACHED hasRestrictedAncestor) also fires. An unauthorized user then gets
-    // BOTH, and if the delete lands first it is a no-op and the later move
-    // renders the restricted node → leak. So when the node is known-restricted we
-    // must NOT route the move through the cache-gated path.
+    // A known-restricted move must NOT go through emitTreeEvent: it gates on the
+    // CACHED spaceHasRestrictions, which right after a space gets its FIRST
+    // restriction still says "no restrictions" and would fan the move out to the
+    // WHOLE room, rendering the restricted node for unauthorized users.
     const isRestricted = await this.pagePermissionRepo.hasRestrictedAncestor(
       node.id,
     );
@@ -132,14 +129,12 @@ export class WsTreeService {
 
     // Restricted case: a move can push a previously-visible page UNDER a
     // restricted ancestor. The move (to authorized users) and the compensating
-    // delete (to everyone else) are now driven from ONE socket/access snapshot:
+    // delete (to everyone else) are driven from ONE socket/access snapshot:
     // emitMoveWithRestrictionSplit performs a single fetchSockets + a single
-    // getUserIdsWithPageAccess and partitions the room from that one snapshot.
-    // This eliminates the race window that existed when the move and the delete
-    // each resolved the audience independently — a socket could otherwise have
-    // landed in both sets (leaking the restricted node) or in neither (losing the
-    // compensating delete). Authorized users get exactly the moveTreeNode,
-    // everyone else (unauthorized + anonymous) gets exactly the deleteTreeNode.
+    // getUserIdsWithPageAccess and partitions the room from it, so no socket
+    // lands in both sets or in neither. Authorized users get exactly the
+    // moveTreeNode, everyone else (unauthorized + anonymous) exactly the
+    // deleteTreeNode.
     //
     // Users who LOSE visibility need the delete because otherwise the node would
     // linger in their tree at its old parent with its real title/slugId/icon

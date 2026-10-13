@@ -1,12 +1,11 @@
 import { markInputRule } from "@tiptap/core";
 import { StarterKit } from "@tiptap/starter-kit";
-import { Code } from "@tiptap/extension-code";
 import { TextAlign } from "@tiptap/extension-text-align";
 import { TaskList, TaskItem } from "@tiptap/extension-list";
 import { Placeholder, CharacterCount, UndoRedo } from "@tiptap/extensions";
 import { Superscript } from "@tiptap/extension-superscript";
 import SubScript from "@tiptap/extension-subscript";
-import { Typography } from "@tiptap/extension-typography";
+import { CustomTypography } from "./custom-typography";
 import { TextStyle } from "@tiptap/extension-text-style";
 import { Color } from "@tiptap/extension-color";
 import { Youtube } from "@tiptap/extension-youtube";
@@ -16,7 +15,13 @@ import SlashCommand, {
 import renderItems from "@/features/editor/components/slash-menu/render-items";
 import getSuggestionItems from "@/features/editor/components/slash-menu/menu-items";
 import { Collaboration, isChangeOrigin } from "@tiptap/extension-collaboration";
-import { CollaborationCaret } from "@tiptap/extension-collaboration-caret";
+import { yCursorPlugin, ySyncPluginKey } from "@tiptap/y-tiptap";
+import type { Plugin } from "@tiptap/pm/state";
+import type { EditorView } from "@tiptap/pm/view";
+import {
+  CollaborationCaret,
+  type CollaborationCaretOptions,
+} from "@tiptap/extension-collaboration-caret";
 import { HocuspocusProvider } from "@hocuspocus/provider";
 import {
   Comment,
@@ -53,8 +58,10 @@ import {
   Subpages,
   Heading,
   Highlight,
+  Spoiler,
   Indent,
   UniqueID,
+  UNIQUE_ID_TYPES,
   SharedStorage,
   Columns,
   Column,
@@ -62,10 +69,10 @@ import {
   TransclusionSource,
   TransclusionReference,
   PageEmbed,
-  TableView,
   FootnoteReference,
   FootnotesList,
   FootnoteDefinition,
+  Code,
 } from "@docmost/editor-ext";
 import {
   randomElement,
@@ -80,8 +87,8 @@ import {
   createResizeHandle,
   buildResizeClasses,
 } from "@/features/editor/components/common/node-resize-handles.ts";
-import MathInlineView from "@/features/editor/components/math/math-inline.tsx";
-import MathBlockView from "@/features/editor/components/math/math-block.tsx";
+import MathInlineView from "@/features/editor/components/math/math-inline-lazy.tsx";
+import MathBlockView from "@/features/editor/components/math/math-block-lazy.tsx";
 import ImageView from "@/features/editor/components/image/image-view.tsx";
 import CalloutView from "@/features/editor/components/callout/callout-view.tsx";
 import StatusView from "@/features/editor/components/status/status-view.tsx";
@@ -89,7 +96,7 @@ import VideoView from "@/features/editor/components/video/video-view.tsx";
 import AudioView from "@/features/editor/components/audio/audio-view.tsx";
 import AttachmentView from "@/features/editor/components/attachment/attachment-view.tsx";
 import CodeBlockView from "@/features/editor/components/code-block/code-block-view.tsx";
-import DrawioView from "../components/drawio/drawio-view";
+import DrawioView from "../components/drawio/drawio-view-lazy.tsx";
 import ExcalidrawView from "@/features/editor/components/excalidraw/excalidraw-view-lazy.tsx";
 import EmbedView from "@/features/editor/components/embed/embed-view.tsx";
 import HtmlEmbedView from "@/features/editor/components/html-embed/html-embed-view.tsx";
@@ -101,6 +108,8 @@ import FootnoteReferenceView from "@/features/editor/components/footnote/footnot
 import FootnotesListView from "@/features/editor/components/footnote/footnotes-list-view.tsx";
 import FootnoteDefinitionView from "@/features/editor/components/footnote/footnote-definition-view.tsx";
 import PageEmbedView from "@/features/editor/components/page-embed/page-embed-view.tsx";
+import { reportOperation } from "@/lib/telemetry/vitals";
+import { isClientTelemetryEnabled } from "@/lib/config";
 import { common, createLowlight } from "lowlight";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import powershell from "highlight.js/lib/languages/powershell";
@@ -115,7 +124,9 @@ import scala from "highlight.js/lib/languages/scala";
 import mentionRenderItems from "@/features/editor/components/mention/mention-suggestion.ts";
 import { ReactNodeViewRenderer, ReactMarkViewRenderer } from "@tiptap/react";
 import MentionView from "@/features/editor/components/mention/mention-view.tsx";
-import LinkView from "@/features/editor/components/link/link-view.tsx";
+import { createLinkClickPlugin } from "@/features/editor/components/link/link-click-plugin.ts";
+import { linkDomAttributes } from "@/features/editor/components/link/link-href.ts";
+import SpoilerView from "@/features/editor/components/spoiler/spoiler-view.tsx";
 import i18n from "@/i18n.ts";
 import { MarkdownClipboard } from "@/features/editor/extensions/markdown-clipboard.ts";
 import EmojiCommand from "./emoji-command";
@@ -123,6 +134,8 @@ import { countWords } from "alfaaz";
 import AutoJoiner from "@/features/editor/extensions/autojoiner.ts";
 import GlobalDragHandle from "@/features/editor/extensions/drag-handle.ts";
 import { CleanStyles } from "@/features/editor/extensions/clean-styles.ts";
+import { IntentionalClear } from "@/features/editor/extensions/intentional-clear.ts";
+import { SingleDocumentBuild } from "@/features/editor/extensions/single-document-build.ts";
 
 const lowlight = createLowlight(common);
 lowlight.register("mermaid", plaintext);
@@ -150,6 +163,11 @@ export const mainExtensions = [
     codeBlock: false,
     code: false,
   }),
+  // The shared `Code` mark from @docmost/editor-ext (single source of the
+  // `excludes: "code"` policy: inline code must be able to carry bold / italic /
+  // … like CommonMark) re-extended here with the CLIENT-only input rule and
+  // keyboard shortcut.
+  //
   // Override TipTap's Code extension to fix the inline code input rule.
   // The upstream regex /(^|[^`])`([^`]+)`(?!`)$/ captures the character
   // before the opening backtick as part of the match, causing markInputRule
@@ -190,7 +208,7 @@ export const mainExtensions = [
   SharedStorage,
   Heading,
   UniqueID.configure({
-    types: ["heading", "paragraph", "transclusionSource"],
+    types: UNIQUE_ID_TYPES,
     filterTransaction: (transaction) => !isChangeOrigin(transaction),
   }),
   Placeholder.configure({
@@ -228,8 +246,15 @@ export const mainExtensions = [
   LinkExtension.configure({
     openOnClick: false,
   }).extend({
-    addMarkView() {
-      return ReactMarkViewRenderer(LinkView);
+    // Links render as plain <a>: the href is the one the UI points at (a share
+    // route maps internal links to the shared copy, external ones are
+    // normalized), and none of the document's own class/rel/target attributes
+    // reach the DOM — see linkDomAttributes.
+    renderHTML({ mark }) {
+      return ["a", linkDomAttributes(mark.attrs, window.location.pathname), 0];
+    },
+    addProseMirrorPlugins() {
+      return [...(this.parent?.() ?? []), createLinkClickPlugin(this.editor)];
     },
   }),
   Superscript,
@@ -237,7 +262,14 @@ export const mainExtensions = [
   Highlight.configure({
     multicolor: true,
   }),
-  Typography,
+  Spoiler.configure({}).extend({
+    addMarkView() {
+      return ReactMarkViewRenderer(SpoilerView);
+    },
+  }),
+  // Typography with an undo guard: does not re-apply a substitution the user
+  // just undid (e.g. Ctrl+Z on "1/2" -> "½" followed by another space).
+  CustomTypography,
   TrailingNode,
   GlobalDragHandle.configure({
     customNodes: ["transclusionSource", "transclusionReference", "pageEmbed"],
@@ -276,7 +308,12 @@ export const mainExtensions = [
     lastColumnResizable: true,
     allowTableNodeSelection: true,
     cellMinWidth: 49,
-    View: TableView,
+    // No `View:` here on purpose, and it would be ignored anyway: CustomTable
+    // builds the columnResizing plugin itself (so resizing survives the body
+    // editor being constructed read-only) and hard-codes `View: null` there,
+    // which stops prosemirror-tables installing a competing table node view.
+    // The one and only table node view is the one CustomTable registers via
+    // addNodeView() — see the comments there.
   }),
   TableRow,
   TableCell,
@@ -341,6 +378,21 @@ export const mainExtensions = [
     HTMLAttributes: {
       spellcheck: false,
     },
+    // `code_highlight` — report a REAL syntax-highlight recompute (init +
+    // guarded recompute inside the plugin), never a plain keystroke.
+    // reportOperation is threshold-gated + isVitalsActive()-gated internally; the
+    // callback is wired ONLY when the operator flag is on, so a telemetry-off
+    // build passes no callback and the plugin skips timing entirely (zero cost).
+    //
+    // CADENCE (for the operator reading the metric): this emits ONE sample per
+    // recompute that exceeds the >8ms threshold — NOT one per diagram/open. Every
+    // edit that touches a code block recomputes its decorations, so typing inside
+    // a LARGE code block (where each recompute is >8ms) yields roughly one
+    // `code_highlight` sample per keystroke. Read the distribution as "per-
+    // recompute cost", and expect high sample counts on big code blocks.
+    onHighlight: isClientTelemetryEnabled()
+      ? (ms: number) => reportOperation("code_highlight", ms)
+      : undefined,
   }),
   Selection,
   Attachment.configure({
@@ -442,6 +494,9 @@ export const mainExtensions = [
   AutoJoiner.configure({
     elementsToJoin: [],
   }),
+  // Builds the document DOM once per mount instead of twice; every editor
+  // built from mainExtensions (live, static, history, readonly, embeds) gets it.
+  SingleDocumentBuild,
 ] as any;
 
 type CollabExtensions = (provider: HocuspocusProvider, user: IUser) => any[];
@@ -474,16 +529,106 @@ export const templateExtensions = [
   UndoRedo,
 ] as any;
 
+// y-tiptap's ySyncPlugin view rebuilds the whole ProseMirror doc from Yjs
+// (`binding._forceRerender`) every time its plugin view is created, and
+// ProseMirror re-creates ALL plugin views whenever the plugin set changes — so
+// every registerPlugin/unregisterPlugin (each BubbleMenu mount) re-derived the
+// full document, ~10 times per page open. A re-creation for the SAME EditorView
+// needs no rerender: ProseMirror destroys and re-creates the views
+// synchronously inside one updateState call, so neither the doc nor the Yjs
+// fragment can change in between and the binding mapping stays valid. Only the
+// first view creation per EditorView keeps the forced rerender.
+const CollaborationWithoutRerenderOnReconfigure = Collaboration.extend({
+  addProseMirrorPlugins() {
+    const plugins: Plugin[] = this.parent?.() ?? [];
+    const ySync = plugins.find((plugin) => plugin?.spec.key === ySyncPluginKey);
+    const createView = ySync?.spec.view;
+    if (!createView) return plugins;
+
+    let renderedView: EditorView | null = null;
+    ySync.spec.view = (view) => {
+      const binding = ySyncPluginKey.getState(view.state)?.binding;
+      if (view !== renderedView || !binding) {
+        renderedView = view;
+        return createView(view);
+      }
+      const forceRerender = binding._forceRerender;
+      binding._forceRerender = () => {};
+      try {
+        return createView(view);
+      } finally {
+        binding._forceRerender = forceRerender;
+      }
+    };
+    return plugins;
+  },
+});
+
+const awarenessStatesToArray = (states: Map<number, Record<string, any>>) =>
+  Array.from(states.entries()).map(([key, value]) => ({
+    clientId: key,
+    ...value.user,
+  }));
+
+// Local override of @tiptap/extension-collaboration-caret 3.20.4, whose
+// plugin adds an awareness "update" listener and never removes it; the
+// listener's closure holds the extension context and, through it, the editor.
+// With warm collab sessions the provider (and its awareness) outlives the
+// editor, so every mount would leak one. The user is still set once, as in
+// 3.20.4 (not in the plugin view, as 3.31 does — that view is re-created ~10
+// times per page open); the listener is kept in storage and removed in
+// onDestroy. Remove this override when tiptap is upgraded to >= 3.31.
+const CollaborationCaretWithListenerCleanup = CollaborationCaret.extend<
+  CollaborationCaretOptions,
+  {
+    users: { clientId: number; [key: string]: any }[];
+    awarenessUpdateListener: (() => void) | null;
+  }
+>({
+  addStorage() {
+    return {
+      ...this.parent?.(),
+      awarenessUpdateListener: null,
+    };
+  },
+  addProseMirrorPlugins() {
+    const awareness = this.options.provider.awareness;
+    awareness.setLocalStateField("user", this.options.user);
+    this.storage.users = awarenessStatesToArray(awareness.states);
+    const awarenessUpdateListener = () => {
+      this.storage.users = awarenessStatesToArray(awareness.states);
+    };
+    awareness.on("update", awarenessUpdateListener);
+    this.storage.awarenessUpdateListener = awarenessUpdateListener;
+    return [
+      yCursorPlugin(awareness, {
+        cursorBuilder: this.options.render,
+        selectionBuilder: this.options.selectionRender,
+      }),
+    ];
+  },
+  onDestroy() {
+    const listener = this.storage.awarenessUpdateListener;
+    if (listener) this.options.provider.awareness.off("update", listener);
+  },
+});
+
 export const collabExtensions: CollabExtensions = (provider, user) => [
-  Collaboration.configure({
+  CollaborationWithoutRerenderOnReconfigure.configure({
     document: provider.document,
     provider,
   }),
-  CollaborationCaret.configure({
+  CollaborationCaretWithListenerCleanup.configure({
     provider,
     user: {
       name: user.name,
       color: randomElement(userColors),
     },
+  }),
+  // #251 — emit an intentional-clear signal to the server when the user
+  // deliberately empties the page, so the #248 store-side empty-guard lets that
+  // one clear through while still blocking accidental empties.
+  IntentionalClear.configure({
+    provider,
   }),
 ];

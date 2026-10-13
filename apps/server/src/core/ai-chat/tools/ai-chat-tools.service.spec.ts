@@ -1,6 +1,16 @@
 import { AiChatToolsService } from './ai-chat-tools.service';
 import * as loader from './docmost-client.loader';
 import type { DocmostClientLike } from './docmost-client.loader';
+
+// Test-double type for the loopback client. `DocmostClientLike` is DERIVED from
+// the real `DocmostClient`, so its method RETURN types are the concrete client
+// shapes. These stubs return minimal recording shapes (e.g. `{ ok: true }`), so
+// the doubles are typed with the same method NAMES but loose async returns. Each
+// is still cast to `DocmostClientLike` at the (return-erased) mock site, so the
+// positional-call type-safety on the PRODUCTION client is unaffected.
+type FakeDocmostClient = Partial<
+  Record<keyof DocmostClientLike, (...args: any[]) => Promise<any>>
+>;
 // The real zod-agnostic shared tool-spec registry. It has no runtime deps, so
 // importing the TS source directly keeps these mocks honest: the service builds
 // the shared tools from exactly the specs the package ships, not a hand-stub.
@@ -12,7 +22,15 @@ import { SHARED_TOOL_SPECS } from '../../../../../../packages/mcp/src/tool-specs
 // sync.
 const mockLoaded = (DocmostClient: loader.DocmostClientCtor) => ({
   DocmostClient,
-  sharedToolSpecs: SHARED_TOOL_SPECS as Record<string, loader.SharedToolSpec>,
+  sharedToolSpecs: SHARED_TOOL_SPECS as unknown as Record<string, loader.SharedToolSpec>,
+  // Pure no-network draw.io helpers (#424). Type-correct stubs: these tests
+  // never execute the drawioShapes / drawioGuide tool bodies.
+  searchShapes: (() => []) as unknown as loader.SearchShapesFn,
+  getGuideSection: (() => ({
+    section: 'index',
+    content: '',
+    sections: [],
+  })) as unknown as loader.GetGuideSectionFn,
 });
 
 /**
@@ -31,7 +49,7 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
 
   // Minimal fake DocmostClient: only the write methods the tools touch need to
   // exist; deletePage records its args. No network, no ESM import.
-  const fakeClient: Partial<DocmostClientLike> = {
+  const fakeClient: FakeDocmostClient = {
     deletePage: (...args: unknown[]) => {
       deletePageCalls.push(args);
       return Promise.resolve({ success: true });
@@ -55,14 +73,21 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
         return fakeClient as DocmostClientLike;
       } as unknown as loader.DocmostClientCtor),
     );
-    // The new semanticSearch deps (aiService + repos) are not exercised by the
-    // deletePage guardrail tests; pass stubs to satisfy the constructor arity.
+    // aiService + searchService are not exercised by the deletePage guardrail
+    // tests; pass stubs to satisfy the constructor arity.
     service = new AiChatToolsService(
       tokenServiceStub as never,
       {} as never,
       {} as never,
-      {} as never,
-      {} as never,
+      // sandboxStore: forUser() eagerly calls asSink() to wire the stash tool,
+      // even though these tests never execute it — return a no-op sink so the
+      // tool wiring in forUser() succeeds.
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -154,7 +179,7 @@ describe('AiChatToolsService deletePage guardrail (H4)', () => {
 describe('AiChatToolsService expanded toolset guardrails', () => {
   // No client method is invoked here — every assertion is on tool presence /
   // input schema — so an empty fake client is sufficient.
-  const fakeClient: Partial<DocmostClientLike> = {};
+  const fakeClient: FakeDocmostClient = {};
 
   const tokenServiceStub = {
     generateAccessToken: jest.fn().mockResolvedValue('access-token'),
@@ -173,8 +198,15 @@ describe('AiChatToolsService expanded toolset guardrails', () => {
       tokenServiceStub as never,
       {} as never,
       {} as never,
-      {} as never,
-      {} as never,
+      // sandboxStore: forUser() eagerly calls asSink() to wire the stash tool,
+      // even though these tests never execute it — return a no-op sink so the
+      // tool wiring in forUser() succeeds.
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -252,8 +284,9 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
   const patchNodeCalls: unknown[][] = [];
   const insertNodeCalls: unknown[][] = [];
   const updatePageJsonCalls: unknown[][] = [];
+  const updatePageCalls: unknown[][] = [];
 
-  const fakeClient: Partial<DocmostClientLike> = {
+  const fakeClient: FakeDocmostClient = {
     patchNode: (...args: unknown[]) => {
       patchNodeCalls.push(args);
       return Promise.resolve({ ok: true });
@@ -265,6 +298,11 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     updatePageJson: (...args: unknown[]) => {
       updatePageJsonCalls.push(args);
       return Promise.resolve({ ok: true });
+    },
+    // Backs the plain-Markdown full-body-replace tool updatePageMarkdown (#411).
+    updatePage: (...args: unknown[]) => {
+      updatePageCalls.push(args);
+      return Promise.resolve({ success: true });
     },
   };
 
@@ -279,6 +317,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     patchNodeCalls.length = 0;
     insertNodeCalls.length = 0;
     updatePageJsonCalls.length = 0;
+    updatePageCalls.length = 0;
     jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
       mockLoaded(function () {
         return fakeClient as DocmostClientLike;
@@ -288,8 +327,15 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       tokenServiceStub as never,
       {} as never,
       {} as never,
-      {} as never,
-      {} as never,
+      // sandboxStore: forUser() eagerly calls asSink() to wire the stash tool,
+      // even though these tests never execute it — return a no-op sink so the
+      // tool wiring in forUser() succeeds.
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -311,23 +357,32 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     content: [{ type: 'text', text: 'Hello' }],
   };
 
-  it('patchNode parses a JSON-string node and forwards it as an object', async () => {
+  it('patchNode parses a JSON-string node and forwards it as { node } (object)', async () => {
     const tools = await buildTools();
     await tools.patchNode.execute(
       { pageId: 'p1', nodeId: 'n1', node: JSON.stringify(NODE_OBJ) } as never,
       {} as never,
     );
     expect(patchNodeCalls).toHaveLength(1);
-    expect(patchNodeCalls[0]).toEqual(['p1', 'n1', NODE_OBJ]);
+    // #413: the 3rd arg is now the XOR input { markdown?, node? }.
+    expect(patchNodeCalls[0]).toEqual([
+      'p1',
+      'n1',
+      { markdown: undefined, node: NODE_OBJ },
+    ]);
   });
 
-  it('patchNode passes an object node through unchanged', async () => {
+  it('patchNode passes an object node through unchanged inside { node }', async () => {
     const tools = await buildTools();
     await tools.patchNode.execute(
       { pageId: 'p1', nodeId: 'n1', node: NODE_OBJ } as never,
       {} as never,
     );
-    expect(patchNodeCalls[0]).toEqual(['p1', 'n1', NODE_OBJ]);
+    expect(patchNodeCalls[0]).toEqual([
+      'p1',
+      'n1',
+      { markdown: undefined, node: NODE_OBJ },
+    ]);
   });
 
   it('patchNode throws the documented message on invalid JSON string', async () => {
@@ -341,7 +396,7 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     expect(patchNodeCalls).toHaveLength(0);
   });
 
-  it('insertNode parses a JSON-string node and forwards it as an object', async () => {
+  it('insertNode parses a JSON-string node and forwards it inside { node }', async () => {
     const tools = await buildTools();
     await tools.insertNode.execute(
       {
@@ -352,9 +407,15 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
       {} as never,
     );
     expect(insertNodeCalls).toHaveLength(1);
-    const [pageId, node] = insertNodeCalls[0];
+    // #413: the 2nd arg is the XOR input { markdown?, node? }, the 3rd is opts.
+    const [pageId, input, opts] = insertNodeCalls[0] as [
+      string,
+      { markdown?: unknown; node?: unknown },
+      { position?: string },
+    ];
     expect(pageId).toBe('p1');
-    expect(node).toEqual(NODE_OBJ);
+    expect(input).toEqual({ markdown: undefined, node: NODE_OBJ });
+    expect(opts.position).toBe('append');
   });
 
   it('insertNode throws the documented message on invalid JSON string', async () => {
@@ -408,20 +469,68 @@ describe('AiChatToolsService node-arg JSON-string coercion', () => {
     ).rejects.toThrow('content was a string but not valid JSON');
     expect(updatePageJsonCalls).toHaveLength(0);
   });
+
+  // #411: the plain-Markdown full-body-replace tool is now the shared
+  // `updatePageMarkdown` (was inline `updatePageContent`). It forwards to
+  // client.updatePage(pageId, content, title) -> updatePageContentRealtime ->
+  // markdownToProseMirrorCanonical, so `^[...]` footnotes materialize.
+  it('updatePageMarkdown forwards { pageId, content, title } to client.updatePage', async () => {
+    const tools = await buildTools();
+    await tools.updatePageMarkdown.execute(
+      { pageId: 'p1', content: 'Body^[a note]', title: 'New title' } as never,
+      {} as never,
+    );
+    expect(updatePageCalls).toHaveLength(1);
+    expect(updatePageCalls[0]).toEqual(['p1', 'Body^[a note]', 'New title']);
+  });
+
+  it('updatePageMarkdown returns the RAW client result in-app (deliberate #411 shape change, documented on the spec)', async () => {
+    const tools = await buildTools();
+    // Registry canonical execute returns client.updatePage's result verbatim.
+    // The old inline tool projected to { pageId, updated }; the rename now
+    // surfaces the raw result (nothing reads the removed `.updated`; the raw
+    // shape carries footnote/verify warnings and matches the on-both-hosts
+    // registry convention). fakeClient.updatePage resolves { success: true }.
+    const result = await tools.updatePageMarkdown.execute(
+      { pageId: 'p1', content: '# Hi' } as never,
+      {} as never,
+    );
+    expect(result).toEqual({ success: true });
+  });
+
+  it('updatePageMarkdown forwards title=undefined when omitted', async () => {
+    const tools = await buildTools();
+    await tools.updatePageMarkdown.execute(
+      { pageId: 'p1', content: '# Hi' } as never,
+      {} as never,
+    );
+    expect(updatePageCalls[0]).toEqual(['p1', '# Hi', undefined]);
+  });
+
+  // #411 surface split: the plain-Markdown replace tool exists in-app under the
+  // new key; the OLD inline updatePageContent key is gone; importPageMarkdown is
+  // still present IN-APP (only the external MCP surface drops it — asserted in
+  // packages/mcp/test/unit/tool-inventory.test.mjs).
+  it('exposes updatePageMarkdown in-app, no legacy updatePageContent, keeps importPageMarkdown', async () => {
+    const tools = await buildTools();
+    expect(tools.updatePageMarkdown).toBeDefined();
+    expect((tools as Record<string, unknown>).updatePageContent).toBeUndefined();
+    expect(tools.importPageMarkdown).toBeDefined();
+  });
 });
 
 /**
- * Model-friendly tool-call validation (#190): when the model drops a required
+ * Model-friendly tool-call validation: when the model drops a required
  * `pageId` in a parallel/batch tool call, the built-in input schema must return
  * a CLEAR, actionable message (naming the parameter, reminding it not to drop
  * ids in batches) instead of zod's raw "expected string, received undefined" —
  * while a valid call still validates. This is wired centrally via
- * modelFriendlyInput, so it applies to every in-app tool; createComment (the
- * tool from the bug report) and a sharedTool-built tool (getPage's sibling
- * getOutline) are exercised here end-to-end through forUser().
+ * modelFriendlyInput, so it applies to every in-app tool; createComment and a
+ * sharedTool-built tool (getOutline) are exercised here end-to-end through
+ * forUser().
  */
 describe('AiChatToolsService model-friendly input validation (#190)', () => {
-  const fakeClient: Partial<DocmostClientLike> = {};
+  const fakeClient: FakeDocmostClient = {};
   const tokenServiceStub = {
     generateAccessToken: jest.fn().mockResolvedValue('access-token'),
     generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
@@ -438,8 +547,15 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
       tokenServiceStub as never,
       {} as never,
       {} as never,
-      {} as never,
-      {} as never,
+      // sandboxStore: forUser() eagerly calls asSink() to wire the stash tool,
+      // even though these tests never execute it — return a no-op sink so the
+      // tool wiring in forUser() succeeds.
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
     );
   });
 
@@ -476,7 +592,7 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
     expect(result.success).toBe(false);
     expect(result.error?.message).toContain('parameter "pageId": missing (required)');
     expect(result.error?.message).toContain('parallel/batch tool calls');
-    // Not the raw zod text the model previously received.
+    // Not zod's raw text.
     expect(result.error?.message).not.toContain('received undefined');
   });
 
@@ -494,10 +610,549 @@ describe('AiChatToolsService model-friendly input validation (#190)', () => {
     });
   });
 
+  it('createComment: accepts an optional suggestedText alongside a selection', async () => {
+    const tools = await buildTools();
+    const result = await inputSchemaOf(tools.createComment).validate({
+      pageId: '019efe44-0000-0000-0000-000000000000',
+      content: 'A remark',
+      selection: 'титановый проводник',
+      suggestedText: 'медный проводник',
+    });
+    expect(result.success).toBe(true);
+    expect(result.value).toMatchObject({
+      suggestedText: 'медный проводник',
+    });
+  });
+
   it('sharedTool-built tools (getOutline) also get the friendly message on a dropped pageId', async () => {
     const tools = await buildTools();
     const result = await inputSchemaOf(tools.getOutline).validate({});
     expect(result.success).toBe(false);
     expect(result.error?.message).toContain('parameter "pageId": missing (required)');
+  });
+});
+
+/**
+ * The contract-parity test introspects only the ADVERTISED schema keys
+ * (buildShape), not the execute bodies. Most execs are plain pass-throughs; two
+ * wirings are not and are otherwise untested:
+ *   - movePage forwards the optional `position` field to the client
+ *     (client.movePage(pageId, parentPageId, position));
+ *   - the table trio takes its param as `table` and must forward it
+ *     positionally. A field destructured under the wrong name would silently pass
+ *     `undefined` to the client (execute is `any`-cast, so tsc won't catch it).
+ */
+describe('AiChatToolsService #294 changed execute wirings', () => {
+  const calls: Record<string, unknown[][]> = {
+    movePage: [],
+    tableInsertRow: [],
+    tableDeleteRow: [],
+    tableUpdateCell: [],
+  };
+  const fakeClient: FakeDocmostClient = {
+    movePage: (...args: unknown[]) => {
+      calls.movePage.push(args);
+      return Promise.resolve({ success: true });
+    },
+    tableInsertRow: (...args: unknown[]) => {
+      calls.tableInsertRow.push(args);
+      return Promise.resolve({ ok: true });
+    },
+    tableDeleteRow: (...args: unknown[]) => {
+      calls.tableDeleteRow.push(args);
+      return Promise.resolve({ ok: true });
+    },
+    tableUpdateCell: (...args: unknown[]) => {
+      calls.tableUpdateCell.push(args);
+      return Promise.resolve({ ok: true });
+    },
+  };
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    for (const k of Object.keys(calls)) calls[k].length = 0;
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return fakeClient as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
+    );
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+
+  it('movePage forwards the optional position to the client', async () => {
+    const tools = await buildTools();
+    await tools.movePage.execute(
+      { pageId: 'p1', parentPageId: 'parent1', position: 'a5' } as never,
+      {} as never,
+    );
+    expect(calls.movePage).toEqual([['p1', 'parent1', 'a5']]);
+  });
+
+  it('movePage passes undefined position and null parent when omitted (unchanged behavior)', async () => {
+    const tools = await buildTools();
+    await tools.movePage.execute({ pageId: 'p2' } as never, {} as never);
+    expect(calls.movePage).toEqual([['p2', null, undefined]]);
+  });
+
+  it('tableInsertRow forwards the unified `table` param positionally', async () => {
+    const tools = await buildTools();
+    await tools.tableInsertRow.execute(
+      { pageId: 'p1', table: '#0', cells: ['a', 'b'], index: 2 } as never,
+      {} as never,
+    );
+    expect(calls.tableInsertRow).toEqual([['p1', '#0', ['a', 'b'], 2]]);
+  });
+
+  it('tableDeleteRow forwards `table` positionally', async () => {
+    const tools = await buildTools();
+    await tools.tableDeleteRow.execute(
+      { pageId: 'p1', table: '#0', index: 1 } as never,
+      {} as never,
+    );
+    expect(calls.tableDeleteRow).toEqual([['p1', '#0', 1]]);
+  });
+
+  it('tableUpdateCell forwards `table` positionally', async () => {
+    const tools = await buildTools();
+    await tools.tableUpdateCell.execute(
+      { pageId: 'p1', table: '#0', row: 1, col: 2, text: 'x' } as never,
+      {} as never,
+    );
+    expect(calls.tableUpdateCell).toEqual([['p1', '#0', 1, 2, 'x']]);
+  });
+});
+
+/**
+ * The footnote + image tools come from the shared registry and are wired in-app.
+ * Assert they are REGISTERED in the in-app
+ * toolset and forward their args to the client with the correct arg->method
+ * mapping (the schema fields `imageUrl`/`attachmentId` map onto the client's
+ * positional `url`/`oldAttachmentId`). A field destructured under the wrong name
+ * would silently pass `undefined` (execute is `any`-cast, so tsc won't catch it).
+ */
+describe('AiChatToolsService #410 footnote + image tools', () => {
+  const calls: Record<string, unknown[][]> = {
+    insertFootnote: [],
+    insertImage: [],
+    replaceImage: [],
+  };
+  const fakeClient: FakeDocmostClient = {
+    insertFootnote: (...args: unknown[]) => {
+      calls.insertFootnote.push(args);
+      return Promise.resolve({ success: true, footnoteId: 'fn1', reused: false });
+    },
+    insertImage: (...args: unknown[]) => {
+      calls.insertImage.push(args);
+      return Promise.resolve({ success: true, attachmentId: 'att1' });
+    },
+    replaceImage: (...args: unknown[]) => {
+      calls.replaceImage.push(args);
+      return Promise.resolve({ success: true, replaced: 1 });
+    },
+  };
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    for (const k of Object.keys(calls)) calls[k].length = 0;
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return fakeClient as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
+    );
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+
+  it('registers all three tools in the in-app toolset', async () => {
+    const tools = await buildTools();
+    expect(tools.insertFootnote).toBeDefined();
+    expect(tools.insertImage).toBeDefined();
+    expect(tools.replaceImage).toBeDefined();
+  });
+
+  it('insertFootnote forwards (pageId, anchorText, text) positionally', async () => {
+    const tools = await buildTools();
+    const r = await tools.insertFootnote.execute(
+      { pageId: 'p1', anchorText: 'the claim', text: 'See source.' } as never,
+      {} as never,
+    );
+    expect(calls.insertFootnote).toEqual([['p1', 'the claim', 'See source.']]);
+    expect(r).toMatchObject({ footnoteId: 'fn1' });
+  });
+
+  it('insertImage maps imageUrl->url and packs the option fields', async () => {
+    const tools = await buildTools();
+    await tools.insertImage.execute(
+      {
+        pageId: 'p1',
+        imageUrl: 'https://x/img.png',
+        align: 'center',
+        alt: 'A',
+        replaceText: '[img]',
+        afterText: undefined,
+      } as never,
+      {} as never,
+    );
+    expect(calls.insertImage).toEqual([
+      [
+        'p1',
+        'https://x/img.png',
+        { align: 'center', alt: 'A', replaceText: '[img]', afterText: undefined },
+      ],
+    ]);
+  });
+
+  it('replaceImage maps attachmentId->oldAttachmentId and imageUrl->url', async () => {
+    const tools = await buildTools();
+    await tools.replaceImage.execute(
+      {
+        pageId: 'p1',
+        attachmentId: 'att-old',
+        imageUrl: 'https://x/new.png',
+        align: 'right',
+        alt: 'B',
+      } as never,
+      {} as never,
+    );
+    expect(calls.replaceImage).toEqual([
+      ['p1', 'att-old', 'https://x/new.png', { align: 'right', alt: 'B' }],
+    ]);
+  });
+});
+
+/**
+ * getCurrentPage selection contract (#388): the tool surfaces the selection that
+ * was sanitized + nested onto the resolved open-page context (last forUser arg).
+ * No page => selection is null. The tool never fetches or verifies anything — it
+ * just projects the resolved context.
+ */
+describe('AiChatToolsService getCurrentPage selection (#388)', () => {
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return {} as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
+    );
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = (openedPage: unknown) =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+      openedPage as never,
+    );
+
+  it('returns the nested selection from the resolved context', async () => {
+    const selection = { text: 'fix this', blockIds: ['b1'], before: 'a ' };
+    const tools = await buildTools({ id: 'p1', title: 'Doc', selection });
+    expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
+      { page: { id: 'p1', title: 'Doc' }, selection },
+    );
+  });
+
+  it('returns selection: null when the context has no selection', async () => {
+    const tools = await buildTools({ id: 'p1', title: 'Doc' });
+    expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
+      { page: { id: 'p1', title: 'Doc' }, selection: null },
+    );
+  });
+
+  it('returns { page: null, selection: null } when no page is open', async () => {
+    const tools = await buildTools(null);
+    expect(await tools.getCurrentPage.execute({} as never, {} as never)).toEqual(
+      { page: null, selection: null },
+    );
+  });
+});
+
+/**
+ * #440 review: the in-app drawioCreate / drawioUpdate handlers must forward
+ * the optional `layout:"elk"` param to the client (5th positional arg), exactly
+ * like the MCP host. It was silently dropped, so ELK auto-layout worked only via
+ * the standalone MCP server, not in-app. These tests pin per-host parity.
+ */
+describe('AiChatToolsService drawio layout passthrough (#440)', () => {
+  const createCalls: unknown[][] = [];
+  const updateCalls: unknown[][] = [];
+
+  // FakeDocmostClient (not Partial<DocmostClientLike>): since #446 derived
+  // DocmostClientLike from the real client, its drawioCreate/drawioUpdate return
+  // the concrete result shape, so a minimal stub object would not be assignable.
+  // FakeDocmostClient types every method as (...args) => Promise<any>, which is
+  // exactly what these arg-capturing doubles need.
+  const fakeClient: FakeDocmostClient = {
+    drawioCreate: (...args: unknown[]) => {
+      createCalls.push(args);
+      return Promise.resolve({ success: true, nodeId: '#0' });
+    },
+    drawioUpdate: (...args: unknown[]) => {
+      updateCalls.push(args);
+      return Promise.resolve({ success: true, nodeId: '#0' });
+    },
+  };
+
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    createCalls.length = 0;
+    updateCalls.length = 0;
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return fakeClient as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      {} as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      // #629: EnvironmentService (DRAWIO_RASTER_ENABLED mirror). Flag OFF here
+      // so viewImage's drawio no-raster path stays inert (resvg fallback).
+      { isDrawioRasterEnabled: () => false } as never,
+    );
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-1', email: 'u@example.com', workspaceId: 'ws-1' } as never,
+      'session-1',
+      'ws-1',
+      'chat-1',
+    );
+
+  it('forwards layout:"elk" to client.drawioCreate as the 5th positional arg', async () => {
+    const tools = await buildTools();
+    await tools.drawioCreate.execute(
+      {
+        pageId: 'p-1',
+        xml: '<mxGraphModel/>',
+        position: 'append',
+        layout: 'elk',
+      } as never,
+      {} as never,
+    );
+    expect(createCalls).toHaveLength(1);
+    // drawioCreate(pageId, where, xml, title, layout) — layout is args[4].
+    expect(createCalls[0][4]).toBe('elk');
+  });
+
+  it('forwards layout:"elk" to client.drawioUpdate as the 5th positional arg', async () => {
+    const tools = await buildTools();
+    await tools.drawioUpdate.execute(
+      {
+        pageId: 'p-1',
+        node: '#0',
+        xml: '<mxGraphModel/>',
+        baseHash: 'h',
+        layout: 'elk',
+      } as never,
+      {} as never,
+    );
+    expect(updateCalls).toHaveLength(1);
+    // drawioUpdate(pageId, node, xml, baseHash, layout) — layout is args[4].
+    expect(updateCalls[0][4]).toBe('elk');
+  });
+
+  it('omits layout (undefined 5th arg) when not requested', async () => {
+    const tools = await buildTools();
+    await tools.drawioCreate.execute(
+      { pageId: 'p-1', xml: '<mxGraphModel/>', position: 'append' } as never,
+      {} as never,
+    );
+    expect(createCalls[0][4]).toBeUndefined();
+  });
+});
+
+/**
+ * searchPages runs the shared SearchService (#701) AS the requesting user: the
+ * `userId` is what scopes the search to the user's member spaces and runs the
+ * page-permission filter. `items` (real matches) become `results`; `related`
+ * (non-matching semantic neighbours) stay separate, so a miss is `total: 0`.
+ */
+describe('AiChatToolsService searchPages (shared SearchService)', () => {
+  const tokenServiceStub = {
+    generateAccessToken: jest.fn().mockResolvedValue('access-token'),
+    generateCollabToken: jest.fn().mockResolvedValue('collab-token'),
+  };
+  const searchPage = jest.fn();
+
+  let service: AiChatToolsService;
+
+  beforeEach(() => {
+    searchPage.mockReset();
+    jest.spyOn(loader, 'loadDocmostMcp').mockResolvedValue(
+      mockLoaded(function () {
+        return {} as DocmostClientLike;
+      } as unknown as loader.DocmostClientCtor),
+    );
+    service = new AiChatToolsService(
+      tokenServiceStub as never,
+      {} as never,
+      { searchPage } as never,
+      {
+        asSink: () => ({ put: jest.fn(), has: jest.fn(), evict: jest.fn() }),
+      } as never,
+      { isDrawioRasterEnabled: () => false } as never,
+    );
+  });
+
+  afterEach(() => jest.restoreAllMocks());
+
+  const buildTools = () =>
+    service.forUser(
+      { id: 'user-42', email: 'u@example.com', workspaceId: 'ws-9' } as never,
+      'session-1',
+      'ws-9',
+      'chat-1',
+    );
+
+  it('calls searchPage as the requesting user and maps items -> results, related -> related', async () => {
+    searchPage.mockResolvedValue({
+      items: [
+        { id: 'p1', title: 'Invoice flow', snippet: 'how invoices work' },
+        { id: 'p2', title: null, snippet: 'untitled hit' },
+      ],
+      related: [{ id: 'r1', title: 'Billing', snippet: 'near miss' }],
+      total: 2,
+    });
+    const tools = await buildTools();
+
+    const out = await tools.searchPages.execute(
+      { query: '  invoice  ', limit: 5 } as never,
+      {} as never,
+    );
+
+    expect(searchPage).toHaveBeenCalledTimes(1);
+    expect(searchPage).toHaveBeenCalledWith(
+      { query: 'invoice', limit: 5 },
+      { userId: 'user-42', workspaceId: 'ws-9' },
+    );
+    expect(out).toEqual({
+      results: [
+        { id: 'p1', title: 'Invoice flow', snippet: 'how invoices work' },
+        { id: 'p2', title: '', snippet: 'untitled hit' },
+      ],
+      related: [{ id: 'r1', title: 'Billing', snippet: 'near miss' }],
+      total: 2,
+    });
+  });
+
+  it('a miss is results: [] and total: 0, with the neighbours only in related', async () => {
+    searchPage.mockResolvedValue({
+      items: [],
+      related: [{ id: 'r1', title: 'Billing', snippet: 'near miss' }],
+      total: 0,
+    });
+    const tools = await buildTools();
+
+    const out = await tools.searchPages.execute(
+      { query: 'nonexistent thing' } as never,
+      {} as never,
+    );
+
+    expect(out).toEqual({
+      results: [],
+      related: [{ id: 'r1', title: 'Billing', snippet: 'near miss' }],
+      total: 0,
+    });
+  });
+
+  it('prefers the match highlight over the leading-text snippet', async () => {
+    searchPage.mockResolvedValue({
+      items: [
+        {
+          id: 'p1',
+          title: 'Invoices',
+          highlight: 'approve <b>invoices</b> in step 7',
+          snippet: 'contents 1. intro 2. setup',
+        },
+      ],
+      related: [],
+      total: 1,
+    });
+    const tools = await buildTools();
+
+    const out = (await tools.searchPages.execute(
+      { query: 'invoices' } as never,
+      {} as never,
+    )) as { results: { snippet: string }[] };
+
+    expect(out.results[0].snippet).toBe('approve <b>invoices</b> in step 7');
   });
 });

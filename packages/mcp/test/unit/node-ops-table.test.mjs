@@ -5,7 +5,7 @@ import {
   insertNodeRelative,
   sanitizeForYjs,
   findUnstorableAttr,
-} from "../../build/lib/node-ops.js";
+} from "@docmost/prosemirror-markdown";
 
 // ProseMirror builders. Blocks carry a stable id in attrs.id.
 const textNode = (text) => ({ type: "text", text });
@@ -266,7 +266,7 @@ test("insertNodeRelative tableRow by anchorText resolving to the table block app
 });
 
 // ---------------------------------------------------------------------------
-// Regression: a normal (non-structural) paragraph insert is unchanged.
+// A normal (non-structural) paragraph insert.
 // ---------------------------------------------------------------------------
 
 test("insertNodeRelative regression: normal paragraph before/after a top-level block behaves as before", () => {

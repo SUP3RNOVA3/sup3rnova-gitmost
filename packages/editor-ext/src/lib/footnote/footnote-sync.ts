@@ -91,7 +91,7 @@ interface CollisionPlan {
 /**
  * Resolve the footnote id topology WITHOUT ever dropping a definition.
  *
- * Reference REUSE (Pandoc semantics, #166): repeated `[^a]` references that share
+ * Reference REUSE (Pandoc semantics): repeated `[^a]` references that share
  * an id are the SAME footnote — they get one number and one definition and are
  * NEVER re-id'd. So the reference walk only records the FIRST occurrence of each
  * id (de-duplicating in document order); later occurrences are reuse and produce
@@ -103,8 +103,9 @@ interface CollisionPlan {
  * `X__2`, `X__3`, collision-bumped) so it survives as a distinct footnote — which,
  * having no matching reference, then falls under the normal orphan policy. It is
  * only ever dropped for lacking a reference, never for colliding. The IMPORT
- * paths (footnote.marked.ts / MCP extractFootnotes) instead apply first-wins +
- * drop + warn for duplicate definitions; that divergence is intentional — import
+ * paths (@docmost/prosemirror-markdown / MCP extractFootnotes) instead apply
+ * first-wins + drop + warn for duplicate definitions; that divergence is
+ * intentional — import
  * is an agent-authored artifact we sanitize, the editor is live user data we must
  * not lose.
  *
@@ -194,7 +195,7 @@ function resolveCollisions(scan: FootnoteScan): CollisionPlan {
  * ping-pong forever (list moved to end -> trailing paragraph appended -> list
  * no longer last -> moved again ...).
  *
- * The id topology is resolved up front by resolveCollisions() (#166): repeated
+ * The id topology is resolved up front by resolveCollisions(): repeated
  * references sharing an id are REUSE — one footnote, never re-id'd — while a
  * duplicate DEFINITION (from pasting/duplicating a definition, or a collab merge)
  * is re-id'd to a fresh unique id. No footnoteDefinition is ever silently deleted
@@ -490,7 +491,7 @@ export const footnotePastePluginKey = new PluginKey("footnotePaste");
  * regenerating at paste time keeps the pasted footnote cleanly separate from the
  * start and avoids any transient merge.
  *
- * REUSE-aware (#166): only a colliding DEFINITION forces a remap. Pasting a lone
+ * REUSE-aware: only a colliding DEFINITION forces a remap. Pasting a lone
  * reference whose id already exists is REUSE — it must keep the id so it resolves
  * to the existing footnote (one number, shared definition). So we remap an id
  * only when the pasted slice itself carries a `footnoteDefinition` for it (which

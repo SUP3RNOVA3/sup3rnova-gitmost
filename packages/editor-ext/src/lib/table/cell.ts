@@ -8,6 +8,16 @@ export const TableCell = TiptapTableCell.extend({
   addAttributes() {
     return {
       ...this.parent?.(),
+      // Column alignment so GFM aligned tables (|:--|:-:|--:|) keep it through the
+      // markdown converter and the server-side write path, which both build their
+      // schema from this extension.
+      align: {
+        default: null,
+        parseHTML: (element) =>
+          element.getAttribute("align") || element.style.textAlign || null,
+        renderHTML: (attributes) =>
+          attributes.align ? { align: attributes.align } : {},
+      },
       backgroundColor: {
         default: null,
         parseHTML: (element) =>

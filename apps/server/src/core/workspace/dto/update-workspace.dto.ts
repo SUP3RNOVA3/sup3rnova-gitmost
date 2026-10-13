@@ -33,10 +33,6 @@ export class UpdateWorkspaceDto extends PartialType(CreateWorkspaceDto) {
 
   @IsOptional()
   @IsBoolean()
-  generativeAi: boolean;
-
-  @IsOptional()
-  @IsBoolean()
   disablePublicSharing: boolean;
 
   @IsOptional()
@@ -67,6 +63,17 @@ export class UpdateWorkspaceDto extends PartialType(CreateWorkspaceDto) {
   @IsBoolean()
   htmlEmbed: boolean;
 
+  // Workspace toggle for the sidebar page-tree row quick actions (copy link +
+  // move to trash icons). Persisted at settings.treeQuickActions. An ABSENT
+  // settings.treeQuickActions key => ON (default): the icons already shipped,
+  // so a workspace that never touched this setting must keep them visible, and
+  // only an explicit stored `false` hides them. (Omitting the field from an
+  // update payload, as everywhere in this DTO, just leaves the stored value
+  // alone.)
+  @IsOptional()
+  @IsBoolean()
+  treeQuickActions: boolean;
+
   // Admin-only analytics/tracker snippet (raw HTML/JS) injected verbatim into
   // the <head> of PUBLIC SHARE pages only (same-origin). Persisted at
   // settings.trackerHead. Admin-authored trusted content.
@@ -83,6 +90,13 @@ export class UpdateWorkspaceDto extends PartialType(CreateWorkspaceDto) {
   @IsInt()
   @Min(1)
   trashRetentionDays: number;
+
+  // Default lifetime for new temporary notes, in HOURS. Frozen per-note at
+  // creation, so changing this never reschedules existing notes.
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  temporaryNoteHours: number;
 
   @IsOptional()
   @IsBoolean()

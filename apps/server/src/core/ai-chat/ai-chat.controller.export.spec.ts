@@ -53,8 +53,10 @@ describe('AiChatController.export', () => {
     };
     const controller = new AiChatController(
       {} as never,
+      {} as never, // aiChatRunService
       aiChatRepo as never,
       aiChatMessageRepo as never,
+      {} as never,
       {} as never,
     );
     return { controller, aiChatRepo, aiChatMessageRepo };
@@ -98,22 +100,20 @@ describe('AiChatController.export', () => {
 });
 
 /**
- * The terminal-finalize dispatch (#183): the assistant row is INSERTed upfront
- * as 'streaming' and finalized once on the terminal callback. When the upfront
- * insert SUCCEEDED (we hold an id) finalize UPDATEs that row; when it FAILED
- * (assistantId is undefined) finalize falls back to INSERTing the terminal row
- * so the turn is not lost — the only safety against losing the turn entirely.
+ * The terminal-finalize dispatch: the assistant row is INSERTed upfront as
+ * 'streaming' and finalized once on the terminal callback. With an id, finalize
+ * UPDATEs that row; without one (the upfront insert failed) it INSERTs the
+ * terminal row so the turn is not lost.
  *
- * `planFinalizeAssistant` is the pure decision; `applyFinalize` is the REAL
- * dispatch the service uses, exercised here over a mock repo (not a copy of the
- * logic) so a production drift would fail the test (#186 review).
+ * `planFinalizeAssistant` is the pure decision; `applyFinalize` is the real
+ * dispatch the service uses, exercised here over a mock repo.
  */
 describe('finalizeAssistant dispatch (planFinalizeAssistant + applyFinalize)', () => {
   const workspaceId = 'ws1';
 
   // Drive the SAME applyFinalize the service calls (no duplicated logic).
   async function dispatchFinalize(
-    repo: { insert: jest.Mock; update: jest.Mock },
+    repo: { insert: jest.Mock; finalizeOwner: jest.Mock },
     assistantId: string | undefined,
     flushed: AssistantFlush,
   ): Promise<void> {
@@ -133,21 +133,22 @@ describe('finalizeAssistant dispatch (planFinalizeAssistant + applyFinalize)', (
     expect(planFinalizeAssistant(undefined)).toEqual({ kind: 'insert' });
   });
 
-  it('(a) upfront insert succeeded -> finalize UPDATEs the row by id', async () => {
-    const repo = { insert: jest.fn(), update: jest.fn() };
+  it('(a) upfront insert succeeded -> finalize CONDITIONALLY updates the row by id (#487 owner-write)', async () => {
+    const repo = { insert: jest.fn(), finalizeOwner: jest.fn() };
     const flushed = flushAssistant([], 'final answer', 'completed', {
       finishReason: 'stop',
     });
     await dispatchFinalize(repo, 'a1', flushed);
-    expect(repo.update).toHaveBeenCalledWith('a1', workspaceId, flushed);
+    // #487: the owner write is the CONDITIONAL finalizeOwner, not a raw update.
+    expect(repo.finalizeOwner).toHaveBeenCalledWith('a1', workspaceId, flushed);
     expect(repo.insert).not.toHaveBeenCalled();
   });
 
   it('(b) upfront insert failed -> finalize INSERTs the terminal payload', async () => {
-    const repo = { insert: jest.fn(), update: jest.fn() };
+    const repo = { insert: jest.fn(), finalizeOwner: jest.fn() };
     const flushed = flushAssistant([], 'partial', 'error', { error: 'boom' });
     await dispatchFinalize(repo, undefined, flushed);
-    expect(repo.update).not.toHaveBeenCalled();
+    expect(repo.finalizeOwner).not.toHaveBeenCalled();
     expect(repo.insert).toHaveBeenCalledTimes(1);
     const arg = repo.insert.mock.calls[0][0];
     // The fallback insert carries the terminal content/status/metadata.

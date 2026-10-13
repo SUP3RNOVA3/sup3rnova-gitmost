@@ -728,7 +728,7 @@ describe('PublicShareChatService.withinShareTokenBudget / recordShareTokens', ()
   });
 });
 
-describe('PublicShareChatService.recordTurnUsage (streamText onFinish accounting)', () => {
+describe('PublicShareChatService.recordTurnUsage (streamText onStepFinish accounting)', () => {
   function makeService() {
     const redisService = { getOrThrow: () => new FakeTokenRedis() } as never;
     const service = new PublicShareChatService(
@@ -746,7 +746,7 @@ describe('PublicShareChatService.recordTurnUsage (streamText onFinish accounting
 
   it('sums input+output when the provider omits totalTokens', () => {
     const { service, recordSpy } = makeService();
-    // The onFinish payload shape: a totalUsage with per-component counts but no
+    // The onStepFinish payload shape: a usage with per-component counts but no
     // authoritative total (provider omitted it).
     service.recordTurnUsage('ws-1', { inputTokens: 1200, outputTokens: 300 });
     expect(recordSpy).toHaveBeenCalledWith('ws-1', 1500);
@@ -808,7 +808,7 @@ describe('PublicShareChatToolsService share scoping', () => {
     };
 
     await expect(getSharePage.execute({ pageId: 'p-outside' })).rejects.toThrow(
-      /not part of this published share/i,
+      /not available in this share/i,
     );
     // The tool delegated the resolve to the canonical boundary with the
     // forShare-scoped shareId, and returned NO content for a non-resolving page.
@@ -841,15 +841,16 @@ describe('PublicShareChatToolsService share scoping', () => {
 
     await expect(
       getSharePage.execute({ pageId: 'p-restricted' }),
-    ).rejects.toThrow(/not part of this published share/i);
+    ).rejects.toThrow(/not available in this share/i);
     // No content was ever sanitized/returned for the blocked page.
     expect(shareService.updatePublicAttachments).not.toHaveBeenCalled();
   });
 
-  it('searchSharePages forwards the share scope (shareId, no spaceId/userId) to the FTS branch', async () => {
+  it('searchSharePages forwards the share scope (shareId, anonymous caller, no spaceId/userId)', async () => {
     const searchService = {
       searchPage: jest.fn().mockResolvedValue({
         items: [{ id: 'p1', title: 'T', highlight: 'snip' }],
+        related: [],
       }),
     };
     const svc = new PublicShareChatToolsService(
@@ -865,11 +866,13 @@ describe('PublicShareChatToolsService share scoping', () => {
     const res = await searchSharePages.execute({ query: 'hello' });
     const [params, opts] = searchService.searchPage.mock.calls[0];
     expect(params.shareId).toBe('THIS-SHARE');
-    // The share-scoped FTS branch requires NO spaceId and NO userId.
+    // The anonymous share-scoped caller: NO spaceId and NO userId.
     expect(params.spaceId).toBeUndefined();
-    expect(opts.userId).toBeUndefined();
-    expect(opts.workspaceId).toBe('ws-1');
-    expect(res).toEqual([{ id: 'p1', title: 'T', snippet: 'snip' }]);
+    expect(opts).toEqual({ anonymousShare: true, workspaceId: 'ws-1' });
+    expect(res).toEqual({
+      results: [{ id: 'p1', title: 'T', snippet: 'snip' }],
+      related: [],
+    });
   });
 });
 
@@ -1003,7 +1006,7 @@ describe('public-share assistant boundary locks (red-team regression guards)', (
     };
     await expect(
       getSharePage.execute({ pageId: 'p-elsewhere' }),
-    ).rejects.toThrow(/not part of this published share/i);
+    ).rejects.toThrow(/not available in this share/i);
     // The forged share id is the scope the boundary re-derivation rejects against.
     expect(shareService.resolveReadableSharePage).toHaveBeenCalledWith(
       'FORGED-SHARE',

@@ -22,14 +22,14 @@ export type PageEmbedSnapshot = {
 
 /**
  * Generic, internal "collect every node of one PM type from a doc" walker that
- * the three public `collect*FromPmJson` collectors are built on. They all share
- * the exact same recursion (block-container descent + the #55 depth cap), and
- * differed only in (target type, how a matched node maps to an output snapshot,
- * how matches are deduped, and whether the walk descends into a
- * `transclusionSource`). Centralising the recursion here keeps that shared logic
- * — especially the depth guard — in one place so the collectors can't drift.
+ * the three public `collect*FromPmJson` collectors are built on. They share the
+ * same recursion (block-container descent + the depth cap) and differ only in
+ * (target type, how a matched node maps to an output snapshot, how matches are
+ * deduped, and whether the walk descends into a `transclusionSource`). Keeping
+ * the recursion here keeps that shared logic — especially the depth guard — in
+ * one place so the collectors can't drift.
  *
- * Behaviour knobs (each collector wires these to reproduce its EXACT prior output):
+ * Behaviour knobs:
  *  - `type`: only nodes whose `node.type` equals this are passed to `map`.
  *  - `map`: turns a matched node into a snapshot, or returns `undefined` to skip
  *    it (e.g. a transclusion with no id, or a reference missing attrs).
@@ -47,7 +47,7 @@ export type PageEmbedSnapshot = {
  *
  * A matched node never recurses into its own children: every target type here is
  * either an atom (reference/pageEmbed) or a boundary we deliberately don't nest
- * into (transclusionSource), exactly as the original collectors behaved.
+ * into (transclusionSource).
  */
 function collectNodes<T>(
   doc: unknown,
@@ -91,6 +91,41 @@ function collectNodes<T>(
 
   visit(doc, 0);
   return Array.from(byKey.values());
+}
+
+/**
+ * Cheap early-exit probe: does this doc contain ANY node the transclusion
+ * syncs care about (`transclusionSource` / `transclusionReference` / `pageEmbed`)?
+ * Lets the collab store skip the three sync SELECTs when neither the previous nor
+ * the new content has any such node — there is nothing to insert, and (since the
+ * DB mirrors the previously-persisted content) nothing to delete. Walks once and
+ * short-circuits on the first match; uses the same depth ceiling as the
+ * collectors. Deliberately does NOT skip `transclusionSource` subtrees: it only
+ * answers "any node present?", so descending everywhere is strictly conservative
+ * (it can never wrongly report "none").
+ */
+export function hasTransclusionFamilyNodes(doc: unknown): boolean {
+  const visit = (node: any, depth: number): boolean => {
+    if (!node || typeof node !== 'object') return false;
+    if (depth > MAX_PM_WALK_DEPTH) return false;
+
+    if (
+      node.type === TRANSCLUSION_TYPE ||
+      node.type === REFERENCE_TYPE ||
+      node.type === PAGE_EMBED_TYPE
+    ) {
+      return true;
+    }
+
+    if (Array.isArray(node.content)) {
+      for (const child of node.content) {
+        if (visit(child, depth + 1)) return true;
+      }
+    }
+    return false;
+  };
+
+  return visit(doc, 0);
 }
 
 /**

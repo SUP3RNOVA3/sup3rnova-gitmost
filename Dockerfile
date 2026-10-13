@@ -5,6 +5,13 @@ RUN npm install -g pnpm@10.4.0
 
 FROM base AS builder
 
+# re2 (packages/mcp) always compiles from source under pnpm (the prebuilt-binary
+# download cannot identify the GitHub repo), so node-gyp needs python3/make/g++.
+# This stage is discarded, so the toolchain can stay installed.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY . .
@@ -17,11 +24,20 @@ RUN pnpm build
 
 FROM base AS installer
 
+# git: required by the git-sync VaultGit (shells out to git)
+# tini: PID 1 that reaps orphaned processes — a killed `git http-backend`
+# leaves its receive-pack/index-pack children to PID 1, and the /git host waits
+# for that whole process group to be gone before it releases the space lock.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl bash \
+  && apt-get install -y --no-install-recommends curl bash git tini \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Agent-roles catalog base URL: per-branch default set at build time (CI);
+# overridable at runtime via the AI_AGENT_ROLES_CATALOG_URL env var.
+ARG AI_AGENT_ROLES_CATALOG_URL=""
+ENV AI_AGENT_ROLES_CATALOG_URL=$AI_AGENT_ROLES_CATALOG_URL
 
 # Copy apps
 COPY --from=builder /app/apps/server/dist /app/apps/server/dist
@@ -34,6 +50,33 @@ COPY --from=builder /app/packages/editor-ext/dist /app/packages/editor-ext/dist
 COPY --from=builder /app/packages/editor-ext/package.json /app/packages/editor-ext/package.json
 COPY --from=builder /app/packages/mcp/build /app/packages/mcp/build
 COPY --from=builder /app/packages/mcp/package.json /app/packages/mcp/package.json
+# The mcp package reads its data files (drawio-presets.json, drawio-shape-index.json.gz)
+# at runtime via `new URL("../../data/…", import.meta.url)` relative to build/lib/*.js,
+# i.e. from packages/mcp/data/. tsc emits only build/, so ship data/ explicitly or
+# drawioFromGraph and the shape catalog die with ENOENT on packages/mcp/data/*.
+COPY --from=builder /app/packages/mcp/data /app/packages/mcp/data
+# @docmost/prosemirror-markdown is the shared converter (#293/#326). Both mcp and
+# git-sync depend on it (workspace:*) and load it at runtime, so the built package +
+# its manifest must be shipped or the prod install resolves a broken workspace
+# symlink and every consumer dies with ERR_MODULE_NOT_FOUND.
+COPY --from=builder /app/packages/prosemirror-markdown/build /app/packages/prosemirror-markdown/build
+COPY --from=builder /app/packages/prosemirror-markdown/package.json /app/packages/prosemirror-markdown/package.json
+# git-sync: the server loads @docmost/git-sync at runtime via the loader
+# (git-sync.loader.ts), which deliberately does NOT `require()` it — the package is
+# ESM-only, so the loader uses `require.resolve` + a dynamic `import()`. Without
+# these copied build artifacts that resolve/import fails and the server crashes on
+# first use. Built fresh by the builder's `pnpm build` (nx builds the package's tsc
+# `build` target). This branch (#119) is where git-sync gains its runtime consumer.
+COPY --from=builder /app/packages/git-sync/build /app/packages/git-sync/build
+COPY --from=builder /app/packages/git-sync/package.json /app/packages/git-sync/package.json
+
+# apps/server imports @docmost/token-estimate (workspace:*) at runtime
+# (history-budget.ts, #490). tsc emits only dist/ and dist/ is gitignored, so the
+# prod install would resolve a broken workspace symlink and the server would die
+# with ERR_MODULE_NOT_FOUND on the first history-budget call. Ship the built
+# package + its manifest, mirroring prosemirror-markdown above.
+COPY --from=builder /app/packages/token-estimate/dist /app/packages/token-estimate/dist
+COPY --from=builder /app/packages/token-estimate/package.json /app/packages/token-estimate/package.json
 
 # Copy root package files
 COPY --from=builder /app/package.json /app/package.json
@@ -45,9 +88,16 @@ COPY --from=builder /app/patches /app/patches
 
 RUN chown -R node:node /app
 
-USER node
+# Toolchain is needed transiently to compile re2 during the prod install; install
+# and purge it in one layer to keep the final image slim. The install itself runs
+# as the node user via su to keep node_modules ownership without a costly chown layer.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && su node -c "pnpm install --frozen-lockfile --prod" \
+  && apt-get purge -y --auto-remove python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
 
-RUN pnpm install --frozen-lockfile --prod
+USER node
 
 RUN mkdir -p /app/data/storage
 
@@ -55,4 +105,14 @@ VOLUME ["/app/data/storage"]
 
 EXPOSE 3000
 
+# DEPLOY REQUIREMENT — SINGLE INSTANCE or STICKY SESSIONS.
+# MCP content writes are serialized per page by an IN-PROCESS mutex, and the
+# stash_page blob store + cached collab sessions are RAM-only and process-local.
+# Multiple replicas behind a load balancer without sticky sessions break per-page
+# write serialization and make stash_page blobs unreachable across replicas. Run a
+# single instance, or pin each page's traffic to one replica (sticky sessions /
+# consistent hashing on page id); there is no cross-process lock. See
+# .env.example (the "MCP collaboration write path" block) and
+# packages/mcp/README.md.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["pnpm", "start"]

@@ -267,4 +267,34 @@ describe('AiChatMessageRepo.update + sweepStreaming [integration]', () => {
     const all = await repo.findAllByChat(cappedChat, workspaceId, 100);
     expect(all.map((r) => r.content)).toEqual(['m1-oldest', 'm2', 'm3-newest']);
   });
+
+  it('default findAllByChat returns the FULL transcript past 50 rows — no recent-tail window (#202)', async () => {
+    // The model-history rebuild in AiChatService.handle uses
+    // findAllByChat(chatId, ws) WITHOUT a limit arg: a long chat (60 rows here)
+    // comes back in FULL (oldest -> newest), so no early turns are silently
+    // dropped from what the model sees.
+    const longChat = (
+      await createChat(db, { workspaceId, creatorId: userId })
+    ).id;
+    const base = Date.now();
+    const total = 60;
+    for (let i = 0; i < total; i++) {
+      await createMessage(db, {
+        workspaceId,
+        chatId: longChat,
+        content: `msg-${i}`,
+        // Strictly increasing timestamps so ordering is deterministic.
+        createdAt: new Date(base + i * 1000),
+      });
+    }
+
+    // Default args == exactly how handle() calls it now.
+    const history = await repo.findAllByChat(longChat, workspaceId);
+    expect(history).toHaveLength(total);
+    expect(history.map((r) => r.content)).toEqual(
+      Array.from({ length: total }, (_, i) => `msg-${i}`),
+    );
+    // The very first turn (which the old 50-window would have dropped) is present.
+    expect(history[0]!.content).toBe('msg-0');
+  });
 });

@@ -24,6 +24,10 @@ const migrator = new Migrator({
     path,
     migrationFolder,
   }),
+  // Match the startup auto-migrator (migration.service.ts): a back-dated
+  // migration from a long-lived branch must be applied, not rejected as
+  // "corrupted migrations".
+  allowUnorderedMigrations: true,
 });
 
 run(db, migrator, migrationFolder);

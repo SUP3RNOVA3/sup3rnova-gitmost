@@ -12,7 +12,10 @@ import { AiAgentRoleRepo } from '@docmost/db/repos/ai-agent-roles/ai-agent-roles
 import { AiAgentRole } from '@docmost/db/types/entity.types';
 import { AiService } from '../../integrations/ai/ai.service';
 import { AiSettingsService } from '../../integrations/ai/ai-settings.service';
-import { PublicShareChatToolsService } from './tools/public-share-chat-tools.service';
+import {
+  PublicShareChatToolsService,
+  ShareToolError,
+} from './tools/public-share-chat-tools.service';
 import { buildShareSystemPrompt } from './public-share-chat.prompt';
 import { roleModelOverride } from './roles/role-model-config';
 import {
@@ -103,6 +106,30 @@ export function filterShareTranscript(messages: UIMessage[]): UIMessage[] {
 }
 
 /**
+ * Fixed, classified strings an ANONYMOUS share reader may see when the assistant
+ * stream fails. These reveal NOTHING about the internal provider, its
+ * baseUrl, the model name, or the raw response body — unlike describeProviderError
+ * (which is for the server log / the authenticated operator only). We classify by
+ * HTTP status where available so the reader still gets a useful hint (retry vs.
+ * give up) without any internal detail.
+ */
+export function classifyAnonStreamError(error: unknown): string {
+  const status =
+    typeof error === 'object' && error !== null
+      ? (error as { statusCode?: number }).statusCode
+      : undefined;
+  if (status === 429) {
+    return 'The assistant is receiving too many requests right now. Please try again shortly.';
+  }
+  if (typeof status === 'number' && status >= 500) {
+    return 'The assistant is temporarily unavailable. Please try again.';
+  }
+  // Any other failure (including a bare connection error with no status): a
+  // single neutral line. No provider identity, no config, no response body.
+  return 'The assistant could not complete your request. Please try again.';
+}
+
+/**
  * Anonymous, read-only AI assistant for a single PUBLIC share tree.
  *
  * Mirrors the streaming plumbing of `AiChatService` (streamText ->
@@ -131,9 +158,10 @@ export class PublicShareChatService {
    * COST contour two: a per-workspace TOKEN budget over a rolling day. The
    * request-count limiter above bounds how many anonymous calls run; this bounds
    * how many provider TOKENS they spend (input re-sent per step + output),
-   * which is what the owner is actually billed for (issue #159, finding #5).
-   * Checked read-only before a turn streams; the real usage is recorded once the
-   * turn finishes (`onFinish`).
+   * which is what the owner is actually billed for.
+   * Checked read-only before a turn streams; the real usage is recorded as each
+   * step completes (`onStepFinish`), so a turn cut short by a disconnect or an
+   * abort is still charged for every step the provider already billed.
    */
   private readonly tokenBudget: PublicShareWorkspaceTokenBudget;
 
@@ -162,7 +190,7 @@ export class PublicShareChatService {
    * rolling-day token budget, false once the trailing-day token spend has
    * reached it (the controller must then 429 BEFORE starting the stream). This
    * bounds the owner's actual provider bill, which counting requests alone does
-   * not (issue #159, finding #5).
+   * not.
    */
   async withinShareTokenBudget(workspaceId: string): Promise<boolean> {
     return this.tokenBudget.withinBudget(workspaceId);
@@ -177,13 +205,17 @@ export class PublicShareChatService {
   }
 
   /**
-   * `streamText` onFinish hook body: account a finished turn's REAL token spend
-   * (input re-sent per step + output, summed across all steps) against the
+   * `streamText` onStepFinish hook body: account one COMPLETED step's REAL token
+   * spend (its input, re-sent on every step, + its output) against the
    * per-workspace rolling-day budget, so a future turn over budget is rejected up
-   * front (issue #159, finding #5). `totalUsage` fields are `number | undefined`;
-   * fall back to the sum of input+output when the provider omits `totalTokens`.
-   * Fire-and-forget: the turn already streamed, so a record failure must not
-   * break it.
+   * front. Charging per step, not once in `onFinish`, keeps the budget when the
+   * anonymous visitor disconnects mid-turn: after an abort `onFinish` gets an
+   * empty usage or does not fire, while every step the provider already billed
+   * has fired `onStepFinish` exactly once. The in-flight step of an aborted turn
+   * is not reported by the SDK and cannot be charged. Usage fields are
+   * `number | undefined`; fall back to the sum of input+output when the provider
+   * omits `totalTokens`. Fire-and-forget: a record failure must not break the
+   * stream.
    */
   recordTurnUsage(
     workspaceId: string,
@@ -280,14 +312,22 @@ export class PublicShareChatService {
         system,
         messages: modelMessages,
         tools,
+        // Pin the AI SDK per-request retry budget explicitly (matches the SDK
+        // default of 2). Connection arithmetic: (1 + maxRetries) × (1 +
+        // AI_STREAM_PRE_RESPONSE_RETRIES) worst-case connects per turn.
+        maxRetries: 2,
         // Bound the agent loop for anonymous callers.
         stopWhen: stepCountIs(5),
         // Cap per-request output so one anonymous call cannot run up the provider
         // bill even if the per-IP throttle is evaded; worst case = steps × this.
         maxOutputTokens: resolveShareAiMaxOutputTokens(),
         abortSignal: signal,
-        onFinish: ({ totalUsage }) =>
-          this.recordTurnUsage(workspaceId, totalUsage),
+        // Charge each completed step as it lands (see recordTurnUsage): exactly
+        // once per step on every terminal path — finish, error, or an abort,
+        // where the SDK fires BOTH onAbort and onFinish and neither carries the
+        // usage. Nothing is charged in onFinish/onAbort, so that double fire
+        // cannot double-charge.
+        onStepFinish: ({ usage }) => this.recordTurnUsage(workspaceId, usage),
         onError: ({ error }) => {
           // Reuse the shared formatter so provider error formatting stays
           // unified (statusCode + body) with the authenticated path.
@@ -318,11 +358,28 @@ export class PublicShareChatService {
       result.pipeUIMessageStreamToResponse(res.raw, {
         headers: { 'X-Accel-Buffering': 'no' },
         onError: (error: unknown) => {
-          // Reuse the shared formatter so provider error formatting stays
-          // unified between the log line and the streamed error message — a
-          // share reader sees 402/429/503 causes consistently with the
-          // authenticated path.
-          return describeProviderError(error, 'AI stream error');
+          // SECURITY: the string this returns is written verbatim into the
+          // SSE error frame delivered to an ANONYMOUS reader (for a tool failure
+          // it becomes the atomic `tool-output-error` frame's errorText; for a
+          // stream/provider failure, the terminal error frame).
+          //
+          // A ShareToolError is already a classified, safe tool message (see
+          // PublicShareChatToolsService.wrapToolErrors) — pass it through so the
+          // reader still gets the useful "page not available in this share" hint.
+          if (error instanceof ShareToolError) {
+            return error.message;
+          }
+          // Anything else is a provider/stream error. describeProviderError
+          // bundles the provider statusCode AND response body, which can carry the
+          // internal baseUrl or model name — NEVER expose that to the public. Log
+          // the full detail server-side only and return a fixed classified string.
+          this.logger.error(
+            `Public share chat pipe error: ${describeProviderError(
+              error,
+              'AI stream error',
+            )}`,
+          );
+          return classifyAnonStreamError(error);
         },
       });
 

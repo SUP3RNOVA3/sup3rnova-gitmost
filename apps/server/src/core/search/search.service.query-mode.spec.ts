@@ -1,74 +1,55 @@
-import { SearchService } from './search.service';
+import { NotFoundException } from '@nestjs/common';
+import {
+  SHARE_SEARCH_DISABLED_APPROVED,
+  SearchService,
+} from './search.service';
 
 /**
- * Coverage for SearchService.searchPage query-mode selection (search.service.ts
- * @25). searchPage chooses HOW the result set is scoped — by explicit space, by
- * the authenticated user's member spaces, or by a share — and must return an
- * empty set (without leaking data) for every disallowed combination.
+ * Unit coverage for SearchService.searchPage SCOPE-SECURITY early returns — the
+ * branches that must yield an empty result WITHOUT ever touching the DB, so they
+ * can leak nothing. The happy-path scope SQL (explicit space / member spaces /
+ * share id set) is covered against the real schema in the integration spec.
  *
- * The kysely query builder is mocked with the same chainable pattern as the
- * existing search.service.spec.ts: every builder method returns the same builder
- * and `.execute()` resolves the supplied rows. Each `.where(...)` call is
- * recorded so we can assert exactly which scope clause was applied — that is the
- * mutation-resistant signal that distinguishes one query mode from another.
- *
- * These specs catch cross-space / cross-workspace search leakage and
- * share-scope bypass (data exposure).
+ * Every case here returns BEFORE the raw-SQL candidate query runs, so a bare `db`
+ * stub (never called) is enough — a call to it would itself be a failure signal.
  */
-describe('SearchService.searchPage — query-mode selection', () => {
-  // Build a chainable selectFrom('pages') builder that records its calls. The
-  // builder is returned from `db.selectFrom` and is the single object every
-  // chained call mutates/returns, mirroring the existing spec's pattern.
-  function makeBuilder(rows: Array<{ id: string; highlight?: string }>) {
-    const builder: any = {};
-    builder.select = jest.fn(() => builder);
-    builder.where = jest.fn(() => builder);
-    builder.$if = jest.fn(() => builder);
-    builder.orderBy = jest.fn(() => builder);
-    builder.limit = jest.fn(() => builder);
-    builder.offset = jest.fn(() => builder);
-    builder.execute = jest.fn(async () => rows);
-    return builder;
-  }
-
+describe('SearchService.searchPage — scope-security early returns', () => {
   function makeService(opts?: {
-    rows?: Array<{ id: string; highlight?: string }>;
     share?: any;
     isRestricted?: boolean;
-    descendants?: Array<{ id: string }>;
+    memberSpaceIds?: string[];
+    sharingAllowed?: boolean;
   }) {
-    const builder = makeBuilder(opts?.rows ?? []);
-
-    const db: any = {
-      selectFrom: jest.fn(() => builder),
-    };
-
-    // `getUserSpaceIdsQuery` returns a sub-query object that searchPage passes
-    // straight into `.where('spaceId', 'in', <subquery>)`. A sentinel is enough
-    // to assert the user-scoped branch was taken.
-    const userSpaceIdsQuery = { __userSpaceIdsQuery: true };
+    // A db that THROWS if touched — these branches must not reach SQL.
+    const db: any = new Proxy(
+      {},
+      {
+        get() {
+          throw new Error('db must not be touched on an empty-scope branch');
+        },
+      },
+    );
 
     const pageRepo = {
-      // `.select((eb) => this.pageRepo.withSpace(eb))` — value ignored by stub.
-      withSpace: jest.fn(() => ({ __withSpace: true })),
-      getPageAndDescendantsExcludingRestricted: jest
-        .fn()
-        .mockResolvedValue(opts?.descendants ?? []),
+      getPageAndDescendantsExcludingRestricted: jest.fn(),
+      getPageAndDescendants: jest.fn(),
     };
     const shareRepo = {
       findById: jest.fn().mockResolvedValue(opts?.share ?? null),
     };
     const spaceMemberRepo = {
-      getUserSpaceIdsQuery: jest.fn(() => userSpaceIdsQuery),
+      getUserSpaceIds: jest.fn().mockResolvedValue(opts?.memberSpaceIds ?? []),
     };
     const pagePermissionRepo = {
       hasRestrictedAncestor: jest
         .fn()
         .mockResolvedValue(opts?.isRestricted ?? false),
-      // Let everything through page-level permission filtering by default.
-      filterAccessiblePageIds: jest
+      filterAccessiblePageIds: jest.fn(),
+    };
+    const shareService = {
+      isSharingAllowed: jest
         .fn()
-        .mockImplementation(async ({ pageIds }: { pageIds: string[] }) => pageIds),
+        .mockResolvedValue(opts?.sharingAllowed ?? true),
     };
 
     const service = new SearchService(
@@ -77,146 +58,263 @@ describe('SearchService.searchPage — query-mode selection', () => {
       shareRepo as any,
       spaceMemberRepo as any,
       pagePermissionRepo as any,
+      { vectorCandidateArm: jest.fn() } as any,
+      // #530/#599 semantic path off for these query-mode unit tests: the query-embed
+      // funnel throws, so the service degrades to the byte-identical lexical path.
+      {
+        embedQueryForActiveGeneration: jest
+          .fn()
+          .mockRejectedValue(new Error('no embed')),
+      } as any,
+      shareService as any,
     );
-
     return {
       service,
-      db,
-      builder,
       pageRepo,
       shareRepo,
       spaceMemberRepo,
       pagePermissionRepo,
-      userSpaceIdsQuery,
+      shareService,
     };
   }
 
-  const whereCallFor = (builder: any, column: any) =>
-    builder.where.mock.calls.find((c: any[]) => c[0] === column);
-
-  it('returns {items:[]} for a blank query WITHOUT touching the DB', async () => {
-    const { service, db } = makeService();
-
+  it('returns total:0 for a blank query WITHOUT touching the DB or any repo', async () => {
+    const { service, shareRepo, spaceMemberRepo } = makeService();
     const result = await service.searchPage(
       { query: '' } as any,
       { userId: 'user-1', workspaceId: 'ws-1' },
     );
-
-    expect(result).toEqual({ items: [] });
-    // Blank query is rejected before any query builder is constructed.
-    expect(db.selectFrom).not.toHaveBeenCalled();
+    expect(result.items).toEqual([]);
+    expect(result.total).toBe(0);
+    expect(shareRepo.findById).not.toHaveBeenCalled();
+    expect(spaceMemberRepo.getUserSpaceIds).not.toHaveBeenCalled();
   });
 
-  it('scopes to the explicit spaceId branch', async () => {
-    const { service, builder, db, spaceMemberRepo, shareRepo } = makeService({
-      rows: [{ id: 'p-1' }],
-    });
-
+  it('only-negation short-circuits with reason "only-negation", never scanning', async () => {
+    const { service, spaceMemberRepo } = makeService();
     const result = await service.searchPage(
-      { query: 'plan', spaceId: 'space-42' } as any,
+      { query: '-архив' } as any,
       { userId: 'user-1', workspaceId: 'ws-1' },
     );
-
-    expect(db.selectFrom).toHaveBeenCalledWith('pages');
-    // The explicit-space branch adds exactly `.where('spaceId', '=', 'space-42')`.
-    expect(whereCallFor(builder, 'spaceId')).toEqual([
-      'spaceId',
-      '=',
-      'space-42',
-    ]);
-    // It must NOT fall through to the user-member-spaces or share branch.
-    expect(spaceMemberRepo.getUserSpaceIdsQuery).not.toHaveBeenCalled();
-    expect(shareRepo.findById).not.toHaveBeenCalled();
-    expect(result.items.map((i: any) => i.id)).toEqual(['p-1']);
+    expect(result.total).toBe(0);
+    expect(result.query.parsed.reason).toBe('only-negation');
+    // Never resolves scope (returns before) — no expensive NOT-only scan.
+    expect(spaceMemberRepo.getUserSpaceIds).not.toHaveBeenCalled();
   });
 
-  it('scopes an authenticated user WITHOUT spaceId to their member spaces', async () => {
-    const { service, builder, spaceMemberRepo, userSpaceIdsQuery, shareRepo } =
-      makeService({ rows: [{ id: 'p-9' }] });
-
-    await service.searchPage(
-      { query: 'plan' } as any,
-      { userId: 'user-7', workspaceId: 'ws-1' },
-    );
-
-    // The user-scoped branch resolves the member-spaces sub-query for that user
-    // and restricts both spaceId (to that sub-query) and workspaceId.
-    expect(spaceMemberRepo.getUserSpaceIdsQuery).toHaveBeenCalledWith('user-7');
-    expect(whereCallFor(builder, 'spaceId')).toEqual([
-      'spaceId',
-      'in',
-      userSpaceIdsQuery,
-    ]);
-    expect(whereCallFor(builder, 'workspaceId')).toEqual([
-      'workspaceId',
-      '=',
-      'ws-1',
-    ]);
-    // Authenticated user path must not consult shares.
-    expect(shareRepo.findById).not.toHaveBeenCalled();
-  });
-
-  it('returns {items:[]} when the share belongs to a DIFFERENT workspace', async () => {
-    const { service, builder, shareRepo, pagePermissionRepo } = makeService({
-      share: {
-        id: 'share-1',
-        pageId: 'page-1',
-        workspaceId: 'OTHER-ws',
-        includeSubPages: false,
-      },
+  it('404s when the share belongs to a DIFFERENT workspace (no leak)', async () => {
+    const { service, shareRepo, pagePermissionRepo } = makeService({
+      share: { id: 's1', pageId: 'p1', workspaceId: 'OTHER', includeSubPages: false },
     });
-
-    const result = await service.searchPage(
-      { query: 'plan', shareId: 'share-1' } as any,
-      { workspaceId: 'ws-1' },
-    );
-
-    expect(shareRepo.findById).toHaveBeenCalledWith('share-1');
-    expect(result).toEqual({ items: [] });
-    // Workspace mismatch short-circuits before any restricted-ancestor / id
-    // scoping or DB execution: no leak across workspaces.
+    await expect(
+      service.searchPage(
+        { query: 'plan', shareId: 's1' } as any,
+        { anonymousShare: true, workspaceId: 'ws-1' },
+      ),
+    ).rejects.toThrow(NotFoundException);
+    expect(shareRepo.findById).toHaveBeenCalledWith('s1');
+    // Workspace mismatch short-circuits before restricted-ancestor / enumeration.
     expect(pagePermissionRepo.hasRestrictedAncestor).not.toHaveBeenCalled();
-    expect(builder.execute).not.toHaveBeenCalled();
   });
 
-  it('returns {items:[]} when the shared page has a restricted ancestor', async () => {
-    const { service, builder, pagePermissionRepo, pageRepo } = makeService({
-      share: {
-        id: 'share-1',
-        pageId: 'page-1',
-        workspaceId: 'ws-1',
-        includeSubPages: true,
-      },
-      isRestricted: true,
+  // SR-3: the same gate as the share page itself.
+  it('404s when sharing is disabled for the share\'s workspace/space', async () => {
+    const { service, shareService, pagePermissionRepo, pageRepo } = makeService({
+      share: { id: 's1', pageId: 'p1', spaceId: 'sp1', workspaceId: 'ws-1', includeSubPages: true },
+      sharingAllowed: false,
     });
-
-    const result = await service.searchPage(
-      { query: 'plan', shareId: 'share-1' } as any,
-      { workspaceId: 'ws-1' },
-    );
-
-    expect(pagePermissionRepo.hasRestrictedAncestor).toHaveBeenCalledWith(
-      'page-1',
-    );
-    expect(result).toEqual({ items: [] });
-    // Restricted ancestor must block before page enumeration and DB execution.
+    await expect(
+      service.searchPage(
+        { query: 'plan', shareId: 's1' } as any,
+        { anonymousShare: true, workspaceId: 'ws-1' },
+      ),
+    ).rejects.toThrow(NotFoundException);
+    expect(shareService.isSharingAllowed).toHaveBeenCalledWith('ws-1', 'sp1');
+    expect(pagePermissionRepo.hasRestrictedAncestor).not.toHaveBeenCalled();
     expect(
       pageRepo.getPageAndDescendantsExcludingRestricted,
     ).not.toHaveBeenCalled();
-    expect(builder.execute).not.toHaveBeenCalled();
   });
 
-  it('returns {items:[]} with no userId, no spaceId and no shareId', async () => {
-    const { service, builder, shareRepo } = makeService();
+  // SR-1: an approved share publishes only saved versions; the index holds the
+  // live draft, so search is off there, with an explicit reason.
+  it('an approved-mode share returns an empty result with the disabled reason', async () => {
+    const { service, pageRepo } = makeService({
+      share: {
+        id: 's1',
+        pageId: 'p1',
+        spaceId: 'sp1',
+        workspaceId: 'ws-1',
+        includeSubPages: false,
+        publishedMode: 'approved',
+      },
+    });
+    const disabled = await service.searchPage(
+      { query: 'secret', shareId: 's1' } as any,
+      { anonymousShare: true, workspaceId: 'ws-1' },
+    );
+    expect(disabled.items).toEqual([]);
+    expect(disabled.related).toEqual([]);
+    expect(disabled.total).toBe(0);
+    expect(disabled.disabledReason).toBe(SHARE_SEARCH_DISABLED_APPROVED);
+    expect(
+      pageRepo.getPageAndDescendantsExcludingRestricted,
+    ).not.toHaveBeenCalled();
+  });
 
+  // SR-5: a parentPageId outside the share is never looked up (an existence
+  // oracle, and a 22P02 on a non-uuid) — the result is plainly empty.
+  it('a parentPageId outside the share is never looked up', async () => {
+    const { service, pageRepo } = makeService({
+      share: { id: 's1', pageId: 'p1', spaceId: 'sp1', workspaceId: 'ws-1', includeSubPages: false },
+    });
+    for (const parentPageId of ['x', 'some-other-page-id']) {
+      const result = await service.searchPage(
+        { query: 'plan', shareId: 's1', parentPageId } as any,
+        { anonymousShare: true, workspaceId: 'ws-1' },
+      );
+      expect(result.items).toEqual([]);
+      expect(result.semantic).toBeUndefined();
+    }
+    expect(pageRepo.getPageAndDescendants).not.toHaveBeenCalled();
+  });
+
+  it('returns empty when the shared page has a restricted ancestor', async () => {
+    const { service, pagePermissionRepo, pageRepo } = makeService({
+      share: { id: 's1', pageId: 'p1', workspaceId: 'ws-1', includeSubPages: true },
+      isRestricted: true,
+    });
+    const result = await service.searchPage(
+      { query: 'plan', shareId: 's1' } as any,
+      { anonymousShare: true, workspaceId: 'ws-1' },
+    );
+    expect(pagePermissionRepo.hasRestrictedAncestor).toHaveBeenCalledWith('p1');
+    expect(result.items).toEqual([]);
+    expect(
+      pageRepo.getPageAndDescendantsExcludingRestricted,
+    ).not.toHaveBeenCalled();
+  });
+
+  it('an anonymous caller without a shareId gets nothing (spaceId is ignored)', async () => {
+    const { service, shareRepo, spaceMemberRepo } = makeService();
+    const result = await service.searchPage(
+      { query: 'plan', spaceId: 'space-1' } as any,
+      { anonymousShare: true, workspaceId: 'ws-1' },
+    );
+    expect(result.items).toEqual([]);
+    expect(shareRepo.findById).not.toHaveBeenCalled();
+    expect(spaceMemberRepo.getUserSpaceIds).not.toHaveBeenCalled();
+  });
+
+  // SR-4: a non-anonymous search without a user would run with no membership
+  // scope and no permission filter — it is refused, never run.
+  it('refuses a non-anonymous search without a userId (fail closed)', async () => {
+    const { service, spaceMemberRepo } = makeService();
+    await expect(
+      service.searchPage(
+        { query: 'plan', spaceId: 'space-1' } as any,
+        { userId: undefined, workspaceId: 'ws-1' } as any,
+      ),
+    ).rejects.toThrow(/requires a userId/);
+    expect(spaceMemberRepo.getUserSpaceIds).not.toHaveBeenCalled();
+  });
+
+  it('an authenticated user with NO member spaces gets an empty result', async () => {
+    const { service, spaceMemberRepo } = makeService({ memberSpaceIds: [] });
     const result = await service.searchPage(
       { query: 'plan' } as any,
-      { workspaceId: 'ws-1' },
+      { userId: 'user-1', workspaceId: 'ws-1' },
     );
+    expect(spaceMemberRepo.getUserSpaceIds).toHaveBeenCalledWith('user-1');
+    expect(result.items).toEqual([]);
+    expect(result.total).toBe(0);
+  });
+});
 
-    expect(result).toEqual({ items: [] });
-    // The catch-all else returns empty without scoping/executing or hitting shares.
-    expect(shareRepo.findById).not.toHaveBeenCalled();
-    expect(builder.execute).not.toHaveBeenCalled();
+/**
+ * The per-item shape of a search that FINDS a page: an anonymous share reader
+ * never gets the page's `space` or `creatorId`; an authenticated caller does.
+ * The ranked-id query and the ancestor-path walk are stubbed; the detail fetch
+ * runs over a chainable query-builder stub returning one row.
+ */
+describe('SearchService.searchPage — result item shape', () => {
+  const row = {
+    id: 'p1',
+    slugId: 'slug1',
+    title: 'Plan',
+    icon: null,
+    creatorId: 'user-9',
+    spaceId: 'sp1',
+    space: { id: 'sp1', name: 'Secret space', slug: 'secret' },
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    rank: 0.5,
+    highlight: null,
+    snippet: 'plan',
+    titleMatch: true,
+    textMatch: false,
+    tmatch0: true,
+  };
+
+  function makeService() {
+    const db: any = {
+      selectFrom: jest.fn(() => db),
+      select: jest.fn(() => db),
+      where: jest.fn(() => db),
+      execute: jest.fn(async () => [row]),
+    };
+    const service = new SearchService(
+      db,
+      { withSpace: jest.fn() } as any,
+      {
+        findById: jest.fn().mockResolvedValue({
+          id: 's1',
+          pageId: 'p1',
+          spaceId: 'sp1',
+          workspaceId: 'ws-1',
+          includeSubPages: false,
+        }),
+      } as any,
+      { getUserSpaceIds: jest.fn().mockResolvedValue(['sp1']) } as any,
+      {
+        hasRestrictedAncestor: jest.fn().mockResolvedValue(false),
+        filterAccessiblePageIds: jest.fn(async ({ pageIds }) => pageIds),
+      } as any,
+      { vectorCandidateArm: jest.fn() } as any,
+      {
+        embedQueryForActiveGeneration: jest
+          .fn()
+          .mockRejectedValue(new Error('no embed')),
+      } as any,
+      { isSharingAllowed: jest.fn().mockResolvedValue(true) } as any,
+    );
+    jest
+      .spyOn(service as any, 'runRankedQuery')
+      .mockResolvedValue([{ id: 'p1', lexical: true }]);
+    jest
+      .spyOn(service as any, 'buildAncestorPaths')
+      .mockResolvedValue(new Map());
+    return service;
+  }
+
+  it('an anonymous share search omits space and creatorId from every item', async () => {
+    const result = await makeService().searchPage(
+      { query: 'plan', shareId: 's1' } as any,
+      { anonymousShare: true, workspaceId: 'ws-1' },
+    );
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].id).toBe('p1');
+    expect(result.items[0]).not.toHaveProperty('space');
+    expect(result.items[0]).not.toHaveProperty('creatorId');
+  });
+
+  it('an authenticated search keeps space and creatorId', async () => {
+    const result = await makeService().searchPage(
+      { query: 'plan' } as any,
+      { userId: 'user-1', workspaceId: 'ws-1' },
+    );
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].space).toEqual(row.space);
+    expect(result.items[0].creatorId).toBe('user-9');
   });
 });

@@ -1,6 +1,9 @@
 import axios, { AxiosInstance } from "axios";
 import APP_ROUTE from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
+import { clearPersistedTreeCaches } from "@/features/page/tree/atoms/tree-data-atom";
+import { clearPersistedCurrentUser } from "@/features/user/atoms/current-user-atom";
+import { purgePageYdocDatabases } from "@/features/editor/page-ydoc-eviction";
 
 const api: AxiosInstance = axios.create({
   baseURL: "/api",
@@ -25,6 +28,16 @@ api.interceptors.response.use(
       switch (error.response.status) {
         case 401: {
           const url = new URL(error.request.responseURL)?.pathname;
+
+          // #642, part 3 — a 401 means the session is dead. Purge the persisted
+          // current-user BEFORE any early `return` below (the collab-token and
+          // /share short-circuits here, AND redirectToLogin's own exempt-path
+          // return, incl. /login). Otherwise a dead-session reload paints the
+          // shell from the seed (#642 part 1) then redirects to /login, where
+          // redirectToLogin early-returns WITHOUT clearing → the key survives →
+          // /login seeds again → app → /me → 401: an infinite loop.
+          clearPersistedCurrentUser();
+
           if (url === "/api/auth/collab-token") return;
           if (window.location.pathname.startsWith("/share/")) return;
 
@@ -62,7 +75,7 @@ api.interceptors.response.use(
   },
 );
 
-function redirectToLogin() {
+async function redirectToLogin() {
   const exemptPaths = [
     APP_ROUTE.AUTH.LOGIN,
     APP_ROUTE.AUTH.SIGNUP,
@@ -71,6 +84,21 @@ function redirectToLogin() {
     "/invites",
   ];
   if (!exemptPaths.some((path) => window.location.pathname.startsWith(path))) {
+    // Forced logout (401 / expired session) must purge the persisted sidebar
+    // tree caches too: they contain page titles, and on a shared machine most
+    // sessions end via cookie expiry — not the logout button — so this is the
+    // only cleanup that runs on that path. It also disables further cache
+    // persistence until the full page load below.
+    clearPersistedTreeCaches();
+    // Also purge the local page-body ydoc databases on a forced 401 logout,
+    // AWAITED before the navigation below so `deleteDatabase` finishes.
+    //
+    // Safe only while the write-guard forbids local edits, so a purged ydoc
+    // holds no unsent work. Once offline editing exists this must become
+    // "quarantine, not delete, if the ydoc has unsent updates" (see the
+    // reconciledAt reservation in page-ydoc-reconciled), or a 401 on reconnect
+    // would delete the user's unsynced edits.
+    await purgePageYdocDatabases();
     const redirectTo = window.location.pathname;
     if (redirectTo === APP_ROUTE.HOME) {
       window.location.href = APP_ROUTE.AUTH.LOGIN;

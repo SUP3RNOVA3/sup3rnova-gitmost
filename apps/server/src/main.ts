@@ -10,17 +10,37 @@ import { TransformHttpResponseInterceptor } from './common/interceptors/http-res
 import { WsRedisIoAdapter } from './ws/adapter/ws-redis.adapter';
 import fastifyMultipart from '@fastify/multipart';
 import fastifyCookie from '@fastify/cookie';
+import fastifyCompress from '@fastify/compress';
 import fastifyIp from 'fastify-ip';
 import { InternalLogFilter } from './common/logger/internal-log-filter';
 import { EnvironmentService } from './integrations/environment/environment.service';
+import { SANDBOX_API_PATH } from './integrations/sandbox/sandbox.constants';
 import { resolveFrameHeader } from './common/helpers';
 import { resolveTrustProxy } from './integrations/environment/trust-proxy.util';
+import { isMetricsEnabled } from './integrations/metrics/metrics.registry';
+import { recordHttpResponse } from './integrations/metrics/http-metrics.hook';
+import { startMetricsServer } from './integrations/metrics/metrics.server';
+import { GitHttpService } from './integrations/git-sync/http/git-http.service';
 
 async function bootstrap() {
+  // Fastify JSON body cap. Fastify defaults to 1 MiB, which a long AI-chat
+  // research turn exceeds: the client resends the FULL message history (every
+  // tool call + search result) on each turn, so a deep conversation's POST to
+  // /api/ai-chat/stream can be several MB and would otherwise be rejected with
+  // FST_ERR_CTP_BODY_TOO_LARGE (413). Raise the cap; override with
+  // HTTP_JSON_BODY_LIMIT (bytes). A missing/invalid/non-positive value keeps the
+  // 25 MiB default. Multipart uploads are unaffected (their own @fastify/multipart
+  // limits apply); this only bounds JSON/urlencoded request bodies.
+  const bodyLimitEnv = Number(process.env.HTTP_JSON_BODY_LIMIT);
+  const bodyLimit =
+    Number.isFinite(bodyLimitEnv) && bodyLimitEnv > 0
+      ? bodyLimitEnv
+      : 25 * 1024 * 1024;
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({
       trustProxy: resolveTrustProxy(process.env.TRUST_PROXY),
+      bodyLimit,
       routerOptions: {
         maxParamLength: 1000,
         ignoreTrailingSlash: true,
@@ -40,7 +60,14 @@ async function bootstrap() {
   app.useLogger(app.get(PinoLogger));
 
   app.setGlobalPrefix('api', {
-    exclude: ['robots.txt', 'share/:shareId/p/:pageSlug', 'mcp'],
+    exclude: [
+      'robots.txt',
+      'share/:shareId/p/:pageSlug',
+      // Vanity link resolver lives outside /api so /l/<alias> is a clean
+      // public URL that 302s to the canonical share page.
+      'l/:alias',
+      'mcp',
+    ],
   });
 
   const reflector = app.get(Reflector);
@@ -52,6 +79,17 @@ async function bootstrap() {
   await app.register(fastifyIp);
   await app.register(fastifyMultipart);
   await app.register(fastifyCookie);
+  // Compress dynamic responses (API JSON, the rewritten share-SEO HTML) when the
+  // client accepts br/gzip. @fastify/compress only compresses content-types that
+  // mime-db flags `compressible` (application/json, text/html, …); `text/event-stream`
+  // is not in mime-db, so SSE is never compressed by the allowlist. The AI-chat
+  // stream additionally hijacks the raw socket (pipeUIMessageStreamToResponse ->
+  // res.raw in ai-chat.service.ts), bypassing Fastify's reply/onSend lifecycle
+  // entirely, so this hook can never buffer that stream.
+  await app.register(fastifyCompress, {
+    // Skip tiny payloads where compression overhead outweighs the savings.
+    threshold: 1024,
+  });
 
   const environmentService = app.get(EnvironmentService);
   const frameHeader = resolveFrameHeader(
@@ -83,6 +121,19 @@ async function bootstrap() {
       done();
     });
 
+  // #355 — HTTP request-duration histogram. Registered ONLY when METRICS_PORT is
+  // set (otherwise no collector runs at all). Uses the bounded route template
+  // label and excludes SSE/streaming responses (see recordHttpResponse).
+  if (isMetricsEnabled()) {
+    app
+      .getHttpAdapter()
+      .getInstance()
+      .addHook('onResponse', (req, reply, done) => {
+        recordHttpResponse(req, reply);
+        done();
+      });
+  }
+
   app
     .getHttpAdapter()
     .getInstance()
@@ -98,6 +149,33 @@ async function bootstrap() {
         }
       },
     );
+
+  // The /git smart-HTTP host (parsers below + raw route further down) exists
+  // only when git-sync AND its HTTP host are enabled; otherwise /git/... falls
+  // through like any unknown route and GitHttpService is never resolved (the
+  // GitSyncModule registers no providers when disabled).
+  const gitHttpEnabled =
+    environmentService.isGitSyncEnabled() &&
+    environmentService.isGitSyncHttpEnabled();
+
+  // git smart-HTTP POST bodies use these media types. Register PASSTHROUGH
+  // content-type parsers so Fastify does NOT buffer/parse them (it would
+  // otherwise reject the unknown type with 415); the /git handler streams the
+  // raw Node request (request.raw) to `git http-backend` stdin instead. A
+  // passthrough parser also bypasses the bodyLimit, so large pushes are not
+  // truncated (the bytes are never buffered by Fastify).
+  if (gitHttpEnabled) {
+    app
+      .getHttpAdapter()
+      .getInstance()
+      .addContentTypeParser(
+        [
+          'application/x-git-upload-pack-request',
+          'application/x-git-receive-pack-request',
+        ],
+        (_req, payload, done) => done(null, payload),
+      );
+  }
 
   app
     .getHttpAdapter()
@@ -120,6 +198,13 @@ async function bootstrap() {
         '/api/workspace/joined',
         '/api/workspace/find-by-email',
         '/api/internal/nova/mcp-token',
+        // Public client perf-telemetry sink: browsers post it without a
+        // resolved workspace host, so the workspace-resolution gate must not 404 it.
+        '/api/telemetry/vitals',
+        // Anonymous in-RAM blob sandbox: a remote consumer fetches blobs by an
+        // unguessable UUID without any workspace host context, so the
+        // workspace-resolution gate must not apply.
+        SANDBOX_API_PATH,
       ];
 
       if (
@@ -143,9 +228,35 @@ async function bootstrap() {
     }),
   );
 
-  app.enableCors();
+  // #636 — `WWW-Authenticate` is NOT on the CORS-safelisted response headers, so
+  // without exposing it a browser-based MCP client (e.g. MCP Inspector) cannot read
+  // the 401's challenge at all: fetch() hides the header and the client is back to
+  // guessing OAuth — the exact failure the challenge exists to prevent.
+  app.enableCors({ exposedHeaders: ['WWW-Authenticate'] });
   app.useGlobalInterceptors(new TransformHttpResponseInterceptor(reflector));
   app.enableShutdownHooks();
+
+  // git smart-HTTP host (the /git/<spaceId>.git/... subtree). Registered as a
+  // RAW Fastify route — NOT a Nest controller under the global '/api' prefix —
+  // so it lives at the ROOT and a single wildcard reliably captures the whole
+  // multi-segment subtree (avoiding the path-to-regexp v8 wildcard / global-
+  // prefix-exclude ambiguity in NestJS v11). The handler is resolved from the
+  // Nest container so all auth/authz/gating still runs. NOTE: Nest middleware
+  // (DomainMiddleware) does NOT run for this raw root route — it is bound to the
+  // Nest router under the global '/api' prefix — so request.raw.workspaceId is
+  // NOT populated here; GitHttpService resolves the workspace itself, through
+  // the same resolveRequestWorkspace helper and cached loader DomainMiddleware
+  // uses. The Fastify wildcard '/git/*' captures the multi-segment
+  // subpath; the handler re-parses req.url itself.
+  if (gitHttpEnabled) {
+    const gitHttpService = app.get(GitHttpService);
+    app
+      .getHttpAdapter()
+      .getInstance()
+      .all('/git/*', async (request, reply) => {
+        await gitHttpService.handle(request as any, reply as any);
+      });
+  }
 
   const logger = new Logger('NestApplication');
 
@@ -164,6 +275,11 @@ async function bootstrap() {
       `Listening on http://127.0.0.1:${port} / ${process.env.APP_URL}`,
     );
   });
+
+  // #355 — Prometheus scrape endpoint on a SEPARATE port (METRICS_PORT),
+  // started after the app is up. No default port: a no-op when METRICS_PORT is
+  // unset. Closed on shutdown by MetricsServerLifecycle (MetricsModule).
+  startMetricsServer();
 }
 
 bootstrap();

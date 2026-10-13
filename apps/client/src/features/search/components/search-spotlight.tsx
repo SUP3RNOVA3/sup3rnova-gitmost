@@ -1,8 +1,12 @@
 import { Spotlight } from "@mantine/spotlight";
 import { IconSearch } from "@tabler/icons-react";
-import { Group, VisuallyHidden } from "@mantine/core";
-import { useState, useMemo } from "react";
+import { Group, Text, VisuallyHidden } from "@mantine/core";
+import { useState, useMemo, useEffect } from "react";
 import { useDebouncedValue } from "@mantine/hooks";
+import {
+  markOperationStart,
+  measureOperation,
+} from "@/lib/telemetry/vitals";
 import { useTranslation } from "react-i18next";
 import { searchSpotlightStore } from "../constants.ts";
 import { SearchSpotlightFilters } from "./search-spotlight-filters.tsx";
@@ -38,13 +42,44 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
     return params;
   }, [debouncedSearchQuery, filters]);
 
-  const { data: searchResults, isLoading } = useUnifiedSearch(searchParams);
+  const { data: searchResults, isLoading, isError } = useUnifiedSearch(searchParams);
 
-  const resultItems = (searchResults || []).map((result) => (
+  // `search_full` — the user's search round-trip: a new non-empty debounced
+  // query is the "submit" (mark), and the metric is settled when its results
+  // render (isLoading → false). A brand-new query key starts as isLoading=true,
+  // so the mark is set before the settle; a superseding query overwrites the mark
+  // (replayed search) and an empty query never marks. measureOperation consumes
+  // the mark, so each query reports at most once; the surface-open cost is the
+  // separate `spotlight_open` metric, so this is not double-counted.
+  // Success-only: a failed search (isError) does NOT measure — its mark is left
+  // to be overwritten by the next query or to expire silently, so retry-inflated
+  // failures never pollute the p95/p99 the metric exists for.
+  useEffect(() => {
+    if (debouncedSearchQuery.length > 0) markOperationStart("search_full");
+  }, [debouncedSearchQuery]);
+
+  useEffect(() => {
+    if (debouncedSearchQuery.length > 0 && !isLoading && !isError) {
+      measureOperation("search_full");
+    }
+  }, [debouncedSearchQuery, isLoading, isError]);
+
+  const resultItems = (searchResults?.items || []).map((result) => (
     <SearchResultItem
       key={result.id}
       result={result}
       isAttachmentResult={filters.contentType === "attachment"}
+      showSpace={!filters.spaceId}
+    />
+  ));
+
+  // #701: semantically similar pages that do NOT match the query — shown apart
+  // from the matches and never counted as results.
+  const relatedItems = (searchResults?.related || []).map((result) => (
+    <SearchResultItem
+      key={result.id}
+      result={result}
+      isAttachmentResult={false}
       showSpace={!filters.spaceId}
     />
   ));
@@ -84,6 +119,11 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
             onFiltersChange={handleFiltersChange}
             spaceId={spaceId}
           />
+          {/* #529: operator hint — matches ANY word by default; "…" for an exact
+              phrase, +term to require, -term to exclude. */}
+          <Text size="xs" c="dimmed" mt={4}>
+            {t('Tip: "exact phrase", +required, -excluded')}
+          </Text>
         </div>
 
         <VisuallyHidden role="status" aria-live="polite">
@@ -106,6 +146,15 @@ export function SearchSpotlight({ spaceId }: SearchSpotlightProps) {
           )}
 
           {resultItems.length > 0 && <>{resultItems}</>}
+
+          {relatedItems.length > 0 && (
+            <>
+              <Text size="xs" c="dimmed" px="sm" pt="sm" pb={4}>
+                {t("Similar pages")}
+              </Text>
+              {relatedItems}
+            </>
+          )}
         </Spotlight.ActionsList>
       </Spotlight.Root>
     </>

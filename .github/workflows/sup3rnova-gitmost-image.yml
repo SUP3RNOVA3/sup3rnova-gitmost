@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - sup3rnova-v0.94.1-brand.1
+      - sup3rnova-v1.0.1-brand.1
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ permissions:
 
 env:
   IMAGE: ghcr.io/sup3rnova3/sup3rnova-gitmost
-  TAG: v0.94.1-brand.1
+  TAG: v1.0.1-brand.1
 
 jobs:
   test:
@@ -45,7 +45,6 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:sha-${{ github.sha }}
-            ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

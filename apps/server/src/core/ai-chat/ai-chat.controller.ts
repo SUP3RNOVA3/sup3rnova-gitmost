@@ -1,13 +1,18 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   ForbiddenException,
+  Get,
   HttpCode,
   HttpException,
   HttpStatus,
   Logger,
+  Param,
+  ParseUUIDPipe,
   Post,
+  Query,
   Req,
   Res,
   ServiceUnavailableException,
@@ -20,23 +25,118 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { AuthWorkspace } from '../../common/decorators/auth-workspace.decorator';
 import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
-import { AiChat, User, Workspace } from '@docmost/db/types/entity.types';
+import {
+  AiChat,
+  AiChatMessage,
+  AiChatRun,
+  User,
+  Workspace,
+} from '@docmost/db/types/entity.types';
 import { PaginationOptions } from '@docmost/db/pagination/pagination-options';
 import { AiChatRepo } from '@docmost/db/repos/ai-chat/ai-chat.repo';
 import { AiChatMessageRepo } from '@docmost/db/repos/ai-chat/ai-chat-message.repo';
+import { AiChatRunStepRepo } from '@docmost/db/repos/ai-chat/ai-chat-run-step.repo';
+import { AiChatPageBindingRepo } from '@docmost/db/repos/ai-chat/ai-chat-page-binding.repo';
+import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { incAiChatBindSkipped } from '../../integrations/metrics/metrics.registry';
 import { UserThrottlerGuard } from '../../integrations/throttle/user-throttler.guard';
 import { AI_CHAT_THROTTLER } from '../../integrations/throttle/throttler-names';
 import { FileInterceptor } from '../../common/interceptors/file.interceptor';
-import { AiChatService, AiChatStreamBody } from './ai-chat.service';
+import {
+  AiChatRunHooks,
+  AiChatService,
+  AiChatStreamBody,
+  rowHasInlineParts,
+  hydrateAssistantParts,
+} from './ai-chat.service';
+import { AiChatRunService } from './ai-chat-run.service';
 import { AiTranscriptionService } from './ai-transcription.service';
 import {
+  BindPageDto,
+  BoundChatDto,
   ChatIdDto,
   ExportChatDto,
+  GeneratePageTitleDto,
+  GetChatDeltaDto,
   GetChatMessagesDto,
+  GetRunDto,
   RenameChatDto,
+  StopRunDto,
 } from './dto/ai-chat.dto';
 import { describeProviderError } from '../../integrations/ai/ai-error.util';
 import { buildChatMarkdown } from './chat-markdown.util';
+import {
+  AiChatStreamRegistryService,
+  SUBSCRIBER_MAX_BUFFERED_BYTES,
+} from './ai-chat-stream-registry.service';
+import { startSseHeartbeat } from './sse-resilience';
+
+/**
+ * Deadline for writing the attach tail: the whole replay must reach the socket
+ * within this window. A reader that never drains (zero TCP window, a client that
+ * neither reads nor closes) would otherwise park the handler forever, pinning the
+ * replay snapshot (up to the ring cap), the paused subscriber and the socket's
+ * write buffer, and the attach route lets one user open 60 of those a minute. A
+ * healthy client drains the tail (<= the 4MB ring cap) in well under a second; on
+ * expiry the stream is torn down and the client falls back to its delta poll, as
+ * on a dropped live stream.
+ */
+export const ATTACH_TAIL_WRITE_TIMEOUT_MS = 30_000;
+
+/**
+ * Write the attach tail to the hijacked socket respecting drain: each `write()`
+ * that returns false is followed by awaiting 'drain', raced against
+ * 'close'/'error' and the time left to the tail deadline, so the loop never
+ * parks. Frames the paused registry subscriber buffers meanwhile are delivered
+ * by start(). Returns 'written' (the whole tail is on the socket), 'closed' (the
+ * socket ended or errored) or 'timeout' (the deadline passed first); on anything
+ * but 'written' the caller tears the attachment down.
+ */
+async function writeTailRespectingDrain(
+  raw: {
+    write(chunk: string): boolean;
+    writableEnded?: boolean;
+    destroyed?: boolean;
+    once(event: string, cb: () => void): unknown;
+    removeListener?(event: string, cb: () => void): unknown;
+  },
+  frames: string[],
+): Promise<'written' | 'closed' | 'timeout'> {
+  const deadline = Date.now() + ATTACH_TAIL_WRITE_TIMEOUT_MS;
+  for (const frame of frames) {
+    if (raw.writableEnded || raw.destroyed) return 'closed';
+    const ok = raw.write(frame);
+    if (!ok) {
+      // Kernel buffer full — wait for drain (or an early close/error, or the
+      // deadline) before the next chunk, so a slow reader never forces the whole
+      // tail into memory and a non-reader never parks the handler. Remove ALL
+      // listeners and the timer once any fires, so a many-chunk tail with
+      // repeated backpressure never leaks (MaxListenersExceededWarning).
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return 'timeout';
+      const outcome = await new Promise<'drained' | 'closed' | 'timeout'>(
+        (resolve) => {
+          const timer = setTimeout(() => finish('timeout'), remaining);
+          timer.unref?.();
+          const finish = (result: 'drained' | 'closed' | 'timeout'): void => {
+            clearTimeout(timer);
+            raw.removeListener?.('drain', onDrain);
+            raw.removeListener?.('close', onClosed);
+            raw.removeListener?.('error', onClosed);
+            resolve(result);
+          };
+          const onDrain = (): void => finish('drained');
+          const onClosed = (): void => finish('closed');
+          raw.once('drain', onDrain);
+          raw.once('close', onClosed);
+          raw.once('error', onClosed);
+        },
+      );
+      if (outcome !== 'drained') return outcome;
+    }
+  }
+  return 'written';
+}
 
 /**
  * Per-user AI chat API (§6.1). Routes are POST to match this codebase's
@@ -50,10 +150,49 @@ export class AiChatController {
 
   constructor(
     private readonly aiChatService: AiChatService,
+    private readonly aiChatRunService: AiChatRunService,
     private readonly aiChatRepo: AiChatRepo,
     private readonly aiChatMessageRepo: AiChatMessageRepo,
     private readonly aiTranscription: AiTranscriptionService,
+    private readonly pageRepo: PageRepo,
+    // #184 phase 1.5. OPTIONAL so existing positional constructions (controller
+    // specs) compile unchanged; Nest always injects the real providers in
+    // production.
+    private readonly streamRegistry?: AiChatStreamRegistryService,
+    // #492: reconstruct a #492 mid-run record's parts from the steps table before
+    // returning rows to the client / export. OPTIONAL so positional controller
+    // specs compile unchanged; when absent, hydration is skipped (old-era rows
+    // already carry inline parts, so nothing to reconstruct).
+    private readonly aiChatRunStepRepo?: AiChatRunStepRepo,
+    // #665: the mutable page->chat binding repo, behind bound-chat (read) and
+    // bind-page (write). OPTIONAL so existing positional controller specs compile
+    // unchanged; Nest always injects the real singleton in production.
+    private readonly aiChatPageBindingRepo?: AiChatPageBindingRepo,
   ) {}
+
+  /**
+   * Reconstruct parts for assistant rows that don't carry them inline — a mid-run
+   * row whose per-step parts live in `ai_chat_run_steps`. Finished rows already
+   * have inline `metadata.parts`, so the common path fetches nothing; only an
+   * actively-streaming row triggers the batch step fetch. Consumers
+   * (seed/poll/export) read `metadata.parts` off the returned rows either way
+   * (reconstructRunParts contract).
+   */
+  private async withReconstructedParts(
+    rows: AiChatMessage[],
+    workspaceId: string,
+  ): Promise<AiChatMessage[]> {
+    if (!this.aiChatRunStepRepo) return rows;
+    const needy = rows.filter(
+      (r) => r.role === 'assistant' && !rowHasInlineParts(r),
+    );
+    if (needy.length === 0) return rows;
+    const stepsByMessage = await this.aiChatRunStepRepo.findByMessageIds(
+      needy.map((r) => r.id),
+      workspaceId,
+    );
+    return hydrateAssistantParts(rows, stepsByMessage);
+  }
 
   /** List the requesting user's chats in this workspace (paginated). */
   @HttpCode(HttpStatus.OK)
@@ -66,6 +205,103 @@ export class AiChatController {
     return this.aiChatRepo.findByCreator(user.id, workspace.id, pagination);
   }
 
+  /**
+   * Resolve the chat bound to a document for the requesting user: the chat the
+   * `ai_chat_page_bindings` pointer holds for (user, page), or { chatId: null }
+   * when nothing is bound. There is no fallback to "latest chat on the page":
+   * after "New chat" the binding row is gone, and a fallback would resurrect the
+   * unbound chat.
+   *
+   * `dto.pageId` is a page slugId (10-char nanoid) OR uuid; PageRepo.findById
+   * resolves both before anything touches the uuid page_id column (a raw slugId
+   * there is a Postgres 22P02). The workspace guard turns an unknown or
+   * cross-workspace page into { chatId: null }; the binding resolver re-checks
+   * chat ownership itself.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('bound-chat')
+  async boundChat(
+    @Body() dto: BoundChatDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ chatId: string | null }> {
+    const page = await this.pageRepo.findById(dto.pageId); // accepts slugId OR uuid
+    if (!page || page.workspaceId !== workspace.id) {
+      return { chatId: null }; // unknown or foreign-workspace page — no binding, no leak
+    }
+    const chatId = await this.aiChatPageBindingRepo.findChatIdByPage(
+      user.id,
+      workspace.id,
+      page.id, // the real uuid, never the incoming slugId
+    );
+    return { chatId };
+  }
+
+  /**
+   * Move (or clear) the page->chat binding for the requesting user. Called on a
+   * conscious open: the client's history select re-binds the page to the chosen
+   * chat; "New chat" clears it (`chatId: null`). The header button and the
+   * agent-badge deeplink do NOT call this.
+   *
+   * Binding is a convenience, not access control, so every "not applied" outcome
+   * is a fail-soft `200 { chatId: null }` with no write, each with a WARN + a
+   * bounded skip counter (otherwise a no-op looks like success in the HTTP
+   * histogram). `dto.pageId` accepts a slugId OR uuid. A `chatId` that does not
+   * exist / is not the caller's / left the workspace / is soft-deleted is
+   * fail-closed. The response body is a debug aid; the client ignores it.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('bind-page')
+  async bindPage(
+    @Body() dto: BindPageDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ chatId: string | null }> {
+    const page = await this.pageRepo.findById(dto.pageId); // accepts slugId OR uuid
+    if (!page || page.workspaceId !== workspace.id) {
+      // Unknown / foreign-workspace page: no write, existing binding untouched, no
+      // probe of another workspace (mirrors boundChat).
+      this.logger.warn(
+        `bind-page skipped: page unresolved (user ${user.id}, reason=page_unresolved)`,
+      );
+      incAiChatBindSkipped('page_unresolved');
+      return { chatId: null };
+    }
+
+    // Clear ("New chat").
+    if (dto.chatId === null || dto.chatId === undefined) {
+      await this.aiChatPageBindingRepo.clear(user.id, page.id);
+      return { chatId: null };
+    }
+
+    // Re-bind: the chat must exist, be the caller's, in this workspace, and live.
+    // findOwnershipById selects the ownership triple WITHOUT filtering so the three
+    // failure modes stay distinguishable (a plain findById would collapse them into
+    // one `undefined`, making the chat_deleted reason unobservable).
+    const owned = await this.aiChatRepo.findOwnershipById(dto.chatId);
+    if (
+      !owned ||
+      owned.creatorId !== user.id ||
+      owned.workspaceId !== workspace.id
+    ) {
+      this.logger.warn(
+        `bind-page skipped: chat ${dto.chatId} not owned by user ${user.id} (reason=chat_not_owned)`,
+      );
+      incAiChatBindSkipped('chat_not_owned');
+      return { chatId: null };
+    }
+    if (owned.deletedAt !== null) {
+      this.logger.warn(
+        `bind-page skipped: chat ${dto.chatId} is deleted (reason=chat_deleted)`,
+      );
+      incAiChatBindSkipped('chat_deleted');
+      return { chatId: null };
+    }
+
+    await this.aiChatPageBindingRepo.upsert(user.id, page.id, dto.chatId);
+    return { chatId: dto.chatId };
+  }
+
   /** Fetch the messages of a chat (oldest first, paginated). */
   @HttpCode(HttpStatus.OK)
   @Post('messages')
@@ -76,20 +312,65 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ) {
     await this.assertOwnedChat(dto.chatId, user, workspace);
-    return this.aiChatMessageRepo.findByChat(
+    const page = await this.aiChatMessageRepo.findByChat(
       dto.chatId,
       workspace.id,
       pagination,
     );
+    // #492: reconstruct parts for any active new-style row so the client seed sees
+    // `metadata.parts` unchanged (a no-op for the finished rows that fill a page).
+    return {
+      ...page,
+      items: await this.withReconstructedParts(page.items, workspace.id),
+    };
   }
 
   /**
-   * Export a chat to Markdown (#183). The DB is the single source of truth: the
-   * whole transcript is loaded (oldest -> newest) and rendered server-side. Now
-   * that the assistant row is persisted upfront and per step, an interrupted
-   * turn is included up to its last finished step. Workspace-scoped and owner-
-   * gated via assertOwnedChat (same as the other read endpoints). Returns
-   * `{ markdown }`. `lang` localizes the few fixed labels (default English).
+   * Delta poll — the degraded-poll payload. Returns the chat's message rows
+   * changed since `cursor` (a DB-clock timestamp from the previous poll), a fresh
+   * cursor, and the current run fact `{ id, status } | null`. The client seeds
+   * once and then merges deltas by id (the overlap window guarantees repeats; the
+   * merge is idempotent, see mergeById). The run fact rides in the delta so a
+   * separate /run poll is not needed. Owner-gated via assertOwnedChat.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('messages/delta')
+  async getMessagesDelta(
+    @Body() dto: GetChatDeltaDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{
+    rows: AiChatMessage[];
+    cursor: string;
+    run: { id: string; status: string } | null;
+  }> {
+    await this.assertOwnedChat(dto.chatId, user, workspace);
+    const { rows, cursor } =
+      await this.aiChatMessageRepo.findByChatUpdatedAfter(
+        dto.chatId,
+        workspace.id,
+        dto.cursor ?? null,
+      );
+    const run = await this.aiChatRunService.getLatestForChat(
+      dto.chatId,
+      workspace.id,
+    );
+    return {
+      // #492: the delta of an actively-streaming new-style row carries its parts
+      // reconstructed from the steps table, so the degraded poll shows persisted
+      // progress exactly as the pre-#492 full-row snapshot did.
+      rows: await this.withReconstructedParts(rows, workspace.id),
+      cursor,
+      run: run ? { id: run.id, status: run.status } : null,
+    };
+  }
+
+  /**
+   * Export a chat to Markdown. The whole transcript is loaded from the DB (oldest
+   * -> newest) and rendered server-side; an interrupted turn is included up to
+   * its last finished step. Workspace-scoped and owner-gated via
+   * assertOwnedChat. Returns `{ markdown }`. `lang` localizes the few fixed
+   * labels (default English).
    */
   @HttpCode(HttpStatus.OK)
   @Post('export')
@@ -99,8 +380,10 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<{ markdown: string }> {
     const chat = await this.assertOwnedChat(dto.chatId, user, workspace);
-    const rows = await this.aiChatMessageRepo.findAllByChat(
-      dto.chatId,
+    const rows = await this.withReconstructedParts(
+      await this.aiChatMessageRepo.findAllByChat(dto.chatId, workspace.id),
+      // #492: an interrupted-but-still-active turn exports its persisted steps
+      // (reconstructed from the steps table) just like the pre-#492 full row did.
       workspace.id,
     );
     const markdown = buildChatMarkdown({
@@ -111,6 +394,206 @@ export class AiChatController {
       lang: dto.lang,
     });
     return { markdown };
+  }
+
+  /**
+   * Reconnect to the latest run of a chat. Returns the run's
+   * persisted lifecycle state ({ status, error, stepCount, timings, ... }) plus
+   * the assistant message it projects (the partial/final output) — the DB is the
+   * source of truth, so this works for an in-flight run (the browser dropped, the
+   * run kept going) and a finished one alike. Owner-gated via assertOwnedChat.
+   * `{ run: null }` when the chat has never had a run.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('run')
+  async getRun(
+    @Body() dto: GetRunDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ run: AiChatRun | null; message: AiChatMessage | null }> {
+    await this.assertOwnedChat(dto.chatId, user, workspace);
+    const run = await this.aiChatRunService.getLatestForChat(
+      dto.chatId,
+      workspace.id,
+    );
+    if (!run) return { run: null, message: null };
+    const message = run.assistantMessageId
+      ? await this.aiChatMessageRepo.findById(
+          run.assistantMessageId,
+          workspace.id,
+        )
+      : undefined;
+    // #492: reconnect to an IN-FLIGHT run reconstructs the projection row's parts
+    // from the steps table (the row itself carries only the step marker mid-run);
+    // a finished run's row already has inline parts, so this is a no-op.
+    const [hydrated] = message
+      ? await this.withReconstructedParts([message], workspace.id)
+      : [undefined];
+    return { run, message: hydrated ?? null };
+  }
+
+  /**
+   * Explicitly STOP an agent run — the user pressed Stop. This is the only
+   * thing that ends a detached run; a browser disconnect does not (except, see
+   * stream(): a new chat's client that left before
+   * the first frame). Target by `runId` (from the streamed start metadata) or
+   * by `chatId` (stop whatever run is active on it). Owner-gated. Returns
+   * `{ stopped }` — false when there was nothing active to stop.
+   */
+  @HttpCode(HttpStatus.OK)
+  @Post('stop')
+  async stopRun(
+    @Body() dto: StopRunDto,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ stopped: boolean }> {
+    let runId = dto.runId;
+    if (!runId && !dto.chatId) {
+      throw new BadRequestException('runId or chatId is required');
+    }
+    if (runId) {
+      // Resolve the run to its chat and owner-gate via that chat.
+      const run = await this.aiChatRunService.getRun(runId, workspace.id);
+      if (!run) return { stopped: false };
+      await this.assertOwnedChat(run.chatId, user, workspace);
+    } else {
+      await this.assertOwnedChat(dto.chatId!, user, workspace);
+      const active = await this.aiChatRunService.getActiveForChat(
+        dto.chatId!,
+        workspace.id,
+      );
+      if (!active) return { stopped: false };
+      runId = active.id;
+    }
+    const stopped = await this.aiChatRunService.requestStop(
+      runId,
+      workspace.id,
+    );
+    return { stopped };
+  }
+
+  /**
+   * Attach to a chat's live run stream from the client's step frontier. A
+   * late/reloaded tab sends the step count it has persisted (`n` = the seeded
+   * row's `metadata.stepsPersisted`) and its assistant row id (`anchor`); the
+   * registry answers with the tail past step `n` (a synthetic `start` frame + the
+   * buffered frames stamped >= n) and then the live stream. Owner-gated via
+   * assertOwnedChat. When there is nothing to resume — no entry, a ring that does
+   * not cover the frontier, or an anchor that pins a different run — the
+   * endpoint answers 204, the only "nothing to resume" signal the AI SDK's
+   * reconnect accepts; the client then refetches (a larger n) and re-attaches.
+   *
+   * `n` comes only from the client: a server-side n from a stale seed would open
+   * a silent one-step hole. The tail is written in chunks respecting drain
+   * (writeTailRespectingDrain).
+   */
+  @SkipTransform()
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  @Throttle({ [AI_CHAT_THROTTLER]: { limit: 60, ttl: 60000 } })
+  @Get('runs/:chatId/stream')
+  async attachRunStream(
+    @Param('chatId', new ParseUUIDPipe()) chatId: string,
+    @Query('anchor') anchor: string | undefined,
+    @Query('n') n: string | undefined,
+    @Req() req: FastifyRequest,
+    @Res() res: FastifyReply,
+    @AuthUser() user: User,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<void> {
+    await this.assertOwnedChat(chatId, user, workspace); // same gate as getRun
+    // The client's persisted step frontier. A missing/invalid `n` (null: a client
+    // that is not tail-aware) differs from `n=0` (tail-aware, nothing persisted).
+    // Passing 0 for a missing `n` would serve a finished, non-rotated run's whole
+    // tail, which such a client appends onto the steps it already shows; null
+    // makes the registry answer 204 for a finished run (see attach).
+    const frontier: number | null =
+      n === undefined || n === '' || !Number.isFinite(Number(n))
+        ? null
+        : Math.max(0, Number(n));
+    // The per-subscriber backpressure cap tracks the (env-tunable) ring cap.
+    const subscriberCap =
+      this.streamRegistry?.subscriberMaxBufferedBytes ??
+      SUBSCRIBER_MAX_BUFFERED_BYTES;
+    let stopHeartbeat: () => void = () => undefined;
+    const attachment = await this.streamRegistry?.attach(chatId, anchor, frontier, {
+      onFrame: (frame) => {
+        // Backpressure guard: 2x the ring cap, so the initial tail burst alone
+        // can never trip it; only a genuinely stalled socket can.
+        try {
+          if (res.raw.writableLength > subscriberCap) {
+            res.raw.destroy(); // 'close' fires -> unsubscribe below
+            return;
+          }
+          if (!res.raw.writableEnded) res.raw.write(frame);
+        } catch {
+          res.raw.destroy();
+        }
+      },
+      onEnd: () => {
+        stopHeartbeat();
+        if (!res.raw.writableEnded) res.raw.end();
+      },
+    });
+    if (!attachment) {
+      res.status(204).send(); // the ONLY "nothing to resume" signal the SDK accepts
+      return;
+    }
+    res.hijack();
+    // Cleanup BEFORE any write (invariant 5): a torn-down socket must not orphan
+    // a paused subscriber whose pending queue would buffer the whole run.
+    req.raw.once('close', () => {
+      attachment.unsubscribe();
+      stopHeartbeat();
+    });
+    // A close emitted DURING the awaits above was missed by the listener — check.
+    // (Healthy pending GETs have req.raw.destroyed === false, so no false
+    // positives; returning without end() is fine — the socket is gone.)
+    if (req.raw.destroyed) {
+      attachment.unsubscribe();
+      return;
+    }
+    res.raw.on('error', () => undefined);
+    try {
+      res.raw.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        'x-vercel-ai-ui-message-stream': 'v1',
+        'x-accel-buffering': 'no',
+        // deliberately NO Connection/Keep-Alive (hop-by-hop; Safari/HTTP2)
+      });
+      res.raw.flushHeaders?.();
+      // Write the tail in chunks respecting drain (not a synchronous blast, which
+      // was half the OOM). Frames the paused subscriber buffers meanwhile are
+      // drained by start() below; its cap is the backstop for a stalled socket.
+      const tail = await writeTailRespectingDrain(res.raw, attachment.replay);
+      if (tail !== 'written') {
+        // The socket closed mid-tail, or the reader never drained within the
+        // deadline (AI-3): tear down instead of going live — drop the paused
+        // subscriber and destroy the socket so its write buffer is released
+        // (end() would keep the unflushed bytes queued behind a dead reader).
+        if (tail === 'timeout') {
+          this.logger.warn(
+            `run-stream attach for chat ${chatId}: the client did not drain the ` +
+              `${attachment.replay.length}-frame tail within ` +
+              `${ATTACH_TAIL_WRITE_TIMEOUT_MS}ms; closing the attach stream`,
+          );
+        }
+        attachment.unsubscribe();
+        stopHeartbeat();
+        res.raw.destroy();
+        return;
+      }
+      if (attachment.finished) {
+        if (!res.raw.writableEnded) res.raw.end();
+        return;
+      }
+      stopHeartbeat = startSseHeartbeat(res.raw, 15_000);
+      attachment.start(); // drain pending accumulated during the tail write, go live
+    } catch {
+      attachment.unsubscribe();
+      stopHeartbeat();
+      res.raw.destroy();
+    }
   }
 
   /** Rename a chat. */
@@ -164,7 +647,9 @@ export class AiChatController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<void> {
     // A7 gate: the workspace must have AI chat explicitly enabled.
-    const settings = (workspace.settings ?? {}) as { ai?: { chat?: boolean } };
+    const settings = (workspace.settings ?? {}) as {
+      ai?: { chat?: boolean };
+    };
     if (settings.ai?.chat !== true) {
       throw new ForbiddenException('AI chat is disabled');
     }
@@ -177,6 +662,15 @@ export class AiChatController {
     }
 
     const body = (req.body ?? {}) as AiChatStreamBody;
+
+    // Owner-check an EXISTING chat before anything reads its runs, like every
+    // sibling endpoint. Otherwise a same-workspace member could POST a supersede
+    // against another user's chat, harvest its active runId from the 409
+    // SUPERSEDE_TARGET_MISMATCH body and requestStop it. A brand-new chat (no
+    // chatId) has no owner to check. Runs pre-hijack so it returns clean JSON.
+    if (body.chatId) {
+      await this.assertOwnedChat(body.chatId, user, workspace);
+    }
 
     // Resolve the agent role for this turn BEFORE hijack: existing chats read it
     // from ai_chats.role_id (authoritative), a new chat from body.roleId. The
@@ -192,31 +686,171 @@ export class AiChatController {
     // HttpException) instead of breaking mid-stream.
     const model = await this.aiChatService.getChatModel(workspace.id, role);
 
-    // Abort the agent loop when the client disconnects. `close` also fires on
-    // normal completion, so only abort when the response has not finished
-    // writing (a genuine disconnect). `once` fires at most once and self-removes;
-    // we also drop it on response `finish` so it never lingers after the stream
-    // completes normally (the AI SDK pipes the response fire-and-forget, so we
-    // cannot simply remove it once `stream()` returns).
-    // DIAGNOSTIC (Safari stream-drop investigation) — temporary: wall-clock at
-    // which a Safari disconnect is observed, measured from request receipt.
-    const reqStartedAt = Date.now();
-    const controller = new AbortController();
-    const onClose = (): void => {
-      // A genuine disconnect leaves the response unfinished (unlike a normal
-      // completion, which also fires `close`). Such a drop — e.g. a reverse
-      // proxy cutting the SSE mid-answer — is otherwise invisible server-side,
-      // so log it here before aborting the agent loop.
-      if (!res.raw.writableEnded) {
-        this.logger.warn(
-          `AI chat stream: client disconnected before completion; aborting turn ` +
-            `(elapsed=${Date.now() - reqStartedAt}ms since request received)`,
-        );
-        controller.abort();
+    // #487: server-side supersede CAS ("interrupt and send now"). When the client
+    // asks to replace a live run, atomically STOP it and wait for it to settle
+    // before this turn claims the slot. Runs BEFORE hijack so every branch returns
+    // clean JSON (the client keeps the composer text on a 409). See
+    // AiChatRunService.supersede for the branch semantics.
+    let superseded = false;
+    const supersedeRunId = body.supersede?.runId;
+    if (supersedeRunId) {
+      if (!body.chatId) {
+        throw new BadRequestException({
+          message: 'supersede requires chatId',
+          code: 'SUPERSEDE_INVALID',
+        });
       }
+      const result = await this.aiChatRunService.supersede(
+        body.chatId,
+        supersedeRunId,
+        workspace.id,
+      );
+      switch (result.kind) {
+        case 'invalid':
+          throw new BadRequestException({
+            message: 'The run to supersede does not belong to this chat',
+            code: 'SUPERSEDE_INVALID',
+          });
+        case 'mismatch':
+          // A DIFFERENT run is active than the one the client targeted. Surface
+          // the CURRENT runId; the client does NOT auto-retry (a stale CAS).
+          throw new ConflictException({
+            message: 'A different agent run is now active on this chat',
+            code: 'SUPERSEDE_TARGET_MISMATCH',
+            activeRunId: result.activeRunId,
+          });
+        case 'timeout':
+          // The target did not settle within W — nothing was persisted, the
+          // composer keeps the text. NOT a rollback: the stop is already issued.
+          throw new ConflictException({
+            message:
+              'The previous run did not stop in time; nothing was sent — please try again',
+            code: 'SUPERSEDE_TIMEOUT',
+          });
+        case 'ready':
+          // The target stopped and settled: the slot is free. Prompt the new run
+          // that the old run's last operations may still be applying.
+          superseded = true;
+          break;
+        case 'degrade':
+          // The run already ended between click and POST — send normally.
+          break;
+      }
+    }
+
+    // #487: one active run per chat (without this gate two tabs streamed two
+    // parallel turns on one chat, which interleaved history and crashed
+    // convertToModelMessages). Reject a concurrent start with a clean
+    // pre-hijack 409 (double-submit / second-tab). A brand-new
+    // chat (no chatId) cannot have a prior run, and the DB partial unique index in
+    // beginRun is the authoritative backstop for any race that slips past here
+    // (including a slot stolen between a supersede release and beginRun).
+    if (body.chatId) {
+      const active = await this.aiChatRunService.getActiveForChat(
+        body.chatId,
+        workspace.id,
+      );
+      if (active) {
+        throw new ConflictException({
+          message: 'An agent run is already in progress for this chat',
+          code: 'A_RUN_ALREADY_ACTIVE',
+          activeRunId: active.id,
+        });
+      }
+    }
+
+    // The turn is a detached RUN: a browser disconnect does not stop it (onClose
+    // below); only an explicit stop (/ai-chat/stop or a supersede) aborts it.
+    //
+    // Exception: a NEW chat learns its id only from the first stream frame (the
+    // `start` part, written right after the headers). If the client goes away
+    // before that, it can never address this run, so the server stops it.
+    const isNewChat = !body.chatId;
+    let newChatRun: { runId: string; chatId: string } | undefined;
+    // Whether that first frame has been written to the socket. NOT
+    // `res.raw.headersSent`: it flips synchronously inside writeHead, before any
+    // frame is on the wire, so a client that leaves between the status line and
+    // the first frame looked "served" and its run kept editing pages after the
+    // Stop it could never send. The first body write after hijack is the SDK's
+    // `start` frame (the heartbeat only starts 15s later), so the flag flips on
+    // the first `write()` that reaches a still-open socket; the wrapper then
+    // removes itself.
+    let firstFrameWritten = false;
+    const rawWrite = res.raw.write;
+    res.raw.write = function (this: typeof res.raw, ...args: unknown[]) {
+      if (!res.raw.destroyed) firstFrameWritten = true;
+      res.raw.write = rawWrite;
+      return (rawWrite as (...a: unknown[]) => boolean).apply(this, args);
+    } as typeof res.raw.write;
+    const stopUnaddressableRun = (run: { runId: string; chatId: string }) => {
+      this.logger.warn(
+        `AI chat stream: client left before new chat ${run.chatId} reached it; stopping run ${run.runId}`,
+      );
+      void this.aiChatRunService.requestStop(run.runId, workspace.id);
     };
-    req.raw.once('close', onClose);
-    res.raw.once('finish', () => req.raw.off('close', onClose));
+    const runHooks: AiChatRunHooks = {
+      begin: async (chatId) => {
+        const handle = await this.aiChatRunService.beginRun({
+          chatId,
+          workspaceId: workspace.id,
+          userId: user.id,
+          trigger: 'user',
+        });
+        // #184 phase 1.5: register the run-stream entry at BEGIN (before any
+        // frame) so a tab that attaches in the begin->seed window finds an entry
+        // to wait on.
+        this.streamRegistry?.open(chatId, handle.runId);
+        if (isNewChat) {
+          newChatRun = { runId: handle.runId, chatId };
+          // #714: the client left before the run existed (onClose had nothing
+          // to stop yet, or fired before its listener was attached).
+          if (res.raw.destroyed) stopUnaddressableRun(newChatRun);
+        }
+        return handle;
+      },
+      onAssistantSeeded: (runId, messageId) =>
+        this.aiChatRunService.linkAssistantMessage(
+          runId,
+          workspace.id,
+          messageId,
+        ),
+      onStep: (runId, stepCount) =>
+        void this.aiChatRunService.recordStep(runId, workspace.id, stepCount),
+      onSettled: (runId, status, error) =>
+        this.aiChatRunService.finalizeRun(runId, workspace.id, status, error),
+    };
+
+    // Handle a client disconnect. Listen on the RESPONSE: by the time this handler
+    // runs Fastify has consumed the POST body, so `req.raw` is already closed and
+    // its 'close' never fires on a later disconnect. `close` also fires on normal
+    // completion, so only act when the response has not finished writing.
+    const onClose = (): void => {
+      if (res.raw.writableEnded) return;
+      if (isNewChat && !firstFrameWritten) {
+        // #714: no frame went out, so the client never got the new chat id.
+        // Before begin there is no run yet — begin stops it (res.raw.destroyed).
+        if (newChatRun) stopUnaddressableRun(newChatRun);
+        return;
+      }
+      // #184: a DETACHED run — a disconnect must NOT stop it. The run keeps
+      // executing and persisting server-side; the client reconnects via
+      // /ai-chat/run (or re-stops via /ai-chat/stop). Log only.
+      this.logger.log(
+        'AI chat stream: client disconnected; run continues server-side',
+      );
+    };
+    res.raw.once('close', onClose);
+
+    // #184/#487: the run/pipe outlives the socket (a disconnect does not stop it).
+    // The SDK's pipe may then write to a dropped socket and emit an 'error' on the
+    // raw response — swallow it so it never surfaces as an unhandled error event.
+    res.raw.on('error', (err) => {
+      this.logger.debug(
+        `AI chat stream: post-disconnect socket error swallowed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
 
     // Commit to streaming: hijack so Fastify stops managing the response and
     // the AI SDK can write the UI-message stream directly to the Node socket.
@@ -229,18 +863,36 @@ export class AiChatController {
         sessionId,
         body,
         res,
-        signal: controller.signal,
         model,
         role,
+        // #487: the turn is always run-wrapped.
+        runHooks,
+        // #487: warn the new run that a superseded run's last ops may still apply.
+        superseded,
       });
     } catch (err) {
-      // Any failure AFTER hijack can no longer send a clean JSON error, so emit
-      // a minimal error on the raw socket if nothing has been written yet.
-      this.logger.error('AI chat stream failed', err as Error);
+      // Any failure AFTER hijack can no longer go through Nest's exception
+      // filter, so emit the error on the raw socket if nothing has been written
+      // yet. The lost-the-race 409 (RunAlreadyActiveError -> ConflictException)
+      // is raised by stream() BEFORE it writes a byte, so headers are still
+      // unsent here: honor the HttpException's real status + body (a clean 409),
+      // not a blanket 500. Everything else stays a 500.
+      const isHttp = err instanceof HttpException;
+      if (!isHttp) {
+        this.logger.error('AI chat stream failed', err as Error);
+      }
       if (!res.raw.headersSent) {
-        res.raw.statusCode = 500;
+        const status = isHttp ? err.getStatus() : 500;
+        const payload = isHttp
+          ? err.getResponse()
+          : { error: 'Internal server error' };
+        res.raw.statusCode = status;
         res.raw.setHeader('Content-Type', 'application/json');
-        res.raw.end(JSON.stringify({ error: 'Internal server error' }));
+        res.raw.end(
+          JSON.stringify(
+            typeof payload === 'string' ? { message: payload } : payload,
+          ),
+        );
       } else if (!res.raw.writableEnded) {
         res.raw.end();
       }
@@ -314,6 +966,41 @@ export class AiChatController {
       throw new ServiceUnavailableException(describeProviderError(err));
     }
     return { text };
+  }
+
+  /**
+   * Generate a page title from supplied note content. One-shot, non-streaming.
+   * Gated by the AI chat flag (settings.ai.chat); returns { title }. The endpoint
+   * never writes the page — the client applies the title via /pages/update
+   * (which enforces edit permission). Throttled per user via AI_CHAT_THROTTLER.
+   */
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(JwtAuthGuard, UserThrottlerGuard)
+  @Throttle({ [AI_CHAT_THROTTLER]: { limit: 20, ttl: 60000 } })
+  @Post('generate-page-title')
+  async generatePageTitle(
+    @Body() dto: GeneratePageTitleDto,
+    @AuthWorkspace() workspace: Workspace,
+  ): Promise<{ title: string }> {
+    const settings = (workspace.settings ?? {}) as {
+      ai?: { chat?: boolean };
+    };
+    if (settings.ai?.chat !== true) {
+      throw new ForbiddenException('AI title generation is disabled');
+    }
+    try {
+      const title = await this.aiChatService.generatePageTitle(
+        workspace.id,
+        dto.content,
+      );
+      return { title };
+    } catch (err) {
+      // Preserve meaningful HTTP errors (e.g. AiNotConfiguredException -> 503).
+      if (err instanceof HttpException) throw err;
+      // Surface the real provider/transport reason instead of an opaque 500.
+      this.logger.error('AI title generation failed', err as Error);
+      throw new ServiceUnavailableException(describeProviderError(err));
+    }
   }
 
   /**

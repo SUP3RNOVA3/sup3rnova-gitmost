@@ -6,7 +6,8 @@ import {
   TextInput,
   UnstyledButton,
 } from "@mantine/core";
-import { IconFileDescription, IconLink, IconWorld } from "@tabler/icons-react";
+import { IconLink, IconWorld } from "@tabler/icons-react";
+import { PageIcon } from "@/components/ui/page-icon.tsx";
 import { useLinkEditorState } from "@/features/editor/components/link/use-link-editor-state.tsx";
 import { LinkEditorPanelProps } from "@/features/editor/components/link/types.ts";
 import { useTranslation } from "react-i18next";
@@ -23,9 +24,11 @@ export const LinkEditorPanel = ({
   onSetLink,
   initialUrl,
   onUnsetLink,
+  spaceSlug: spaceSlugProp,
 }: LinkEditorPanelProps) => {
   const { t } = useTranslation();
-  const { spaceSlug } = useParams();
+  const params = useParams();
+  const spaceSlug = spaceSlugProp ?? params.spaceSlug;
   const { data: space } = useSpaceQuery(spaceSlug);
   const state = useLinkEditorState({ onSetLink, initialUrl });
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -181,7 +184,7 @@ export const LinkEditorPanel = ({
                 >
                   <Group gap={10} wrap="nowrap" align="flex-start">
                     <span className={classes.pageIcon}>
-                      {page.icon || <IconFileDescription size={18} stroke={1.5} />}
+                      <PageIcon value={page.icon} size={18} />
                     </span>
 
                     <div style={{ flex: 1, minWidth: 0 }}>

@@ -2,6 +2,7 @@ import {
   IsIn,
   IsNotEmpty,
   IsNotIn,
+  IsNumberString,
   IsOptional,
   IsString,
   IsUrl,
@@ -10,7 +11,6 @@ import {
   validateSync,
 } from 'class-validator';
 import { plainToInstance } from 'class-transformer';
-import { IsISO6391 } from '../../common/validators/is-iso6391';
 
 export class EnvironmentVariables {
   @IsNotEmpty()
@@ -97,37 +97,6 @@ export class EnvironmentVariables {
   SUBDOMAIN_HOST: string;
 
   @IsOptional()
-  @IsIn(['database', 'typesense'])
-  @IsString()
-  SEARCH_DRIVER: string;
-
-  @IsOptional()
-  @IsUrl(
-    {
-      protocols: ['http', 'https'],
-      require_tld: false,
-      allow_underscores: true,
-    },
-    {
-      message:
-        'TYPESENSE_URL must be a valid typesense url e.g http://localhost:8108',
-    },
-  )
-  @ValidateIf((obj) => obj.SEARCH_DRIVER === 'typesense')
-  TYPESENSE_URL: string;
-
-  @ValidateIf((obj) => obj.SEARCH_DRIVER === 'typesense')
-  @IsNotEmpty()
-  @IsString()
-  TYPESENSE_API_KEY: string;
-
-  @IsOptional()
-  @ValidateIf((obj) => obj.SEARCH_DRIVER === 'typesense')
-  @IsISO6391()
-  @IsString()
-  TYPESENSE_LOCALE: string;
-
-  @IsOptional()
   @ValidateIf((obj) => obj.AI_DRIVER)
   @IsIn(['openai', 'openai-compatible', 'gemini', 'ollama'])
   @IsString()
@@ -195,6 +164,77 @@ export class EnvironmentVariables {
     },
   )
   CLICKHOUSE_URL: string;
+
+  // --- git-sync — all OPTIONAL. The master switch defaults off; a
+  // required-if-enabled service user id is validated only when sync is on. ---
+
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  @IsString()
+  GIT_SYNC_ENABLED: string;
+
+  // Whether to serve the per-space vaults over smart-HTTP (the /git host).
+  // When unset, defaults to GIT_SYNC_ENABLED (see isGitSyncHttpEnabled).
+  @IsOptional()
+  @IsIn(['true', 'false'])
+  @IsString()
+  GIT_SYNC_HTTP_ENABLED: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_DATA_DIR: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_POLL_INTERVAL_MS: string;
+
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_DEBOUNCE_MS: string;
+
+  // Watchdog timeout (ms) for the spawned `git http-backend` process (default
+  // 120000): a stalled receive-pack is killed so it cannot hold the per-space
+  // lock forever. Optional int (validated as a string env).
+  @IsOptional()
+  @IsString()
+  GIT_SYNC_BACKEND_TIMEOUT_MS: string;
+
+
+  // Required when git-sync is enabled: the service user create/move/rename/delete
+  // are attributed to. Optional otherwise.
+  @ValidateIf((obj) => obj.GIT_SYNC_ENABLED === 'true')
+  @IsNotEmpty()
+  @IsString()
+  GIT_SYNC_SERVICE_USER_ID: string;
+
+  // --- Blob sandbox (in-RAM ephemeral blob transfer; see SandboxModule) ---
+
+  @IsOptional()
+  @ValidateIf((obj) => obj.SANDBOX_PUBLIC_URL != '' && obj.SANDBOX_PUBLIC_URL != null)
+  @IsUrl(
+    { protocols: ['http', 'https'], require_tld: false },
+    {
+      message:
+        'SANDBOX_PUBLIC_URL must be a valid http(s) URL reachable by the external blob consumer',
+    },
+  )
+  SANDBOX_PUBLIC_URL: string;
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'SANDBOX_TTL_MS must be an integer (milliseconds)' })
+  SANDBOX_TTL_MS: string;
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'SANDBOX_MAX_BYTES must be an integer (bytes)' })
+  SANDBOX_MAX_BYTES: string;
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'SANDBOX_MAX_IMAGE_BYTES must be an integer (bytes)' })
+  SANDBOX_MAX_IMAGE_BYTES: string;
+
+  @IsOptional()
+  @IsNumberString({}, { message: 'SANDBOX_MAX_TOTAL_BYTES must be an integer (bytes)' })
+  SANDBOX_MAX_TOTAL_BYTES: string;
 }
 
 export function validate(config: Record<string, any>) {

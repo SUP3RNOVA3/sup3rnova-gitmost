@@ -20,7 +20,6 @@ export interface IWorkspace {
   plan?: string;
   enforceMfa?: boolean;
   aiSearch?: boolean;
-  generativeAi?: boolean;
   disablePublicSharing?: boolean;
   mcpEnabled?: boolean;
   aiChat?: boolean;
@@ -28,12 +27,17 @@ export interface IWorkspace {
   aiDictationStreaming?: boolean;
   aiPublicShareAssistant?: boolean;
   trashRetentionDays?: number;
+  // Default lifetime (HOURS) for new temporary notes; frozen per-note at creation.
+  temporaryNoteHours?: number;
   restrictApiToAdmins?: boolean;
   allowMemberTemplates?: boolean;
   isScimEnabled?: boolean;
   // Write-only field for updateWorkspace({ htmlEmbed }). Read state lives at
   // settings.htmlEmbed.
   htmlEmbed?: boolean;
+  // Write-only field for updateWorkspace({ treeQuickActions }). Read state lives
+  // at settings.treeQuickActions.
+  treeQuickActions?: boolean;
   // Write-only field for updateWorkspace({ trackerHead }). Read state lives at
   // settings.trackerHead.
   trackerHead?: string;
@@ -48,6 +52,11 @@ export interface IWorkspaceSettings {
   // renders in a sandboxed iframe, so this is a feature switch, not a security
   // gate. ABSENT/false => OFF (default).
   htmlEmbed?: boolean;
+  // Sidebar page-tree row quick actions (copy link + move to trash icons).
+  // ABSENT => ON (default) — read it as `treeQuickActions !== false`, never
+  // `=== true`, because the icons already ship and a missing key must keep them
+  // visible.
+  treeQuickActions?: boolean;
   // Admin-only analytics/tracker snippet injected into the <head> of public
   // share pages (same-origin). ABSENT/empty => none.
   trackerHead?: string;
@@ -59,7 +68,6 @@ export interface IWorkspaceApiSettings {
 
 export interface IWorkspaceAiSettings {
   search?: boolean;
-  generative?: boolean;
   mcp?: boolean;
   chat?: boolean;
   dictation?: boolean;
@@ -69,6 +77,17 @@ export interface IWorkspaceAiSettings {
 
 export interface IWorkspaceSharingSettings {
   disabled?: boolean;
+}
+
+// Response of `POST /workspace/entitlements`. Kept loose (extra fields tolerated)
+// since it also carries license tier/feature data the client doesn't model here.
+export interface IWorkspaceEntitlements {
+  cloud: boolean;
+  tier: string;
+  features: string[];
+  // #686 kill-switch (MCP_PERSONAL_SERVERS_ENABLED). When false, the personal
+  // external MCP servers page is hidden/disabled. The server enforces it too.
+  mcpPersonalServersEnabled: boolean;
 }
 
 export interface IWorkspaceTemplateSettings {

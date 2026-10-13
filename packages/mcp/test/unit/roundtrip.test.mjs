@@ -1,6 +1,6 @@
-// Round-trip regression tests: PM -> markdown -> PM must preserve rich nodes.
-// These lock in the converter/schema fixes (math, mention, attachment, columns,
-// nested blocks, text color) and the attribute-escaping idempotency fix.
+// Round-trip tests: PM -> markdown -> PM must preserve rich nodes (math,
+// mention, attachment, columns, nested blocks, text color) and attribute
+// escaping must be idempotent.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { convertProseMirrorToMarkdown } from "../../build/lib/markdown-converter.js";
@@ -82,6 +82,24 @@ test("round-trip: image inside a column survives as an image node (not literal m
   assert.ok(!JSON.stringify(out).includes("![pic]"), "image must not become literal markdown text");
 });
 
+test("round-trip: captioned image inside a column preserves its caption (imageToHtml branch)", async () => {
+  // A captioned image in a column is emitted via the imageToHtml helper (raw
+  // HTML container), a different path from the top-level image case. Special
+  // chars in the caption exercise attribute escaping on the way out and in.
+  const caption = 'Tom & "Jerry"';
+  const input = doc({
+    type: "columns",
+    content: [
+      { type: "column", content: [{ type: "image", attrs: { src: "/api/files/a/p.png", alt: "pic", caption } }] },
+      { type: "column", content: [para(text("right"))] },
+    ],
+  });
+  const out = await roundtrip(input);
+  const imgs = findNodes(out, "image");
+  assert.equal(imgs.length, 1, "captioned image inside a column must survive");
+  assert.equal(imgs[0].attrs?.caption, caption, "caption (incl. special chars) must be preserved");
+});
+
 test("round-trip: blockquote inside a column survives as a blockquote node", async () => {
   const input = doc({
     type: "columns",
@@ -146,4 +164,65 @@ test("import: a colored span that is also a comment keeps the comment mark", asy
 test("import: a colored mention span keeps the mention node", async () => {
   const out = await markdownToProseMirror('<span data-type="mention" data-id="u1" data-label="Alice" style="color: blue">@Alice</span>');
   assert.equal(findNodes(out, "mention").length, 1, "mention node must survive a colored span");
+});
+
+// ---------------------------------------------------------------------------
+// Canon safety net. These assert STRUCTURE/content preservation (the node/mark
+// and its value survive PM -> markdown -> PM, and the markdown is idempotent),
+// NOT the exact markdown bytes, for highlight-without-color, textAlign, subpages
+// and inline footnotes.
+// ---------------------------------------------------------------------------
+test("round-trip: highlight WITHOUT a color survives as a highlight mark (==)", async () => {
+  const input = doc(para(text("hi", [{ type: "highlight", attrs: { color: null } }])));
+  const md = convertProseMirrorToMarkdown(input);
+  const out = await roundtrip(input);
+  const hit = findNodes(out, "text").find(
+    (n) => n.text === "hi" && (n.marks || []).some((m) => m.type === "highlight"),
+  );
+  assert.ok(hit, "the highlight mark must survive a color-less round-trip");
+  // Idempotent markdown.
+  assert.equal(convertProseMirrorToMarkdown(out), md);
+});
+
+test("round-trip: paragraph textAlign survives via the attached-comment directive", async () => {
+  const input = doc({
+    type: "paragraph",
+    attrs: { textAlign: "center" },
+    content: [text("mid")],
+  });
+  const md = convertProseMirrorToMarkdown(input);
+  const out = await roundtrip(input);
+  const p = findNodes(out, "paragraph").find((n) => n.attrs && n.attrs.textAlign === "center");
+  assert.ok(p, "textAlign must be restored on the paragraph");
+  assert.equal(convertProseMirrorToMarkdown(out), md, "textAlign round-trip is idempotent");
+});
+
+test("round-trip: subpages atom survives", async () => {
+  const input = doc({ type: "subpages" });
+  const out = await roundtrip(input);
+  assert.equal(findNodes(out, "subpages").length, 1, "subpages node must survive");
+});
+
+test("round-trip: inline footnote survives with body text (canonical structure)", async () => {
+  const input = doc(
+    para(text("Claim"), { type: "footnoteReference", attrs: { id: "fnA" } }),
+    {
+      type: "footnotesList",
+      content: [
+        {
+          type: "footnoteDefinition",
+          attrs: { id: "fnA" },
+          content: [para(text("the evidence"))],
+        },
+      ],
+    },
+  );
+  const md = convertProseMirrorToMarkdown(input);
+  const out = await roundtrip(input);
+  assert.equal(findNodes(out, "footnoteReference").length, 1);
+  assert.equal(findNodes(out, "footnotesList").length, 1);
+  assert.equal(findNodes(out, "footnoteDefinition").length, 1);
+  assert.match(JSON.stringify(out), /the evidence/, "footnote body survives");
+  // Byte-stable (the schema id is never written to markdown).
+  assert.equal(convertProseMirrorToMarkdown(out), md);
 });
